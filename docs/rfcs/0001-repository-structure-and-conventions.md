@@ -1,6 +1,6 @@
 # RFC 0001: Repository structure and conventions
 
-- **Status:** Accepted
+- **Status:** Implemented
 - **Date:** 2026-07-08
 
 ## Summary
