@@ -1,0 +1,47 @@
+# Working in moraine
+
+Moraine brings a SlateDB backend to DuckLake. Structure and conventions are
+specified in [RFC 0001](docs/rfcs/0001-repository-structure-and-conventions.md);
+this file is the operational summary.
+
+## Layout
+
+- `crates/moraine` — core library. `catalog` (DuckLake domain) never touches
+  SlateDB directly; `store` (keys/codecs) knows nothing about DuckLake; `txn`
+  bridges them. `lib.rs` is docs + re-exports only.
+- `crates/moraine-duckdb` — cdylib DuckDB extension. Thin by policy: if logic
+  accumulates here, move it to the core.
+- `xtask` — automation (`cargo xtask e2e`). Rust, not shell scripts.
+
+## Rules
+
+- TDD: write the failing test first. No mocks of the store layer — use real
+  SlateDB on in-memory `object_store`.
+- Proptest roundtrips are mandatory for anything in `store` that
+  encodes/decodes.
+- No `unwrap`/`expect`/`panic` in library code (lint-enforced; tests exempt
+  via `clippy.toml`). `unsafe` is forbidden in `moraine`, and in
+  `moraine-duckdb` requires a `// SAFETY:` comment.
+- Modules: start as `foo.rs`, split into `foo.rs` + `foo/` (never `mod.rs`).
+- Public items are documented (`missing_docs` warns); key APIs carry doctests;
+  crate-root docs teach by worked example.
+- Features are additive-only and documented in the crate root.
+- Conventional commits; PRs squash-merge into `main`.
+
+## Design docs
+
+- Design/brainstorm outputs are written directly as RFCs in `docs/rfcs/`
+  (`NNNN-kebab-title.md`, status `Draft → Accepted → Implemented/Superseded`).
+  **Do not** create `docs/superpowers/specs/` — the RFC directory overrides
+  that default.
+- Implementation plans go to `docs/plans/` (committed, pruned when executed).
+- RFCs are required for: KV key layout, commit protocol, public API shape.
+
+## The local gate
+
+```bash
+cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
+  && cargo test --workspace --locked \
+  && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
+  && cargo deny check && cargo xtask e2e
+```
