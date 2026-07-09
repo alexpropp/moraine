@@ -1,0 +1,22 @@
+[graph]
+all-features = true
+
+[licenses]
+# Add specific SPDX ids here as dependencies demand them; unused allowances
+# fail the check, so this list always reflects the real graph.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
