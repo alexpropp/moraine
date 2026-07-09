@@ -1,0 +1,7 @@
+[workspace]
+changelog_update = true
+semver_check = true
+
+[[package]]
+name = "xtask"
+release = false
