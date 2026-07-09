@@ -1,0 +1,4 @@
+# These options below are unstable: they take effect under
+# `cargo +nightly fmt` and are silently ignored by stable rustfmt.
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
