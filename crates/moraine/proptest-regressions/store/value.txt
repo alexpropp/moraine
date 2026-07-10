@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8ccc6d7be27f0f31466393c7c927e8d9c928daaccd1fcf799b7d93d89c03153a # shrinks to msg = FormatValue { format_version: 0, writer_version: "" }
+cc 8abebe4a16c108fbf451e6eb0afeb1bb5ddcbf9c5ba3d36f44a553ee64d910ab # shrinks to msg = HeadValue { snapshot_id: 0 }
+cc 6c188592459101148d64eeee4f7380de8108b557d196dc00bb2e08d0c95f1124 # shrinks to msg = GcFileValue { data_file_id: 0, path: "", path_is_relative: false, schedule_start_micros: 0 }
+cc 7b74081a96a317cc875e7bf752308f8166b0e5871f0188c9c4075f6611cab8e5 # shrinks to msg = InlineChunkValue { body: [], row_id_start: 0, row_count: 0, data_file_id: None }
+cc ee5d6181d43cca8b4ed206bdff758972d6f7692d569da4fd345a8c962ee1a758 # shrinks to msg = FileColumnStatsValue { data_file_id: 0, table_id: 0, column_id: 0, column_size_bytes: 0, value_count: 0, null_count: 0, min_value: None, max_value: None, contains_nan: None, extra_stats: None, variant_stats: [] }
+cc 9e89fd1294cf54f86d3acbe373ae19f42923f423a8e73f24afcae106cfca5919 # shrinks to msg = DeleteFileValue { delete_file_id: 0, table_id: 0, begin_snapshot: 0, end_snapshot: None, data_file_id: 0, path: "", path_is_relative: false, format: "", delete_count: 0, file_size_bytes: 0, footer_size: 0, encryption_key: None, partial_max: None }
+cc 793814c453881ccbcfee67379b3faec4d7ab13d41b6435cd48bdaaecb6e02681 # shrinks to msg = DataFileValue { data_file_id: 0, table_id: 0, begin_snapshot: 0, end_snapshot: None, file_order: None, path: "", path_is_relative: false, file_format: "", record_count: 0, file_size_bytes: 0, footer_size: 0, row_id_start: 0, partition_id: None, encryption_key: None, mapping_id: None, partial_max: None, partition_values: [] }
+cc ee1c859e53800443a153901378f9019ae6ca2aa21bc8a65011146b9e9f949597 # shrinks to msg = ColumnValue { column_id: 0, begin_snapshot: 0, end_snapshot: None, table_id: 0, column_order: 0, column_name: "", column_type: "", initial_default: None, default_value: None, nulls_allowed: false, parent_column: None, default_value_type: None, default_value_dialect: None, tags: [] }

@@ -1,4 +1,4 @@
-//! Tier 2 integration tests: exercise the public API only.
+//! Integration tests: exercise the public API only.
 
 use moraine::Error;
 

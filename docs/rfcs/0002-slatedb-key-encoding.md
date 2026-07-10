@@ -239,7 +239,7 @@ Per RFC 0001:
   encode/decode surface (~300 lines) whose only job is restating the type
   structure, and the golden vectors pin the bytes either way. Rejected in
   favor of deriving `Encode`/`Decode` on the key tree: the structure is
-  the format, and the tests are the byte contract. |
+  the format, and the tests are the byte contract.
 - **Unsegmented stores (SlateDB's default):** the longer-exercised
   crash/recovery path, but the extractor is fixed per store at creation,
   making format-v1 genesis the only free adoption moment — deferring would

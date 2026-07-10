@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Tier 3: build the extension cdylib and run its test suite.
+/// Build the extension cdylib and run its test suite.
 ///
 /// Loading into a real DuckDB is added once the extension has entry points;
 /// until then this validates the artifact and packaging plumbing.

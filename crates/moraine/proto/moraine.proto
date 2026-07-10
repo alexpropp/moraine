@@ -1,0 +1,267 @@
+// Value messages for the moraine store, one per key kind.
+//
+// Fields mirror DuckLake's metadata DDL row-faithfully (branch
+// v1.5-variegata, catalog format 1.0); columns that DuckLake writes as
+// NULL are `optional`. Values are self-contained: ids present in the key
+// are repeated here, and `hist` values carry `end_snapshot` even though
+// the key ends with it. Timestamps are microseconds since epoch, UTC.
+//
+// Evolution: add or deprecate fields only — field numbers are permanent.
+
+syntax = "proto3";
+
+package moraine.store;
+
+// ducklake_schema.
+message SchemaValue {
+  uint64 schema_id = 1;
+  string schema_uuid = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  string schema_name = 5;
+  string path = 6;
+  bool path_is_relative = 7;
+}
+
+// ducklake_table.
+message TableValue {
+  uint64 table_id = 1;
+  string table_uuid = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  uint64 schema_id = 5;
+  string table_name = 6;
+  string path = 7;
+  bool path_is_relative = 8;
+}
+
+// ducklake_view.
+message ViewValue {
+  uint64 view_id = 1;
+  string view_uuid = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  uint64 schema_id = 5;
+  string view_name = 6;
+  string dialect = 7;
+  string sql = 8;
+  optional string column_aliases = 9;
+}
+
+// ducklake_column_tag — embedded in ColumnValue
+message ColumnTag {
+  uint64 begin_snapshot = 1;
+  optional uint64 end_snapshot = 2;
+  string key = 3;
+  string value = 4;
+}
+
+// ducklake_column — one record per row, nested fields included
+message ColumnValue {
+  uint64 column_id = 1;
+  uint64 begin_snapshot = 2;
+  optional uint64 end_snapshot = 3;
+  uint64 table_id = 4;
+  uint64 column_order = 5;
+  string column_name = 6;
+  string column_type = 7;
+  optional string initial_default = 8;
+  optional string default_value = 9;
+  bool nulls_allowed = 10;
+  optional uint64 parent_column = 11;
+  optional string default_value_type = 12;
+  optional string default_value_dialect = 13;
+  repeated ColumnTag tags = 14;
+}
+
+// ducklake_partition_column — embedded in PartitionValue.
+message PartitionColumn {
+  uint64 partition_key_index = 1;
+  uint64 column_id = 2;
+  string transform = 3;
+}
+
+// ducklake_partition_info (+ partition columns embedded).
+message PartitionValue {
+  uint64 partition_id = 1;
+  uint64 table_id = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  repeated PartitionColumn columns = 5;
+}
+
+// ducklake_file_partition_value — embedded in DataFileValue.
+message FilePartitionValue {
+  uint64 partition_key_index = 1;
+  string partition_value = 2;
+}
+
+// ducklake_data_file (+ per-file partition values embedded).
+message DataFileValue {
+  uint64 data_file_id = 1;
+  uint64 table_id = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  optional uint64 file_order = 5;
+  string path = 6;
+  bool path_is_relative = 7;
+  string file_format = 8;
+  uint64 record_count = 9;
+  uint64 file_size_bytes = 10;
+  uint64 footer_size = 11;
+  uint64 row_id_start = 12;
+  optional uint64 partition_id = 13;
+  optional string encryption_key = 14;
+  optional uint64 mapping_id = 15;
+  optional uint64 partial_max = 16;
+  repeated FilePartitionValue partition_values = 17;
+}
+
+// ducklake_delete_file.
+message DeleteFileValue {
+  uint64 delete_file_id = 1;
+  uint64 table_id = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  uint64 data_file_id = 5;
+  string path = 6;
+  bool path_is_relative = 7;
+  string format = 8;
+  uint64 delete_count = 9;
+  uint64 file_size_bytes = 10;
+  uint64 footer_size = 11;
+  optional string encryption_key = 12;
+  optional uint64 partial_max = 13;
+}
+
+// ducklake_file_variant_stats — embedded in FileColumnStatsValue.
+message FileVariantStats {
+  string variant_path = 1;
+  string shredded_type = 2;
+  uint64 column_size_bytes = 3;
+  uint64 value_count = 4;
+  uint64 null_count = 5;
+  optional string min_value = 6;
+  optional string max_value = 7;
+  optional bool contains_nan = 8;
+  optional string extra_stats = 9;
+}
+
+// ducklake_file_column_stats (+ variant stats embedded). min/max are
+// DuckLake's verbatim strings — stored faithfully, never interpreted.
+message FileColumnStatsValue {
+  uint64 data_file_id = 1;
+  uint64 table_id = 2;
+  uint64 column_id = 3;
+  uint64 column_size_bytes = 4;
+  uint64 value_count = 5;
+  uint64 null_count = 6;
+  optional string min_value = 7;
+  optional string max_value = 8;
+  optional bool contains_nan = 9;
+  optional string extra_stats = 10;
+  repeated FileVariantStats variant_stats = 11;
+}
+
+// ducklake_table_stats. next_row_id is the per-table row-id counter.
+message TableStatsValue {
+  uint64 table_id = 1;
+  uint64 record_count = 2;
+  uint64 next_row_id = 3;
+  uint64 file_size_bytes = 4;
+}
+
+// ducklake_table_column_stats.
+message TableColumnStatsValue {
+  uint64 table_id = 1;
+  uint64 column_id = 2;
+  optional bool contains_null = 3;
+  optional bool contains_nan = 4;
+  optional string min_value = 5;
+  optional string max_value = 6;
+  optional string extra_stats = 7;
+}
+
+// ducklake_tag.
+message TagValue {
+  uint64 object_id = 1;
+  uint64 begin_snapshot = 2;
+  optional uint64 end_snapshot = 3;
+  string key = 4;
+  string value = 5;
+}
+
+// ducklake_metadata, one record per scope. Options are
+// unversioned: last-write-wins, never to hist.
+message OptionScopeValue {
+  map<string, string> options = 1;
+}
+
+// ducklake_snapshot + ducklake_snapshot_changes, merged (1:1).
+// next_deletion_id is moraine's gcfile counter, allocated
+// alongside DuckLake's counters.
+message SnapshotValue {
+  uint64 snapshot_id = 1;
+  int64 snapshot_time_micros = 2;
+  uint64 schema_version = 3;
+  uint64 next_catalog_id = 4;
+  uint64 next_file_id = 5;
+  uint64 next_deletion_id = 6;
+  string changes_made = 7;
+  optional string author = 8;
+  optional string commit_message = 9;
+  optional string commit_extra_info = 10;
+}
+
+// ducklake_files_scheduled_for_deletion.
+message GcFileValue {
+  uint64 data_file_id = 1;
+  string path = 2;
+  bool path_is_relative = 3;
+  int64 schedule_start_micros = 4;
+}
+
+// sys/format: structural layout version (currently 1) and the moraine
+// version that wrote the store.
+message FormatValue {
+  uint64 format_version = 1;
+  string writer_version = 2;
+}
+
+// sys/head: latest committed snapshot id.
+message HeadValue {
+  uint64 snapshot_id = 1;
+}
+
+// sys/migration: structural-migration marker. Present only
+// mid-migration; readers refuse the store while it exists.
+message MigrationValue {
+  uint64 from_format = 1;
+  uint64 to_format = 2;
+  bytes cursor = 3;
+}
+
+// inline/schema: the Arrow IPC schema message, verbatim.
+message InlineSchemaValue {
+  bytes arrow_schema = 1;
+}
+
+// inline/ins and its archive form: an Arrow IPC record-batch body.
+// data_file_id is set at flush on the archived form — the hook for
+// file-grain archive invalidation.
+message InlineChunkValue {
+  bytes body = 1;
+  uint64 row_id_start = 2;
+  uint64 row_count = 3;
+  optional uint64 data_file_id = 4;
+}
+
+// inline/idel: tombstone for an inlined insert row.
+message InlineIdelValue {
+  uint64 end_snapshot = 1;
+}
+
+// inline/fdel: inlined delete against a Parquet-file row.
+message InlineFdelValue {
+  uint64 begin_snapshot = 1;
+}
