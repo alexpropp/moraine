@@ -1,6 +1,5 @@
 # RFC 0001: Repository structure and conventions
 
-- **Status:** Implemented
 - **Date:** 2026-07-08
 
 ## Summary
@@ -9,7 +8,7 @@ Moraine brings a [SlateDB](https://slatedb.io) backend to [DuckLake](https://duc
 
 ## Goals
 
-- Open-source release quality from the start (licensing, CI, semver, docs), growing into a production dependency.
+- Open-source best practices from the start (licensing, CI, semver, docs), growing into a production quality dependency.
 - Core catalog logic developed and tested as pure Rust, independent of DuckDB.
 - Conventions enforced by tooling wherever possible; prose only for what can't be mechanized.
 
@@ -20,7 +19,7 @@ A Cargo workspace with a virtual root (no root crate):
 | Crate | Type | Role |
 |---|---|---|
 | `moraine` | lib | Core: DuckLake catalog semantics on SlateDB. The flagship crate. |
-| `moraine-duckdb` | cdylib | DuckDB extension wrapping the core. Thin by policy: extension entry points and the sync↔async bridge only. If logic accumulates here, it belongs in the core. |
+| `moraine-duckdb` | cdylib (+ linked C++ shim) | DuckDB extension wrapping the core. Thin by policy — *language-agnostic*: no domain logic, only `StorageExtension` registration, C-ABI marshalling, and the sync↔async bridge. Composition and the DuckLake catalog contract are specified by [RFC 0006](0006-extension-surface.md). If logic accumulates here, it belongs in the core. |
 | `xtask` | bin (unpublished) | Automation: build/package the extension, orchestrate the e2e suite. Rust instead of shell scripts/Makefiles — cross-platform and type-checked. |
 
 Library-first: the catalog logic lives in `moraine`, free of the FFI/build tax and embeddable in any Rust host. The extension is one consumer of it.
@@ -55,11 +54,11 @@ moraine/
 │   │   ├── Cargo.toml
 │   │   ├── src/
 │   │   ├── examples/             # runnable usage examples, compiled by CI
-│   │   └── tests/                # Tier 2 integration tests
+│   │   └── tests/                # Integration tests
 │   └── moraine-duckdb/
 │       ├── Cargo.toml
 │       ├── src/
-│       └── tests/                # Tier 3 e2e tests
+│       └── tests/                # e2e tests
 ├── xtask/
 │   └── src/main.rs
 └── docs/
@@ -74,10 +73,10 @@ Community files (`SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates) exist 
 
 ## RFC process
 
-- Files are `docs/rfcs/NNNN-kebab-title.md` with a status header: `Draft → Accepted → Implemented / Superseded`.
+- Files are `docs/rfcs/NNNN-kebab-title.md`. RFCs carry no status field: every RFC in the directory is the current, binding design; superseding one means updating or replacing it (with a pointer back), not re-labeling it.
 - An RFC is **required** for decisions that are expensive to reverse: on-disk/KV key layout, commit/transaction protocol, public API shape. Optional for everything else.
 - RFCs double as an ADR log. RFC 0002 is expected to be the SlateDB key encoding for DuckLake catalog state.
-- Design documents produced by brainstorming/design sessions are written directly as RFCs in this directory (entering as `Draft`, graduating to `Accepted` on sign-off). There is no separate specs directory; this location overrides any tooling default (e.g. `docs/superpowers/specs/`).
+- Design documents produced by brainstorming/design sessions are written directly as RFCs in this directory. There is no separate specs directory; this location overrides any tooling default (e.g. `docs/superpowers/specs/`).
 
 ## Core crate skeleton (`crates/moraine`)
 
@@ -104,13 +103,13 @@ This skeleton is a starting guess at the seams. If an implementation RFC (key la
 
 | Tier | Home | What | CI cadence |
 |---|---|---|---|
-| 1 — Unit | colocated `#[cfg(test)]` mods | Tricky internals: key encoding, codecs, conflict resolution. Property-based tests (`proptest`) are **mandatory** for anything in `store` that encodes/decodes: roundtrips, key-ordering preservation. Encoding bugs in a catalog are data-corruption bugs. | every push/PR |
-| 2 — Integration | `crates/moraine/tests/` | Public API against real SlateDB on in-memory `object_store`. **No mocks of the store layer.** Covers snapshot visibility, concurrent-commit conflicts, crash-shaped sequences (commit, reopen, verify). | every push/PR |
-| 3 — E2E | `crates/moraine-duckdb/tests/`, via `cargo xtask e2e` | Build the cdylib, load into real DuckDB, run actual DuckLake SQL. Validates our assumptions about what DuckLake demands, not just that the code does what we think. | separate required PR job |
-| 4 — Real object storage | (future) | MinIO/localstack backend tests. Roadmap item, not built now. | — |
-| 5 — Fuzzing | (future) `fuzz/` via `cargo-fuzz` | Fuzz targets for `store` codecs and the commit protocol's read-path (decode arbitrary bytes without panicking). The project's worst failure mode is catalog corruption; fuzzing is the cheapest insurance against it. Added once the codecs stabilize. | scheduled/nightly |
+| Unit | colocated `#[cfg(test)]` mods | Tricky internals: key encoding, codecs, conflict resolution. Property-based tests (`proptest`) are **mandatory** for anything in `store` that encodes/decodes: roundtrips, key-ordering preservation. Encoding bugs in a catalog are data-corruption bugs. | every push/PR |
+| Integration | `crates/moraine/tests/` | Public API against real SlateDB on in-memory `object_store`. **No mocks of the store layer.** Covers snapshot visibility, concurrent-commit conflicts, crash-shaped sequences (commit, reopen, verify). | every push/PR |
+| E2E | `crates/moraine-duckdb/tests/`, via `cargo xtask e2e` | Build the cdylib, load into real DuckDB, run actual DuckLake SQL. Validates our assumptions about what DuckLake demands, not just that the code does what we think. | separate required PR job |
+| Real object storage | (future) | MinIO/localstack backend tests. Roadmap item, not built now. | — |
+| Fuzzing | (future) `fuzz/` via `cargo-fuzz` | Fuzz targets for `store` codecs and the commit protocol's read-path (decode arbitrary bytes without panicking). The project's worst failure mode is catalog corruption; fuzzing is the cheapest insurance against it. Added once the codecs stabilize. | scheduled/nightly |
 
-Process: TDD (test first, watch it fail, implement). Every bugfix lands with a regression test. Tests assert on behavior through public APIs, except Tier 1.
+Process: TDD (test first, watch it fail, implement). Every bugfix lands with a regression test. Tests assert on behavior through public APIs, except Unit.
 
 ## Lint and format policy
 
@@ -129,10 +128,10 @@ One workflow (`ci.yml`), parallel jobs, all required:
 |---|---|
 | `fmt` | `cargo fmt --check` |
 | `clippy` | `cargo clippy --workspace --all-targets`, warnings denied |
-| `test` | `cargo test --workspace --locked` (Tiers 1–2, doctests, examples) |
+| `test` | `cargo test --workspace --locked` (Unit + Integration, doctests, examples) |
 | `doc` | `cargo doc` with `RUSTDOCFLAGS="-D warnings"` |
 | `deny` | `cargo deny check` |
-| `e2e` | `cargo xtask e2e` (Tier 3; separate job so it doesn't gate fast feedback) |
+| `e2e` | `cargo xtask e2e` (E2E; separate job so it doesn't gate fast feedback) |
 
 Toolchain pinned via `rust-toolchain.toml`. `rust-version` declared in workspace metadata; a dedicated MSRV-check job is deferred until there are external users. Rust build caching (e.g. `Swatinem/rust-cache`) for CI speed. Workflows set a `concurrency` group with cancel-in-progress so superseded pushes don't burn CI minutes. Dependabot keeps both cargo dependencies and pinned GitHub Actions current (weekly, so `deny` advisories surface as PRs rather than red CI).
 
@@ -141,11 +140,11 @@ Toolchain pinned via `rust-toolchain.toml`. `rust-version` declared in workspace
 - **Conventional commits** (`feat:`, `fix:`, `docs:`, `refactor:`, …). Load-bearing, not cosmetic: `release-plz` derives changelogs and version bumps from them.
 - **release-plz** on `release.yml`: opens a release PR with version bumps + CHANGELOG; merging publishes to crates.io. Configured from the start, dormant until the first release.
 - Both published crates share a workspace version (`[workspace.package] version`) and release in lockstep. Decoupling is a post-1.0 problem.
-- Pre-1.0 semver: breaking changes bump the minor version. Stated in the README. From the first release onward, `release-plz` runs `cargo-semver-checks` so accidental breaking changes are caught mechanically, not by reviewer vigilance.
+- Pre-1.0 semver: breaking changes bump the minor version. Stated in the README. From the first release onward, `release-plz` runs `cargo-semver-checks`, catching accidental breaking changes mechanically, not by reviewer vigilance.
 - PRs into `main`; squash-merge so `main` stays a clean conventional-commit history.
 
 ## Alternatives considered
 
-- **Extension-first (cdylib as the primary crate):** rejected — pays the FFI/build/version-pinning tax during the phase where all the hard problems are pure Rust. Risk of drift from real DuckLake behavior is mitigated by the Tier 3 e2e suite instead.
+- **Extension-first (cdylib as the primary crate):** rejected — pays the FFI/build/version-pinning tax during the phase where all the hard problems are pure Rust. The E2E suite mitigates the risk of drift from real DuckLake behavior instead.
 - **Single crate, split later:** rejected — both crates are already committed; converting a root crate to a workspace later touches paths, CI, and metadata for no savings.
 - **Lean scaffold, add tooling later (no xtask/release config/templates up front):** rejected in favor of full scaffold, given the stated open-source-release ambition; cargo-deny and licensing especially are cheap now and painful to retrofit.

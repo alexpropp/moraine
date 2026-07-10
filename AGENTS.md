@@ -9,8 +9,9 @@ this file is the operational summary.
 - `crates/moraine` — core library. `catalog` (DuckLake domain) never touches
   SlateDB directly; `store` (keys/codecs) knows nothing about DuckLake; `txn`
   bridges them. `lib.rs` is docs + re-exports only.
-- `crates/moraine-duckdb` — cdylib DuckDB extension. Thin by policy: if logic
-  accumulates here, move it to the core.
+- `crates/moraine-duckdb` — DuckDB extension: a thin C++ shim registering a
+  `StorageExtension` over a C ABI to the Rust core (RFC 0006). Thin by policy:
+  if logic accumulates here, move it to the core.
 - `xtask` — automation (`cargo xtask e2e`). Rust, not shell scripts.
 
 ## Rules
@@ -20,21 +21,31 @@ this file is the operational summary.
 - Proptest roundtrips are mandatory for anything in `store` that
   encodes/decodes.
 - No `unwrap`/`expect`/`panic` in library code (lint-enforced; tests exempt
-  via `clippy.toml`). `unsafe` is forbidden in `moraine`, and in
-  `moraine-duckdb` requires a `// SAFETY:` comment.
+  via `clippy.toml`). One sanctioned exception: a targeted
+  `#[allow(clippy::expect_used)]` where failure is impossible by
+  construction (e.g. encoding into a `Vec`), with the invariant stated in a
+  comment at the call site — never a fabricated fallback path. `unsafe` is
+  forbidden in `moraine`, and in `moraine-duckdb` requires a `// SAFETY:`
+  comment.
 - Modules: start as `foo.rs`, split into `foo.rs` + `foo/` (never `mod.rs`).
 - Public items are documented (`missing_docs` warns); key APIs carry doctests;
   crate-root docs teach by worked example.
+- No decorative comment banners (`// --- section ---`, `// ====`, etc.).
+  Comments carry content, not typography; if a file needs section markers,
+  split the module instead.
+- Code and code comments never cite RFCs by number or name. State the
+  constraint itself in the comment; RFCs reference code, not the reverse.
 - Features are additive-only and documented in the crate root.
 - Conventional commits; PRs squash-merge into `main`.
 
 ## Design docs
 
 - Design/brainstorm outputs are written directly as RFCs in `docs/rfcs/`
-  (`NNNN-kebab-title.md`, status `Draft → Accepted → Implemented/Superseded`).
+  (`NNNN-kebab-title.md`; no status field — every RFC is the current,
+  binding design; update or replace, never re-label).
   **Do not** create `docs/superpowers/specs/` — the RFC directory overrides
   that default.
-- Implementation plans go to `docs/plans/` (committed, pruned when executed).
+- Implementation plans go to `docs/plans/` (not-committed).
 - RFCs are required for: KV key layout, commit protocol, public API shape.
 
 ## The local gate

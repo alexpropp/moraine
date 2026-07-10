@@ -8,10 +8,10 @@ record *why* the project is the way it is.
 ## Process
 
 1. Copy `0000-template.md` to `NNNN-kebab-title.md` (next free number).
-2. Status lifecycle: `Draft` → `Accepted` (on sign-off) → `Implemented`.
-   Replaced RFCs become `Superseded` with a pointer to their successor.
-3. Accepted RFCs are binding until superseded. If implementation reveals a
-   better design, update or supersede the RFC — don't silently diverge.
+2. RFCs carry no status field. Every RFC in this directory is the current
+   design and is binding: if implementation reveals a better design, update
+   the RFC (or replace it with a successor that points back) — don't
+   silently diverge.
 
 Design documents produced in brainstorming/design sessions are written
-directly here as `Draft` RFCs; there is no separate specs directory.
+directly here as RFCs; there is no separate specs directory.

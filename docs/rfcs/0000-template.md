@@ -1,6 +1,5 @@
 # RFC NNNN: Title
 
-- **Status:** Draft
 - **Date:** YYYY-MM-DD
 
 ## Summary
