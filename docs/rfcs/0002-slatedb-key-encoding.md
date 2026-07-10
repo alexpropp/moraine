@@ -196,9 +196,9 @@ Per RFC 0001:
 
 - `decode(encode(k)) == k` for every key kind, with golden vectors pinning
   the exact on-disk bytes per kind (so an encoding change in a `storekey`
-  bump fails CI instead of silently forking the format).
-- Order preservation: lexicographic byte order equals component-tuple
-  order for keys of one kind.
+  bump — or a reordered variant — fails CI instead of silently forking
+  the format). Order preservation itself is `storekey`'s documented
+  contract and is not re-proven here; the goldens pin our use of it.
 - Value roundtrip (framing included) for every message type; framing
   rejection — corrupt magic, truncated header, unknown encoding version —
   fails as `Corruption`, never a partial decode.

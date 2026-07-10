@@ -16,7 +16,7 @@ atomicity invariant and conflict-retry loop live in the core, not duplicated in
 every host. SlateDB never appears in a public signature: the substrate is an
 implementation detail behind `object_store` plus moraine's own options type.
 The operation set is enumerated in full, grounded in DuckLake v1.0 catalog
-semantics and the entities RFC 0002 already maps.
+semantics.
 
 ## Goals
 
@@ -24,14 +24,11 @@ semantics and the entities RFC 0002 already maps.
   commit (the `Txn` handed to the closure exposes the same accessors). A host
   learns the accessors once.
 - The atomicity invariant (RFC 0002: one catalog commit is exactly one SlateDB
-  `WriteBatch`) and the conflict-retry loop are the core's responsibility. No
-  host — least of all the "thin by policy" DuckDB bridge — reimplements them.
+  `WriteBatch`) and the conflict-retry loop are the core's responsibility.
 - SlateDB is an implementation detail. No `slatedb::` type crosses the public
   boundary, so the substrate's version churn stays out of moraine's semver
-  surface (README: pre-1.0 breaking changes bump the minor version).
-- The `prost`-generated value types (RFC 0002) stay private to `store`. RFC
-  0002's "values can evolve without rewriting the store" promise must not
-  become a public breaking change.
+  surface
+- The `prost`-generated value types (RFC 0002) stay private to `store`.
 - Every DuckLake v1.0 catalog mutation the entities in RFC 0002 imply has a
   named, DuckLake-shaped operation on `Txn`. The version and `cur`↔`hist`
   bookkeeping is internal.
@@ -41,16 +38,11 @@ semantics and the entities RFC 0002 already maps.
 Non-goals:
 
 - The commit protocol itself — conflict detection, snapshot allocation, group
-  commit, the CAS/fencing discipline on `sys/head`. That is RFC 0004. This RFC
-  consumes the protocol's guarantees and defines the surface over it; it does
-  not specify how a commit is made durable.
+  commit, the CAS/fencing discipline on `sys/head`. That is RFC 0004.
 - The DuckDB extension entry points (RFC 0006) and the sync↔async bridge
   (RFC 0010). This RFC defines the async core surface that bridge wraps.
 - Snapshot expiry / `hist` garbage collection — RFC 0007. No public verb is
   reserved for it here.
-- A stable API. Pre-1.0, this surface is expected to move as the DuckLake
-  extension contract (RFC 0005 open question) is discovered in e2e work; per
-  the RFC process this document is updated, not diverged from.
 
 ## Background
 
