@@ -8,7 +8,23 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+object_store = { workspace = true }
+prost = { workspace = true }
+slatedb = { workspace = true }
+storekey = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

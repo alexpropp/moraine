@@ -1,3 +1,10 @@
+# Rust
 /target
+**/*.rs.bk
+*.pdb
 
+# macOS
+.DS_Store
+
+# Project
 /docs/plans
