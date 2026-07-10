@@ -56,3 +56,6 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
   && cargo deny check && cargo xtask e2e
 ```
+
+The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`.
+One-time setup per clone: `git config core.hooksPath .githooks`.
