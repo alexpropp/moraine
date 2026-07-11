@@ -8,7 +8,7 @@ this file is the operational summary.
 
 - `crates/moraine` — core library. `catalog` (DuckLake domain) owns the
   store handle but no key/value knowledge — that lives in `store`
-  (keys/codecs, which knows nothing about DuckLake); `txn` (the commit
+  (keys/codecs, which knows nothing about DuckLake); `transaction` (the commit
   protocol) bridges them. `lib.rs` is docs + re-exports only.
 - `crates/moraine-duckdb` — DuckDB extension: a thin C++ shim registering a
   `StorageExtension` over a C ABI to the Rust core (RFC 0006). Thin by policy:

@@ -236,7 +236,7 @@ When the head conflict fires, the committer compares the set of
   invalidate this commit's premise. Retry from step 1 against the new head
   (what a retry re-runs is defined in Conflict resolution below — on the
   verb path it includes re-running the caller's closure, not just
-  re-stamping ids). This is bounded internal retry inside `txn`; no caller
+  re-stamping ids). This is bounded internal retry inside `transaction`; no caller
   involvement.
 - **Overlapping table set → true conflict** (subject to the append-append
   refinement below). A concurrent commit mutated a table this commit also
@@ -309,7 +309,7 @@ that, treating `set_option`/`unset_option` as non-conflicting overwrites.
 
 The benign/true classification is mechanical — set comparison over
 `table_id`s and mutation kinds — but classification only decides *whether*
-to retry; the retry itself re-validates (next section). `txn` still never
+to retry; the retry itself re-validates (next section). `tx` still never
 needs to understand what SQL produced the mutations.
 
 ### Conflict resolution — abort, with internal benign-race retry

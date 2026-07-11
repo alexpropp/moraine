@@ -77,7 +77,7 @@ object storage and assert. Concretely, the harness realizes a crash two ways:
 
 - **Seam crash** (multi-step paths). The test drives the operation up to a
   named seam — e.g. issues the Parquet PUTs of a flush but not the commit
-  batch — then drops the writer handle and reopens. This requires the `txn`,
+  batch — then drops the writer handle and reopens. This requires the `transaction`,
   flush, and GC code to be decomposable at those seams (a testing surface,
   not a production API; see Open questions).
 
@@ -292,9 +292,8 @@ edit to those three RFCs.
   invariant (no duplicate snapshot/id) holds either way, but the assertion's
   shape depends on it.
 - **Where the seam hooks live.** The `CrashPoint` injection points are a
-  test-only surface on `txn`/flush/GC. Confirm they can be `#[cfg(...)]`-gated
-  with zero production footprint and no `unsafe` (RFC 0001 forbids `unsafe`
-  in `moraine`), rather than leaking a fault-injection parameter into public
+  test-only surface on `transaction`/flush/GC. Confirm they can be `#[cfg(...)]`-gated
+  with zero production footprint and no `unsafe`, rather than leaking a fault-injection parameter into public
   signatures.
 - **Compaction seams (RFC 0008).** Does compaction introduce any state-change
   seam not already shaped like an inline flush (PUT-then-batch)? If it writes

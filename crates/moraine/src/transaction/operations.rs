@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 /// One staged mutation, at the grain conflict classification needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Op {
+pub(crate) enum Operation {
     /// A schema was created.
     CreateSchema {
         /// The new schema's id.
@@ -70,23 +70,47 @@ pub(crate) enum Op {
         /// conflict detection.
         table_id: u64,
     },
+    /// A view was created.
+    CreateView {
+        /// The schema the view was created in.
+        schema_id: u64,
+        /// The new view's id.
+        view_id: u64,
+        /// The owning schema's name, serialized as `"schema"."view"`.
+        schema_name: String,
+        /// The new view's name.
+        view_name: String,
+    },
+    /// An existing view was mutated.
+    AlterView {
+        /// The mutated view's id.
+        view_id: u64,
+    },
+    /// A view was dropped.
+    DropView {
+        /// The dropped view's id.
+        view_id: u64,
+    },
 }
 
-impl Op {
+impl Operation {
     /// Whether this op changes the catalog's shape (and bumps the schema
     /// version). Explicit per op — never inferred from the write set.
     pub(crate) fn is_schema_changing(&self) -> bool {
         match self {
-            Op::CreateSchema { .. }
-            | Op::DropSchema { .. }
-            | Op::CreateTable { .. }
-            | Op::AlterTable { .. }
-            | Op::DropTable { .. } => true,
-            Op::RegisterDataFile { .. }
-            | Op::RegisterDeleteFile { .. }
-            | Op::ExpireDataFile { .. }
-            | Op::ExpireDeleteFile { .. }
-            | Op::UpdateStats { .. } => false,
+            Operation::CreateSchema { .. }
+            | Operation::DropSchema { .. }
+            | Operation::CreateTable { .. }
+            | Operation::AlterTable { .. }
+            | Operation::DropTable { .. }
+            | Operation::CreateView { .. }
+            | Operation::AlterView { .. }
+            | Operation::DropView { .. } => true,
+            Operation::RegisterDataFile { .. }
+            | Operation::RegisterDeleteFile { .. }
+            | Operation::ExpireDataFile { .. }
+            | Operation::ExpireDeleteFile { .. }
+            | Operation::UpdateStats { .. } => false,
         }
     }
 }
@@ -189,6 +213,14 @@ pub(crate) struct ChangeSet {
     pub(crate) created_table_schema_ids: BTreeSet<u64>,
     pub(crate) altered_tables: BTreeSet<u64>,
     pub(crate) dropped_tables: BTreeSet<u64>,
+    /// `(schema name, view name)` pairs, unquoted — the view twin of
+    /// [`Self::created_tables`].
+    pub(crate) created_views: BTreeSet<(String, String)>,
+    /// Schema ids a view was created in — the view twin of
+    /// [`Self::created_table_schema_ids`].
+    pub(crate) created_view_schema_ids: BTreeSet<u64>,
+    pub(crate) altered_views: BTreeSet<u64>,
+    pub(crate) dropped_views: BTreeSet<u64>,
     /// Tables data was appended to.
     pub(crate) inserted_tables: BTreeSet<u64>,
     /// Tables delete markers were appended to.
@@ -206,17 +238,17 @@ pub(crate) struct ChangeSet {
 }
 
 impl ChangeSet {
-    pub(crate) fn from_ops(ops: &[Op]) -> Self {
+    pub(crate) fn from_operations(operations: &[Operation]) -> Self {
         let mut set = Self::default();
-        for op in ops {
+        for op in operations {
             match op {
-                Op::CreateSchema { name, .. } => {
+                Operation::CreateSchema { name, .. } => {
                     set.created_schemas.insert(name.clone());
                 }
-                Op::DropSchema { schema_id } => {
+                Operation::DropSchema { schema_id } => {
                     set.dropped_schemas.insert(*schema_id);
                 }
-                Op::CreateTable {
+                Operation::CreateTable {
                     schema_id,
                     schema_name,
                     table_name,
@@ -226,27 +258,43 @@ impl ChangeSet {
                         .insert((schema_name.clone(), table_name.clone()));
                     set.created_table_schema_ids.insert(*schema_id);
                 }
-                Op::AlterTable { table_id } => {
+                Operation::AlterTable { table_id } => {
                     set.altered_tables.insert(*table_id);
                 }
-                Op::DropTable { table_id } => {
+                Operation::DropTable { table_id } => {
                     set.dropped_tables.insert(*table_id);
                 }
-                Op::RegisterDataFile { table_id } => {
+                Operation::RegisterDataFile { table_id } => {
                     set.inserted_tables.insert(*table_id);
                 }
-                Op::RegisterDeleteFile { table_id } => {
+                Operation::RegisterDeleteFile { table_id } => {
                     set.deleted_from_tables.insert(*table_id);
                 }
-                Op::ExpireDataFile { table_id } => {
+                Operation::ExpireDataFile { table_id } => {
                     set.merge_adjacent_tables.insert(*table_id);
                 }
-                Op::ExpireDeleteFile { table_id } => {
+                Operation::ExpireDeleteFile { table_id } => {
                     set.rewrite_delete_tables.insert(*table_id);
                 }
-                Op::UpdateStats { .. } => {
+                Operation::UpdateStats { .. } => {
                     // UpdateStats does not populate any set; it exists so a
                     // stats-only commit is non-empty and mints a snapshot.
+                }
+                Operation::CreateView {
+                    schema_id,
+                    schema_name,
+                    view_name,
+                    ..
+                } => {
+                    set.created_views
+                        .insert((schema_name.clone(), view_name.clone()));
+                    set.created_view_schema_ids.insert(*schema_id);
+                }
+                Operation::AlterView { view_id } => {
+                    set.altered_views.insert(*view_id);
+                }
+                Operation::DropView { view_id } => {
+                    set.dropped_views.insert(*view_id);
                 }
             }
         }
@@ -254,8 +302,9 @@ impl ChangeSet {
     }
 
     /// Emits entries in DuckLake's writer order (the subset moraine
-    /// emits): dropped schemas, dropped tables, created schemas, created
-    /// tables, `inserted_into_table`, `deleted_from_table`, altered tables,
+    /// emits): dropped schemas, dropped tables, dropped views, created
+    /// schemas, created tables, created views, `inserted_into_table`,
+    /// `deleted_from_table`, altered tables, altered views,
     /// `merge_adjacent`, `rewrite_delete`.
     pub(crate) fn to_changes_made(&self) -> String {
         let mut entries = Vec::new();
@@ -270,6 +319,11 @@ impl ChangeSet {
                 .map(|id| format!("dropped_table:{id}")),
         );
         entries.extend(
+            self.dropped_views
+                .iter()
+                .map(|id| format!("dropped_view:{id}")),
+        );
+        entries.extend(
             self.created_schemas
                 .iter()
                 .map(|name| format!("created_schema:{}", quote_ident(name))),
@@ -278,6 +332,11 @@ impl ChangeSet {
             self.created_tables
                 .iter()
                 .map(|(s, t)| format!("created_table:{}.{}", quote_ident(s), quote_ident(t))),
+        );
+        entries.extend(
+            self.created_views
+                .iter()
+                .map(|(s, v)| format!("created_view:{}.{}", quote_ident(s), quote_ident(v))),
         );
         entries.extend(
             self.inserted_tables
@@ -293,6 +352,11 @@ impl ChangeSet {
             self.altered_tables
                 .iter()
                 .map(|id| format!("altered_table:{id}")),
+        );
+        entries.extend(
+            self.altered_views
+                .iter()
+                .map(|id| format!("altered_view:{id}")),
         );
         entries.extend(
             self.merge_adjacent_tables
@@ -340,6 +404,20 @@ impl ChangeSet {
                     .parse()
                     .map(|id| set.dropped_tables.insert(id))
                     .is_ok()
+            } else if kind.eq_ignore_ascii_case("created_view") {
+                parse_created_table_payload(payload)
+                    .map(|pair| set.created_views.insert(pair))
+                    .is_some()
+            } else if kind.eq_ignore_ascii_case("altered_view") {
+                payload
+                    .parse()
+                    .map(|id| set.altered_views.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("dropped_view") {
+                payload
+                    .parse()
+                    .map(|id| set.dropped_views.insert(id))
+                    .is_ok()
             } else if kind.eq_ignore_ascii_case("inserted_into_table") {
                 payload
                     .parse()
@@ -377,12 +455,18 @@ impl ChangeSet {
         set
     }
 
+    /// True when the set records no changes at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
     fn touches_schema_list(&self) -> bool {
         !self.created_schemas.is_empty() || !self.dropped_schemas.is_empty()
     }
 
     fn creates_table_in(&self, schema_id: u64) -> bool {
         self.created_table_schema_ids.contains(&schema_id)
+            || self.created_view_schema_ids.contains(&schema_id)
     }
 
     fn table_kinds(&self) -> std::collections::BTreeMap<u64, TableKinds> {
@@ -394,10 +478,10 @@ impl ChangeSet {
         for &table_id in &self.deleted_from_tables {
             kinds.entry(table_id).or_default().deleted = true;
         }
-        for &table_id in &self.altered_tables {
+        for &table_id in self.altered_tables.iter().chain(self.altered_views.iter()) {
             kinds.entry(table_id).or_default().altered = true;
         }
-        for &table_id in &self.dropped_tables {
+        for &table_id in self.dropped_tables.iter().chain(self.dropped_views.iter()) {
             kinds.entry(table_id).or_default().dropped = true;
         }
         let compacted: std::collections::BTreeSet<u64> = self
@@ -470,15 +554,20 @@ pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
 mod tests {
     use super::*;
 
-    fn create_schema(schema_id: u64, name: &str) -> Op {
-        Op::CreateSchema {
+    fn create_schema(schema_id: u64, name: &str) -> Operation {
+        Operation::CreateSchema {
             schema_id,
             name: name.to_owned(),
         }
     }
 
-    fn create_table(schema_id: u64, table_id: u64, schema_name: &str, table_name: &str) -> Op {
-        Op::CreateTable {
+    fn create_table(
+        schema_id: u64,
+        table_id: u64,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Operation {
+        Operation::CreateTable {
             schema_id,
             table_id,
             schema_name: schema_name.to_owned(),
@@ -490,14 +579,14 @@ mod tests {
     fn data_plane_ops_serialize_in_ducklake_order() {
         let ops = [
             create_schema(1, "s1"),
-            Op::RegisterDataFile { table_id: 7 },
-            Op::RegisterDeleteFile { table_id: 8 },
-            Op::ExpireDataFile { table_id: 9 },
-            Op::ExpireDeleteFile { table_id: 9 },
-            Op::AlterTable { table_id: 3 },
-            Op::UpdateStats { table_id: 7 },
+            Operation::RegisterDataFile { table_id: 7 },
+            Operation::RegisterDeleteFile { table_id: 8 },
+            Operation::ExpireDataFile { table_id: 9 },
+            Operation::ExpireDeleteFile { table_id: 9 },
+            Operation::AlterTable { table_id: 3 },
+            Operation::UpdateStats { table_id: 7 },
         ];
-        let set = ChangeSet::from_ops(&ops);
+        let set = ChangeSet::from_operations(&ops);
         assert_eq!(
             set.to_changes_made(),
             r#"created_schema:"s1",inserted_into_table:7,deleted_from_table:8,altered_table:3,merge_adjacent:9,rewrite_delete:9"#
@@ -511,32 +600,34 @@ mod tests {
 
     #[test]
     fn stats_ops_emit_nothing_but_are_ops() {
-        let ops = [Op::UpdateStats { table_id: 7 }];
-        let set = ChangeSet::from_ops(&ops);
+        let ops = [Operation::UpdateStats { table_id: 7 }];
+        let set = ChangeSet::from_operations(&ops);
         assert_eq!(set.to_changes_made(), "");
         assert!(!ops[0].is_schema_changing());
         // An empty change set conflicts with nothing.
-        let drop = ChangeSet::from_ops(&[Op::DropTable { table_id: 7 }]);
+        let drop = ChangeSet::from_operations(&[Operation::DropTable { table_id: 7 }]);
         assert!(!conflicts(&set, &drop));
     }
 
     #[test]
     fn append_append_is_benign() {
-        let a = ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: 1 }]);
-        let b = ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: 1 }]);
+        let a = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        let b = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
         assert!(!conflicts(&a, &b));
         // Appends are also benign against compactions of the same table.
-        let c = ChangeSet::from_ops(&[Op::ExpireDataFile { table_id: 1 }]);
+        let c = ChangeSet::from_operations(&[Operation::ExpireDataFile { table_id: 1 }]);
         assert!(!conflicts(&a, &c));
     }
 
     #[test]
     fn the_conflict_matrix() {
-        let insert = |t| ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: t }]);
-        let delete = |t| ChangeSet::from_ops(&[Op::RegisterDeleteFile { table_id: t }]);
-        let alter = |t| ChangeSet::from_ops(&[Op::AlterTable { table_id: t }]);
-        let drop = |t| ChangeSet::from_ops(&[Op::DropTable { table_id: t }]);
-        let compact = |t| ChangeSet::from_ops(&[Op::ExpireDeleteFile { table_id: t }]);
+        let insert = |t| ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: t }]);
+        let delete =
+            |t| ChangeSet::from_operations(&[Operation::RegisterDeleteFile { table_id: t }]);
+        let alter = |t| ChangeSet::from_operations(&[Operation::AlterTable { table_id: t }]);
+        let drop = |t| ChangeSet::from_operations(&[Operation::DropTable { table_id: t }]);
+        let compact =
+            |t| ChangeSet::from_operations(&[Operation::ExpireDeleteFile { table_id: t }]);
 
         // Conflicting pairs.
         assert!(conflicts(&insert(1), &alter(1)));
@@ -563,9 +654,9 @@ mod tests {
     fn parsed_compaction_kinds_classify_as_compaction() {
         let theirs = ChangeSet::parse("compacted_table:1");
         assert!(!theirs.has_unknown);
-        let ours = ChangeSet::from_ops(&[Op::RegisterDeleteFile { table_id: 1 }]);
+        let ours = ChangeSet::from_operations(&[Operation::RegisterDeleteFile { table_id: 1 }]);
         assert!(conflicts(&ours, &theirs));
-        let benign = ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: 1 }]);
+        let benign = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
         assert!(!conflicts(&benign, &theirs));
     }
 
@@ -574,11 +665,11 @@ mod tests {
         let ops = [
             create_schema(1, "s1"),
             create_table(1, 2, "s1", "orders"),
-            Op::AlterTable { table_id: 3 },
-            Op::DropTable { table_id: 4 },
-            Op::DropSchema { schema_id: 5 },
+            Operation::AlterTable { table_id: 3 },
+            Operation::DropTable { table_id: 4 },
+            Operation::DropSchema { schema_id: 5 },
         ];
-        let set = ChangeSet::from_ops(&ops);
+        let set = ChangeSet::from_operations(&ops);
         let text = set.to_changes_made();
         assert_eq!(
             text,
@@ -591,11 +682,11 @@ mod tests {
         let ops = [
             create_schema(1, "s1"),
             create_table(1, 2, "s1", "orders"),
-            Op::AlterTable { table_id: 3 },
-            Op::DropTable { table_id: 4 },
-            Op::DropSchema { schema_id: 5 },
+            Operation::AlterTable { table_id: 3 },
+            Operation::DropTable { table_id: 4 },
+            Operation::DropSchema { schema_id: 5 },
         ];
-        let set = ChangeSet::from_ops(&ops);
+        let set = ChangeSet::from_operations(&ops);
         let text = set.to_changes_made();
         let parsed = ChangeSet::parse(&text);
         let expected = ChangeSet {
@@ -611,7 +702,7 @@ mod tests {
         // Names containing a comma, a dot, and an embedded quote must all
         // round-trip through the quoted grammar unchanged.
         let ops = [create_schema(1, "s,1"), create_table(2, 3, "a.b", r#"c"d"#)];
-        let set = ChangeSet::from_ops(&ops);
+        let set = ChangeSet::from_operations(&ops);
         let text = set.to_changes_made();
         assert_eq!(text, r#"created_schema:"s,1",created_table:"a.b"."c""d""#);
         let parsed = ChangeSet::parse(&text);
@@ -653,37 +744,37 @@ mod tests {
 
     #[test]
     fn disjoint_tables_are_benign() {
-        let ours = ChangeSet::from_ops(&[Op::AlterTable { table_id: 1 }]);
-        let theirs = ChangeSet::from_ops(&[Op::AlterTable { table_id: 2 }]);
+        let ours = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
+        let theirs = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 2 }]);
         assert!(!conflicts(&ours, &theirs));
     }
 
     #[test]
     fn overlapping_tables_conflict() {
-        let ours = ChangeSet::from_ops(&[Op::AlterTable { table_id: 1 }]);
-        let dropped = ChangeSet::from_ops(&[Op::DropTable { table_id: 1 }]);
+        let ours = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
+        let dropped = ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]);
         assert!(conflicts(&ours, &dropped));
         assert!(conflicts(&dropped, &ours));
     }
 
     #[test]
     fn schema_list_is_coarse_grained() {
-        let create = ChangeSet::from_ops(&[create_schema(1, "s1")]);
-        let drop = ChangeSet::from_ops(&[Op::DropSchema { schema_id: 9 }]);
+        let create = ChangeSet::from_operations(&[create_schema(1, "s1")]);
+        let drop = ChangeSet::from_operations(&[Operation::DropSchema { schema_id: 9 }]);
         assert!(conflicts(&create, &drop));
         // A table-only commit does not touch the schema list.
-        let alter = ChangeSet::from_ops(&[Op::AlterTable { table_id: 1 }]);
+        let alter = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
         assert!(!conflicts(&alter, &drop));
     }
 
     #[test]
     fn create_inside_dropped_schema_conflicts() {
-        let ours = ChangeSet::from_ops(&[create_table(3, 8, "s3", "t8")]);
-        let theirs = ChangeSet::from_ops(&[Op::DropSchema { schema_id: 3 }]);
+        let ours = ChangeSet::from_operations(&[create_table(3, 8, "s3", "t8")]);
+        let theirs = ChangeSet::from_operations(&[Operation::DropSchema { schema_id: 3 }]);
         assert!(conflicts(&ours, &theirs));
         assert!(conflicts(&theirs, &ours));
         // Creation in a surviving schema is benign.
-        let elsewhere = ChangeSet::from_ops(&[create_table(4, 9, "s4", "t9")]);
+        let elsewhere = ChangeSet::from_operations(&[create_table(4, 9, "s4", "t9")]);
         assert!(!conflicts(&elsewhere, &theirs));
     }
 
@@ -693,10 +784,10 @@ mod tests {
         // entries, so a parsed ChangeSet can never populate
         // created_table_schema_ids — the create-inside-dropped-schema
         // check is a from_ops-only capability for our own side.
-        let ours = ChangeSet::from_ops(&[create_table(3, 8, "s3", "t8")]);
+        let ours = ChangeSet::from_operations(&[create_table(3, 8, "s3", "t8")]);
         let parsed = ChangeSet::parse(&ours.to_changes_made());
         assert!(parsed.created_table_schema_ids.is_empty());
-        let theirs = ChangeSet::from_ops(&[Op::DropSchema { schema_id: 3 }]);
+        let theirs = ChangeSet::from_operations(&[Operation::DropSchema { schema_id: 3 }]);
         // The parsed side can no longer detect its own creation inside
         // the dropped schema by this mechanism; the closure re-run on
         // retry covers that risk instead (see the field's doc comment).
@@ -705,26 +796,71 @@ mod tests {
 
     #[test]
     fn fresh_created_tables_never_conflict_by_id() {
-        let a = ChangeSet::from_ops(&[create_table(1, 7, "s1", "t7")]);
-        let b = ChangeSet::from_ops(&[create_table(1, 7, "s1", "t7")]);
+        let a = ChangeSet::from_operations(&[create_table(1, 7, "s1", "t7")]);
+        let b = ChangeSet::from_operations(&[create_table(1, 7, "s1", "t7")]);
         // Same ids cannot happen for real (ids are allocated above head),
         // but creation is not a mutation of existing state either way.
         assert!(!conflicts(&a, &b));
     }
 
     #[test]
+    fn view_ops_serialize_and_round_trip() {
+        let ops = [
+            Operation::CreateView {
+                schema_id: 1,
+                view_id: 4,
+                schema_name: "s".into(),
+                view_name: "v".into(),
+            },
+            Operation::DropView { view_id: 5 },
+            Operation::AlterView { view_id: 6 },
+        ];
+        let set = ChangeSet::from_operations(&ops);
+        assert_eq!(
+            set.to_changes_made(),
+            r#"dropped_view:5,created_view:"s"."v",altered_view:6"#
+        );
+        assert_eq!(ChangeSet::parse(&set.to_changes_made()), {
+            let mut e = set.clone();
+            e.created_view_schema_ids.clear();
+            e.created_table_schema_ids.clear();
+            e
+        });
+        assert!(ops.iter().all(Operation::is_schema_changing));
+    }
+
+    #[test]
+    fn view_conflicts_classify_at_id_grain() {
+        let alter = ChangeSet::from_operations(&[Operation::AlterView { view_id: 9 }]);
+        let drop = ChangeSet::from_operations(&[Operation::DropView { view_id: 9 }]);
+        assert!(conflicts(&alter, &drop));
+        assert!(conflicts(&alter, &alter));
+        let other = ChangeSet::from_operations(&[Operation::AlterView { view_id: 8 }]);
+        assert!(!conflicts(&alter, &other));
+        // Creating a view inside a schema another commit dropped conflicts.
+        let create = ChangeSet::from_operations(&[Operation::CreateView {
+            schema_id: 3,
+            view_id: 7,
+            schema_name: "s".into(),
+            view_name: "v".into(),
+        }]);
+        let drop_schema = ChangeSet::from_operations(&[Operation::DropSchema { schema_id: 3 }]);
+        assert!(conflicts(&create, &drop_schema));
+    }
+
+    #[test]
     fn ddl_ops_are_schema_changing() {
         assert!(create_schema(0, "s").is_schema_changing());
-        assert!(Op::AlterTable { table_id: 0 }.is_schema_changing());
-        assert!(Op::DropTable { table_id: 0 }.is_schema_changing());
+        assert!(Operation::AlterTable { table_id: 0 }.is_schema_changing());
+        assert!(Operation::DropTable { table_id: 0 }.is_schema_changing());
     }
 
     #[test]
     fn data_plane_ops_are_not_schema_changing() {
-        assert!(!Op::RegisterDataFile { table_id: 0 }.is_schema_changing());
-        assert!(!Op::RegisterDeleteFile { table_id: 0 }.is_schema_changing());
-        assert!(!Op::ExpireDataFile { table_id: 0 }.is_schema_changing());
-        assert!(!Op::ExpireDeleteFile { table_id: 0 }.is_schema_changing());
-        assert!(!Op::UpdateStats { table_id: 0 }.is_schema_changing());
+        assert!(!Operation::RegisterDataFile { table_id: 0 }.is_schema_changing());
+        assert!(!Operation::RegisterDeleteFile { table_id: 0 }.is_schema_changing());
+        assert!(!Operation::ExpireDataFile { table_id: 0 }.is_schema_changing());
+        assert!(!Operation::ExpireDeleteFile { table_id: 0 }.is_schema_changing());
+        assert!(!Operation::UpdateStats { table_id: 0 }.is_schema_changing());
     }
 }

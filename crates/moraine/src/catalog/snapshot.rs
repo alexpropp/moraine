@@ -6,28 +6,40 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
-        SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats,
+        OptionScope, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
+        TableStats, ViewId, ViewInfo,
     },
-    store::{proto, read::EntityRecord},
+    store::{
+        proto::{
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, OptionScopeValue,
+            SchemaValue, SnapshotValue, TableColumnStatsValue, TableStatsValue, TableValue,
+            ViewValue,
+        },
+        read::EntityRecord,
+    },
 };
 
 /// An immutable catalog view at one snapshot.
 ///
 /// Reads issue no store I/O after the view is built — a `CatalogSnapshot`
-/// is a value, not a cursor.
-#[derive(Debug, Clone)]
+/// is a value, not a cursor. The default value is an empty view at
+/// snapshot 0.
+#[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
-    pub(crate) snap: proto::SnapshotValue,
-    pub(crate) schemas: BTreeMap<u64, proto::SchemaValue>,
-    pub(crate) tables: BTreeMap<u64, proto::TableValue>,
-    pub(crate) columns: BTreeMap<u64, BTreeMap<u64, proto::ColumnValue>>,
+    pub(crate) snap: SnapshotValue,
+    pub(crate) schemas: BTreeMap<u64, SchemaValue>,
+    pub(crate) tables: BTreeMap<u64, TableValue>,
+    pub(crate) views: BTreeMap<u64, ViewValue>,
+    pub(crate) columns: BTreeMap<u64, BTreeMap<u64, ColumnValue>>,
     pub(crate) schema_names: HashMap<String, u64>,
     pub(crate) table_names: HashMap<(u64, String), u64>,
-    pub(crate) data_files: BTreeMap<u64, BTreeMap<u64, proto::DataFileValue>>,
-    pub(crate) delete_files: BTreeMap<u64, BTreeMap<u64, proto::DeleteFileValue>>,
-    pub(crate) table_stats: BTreeMap<u64, proto::TableStatsValue>,
-    pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, proto::TableColumnStatsValue>>,
-    pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), proto::FileColumnStatsValue>>,
+    pub(crate) view_names: HashMap<(u64, String), u64>,
+    pub(crate) data_files: BTreeMap<u64, BTreeMap<u64, DataFileValue>>,
+    pub(crate) delete_files: BTreeMap<u64, BTreeMap<u64, DeleteFileValue>>,
+    pub(crate) table_stats: BTreeMap<u64, TableStatsValue>,
+    pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
+    pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
+    pub(crate) options: BTreeMap<(u64, u64), OptionScopeValue>,
 }
 
 impl CatalogSnapshot {
@@ -37,24 +49,16 @@ impl CatalogSnapshot {
     /// `begin_snapshot <= s` and it had not ended by `s` (`cur` records
     /// never have; `hist` records carry their end).
     pub(crate) fn build(
-        snap: proto::SnapshotValue,
+        snap: SnapshotValue,
         cur: Vec<EntityRecord>,
         hist: Vec<EntityRecord>,
         at: Option<u64>,
     ) -> Self {
         let mut view = Self {
             snap,
-            schemas: BTreeMap::new(),
-            tables: BTreeMap::new(),
-            columns: BTreeMap::new(),
-            schema_names: HashMap::new(),
-            table_names: HashMap::new(),
-            data_files: BTreeMap::new(),
-            delete_files: BTreeMap::new(),
-            table_stats: BTreeMap::new(),
-            table_column_stats: BTreeMap::new(),
-            file_column_stats: BTreeMap::new(),
+            ..Self::default()
         };
+
         let included = |begin: u64, end: Option<u64>| match at {
             None => end.is_none(),
             Some(s) => begin <= s && end.is_none_or(|e| e > s),
@@ -76,6 +80,9 @@ impl CatalogSnapshot {
                 EntityRecord::DeleteFile(d) if included(d.begin_snapshot, d.end_snapshot) => {
                     view.put_delete_file(d);
                 }
+                EntityRecord::View(v) if included(v.begin_snapshot, v.end_snapshot) => {
+                    view.put_view(v);
+                }
                 EntityRecord::FileColumnStats(fcs) => {
                     view.put_file_column_stats(fcs);
                 }
@@ -85,11 +92,19 @@ impl CatalogSnapshot {
                 EntityRecord::TableColumnStats(tcs) => {
                     view.put_table_column_stats(tcs);
                 }
+                EntityRecord::Option {
+                    scope_kind,
+                    scope_id,
+                    value,
+                } => {
+                    view.set_option_record((scope_kind, scope_id), value);
+                }
                 EntityRecord::Schema(_)
                 | EntityRecord::Table(_)
                 | EntityRecord::Column(_)
                 | EntityRecord::File(_)
-                | EntityRecord::DeleteFile(_) => {
+                | EntityRecord::DeleteFile(_)
+                | EntityRecord::View(_) => {
                     // Filtered out by version range
                 }
             }
@@ -174,7 +189,56 @@ impl CatalogSnapshot {
         infos
     }
 
-    pub(crate) fn put_schema(&mut self, value: proto::SchemaValue) {
+    /// The schema's live views, ordered by id.
+    #[must_use]
+    pub fn views_in(&self, schema: SchemaId) -> Vec<ViewInfo> {
+        self.views
+            .values()
+            .filter(|v| v.schema_id == schema.get())
+            .map(view_info)
+            .collect()
+    }
+
+    /// One view by name within a schema.
+    #[must_use]
+    pub fn view_by_name(&self, schema: SchemaId, name: &str) -> Option<ViewInfo> {
+        self.view_names
+            .get(&(schema.get(), name.to_owned()))
+            .and_then(|id| self.views.get(id))
+            .map(view_info)
+    }
+
+    /// One view by id.
+    #[must_use]
+    pub fn view_by_id(&self, id: ViewId) -> Option<ViewInfo> {
+        self.views.get(&id.get()).map(view_info)
+    }
+
+    /// A resolved option value: table falls back to its schema, then
+    /// global; schema falls back to global. Options are unversioned: a
+    /// time-traveled snapshot resolves current values.
+    #[must_use]
+    pub fn option(&self, scope: OptionScope, key: &str) -> Option<String> {
+        let mut candidates = vec![scope.key_components()];
+        match scope {
+            OptionScope::Table(t) => {
+                if let Some(table) = self.tables.get(&t.get()) {
+                    candidates
+                        .push(OptionScope::Schema(SchemaId::new(table.schema_id)).key_components());
+                }
+                candidates.push(OptionScope::Global.key_components());
+            }
+            OptionScope::Schema(_) => candidates.push(OptionScope::Global.key_components()),
+            OptionScope::Global => {}
+        }
+        candidates.into_iter().find_map(|c| {
+            self.options
+                .get(&c)
+                .and_then(|v| v.options.get(key).cloned())
+        })
+    }
+
+    pub(crate) fn put_schema(&mut self, value: SchemaValue) {
         if let Some(old) = self.schemas.get(&value.schema_id) {
             self.schema_names.remove(&old.schema_name);
         }
@@ -187,9 +251,10 @@ impl CatalogSnapshot {
         if let Some(old) = self.schemas.remove(&schema_id) {
             self.schema_names.remove(&old.schema_name);
         }
+        self.remove_option_record(OptionScope::Schema(SchemaId::new(schema_id)).key_components());
     }
 
-    pub(crate) fn put_table(&mut self, value: proto::TableValue) {
+    pub(crate) fn put_table(&mut self, value: TableValue) {
         if let Some(old) = self.tables.get(&value.table_id) {
             self.table_names
                 .remove(&(old.schema_id, old.table_name.clone()));
@@ -209,11 +274,28 @@ impl CatalogSnapshot {
         self.delete_files.remove(&table_id);
         self.table_stats.remove(&table_id);
         self.table_column_stats.remove(&table_id);
+        self.remove_option_record(OptionScope::Table(TableId::new(table_id)).key_components());
         // file_column_stats is kept: per-file stats outlive the file's
         // live version until its history is garbage-collected.
     }
 
-    pub(crate) fn put_column(&mut self, value: proto::ColumnValue) {
+    pub(crate) fn put_view(&mut self, value: ViewValue) {
+        if let Some(old) = self.views.get(&value.view_id) {
+            self.view_names
+                .remove(&(old.schema_id, old.view_name.clone()));
+        }
+        self.view_names
+            .insert((value.schema_id, value.view_name.clone()), value.view_id);
+        self.views.insert(value.view_id, value);
+    }
+    pub(crate) fn delete_view(&mut self, view_id: u64) {
+        if let Some(old) = self.views.remove(&view_id) {
+            self.view_names
+                .remove(&(old.schema_id, old.view_name.clone()));
+        }
+    }
+
+    pub(crate) fn put_column(&mut self, value: ColumnValue) {
         self.columns
             .entry(value.table_id)
             .or_default()
@@ -267,7 +349,7 @@ impl CatalogSnapshot {
             .map(column_stats_from_proto)
     }
 
-    pub(crate) fn put_data_file(&mut self, value: proto::DataFileValue) {
+    pub(crate) fn put_data_file(&mut self, value: DataFileValue) {
         self.data_files
             .entry(value.table_id)
             .or_default()
@@ -280,7 +362,7 @@ impl CatalogSnapshot {
         }
     }
 
-    pub(crate) fn put_delete_file(&mut self, value: proto::DeleteFileValue) {
+    pub(crate) fn put_delete_file(&mut self, value: DeleteFileValue) {
         self.delete_files
             .entry(value.table_id)
             .or_default()
@@ -293,33 +375,41 @@ impl CatalogSnapshot {
         }
     }
 
-    pub(crate) fn put_table_stats(&mut self, value: proto::TableStatsValue) {
+    pub(crate) fn put_table_stats(&mut self, value: TableStatsValue) {
         self.table_stats.insert(value.table_id, value);
     }
 
-    pub(crate) fn put_table_column_stats(&mut self, value: proto::TableColumnStatsValue) {
+    pub(crate) fn put_table_column_stats(&mut self, value: TableColumnStatsValue) {
         self.table_column_stats
             .entry(value.table_id)
             .or_default()
             .insert(value.column_id, value);
     }
 
-    pub(crate) fn put_file_column_stats(&mut self, value: proto::FileColumnStatsValue) {
+    pub(crate) fn put_file_column_stats(&mut self, value: FileColumnStatsValue) {
         self.file_column_stats
             .entry(value.table_id)
             .or_default()
             .insert((value.data_file_id, value.column_id), value);
     }
+
+    pub(crate) fn set_option_record(&mut self, components: (u64, u64), value: OptionScopeValue) {
+        self.options.insert(components, value);
+    }
+
+    pub(crate) fn remove_option_record(&mut self, components: (u64, u64)) {
+        self.options.remove(&components);
+    }
 }
 
-fn schema_info(value: &proto::SchemaValue) -> SchemaInfo {
+fn schema_info(value: &SchemaValue) -> SchemaInfo {
     SchemaInfo {
         id: SchemaId::new(value.schema_id),
         name: value.schema_name.clone(),
     }
 }
 
-fn table_info(value: &proto::TableValue) -> TableInfo {
+fn table_info(value: &TableValue) -> TableInfo {
     TableInfo {
         id: TableId::new(value.table_id),
         schema_id: SchemaId::new(value.schema_id),
@@ -327,7 +417,17 @@ fn table_info(value: &proto::TableValue) -> TableInfo {
     }
 }
 
-fn data_file_info(value: &proto::DataFileValue) -> DataFileInfo {
+fn view_info(value: &ViewValue) -> ViewInfo {
+    ViewInfo {
+        id: ViewId::new(value.view_id),
+        schema_id: SchemaId::new(value.schema_id),
+        name: value.view_name.clone(),
+        dialect: value.dialect.clone(),
+        sql: value.sql.clone(),
+    }
+}
+
+fn data_file_info(value: &DataFileValue) -> DataFileInfo {
     DataFileInfo {
         id: DataFileId::new(value.data_file_id),
         path: value.path.clone(),
@@ -340,7 +440,7 @@ fn data_file_info(value: &proto::DataFileValue) -> DataFileInfo {
     }
 }
 
-fn delete_file_info(value: &proto::DeleteFileValue) -> DeleteFileInfo {
+fn delete_file_info(value: &DeleteFileValue) -> DeleteFileInfo {
     DeleteFileInfo {
         id: DeleteFileId::new(value.delete_file_id),
         data_file_id: DataFileId::new(value.data_file_id),
@@ -353,7 +453,7 @@ fn delete_file_info(value: &proto::DeleteFileValue) -> DeleteFileInfo {
     }
 }
 
-fn table_stats_from_proto(value: &proto::TableStatsValue) -> TableStats {
+fn table_stats_from_proto(value: &TableStatsValue) -> TableStats {
     TableStats {
         record_count: value.record_count,
         file_size_bytes: value.file_size_bytes,
@@ -361,7 +461,7 @@ fn table_stats_from_proto(value: &proto::TableStatsValue) -> TableStats {
     }
 }
 
-fn column_stats_from_proto(value: &proto::TableColumnStatsValue) -> ColumnStats {
+fn column_stats_from_proto(value: &TableColumnStatsValue) -> ColumnStats {
     ColumnStats {
         contains_null: value.contains_null,
         contains_nan: value.contains_nan,
@@ -376,8 +476,8 @@ mod tests {
     use super::*;
     use crate::catalog::types::DataFileId;
 
-    fn snap(id: u64) -> proto::SnapshotValue {
-        proto::SnapshotValue {
+    fn snap(id: u64) -> SnapshotValue {
+        SnapshotValue {
             snapshot_id: id,
             snapshot_time_micros: 1,
             schema_version: 0,
@@ -391,8 +491,8 @@ mod tests {
         }
     }
 
-    fn schema_rec(id: u64, name: &str, begin: u64, end: Option<u64>) -> proto::SchemaValue {
-        proto::SchemaValue {
+    fn schema_rec(id: u64, name: &str, begin: u64, end: Option<u64>) -> SchemaValue {
+        SchemaValue {
             schema_id: id,
             schema_uuid: format!("uuid-{id}"),
             begin_snapshot: begin,
@@ -403,8 +503,8 @@ mod tests {
         }
     }
 
-    fn table_rec(id: u64, schema: u64, name: &str, begin: u64) -> proto::TableValue {
-        proto::TableValue {
+    fn table_rec(id: u64, schema: u64, name: &str, begin: u64) -> TableValue {
+        TableValue {
             table_id: id,
             table_uuid: format!("uuid-t{id}"),
             begin_snapshot: begin,
@@ -417,8 +517,8 @@ mod tests {
         }
     }
 
-    fn column_rec(table: u64, id: u64, name: &str, order: u64, begin: u64) -> proto::ColumnValue {
-        proto::ColumnValue {
+    fn column_rec(table: u64, id: u64, name: &str, order: u64, begin: u64) -> ColumnValue {
+        ColumnValue {
             column_id: id,
             begin_snapshot: begin,
             end_snapshot: None,
@@ -436,14 +536,8 @@ mod tests {
         }
     }
 
-    fn file_rec(
-        table: u64,
-        id: u64,
-        rows: u64,
-        begin: u64,
-        end: Option<u64>,
-    ) -> proto::DataFileValue {
-        proto::DataFileValue {
+    fn file_rec(table: u64, id: u64, rows: u64, begin: u64, end: Option<u64>) -> DataFileValue {
+        DataFileValue {
             data_file_id: id,
             table_id: table,
             begin_snapshot: begin,
@@ -464,8 +558,22 @@ mod tests {
         }
     }
 
-    fn tstat_rec(table: u64, count: u64, next_row: u64) -> proto::TableStatsValue {
-        proto::TableStatsValue {
+    fn view_rec(id: u64, schema: u64, name: &str, begin: u64, end: Option<u64>) -> ViewValue {
+        ViewValue {
+            view_id: id,
+            view_uuid: format!("uuid-v{id}"),
+            begin_snapshot: begin,
+            end_snapshot: end,
+            schema_id: schema,
+            view_name: name.into(),
+            dialect: "duckdb".into(),
+            sql: format!("select * from {name}"),
+            column_aliases: None,
+        }
+    }
+
+    fn tstat_rec(table: u64, count: u64, next_row: u64) -> TableStatsValue {
+        TableStatsValue {
             table_id: table,
             record_count: count,
             next_row_id: next_row,
@@ -520,7 +628,7 @@ mod tests {
         // Column allocation now reads the table's persisted counter, not
         // `hist` — so `build` at head must not resurrect a dropped column
         // (or any other purely-historical record) into the live view.
-        let hist = vec![EntityRecord::Column(proto::ColumnValue {
+        let hist = vec![EntityRecord::Column(ColumnValue {
             end_snapshot: Some(3),
             ..column_rec(1, 5, "gone", 0, 1)
         })];
@@ -584,7 +692,7 @@ mod tests {
         );
 
         view.put_table_stats(tstat_rec(1, 7, 7));
-        view.put_table_column_stats(proto::TableColumnStatsValue {
+        view.put_table_column_stats(TableColumnStatsValue {
             table_id: 1,
             column_id: 2,
             contains_null: Some(true),
@@ -601,7 +709,7 @@ mod tests {
         assert_eq!(stats.max_value.as_deref(), Some("10"));
 
         view.put_data_file(file_rec(1, 3, 10, 1, None));
-        view.put_delete_file(proto::DeleteFileValue {
+        view.put_delete_file(DeleteFileValue {
             delete_file_id: 4,
             table_id: 1,
             begin_snapshot: 1,
@@ -621,7 +729,7 @@ mod tests {
             DataFileId::new(3)
         );
 
-        view.put_file_column_stats(proto::FileColumnStatsValue {
+        view.put_file_column_stats(FileColumnStatsValue {
             data_file_id: 3,
             table_id: 1,
             column_id: 2,
@@ -650,6 +758,65 @@ mod tests {
             view.file_column_stats
                 .get(&1)
                 .is_some_and(|cols| cols.contains_key(&(3, 2)))
+        );
+    }
+
+    #[test]
+    fn views_are_versioned_and_indexed() {
+        let cur = vec![EntityRecord::View(view_rec(3, 0, "v2", 4, None))];
+        let hist = vec![EntityRecord::View(view_rec(3, 0, "v1", 1, Some(4)))];
+        let head = CatalogSnapshot::build(snap(5), cur.clone(), vec![], None);
+        assert_eq!(
+            head.view_by_name(SchemaId::new(0), "v2").unwrap().id,
+            ViewId::new(3)
+        );
+        assert!(head.view_by_name(SchemaId::new(0), "v1").is_none());
+        let past = CatalogSnapshot::build(snap(2), cur, hist, Some(2));
+        assert_eq!(past.view_by_id(ViewId::new(3)).unwrap().name, "v1");
+    }
+
+    #[test]
+    fn option_resolution_cascades() {
+        let mut view = CatalogSnapshot::build(snap(1), vec![], vec![], None);
+        view.put_schema(schema_rec(0, "s", 1, None));
+        view.put_table(table_rec(1, 0, "t", 1));
+        let mk = |pairs: &[(&str, &str)]| OptionScopeValue {
+            options: pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+        };
+        view.set_option_record((0, 0), mk(&[("a", "global"), ("b", "global")]));
+        view.set_option_record((1, 0), mk(&[("a", "schema")]));
+        view.set_option_record((2, 1), mk(&[("c", "table")]));
+        let t = TableId::new(1);
+        assert_eq!(
+            view.option(OptionScope::Table(t), "c").as_deref(),
+            Some("table")
+        );
+        assert_eq!(
+            view.option(OptionScope::Table(t), "a").as_deref(),
+            Some("schema")
+        );
+        assert_eq!(
+            view.option(OptionScope::Table(t), "b").as_deref(),
+            Some("global")
+        );
+        assert_eq!(
+            view.option(OptionScope::Schema(SchemaId::new(0)), "a")
+                .as_deref(),
+            Some("schema")
+        );
+        assert_eq!(
+            view.option(OptionScope::Global, "a").as_deref(),
+            Some("global")
+        );
+        assert!(view.option(OptionScope::Global, "zz").is_none());
+
+        view.delete_table(1);
+        assert!(
+            !view.options.contains_key(&(2, 1)),
+            "table options die with the table"
         );
     }
 }

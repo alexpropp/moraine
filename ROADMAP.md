@@ -6,7 +6,7 @@
 - [x] RFC 0004: commit/transaction protocol
 - [x] `store`: key layout + codecs (proptest roundtrips)
 - [x] `catalog`: snapshots, schemas, tables, data-file metadata
-- [x] `txn`: atomic commit with conflict detection
+- [x] `transaction`: atomic commit with conflict detection
 - [x] First runnable example in `crates/moraine/examples/` once the API exists
 
 ### DuckDB extension loads
@@ -35,7 +35,7 @@ the keyspace (RFC 0002) and is validated against real DuckLake SQL in the
 e2e suite before it is checked off.
 
 ### Catalog & schema
-- [ ] Hierarchy: schemas, tables, views (`schema`, `table`, `view`,
+- [x] Hierarchy: schemas, tables, views (`schema`, `table`, `view`,
   `column`)
 - [ ] Full schema evolution: add / drop / rename / reorder columns, type
   promotion, schema versioning (`schema_versions`) (RFC 0012)
@@ -70,4 +70,4 @@ e2e suite before it is checked off.
   (RFC 0007; `files_scheduled_for_deletion`)
 - [ ] Data-file encryption (RFC 0014)
 - [ ] Table/column tags and catalog options (`tag`, `column_tag`,
-  `metadata`)
+  `metadata`) (options done; tags pending a keyspace decision)

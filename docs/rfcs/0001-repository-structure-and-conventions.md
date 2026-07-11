@@ -86,7 +86,7 @@ src/
 ├── error.rs          # thiserror-based Error enum + crate Result alias
 ├── catalog.rs        # DuckLake domain: snapshots, schemas, tables, data-file metadata
 ├── store.rs          # SlateDB layer: key layout, value codec
-└── txn.rs            # commit protocol: catalog transaction → atomic SlateDB write
+└── transaction.rs            # commit protocol: catalog transaction → atomic SlateDB write
 ```
 
 - **Layering:** `catalog` never touches SlateDB directly; `store` knows nothing about DuckLake semantics. The small API between them keeps catalog logic testable against an in-memory store and concentrates key-encoding decisions in one reviewable place.

@@ -9,7 +9,7 @@ catalog, reads it, and commits changes to it. This is the third
 expensive-to-reverse decision the project requires an RFC for (key layout —
 RFC 0002/0005; commit protocol — RFC 0004; public API shape — here). The
 surface is three types — `Catalog` (the handle), `CatalogSnapshot` (an
-immutable materialized read view), and `Txn` (the mutation handle passed to a
+immutable materialized read view), and `Transaction` (the mutation handle passed to a
 commit closure) — over an error taxonomy with one variant per failure domain.
 Writes go through a closure-with-retry model so the RFC 0002 single-`WriteBatch`
 atomicity invariant and conflict-retry loop live in the core, not duplicated in
@@ -21,7 +21,7 @@ semantics.
 ## Goals
 
 - One read API, usable both standalone (`catalog.snapshot()`) and inside a
-  commit (the `Txn` handed to the closure exposes the same accessors). A host
+  commit (the `Transaction` handed to the closure exposes the same accessors). A host
   learns the accessors once.
 - The atomicity invariant (RFC 0002: one catalog commit is exactly one SlateDB
   `WriteBatch`) and the conflict-retry loop are the core's responsibility.
@@ -30,7 +30,7 @@ semantics.
   surface
 - The `prost`-generated value types (RFC 0002) stay private to `store`.
 - Every DuckLake v1.0 catalog mutation the entities in RFC 0002 imply has a
-  named, DuckLake-shaped operation on `Txn`. The version and `cur`↔`hist`
+  named, DuckLake-shaped operation on `Transaction`. The version and `cur`↔`hist`
   bookkeeping is internal.
 - Errors are matchable per failure domain, so the DuckDB bridge maps each to a
   DuckDB error code without parsing strings.
@@ -69,7 +69,7 @@ types.
 ### Types and layering
 
 Three public types map onto the existing private modules (`catalog`, `store`,
-`txn`). `store` stays entirely private; `lib.rs` re-exports the public types
+`transaction`). `store` stays entirely private; `lib.rs` re-exports the public types
 alongside `Error`/`Result`.
 
 - **`Catalog`** — the handle. Owns the `slatedb::Db` (private field).
@@ -79,11 +79,11 @@ alongside `Error`/`Result`.
   scanning `cur` (or `cur` + the relevant `hist` ranges, for time travel) per
   RFC 0002. All accessors are in-memory; after construction it never touches
   the store. Lives in `catalog`.
-- **`Txn`** — the mutation handle passed to the commit closure. It `Deref`s to
+- **`Transaction`** — the mutation handle passed to the commit closure. It `Deref`s to
   `CatalogSnapshot`, so every read accessor is available inside a commit for
   name→id resolution and validation, and adds the mutators. The commit
   machinery (retry, `WriteBatch` assembly, `cur`↔`hist` bookkeeping) lives in
-  `txn`; `Txn` is its public face.
+  `transaction`; `Transaction` is its public face.
 
 ### Front door
 
@@ -137,10 +137,10 @@ value, not a cursor.
 ### Writes: closure-with-retry
 
 ```rust
-let new_snapshot: SnapshotId = catalog.commit(|txn| {
-    let s = txn.create_schema("sales")?;
-    let t = txn.create_table(s, "orders", columns)?;
-    txn.register_data_file(t, data_file)?;
+let new_snapshot: SnapshotId = catalog.commit(|tx| {
+    let s = tx.create_schema("sales")?;
+    let t = tx.create_table(s, "orders", columns)?;
+    tx.register_data_file(t, data_file)?;
     Ok(())
 }).await?;
 ```
@@ -153,7 +153,7 @@ the snapshot and re-running the closure — up to a bounded budget. On a logical
 error it aborts immediately.
 
 Because the closure may run more than once, it must be pure and idempotent:
-its only effects are the `Txn` mutators it calls and the value it returns.
+its only effects are the `Transaction` mutators it calls and the value it returns.
 This is documented on `commit` and is the single most important contract of
 the API. The re-run is not merely permitted, it is load-bearing: RFC 0004's
 benign-race retry re-runs the closure against the fresh snapshot precisely
@@ -162,7 +162,7 @@ re-validated against the state that won the race — a mechanical re-stage
 without the closure would commit duplicate names. Two Rust-shape
 consequences follow and are part of the contract, not incidental: the
 closure is **`Fn`, not `FnOnce`** (it cannot consume captured values — move
-clones in, or stage owned data on the `Txn`), and it is **synchronous** (no
+clones in, or stage owned data on the `Transaction`), and it is **synchronous** (no
 I/O of its own; name→id resolution and staging run against the in-memory
 snapshot, and anything slow — writing Parquet, say — happens *before*
 `commit`, per the RFC 0005 data-before-metadata order). Snapshot allocation
@@ -215,7 +215,7 @@ field evolution stay an internal change instead of a public breaking one.
 
 ### Operation enumeration
 
-Every mutator is a method on `Txn`. Operations read as DuckLake catalog verbs,
+Every mutator is a method on `Transaction`. Operations read as DuckLake catalog verbs,
 not as low-level "put entity version" primitives; the `cur`↔`hist` version
 bookkeeping of RFC 0002 is internal to each. Grounded in DuckLake v1.0
 semantics and the entities RFC 0002 maps:
@@ -265,8 +265,8 @@ Per RFC 0001:
 
 ## Alternatives considered
 
-- **Explicit `begin`/`commit` transactions** (`let mut txn =
-  catalog.begin().await?; …; txn.commit().await?`): gives the host full
+- **Explicit `begin`/`commit` transactions** (`let mut tx =
+  catalog.begin().await?; …; tx.commit().await?`): gives the host full
   control of the retry loop, but pushes retry boilerplate to every call site —
   including inside the DuckDB bridge, exactly where "thin by policy" forbids
   it. Rejected: the conflict-retry loop and the atomicity invariant belong in
@@ -275,7 +275,7 @@ Per RFC 0001:
 - **Build-a-changeset, then `apply`** (host constructs an inspectable data
   value describing all mutations, then `catalog.apply(changeset).await?`):
   maximally decoupled and testable, but pushes read and name→id resolution
-  onto the host and reads least like DuckLake DDL/DML. Rejected: the `Txn`
+  onto the host and reads least like DuckLake DDL/DML. Rejected: the `Transaction`
   closure already gives an inspectable, testable unit while keeping resolution
   in the core where the in-memory snapshot lives.
 

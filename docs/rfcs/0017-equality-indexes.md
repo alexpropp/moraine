@@ -93,7 +93,7 @@ flag, and `begin_snapshot`. The *definition* is temporally versioned like any
 entity — time travel reconstructs which indexes existed at snapshot `S` —
 even though entries (below) are not.
 
-Verbs on `Txn`:
+Verbs on `Transaction`:
 
 | Verb | Effect |
 |---|---|

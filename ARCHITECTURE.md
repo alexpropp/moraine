@@ -65,11 +65,11 @@ lib.rs      # crate docs + re-exports only; no logic
 error.rs    # one thiserror Error enum, one variant per failure domain
 catalog.rs  # DuckLake domain: snapshots, schemas, tables, data-file metadata
 store.rs    # SlateDB layer: key layout + value codec
-txn.rs      # commit protocol: catalog transaction → one atomic SlateDB write
+transaction.rs      # commit protocol: catalog transaction → one atomic SlateDB write
 ```
 
 The load-bearing rule: **`catalog` never touches SlateDB directly; `store`
-knows nothing about DuckLake semantics; `txn` bridges them.** This keeps
+knows nothing about DuckLake semantics; `tx` bridges them.** This keeps
 catalog logic testable against an in-memory store and concentrates every
 key-encoding decision in one reviewable place.
 
@@ -81,7 +81,7 @@ types over that error taxonomy — SlateDB never appears in a public signature:
 - **`CatalogSnapshot`** — an immutable, materialized read view. Built by
   scanning live state once, then answered entirely in memory — a value, not a
   cursor.
-- **`Txn`** — the mutation handle passed to a commit closure. `Deref`s to
+- **`Transaction`** — the mutation handle passed to a commit closure. `Deref`s to
   `CatalogSnapshot` (reads available inside a commit) and adds DuckLake-shaped
   mutators (`create_table`, `register_data_file`, …).
 
@@ -90,10 +90,10 @@ atomicity invariant and the conflict-retry loop live in the core — never
 duplicated in a host:
 
 ```rust
-let new_snapshot = catalog.commit(|txn| {
-    let s = txn.create_schema("sales")?;
-    let t = txn.create_table(s, "orders", columns)?;
-    txn.register_data_file(t, data_file)?;
+let new_snapshot = catalog.commit(|tx| {
+    let s = tx.create_schema("sales")?;
+    let t = tx.create_table(s, "orders", columns)?;
+    tx.register_data_file(t, data_file)?;
     Ok(())
 }).await?;
 ```

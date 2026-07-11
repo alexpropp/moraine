@@ -15,14 +15,18 @@ use crate::{
         open::open_store,
         proto, read, value,
     },
-    txn::{
-        ops::{ChangeSet, Op},
-        verbs::Txn,
+    transaction::{
+        operations::{ChangeSet, Operation},
+        verbs::Transaction,
     },
 };
 
 /// Structural layout version this binary reads and writes.
 pub(crate) const FORMAT_VERSION: u64 = 1;
+/// Bounded internal retries before a benign race is reported as a
+/// conflict. The attempt count mirrors the composing client's default
+/// retry count; backoff and jitter are deliberately not implemented yet.
+pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 /// Current time in microseconds since the Unix epoch. Clamped, never
 /// panicking: a clock before the epoch stamps 0.
@@ -42,13 +46,13 @@ fn durable() -> WriteOptions {
 /// Refuses a store this binary must not touch: mid-migration, or a
 /// format newer/older than it understands. `None` format means the store
 /// is empty and needs bootstrap.
-async fn validate_format(txn: &DbTransaction) -> Result<Option<proto::FormatValue>> {
-    if read::read_migration(txn).await?.is_some() {
+async fn validate_format(tx: &DbTransaction) -> Result<Option<proto::FormatValue>> {
+    if read::read_migration(tx).await?.is_some() {
         return Err(Error::Corruption(
             "store is mid-migration; refusing to open".to_string(),
         ));
     }
-    match read::read_format(txn).await? {
+    match read::read_format(tx).await? {
         Some(format) if format.format_version == FORMAT_VERSION => Ok(Some(format)),
         Some(format) => Err(Error::Corruption(format!(
             "store format {} is not the supported format {FORMAT_VERSION}",
@@ -58,10 +62,10 @@ async fn validate_format(txn: &DbTransaction) -> Result<Option<proto::FormatValu
     }
 }
 
-/// Stages the initial state of an empty store into `txn`: format stamp,
+/// Stages the initial state of an empty store into `tx`: format stamp,
 /// snapshot 0 (empty catalog, counters at zero), and head pointer.
-fn stage_bootstrap(txn: &DbTransaction) -> Result<()> {
-    let stage = |key: Key, bytes: Vec<u8>| txn.put(key.encode(), bytes).map_err(Error::from);
+fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
+    let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     stage(
         Key::Sys(SysKey::Format),
         value::encode_value(&proto::FormatValue {
@@ -95,35 +99,35 @@ fn stage_bootstrap(txn: &DbTransaction) -> Result<()> {
 /// double-initializing. Every exit that does not commit rolls back.
 pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<Db> {
     let db = open_store(path, object_store).await?;
-    let txn = db
+    let tx = db
         .begin(IsolationLevel::Snapshot)
         .await
         .map_err(Error::from)?;
-    match validate_format(&txn).await {
+    match validate_format(&tx).await {
         Ok(Some(_)) => {
-            txn.rollback();
+            tx.rollback();
             return Ok(db);
         }
         Ok(None) => {}
         Err(err) => {
-            txn.rollback();
+            tx.rollback();
             return Err(err);
         }
     }
-    if let Err(err) = stage_bootstrap(&txn) {
-        txn.rollback();
+    if let Err(err) = stage_bootstrap(&tx) {
+        tx.rollback();
         return Err(err);
     }
-    match txn.commit_with_options(&durable()).await {
+    match tx.commit_with_options(&durable()).await {
         Ok(_) => Ok(db),
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
-            let txn = db
+            let tx = db
                 .begin(IsolationLevel::Snapshot)
                 .await
                 .map_err(Error::from)?;
-            let validated = validate_format(&txn).await;
-            txn.rollback();
+            let validated = validate_format(&tx).await;
+            tx.rollback();
             if validated?.is_some() {
                 Ok(db)
             } else {
@@ -140,8 +144,8 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
 /// and any staged writes share one read point. `at: None` reads the head
 /// (`cur` only); `at: Some(s)` also scans `hist` to reconstruct the
 /// entities live at `s`.
-pub(crate) async fn materialize(txn: &DbTransaction, at: Option<u64>) -> Result<CatalogSnapshot> {
-    let head = read::read_head(txn)
+pub(crate) async fn materialize(tx: &DbTransaction, at: Option<u64>) -> Result<CatalogSnapshot> {
+    let head = read::read_head(tx)
         .await?
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
         .snapshot_id;
@@ -152,12 +156,12 @@ pub(crate) async fn materialize(txn: &DbTransaction, at: Option<u64>) -> Result<
         Some(s) => s,
         None => head,
     };
-    let snap = read::read_snapshot(txn, target)
+    let snap = read::read_snapshot(tx, target)
         .await?
         .ok_or_else(|| Error::Corruption(format!("snapshot record {target} missing")))?;
-    let cur = read::scan_cur_entities(txn).await?;
+    let cur = read::scan_cur_entities(tx).await?;
     let hist = match at {
-        Some(_) => read::scan_hist_entities(txn).await?,
+        Some(_) => read::scan_hist_entities(tx).await?,
         None => Vec::new(),
     };
     Ok(CatalogSnapshot::build(snap, cur, hist, at.map(|_| target)))
@@ -253,6 +257,43 @@ fn diff_tables(
                 end_snapshot: Some(new_snapshot),
                 ..b.clone()
             },
+        );
+    }
+}
+
+fn diff_views(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    let view_ids = base.views.keys().chain(state.views.keys());
+    for &view_id in view_ids.collect::<std::collections::BTreeSet<_>>() {
+        stage_transition(
+            writes,
+            EntityKey::View { view_id },
+            base.views.get(&view_id),
+            state.views.get(&view_id),
+            new_snapshot,
+            |b| proto::ViewValue {
+                end_snapshot: Some(new_snapshot),
+                ..b.clone()
+            },
+        );
+    }
+}
+
+fn diff_options(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
+    let scopes = base.options.keys().chain(state.options.keys());
+    for &(scope_kind, scope_id) in scopes.collect::<std::collections::BTreeSet<_>>() {
+        stage_overwrite(
+            writes,
+            EntityKey::Option {
+                scope_kind,
+                scope_id,
+            },
+            base.options.get(&(scope_kind, scope_id)),
+            state.options.get(&(scope_kind, scope_id)),
         );
     }
 }
@@ -464,19 +505,16 @@ pub(crate) fn diff_writes(
     let mut writes = Vec::new();
     diff_schemas(&mut writes, base, state, new_snapshot);
     diff_tables(&mut writes, base, state, new_snapshot);
+    diff_views(&mut writes, base, state, new_snapshot);
     diff_columns(&mut writes, base, state, new_snapshot);
     diff_data_files(&mut writes, base, state, new_snapshot);
     diff_delete_files(&mut writes, base, state, new_snapshot);
     diff_table_stats(&mut writes, base, state);
     diff_table_column_stats(&mut writes, base, state);
     diff_file_column_stats(&mut writes, base, state);
+    diff_options(&mut writes, base, state);
     writes
 }
-
-/// Bounded internal retries before a benign race is reported as a
-/// conflict. The attempt count mirrors the composing client's default
-/// retry count; backoff and jitter are deliberately not implemented yet.
-pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 /// The result of one commit attempt.
 enum CommitOutcome {
@@ -495,36 +533,80 @@ enum CommitOutcome {
 /// exit that does not reach the final commit rolls the transaction back.
 async fn attempt_commit<F>(db: &Db, f: &F) -> Result<CommitOutcome>
 where
-    F: Fn(&mut Txn) -> Result<()>,
+    F: Fn(&mut Transaction) -> Result<()>,
 {
-    let dbtxn = db
+    let db_tx = db
         .begin(IsolationLevel::Snapshot)
         .await
         .map_err(Error::from)?;
-    let base = match materialize(&dbtxn, None).await {
-        Ok(base) => base,
-        Err(err) => {
-            dbtxn.rollback();
-            return Err(err);
+
+    match prepare_and_stage(&db_tx, f).await {
+        Ok(Prepared::Nothing { head }) => {
+            db_tx.rollback();
+            Ok(CommitOutcome::Committed(SnapshotId::new(head)))
         }
-    };
+        Ok(Prepared::Staged {
+            ours,
+            head_before,
+            commits,
+        }) => finish_commit(db_tx, ours, head_before, commits).await,
+        Err(err) => {
+            db_tx.rollback();
+            Err(err)
+        }
+    }
+}
+
+/// What one attempt staged onto its transaction.
+enum Prepared {
+    /// The closure changed nothing; the head is unchanged.
+    Nothing {
+        /// The head snapshot id the attempt read.
+        head: u64,
+    },
+    /// Writes are staged and ready to commit.
+    Staged {
+        /// This attempt's change set, empty for an options-only commit.
+        ours: Box<ChangeSet>,
+        /// The head snapshot id the attempt's premise was read at.
+        head_before: u64,
+        /// The snapshot id a successful commit reports.
+        commits: u64,
+    },
+}
+
+/// Materializes, runs the closure, and stages the resulting writes.
+/// Options-only commits stage no snapshot record and no head advance.
+async fn prepare_and_stage<F>(db_tx: &DbTransaction, f: &F) -> Result<Prepared>
+where
+    F: Fn(&mut Transaction) -> Result<()>,
+{
+    let base = materialize(db_tx, None).await?;
     let head = base.snap.snapshot_id;
     let new_id = head + 1;
 
-    let mut txn = Txn::new(base.clone(), new_id);
-    if let Err(err) = f(&mut txn) {
-        dbtxn.rollback();
-        return Err(err);
-    }
-    let (ops, state, next_catalog_id, next_file_id) = txn.into_parts();
-    if ops.is_empty() {
-        dbtxn.rollback();
-        return Ok(CommitOutcome::Committed(SnapshotId::new(head)));
+    let mut tx = Transaction::new(base.clone(), new_id);
+    f(&mut tx)?;
+    let (operations, state, next_catalog_id, next_file_id) = tx.into_parts();
+
+    if operations.is_empty() {
+        let mut writes = Vec::new();
+        diff_options(&mut writes, &base, &state);
+        if writes.is_empty() {
+            return Ok(Prepared::Nothing { head });
+        }
+        stage_writes(db_tx, writes)?;
+        return Ok(Prepared::Staged {
+            ours: Box::default(),
+            head_before: head,
+            commits: head,
+        });
     }
 
     let mut writes = diff_writes(&base, &state, new_id);
-    let schema_changed = ops.iter().any(Op::is_schema_changing);
-    let ours = ChangeSet::from_ops(&ops);
+    let schema_changed = operations.iter().any(Operation::is_schema_changing);
+    let ours = ChangeSet::from_operations(&operations);
+
     let snap = proto::SnapshotValue {
         snapshot_id: new_id,
         snapshot_time_micros: now_micros(),
@@ -550,24 +632,37 @@ where
             snapshot_id: new_id,
         })),
     ));
+    stage_writes(db_tx, writes)?;
 
+    Ok(Prepared::Staged {
+        ours: Box::new(ours),
+        head_before: head,
+        commits: new_id,
+    })
+}
+
+fn stage_writes(db_tx: &DbTransaction, writes: Vec<StagedWrite>) -> Result<()> {
     for (key, write) in writes {
-        let staged = match write {
-            Some(bytes) => dbtxn.put(key, bytes),
-            None => dbtxn.delete(key),
-        };
-        if let Err(err) = staged {
-            dbtxn.rollback();
-            return Err(err.into());
+        match write {
+            Some(bytes) => db_tx.put(key, bytes),
+            None => db_tx.delete(key),
         }
+        .map_err(Error::from)?;
     }
+    Ok(())
+}
 
-    match dbtxn.commit_with_options(&durable()).await {
-        Ok(_) => Ok(CommitOutcome::Committed(SnapshotId::new(new_id))),
-        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(CommitOutcome::LostRace {
-            ours: Box::new(ours),
-            head_before: head,
-        }),
+async fn finish_commit(
+    db_tx: DbTransaction,
+    ours: Box<ChangeSet>,
+    head_before: u64,
+    commits: u64,
+) -> Result<CommitOutcome> {
+    match db_tx.commit_with_options(&durable()).await {
+        Ok(_) => Ok(CommitOutcome::Committed(SnapshotId::new(commits))),
+        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
+            Ok(CommitOutcome::LostRace { ours, head_before })
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -578,15 +673,19 @@ where
 /// [`Error::CommitConflict`].
 pub(crate) async fn commit_cycle<F>(db: &Db, f: &F) -> Result<SnapshotId>
 where
-    F: Fn(&mut Txn) -> Result<()>,
+    F: Fn(&mut Transaction) -> Result<()>,
 {
     for _ in 0..MAX_COMMIT_ATTEMPTS {
         match attempt_commit(db, f).await? {
             CommitOutcome::Committed(id) => return Ok(id),
             CommitOutcome::LostRace { ours, head_before } => {
+                // An options-only loser is last-write-wins: always benign.
+                if ours.is_empty() {
+                    continue;
+                }
                 let intervening = intervening_changes(db, head_before).await?;
                 for (snapshot_id, theirs) in &intervening {
-                    if crate::txn::ops::conflicts(&ours, theirs) {
+                    if crate::transaction::operations::conflicts(&ours, theirs) {
                         return Err(Error::CommitConflict(format!(
                             "concurrent commit {snapshot_id} touched the same state"
                         )));
@@ -611,6 +710,7 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?;
     let head: proto::HeadValue = value::decode_value(&head_bytes)?;
     let mut changes = Vec::new();
+
     for snapshot_id in (head_before + 1)..=head.snapshot_id {
         let bytes = db
             .get(Key::Snap { snapshot_id }.encode())
@@ -620,6 +720,7 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
         let snap: proto::SnapshotValue = value::decode_value(&bytes)?;
         changes.push((snapshot_id, ChangeSet::parse(&snap.changes_made)));
     }
+
     Ok(changes)
 }
 
@@ -694,7 +795,7 @@ mod tests {
             commit_extra_info: None,
         };
         let empty = CatalogSnapshot::build(snap0, vec![], vec![], None);
-        let mut setup = Txn::new(empty, 1);
+        let mut setup = Transaction::new(empty, 1);
         let schema = setup.create_schema("s").unwrap();
         let table = setup
             .create_table(
@@ -713,8 +814,8 @@ mod tests {
 
         // Register a file with column stats, then expire it — all inside
         // this one commit's transaction.
-        let mut txn = Txn::new(base.clone(), 2);
-        let file = txn
+        let mut tx = Transaction::new(base.clone(), 2);
+        let file = tx
             .register_data_file(
                 table,
                 DataFile {
@@ -737,8 +838,8 @@ mod tests {
                 },
             )
             .unwrap();
-        txn.expire_data_file(table, file).unwrap();
-        let (_, state, _, _) = txn.into_parts();
+        tx.expire_data_file(table, file).unwrap();
+        let (_, state, _, _) = tx.into_parts();
 
         let writes = diff_writes(&base, &state, 2);
         for (key_bytes, _) in &writes {
@@ -771,7 +872,7 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .commit(|txn| txn.create_schema("visible").map(|_| ()))
+            .commit(|tx| tx.create_schema("visible").map(|_| ()))
             .await
             .unwrap();
 

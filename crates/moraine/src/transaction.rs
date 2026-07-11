@@ -2,7 +2,7 @@
 //! write, with conflict classification and bounded benign-race retry.
 
 pub(crate) mod commit;
-pub(crate) mod ops;
+pub(crate) mod operations;
 mod verbs;
 
-pub use verbs::Txn;
+pub use verbs::Transaction;

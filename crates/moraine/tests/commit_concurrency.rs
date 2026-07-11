@@ -38,10 +38,10 @@ async fn seeded() -> (Catalog, SchemaId, TableId, TableId) {
         .await
         .unwrap();
     catalog
-        .commit(|txn| {
-            let s = txn.create_schema("s")?;
-            txn.create_table(s, "a", &[col("x")])?;
-            txn.create_table(s, "b", &[col("x")])?;
+        .commit(|tx| {
+            let s = tx.create_schema("s")?;
+            tx.create_table(s, "a", &[col("x")])?;
+            tx.create_table(s, "b", &[col("x")])?;
             Ok(())
         })
         .await
@@ -59,11 +59,11 @@ async fn disjoint_table_ddl_both_succeed() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |txn| txn.add_column(a, &col("a1")).map(|_| ()))
+        c1.commit(move |tx| tx.add_column(a, &col("a1")).map(|_| ()))
             .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |txn| txn.add_column(b, &col("b1")).map(|_| ()))
+        c2.commit(move |tx| tx.add_column(b, &col("b1")).map(|_| ()))
             .await
     });
     t1.await.unwrap().unwrap();
@@ -79,7 +79,7 @@ async fn disjoint_table_ddl_both_succeed() {
 async fn same_table_ddl_races_serialize_or_conflict() {
     let (catalog, _s, a, _b) = seeded().await;
     // Whether a round serializes or conflicts depends on scheduling; the
-    // classifier itself is pinned by the `txn::ops` unit tests. This test
+    // classifier itself is pinned by the `transaction::operations` unit tests. This test
     // only requires that races never corrupt state.
     let mut added = Vec::new();
     for round in 0..20 {
@@ -90,14 +90,14 @@ async fn same_table_ddl_races_serialize_or_conflict() {
         let t1 = tokio::spawn({
             let n1 = n1.clone();
             async move {
-                c1.commit(move |txn| txn.add_column(a, &col(&n1)).map(|_| ()))
+                c1.commit(move |tx| tx.add_column(a, &col(&n1)).map(|_| ()))
                     .await
             }
         });
         let t2 = tokio::spawn({
             let n2 = n2.clone();
             async move {
-                c2.commit(move |txn| txn.add_column(a, &col(&n2)).map(|_| ()))
+                c2.commit(move |tx| tx.add_column(a, &col(&n2)).map(|_| ()))
                     .await
             }
         });
@@ -134,11 +134,11 @@ async fn same_name_create_race_yields_already_exists() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |txn| txn.create_table(s, "orders", &[col("x")]).map(|_| ()))
+        c1.commit(move |tx| tx.create_table(s, "orders", &[col("x")]).map(|_| ()))
             .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |txn| txn.create_table(s, "orders", &[col("x")]).map(|_| ()))
+        c2.commit(move |tx| tx.create_table(s, "orders", &[col("x")]).map(|_| ()))
             .await
     });
     let results = [t1.await.unwrap(), t2.await.unwrap()];
@@ -168,7 +168,7 @@ async fn counters_never_regress_or_collide_under_concurrency() {
         let c = catalog.clone();
         let name = format!("t{i}");
         handles.push(tokio::spawn(async move {
-            c.commit(move |txn| txn.create_table(s, &name, &[col("x")]).map(|_| ()))
+            c.commit(move |tx| tx.create_table(s, &name, &[col("x")]).map(|_| ()))
                 .await
         }));
     }
@@ -191,11 +191,11 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |txn| txn.register_data_file(a, datafile(100)).map(|_| ()))
+        c1.commit(move |tx| tx.register_data_file(a, datafile(100)).map(|_| ()))
             .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |txn| txn.register_data_file(a, datafile(50)).map(|_| ()))
+        c2.commit(move |tx| tx.register_data_file(a, datafile(50)).map(|_| ()))
             .await
     });
     t1.await.unwrap().unwrap();
@@ -222,10 +222,10 @@ async fn append_vs_drop_is_a_real_error() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |txn| txn.register_data_file(a, datafile(10)).map(|_| ()))
+        c1.commit(move |tx| tx.register_data_file(a, datafile(10)).map(|_| ()))
             .await
     });
-    let t2 = tokio::spawn(async move { c2.commit(move |txn| txn.drop_table(a)).await });
+    let t2 = tokio::spawn(async move { c2.commit(move |tx| tx.drop_table(a)).await });
     let r1 = t1.await.unwrap();
     let r2 = t2.await.unwrap();
     // Serialized is fine; a genuine race surfaces CommitConflict or

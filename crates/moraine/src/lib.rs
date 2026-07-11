@@ -5,7 +5,10 @@
 //!
 //! Exactly one process holds a read-write [`Catalog`] per store at a time
 //! (opening a second fences the first); any number of processes may read
-//! snapshots concurrently.
+//! snapshots concurrently. Schemas, tables, views, data files, and
+//! statistics all commit through the same transaction; catalog options
+//! live outside the snapshot protocol (last-write-wins, no snapshot
+//! minted).
 //!
 //! # A worked example
 //!
@@ -20,9 +23,9 @@
 //! let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
 //!
 //! let v1 = catalog
-//!     .commit(|txn| {
-//!         let sales = txn.create_schema("sales")?;
-//!         txn.create_table(
+//!     .commit(|tx| {
+//!         let sales = tx.create_schema("sales")?;
+//!         tx.create_table(
 //!             sales,
 //!             "orders",
 //!             &[ColumnDef {
@@ -56,7 +59,7 @@
 //! - `catalog` — the DuckLake domain model. Never touches SlateDB directly.
 //! - `store` — the SlateDB layer: key layout and value codecs. Knows nothing
 //!   about DuckLake semantics.
-//! - `txn` — the commit protocol turning a catalog transaction into an atomic
+//! - `tx` — the commit protocol turning a catalog transaction into an atomic
 //!   store write.
 
 #![forbid(unsafe_code)]
@@ -64,13 +67,13 @@
 mod catalog;
 mod error;
 mod store;
-mod txn;
+mod transaction;
 
 pub use catalog::{
     Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
     ColumnStats, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
-    FileColumnStats, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
-    TableStats,
+    FileColumnStats, OptionScope, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId,
+    TableInfo, TableStats, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
-pub use txn::Txn;
+pub use transaction::Transaction;

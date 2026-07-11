@@ -8,11 +8,14 @@ use uuid::Uuid;
 use crate::{
     catalog::{
         CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnStats, DataFile, DataFileId,
-        DeleteFile, DeleteFileId, SchemaId, TableId,
+        DeleteFile, DeleteFileId, OptionScope, SchemaId, TableId, ViewId,
     },
     error::{Error, Result},
-    store::proto,
-    txn::ops::Op,
+    store::proto::{
+        ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, SchemaValue,
+        TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+    },
+    transaction::operations::Operation,
 };
 
 /// The mutation handle a commit closure receives.
@@ -20,15 +23,15 @@ use crate::{
 /// Dereferences to [`CatalogSnapshot`]; reads observe the transaction's
 /// own staged mutations. Nothing touches the store until the closure
 /// returns.
-pub struct Txn {
+pub struct Transaction {
     state: CatalogSnapshot,
-    ops: Vec<Op>,
+    ops: Vec<Operation>,
     next_catalog_id: u64,
     next_file_id: u64,
     new_snapshot_id: u64,
 }
 
-impl Deref for Txn {
+impl Deref for Transaction {
     type Target = CatalogSnapshot;
 
     fn deref(&self) -> &CatalogSnapshot {
@@ -36,10 +39,11 @@ impl Deref for Txn {
     }
 }
 
-impl Txn {
+impl Transaction {
     pub(crate) fn new(state: CatalogSnapshot, new_snapshot_id: u64) -> Self {
         let next_catalog_id = state.snap.next_catalog_id;
         let next_file_id = state.snap.next_file_id;
+
         Self {
             state,
             ops: Vec::new(),
@@ -49,12 +53,7 @@ impl Txn {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn state(&self) -> &CatalogSnapshot {
-        &self.state
-    }
-
-    pub(crate) fn into_parts(self) -> (Vec<Op>, CatalogSnapshot, u64, u64) {
+    pub(crate) fn into_parts(self) -> (Vec<Operation>, CatalogSnapshot, u64, u64) {
         (
             self.ops,
             self.state,
@@ -86,7 +85,7 @@ impl Txn {
             return Err(Error::AlreadyExists(format!("schema {name}")));
         }
         let schema_id = self.alloc_catalog_id();
-        self.state.put_schema(proto::SchemaValue {
+        self.state.put_schema(SchemaValue {
             schema_id,
             schema_uuid: Uuid::new_v4().to_string(),
             begin_snapshot: self.new_snapshot_id,
@@ -95,7 +94,7 @@ impl Txn {
             path: format!("{name}/"),
             path_is_relative: true,
         });
-        self.ops.push(Op::CreateSchema {
+        self.ops.push(Operation::CreateSchema {
             schema_id,
             name: name.to_owned(),
         });
@@ -123,8 +122,18 @@ impl Txn {
                 "schema {schema} still contains tables"
             )));
         }
+        if self
+            .state
+            .views
+            .values()
+            .any(|v| v.schema_id == schema.get())
+        {
+            return Err(Error::Constraint(format!(
+                "schema {schema} still contains views"
+            )));
+        }
         self.state.delete_schema(schema.get());
-        self.ops.push(Op::DropSchema {
+        self.ops.push(Operation::DropSchema {
             schema_id: schema.get(),
         });
         Ok(())
@@ -148,13 +157,8 @@ impl Txn {
         if !self.state.schemas.contains_key(&schema.get()) {
             return Err(Error::NotFound(format!("schema {schema}")));
         }
-        if self
-            .state
-            .table_names
-            .contains_key(&(schema.get(), name.to_owned()))
-        {
-            return Err(Error::AlreadyExists(format!("table {name}")));
-        }
+
+        self.relation_name_free(schema.get(), name)?;
         if columns.is_empty() {
             return Err(Error::Constraint(format!(
                 "table {name} needs at least one column"
@@ -165,9 +169,10 @@ impl Txn {
                 return Err(Error::Constraint(format!("duplicate column {}", a.name)));
             }
         }
+
         let table_id = self.alloc_catalog_id();
         let column_count = columns.len() as u64;
-        self.state.put_table(proto::TableValue {
+        self.state.put_table(TableValue {
             table_id,
             table_uuid: Uuid::new_v4().to_string(),
             begin_snapshot: self.new_snapshot_id,
@@ -178,7 +183,8 @@ impl Txn {
             path_is_relative: true,
             next_column_id: column_count + 1,
         });
-        // Field ids are assigned from 1 in declaration order, matching
+        // Field
+        //  ids are assigned from 1 in declaration order, matching
         // DuckLake; column_order (the position) stays 0-based.
         for (order, def) in columns.iter().enumerate() {
             self.state.put_column(new_column(
@@ -189,14 +195,14 @@ impl Txn {
                 def,
             ));
         }
-        self.state.put_table_stats(proto::TableStatsValue {
+        self.state.put_table_stats(TableStatsValue {
             table_id,
             record_count: 0,
             next_row_id: 0,
             file_size_bytes: 0,
         });
         let schema_name = self.state.schemas[&schema.get()].schema_name.clone();
-        self.ops.push(Op::CreateTable {
+        self.ops.push(Operation::CreateTable {
             schema_id: schema.get(),
             table_id,
             schema_name,
@@ -205,7 +211,7 @@ impl Txn {
         Ok(TableId::new(table_id))
     }
 
-    fn live_table(&self, table: TableId) -> Result<proto::TableValue> {
+    fn live_table(&self, table: TableId) -> Result<TableValue> {
         self.state
             .tables
             .get(&table.get())
@@ -213,8 +219,24 @@ impl Txn {
             .ok_or_else(|| Error::NotFound(format!("table {table}")))
     }
 
+    /// Tables and views share one name namespace per schema.
+    fn relation_name_free(&self, schema_id: u64, name: &str) -> Result<()> {
+        let taken = self
+            .state
+            .table_names
+            .contains_key(&(schema_id, name.to_owned()))
+            || self
+                .state
+                .view_names
+                .contains_key(&(schema_id, name.to_owned()));
+        if taken {
+            return Err(Error::AlreadyExists(format!("relation {name}")));
+        }
+        Ok(())
+    }
+
     fn mark_altered(&mut self, table_id: u64) {
-        self.ops.push(Op::AlterTable { table_id });
+        self.ops.push(Operation::AlterTable { table_id });
     }
 
     /// Renames a table within its schema. Renaming to the current name
@@ -227,13 +249,7 @@ impl Txn {
     /// exists in the same schema (including this table itself).
     pub fn rename_table(&mut self, table: TableId, new_name: &str) -> Result<()> {
         let mut value = self.live_table(table)?;
-        if self
-            .state
-            .table_names
-            .contains_key(&(value.schema_id, new_name.to_owned()))
-        {
-            return Err(Error::AlreadyExists(format!("table {new_name}")));
-        }
+        self.relation_name_free(value.schema_id, new_name)?;
         new_name.clone_into(&mut value.table_name);
         value.begin_snapshot = self.new_snapshot_id;
         self.state.put_table(value);
@@ -256,13 +272,7 @@ impl Txn {
         if !self.state.schemas.contains_key(&new_schema.get()) {
             return Err(Error::NotFound(format!("schema {new_schema}")));
         }
-        if self
-            .state
-            .table_names
-            .contains_key(&(new_schema.get(), value.table_name.clone()))
-        {
-            return Err(Error::AlreadyExists(format!("table {}", value.table_name)));
-        }
+        self.relation_name_free(new_schema.get(), &value.table_name)?;
         value.schema_id = new_schema.get();
         value.begin_snapshot = self.new_snapshot_id;
         self.state.put_table(value);
@@ -278,7 +288,7 @@ impl Txn {
     pub fn drop_table(&mut self, table: TableId) -> Result<()> {
         self.live_table(table)?;
         self.state.delete_table(table.get());
-        self.ops.push(Op::DropTable {
+        self.ops.push(Operation::DropTable {
             table_id: table.get(),
         });
         Ok(())
@@ -318,7 +328,7 @@ impl Txn {
         Ok(ColumnId::new(column_id))
     }
 
-    fn live_column(&self, table: TableId, column: ColumnId) -> Result<proto::ColumnValue> {
+    fn live_column(&self, table: TableId, column: ColumnId) -> Result<ColumnValue> {
         self.state
             .columns
             .get(&table.get())
@@ -413,7 +423,7 @@ impl Txn {
         Ok(())
     }
 
-    fn live_tstat(&self, table: TableId) -> Result<proto::TableStatsValue> {
+    fn live_tstat(&self, table: TableId) -> Result<TableStatsValue> {
         self.state
             .table_stats
             .get(&table.get())
@@ -445,7 +455,7 @@ impl Txn {
         tstat.record_count = tstat.record_count.saturating_add(file.record_count);
         tstat.file_size_bytes = tstat.file_size_bytes.saturating_add(file.file_size_bytes);
         self.state.put_table_stats(tstat);
-        self.state.put_data_file(proto::DataFileValue {
+        self.state.put_data_file(DataFileValue {
             data_file_id,
             table_id: table.get(),
             begin_snapshot: self.new_snapshot_id,
@@ -465,22 +475,21 @@ impl Txn {
             partition_values: vec![],
         });
         for entry in file.column_stats {
-            self.state
-                .put_file_column_stats(proto::FileColumnStatsValue {
-                    data_file_id,
-                    table_id: table.get(),
-                    column_id: entry.column_id.get(),
-                    column_size_bytes: entry.column_size_bytes,
-                    value_count: entry.value_count,
-                    null_count: entry.null_count,
-                    min_value: entry.min_value,
-                    max_value: entry.max_value,
-                    contains_nan: entry.contains_nan,
-                    extra_stats: entry.extra_stats,
-                    variant_stats: vec![],
-                });
+            self.state.put_file_column_stats(FileColumnStatsValue {
+                data_file_id,
+                table_id: table.get(),
+                column_id: entry.column_id.get(),
+                column_size_bytes: entry.column_size_bytes,
+                value_count: entry.value_count,
+                null_count: entry.null_count,
+                min_value: entry.min_value,
+                max_value: entry.max_value,
+                contains_nan: entry.contains_nan,
+                extra_stats: entry.extra_stats,
+                variant_stats: vec![],
+            });
         }
-        self.ops.push(Op::RegisterDataFile {
+        self.ops.push(Operation::RegisterDataFile {
             table_id: table.get(),
         });
         Ok(DataFileId::new(data_file_id))
@@ -523,7 +532,7 @@ impl Txn {
             .saturating_sub(data_file.file_size_bytes);
         self.state.put_table_stats(tstat);
 
-        self.ops.push(Op::ExpireDataFile {
+        self.ops.push(Operation::ExpireDataFile {
             table_id: table.get(),
         });
         Ok(())
@@ -556,7 +565,8 @@ impl Txn {
             )));
         }
         let delete_file_id = self.alloc_file_id();
-        self.state.put_delete_file(proto::DeleteFileValue {
+
+        self.state.put_delete_file(DeleteFileValue {
             delete_file_id,
             table_id: table.get(),
             begin_snapshot: self.new_snapshot_id,
@@ -571,7 +581,7 @@ impl Txn {
             encryption_key: None,
             partial_max: None,
         });
-        self.ops.push(Op::RegisterDeleteFile {
+        self.ops.push(Operation::RegisterDeleteFile {
             table_id: table.get(),
         });
 
@@ -595,7 +605,7 @@ impl Txn {
             )));
         }
         self.state.delete_delete_file(table.get(), file.get());
-        self.ops.push(Op::ExpireDeleteFile {
+        self.ops.push(Operation::ExpireDeleteFile {
             table_id: table.get(),
         });
 
@@ -622,7 +632,7 @@ impl Txn {
         tstat.record_count = record_count;
         tstat.file_size_bytes = file_size_bytes;
         self.state.put_table_stats(tstat);
-        self.ops.push(Op::UpdateStats {
+        self.ops.push(Operation::UpdateStats {
             table_id: table.get(),
         });
 
@@ -641,21 +651,169 @@ impl Txn {
         stats: ColumnStats,
     ) -> Result<()> {
         self.live_column(table, column)?;
-        self.state
-            .put_table_column_stats(proto::TableColumnStatsValue {
-                table_id: table.get(),
-                column_id: column.get(),
-                contains_null: stats.contains_null,
-                contains_nan: stats.contains_nan,
-                min_value: stats.min_value,
-                max_value: stats.max_value,
-                extra_stats: stats.extra_stats,
-            });
-        self.ops.push(Op::UpdateStats {
+        self.state.put_table_column_stats(TableColumnStatsValue {
+            table_id: table.get(),
+            column_id: column.get(),
+            contains_null: stats.contains_null,
+            contains_nan: stats.contains_nan,
+            min_value: stats.min_value,
+            max_value: stats.max_value,
+            extra_stats: stats.extra_stats,
+        });
+        self.ops.push(Operation::UpdateStats {
             table_id: table.get(),
         });
 
         Ok(())
+    }
+
+    /// Creates a view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the schema does not exist.
+    /// Returns [`Error::AlreadyExists`] if a relation with that name
+    /// already exists in the schema.
+    pub fn create_view(
+        &mut self,
+        schema: SchemaId,
+        name: &str,
+        dialect: &str,
+        sql: &str,
+    ) -> Result<ViewId> {
+        let Some(schema_rec) = self.state.schemas.get(&schema.get()) else {
+            return Err(Error::NotFound(format!("schema {schema}")));
+        };
+        let schema_name = schema_rec.schema_name.clone();
+        self.relation_name_free(schema.get(), name)?;
+        let view_id = self.alloc_catalog_id();
+
+        self.state.put_view(ViewValue {
+            view_id,
+            view_uuid: Uuid::new_v4().to_string(),
+            begin_snapshot: self.new_snapshot_id,
+            end_snapshot: None,
+            schema_id: schema.get(),
+            view_name: name.to_owned(),
+            dialect: dialect.to_owned(),
+            sql: sql.to_owned(),
+            column_aliases: None,
+        });
+        self.ops.push(Operation::CreateView {
+            schema_id: schema.get(),
+            view_id,
+            schema_name,
+            view_name: name.to_owned(),
+        });
+
+        Ok(ViewId::new(view_id))
+    }
+
+    /// Replaces a view's definition as a new version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the view does not exist.
+    pub fn alter_view(&mut self, view: ViewId, dialect: &str, sql: &str) -> Result<()> {
+        let mut value = self
+            .state
+            .views
+            .get(&view.get())
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("view {view}")))?;
+        dialect.clone_into(&mut value.dialect);
+        sql.clone_into(&mut value.sql);
+        value.begin_snapshot = self.new_snapshot_id;
+        self.state.put_view(value);
+        self.ops.push(Operation::AlterView {
+            view_id: view.get(),
+        });
+        Ok(())
+    }
+
+    /// Drops a view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the view does not exist.
+    pub fn drop_view(&mut self, view: ViewId) -> Result<()> {
+        if !self.state.views.contains_key(&view.get()) {
+            return Err(Error::NotFound(format!("view {view}")));
+        }
+        self.state.delete_view(view.get());
+        self.ops.push(Operation::DropView {
+            view_id: view.get(),
+        });
+        Ok(())
+    }
+
+    /// Sets an option in a scope. Last-write-wins; an options-only
+    /// commit mints no snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the scope's schema or table does
+    /// not exist.
+    pub fn set_option(&mut self, scope: OptionScope, key: &str, value: &str) -> Result<()> {
+        self.live_scope(scope)?;
+        let components = scope.key_components();
+        let mut record = self
+            .state
+            .options
+            .get(&components)
+            .cloned()
+            .unwrap_or_default();
+        record.options.insert(key.to_owned(), value.to_owned());
+        self.state.set_option_record(components, record);
+        Ok(())
+    }
+
+    /// Removes an option from a scope; absent keys are a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the scope's schema or table does
+    /// not exist.
+    pub fn unset_option(&mut self, scope: OptionScope, key: &str) -> Result<()> {
+        self.live_scope(scope)?;
+        let components = scope.key_components();
+        let Some(mut record) = self.state.options.get(&components).cloned() else {
+            return Ok(());
+        };
+        if record.options.remove(key).is_none() {
+            return Ok(());
+        }
+        if record.options.is_empty() {
+            self.state.remove_option_record(components);
+        } else {
+            self.state.set_option_record(components, record);
+        }
+        Ok(())
+    }
+
+    fn live_scope(&self, scope: OptionScope) -> Result<()> {
+        match scope {
+            OptionScope::Global => Ok(()),
+            OptionScope::Schema(s) => {
+                if self.state.schemas.contains_key(&s.get()) {
+                    Ok(())
+                } else {
+                    Err(Error::NotFound(format!("schema {s}")))
+                }
+            }
+            OptionScope::Table(t) => {
+                if self.state.tables.contains_key(&t.get()) {
+                    Ok(())
+                } else {
+                    Err(Error::NotFound(format!("table {t}")))
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &CatalogSnapshot {
+        &self.state
     }
 }
 
@@ -665,8 +823,8 @@ fn new_column(
     column_order: u64,
     begin_snapshot: u64,
     def: &ColumnDef,
-) -> proto::ColumnValue {
-    proto::ColumnValue {
+) -> ColumnValue {
+    ColumnValue {
         column_id,
         begin_snapshot,
         end_snapshot: None,
@@ -688,10 +846,10 @@ fn new_column(
 mod tests {
     use super::*;
     use crate::catalog::{CatalogSnapshot, FileColumnStats};
-    use crate::store::proto;
+    use crate::store::proto::SnapshotValue;
 
-    fn empty_txn() -> Txn {
-        let snap = proto::SnapshotValue {
+    fn empty_transaction() -> Transaction {
+        let snap = SnapshotValue {
             snapshot_id: 4,
             snapshot_time_micros: 1,
             schema_version: 2,
@@ -703,7 +861,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
         };
-        Txn::new(CatalogSnapshot::build(snap, vec![], vec![], None), 5)
+        Transaction::new(CatalogSnapshot::build(snap, vec![], vec![], None), 5)
     }
 
     fn col(name: &str) -> ColumnDef {
@@ -717,33 +875,33 @@ mod tests {
 
     #[test]
     fn create_read_your_own_writes_and_id_allocation() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("sales").unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("sales").unwrap();
         assert_eq!(s, SchemaId::new(10));
-        let t = txn
+        let t = transaction
             .create_table(s, "orders", &[col("id"), col("qty")])
             .unwrap();
         assert_eq!(t, TableId::new(11));
-        // Reads on the Txn see staged state (Deref to the working view).
-        assert_eq!(txn.schema_by_name("sales").unwrap().id, s);
-        let cols = txn.columns_of(t);
+        // Reads on the Transaction see staged state (Deref to the working view).
+        assert_eq!(transaction.schema_by_name("sales").unwrap().id, s);
+        let cols = transaction.columns_of(t);
         assert_eq!(cols[0].id, ColumnId::new(1));
         assert_eq!(cols[1].id, ColumnId::new(2));
         // Records are stamped with the commit's snapshot id.
-        assert_eq!(txn.state().tables[&11].begin_snapshot, 5);
+        assert_eq!(transaction.state().tables[&11].begin_snapshot, 5);
         // The counter is seeded past the ids just handed out.
-        assert_eq!(txn.state().tables[&11].next_column_id, 3);
+        assert_eq!(transaction.state().tables[&11].next_column_id, 3);
 
-        let (ops, _, next_catalog_id, _) = txn.into_parts();
+        let (ops, _, next_catalog_id, _) = transaction.into_parts();
         assert_eq!(next_catalog_id, 12);
         assert_eq!(
             ops,
             vec![
-                Op::CreateSchema {
+                Operation::CreateSchema {
                     schema_id: 10,
                     name: "sales".into(),
                 },
-                Op::CreateTable {
+                Operation::CreateTable {
                     schema_id: 10,
                     table_id: 11,
                     schema_name: "sales".into(),
@@ -755,84 +913,92 @@ mod tests {
 
     #[test]
     fn name_collisions_and_missing_entities() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("sales").unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("sales").unwrap();
         assert!(matches!(
-            txn.create_schema("sales"),
+            transaction.create_schema("sales"),
             Err(Error::AlreadyExists(_))
         ));
-        txn.create_table(s, "orders", &[col("id")]).unwrap();
+        transaction.create_table(s, "orders", &[col("id")]).unwrap();
         assert!(matches!(
-            txn.create_table(s, "orders", &[col("id")]),
+            transaction.create_table(s, "orders", &[col("id")]),
             Err(Error::AlreadyExists(_))
         ));
         assert!(matches!(
-            txn.create_table(SchemaId::new(99), "x", &[col("id")]),
+            transaction.create_table(SchemaId::new(99), "x", &[col("id")]),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            txn.rename_table(TableId::new(99), "y"),
+            transaction.rename_table(TableId::new(99), "y"),
             Err(Error::NotFound(_))
         ));
     }
 
     #[test]
     fn constraints() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("sales").unwrap();
-        let t = txn.create_table(s, "orders", &[col("id")]).unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("sales").unwrap();
+        let t = transaction.create_table(s, "orders", &[col("id")]).unwrap();
         // A schema with live tables cannot be dropped.
-        assert!(matches!(txn.drop_schema(s), Err(Error::Constraint(_))));
+        assert!(matches!(
+            transaction.drop_schema(s),
+            Err(Error::Constraint(_))
+        ));
         // The last live column cannot be dropped.
         assert!(matches!(
-            txn.drop_column(t, ColumnId::new(1)),
+            transaction.drop_column(t, ColumnId::new(1)),
             Err(Error::Constraint(_))
         ));
         // Tables need at least one column, without duplicate names.
         assert!(matches!(
-            txn.create_table(s, "empty", &[]),
+            transaction.create_table(s, "empty", &[]),
             Err(Error::Constraint(_))
         ));
         assert!(matches!(
-            txn.create_table(s, "dup", &[col("a"), col("a")]),
+            transaction.create_table(s, "dup", &[col("a"), col("a")]),
             Err(Error::Constraint(_))
         ));
         // Drop the table, then the schema drop succeeds.
-        txn.drop_table(t).unwrap();
-        txn.drop_schema(s).unwrap();
+        transaction.drop_table(t).unwrap();
+        transaction.drop_schema(s).unwrap();
     }
 
     #[test]
     fn column_ddl_allocates_fresh_field_ids() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("s").unwrap();
-        let t = txn.create_table(s, "t", &[col("a"), col("b")]).unwrap();
-        txn.drop_column(t, ColumnId::new(2)).unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction
+            .create_table(s, "t", &[col("a"), col("b")])
+            .unwrap();
+        transaction.drop_column(t, ColumnId::new(2)).unwrap();
         // The dropped column's field id is never reused.
-        let c = txn.add_column(t, &col("c")).unwrap();
+        let c = transaction.add_column(t, &col("c")).unwrap();
         assert_eq!(c, ColumnId::new(3));
-        let cols = txn.columns_of(t);
+        let cols = transaction.columns_of(t);
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[1].position, 1);
 
-        txn.rename_column(t, ColumnId::new(1), "a2").unwrap();
-        assert_eq!(txn.columns_of(t)[0].name, "a2");
+        transaction
+            .rename_column(t, ColumnId::new(1), "a2")
+            .unwrap();
+        assert_eq!(transaction.columns_of(t)[0].name, "a2");
         assert!(matches!(
-            txn.rename_column(t, ColumnId::new(1), "c"),
+            transaction.rename_column(t, ColumnId::new(1), "c"),
             Err(Error::AlreadyExists(_))
         ));
 
-        txn.alter_column(
-            t,
-            c,
-            ColumnAlteration {
-                column_type: Some("VARCHAR".into()),
-                nulls_allowed: Some(false),
-                default_value: Some(Some("''".into())),
-            },
-        )
-        .unwrap();
-        let altered = &txn.columns_of(t)[1];
+        transaction
+            .alter_column(
+                t,
+                c,
+                ColumnAlteration {
+                    column_type: Some("VARCHAR".into()),
+                    nulls_allowed: Some(false),
+                    default_value: Some(Some("''".into())),
+                },
+            )
+            .unwrap();
+        let altered = &transaction.columns_of(t)[1];
         assert_eq!(altered.column_type, "VARCHAR");
         assert!(!altered.nulls_allowed);
         assert_eq!(altered.default_value, Some("''".into()));
@@ -840,47 +1006,47 @@ mod tests {
 
     #[test]
     fn table_moves_and_renames_validate_against_target() {
-        let mut txn = empty_txn();
-        let s1 = txn.create_schema("a").unwrap();
-        let s2 = txn.create_schema("b").unwrap();
-        let t1 = txn.create_table(s1, "t", &[col("x")]).unwrap();
-        let _t2 = txn.create_table(s2, "t", &[col("x")]).unwrap();
+        let mut transaction = empty_transaction();
+        let s1 = transaction.create_schema("a").unwrap();
+        let s2 = transaction.create_schema("b").unwrap();
+        let t1 = transaction.create_table(s1, "t", &[col("x")]).unwrap();
+        let _t2 = transaction.create_table(s2, "t", &[col("x")]).unwrap();
         // Moving into a schema that already has a table of that name fails.
         assert!(matches!(
-            txn.set_table_schema(t1, s2),
+            transaction.set_table_schema(t1, s2),
             Err(Error::AlreadyExists(_))
         ));
         assert!(matches!(
-            txn.set_table_schema(t1, SchemaId::new(99)),
+            transaction.set_table_schema(t1, SchemaId::new(99)),
             Err(Error::NotFound(_))
         ));
-        txn.rename_table(t1, "t_renamed").unwrap();
-        txn.set_table_schema(t1, s2).unwrap();
-        assert_eq!(txn.tables_in(s2).len(), 2);
+        transaction.rename_table(t1, "t_renamed").unwrap();
+        transaction.set_table_schema(t1, s2).unwrap();
+        assert_eq!(transaction.tables_in(s2).len(), 2);
         // Each mutation of an existing table classifies as an alter.
-        let (ops, _, _, _) = txn.into_parts();
+        let (ops, _, _, _) = transaction.into_parts();
         let alters = ops
             .iter()
-            .filter(|op| matches!(op, Op::AlterTable { table_id } if *table_id == t1.get()))
+            .filter(|op| matches!(op, Operation::AlterTable { table_id } if *table_id == t1.get()))
             .count();
         assert_eq!(alters, 2);
     }
 
     #[test]
     fn self_targeted_renames_and_moves_error() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("s").unwrap();
-        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
         assert!(matches!(
-            txn.rename_table(t, "t"),
+            transaction.rename_table(t, "t"),
             Err(Error::AlreadyExists(_))
         ));
         assert!(matches!(
-            txn.set_table_schema(t, s),
+            transaction.set_table_schema(t, s),
             Err(Error::AlreadyExists(_))
         ));
         assert!(matches!(
-            txn.rename_column(t, ColumnId::new(1), "a"),
+            transaction.rename_column(t, ColumnId::new(1), "a"),
             Err(Error::AlreadyExists(_))
         ));
     }
@@ -893,7 +1059,7 @@ mod tests {
         use crate::catalog::CatalogSnapshot;
         use crate::store::read::EntityRecord;
 
-        let snap = proto::SnapshotValue {
+        let snap = SnapshotValue {
             snapshot_id: 4,
             snapshot_time_micros: 1,
             schema_version: 0,
@@ -905,7 +1071,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
         };
-        let table = proto::TableValue {
+        let table = TableValue {
             table_id: 1,
             table_uuid: "uuid-t1".into(),
             begin_snapshot: 1,
@@ -917,7 +1083,7 @@ mod tests {
             next_column_id: 0,
         };
         let columns = [1u64, 2].map(|id| {
-            EntityRecord::Column(proto::ColumnValue {
+            EntityRecord::Column(ColumnValue {
                 column_id: id,
                 begin_snapshot: 1,
                 end_snapshot: None,
@@ -937,8 +1103,8 @@ mod tests {
         let mut cur = vec![EntityRecord::Table(table)];
         cur.extend(columns);
         let state = CatalogSnapshot::build(snap, cur, vec![], None);
-        let mut txn = Txn::new(state, 5);
-        let c = txn.add_column(TableId::new(1), &col("c")).unwrap();
+        let mut transaction = Transaction::new(state, 5);
+        let c = transaction.add_column(TableId::new(1), &col("c")).unwrap();
         assert_eq!(c, ColumnId::new(3));
     }
 
@@ -956,20 +1122,24 @@ mod tests {
 
     #[test]
     fn register_allocates_row_ids_and_maintains_stats() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("s").unwrap();
-        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
         // create_table minted the stats record.
-        let stats = txn.table_stats(t).unwrap();
+        let stats = transaction.table_stats(t).unwrap();
         assert_eq!((stats.record_count, stats.next_row_id), (0, 0));
 
-        let f1 = txn.register_data_file(t, datafile(100, vec![])).unwrap();
-        let f2 = txn.register_data_file(t, datafile(50, vec![])).unwrap();
+        let f1 = transaction
+            .register_data_file(t, datafile(100, vec![]))
+            .unwrap();
+        let f2 = transaction
+            .register_data_file(t, datafile(50, vec![]))
+            .unwrap();
         assert_ne!(f1, f2);
-        let files = txn.data_files_of(t);
+        let files = transaction.data_files_of(t);
         assert_eq!(files[0].row_id_start, 0);
         assert_eq!(files[1].row_id_start, 100);
-        let stats = txn.table_stats(t).unwrap();
+        let stats = transaction.table_stats(t).unwrap();
         assert_eq!(stats.record_count, 150);
         assert_eq!(stats.next_row_id, 150);
         assert_eq!(stats.file_size_bytes, 1500);
@@ -977,11 +1147,11 @@ mod tests {
 
     #[test]
     fn register_validates_table_and_stat_columns() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("s").unwrap();
-        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
         assert!(matches!(
-            txn.register_data_file(TableId::new(99), datafile(1, vec![])),
+            transaction.register_data_file(TableId::new(99), datafile(1, vec![])),
             Err(Error::NotFound(_))
         ));
         let bad_stats = vec![FileColumnStats {
@@ -995,18 +1165,20 @@ mod tests {
             extra_stats: None,
         }];
         assert!(matches!(
-            txn.register_data_file(t, datafile(1, bad_stats)),
+            transaction.register_data_file(t, datafile(1, bad_stats)),
             Err(Error::NotFound(_))
         ));
     }
 
     #[test]
     fn expire_cascades_delete_files_and_preserves_next_row_id() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("s").unwrap();
-        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
-        let f = txn.register_data_file(t, datafile(100, vec![])).unwrap();
-        let d = txn
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let f = transaction
+            .register_data_file(t, datafile(100, vec![]))
+            .unwrap();
+        let d = transaction
             .register_delete_file(
                 t,
                 DeleteFile {
@@ -1020,27 +1192,32 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(txn.delete_files_of(t)[0].id, d);
+        assert_eq!(transaction.delete_files_of(t)[0].id, d);
 
-        txn.expire_data_file(t, f).unwrap();
-        assert!(txn.data_files_of(t).is_empty());
-        assert!(txn.delete_files_of(t).is_empty(), "delete file cascades");
-        let stats = txn.table_stats(t).unwrap();
+        transaction.expire_data_file(t, f).unwrap();
+        assert!(transaction.data_files_of(t).is_empty());
+        assert!(
+            transaction.delete_files_of(t).is_empty(),
+            "delete file cascades"
+        );
+        let stats = transaction.table_stats(t).unwrap();
         assert_eq!(stats.record_count, 0);
         // The row-id counter never regresses.
         assert_eq!(stats.next_row_id, 100);
-        let f2 = txn.register_data_file(t, datafile(10, vec![])).unwrap();
-        assert_eq!(txn.data_files_of(t)[0].row_id_start, 100);
+        let f2 = transaction
+            .register_data_file(t, datafile(10, vec![]))
+            .unwrap();
+        assert_eq!(transaction.data_files_of(t)[0].row_id_start, 100);
         let _ = f2;
     }
 
     #[test]
     fn delete_file_requires_live_data_file() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("s").unwrap();
-        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
         assert!(matches!(
-            txn.register_delete_file(
+            transaction.register_delete_file(
                 t,
                 DeleteFile {
                     data_file_id: DataFileId::new(99),
@@ -1058,54 +1235,138 @@ mod tests {
 
     #[test]
     fn stats_verbs_update_verbatim_and_preserve_row_counter() {
-        let mut txn = empty_txn();
-        let s = txn.create_schema("s").unwrap();
-        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
-        txn.register_data_file(t, datafile(100, vec![])).unwrap();
-        txn.update_table_stats(t, 42, 420).unwrap();
-        let stats = txn.table_stats(t).unwrap();
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        transaction
+            .register_data_file(t, datafile(100, vec![]))
+            .unwrap();
+        transaction.update_table_stats(t, 42, 420).unwrap();
+        let stats = transaction.table_stats(t).unwrap();
         assert_eq!((stats.record_count, stats.file_size_bytes), (42, 420));
         assert_eq!(
             stats.next_row_id, 100,
             "override cannot regress the counter"
         );
 
-        txn.update_column_stats(
-            t,
-            ColumnId::new(1),
-            ColumnStats {
-                contains_null: Some(false),
-                contains_nan: None,
-                min_value: Some("9".into()),
-                max_value: Some("10".into()),
-                extra_stats: None,
-            },
-        )
-        .unwrap();
-        let cs = txn.column_stats(t, ColumnId::new(1)).unwrap();
+        transaction
+            .update_column_stats(
+                t,
+                ColumnId::new(1),
+                ColumnStats {
+                    contains_null: Some(false),
+                    contains_nan: None,
+                    min_value: Some("9".into()),
+                    max_value: Some("10".into()),
+                    extra_stats: None,
+                },
+            )
+            .unwrap();
+        let cs = transaction.column_stats(t, ColumnId::new(1)).unwrap();
         assert_eq!(cs.min_value.as_deref(), Some("9"));
         assert!(matches!(
-            txn.update_column_stats(t, ColumnId::new(9), ColumnStats::default()),
+            transaction.update_column_stats(t, ColumnId::new(9), ColumnStats::default()),
             Err(Error::NotFound(_))
         ));
 
         // Dropping a column removes its table-level stats too, symmetric
         // with delete_table removing table_stats.
-        let c2 = txn.add_column(t, &col("b")).unwrap();
-        txn.update_column_stats(
-            t,
-            c2,
-            ColumnStats {
-                contains_null: Some(true),
-                contains_nan: None,
-                min_value: Some("1".into()),
-                max_value: Some("2".into()),
-                extra_stats: None,
-            },
-        )
-        .unwrap();
-        assert!(txn.column_stats(t, c2).is_some());
-        txn.drop_column(t, c2).unwrap();
-        assert!(txn.column_stats(t, c2).is_none());
+        let c2 = transaction.add_column(t, &col("b")).unwrap();
+        transaction
+            .update_column_stats(
+                t,
+                c2,
+                ColumnStats {
+                    contains_null: Some(true),
+                    contains_nan: None,
+                    min_value: Some("1".into()),
+                    max_value: Some("2".into()),
+                    extra_stats: None,
+                },
+            )
+            .unwrap();
+        assert!(transaction.column_stats(t, c2).is_some());
+        transaction.drop_column(t, c2).unwrap();
+        assert!(transaction.column_stats(t, c2).is_none());
+    }
+
+    #[test]
+    fn views_share_the_relation_namespace() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "orders", &[col("a")]).unwrap();
+        assert!(matches!(
+            transaction.create_view(s, "orders", "duckdb", "SELECT 1"),
+            Err(Error::AlreadyExists(_))
+        ));
+        let v = transaction
+            .create_view(s, "v_orders", "duckdb", "SELECT 1")
+            .unwrap();
+        assert!(matches!(
+            transaction.create_table(s, "v_orders", &[col("a")]),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            transaction.rename_table(t, "v_orders"),
+            Err(Error::AlreadyExists(_))
+        ));
+        assert_eq!(transaction.view_by_name(s, "v_orders").unwrap().id, v);
+        // A schema with live views cannot be dropped.
+        transaction.drop_table(t).unwrap();
+        assert!(matches!(
+            transaction.drop_schema(s),
+            Err(Error::Constraint(_))
+        ));
+        transaction.drop_view(v).unwrap();
+        transaction.drop_schema(s).unwrap();
+    }
+
+    #[test]
+    fn alter_view_replaces_definition() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let v = transaction
+            .create_view(s, "v", "duckdb", "SELECT 1")
+            .unwrap();
+        transaction.alter_view(v, "duckdb", "SELECT 2").unwrap();
+        assert_eq!(transaction.view_by_id(v).unwrap().sql, "SELECT 2");
+        assert!(matches!(
+            transaction.alter_view(ViewId::new(99), "d", "s"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn options_set_unset_and_validate_scopes() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        transaction
+            .set_option(OptionScope::Global, "k", "g")
+            .unwrap();
+        transaction
+            .set_option(OptionScope::Table(t), "k", "t")
+            .unwrap();
+        assert_eq!(
+            transaction.option(OptionScope::Table(t), "k").as_deref(),
+            Some("t")
+        );
+        transaction
+            .unset_option(OptionScope::Table(t), "k")
+            .unwrap();
+        assert_eq!(
+            transaction.option(OptionScope::Table(t), "k").as_deref(),
+            Some("g")
+        );
+        transaction
+            .unset_option(OptionScope::Table(t), "missing")
+            .unwrap();
+        assert!(matches!(
+            transaction.set_option(OptionScope::Table(TableId::new(99)), "k", "v"),
+            Err(Error::NotFound(_))
+        ));
+        // Option mutations stage no ops; the two DDL ops remain.
+        let (ops, _, _, _) = transaction.into_parts();
+        assert_eq!(ops.len(), 2);
     }
 }

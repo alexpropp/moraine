@@ -9,7 +9,7 @@ use slatedb::{Db, IsolationLevel};
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId},
     error::{Error, Result},
-    txn::{Txn, commit},
+    transaction::{Transaction, commit},
 };
 
 /// Options for opening a catalog.
@@ -87,13 +87,14 @@ impl Catalog {
     }
 
     async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
-        let txn = self
+        let tx = self
             .db
             .begin(IsolationLevel::Snapshot)
             .await
             .map_err(Error::from)?;
-        let view = commit::materialize(&txn, at).await;
-        txn.rollback();
+        let view = commit::materialize(&tx, at).await;
+        tx.rollback();
+
         view
     }
 
@@ -113,10 +114,10 @@ impl Catalog {
 
     /// Commits catalog mutations atomically, producing one new snapshot.
     ///
-    /// The closure stages mutations on the [`Txn`]; reads on the `Txn`
+    /// The closure stages mutations on the [`Tx`]; reads on the `Tx`
     /// observe its own staged state. Because a lost race with a
     /// concurrent commit re-runs the closure against the fresh state, the
-    /// closure must be pure: no I/O, no effects other than the `Txn`
+    /// closure must be pure: no I/O, no effects other than the `Tx`
     /// calls. A closure that stages nothing commits nothing and returns
     /// the unchanged head snapshot id.
     ///
@@ -138,9 +139,9 @@ impl Catalog {
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
     /// let snapshot = catalog
-    ///     .commit(|txn| {
-    ///         let sales = txn.create_schema("sales")?;
-    ///         txn.create_table(
+    ///     .commit(|tx| {
+    ///         let sales = tx.create_schema("sales")?;
+    ///         tx.create_table(
     ///             sales,
     ///             "orders",
     ///             &[ColumnDef {
@@ -158,7 +159,7 @@ impl Catalog {
     /// ```
     pub async fn commit<F>(&self, f: F) -> Result<SnapshotId>
     where
-        F: Fn(&mut Txn) -> Result<()>,
+        F: Fn(&mut Transaction) -> Result<()>,
     {
         commit::commit_cycle(&self.db, &f).await
     }

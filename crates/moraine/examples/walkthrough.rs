@@ -23,23 +23,25 @@ async fn main() -> Result<()> {
     let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
 
     let v1 = catalog
-        .commit(|txn| {
-            let sales = txn.create_schema("sales")?;
-            txn.create_table(sales, "orders", &[bigint("id"), bigint("qty")])?;
+        .commit(|tx| {
+            let sales = tx.create_schema("sales")?;
+            tx.create_table(sales, "orders", &[bigint("id"), bigint("qty")])?;
+
             Ok(())
         })
         .await?;
 
     let v2 = catalog
-        .commit(|txn| {
-            let sales = txn
+        .commit(|tx| {
+            let sales = tx
                 .schema_by_name("sales")
                 .ok_or_else(|| Error::NotFound("schema sales".to_string()))?;
-            let orders = txn
+            let orders = tx
                 .table_by_name(sales.id, "orders")
                 .ok_or_else(|| Error::NotFound("table orders".to_string()))?;
-            txn.add_column(orders.id, &bigint("discount"))?;
-            txn.rename_table(orders.id, "orders_v2")?;
+            tx.add_column(orders.id, &bigint("discount"))?;
+            tx.rename_table(orders.id, "orders_v2")?;
+
             Ok(())
         })
         .await?;

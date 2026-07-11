@@ -53,9 +53,9 @@ async fn committed_state_survives_reopen() {
         .await
         .unwrap();
     catalog
-        .commit(|txn| {
-            let s = txn.create_schema("durable")?;
-            txn.create_table(s, "t", &[col("x")])?;
+        .commit(|tx| {
+            let s = tx.create_schema("durable")?;
+            tx.create_table(s, "t", &[col("x")])?;
             Ok(())
         })
         .await
@@ -96,9 +96,9 @@ async fn ddl_commits_are_visible_and_time_travelable() {
     let catalog = open_memory().await;
 
     let s1 = catalog
-        .commit(|txn| {
-            let s = txn.create_schema("sales")?;
-            txn.create_table(s, "orders", &[col("id"), col("qty")])?;
+        .commit(|tx| {
+            let s = tx.create_schema("sales")?;
+            tx.create_table(s, "orders", &[col("id"), col("qty")])?;
             Ok(())
         })
         .await
@@ -106,13 +106,13 @@ async fn ddl_commits_are_visible_and_time_travelable() {
     assert_eq!(s1, SnapshotId::new(1));
 
     let s2 = catalog
-        .commit(|txn| {
-            let schema = txn.schema_by_name("sales").expect("committed above");
-            let table = txn
+        .commit(|tx| {
+            let schema = tx.schema_by_name("sales").expect("committed above");
+            let table = tx
                 .table_by_name(schema.id, "orders")
                 .expect("committed above");
-            txn.rename_table(table.id, "orders_v2")?;
-            txn.add_column(table.id, &col("note"))?;
+            tx.rename_table(table.id, "orders_v2")?;
+            tx.add_column(table.id, &col("note"))?;
             Ok(())
         })
         .await
@@ -143,19 +143,19 @@ async fn ddl_commits_are_visible_and_time_travelable() {
 async fn drop_ends_versions_and_schema_version_tracks_ddl() {
     let catalog = open_memory().await;
     let s1 = catalog
-        .commit(|txn| {
-            let s = txn.create_schema("tmp")?;
-            txn.create_table(s, "t", &[col("a")])?;
+        .commit(|tx| {
+            let s = tx.create_schema("tmp")?;
+            tx.create_table(s, "t", &[col("a")])?;
             Ok(())
         })
         .await
         .unwrap();
     let s2 = catalog
-        .commit(|txn| {
-            let schema = txn.schema_by_name("tmp").expect("committed above");
-            let table = txn.table_by_name(schema.id, "t").expect("committed above");
-            txn.drop_table(table.id)?;
-            txn.drop_schema(schema.id)?;
+        .commit(|tx| {
+            let schema = tx.schema_by_name("tmp").expect("committed above");
+            let table = tx.table_by_name(schema.id, "t").expect("committed above");
+            tx.drop_table(table.id)?;
+            tx.drop_schema(schema.id)?;
             Ok(())
         })
         .await
@@ -176,7 +176,7 @@ async fn drop_ends_versions_and_schema_version_tracks_ddl() {
 #[tokio::test]
 async fn empty_commit_mints_no_snapshot() {
     let catalog = open_memory().await;
-    let id = catalog.commit(|_txn| Ok(())).await.unwrap();
+    let id = catalog.commit(|_tx| Ok(())).await.unwrap();
     assert_eq!(id, SnapshotId::new(0));
     let err = catalog.snapshot_at(SnapshotId::new(1)).await.unwrap_err();
     assert!(matches!(err, Error::NotFound(_)));
@@ -187,15 +187,15 @@ async fn empty_commit_mints_no_snapshot() {
 async fn logical_errors_abort_the_commit() {
     let catalog = open_memory().await;
     catalog
-        .commit(|txn| {
-            txn.create_schema("sales")?;
+        .commit(|tx| {
+            tx.create_schema("sales")?;
             Ok(())
         })
         .await
         .unwrap();
     let err = catalog
-        .commit(|txn| {
-            txn.create_schema("sales")?;
+        .commit(|tx| {
+            tx.create_schema("sales")?;
             Ok(())
         })
         .await
@@ -211,27 +211,27 @@ async fn logical_errors_abort_the_commit() {
 async fn dropped_column_field_ids_are_not_reused_across_commits() {
     let catalog = open_memory().await;
     catalog
-        .commit(|txn| {
-            let s = txn.create_schema("s")?;
-            txn.create_table(s, "t", &[col("a"), col("b")])?;
+        .commit(|tx| {
+            let s = tx.create_schema("s")?;
+            tx.create_table(s, "t", &[col("a"), col("b")])?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(|txn| {
-            let schema = txn.schema_by_name("s").expect("committed above");
-            let table = txn.table_by_name(schema.id, "t").expect("committed above");
-            txn.drop_column(table.id, ColumnId::new(2))?;
+        .commit(|tx| {
+            let schema = tx.schema_by_name("s").expect("committed above");
+            let table = tx.table_by_name(schema.id, "t").expect("committed above");
+            tx.drop_column(table.id, ColumnId::new(2))?;
             Ok(())
         })
         .await
         .unwrap();
     catalog
-        .commit(|txn| {
-            let schema = txn.schema_by_name("s").expect("committed above");
-            let table = txn.table_by_name(schema.id, "t").expect("committed above");
-            let id = txn.add_column(table.id, &col("c"))?;
+        .commit(|tx| {
+            let schema = tx.schema_by_name("s").expect("committed above");
+            let table = tx.table_by_name(schema.id, "t").expect("committed above");
+            let id = tx.add_column(table.id, &col("c"))?;
             assert_eq!(id, ColumnId::new(3), "field id 2 must not be reused");
             Ok(())
         })

@@ -56,6 +56,10 @@ id_type!(
     /// Identifies a delete file.
     DeleteFileId
 );
+id_type!(
+    /// Identifies a view.
+    ViewId
+);
 
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
@@ -210,6 +214,21 @@ pub struct TableInfo {
     pub name: String,
 }
 
+/// A live view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewInfo {
+    /// The view's id.
+    pub id: ViewId,
+    /// The schema the view belongs to.
+    pub schema_id: SchemaId,
+    /// The view's name, unique among the schema's live tables and views.
+    pub name: String,
+    /// SQL dialect of the definition.
+    pub dialect: String,
+    /// The view's defining SQL.
+    pub sql: String,
+}
+
 /// A column definition: the input to table creation and column addition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -265,6 +284,28 @@ pub struct SnapshotInfo {
     pub schema_version: u64,
 }
 
+/// An option scope: global, or one schema or table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionScope {
+    /// Catalog-wide.
+    Global,
+    /// One schema.
+    Schema(SchemaId),
+    /// One table.
+    Table(TableId),
+}
+
+impl OptionScope {
+    /// Returns scope key components as (`scope_type`, `id`).
+    pub(crate) fn key_components(self) -> (u64, u64) {
+        match self {
+            Self::Global => (0, 0),
+            Self::Schema(id) => (1, id.get()),
+            Self::Table(id) => (2, id.get()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +320,6 @@ mod tests {
         assert_eq!(SchemaId::new(4).to_string(), "4");
         assert_eq!(DataFileId::new(9).get(), 9);
         assert_eq!(DeleteFileId::new(8).to_string(), "8");
+        assert_eq!(ViewId::new(5).get(), 5);
     }
 }

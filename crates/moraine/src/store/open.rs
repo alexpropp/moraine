@@ -44,11 +44,11 @@ mod tests {
         let snap = Key::Snap { snapshot_id: 1 }.encode();
         let table = Key::cur(key::EntityKey::Table { table_id: 7 }).encode();
 
-        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        txn.put(&head, b"head").unwrap();
-        txn.put(&snap, b"snap").unwrap();
-        txn.put(&table, b"table").unwrap();
-        txn.commit_with_options(&WriteOptions {
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(&head, b"head").unwrap();
+        tx.put(&snap, b"snap").unwrap();
+        tx.put(&table, b"table").unwrap();
+        tx.commit_with_options(&WriteOptions {
             await_durable: true,
             ..Default::default()
         })

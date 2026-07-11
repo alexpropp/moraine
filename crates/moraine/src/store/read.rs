@@ -7,7 +7,12 @@ use crate::{
     error::{Error, Result},
     store::{
         key::{CurKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
-        proto, value,
+        proto::{
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
+            HeadValue, MigrationValue, OptionScopeValue, SchemaValue, SnapshotValue,
+            TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+        },
+        value,
     },
 };
 
@@ -17,60 +22,72 @@ use crate::{
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EntityRecord {
     /// A schema record.
-    Schema(proto::SchemaValue),
+    Schema(SchemaValue),
     /// A table record.
-    Table(proto::TableValue),
+    Table(TableValue),
+    /// A view record.
+    View(ViewValue),
     /// A column record.
-    Column(proto::ColumnValue),
+    Column(ColumnValue),
     /// A data file record.
-    File(proto::DataFileValue),
+    File(DataFileValue),
     /// A delete file record.
-    DeleteFile(proto::DeleteFileValue),
+    DeleteFile(DeleteFileValue),
     /// File-level column statistics record.
-    FileColumnStats(proto::FileColumnStatsValue),
+    FileColumnStats(FileColumnStatsValue),
     /// Table-level statistics record.
-    TableStats(proto::TableStatsValue),
+    TableStats(TableStatsValue),
     /// Table-level column statistics record.
-    TableColumnStats(proto::TableColumnStatsValue),
+    TableColumnStats(TableColumnStatsValue),
+    /// An option-scope record; the scope lives in the key, not the value.
+    Option {
+        /// Scope kind: global = 0, schema = 1, table = 2.
+        scope_kind: u64,
+        /// Scope id (0 for global).
+        scope_id: u64,
+        /// The scope's options map.
+        value: OptionScopeValue,
+    },
 }
 
 async fn read_singleton<M: prost::Message + Default>(
-    txn: &DbTransaction,
+    tx: &DbTransaction,
     key: Key,
 ) -> Result<Option<M>> {
-    match txn.get(key.encode()).await.map_err(Error::from)? {
+    match tx.get(key.encode()).await.map_err(Error::from)? {
         Some(bytes) => Ok(Some(value::decode_value(&bytes)?)),
         None => Ok(None),
     }
 }
 
 /// The layout-format stamp, if the store has been initialized.
-pub(crate) async fn read_format(txn: &DbTransaction) -> Result<Option<proto::FormatValue>> {
-    read_singleton(txn, Key::Sys(SysKey::Format)).await
+pub(crate) async fn read_format(tx: &DbTransaction) -> Result<Option<FormatValue>> {
+    read_singleton(tx, Key::Sys(SysKey::Format)).await
 }
 
 /// The structural-migration marker, present only mid-migration.
-pub(crate) async fn read_migration(txn: &DbTransaction) -> Result<Option<proto::MigrationValue>> {
-    read_singleton(txn, Key::Sys(SysKey::Migration)).await
+pub(crate) async fn read_migration(tx: &DbTransaction) -> Result<Option<MigrationValue>> {
+    read_singleton(tx, Key::Sys(SysKey::Migration)).await
 }
 
 /// The head pointer: the latest committed snapshot id.
-pub(crate) async fn read_head(txn: &DbTransaction) -> Result<Option<proto::HeadValue>> {
-    read_singleton(txn, Key::Sys(SysKey::Head)).await
+pub(crate) async fn read_head(tx: &DbTransaction) -> Result<Option<HeadValue>> {
+    read_singleton(tx, Key::Sys(SysKey::Head)).await
 }
 
 /// One snapshot record.
 pub(crate) async fn read_snapshot(
-    txn: &DbTransaction,
+    tx: &DbTransaction,
     snapshot_id: u64,
-) -> Result<Option<proto::SnapshotValue>> {
-    read_singleton(txn, Key::Snap { snapshot_id }).await
+) -> Result<Option<SnapshotValue>> {
+    read_singleton(tx, Key::Snap { snapshot_id }).await
 }
 
 fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
     match entity {
         EntityKey::Schema { .. } => Ok(EntityRecord::Schema(value::decode_value(bytes)?)),
         EntityKey::Table { .. } => Ok(EntityRecord::Table(value::decode_value(bytes)?)),
+        EntityKey::View { .. } => Ok(EntityRecord::View(value::decode_value(bytes)?)),
         EntityKey::Column { .. } => Ok(EntityRecord::Column(value::decode_value(bytes)?)),
         EntityKey::File { .. } => Ok(EntityRecord::File(value::decode_value(bytes)?)),
         EntityKey::DeleteFile { .. } => Ok(EntityRecord::DeleteFile(value::decode_value(bytes)?)),
@@ -81,6 +98,14 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
         EntityKey::TableColumnStats { .. } => {
             Ok(EntityRecord::TableColumnStats(value::decode_value(bytes)?))
         }
+        EntityKey::Option {
+            scope_kind,
+            scope_id,
+        } => Ok(EntityRecord::Option {
+            scope_kind,
+            scope_id,
+            value: value::decode_value(bytes)?,
+        }),
         other => Err(Error::Corruption(format!(
             "entity kind not modeled by this binary: {other:?}"
         ))),
@@ -88,8 +113,8 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
 }
 
 /// Every live entity record.
-pub(crate) async fn scan_cur_entities(txn: &DbTransaction) -> Result<Vec<EntityRecord>> {
-    let mut iter = txn
+pub(crate) async fn scan_cur_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
+    let mut iter = tx
         .scan_prefix(subspace_prefix(Subspace::Cur), ..)
         .await
         .map_err(Error::from)?;
@@ -114,8 +139,8 @@ pub(crate) async fn scan_cur_entities(txn: &DbTransaction) -> Result<Vec<EntityR
 }
 
 /// Every ended entity-version record.
-pub(crate) async fn scan_hist_entities(txn: &DbTransaction) -> Result<Vec<EntityRecord>> {
-    let mut iter = txn
+pub(crate) async fn scan_hist_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
+    let mut iter = tx
         .scan_prefix(subspace_prefix(Subspace::Hist), ..)
         .await
         .map_err(Error::from)?;
@@ -130,6 +155,7 @@ pub(crate) async fn scan_hist_entities(txn: &DbTransaction) -> Result<Vec<Entity
             }
         }
     }
+
     Ok(records)
 }
 
@@ -144,11 +170,12 @@ mod tests {
     use crate::store::open::open_store;
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn reads_decode_what_was_written() {
         let db = open_store("t", Arc::new(InMemory::new())).await.unwrap();
 
-        let head = proto::HeadValue { snapshot_id: 3 };
-        let schema = proto::SchemaValue {
+        let head = HeadValue { snapshot_id: 3 };
+        let schema = SchemaValue {
             schema_id: 1,
             schema_uuid: "u".into(),
             begin_snapshot: 1,
@@ -157,37 +184,37 @@ mod tests {
             path: "main/".into(),
             path_is_relative: true,
         };
-        let ended = proto::SchemaValue {
+        let ended = SchemaValue {
             schema_id: 0,
             end_snapshot: Some(2),
             ..schema.clone()
         };
 
-        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        txn.put(Key::Sys(SysKey::Head).encode(), value::encode_value(&head))
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(Key::Sys(SysKey::Head).encode(), value::encode_value(&head))
             .unwrap();
-        txn.put(
+        tx.put(
             Key::cur(EntityKey::Schema { schema_id: 1 }).encode(),
             value::encode_value(&schema),
         )
         .unwrap();
-        txn.put(
+        tx.put(
             Key::hist(EntityKey::Schema { schema_id: 0 }, 2).encode(),
             value::encode_value(&ended),
         )
         .unwrap();
-        let tstat = proto::TableStatsValue {
+        let tstat = TableStatsValue {
             table_id: 7,
             record_count: 10,
             next_row_id: 10,
             file_size_bytes: 1024,
         };
-        txn.put(
+        tx.put(
             Key::cur(EntityKey::TableStats { table_id: 7 }).encode(),
             value::encode_value(&tstat),
         )
         .unwrap();
-        let file = proto::DataFileValue {
+        let file = DataFileValue {
             data_file_id: 3,
             table_id: 7,
             begin_snapshot: 1,
@@ -206,7 +233,7 @@ mod tests {
             partial_max: None,
             partition_values: vec![],
         };
-        txn.put(
+        tx.put(
             Key::cur(EntityKey::File {
                 table_id: 7,
                 data_file_id: 3,
@@ -215,27 +242,64 @@ mod tests {
             value::encode_value(&file),
         )
         .unwrap();
-        txn.commit_with_options(&WriteOptions {
+
+        let view = ViewValue {
+            view_id: 4,
+            view_uuid: "uv".into(),
+            begin_snapshot: 1,
+            end_snapshot: None,
+            schema_id: 1,
+            view_name: "v".into(),
+            dialect: "duckdb".into(),
+            sql: "SELECT 1".into(),
+            column_aliases: None,
+        };
+        tx.put(
+            Key::cur(EntityKey::View { view_id: 4 }).encode(),
+            value::encode_value(&view),
+        )
+        .unwrap();
+
+        let mut options = std::collections::HashMap::new();
+        options.insert("key1".into(), "value1".into());
+        let option = OptionScopeValue { options };
+        tx.put(
+            Key::cur(EntityKey::Option {
+                scope_kind: 0,
+                scope_id: 0,
+            })
+            .encode(),
+            value::encode_value(&option),
+        )
+        .unwrap();
+
+        tx.commit_with_options(&WriteOptions {
             await_durable: true,
             ..Default::default()
         })
         .await
         .unwrap();
 
-        let txn = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        assert_eq!(read_head(&txn).await.unwrap(), Some(head));
-        assert_eq!(read_format(&txn).await.unwrap(), None);
-        assert_eq!(read_migration(&txn).await.unwrap(), None);
-        assert_eq!(read_snapshot(&txn, 0).await.unwrap(), None);
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert_eq!(read_head(&tx).await.unwrap(), Some(head));
+        assert_eq!(read_format(&tx).await.unwrap(), None);
+        assert_eq!(read_migration(&tx).await.unwrap(), None);
+        assert_eq!(read_snapshot(&tx, 0).await.unwrap(), None);
 
-        let cur = scan_cur_entities(&txn).await.unwrap();
-        assert_eq!(cur.len(), 3);
+        let cur = scan_cur_entities(&tx).await.unwrap();
+        assert_eq!(cur.len(), 5);
         assert!(cur.contains(&EntityRecord::Schema(schema)));
         assert!(cur.contains(&EntityRecord::File(file)));
         assert!(cur.contains(&EntityRecord::TableStats(tstat)));
-        let hist = scan_hist_entities(&txn).await.unwrap();
+        assert!(cur.contains(&EntityRecord::View(view)));
+        assert!(cur.contains(&EntityRecord::Option {
+            scope_kind: 0,
+            scope_id: 0,
+            value: option,
+        }));
+        let hist = scan_hist_entities(&tx).await.unwrap();
         assert_eq!(hist, vec![EntityRecord::Schema(ended)]);
-        txn.rollback();
+        tx.rollback();
         db.close().await.unwrap();
     }
 }
