@@ -1,16 +1,34 @@
-//! DuckDB extension packaging for [moraine].
+//! DuckDB extension for [moraine]: attaches a moraine store as a DuckDB
+//! catalog. Three layers, thin by policy — no DuckLake domain logic lives
+//! outside the core crate:
 //!
-//! Thin by policy: no DuckLake domain logic — only `StorageExtension`
-//! registration, C-ABI marshalling, and the sync↔async bridge. If logic
-//! accumulates here, it belongs in the core crate.
+//! 1. a **C++ shim** (`cpp/*.cpp`, compiled by `build.rs`) links DuckDB's
+//!    internal C++ API and registers a `StorageExtension`;
+//! 2. a **C ABI** (the [`abi`] module, mirrored by hand in
+//!    `cpp/moraine_abi.h`) marshals calls across the language boundary and
+//!    owns the sync↔async bridge — one tokio runtime per attached catalog,
+//!    `block_on` at every entry point, `catch_unwind` so a core panic
+//!    surfaces as an error code, never an unwind into C++;
+//! 3. the async [moraine] core, unaware any of this exists.
 //!
-//! moraine is a DuckLake catalog backend:
-//! a thin C++ shim registers a DuckDB `StorageExtension` and delegates over a
-//! C ABI to this crate's Rust core, which bridges to async [moraine].
+//! **Works, against a real DuckDB CLI:** `LOAD`; `ATTACH '<path>' AS m
+//! (TYPE moraine)` (a standalone attach type — `ducklake:` chaining is a
+//! later integration); schema/table/view listing (`duckdb_databases()`,
+//! `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`); `SELECT`/
+//! `DESCRIBE` on a table, which scans its live data files by resolving
+//! their paths through the listing ABI and delegating to DuckDB's own
+//! `read_parquet` (see `README.md`'s "Table scans" section).
 //!
-//! **Status: stub.** Extension entry points are not built yet; until then
-//! this builds an empty cdylib so packaging and CI plumbing can be exercised.
+//! **Not implemented, throws `NotImplementedException`:** every write
+//! path, and querying a view's definition (no SQL parser vendored).
+//!
+//! **Single writer.** Attach always opens a read-write [`moraine::Catalog`]
+//! — there is no read-only attach option yet — so only one process may
+//! hold a given store attached; a second attach fences the first's writer
+//! rather than failing itself. See `README.md` for the pinned build shape.
 
-// The `moraine` dependency is declared now so the crates are wired; silence
-// the unused warning until entry points land.
-use moraine as _;
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod abi;
+pub mod error;
+pub mod runtime;

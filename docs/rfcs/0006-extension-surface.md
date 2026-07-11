@@ -31,10 +31,15 @@ in `moraine`.
 
 ### Non-goals
 
-- **A standalone `ATTACH 'moraine:...'` DuckDB catalog** (queryable without
-  the `ducklake` extension). Deferred — no near-term consumer, and it adds
-  DuckDB-catalog surface area orthogonal to every hard problem, which is the
-  DuckLake path. The `moraine` core remains a standalone Rust library
+- **Finalized `ducklake:` chaining.** A standalone moraine attach —
+  `ATTACH '<path>' AS m (TYPE moraine)` — is now the DECIDED first surface
+  (the extension-loads slice registers it and serves attach, read-only
+  metadata, and table scans), reversing this RFC's earlier deferral: it is
+  the smallest real end-to-end proof of the shim/ABI/core stack, and every
+  layer it exercises is on the DuckLake path anyway. What stays out of
+  scope for that slice is the chaining question — how DuckLake's
+  `ducklake:` prefix names or nests the moraine attach (see Open
+  questions). The `moraine` core remains a standalone Rust library
   regardless.
 - **Semantic projection of the catalog** (storing a re-modeled form and
   projecting it into `ducklake_*` on read). Deferred as a possible
@@ -193,6 +198,52 @@ regardless of the language it is written in.
   and `block_on`s core futures, so the C++ shim only ever calls synchronous C
   functions. This is the "FFI boundary" of RFC 0001's async rule.
 
+### C ABI error mapping (v0)
+
+Pinned by the extension-loads slice (`moraine-duckdb/src/error.rs`, `mod
+codes`). Every fallible C-ABI entry point returns an `i32` code and, on
+failure, fills a caller-provided `(code, message)` pair (`MoraineError`);
+messages are UTF-8, allocated by Rust, and freed only via the exported
+`moraine_error_free`. Every entry point wraps its whole body — `block_on`
+included — in `catch_unwind`, so a core panic surfaces as a code, never as
+an unwind into C++. The shim translates codes to DuckDB exceptions:
+
+| Code | ABI constant | Source | Shim raises |
+|---|---|---|---|
+| 0 | `OK` | success | — |
+| 1 | `NOT_FOUND` | `Error::NotFound` | `CatalogException` |
+| 2 | `ALREADY_EXISTS` | `Error::AlreadyExists` | `CatalogException` |
+| 3 | `CONSTRAINT` | `Error::Constraint` | `CatalogException` |
+| 4 | `COMMIT_CONFLICT` | `Error::CommitConflict` | `TransactionException` |
+| 5 | `CORRUPTION` | `Error::Corruption`, plus catalog strings that cannot cross the boundary (embedded NUL) | `IOException` |
+| 6 | `STORE` | `Error::Store` (and, conservatively, any future core variant) | `IOException` |
+| 7 | `INVALID_ARGUMENT` | ABI-layer validation: null pointer, invalid UTF-8, unsupported store scheme | `InvalidInputException` |
+| 8 | `INTERNAL` | a panic caught at the FFI boundary | `InternalException` |
+| 9 | `INTERRUPTED` | `moraine_interrupt` cancelled the read in flight (or about to start) on the handle | `InterruptException` |
+
+Wire contract: the `COMMIT_CONFLICT` message always contains the literal
+substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
+that substring (see the Transactions bullet above) — so the message text
+is part of the ABI contract, not incidental diagnostics.
+
+### Read cancellation seam
+
+Pinned by the extension-loads slice (`moraine-duckdb/src/{abi,runtime}.rs`).
+Each attached handle owns one `tokio::sync::Notify` (`runtime.rs`) alongside
+its runtime and catalog. `moraine_interrupt(handle)` calls `notify_one`;
+cancellable read entry points (`moraine_snapshot`) `block_on` a `select!`
+between the core future and `notify.notified()`, `biased` toward the
+interrupt so a pending signal always wins a tie. `Notify`'s `notify_one`
+semantics make the signal single-use without extra bookkeeping: it either
+wakes a read already waiting, or stores exactly one permit consumed by the
+next `notified()` call — either way it is consumed by the read that
+observes it, so an interrupt never carries over to a later, unrelated read.
+This assumes at most one cancellable read in flight per handle at a time;
+concurrent multi-read cancellation and commit-path shielding (no commit
+path exists in the ABI yet) are both out of scope for this slice. The seam
+is scaffolding only: the C++ shim does not yet call `moraine_interrupt`
+anywhere, so Ctrl-C during a blocked snapshot read is not wired up yet.
+
 ### Version pinning and distribution
 
 Linking DuckDB's C++ internals ties the extension to a specific DuckDB build;
@@ -219,6 +270,74 @@ allocation, the five primary keys) were verified on `main` @ `34db89b`
 between the two are cosmetic (accessor renames, formatting). The e2e suite
 regression-pins against the table above; moving any row of it is a
 deliberate, reviewed bump.
+
+### Build and pin mechanics (as implemented)
+
+The extension-loads slice discovered and pinned the concrete build shape
+this RFC left open above.
+
+**Header vendoring.** The C++ shim compiles against DuckDB's amalgamated
+`duckdb.hpp` (the single-header release asset), vendored under
+`vendor/duckdb-v1.5.4/`, plus 9 supplementary headers the amalgamation
+forward-declares but never defines (`StorageExtension`, catalog-entry base
+classes, `CreateInfo` variants, and their transitive dependencies) — each
+fetched byte-for-byte from the DuckDB source tree at the `v1.5.4` tag with
+a provenance comment recording where it came from and why it's needed. No
+DuckDB library is linked and `duckdb.cpp` itself is never compiled: a
+loadable extension is `dlopen`'d into a process that has already resolved
+every DuckDB symbol, so the shim only needs to compile against
+declarations, not link definitions (`-undefined dynamic_lookup` on macOS;
+tolerated by default on Linux `-shared` links). This keeps the build to a
+few seconds instead of paying for a from-source DuckDB build.
+
+**Entry point and packaging.** DuckDB's loader `dlsym`s a fixed entry
+symbol derived from the artifact's filename with every `.`-suffix
+stripped, so the packaged file must carry exactly one dot
+(`moraine_duckdb.duckdb_extension` → `moraine_duckdb_duckdb_cpp_init`). The
+loader also requires a trailing 512-byte metadata footer (ABI type,
+extension version, the exact DuckDB version string, target platform, magic
+value, and a signature region left zero for unsigned local loading)
+appended after the compiled cdylib's bytes. Both the artifact rename and
+the footer construction live in `xtask`, not a throwaway script, so
+`cargo xtask e2e` produces a real loadable `.duckdb_extension` from a
+plain `cargo build` output on every run.
+
+**e2e harness.** `cargo xtask e2e` downloads and caches the pinned DuckDB
+CLI under `target/` (skipping the fetch once cached), then drives it with
+`-unsigned` — required because the extension is never actually signed —
+through `LOAD`, `ATTACH`, listing, and scan queries against a store seeded
+through the `moraine` API.
+
+**Recorded upgrade path.** The amalgamated single-header build is
+sufficient for this slice's read-only attach/listing/scan surface because
+none of it needs DuckDB's parser types. Two things this slice deliberately
+did not vendor — the SQL parser (needed to bind a view's stored query) and
+the internal binder/relation APIs (needed to call a table function's own
+bind callback directly, which is how DuckLake and DuckDB's built-in
+scanners construct scans) — pull in a large, non-self-contained transitive
+chain the amalgamation doesn't expose. When a later slice forces deeper
+internals anyway (DuckLake chaining is the likely trigger), the build
+should move to DuckDB's full source-tree headers, at which point both view
+query binding and a native scan bind can replace the workarounds below.
+
+### Table scan (as implemented)
+
+This slice's scan hook does not yet implement the "Scan" design above in
+full: no projection/filter pushdown, no delete-file filtering, no row-id
+lineage. What the catalog gives DuckDB is a table's live data-file paths
+and its schema, resolved through the listing ABI — the shim never reads
+Parquet bytes itself. Lacking the binder access the upgrade path above
+would give it, the shim instead opens a fresh connection to the same
+DuckDB database instance and issues an internal, streamed `read_parquet`
+SQL query over the resolved paths, pulling one chunk at a time so a long
+scan still yields to DuckDB's own scheduling between chunks; an empty file
+list reports zero rows without ever calling `read_parquet` (which errors
+on an empty list). File paths are resolved once at scan-function bind time
+and not pinned to a snapshot thereafter, so nothing yet holds a file alive
+against concurrent GC/expiry — a gap this RFC's read-cancellation and
+version-pinning sections don't yet close, tracked as future work once GC
+exists. The SQL-text route is a working, correctness-preserving stand-in
+for a native scan bind, not the target design.
 
 ## Open questions
 
@@ -269,10 +388,12 @@ deliberate, reviewed bump.
 
 ## Alternatives considered
 
-- **A2 — a standalone `ATTACH 'moraine:...'` DuckDB catalog** in addition to
-  the DuckLake surface. Deferred, not rejected forever: it adds a second
-  DuckDB-catalog surface with no near-term consumer while every hard problem
-  lives on the DuckLake path. Revisit if a direct-query use case appears.
+- **A2 — a standalone moraine `ATTACH` DuckDB catalog** in addition to
+  the DuckLake surface. Originally deferred; since **adopted** as the first
+  shipping surface (`ATTACH ... (TYPE moraine)`, see Non-goals) — not for a
+  direct-query consumer, but because it proves the shim/ABI/core stack
+  end-to-end with the least machinery while the DuckLake chaining
+  ergonomics are still open.
 - **B2 — semantic projection.** Store a re-modeled catalog form and project it
   into the `ducklake_*` views on read, translating writes back. Rejected for
   v1: it couples moraine to DuckLake's exact SQL shapes and re-encodes logic

@@ -12,6 +12,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 moraine = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
+
+[build-dependencies]
+cc = { workspace = true }
 
 [lints]
 workspace = true

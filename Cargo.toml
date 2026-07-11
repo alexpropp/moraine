@@ -12,6 +12,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 anyhow = "1"
 bytes = "1"
+cc = "1"
 moraine = { path = "crates/moraine", version = "0.1.0" }
 # object_store must stay on the same minor as slatedb's
 object_store = "0.14"

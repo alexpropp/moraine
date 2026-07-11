@@ -11,9 +11,9 @@
 
 ### DuckDB extension loads
 - [ ] RFC 0006: extension surface (moraine as a DuckLake catalog via a DuckDB `StorageExtension`)
-- [ ] C++ shim registering the `StorageExtension`/`Catalog`/`TransactionManager`, over a C ABI to the Rust core
-- [ ] Extension entry points in `moraine-duckdb`
-- [ ] `cargo xtask e2e` loads the extension into a real DuckDB
+- [x] C++ shim registering the `StorageExtension`/`Catalog`/`TransactionManager`, over a C ABI to the Rust core
+- [x] Extension entry points in `moraine-duckdb`
+- [x] `cargo xtask e2e` loads the extension into a real DuckDB
 
 ### DuckLake end-to-end
 - [ ] DuckLake SQL operations against moraine as the catalog
