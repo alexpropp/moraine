@@ -108,7 +108,14 @@ bump that alters encoding) fails CI before it can reach a store.
 
 ### Keyspace map
 
-Kinds within `cur` (and mirrored in `hist` with `end_snapshot` appended):
+Kinds within `cur`. Temporally versioned kinds are mirrored in `hist`
+with `end_snapshot` appended; the **statistics kinds (`fstat`, `tstat`,
+`tcstat`) are unversioned** — DuckLake's stats tables carry no begin/end
+columns, so these records are overwritten in place, never transition to
+`hist`, and a time-travel view serves the current stats (stats are
+advisory pruning data, not catalog history). An `fstat` record outlives
+its file's live version — historical snapshots still prune by it — and
+is removed only when RFC 0007 GC prunes the file's history:
 
 | Kind | Key components | DuckLake table(s) |
 |---|---|---|

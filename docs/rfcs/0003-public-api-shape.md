@@ -236,8 +236,12 @@ semantics and the entities RFC 0002 maps:
 
 Notes:
 
-- `ducklake_files_scheduled_for_deletion` (RFC 0002 `gcfile`) is written
-  internally by the `expire_*` operations — it is not a public verb.
+- `ducklake_files_scheduled_for_deletion` (RFC 0002 `gcfile`) has no public
+  verb, and the `expire_*` operations do **not** write it: expiring a file
+  only ends its live version into history — historical snapshots still
+  reference the bytes, so scheduling physical deletion belongs to the
+  RFC 0007 expiry commit, which writes `gcfile` records when it prunes the
+  `hist` records below the retention horizon.
 - `alter_column` is one verb taking an optional change per attribute, rather
   than three verbs, because DuckLake models a column alteration as a single
   new column version regardless of which attributes changed.

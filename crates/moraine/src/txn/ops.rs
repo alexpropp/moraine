@@ -13,8 +13,8 @@ pub(crate) enum Op {
     CreateSchema {
         /// The new schema's id.
         schema_id: u64,
-        /// The new schema's name, needed to serialize the created-schema
-        /// entry in DuckLake's name-quoted `changes_made` grammar.
+        /// The new schema's name (the `changes_made` grammar carries
+        /// names for created entries).
         name: String,
     },
     /// A schema was dropped.
@@ -28,8 +28,7 @@ pub(crate) enum Op {
         schema_id: u64,
         /// The new table's id.
         table_id: u64,
-        /// The owning schema's name, needed to serialize the
-        /// created-table entry as `"schema"."table"`.
+        /// The owning schema's name, serialized as `"schema"."table"`.
         schema_name: String,
         /// The new table's name.
         table_name: String,
@@ -44,13 +43,38 @@ pub(crate) enum Op {
         /// The dropped table's id.
         table_id: u64,
     },
+    /// Data was appended to a table.
+    RegisterDataFile {
+        /// The table rows were inserted into.
+        table_id: u64,
+    },
+    /// Delete markers were appended to a table.
+    RegisterDeleteFile {
+        /// The table delete markers were appended to.
+        table_id: u64,
+    },
+    /// Data file(s) became eligible for garbage collection via merge.
+    ExpireDataFile {
+        /// The table whose data files were merged.
+        table_id: u64,
+    },
+    /// Delete marker file(s) became eligible for garbage collection.
+    ExpireDeleteFile {
+        /// The table whose delete marker files were cleaned up.
+        table_id: u64,
+    },
+    /// Table statistics were updated.
+    UpdateStats {
+        /// The table whose statistics changed. Exists so a stats-only
+        /// commit mints a snapshot; feeds no change-set entry and no
+        /// conflict detection.
+        table_id: u64,
+    },
 }
 
 impl Op {
-    /// Whether this op changes the catalog's shape (and therefore bumps
-    /// the schema version). Every op in this set currently does; the
-    /// method exists so data-only ops classify explicitly when they
-    /// arrive, never by inference from the write set.
+    /// Whether this op changes the catalog's shape (and bumps the schema
+    /// version). Explicit per op — never inferred from the write set.
     pub(crate) fn is_schema_changing(&self) -> bool {
         match self {
             Op::CreateSchema { .. }
@@ -58,6 +82,11 @@ impl Op {
             | Op::CreateTable { .. }
             | Op::AlterTable { .. }
             | Op::DropTable { .. } => true,
+            Op::RegisterDataFile { .. }
+            | Op::RegisterDeleteFile { .. }
+            | Op::ExpireDataFile { .. }
+            | Op::ExpireDeleteFile { .. }
+            | Op::UpdateStats { .. } => false,
         }
     }
 }
@@ -74,14 +103,13 @@ fn quote_ident(s: &str) -> String {
         out.push(c);
     }
     out.push('"');
+
     out
 }
 
-/// Parses one SQL-quoted identifier at the start of `s` (which must begin
-/// with `"`), undoubling embedded quotes. Returns the unquoted value and
-/// the remainder of `s` following the closing quote, or `None` if `s` is
-/// not a validly quoted, terminated identifier — DuckLake's
-/// `ParseQuotedValue` counterpart.
+/// Parses one SQL-quoted identifier at the start of `s`, undoubling
+/// embedded quotes; returns the value and the remainder, or `None` if
+/// unterminated.
 fn parse_quoted(s: &str) -> Option<(String, &str)> {
     let rest = s.strip_prefix('"')?;
     let mut value = String::new();
@@ -98,6 +126,7 @@ fn parse_quoted(s: &str) -> Option<(String, &str)> {
             return Some((value, &rest[i + 1..]));
         }
     }
+
     None
 }
 
@@ -119,11 +148,6 @@ fn parse_created_table_payload(payload: &str) -> Option<(String, String)> {
 
 /// Splits `changes_made` on top-level commas: a `"` toggles an in-quotes
 /// flag, and a comma is only an entry separator while the flag is clear.
-/// This is DuckLake's own scan (doubled quotes toggle twice in a row,
-/// which is harmless for separator purposes since no comma ever sits
-/// between the two quotes of an escape pair). Empty entries — including
-/// the sole empty entry produced by scanning an empty string — are
-/// dropped rather than treated as malformed.
 fn split_entries(changes_made: &str) -> Vec<&str> {
     let mut entries = Vec::new();
     let mut in_quotes = false;
@@ -140,6 +164,7 @@ fn split_entries(changes_made: &str) -> Vec<&str> {
     }
     entries.push(&changes_made[start..]);
     entries.retain(|e| !e.is_empty());
+
     entries
 }
 
@@ -154,27 +179,29 @@ pub(crate) struct ChangeSet {
     /// Names of schemas created by this commit, unquoted.
     pub(crate) created_schemas: BTreeSet<String>,
     pub(crate) dropped_schemas: BTreeSet<u64>,
-    /// `(schema name, table name)` pairs, unquoted. DuckLake's grammar
-    /// carries names, not ids, for created entries, so a parsed
-    /// `ChangeSet` cannot recover the schema *id* a created table lives
-    /// in from this field alone.
+    /// `(schema name, table name)` pairs, unquoted — the grammar carries
+    /// names, not ids, for created entries.
     pub(crate) created_tables: BTreeSet<(String, String)>,
-    /// Schema ids a table was created in by this commit. Populated only
-    /// by [`Self::from_ops`] — the wire grammar has no id for created
-    /// entries, so a set built by [`Self::parse`] always leaves this
-    /// empty. It feeds the create-inside-dropped-schema conflict check
-    /// for *our own* side only; the symmetric risk on the intervening
-    /// side is covered by the closure re-run on retry re-validating
-    /// against the state that won, mirroring DuckLake, whose own
-    /// `CheckForConflicts` likewise tests only its own creations against
-    /// others' schema drops.
+    /// Schema ids a table was created in. Populated only by
+    /// [`Self::from_ops`] (the wire grammar has no ids for created
+    /// entries); feeds the create-inside-dropped-schema check for our own
+    /// side only — the other direction re-validates on retry.
     pub(crate) created_table_schema_ids: BTreeSet<u64>,
     pub(crate) altered_tables: BTreeSet<u64>,
     pub(crate) dropped_tables: BTreeSet<u64>,
-    /// Set when parsing met an entry kind or payload this binary does not
-    /// model — including known-DuckLake kinds moraine does not yet emit
-    /// (e.g. `inserted_into_table`, `inline_flush`, `created_view`).
-    /// Unknown changes classify as conflicting — never silently benign.
+    /// Tables data was appended to.
+    pub(crate) inserted_tables: BTreeSet<u64>,
+    /// Tables delete markers were appended to.
+    pub(crate) deleted_from_tables: BTreeSet<u64>,
+    /// Tables whose data files were merged away.
+    pub(crate) merge_adjacent_tables: BTreeSet<u64>,
+    /// Tables whose delete files were rewritten away.
+    pub(crate) rewrite_delete_tables: BTreeSet<u64>,
+    /// Parse-only legacy `compacted_table` kind; never emitted,
+    /// classifies as compaction.
+    pub(crate) compacted_tables: BTreeSet<u64>,
+    /// Set when parsing met a kind or payload this binary does not
+    /// model. Unknown changes classify as conflicting, never benign.
     pub(crate) has_unknown: bool,
 }
 
@@ -205,6 +232,22 @@ impl ChangeSet {
                 Op::DropTable { table_id } => {
                     set.dropped_tables.insert(*table_id);
                 }
+                Op::RegisterDataFile { table_id } => {
+                    set.inserted_tables.insert(*table_id);
+                }
+                Op::RegisterDeleteFile { table_id } => {
+                    set.deleted_from_tables.insert(*table_id);
+                }
+                Op::ExpireDataFile { table_id } => {
+                    set.merge_adjacent_tables.insert(*table_id);
+                }
+                Op::ExpireDeleteFile { table_id } => {
+                    set.rewrite_delete_tables.insert(*table_id);
+                }
+                Op::UpdateStats { .. } => {
+                    // UpdateStats does not populate any set; it exists so a
+                    // stats-only commit is non-empty and mints a snapshot.
+                }
             }
         }
         set
@@ -212,7 +255,8 @@ impl ChangeSet {
 
     /// Emits entries in DuckLake's writer order (the subset moraine
     /// emits): dropped schemas, dropped tables, created schemas, created
-    /// tables, altered tables.
+    /// tables, `inserted_into_table`, `deleted_from_table`, altered tables,
+    /// `merge_adjacent`, `rewrite_delete`.
     pub(crate) fn to_changes_made(&self) -> String {
         let mut entries = Vec::new();
         entries.extend(
@@ -236,21 +280,36 @@ impl ChangeSet {
                 .map(|(s, t)| format!("created_table:{}.{}", quote_ident(s), quote_ident(t))),
         );
         entries.extend(
+            self.inserted_tables
+                .iter()
+                .map(|id| format!("inserted_into_table:{id}")),
+        );
+        entries.extend(
+            self.deleted_from_tables
+                .iter()
+                .map(|id| format!("deleted_from_table:{id}")),
+        );
+        entries.extend(
             self.altered_tables
                 .iter()
                 .map(|id| format!("altered_table:{id}")),
+        );
+        entries.extend(
+            self.merge_adjacent_tables
+                .iter()
+                .map(|id| format!("merge_adjacent:{id}")),
+        );
+        entries.extend(
+            self.rewrite_delete_tables
+                .iter()
+                .map(|id| format!("rewrite_delete:{id}")),
         );
         entries.join(",")
     }
 
     /// Parses a stored `changes_made` string written in DuckLake's
     /// grammar. Kind matching is case-insensitive, matching DuckLake's
-    /// parser. Malformed payloads and unrecognized entry kinds — whether
-    /// truly unknown or a known-DuckLake kind moraine does not model —
-    /// set `has_unknown` instead of erroring: the record may have been
-    /// written by a peer (or a future moraine) this binary predates, and
-    /// the safe reading of "something happened that I don't understand"
-    /// is a conflict.
+    /// parser.
     pub(crate) fn parse(changes_made: &str) -> Self {
         let mut set = Self::default();
         for entry in split_entries(changes_made) {
@@ -281,13 +340,40 @@ impl ChangeSet {
                     .parse()
                     .map(|id| set.dropped_tables.insert(id))
                     .is_ok()
+            } else if kind.eq_ignore_ascii_case("inserted_into_table") {
+                payload
+                    .parse()
+                    .map(|id| set.inserted_tables.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("deleted_from_table") {
+                payload
+                    .parse()
+                    .map(|id| set.deleted_from_tables.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("merge_adjacent") {
+                payload
+                    .parse()
+                    .map(|id| set.merge_adjacent_tables.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("rewrite_delete") {
+                payload
+                    .parse()
+                    .map(|id| set.rewrite_delete_tables.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("compacted_table") {
+                payload
+                    .parse()
+                    .map(|id| set.compacted_tables.insert(id))
+                    .is_ok()
             } else {
                 false
             };
+
             if !known {
                 set.has_unknown = true;
             }
         }
+
         set
     }
 
@@ -295,26 +381,68 @@ impl ChangeSet {
         !self.created_schemas.is_empty() || !self.dropped_schemas.is_empty()
     }
 
-    fn touched_tables(&self) -> impl Iterator<Item = u64> + '_ {
-        self.altered_tables
-            .iter()
-            .chain(self.dropped_tables.iter())
-            .copied()
-    }
-
     fn creates_table_in(&self, schema_id: u64) -> bool {
         self.created_table_schema_ids.contains(&schema_id)
     }
+
+    fn table_kinds(&self) -> std::collections::BTreeMap<u64, TableKinds> {
+        let mut kinds: std::collections::BTreeMap<u64, TableKinds> =
+            std::collections::BTreeMap::new();
+        for &table_id in &self.inserted_tables {
+            kinds.entry(table_id).or_default().inserted = true;
+        }
+        for &table_id in &self.deleted_from_tables {
+            kinds.entry(table_id).or_default().deleted = true;
+        }
+        for &table_id in &self.altered_tables {
+            kinds.entry(table_id).or_default().altered = true;
+        }
+        for &table_id in &self.dropped_tables {
+            kinds.entry(table_id).or_default().dropped = true;
+        }
+        let compacted: std::collections::BTreeSet<u64> = self
+            .merge_adjacent_tables
+            .iter()
+            .chain(self.rewrite_delete_tables.iter())
+            .chain(self.compacted_tables.iter())
+            .copied()
+            .collect();
+        for &table_id in &compacted {
+            kinds.entry(table_id).or_default().compacted = true;
+        }
+
+        kinds
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct TableKinds {
+    inserted: bool,
+    deleted: bool,
+    altered: bool,
+    dropped: bool,
+    compacted: bool,
+}
+
+/// DuckLake's per-table conflict matrix, symmetric closure.
+fn kinds_conflict(a: TableKinds, b: TableKinds) -> bool {
+    let one_way = |x: TableKinds, y: TableKinds| {
+        (x.inserted && (y.altered || y.deleted || y.dropped))
+            || (x.deleted && (y.altered || y.deleted || y.compacted || y.dropped || y.inserted))
+            || (x.altered && (y.altered || y.dropped))
+            || (x.compacted && (y.deleted || y.dropped || y.compacted))
+    };
+
+    one_way(a, b) || one_way(b, a)
 }
 
 /// Whether two concurrent commits are a true conflict. Symmetric.
 ///
-/// Benign unless: either side's changes are unknown to this binary; both
-/// touch the schema list (coarse by design — schema DDL is rare); they
-/// mutated or dropped a common table; or one created a table inside a
-/// schema the other dropped. Creation ids are fresh, so creations never
-/// conflict by id — name uniqueness is re-validated by the closure
-/// re-run, not by set comparison.
+/// Benign unless: either side has unknown changes; both touch the schema
+/// list (coarse by design); a common table has incompatible kinds; or one
+/// created a table inside a schema the other dropped. Name uniqueness is
+/// re-validated by the closure re-run, not by set comparison.
 pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
     if ours.has_unknown || theirs.has_unknown {
         return true;
@@ -322,10 +450,17 @@ pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
     if ours.touches_schema_list() && theirs.touches_schema_list() {
         return true;
     }
-    let their_tables: BTreeSet<u64> = theirs.touched_tables().collect();
-    if ours.touched_tables().any(|t| their_tables.contains(&t)) {
-        return true;
+
+    let our_kinds = ours.table_kinds();
+    let their_kinds = theirs.table_kinds();
+    for (&table_id, &our_table_kinds) in &our_kinds {
+        if let Some(&their_table_kinds) = their_kinds.get(&table_id) {
+            if kinds_conflict(our_table_kinds, their_table_kinds) {
+                return true;
+            }
+        }
     }
+
     let created_in_dropped =
         |a: &ChangeSet, b: &ChangeSet| b.dropped_schemas.iter().any(|s| a.creates_table_in(*s));
     created_in_dropped(ours, theirs) || created_in_dropped(theirs, ours)
@@ -349,6 +484,89 @@ mod tests {
             schema_name: schema_name.to_owned(),
             table_name: table_name.to_owned(),
         }
+    }
+
+    #[test]
+    fn data_plane_ops_serialize_in_ducklake_order() {
+        let ops = [
+            create_schema(1, "s1"),
+            Op::RegisterDataFile { table_id: 7 },
+            Op::RegisterDeleteFile { table_id: 8 },
+            Op::ExpireDataFile { table_id: 9 },
+            Op::ExpireDeleteFile { table_id: 9 },
+            Op::AlterTable { table_id: 3 },
+            Op::UpdateStats { table_id: 7 },
+        ];
+        let set = ChangeSet::from_ops(&ops);
+        assert_eq!(
+            set.to_changes_made(),
+            r#"created_schema:"s1",inserted_into_table:7,deleted_from_table:8,altered_table:3,merge_adjacent:9,rewrite_delete:9"#
+        );
+        assert_eq!(ChangeSet::parse(&set.to_changes_made()), {
+            let mut expect = set.clone();
+            expect.created_table_schema_ids.clear();
+            expect
+        });
+    }
+
+    #[test]
+    fn stats_ops_emit_nothing_but_are_ops() {
+        let ops = [Op::UpdateStats { table_id: 7 }];
+        let set = ChangeSet::from_ops(&ops);
+        assert_eq!(set.to_changes_made(), "");
+        assert!(!ops[0].is_schema_changing());
+        // An empty change set conflicts with nothing.
+        let drop = ChangeSet::from_ops(&[Op::DropTable { table_id: 7 }]);
+        assert!(!conflicts(&set, &drop));
+    }
+
+    #[test]
+    fn append_append_is_benign() {
+        let a = ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: 1 }]);
+        let b = ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: 1 }]);
+        assert!(!conflicts(&a, &b));
+        // Appends are also benign against compactions of the same table.
+        let c = ChangeSet::from_ops(&[Op::ExpireDataFile { table_id: 1 }]);
+        assert!(!conflicts(&a, &c));
+    }
+
+    #[test]
+    fn the_conflict_matrix() {
+        let insert = |t| ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: t }]);
+        let delete = |t| ChangeSet::from_ops(&[Op::RegisterDeleteFile { table_id: t }]);
+        let alter = |t| ChangeSet::from_ops(&[Op::AlterTable { table_id: t }]);
+        let drop = |t| ChangeSet::from_ops(&[Op::DropTable { table_id: t }]);
+        let compact = |t| ChangeSet::from_ops(&[Op::ExpireDeleteFile { table_id: t }]);
+
+        // Conflicting pairs.
+        assert!(conflicts(&insert(1), &alter(1)));
+        assert!(conflicts(&insert(1), &delete(1)));
+        assert!(conflicts(&insert(1), &drop(1)));
+        assert!(conflicts(&delete(1), &delete(1)));
+        assert!(conflicts(&delete(1), &compact(1)));
+        assert!(conflicts(&delete(1), &alter(1)));
+        assert!(conflicts(&delete(1), &drop(1)));
+        assert!(conflicts(&alter(1), &alter(1)));
+        assert!(conflicts(&alter(1), &drop(1)));
+        assert!(conflicts(&compact(1), &compact(1)));
+        assert!(conflicts(&compact(1), &drop(1)));
+        // Benign pairs.
+        assert!(!conflicts(&insert(1), &insert(1)));
+        assert!(!conflicts(&insert(1), &compact(1)));
+        assert!(!conflicts(&alter(1), &compact(1)));
+        assert!(!conflicts(&drop(1), &drop(1)));
+        // Different tables never conflict.
+        assert!(!conflicts(&delete(1), &delete(2)));
+    }
+
+    #[test]
+    fn parsed_compaction_kinds_classify_as_compaction() {
+        let theirs = ChangeSet::parse("compacted_table:1");
+        assert!(!theirs.has_unknown);
+        let ours = ChangeSet::from_ops(&[Op::RegisterDeleteFile { table_id: 1 }]);
+        assert!(conflicts(&ours, &theirs));
+        let benign = ChangeSet::from_ops(&[Op::RegisterDataFile { table_id: 1 }]);
+        assert!(!conflicts(&benign, &theirs));
     }
 
     #[test]
@@ -411,7 +629,7 @@ mod tests {
 
     #[test]
     fn known_ducklake_kind_moraine_does_not_model_is_unknown() {
-        let parsed = ChangeSet::parse("inserted_into_table:7");
+        let parsed = ChangeSet::parse("inline_flush:7");
         assert!(parsed.has_unknown);
         assert!(conflicts(&ChangeSet::default(), &parsed));
     }
@@ -495,8 +713,18 @@ mod tests {
     }
 
     #[test]
-    fn all_slice_ops_are_schema_changing() {
+    fn ddl_ops_are_schema_changing() {
         assert!(create_schema(0, "s").is_schema_changing());
         assert!(Op::AlterTable { table_id: 0 }.is_schema_changing());
+        assert!(Op::DropTable { table_id: 0 }.is_schema_changing());
+    }
+
+    #[test]
+    fn data_plane_ops_are_not_schema_changing() {
+        assert!(!Op::RegisterDataFile { table_id: 0 }.is_schema_changing());
+        assert!(!Op::RegisterDeleteFile { table_id: 0 }.is_schema_changing());
+        assert!(!Op::ExpireDataFile { table_id: 0 }.is_schema_changing());
+        assert!(!Op::ExpireDeleteFile { table_id: 0 }.is_schema_changing());
+        assert!(!Op::UpdateStats { table_id: 0 }.is_schema_changing());
     }
 }

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use moraine::{Catalog, CatalogOptions, ColumnDef, Error, SchemaId, TableId};
+use moraine::{Catalog, CatalogOptions, ColumnDef, DataFile, Error, SchemaId, TableId};
 use object_store::memory::InMemory;
 
 fn col(name: &str) -> ColumnDef {
@@ -12,6 +12,18 @@ fn col(name: &str) -> ColumnDef {
         column_type: "BIGINT".into(),
         nulls_allowed: true,
         default_value: None,
+    }
+}
+
+fn datafile(rows: u64) -> DataFile {
+    DataFile {
+        path: format!("data-{rows}.parquet"),
+        path_is_relative: true,
+        file_format: "parquet".into(),
+        record_count: rows,
+        file_size_bytes: rows * 10,
+        footer_size: 4,
+        column_stats: vec![],
     }
 }
 
@@ -66,15 +78,9 @@ async fn disjoint_table_ddl_both_succeed() {
 #[tokio::test]
 async fn same_table_ddl_races_serialize_or_conflict() {
     let (catalog, _s, a, _b) = seeded().await;
-    // Race two column adds against the same table many times over. Which
-    // way a given round resolves — both succeed (serialized by the
-    // store's write-write detection) or one surfaces `CommitConflict` —
-    // depends on scheduler interleaving and is not pinned here: the
-    // deterministic classifier behavior (that two adds to the same table
-    // conflict) is pinned by the `txn::ops` unit tests
-    // (`overlapping_tables_conflict`). This test only requires that races
-    // never corrupt state: every successful add lands exactly once, and
-    // the table stays intact.
+    // Whether a round serializes or conflicts depends on scheduling; the
+    // classifier itself is pinned by the `txn::ops` unit tests. This test
+    // only requires that races never corrupt state.
     let mut added = Vec::new();
     for round in 0..20 {
         let c1 = catalog.clone();
@@ -176,5 +182,59 @@ async fn counters_never_regress_or_collide_under_concurrency() {
     ids.dedup();
     assert_eq!(ids.len(), before, "table ids must be unique");
     assert_eq!(before, 10, "2 seeded + 8 concurrent");
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_table_appends_both_land_with_dense_row_ids() {
+    let (catalog, _s, a, _b) = seeded().await;
+    let c1 = catalog.clone();
+    let c2 = catalog.clone();
+    let t1 = tokio::spawn(async move {
+        c1.commit(move |txn| txn.register_data_file(a, datafile(100)).map(|_| ()))
+            .await
+    });
+    let t2 = tokio::spawn(async move {
+        c2.commit(move |txn| txn.register_data_file(a, datafile(50)).map(|_| ()))
+            .await
+    });
+    t1.await.unwrap().unwrap();
+    t2.await.unwrap().unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    let files = head.data_files_of(a);
+    assert_eq!(files.len(), 2);
+    let mut starts: Vec<(u64, u64)> = files
+        .iter()
+        .map(|f| (f.row_id_start, f.record_count))
+        .collect();
+    starts.sort_unstable();
+    // Dense, disjoint ranges regardless of which commit won the race.
+    assert_eq!(starts[0].0, 0);
+    assert_eq!(starts[1].0, starts[0].1);
+    assert_eq!(head.table_stats(a).unwrap().next_row_id, 150);
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn append_vs_drop_is_a_real_error() {
+    let (catalog, _s, a, _b) = seeded().await;
+    let c1 = catalog.clone();
+    let c2 = catalog.clone();
+    let t1 = tokio::spawn(async move {
+        c1.commit(move |txn| txn.register_data_file(a, datafile(10)).map(|_| ()))
+            .await
+    });
+    let t2 = tokio::spawn(async move { c2.commit(move |txn| txn.drop_table(a)).await });
+    let r1 = t1.await.unwrap();
+    let r2 = t2.await.unwrap();
+    // Serialized is fine; a genuine race surfaces CommitConflict or
+    // NotFound on the loser.
+    for r in [r1, r2] {
+        match r {
+            Ok(_) | Err(Error::CommitConflict(_) | Error::NotFound(_)) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
     catalog.close().await.unwrap();
 }

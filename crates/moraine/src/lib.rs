@@ -47,7 +47,9 @@
 //! ```
 //!
 //! See `examples/walkthrough.rs` for a longer tour that also alters and
-//! renames a table across a second commit.
+//! renames a table across a second commit. Data files register through the
+//! same [`Catalog::commit`] path, minting a snapshot without bumping the
+//! schema version.
 //!
 //! # Layering
 //!
@@ -66,7 +68,9 @@ mod txn;
 
 pub use catalog::{
     Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
-    SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
+    ColumnStats, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
+    FileColumnStats, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
+    TableStats,
 };
 pub use error::{Error, Result};
 pub use txn::Txn;

@@ -90,13 +90,9 @@ fn stage_bootstrap(txn: &DbTransaction) -> Result<()> {
     )
 }
 
-/// Opens the store and ensures it is initialized: an empty store gets its
-/// format stamp, snapshot 0 (empty catalog, counters at zero), and head
-/// pointer in one atomic batch. The batch commits under write-write
-/// conflict detection, so a lost bootstrap race degrades to "somebody
-/// else initialized it" and is re-validated, never double-initialized.
-///
-/// Every exit that does not commit explicitly rolls the transaction back.
+/// Opens the store, bootstrapping an empty one in one atomic batch under
+/// conflict detection — a lost bootstrap race re-validates instead of
+/// double-initializing. Every exit that does not commit rolls back.
 pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<Db> {
     let db = open_store(path, object_store).await?;
     let txn = db
@@ -141,11 +137,9 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
 }
 
 /// Materializes a catalog view through an open transaction, so the view
-/// and any subsequent staged writes share one consistent read point.
-/// `at: None` reads the head — a scan of `cur` only, since column
-/// allocation now reads the table's persisted counter rather than
-/// deriving it from history. `at: Some(s)` time-travels to snapshot `s`,
-/// which additionally scans `hist` to reconstruct entities live at `s`.
+/// and any staged writes share one read point. `at: None` reads the head
+/// (`cur` only); `at: Some(s)` also scans `hist` to reconstruct the
+/// entities live at `s`.
 pub(crate) async fn materialize(txn: &DbTransaction, at: Option<u64>) -> Result<CatalogSnapshot> {
     let head = read::read_head(txn)
         .await?
@@ -202,21 +196,33 @@ fn stage_transition<M: prost::Message + Clone + PartialEq>(
     }
 }
 
-/// The version bookkeeping: the write set that turns `base` into `state`
-/// at snapshot `new_snapshot`. Ended versions move to history with their
-/// end stamped; new and changed versions land live. Chained mutations of
-/// one entity inside one commit collapse to a single transition.
-pub(crate) fn diff_writes(
+/// Stages an unversioned record: overwritten in place, never mirrored to
+/// history — statistics carry no begin/end lifecycle.
+fn stage_overwrite<M: prost::Message + PartialEq>(
+    writes: &mut Vec<StagedWrite>,
+    entity: EntityKey,
+    base: Option<&M>,
+    state: Option<&M>,
+) {
+    match (base, state) {
+        (Some(_), None) => writes.push((Key::cur(entity).encode(), None)),
+        (base, Some(s)) if base != Some(s) => {
+            writes.push((Key::cur(entity).encode(), Some(value::encode_value(s))));
+        }
+        _ => {}
+    }
+}
+
+fn diff_schemas(
+    writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
     new_snapshot: u64,
-) -> Vec<StagedWrite> {
-    let mut writes = Vec::new();
-
+) {
     let schema_ids = base.schemas.keys().chain(state.schemas.keys());
     for &schema_id in schema_ids.collect::<std::collections::BTreeSet<_>>() {
         stage_transition(
-            &mut writes,
+            writes,
             EntityKey::Schema { schema_id },
             base.schemas.get(&schema_id),
             state.schemas.get(&schema_id),
@@ -227,11 +233,18 @@ pub(crate) fn diff_writes(
             },
         );
     }
+}
 
+fn diff_tables(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
     let table_ids = base.tables.keys().chain(state.tables.keys());
     for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
         stage_transition(
-            &mut writes,
+            writes,
             EntityKey::Table { table_id },
             base.tables.get(&table_id),
             state.tables.get(&table_id),
@@ -242,7 +255,14 @@ pub(crate) fn diff_writes(
             },
         );
     }
+}
 
+fn diff_columns(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
     let column_tables = base.columns.keys().chain(state.columns.keys());
     for &table_id in column_tables.collect::<std::collections::BTreeSet<_>>() {
         static EMPTY: std::collections::BTreeMap<u64, proto::ColumnValue> =
@@ -255,7 +275,7 @@ pub(crate) fn diff_writes(
             .collect::<std::collections::BTreeSet<_>>()
         {
             stage_transition(
-                &mut writes,
+                writes,
                 EntityKey::Column {
                     table_id,
                     column_id,
@@ -270,7 +290,186 @@ pub(crate) fn diff_writes(
             );
         }
     }
+}
 
+fn diff_data_files(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    let file_tables = base.data_files.keys().chain(state.data_files.keys());
+    for &table_id in file_tables.collect::<std::collections::BTreeSet<_>>() {
+        static EMPTY: std::collections::BTreeMap<u64, proto::DataFileValue> =
+            std::collections::BTreeMap::new();
+        let base_files = base.data_files.get(&table_id).unwrap_or(&EMPTY);
+        let state_files = state.data_files.get(&table_id).unwrap_or(&EMPTY);
+        for &data_file_id in base_files
+            .keys()
+            .chain(state_files.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            stage_transition(
+                writes,
+                EntityKey::File {
+                    table_id,
+                    data_file_id,
+                },
+                base_files.get(&data_file_id),
+                state_files.get(&data_file_id),
+                new_snapshot,
+                |b| proto::DataFileValue {
+                    end_snapshot: Some(new_snapshot),
+                    ..b.clone()
+                },
+            );
+        }
+    }
+}
+
+fn diff_delete_files(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    let delete_file_tables = base.delete_files.keys().chain(state.delete_files.keys());
+    for &table_id in delete_file_tables.collect::<std::collections::BTreeSet<_>>() {
+        static EMPTY: std::collections::BTreeMap<u64, proto::DeleteFileValue> =
+            std::collections::BTreeMap::new();
+        let base_files = base.delete_files.get(&table_id).unwrap_or(&EMPTY);
+        let state_files = state.delete_files.get(&table_id).unwrap_or(&EMPTY);
+        for &delete_file_id in base_files
+            .keys()
+            .chain(state_files.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            stage_transition(
+                writes,
+                EntityKey::DeleteFile {
+                    table_id,
+                    delete_file_id,
+                },
+                base_files.get(&delete_file_id),
+                state_files.get(&delete_file_id),
+                new_snapshot,
+                |b| proto::DeleteFileValue {
+                    end_snapshot: Some(new_snapshot),
+                    ..b.clone()
+                },
+            );
+        }
+    }
+}
+
+fn diff_table_stats(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+) {
+    let table_ids = base.table_stats.keys().chain(state.table_stats.keys());
+    for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
+        stage_overwrite(
+            writes,
+            EntityKey::TableStats { table_id },
+            base.table_stats.get(&table_id),
+            state.table_stats.get(&table_id),
+        );
+    }
+}
+
+fn diff_table_column_stats(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+) {
+    let table_ids = base
+        .table_column_stats
+        .keys()
+        .chain(state.table_column_stats.keys());
+    for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
+        static EMPTY: std::collections::BTreeMap<u64, proto::TableColumnStatsValue> =
+            std::collections::BTreeMap::new();
+        let base_cols = base.table_column_stats.get(&table_id).unwrap_or(&EMPTY);
+        let state_cols = state.table_column_stats.get(&table_id).unwrap_or(&EMPTY);
+        for &column_id in base_cols
+            .keys()
+            .chain(state_cols.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            stage_overwrite(
+                writes,
+                EntityKey::TableColumnStats {
+                    table_id,
+                    column_id,
+                },
+                base_cols.get(&column_id),
+                state_cols.get(&column_id),
+            );
+        }
+    }
+}
+
+fn diff_file_column_stats(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+) {
+    let table_ids = base
+        .file_column_stats
+        .keys()
+        .chain(state.file_column_stats.keys());
+    for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
+        static EMPTY: std::collections::BTreeMap<(u64, u64), proto::FileColumnStatsValue> =
+            std::collections::BTreeMap::new();
+        static EMPTY_FILES: std::collections::BTreeMap<u64, proto::DataFileValue> =
+            std::collections::BTreeMap::new();
+        let base_cols = base.file_column_stats.get(&table_id).unwrap_or(&EMPTY);
+        let state_cols = state.file_column_stats.get(&table_id).unwrap_or(&EMPTY);
+        let base_files = base.data_files.get(&table_id).unwrap_or(&EMPTY_FILES);
+        let state_files = state.data_files.get(&table_id).unwrap_or(&EMPTY_FILES);
+        for &(data_file_id, column_id) in base_cols
+            .keys()
+            .chain(state_cols.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            // A file registered and expired within this commit exists in
+            // neither side's data_files; its stats must not be staged.
+            if !base_files.contains_key(&data_file_id) && !state_files.contains_key(&data_file_id) {
+                continue;
+            }
+            stage_overwrite(
+                writes,
+                EntityKey::FileColumnStats {
+                    table_id,
+                    data_file_id,
+                    column_id,
+                },
+                base_cols.get(&(data_file_id, column_id)),
+                state_cols.get(&(data_file_id, column_id)),
+            );
+        }
+    }
+}
+
+/// The write set turning `base` into `state` at `new_snapshot`: ended
+/// versions move to history, new and changed versions land live, and
+/// chained mutations of one entity collapse to a single transition.
+/// Statistics are overwritten in place with no history mirror.
+pub(crate) fn diff_writes(
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) -> Vec<StagedWrite> {
+    let mut writes = Vec::new();
+    diff_schemas(&mut writes, base, state, new_snapshot);
+    diff_tables(&mut writes, base, state, new_snapshot);
+    diff_columns(&mut writes, base, state, new_snapshot);
+    diff_data_files(&mut writes, base, state, new_snapshot);
+    diff_delete_files(&mut writes, base, state, new_snapshot);
+    diff_table_stats(&mut writes, base, state);
+    diff_table_column_stats(&mut writes, base, state);
+    diff_file_column_stats(&mut writes, base, state);
     writes
 }
 
@@ -285,19 +484,15 @@ enum CommitOutcome {
     Committed(SnapshotId),
     /// Lost the head race: what we tried to change, and the head our
     /// premise was read at — classification reads the commits above it.
-    LostRace { ours: ChangeSet, head_before: u64 },
+    LostRace {
+        ours: Box<ChangeSet>,
+        head_before: u64,
+    },
 }
 
 /// Runs one commit attempt: materialize, run the closure, stage, commit.
-/// Returns [`CommitOutcome::Committed`] with the committed snapshot id (or
-/// the unchanged head id when the closure staged nothing — no empty
-/// snapshots), or [`CommitOutcome::LostRace`] when a concurrent commit won
-/// the same head first.
-///
-/// Every exit that does not reach the final commit explicitly rolls the
-/// transaction back first: a closure error, an empty op set, or a staging
-/// write failure all abandon the transaction rather than leaving it
-/// dangling.
+/// An empty op set commits nothing and returns the unchanged head. Every
+/// exit that does not reach the final commit rolls the transaction back.
 async fn attempt_commit<F>(db: &Db, f: &F) -> Result<CommitOutcome>
 where
     F: Fn(&mut Txn) -> Result<()>,
@@ -321,7 +516,7 @@ where
         dbtxn.rollback();
         return Err(err);
     }
-    let (ops, state, next_catalog_id) = txn.into_parts();
+    let (ops, state, next_catalog_id, next_file_id) = txn.into_parts();
     if ops.is_empty() {
         dbtxn.rollback();
         return Ok(CommitOutcome::Committed(SnapshotId::new(head)));
@@ -335,7 +530,7 @@ where
         snapshot_time_micros: now_micros(),
         schema_version: base.snap.schema_version + u64::from(schema_changed),
         next_catalog_id,
-        next_file_id: base.snap.next_file_id,
+        next_file_id,
         next_deletion_id: base.snap.next_deletion_id,
         changes_made: ours.to_changes_made(),
         author: None,
@@ -370,18 +565,17 @@ where
     match dbtxn.commit_with_options(&durable()).await {
         Ok(_) => Ok(CommitOutcome::Committed(SnapshotId::new(new_id))),
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(CommitOutcome::LostRace {
-            ours,
+            ours: Box::new(ours),
             head_before: head,
         }),
         Err(err) => Err(err.into()),
     }
 }
 
-/// Commits through the closure, retrying benign races internally: a lost
-/// head race whose intervening commits touched disjoint state re-runs
-/// the whole cycle — fresh snapshot, closure re-run, fresh ids — so
-/// logical premises are re-validated against the state that won. True
-/// conflicts and an exhausted budget surface as [`Error::CommitConflict`].
+/// Commits through the closure, retrying benign races with a full re-run
+/// — fresh snapshot, closure, ids — so premises re-validate against the
+/// state that won. True conflicts and an exhausted budget surface as
+/// [`Error::CommitConflict`].
 pub(crate) async fn commit_cycle<F>(db: &Db, f: &F) -> Result<SnapshotId>
 where
     F: Fn(&mut Txn) -> Result<()>,
@@ -406,12 +600,9 @@ where
     )))
 }
 
-/// The change sets of every commit above `head_before`, read from their
-/// snapshot records. Reads go straight through `db`: the transaction that
-/// lost the race is dead, so classification reads outside any transaction.
-/// A snapshot record missing below the head is store damage, not a race —
-/// it surfaces as [`Error::Corruption`] and aborts the retry loop rather
-/// than being retried.
+/// The change sets of every commit above `head_before`, read outside any
+/// transaction (the loser's is dead). A missing snapshot record below
+/// the head is store damage: [`Error::Corruption`], not a retry.
 async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
     let head_bytes = db
         .get(Key::Sys(SysKey::Head).encode())
@@ -480,6 +671,91 @@ mod tests {
 
         let err = open_initialized("", object_store).await.err().unwrap();
         assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    /// A file registered and expired within one commit exists in neither
+    /// `base` nor `state`'s `data_files`: its per-file column stats are
+    /// orphaned and must never be staged as a write.
+    #[test]
+    fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
+        use crate::catalog::{ColumnDef, DataFile, FileColumnStats};
+        use crate::store::key::{CurKey, HistKey};
+
+        let snap0 = proto::SnapshotValue {
+            snapshot_id: 0,
+            snapshot_time_micros: 1,
+            schema_version: 0,
+            next_catalog_id: 0,
+            next_file_id: 0,
+            next_deletion_id: 0,
+            changes_made: String::new(),
+            author: None,
+            commit_message: None,
+            commit_extra_info: None,
+        };
+        let empty = CatalogSnapshot::build(snap0, vec![], vec![], None);
+        let mut setup = Txn::new(empty, 1);
+        let schema = setup.create_schema("s").unwrap();
+        let table = setup
+            .create_table(
+                schema,
+                "t",
+                &[ColumnDef {
+                    name: "a".into(),
+                    column_type: "BIGINT".into(),
+                    nulls_allowed: true,
+                    default_value: None,
+                }],
+            )
+            .unwrap();
+        let column = setup.columns_of(table)[0].id;
+        let (_, base, _, _) = setup.into_parts();
+
+        // Register a file with column stats, then expire it — all inside
+        // this one commit's transaction.
+        let mut txn = Txn::new(base.clone(), 2);
+        let file = txn
+            .register_data_file(
+                table,
+                DataFile {
+                    path: "f.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 10,
+                    file_size_bytes: 100,
+                    footer_size: 4,
+                    column_stats: vec![FileColumnStats {
+                        column_id: column,
+                        column_size_bytes: 10,
+                        value_count: 10,
+                        null_count: 0,
+                        min_value: Some("1".into()),
+                        max_value: Some("2".into()),
+                        contains_nan: None,
+                        extra_stats: None,
+                    }],
+                },
+            )
+            .unwrap();
+        txn.expire_data_file(table, file).unwrap();
+        let (_, state, _, _) = txn.into_parts();
+
+        let writes = diff_writes(&base, &state, 2);
+        for (key_bytes, _) in &writes {
+            let key = Key::decode(key_bytes).unwrap();
+            let is_file_column_stats = matches!(
+                key,
+                Key::Cur(CurKey::Entity(EntityKey::FileColumnStats { .. }))
+                    | Key::Hist(HistKey {
+                        entity: EntityKey::FileColumnStats { .. },
+                        ..
+                    })
+            );
+            assert!(
+                !is_file_column_stats,
+                "orphaned file_column_stats write staged: {key:?}"
+            );
+        }
     }
 
     /// A fresh reader opened after commit returns resolves the new head:

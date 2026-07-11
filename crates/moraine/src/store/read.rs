@@ -22,6 +22,16 @@ pub(crate) enum EntityRecord {
     Table(proto::TableValue),
     /// A column record.
     Column(proto::ColumnValue),
+    /// A data file record.
+    File(proto::DataFileValue),
+    /// A delete file record.
+    DeleteFile(proto::DeleteFileValue),
+    /// File-level column statistics record.
+    FileColumnStats(proto::FileColumnStatsValue),
+    /// Table-level statistics record.
+    TableStats(proto::TableStatsValue),
+    /// Table-level column statistics record.
+    TableColumnStats(proto::TableColumnStatsValue),
 }
 
 async fn read_singleton<M: prost::Message + Default>(
@@ -62,6 +72,15 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
         EntityKey::Schema { .. } => Ok(EntityRecord::Schema(value::decode_value(bytes)?)),
         EntityKey::Table { .. } => Ok(EntityRecord::Table(value::decode_value(bytes)?)),
         EntityKey::Column { .. } => Ok(EntityRecord::Column(value::decode_value(bytes)?)),
+        EntityKey::File { .. } => Ok(EntityRecord::File(value::decode_value(bytes)?)),
+        EntityKey::DeleteFile { .. } => Ok(EntityRecord::DeleteFile(value::decode_value(bytes)?)),
+        EntityKey::FileColumnStats { .. } => {
+            Ok(EntityRecord::FileColumnStats(value::decode_value(bytes)?))
+        }
+        EntityKey::TableStats { .. } => Ok(EntityRecord::TableStats(value::decode_value(bytes)?)),
+        EntityKey::TableColumnStats { .. } => {
+            Ok(EntityRecord::TableColumnStats(value::decode_value(bytes)?))
+        }
         other => Err(Error::Corruption(format!(
             "entity kind not modeled by this binary: {other:?}"
         ))),
@@ -157,6 +176,45 @@ mod tests {
             value::encode_value(&ended),
         )
         .unwrap();
+        let tstat = proto::TableStatsValue {
+            table_id: 7,
+            record_count: 10,
+            next_row_id: 10,
+            file_size_bytes: 1024,
+        };
+        txn.put(
+            Key::cur(EntityKey::TableStats { table_id: 7 }).encode(),
+            value::encode_value(&tstat),
+        )
+        .unwrap();
+        let file = proto::DataFileValue {
+            data_file_id: 3,
+            table_id: 7,
+            begin_snapshot: 1,
+            end_snapshot: None,
+            file_order: None,
+            path: "f.parquet".into(),
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: 10,
+            file_size_bytes: 1024,
+            footer_size: 64,
+            row_id_start: 0,
+            partition_id: None,
+            encryption_key: None,
+            mapping_id: None,
+            partial_max: None,
+            partition_values: vec![],
+        };
+        txn.put(
+            Key::cur(EntityKey::File {
+                table_id: 7,
+                data_file_id: 3,
+            })
+            .encode(),
+            value::encode_value(&file),
+        )
+        .unwrap();
         txn.commit_with_options(&WriteOptions {
             await_durable: true,
             ..Default::default()
@@ -171,7 +229,10 @@ mod tests {
         assert_eq!(read_snapshot(&txn, 0).await.unwrap(), None);
 
         let cur = scan_cur_entities(&txn).await.unwrap();
-        assert_eq!(cur, vec![EntityRecord::Schema(schema)]);
+        assert_eq!(cur.len(), 3);
+        assert!(cur.contains(&EntityRecord::Schema(schema)));
+        assert!(cur.contains(&EntityRecord::File(file)));
+        assert!(cur.contains(&EntityRecord::TableStats(tstat)));
         let hist = scan_hist_entities(&txn).await.unwrap();
         assert_eq!(hist, vec![EntityRecord::Schema(ended)]);
         txn.rollback();

@@ -5,8 +5,8 @@
 - [x] RFC 0002: SlateDB key encoding for DuckLake catalog state
 - [x] RFC 0004: commit/transaction protocol
 - [x] `store`: key layout + codecs (proptest roundtrips)
-- [ ] `catalog`: snapshots, schemas, tables, data-file metadata (schemas/tables/columns done; data-file metadata pending)
-- [ ] `txn`: atomic commit with conflict detection
+- [x] `catalog`: snapshots, schemas, tables, data-file metadata
+- [x] `txn`: atomic commit with conflict detection
 - [x] First runnable example in `crates/moraine/examples/` once the API exists
 
 ### DuckDB extension loads
@@ -47,16 +47,16 @@ e2e suite before it is checked off.
   `macro_parameters`)
 
 ### Data, deletes & layout
-- [ ] Parquet data files on object storage (`data_file`)
-- [ ] Row-level deletes via delete files / merge-on-read (`delete_file`)
+- [x] Parquet data files on object storage (`data_file`)
+- [x] Row-level deletes via delete files / merge-on-read (`delete_file`)
 - [ ] Data inlining: inlined inserts/deletes + flush (RFC 0005;
   `inlined_data_tables`)
 - [ ] Partitioning: partition definitions, values, and pruning
   (`partition_info`, `partition_column`, `file_partition_value`) (RFC 0013)
 - [ ] Sort orders (`sort_info`, `sort_expression`)
-- [ ] Statistics for pruning: table, column, per-file, and variant stats
+- [x] Statistics for pruning: table, column, per-file, and variant stats
   (`table_stats`, `table_column_stats`, `file_column_stats`,
-  `file_variant_stats`)
+  `file_variant_stats`) (variant stats pending)
 
 ### Transactions & time travel
 - [ ] Multi-statement, cross-table ACID transactions with conflict

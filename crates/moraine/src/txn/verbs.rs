@@ -6,7 +6,10 @@ use std::ops::Deref;
 use uuid::Uuid;
 
 use crate::{
-    catalog::{CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, SchemaId, TableId},
+    catalog::{
+        CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnStats, DataFile, DataFileId,
+        DeleteFile, DeleteFileId, SchemaId, TableId,
+    },
     error::{Error, Result},
     store::proto,
     txn::ops::Op,
@@ -14,14 +17,14 @@ use crate::{
 
 /// The mutation handle a commit closure receives.
 ///
-/// Dereferences to [`CatalogSnapshot`], so every read accessor is
-/// available for name resolution and validation — reads observe the
-/// transaction's own staged mutations. Mutators validate eagerly and
-/// stage; nothing touches the store until the closure returns.
+/// Dereferences to [`CatalogSnapshot`]; reads observe the transaction's
+/// own staged mutations. Nothing touches the store until the closure
+/// returns.
 pub struct Txn {
     state: CatalogSnapshot,
     ops: Vec<Op>,
     next_catalog_id: u64,
+    next_file_id: u64,
     new_snapshot_id: u64,
 }
 
@@ -36,10 +39,12 @@ impl Deref for Txn {
 impl Txn {
     pub(crate) fn new(state: CatalogSnapshot, new_snapshot_id: u64) -> Self {
         let next_catalog_id = state.snap.next_catalog_id;
+        let next_file_id = state.snap.next_file_id;
         Self {
             state,
             ops: Vec::new(),
             next_catalog_id,
+            next_file_id,
             new_snapshot_id,
         }
     }
@@ -49,8 +54,13 @@ impl Txn {
         &self.state
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<Op>, CatalogSnapshot, u64) {
-        (self.ops, self.state, self.next_catalog_id)
+    pub(crate) fn into_parts(self) -> (Vec<Op>, CatalogSnapshot, u64, u64) {
+        (
+            self.ops,
+            self.state,
+            self.next_catalog_id,
+            self.next_file_id,
+        )
     }
 
     fn alloc_catalog_id(&mut self) -> u64 {
@@ -59,8 +69,13 @@ impl Txn {
         id
     }
 
-    /// Creates a schema. Errors with [`Error::AlreadyExists`] if a live
-    /// schema of that name exists.
+    fn alloc_file_id(&mut self) -> u64 {
+        let id = self.next_file_id;
+        self.next_file_id += 1;
+        id
+    }
+
+    /// Creates a schema.
     ///
     /// # Errors
     ///
@@ -87,8 +102,7 @@ impl Txn {
         Ok(SchemaId::new(schema_id))
     }
 
-    /// Drops a schema. Errors with [`Error::NotFound`] if it does not
-    /// exist and [`Error::Constraint`] if it still contains tables.
+    /// Drops a schema.
     ///
     /// # Errors
     ///
@@ -116,10 +130,7 @@ impl Txn {
         Ok(())
     }
 
-    /// Creates a table with its columns. Errors with
-    /// [`Error::NotFound`] for a missing schema,
-    /// [`Error::AlreadyExists`] for a name collision, and
-    /// [`Error::Constraint`] for an empty or duplicate column list.
+    /// Creates a table with its columns.
     ///
     /// # Errors
     ///
@@ -178,6 +189,12 @@ impl Txn {
                 def,
             ));
         }
+        self.state.put_table_stats(proto::TableStatsValue {
+            table_id,
+            record_count: 0,
+            next_row_id: 0,
+            file_size_bytes: 0,
+        });
         let schema_name = self.state.schemas[&schema.get()].schema_name.clone();
         self.ops.push(Op::CreateTable {
             schema_id: schema.get(),
@@ -200,11 +217,8 @@ impl Txn {
         self.ops.push(Op::AlterTable { table_id });
     }
 
-    /// Renames a table within its schema.
-    ///
-    /// Renaming a table to its current name errors with
-    /// [`Error::AlreadyExists`] — the name is held by the table itself,
-    /// matching SQL engine behavior.
+    /// Renames a table within its schema. Renaming to the current name
+    /// errors, matching SQL engines.
     ///
     /// # Errors
     ///
@@ -227,11 +241,8 @@ impl Txn {
         Ok(())
     }
 
-    /// Moves a table to another schema.
-    ///
-    /// Moving a table to its current schema errors with
-    /// [`Error::AlreadyExists`] — the name is held by the table itself,
-    /// matching SQL engine behavior.
+    /// Moves a table to another schema. Moving to the current schema
+    /// errors, matching SQL engines.
     ///
     /// # Errors
     ///
@@ -273,12 +284,8 @@ impl Txn {
         Ok(())
     }
 
-    /// Adds a column. The new column's field id is allocated from the
-    /// table's persisted `next_column_id` counter, floored so it never
-    /// lands at or below a currently live column id — a defensive floor
-    /// for table versions authored without the counter. The id is then
-    /// never reused: the table record's counter is advanced past it in
-    /// the same version transition.
+    /// Adds a column. Its field id comes from the table's persisted
+    /// counter, floored above every live id, and is never reused.
     ///
     /// # Errors
     ///
@@ -332,11 +339,8 @@ impl Txn {
         Ok(())
     }
 
-    /// Renames a column.
-    ///
-    /// Renaming a column to its current name errors with
-    /// [`Error::AlreadyExists`] — the name is held by the column itself,
-    /// matching SQL engine behavior.
+    /// Renames a column. Renaming to the current name errors, matching
+    /// SQL engines.
     ///
     /// # Errors
     ///
@@ -385,8 +389,7 @@ impl Txn {
         Ok(())
     }
 
-    /// Drops a column. Errors with [`Error::Constraint`] for the table's
-    /// last live column.
+    /// Drops a column.
     ///
     /// # Errors
     ///
@@ -407,6 +410,251 @@ impl Txn {
         }
         self.state.delete_column(table.get(), column.get());
         self.mark_altered(table.get());
+        Ok(())
+    }
+
+    fn live_tstat(&self, table: TableId) -> Result<proto::TableStatsValue> {
+        self.state
+            .table_stats
+            .get(&table.get())
+            .copied()
+            .ok_or_else(|| Error::Corruption(format!("table {table} has no statistics record")))
+    }
+
+    /// Registers a data file, allocating its dense row-id range from the
+    /// table's row-id counter and folding its size into the table's
+    /// statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table does not exist, or if any
+    /// entry in `file.column_stats` names a column that is not live on the
+    /// table.
+    /// Returns [`Error::Corruption`] if the table has no statistics
+    /// record (impossible for a table created by [`Self::create_table`],
+    /// which always mints one).
+    pub fn register_data_file(&mut self, table: TableId, file: DataFile) -> Result<DataFileId> {
+        self.live_table(table)?;
+        for entry in &file.column_stats {
+            self.live_column(table, entry.column_id)?;
+        }
+        let data_file_id = self.alloc_file_id();
+        let mut tstat = self.live_tstat(table)?;
+        let row_id_start = tstat.next_row_id;
+        tstat.next_row_id = tstat.next_row_id.saturating_add(file.record_count);
+        tstat.record_count = tstat.record_count.saturating_add(file.record_count);
+        tstat.file_size_bytes = tstat.file_size_bytes.saturating_add(file.file_size_bytes);
+        self.state.put_table_stats(tstat);
+        self.state.put_data_file(proto::DataFileValue {
+            data_file_id,
+            table_id: table.get(),
+            begin_snapshot: self.new_snapshot_id,
+            end_snapshot: None,
+            file_order: None,
+            path: file.path,
+            path_is_relative: file.path_is_relative,
+            file_format: file.file_format,
+            record_count: file.record_count,
+            file_size_bytes: file.file_size_bytes,
+            footer_size: file.footer_size,
+            row_id_start,
+            partition_id: None,
+            encryption_key: None,
+            mapping_id: None,
+            partial_max: None,
+            partition_values: vec![],
+        });
+        for entry in file.column_stats {
+            self.state
+                .put_file_column_stats(proto::FileColumnStatsValue {
+                    data_file_id,
+                    table_id: table.get(),
+                    column_id: entry.column_id.get(),
+                    column_size_bytes: entry.column_size_bytes,
+                    value_count: entry.value_count,
+                    null_count: entry.null_count,
+                    min_value: entry.min_value,
+                    max_value: entry.max_value,
+                    contains_nan: entry.contains_nan,
+                    extra_stats: entry.extra_stats,
+                    variant_stats: vec![],
+                });
+        }
+        self.ops.push(Op::RegisterDataFile {
+            table_id: table.get(),
+        });
+        Ok(DataFileId::new(data_file_id))
+    }
+
+    /// Expires a data file, removing it and subtracting its contribution
+    /// from the table's statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the file is not live on the table.
+    pub fn expire_data_file(&mut self, table: TableId, file: DataFileId) -> Result<()> {
+        let data_file = self
+            .state
+            .data_files
+            .get(&table.get())
+            .and_then(|files| files.get(&file.get()))
+            .cloned()
+            .ok_or_else(|| Error::NotFound(format!("data file {file} of table {table}")))?;
+
+        let cascaded: Vec<u64> = self
+            .state
+            .delete_files
+            .get(&table.get())
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|d| d.data_file_id == file.get())
+            .map(|d| d.delete_file_id)
+            .collect();
+        for delete_file_id in cascaded {
+            self.state.delete_delete_file(table.get(), delete_file_id);
+        }
+
+        self.state.delete_data_file(table.get(), file.get());
+
+        let mut tstat = self.live_tstat(table)?;
+        tstat.record_count = tstat.record_count.saturating_sub(data_file.record_count);
+        tstat.file_size_bytes = tstat
+            .file_size_bytes
+            .saturating_sub(data_file.file_size_bytes);
+        self.state.put_table_stats(tstat);
+
+        self.ops.push(Op::ExpireDataFile {
+            table_id: table.get(),
+        });
+        Ok(())
+    }
+
+    /// Registers a delete file targeting a live data file's rows.
+    ///
+    /// Delete files do not change table statistics — `record_count`
+    /// counts data-file rows, not delete markers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table does not exist, or if
+    /// `file.data_file_id` is not live on the table.
+    pub fn register_delete_file(
+        &mut self,
+        table: TableId,
+        file: DeleteFile,
+    ) -> Result<DeleteFileId> {
+        self.live_table(table)?;
+        let data_file_live = self
+            .state
+            .data_files
+            .get(&table.get())
+            .is_some_and(|files| files.contains_key(&file.data_file_id.get()));
+        if !data_file_live {
+            return Err(Error::NotFound(format!(
+                "data file {} of table {table}",
+                file.data_file_id
+            )));
+        }
+        let delete_file_id = self.alloc_file_id();
+        self.state.put_delete_file(proto::DeleteFileValue {
+            delete_file_id,
+            table_id: table.get(),
+            begin_snapshot: self.new_snapshot_id,
+            end_snapshot: None,
+            data_file_id: file.data_file_id.get(),
+            path: file.path,
+            path_is_relative: file.path_is_relative,
+            format: file.format,
+            delete_count: file.delete_count,
+            file_size_bytes: file.file_size_bytes,
+            footer_size: file.footer_size,
+            encryption_key: None,
+            partial_max: None,
+        });
+        self.ops.push(Op::RegisterDeleteFile {
+            table_id: table.get(),
+        });
+
+        Ok(DeleteFileId::new(delete_file_id))
+    }
+
+    /// Expires a delete file, removing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the file is not live on the table.
+    pub fn expire_delete_file(&mut self, table: TableId, file: DeleteFileId) -> Result<()> {
+        let live = self
+            .state
+            .delete_files
+            .get(&table.get())
+            .is_some_and(|files| files.contains_key(&file.get()));
+        if !live {
+            return Err(Error::NotFound(format!(
+                "delete file {file} of table {table}"
+            )));
+        }
+        self.state.delete_delete_file(table.get(), file.get());
+        self.ops.push(Op::ExpireDeleteFile {
+            table_id: table.get(),
+        });
+
+        Ok(())
+    }
+
+    /// Overrides a table's row-count and size statistics. `next_row_id`
+    /// is preserved and never regresses; only
+    /// [`Self::register_data_file`] advances it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table does not exist.
+    /// Returns [`Error::Corruption`] if the table has no statistics
+    /// record.
+    pub fn update_table_stats(
+        &mut self,
+        table: TableId,
+        record_count: u64,
+        file_size_bytes: u64,
+    ) -> Result<()> {
+        self.live_table(table)?;
+        let mut tstat = self.live_tstat(table)?;
+        tstat.record_count = record_count;
+        tstat.file_size_bytes = file_size_bytes;
+        self.state.put_table_stats(tstat);
+        self.ops.push(Op::UpdateStats {
+            table_id: table.get(),
+        });
+
+        Ok(())
+    }
+
+    /// Overrides a column's table-level statistics, verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table or column does not exist.
+    pub fn update_column_stats(
+        &mut self,
+        table: TableId,
+        column: ColumnId,
+        stats: ColumnStats,
+    ) -> Result<()> {
+        self.live_column(table, column)?;
+        self.state
+            .put_table_column_stats(proto::TableColumnStatsValue {
+                table_id: table.get(),
+                column_id: column.get(),
+                contains_null: stats.contains_null,
+                contains_nan: stats.contains_nan,
+                min_value: stats.min_value,
+                max_value: stats.max_value,
+                extra_stats: stats.extra_stats,
+            });
+        self.ops.push(Op::UpdateStats {
+            table_id: table.get(),
+        });
+
         Ok(())
     }
 }
@@ -439,7 +687,7 @@ fn new_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::CatalogSnapshot;
+    use crate::catalog::{CatalogSnapshot, FileColumnStats};
     use crate::store::proto;
 
     fn empty_txn() -> Txn {
@@ -486,7 +734,7 @@ mod tests {
         // The counter is seeded past the ids just handed out.
         assert_eq!(txn.state().tables[&11].next_column_id, 3);
 
-        let (ops, _, next_catalog_id) = txn.into_parts();
+        let (ops, _, next_catalog_id, _) = txn.into_parts();
         assert_eq!(next_catalog_id, 12);
         assert_eq!(
             ops,
@@ -610,7 +858,7 @@ mod tests {
         txn.set_table_schema(t1, s2).unwrap();
         assert_eq!(txn.tables_in(s2).len(), 2);
         // Each mutation of an existing table classifies as an alter.
-        let (ops, _, _) = txn.into_parts();
+        let (ops, _, _, _) = txn.into_parts();
         let alters = ops
             .iter()
             .filter(|op| matches!(op, Op::AlterTable { table_id } if *table_id == t1.get()))
@@ -692,5 +940,172 @@ mod tests {
         let mut txn = Txn::new(state, 5);
         let c = txn.add_column(TableId::new(1), &col("c")).unwrap();
         assert_eq!(c, ColumnId::new(3));
+    }
+
+    fn datafile(rows: u64, stats: Vec<FileColumnStats>) -> DataFile {
+        DataFile {
+            path: "f.parquet".into(),
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: rows,
+            file_size_bytes: rows * 10,
+            footer_size: 4,
+            column_stats: stats,
+        }
+    }
+
+    #[test]
+    fn register_allocates_row_ids_and_maintains_stats() {
+        let mut txn = empty_txn();
+        let s = txn.create_schema("s").unwrap();
+        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        // create_table minted the stats record.
+        let stats = txn.table_stats(t).unwrap();
+        assert_eq!((stats.record_count, stats.next_row_id), (0, 0));
+
+        let f1 = txn.register_data_file(t, datafile(100, vec![])).unwrap();
+        let f2 = txn.register_data_file(t, datafile(50, vec![])).unwrap();
+        assert_ne!(f1, f2);
+        let files = txn.data_files_of(t);
+        assert_eq!(files[0].row_id_start, 0);
+        assert_eq!(files[1].row_id_start, 100);
+        let stats = txn.table_stats(t).unwrap();
+        assert_eq!(stats.record_count, 150);
+        assert_eq!(stats.next_row_id, 150);
+        assert_eq!(stats.file_size_bytes, 1500);
+    }
+
+    #[test]
+    fn register_validates_table_and_stat_columns() {
+        let mut txn = empty_txn();
+        let s = txn.create_schema("s").unwrap();
+        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        assert!(matches!(
+            txn.register_data_file(TableId::new(99), datafile(1, vec![])),
+            Err(Error::NotFound(_))
+        ));
+        let bad_stats = vec![FileColumnStats {
+            column_id: ColumnId::new(99),
+            column_size_bytes: 1,
+            value_count: 1,
+            null_count: 0,
+            min_value: None,
+            max_value: None,
+            contains_nan: None,
+            extra_stats: None,
+        }];
+        assert!(matches!(
+            txn.register_data_file(t, datafile(1, bad_stats)),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn expire_cascades_delete_files_and_preserves_next_row_id() {
+        let mut txn = empty_txn();
+        let s = txn.create_schema("s").unwrap();
+        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        let f = txn.register_data_file(t, datafile(100, vec![])).unwrap();
+        let d = txn
+            .register_delete_file(
+                t,
+                DeleteFile {
+                    data_file_id: f,
+                    path: "d.parquet".into(),
+                    path_is_relative: true,
+                    format: "parquet".into(),
+                    delete_count: 5,
+                    file_size_bytes: 50,
+                    footer_size: 4,
+                },
+            )
+            .unwrap();
+        assert_eq!(txn.delete_files_of(t)[0].id, d);
+
+        txn.expire_data_file(t, f).unwrap();
+        assert!(txn.data_files_of(t).is_empty());
+        assert!(txn.delete_files_of(t).is_empty(), "delete file cascades");
+        let stats = txn.table_stats(t).unwrap();
+        assert_eq!(stats.record_count, 0);
+        // The row-id counter never regresses.
+        assert_eq!(stats.next_row_id, 100);
+        let f2 = txn.register_data_file(t, datafile(10, vec![])).unwrap();
+        assert_eq!(txn.data_files_of(t)[0].row_id_start, 100);
+        let _ = f2;
+    }
+
+    #[test]
+    fn delete_file_requires_live_data_file() {
+        let mut txn = empty_txn();
+        let s = txn.create_schema("s").unwrap();
+        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        assert!(matches!(
+            txn.register_delete_file(
+                t,
+                DeleteFile {
+                    data_file_id: DataFileId::new(99),
+                    path: "d.parquet".into(),
+                    path_is_relative: true,
+                    format: "parquet".into(),
+                    delete_count: 1,
+                    file_size_bytes: 10,
+                    footer_size: 4,
+                },
+            ),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn stats_verbs_update_verbatim_and_preserve_row_counter() {
+        let mut txn = empty_txn();
+        let s = txn.create_schema("s").unwrap();
+        let t = txn.create_table(s, "t", &[col("a")]).unwrap();
+        txn.register_data_file(t, datafile(100, vec![])).unwrap();
+        txn.update_table_stats(t, 42, 420).unwrap();
+        let stats = txn.table_stats(t).unwrap();
+        assert_eq!((stats.record_count, stats.file_size_bytes), (42, 420));
+        assert_eq!(
+            stats.next_row_id, 100,
+            "override cannot regress the counter"
+        );
+
+        txn.update_column_stats(
+            t,
+            ColumnId::new(1),
+            ColumnStats {
+                contains_null: Some(false),
+                contains_nan: None,
+                min_value: Some("9".into()),
+                max_value: Some("10".into()),
+                extra_stats: None,
+            },
+        )
+        .unwrap();
+        let cs = txn.column_stats(t, ColumnId::new(1)).unwrap();
+        assert_eq!(cs.min_value.as_deref(), Some("9"));
+        assert!(matches!(
+            txn.update_column_stats(t, ColumnId::new(9), ColumnStats::default()),
+            Err(Error::NotFound(_))
+        ));
+
+        // Dropping a column removes its table-level stats too, symmetric
+        // with delete_table removing table_stats.
+        let c2 = txn.add_column(t, &col("b")).unwrap();
+        txn.update_column_stats(
+            t,
+            c2,
+            ColumnStats {
+                contains_null: Some(true),
+                contains_nan: None,
+                min_value: Some("1".into()),
+                max_value: Some("2".into()),
+                extra_stats: None,
+            },
+        )
+        .unwrap();
+        assert!(txn.column_stats(t, c2).is_some());
+        txn.drop_column(t, c2).unwrap();
+        assert!(txn.column_stats(t, c2).is_none());
     }
 }

@@ -216,6 +216,18 @@ DuckLake's writer order and, when *parsing*, treats any entry kind it
 does not model as an unclassifiable change — conservatively a true
 conflict — rather than erroring.
 
+The verb-path mapping for data-plane operations, chosen so every emitted
+kind is one DuckLake's conflict matrix actually checks (the legacy
+`compacted_table` kind is parse-only in DuckLake's source and unchecked
+by its matrix — emitting it would make these commits invisible to a
+DuckLake retry): `register_data_file` → `inserted_into_table:<id>`;
+`register_delete_file` → `deleted_from_table:<id>`; `expire_data_file` →
+`merge_adjacent:<id>`; `expire_delete_file` → `rewrite_delete:<id>` (the
+two compaction kinds — an expiry's conflict profile is a compaction's:
+true against concurrent deletes, drops, and compaction of the table,
+benign against appends and alters). Statistics-only mutations emit no
+entry: stats are re-derived on retry and conflict with nothing.
+
 When the head conflict fires, the committer compares the set of
 `table_id`s it touched against those touched by the intervening commits
 `N+1 … N+k` (recoverable from their `snapshot_changes`):
