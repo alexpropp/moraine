@@ -63,5 +63,7 @@ cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
   && cargo deny check && cargo xtask e2e
 ```
 
-The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`.
+The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`,
+and a commit-msg hook there rejects non-conventional commit subjects (the
+changelog is generated from them; CI validates PR titles the same way).
 One-time setup per clone: `git config core.hooksPath .githooks`.

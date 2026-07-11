@@ -1,0 +1,19 @@
+name: PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  semantic:
+    runs-on: ubuntu-latest
+    steps:
+      # PRs squash-merge with the PR title as the commit subject, and the
+      # changelog is generated from those subjects — so the title must be a
+      # conventional commit.
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
