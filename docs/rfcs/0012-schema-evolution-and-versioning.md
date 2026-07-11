@@ -61,11 +61,28 @@ the table's **entire column history, ended versions included**
 the id must be unique across dropped columns too). The field id is the
 column's permanent identity: it is what data files record, and what a
 reader uses to project a physical Parquet column onto a logical catalog
-column. Field ids are **never reused** — MAX-over-history allocation means
-a dropped column's id can never collide with a later `add_column`. That is
-precisely what lets old Parquet, written against the old schema, be read
-back: the file references field ids, and a retired id in a file simply is
-not projected by the current schema.
+column. Field ids are **never reused** — a dropped column's id can never
+collide with a later `add_column`. That is precisely what lets old
+Parquet, written against the old schema, be read back: the file references
+field ids, and a retired id in a file simply is not projected by the
+current schema.
+
+DuckLake *derives* the next field id by `MAX(column_id) + 1` over the
+table's entire column history because a SQL catalog can run that query
+cheaply. moraine does not copy the derivation — it **persists the counter
+instead**: the table record carries `next_column_id`, seeded past the
+highest id at `CREATE TABLE` and advanced by each `add_column` (the add is
+therefore also a new version of the table record). Deriving from history
+in moraine would force every head materialization to scan `hist` —
+violating RFC 0002's "loading the current catalog is a scan of `cur`
+only" — and, fatally, the derived high-water mark would *regress* once
+RFC 0007 expires the very `hist` records it was derived from, silently
+re-issuing retired field ids. A persisted counter survives history expiry
+by construction. Defensively, allocation never goes below the live
+columns: the next id is `max(next_column_id, max live column_id + 1)`, so
+a table version whose counter field is absent (e.g. authored by the
+RFC 0006 staged-row path, where DuckLake computes ids itself) degrades to
+live-max allocation rather than colliding with a live id.
 
 RFC 0002 keys the `column` kind by `(table_id, column_id)` and keeps names
 out of keys entirely. RFC 0004 tracks a `schema_changed` flag and advances
@@ -109,8 +126,8 @@ one column. A reorder touches the columns whose position changed — under
 dense ordinals (Open questions) that can be most of the table, but it is
 one small `hist` record per moved column in one batch, O(columns), never
 O(data). Untouched siblings produce nothing. `add` allocates the table's
-next per-table `column_id` (`MAX + 1` over the table's column history —
-Background). `drop` ends the column's `cur` version
+next per-table `column_id` from the table record's persisted
+`next_column_id` counter (Background). `drop` ends the column's `cur` version
 exactly as any entity end does under RFC 0002 — delete the `cur` key, write
 the `hist` key with `end_snapshot` appended, both in the same batch — and
 the id is never handed out again.

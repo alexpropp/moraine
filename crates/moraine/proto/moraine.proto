@@ -33,6 +33,9 @@ message TableValue {
   string table_name = 6;
   string path = 7;
   bool path_is_relative = 8;
+  // moraine-side per-table field-id counter: the next column_id to
+  // allocate. Persisted so allocation never depends on scanning history.
+  uint64 next_column_id = 9;
 }
 
 // ducklake_view.

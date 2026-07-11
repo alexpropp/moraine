@@ -2,12 +2,12 @@
 
 ## Milestones
 ### Catalog core on SlateDB
-- [ ] RFC 0002: SlateDB key encoding for DuckLake catalog state
-- [ ] RFC 0004: commit/transaction protocol
-- [ ] `store`: key layout + codecs (proptest roundtrips)
-- [ ] `catalog`: snapshots, schemas, tables, data-file metadata
+- [x] RFC 0002: SlateDB key encoding for DuckLake catalog state
+- [x] RFC 0004: commit/transaction protocol
+- [x] `store`: key layout + codecs (proptest roundtrips)
+- [ ] `catalog`: snapshots, schemas, tables, data-file metadata (schemas/tables/columns done; data-file metadata pending)
 - [ ] `txn`: atomic commit with conflict detection
-- [ ] First runnable example in `crates/moraine/examples/` once the API exists
+- [x] First runnable example in `crates/moraine/examples/` once the API exists
 
 ### DuckDB extension loads
 - [ ] RFC 0006: extension surface (moraine as a DuckLake catalog via a DuckDB `StorageExtension`)

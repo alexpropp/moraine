@@ -29,6 +29,11 @@ pub(crate) fn header_buf(payload_len: usize) -> Vec<u8> {
 }
 
 /// Prepend the framing header to a payload.
+///
+/// Test-only: production code builds framed buffers through
+/// [`header_buf`] to encode a message directly without a payload copy;
+/// this whole-buffer form only serves fixture construction in tests.
+#[cfg(test)]
 pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
     let mut framed = header_buf(payload.len());
     framed.extend_from_slice(payload);

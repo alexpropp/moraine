@@ -100,6 +100,9 @@ deployment unit the README already sells ("a deployment is a bucket and
 credentials"). `CatalogOptions` surfaces deliberate SlateDB/WAL tuning (e.g.
 WAL bucket, flush cadence) through moraine's own type, so no `slatedb::` name
 appears publicly and options can be documented and evolved on moraine's terms.
+It also carries the store's path within the bucket, defaulting to the bucket
+root — the default deployment stays "a bucket and credentials", and a prefix
+is opt-in for hosts sharing a bucket.
 
 ### Reads
 
@@ -178,7 +181,7 @@ is a verb-path property.
 
 | Variant | Meaning | Retried? |
 |---|---|---|
-| `Conflict` | write-write race, retry budget exhausted | (internal retries preceded it) |
+| `CommitConflict` | write-write race, retry budget exhausted | (internal retries preceded it) |
 | `NotFound` | operation references a missing entity | no — abort |
 | `AlreadyExists` / `Constraint` | logical conflict (duplicate name, constraint violation) | no — abort |
 | `Store(#[source])` | underlying object-store / SlateDB I/O failure | no |
@@ -190,7 +193,7 @@ is a verb-path property.
 
 The conflict split follows from closure-with-retry: transient races
 (another writer advanced `sys/head`) are retried internally and only surface
-as `Conflict` when the budget is exhausted; logical conflicts
+as `CommitConflict` when the budget is exhausted; logical conflicts
 (`AlreadyExists`, `NotFound`) surface immediately because re-running the
 closure against fresher state cannot resolve them. Source errors are preserved
 via `thiserror` `#[source]`, so the DuckDB bridge maps each variant to a

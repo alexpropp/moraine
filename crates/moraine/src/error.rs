@@ -14,6 +14,20 @@ pub enum Error {
     #[error("corruption: {0}")]
     Corruption(String),
 
+    /// An operation referenced an entity that does not exist (or is not
+    /// live in the transaction's view).
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// An operation would violate name uniqueness.
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+
+    /// An operation would violate a structural constraint (e.g. dropping
+    /// a schema that still contains tables).
+    #[error("constraint violation: {0}")]
+    Constraint(String),
+
     /// The underlying store failed (SlateDB / object-store I/O).
     #[error("store error")]
     Store(#[source] Box<slatedb::Error>),

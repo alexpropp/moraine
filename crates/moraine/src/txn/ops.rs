@@ -1,0 +1,502 @@
+//! The typed mutation log and conflict classification.
+//!
+//! Ops are recorded at classification grain — which schema-list entries
+//! and which tables a commit touched — not at entity-payload grain; the
+//! staged entity state lives in the transaction's working snapshot.
+
+use std::collections::BTreeSet;
+
+/// One staged mutation, at the grain conflict classification needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Op {
+    /// A schema was created.
+    CreateSchema {
+        /// The new schema's id.
+        schema_id: u64,
+        /// The new schema's name, needed to serialize the created-schema
+        /// entry in DuckLake's name-quoted `changes_made` grammar.
+        name: String,
+    },
+    /// A schema was dropped.
+    DropSchema {
+        /// The dropped schema's id.
+        schema_id: u64,
+    },
+    /// A table was created.
+    CreateTable {
+        /// The schema the table was created in.
+        schema_id: u64,
+        /// The new table's id.
+        table_id: u64,
+        /// The owning schema's name, needed to serialize the
+        /// created-table entry as `"schema"."table"`.
+        schema_name: String,
+        /// The new table's name.
+        table_name: String,
+    },
+    /// An existing table was mutated (rename, move, or column DDL).
+    AlterTable {
+        /// The mutated table's id.
+        table_id: u64,
+    },
+    /// A table was dropped.
+    DropTable {
+        /// The dropped table's id.
+        table_id: u64,
+    },
+}
+
+impl Op {
+    /// Whether this op changes the catalog's shape (and therefore bumps
+    /// the schema version). Every op in this set currently does; the
+    /// method exists so data-only ops classify explicitly when they
+    /// arrive, never by inference from the write set.
+    pub(crate) fn is_schema_changing(&self) -> bool {
+        match self {
+            Op::CreateSchema { .. }
+            | Op::DropSchema { .. }
+            | Op::CreateTable { .. }
+            | Op::AlterTable { .. }
+            | Op::DropTable { .. } => true,
+        }
+    }
+}
+
+/// Wraps `s` in double quotes, doubling any embedded quote — DuckLake's
+/// `SQLIdentifierToString` quoting rule for names in `changes_made`.
+fn quote_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push('"');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Parses one SQL-quoted identifier at the start of `s` (which must begin
+/// with `"`), undoubling embedded quotes. Returns the unquoted value and
+/// the remainder of `s` following the closing quote, or `None` if `s` is
+/// not a validly quoted, terminated identifier — DuckLake's
+/// `ParseQuotedValue` counterpart.
+fn parse_quoted(s: &str) -> Option<(String, &str)> {
+    let rest = s.strip_prefix('"')?;
+    let mut value = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c != '"' {
+            value.push(c);
+            continue;
+        }
+        if let Some(b'"') = rest.as_bytes().get(i + 1) {
+            value.push('"');
+            chars.next();
+        } else {
+            return Some((value, &rest[i + 1..]));
+        }
+    }
+    None
+}
+
+/// Parses a fully quoted `created_schema` payload: a single quoted name
+/// consuming the entire payload.
+fn parse_created_schema_payload(payload: &str) -> Option<String> {
+    let (name, rest) = parse_quoted(payload)?;
+    rest.is_empty().then_some(name)
+}
+
+/// Parses a `created_table` payload: `"schema"."table"`, each name
+/// independently quoted and joined by a bare dot.
+fn parse_created_table_payload(payload: &str) -> Option<(String, String)> {
+    let (schema, rest) = parse_quoted(payload)?;
+    let rest = rest.strip_prefix('.')?;
+    let (table, rest) = parse_quoted(rest)?;
+    rest.is_empty().then_some((schema, table))
+}
+
+/// Splits `changes_made` on top-level commas: a `"` toggles an in-quotes
+/// flag, and a comma is only an entry separator while the flag is clear.
+/// This is DuckLake's own scan (doubled quotes toggle twice in a row,
+/// which is harmless for separator purposes since no comma ever sits
+/// between the two quotes of an escape pair). Empty entries — including
+/// the sole empty entry produced by scanning an empty string — are
+/// dropped rather than treated as malformed.
+fn split_entries(changes_made: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0;
+    for (i, c) in changes_made.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                entries.push(&changes_made[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&changes_made[start..]);
+    entries.retain(|e| !e.is_empty());
+    entries
+}
+
+/// What one commit touched, comparable against another commit's set.
+/// Serialized into the snapshot record's `changes_made` field in
+/// DuckLake's own wire grammar: comma-joined `kind:payload` entries,
+/// created entries carrying SQL-quoted names and all other entries
+/// carrying numeric ids, e.g.
+/// `dropped_schema:5,dropped_table:4,created_schema:"s1",created_table:"s1"."orders",altered_table:3`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChangeSet {
+    /// Names of schemas created by this commit, unquoted.
+    pub(crate) created_schemas: BTreeSet<String>,
+    pub(crate) dropped_schemas: BTreeSet<u64>,
+    /// `(schema name, table name)` pairs, unquoted. DuckLake's grammar
+    /// carries names, not ids, for created entries, so a parsed
+    /// `ChangeSet` cannot recover the schema *id* a created table lives
+    /// in from this field alone.
+    pub(crate) created_tables: BTreeSet<(String, String)>,
+    /// Schema ids a table was created in by this commit. Populated only
+    /// by [`Self::from_ops`] — the wire grammar has no id for created
+    /// entries, so a set built by [`Self::parse`] always leaves this
+    /// empty. It feeds the create-inside-dropped-schema conflict check
+    /// for *our own* side only; the symmetric risk on the intervening
+    /// side is covered by the closure re-run on retry re-validating
+    /// against the state that won, mirroring DuckLake, whose own
+    /// `CheckForConflicts` likewise tests only its own creations against
+    /// others' schema drops.
+    pub(crate) created_table_schema_ids: BTreeSet<u64>,
+    pub(crate) altered_tables: BTreeSet<u64>,
+    pub(crate) dropped_tables: BTreeSet<u64>,
+    /// Set when parsing met an entry kind or payload this binary does not
+    /// model — including known-DuckLake kinds moraine does not yet emit
+    /// (e.g. `inserted_into_table`, `inline_flush`, `created_view`).
+    /// Unknown changes classify as conflicting — never silently benign.
+    pub(crate) has_unknown: bool,
+}
+
+impl ChangeSet {
+    pub(crate) fn from_ops(ops: &[Op]) -> Self {
+        let mut set = Self::default();
+        for op in ops {
+            match op {
+                Op::CreateSchema { name, .. } => {
+                    set.created_schemas.insert(name.clone());
+                }
+                Op::DropSchema { schema_id } => {
+                    set.dropped_schemas.insert(*schema_id);
+                }
+                Op::CreateTable {
+                    schema_id,
+                    schema_name,
+                    table_name,
+                    ..
+                } => {
+                    set.created_tables
+                        .insert((schema_name.clone(), table_name.clone()));
+                    set.created_table_schema_ids.insert(*schema_id);
+                }
+                Op::AlterTable { table_id } => {
+                    set.altered_tables.insert(*table_id);
+                }
+                Op::DropTable { table_id } => {
+                    set.dropped_tables.insert(*table_id);
+                }
+            }
+        }
+        set
+    }
+
+    /// Emits entries in DuckLake's writer order (the subset moraine
+    /// emits): dropped schemas, dropped tables, created schemas, created
+    /// tables, altered tables.
+    pub(crate) fn to_changes_made(&self) -> String {
+        let mut entries = Vec::new();
+        entries.extend(
+            self.dropped_schemas
+                .iter()
+                .map(|id| format!("dropped_schema:{id}")),
+        );
+        entries.extend(
+            self.dropped_tables
+                .iter()
+                .map(|id| format!("dropped_table:{id}")),
+        );
+        entries.extend(
+            self.created_schemas
+                .iter()
+                .map(|name| format!("created_schema:{}", quote_ident(name))),
+        );
+        entries.extend(
+            self.created_tables
+                .iter()
+                .map(|(s, t)| format!("created_table:{}.{}", quote_ident(s), quote_ident(t))),
+        );
+        entries.extend(
+            self.altered_tables
+                .iter()
+                .map(|id| format!("altered_table:{id}")),
+        );
+        entries.join(",")
+    }
+
+    /// Parses a stored `changes_made` string written in DuckLake's
+    /// grammar. Kind matching is case-insensitive, matching DuckLake's
+    /// parser. Malformed payloads and unrecognized entry kinds — whether
+    /// truly unknown or a known-DuckLake kind moraine does not model —
+    /// set `has_unknown` instead of erroring: the record may have been
+    /// written by a peer (or a future moraine) this binary predates, and
+    /// the safe reading of "something happened that I don't understand"
+    /// is a conflict.
+    pub(crate) fn parse(changes_made: &str) -> Self {
+        let mut set = Self::default();
+        for entry in split_entries(changes_made) {
+            let Some((kind, payload)) = entry.split_once(':') else {
+                set.has_unknown = true;
+                continue;
+            };
+            let known = if kind.eq_ignore_ascii_case("created_schema") {
+                parse_created_schema_payload(payload)
+                    .map(|name| set.created_schemas.insert(name))
+                    .is_some()
+            } else if kind.eq_ignore_ascii_case("dropped_schema") {
+                payload
+                    .parse()
+                    .map(|id| set.dropped_schemas.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("created_table") {
+                parse_created_table_payload(payload)
+                    .map(|pair| set.created_tables.insert(pair))
+                    .is_some()
+            } else if kind.eq_ignore_ascii_case("altered_table") {
+                payload
+                    .parse()
+                    .map(|id| set.altered_tables.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("dropped_table") {
+                payload
+                    .parse()
+                    .map(|id| set.dropped_tables.insert(id))
+                    .is_ok()
+            } else {
+                false
+            };
+            if !known {
+                set.has_unknown = true;
+            }
+        }
+        set
+    }
+
+    fn touches_schema_list(&self) -> bool {
+        !self.created_schemas.is_empty() || !self.dropped_schemas.is_empty()
+    }
+
+    fn touched_tables(&self) -> impl Iterator<Item = u64> + '_ {
+        self.altered_tables
+            .iter()
+            .chain(self.dropped_tables.iter())
+            .copied()
+    }
+
+    fn creates_table_in(&self, schema_id: u64) -> bool {
+        self.created_table_schema_ids.contains(&schema_id)
+    }
+}
+
+/// Whether two concurrent commits are a true conflict. Symmetric.
+///
+/// Benign unless: either side's changes are unknown to this binary; both
+/// touch the schema list (coarse by design — schema DDL is rare); they
+/// mutated or dropped a common table; or one created a table inside a
+/// schema the other dropped. Creation ids are fresh, so creations never
+/// conflict by id — name uniqueness is re-validated by the closure
+/// re-run, not by set comparison.
+pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
+    if ours.has_unknown || theirs.has_unknown {
+        return true;
+    }
+    if ours.touches_schema_list() && theirs.touches_schema_list() {
+        return true;
+    }
+    let their_tables: BTreeSet<u64> = theirs.touched_tables().collect();
+    if ours.touched_tables().any(|t| their_tables.contains(&t)) {
+        return true;
+    }
+    let created_in_dropped =
+        |a: &ChangeSet, b: &ChangeSet| b.dropped_schemas.iter().any(|s| a.creates_table_in(*s));
+    created_in_dropped(ours, theirs) || created_in_dropped(theirs, ours)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_schema(schema_id: u64, name: &str) -> Op {
+        Op::CreateSchema {
+            schema_id,
+            name: name.to_owned(),
+        }
+    }
+
+    fn create_table(schema_id: u64, table_id: u64, schema_name: &str, table_name: &str) -> Op {
+        Op::CreateTable {
+            schema_id,
+            table_id,
+            schema_name: schema_name.to_owned(),
+            table_name: table_name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn changes_made_exact_serialization() {
+        let ops = [
+            create_schema(1, "s1"),
+            create_table(1, 2, "s1", "orders"),
+            Op::AlterTable { table_id: 3 },
+            Op::DropTable { table_id: 4 },
+            Op::DropSchema { schema_id: 5 },
+        ];
+        let set = ChangeSet::from_ops(&ops);
+        let text = set.to_changes_made();
+        assert_eq!(
+            text,
+            r#"dropped_schema:5,dropped_table:4,created_schema:"s1",created_table:"s1"."orders",altered_table:3"#
+        );
+    }
+
+    #[test]
+    fn round_trip_clears_created_table_schema_ids() {
+        let ops = [
+            create_schema(1, "s1"),
+            create_table(1, 2, "s1", "orders"),
+            Op::AlterTable { table_id: 3 },
+            Op::DropTable { table_id: 4 },
+            Op::DropSchema { schema_id: 5 },
+        ];
+        let set = ChangeSet::from_ops(&ops);
+        let text = set.to_changes_made();
+        let parsed = ChangeSet::parse(&text);
+        let expected = ChangeSet {
+            created_table_schema_ids: BTreeSet::new(),
+            ..set
+        };
+        assert_eq!(parsed, expected);
+        assert_eq!(ChangeSet::parse(""), ChangeSet::default());
+    }
+
+    #[test]
+    fn quoting_edges_round_trip() {
+        // Names containing a comma, a dot, and an embedded quote must all
+        // round-trip through the quoted grammar unchanged.
+        let ops = [create_schema(1, "s,1"), create_table(2, 3, "a.b", r#"c"d"#)];
+        let set = ChangeSet::from_ops(&ops);
+        let text = set.to_changes_made();
+        assert_eq!(text, r#"created_schema:"s,1",created_table:"a.b"."c""d""#);
+        let parsed = ChangeSet::parse(&text);
+        assert_eq!(parsed.created_schemas, set.created_schemas);
+        assert_eq!(parsed.created_tables, set.created_tables);
+        assert!(!parsed.has_unknown);
+    }
+
+    #[test]
+    fn kind_matching_is_case_insensitive() {
+        let parsed = ChangeSet::parse(r#"CREATED_SCHEMA:"x""#);
+        assert!(!parsed.has_unknown);
+        assert!(parsed.created_schemas.contains("x"));
+    }
+
+    #[test]
+    fn known_ducklake_kind_moraine_does_not_model_is_unknown() {
+        let parsed = ChangeSet::parse("inserted_into_table:7");
+        assert!(parsed.has_unknown);
+        assert!(conflicts(&ChangeSet::default(), &parsed));
+    }
+
+    #[test]
+    fn unknown_entries_are_conservative() {
+        let parsed = ChangeSet::parse("flushed_inline:7");
+        assert!(parsed.has_unknown);
+        assert!(conflicts(&ChangeSet::default(), &parsed));
+    }
+
+    #[test]
+    fn malformed_payload_is_unknown() {
+        // A created_schema payload missing the closing quote is malformed.
+        let parsed = ChangeSet::parse(r#"created_schema:"unterminated"#);
+        assert!(parsed.has_unknown);
+        // A dropped_table payload that is not numeric is malformed.
+        let parsed = ChangeSet::parse("dropped_table:not_a_number");
+        assert!(parsed.has_unknown);
+    }
+
+    #[test]
+    fn disjoint_tables_are_benign() {
+        let ours = ChangeSet::from_ops(&[Op::AlterTable { table_id: 1 }]);
+        let theirs = ChangeSet::from_ops(&[Op::AlterTable { table_id: 2 }]);
+        assert!(!conflicts(&ours, &theirs));
+    }
+
+    #[test]
+    fn overlapping_tables_conflict() {
+        let ours = ChangeSet::from_ops(&[Op::AlterTable { table_id: 1 }]);
+        let dropped = ChangeSet::from_ops(&[Op::DropTable { table_id: 1 }]);
+        assert!(conflicts(&ours, &dropped));
+        assert!(conflicts(&dropped, &ours));
+    }
+
+    #[test]
+    fn schema_list_is_coarse_grained() {
+        let create = ChangeSet::from_ops(&[create_schema(1, "s1")]);
+        let drop = ChangeSet::from_ops(&[Op::DropSchema { schema_id: 9 }]);
+        assert!(conflicts(&create, &drop));
+        // A table-only commit does not touch the schema list.
+        let alter = ChangeSet::from_ops(&[Op::AlterTable { table_id: 1 }]);
+        assert!(!conflicts(&alter, &drop));
+    }
+
+    #[test]
+    fn create_inside_dropped_schema_conflicts() {
+        let ours = ChangeSet::from_ops(&[create_table(3, 8, "s3", "t8")]);
+        let theirs = ChangeSet::from_ops(&[Op::DropSchema { schema_id: 3 }]);
+        assert!(conflicts(&ours, &theirs));
+        assert!(conflicts(&theirs, &ours));
+        // Creation in a surviving schema is benign.
+        let elsewhere = ChangeSet::from_ops(&[create_table(4, 9, "s4", "t9")]);
+        assert!(!conflicts(&elsewhere, &theirs));
+    }
+
+    #[test]
+    fn parsed_created_table_schema_ids_stay_empty() {
+        // The wire grammar carries names, not schema ids, for created
+        // entries, so a parsed ChangeSet can never populate
+        // created_table_schema_ids — the create-inside-dropped-schema
+        // check is a from_ops-only capability for our own side.
+        let ours = ChangeSet::from_ops(&[create_table(3, 8, "s3", "t8")]);
+        let parsed = ChangeSet::parse(&ours.to_changes_made());
+        assert!(parsed.created_table_schema_ids.is_empty());
+        let theirs = ChangeSet::from_ops(&[Op::DropSchema { schema_id: 3 }]);
+        // The parsed side can no longer detect its own creation inside
+        // the dropped schema by this mechanism; the closure re-run on
+        // retry covers that risk instead (see the field's doc comment).
+        assert!(!conflicts(&parsed, &theirs));
+    }
+
+    #[test]
+    fn fresh_created_tables_never_conflict_by_id() {
+        let a = ChangeSet::from_ops(&[create_table(1, 7, "s1", "t7")]);
+        let b = ChangeSet::from_ops(&[create_table(1, 7, "s1", "t7")]);
+        // Same ids cannot happen for real (ids are allocated above head),
+        // but creation is not a mutation of existing state either way.
+        assert!(!conflicts(&a, &b));
+    }
+
+    #[test]
+    fn all_slice_ops_are_schema_changing() {
+        assert!(create_schema(0, "s").is_schema_changing());
+        assert!(Op::AlterTable { table_id: 0 }.is_schema_changing());
+    }
+}

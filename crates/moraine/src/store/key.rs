@@ -247,14 +247,22 @@ impl Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subspace {
     /// Store-level singletons.
+    // Sys keys are read/written by exact key today; no caller prefix-scans
+    // the whole subspace yet.
+    #[allow(dead_code)]
     Sys,
     /// Snapshot records.
+    // No production caller prefix-scans every snapshot yet (snapshot
+    // listing lands with expiry/GC); a store-open test exercises it.
+    #[allow(dead_code)]
     Snap,
     /// Live catalog state.
     Cur,
     /// Ended entity versions.
     Hist,
     /// Inlined data.
+    // Data inlining is not implemented yet.
+    #[allow(dead_code)]
     Inline,
 }
 
@@ -277,6 +285,9 @@ impl Subspace {
 /// The kinds whose live keys are scoped `table_id`-first — the only kinds
 /// [`cur_table_prefix`] accepts, so "which kinds are table-scoped" is a
 /// type, not caller knowledge.
+// No caller needs "everything about table T" yet (cascading table drop and
+// per-table GC land in later slices); the prefix math is pinned by tests.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TableScopedKind {
     /// `ducklake_column`.
@@ -298,6 +309,7 @@ pub(crate) enum TableScopedKind {
 impl TableScopedKind {
     /// An entity of this kind with its table id set and every other
     /// component zeroed, for prefix derivation.
+    #[allow(dead_code)]
     const fn sample(self, table_id: u64) -> EntityKey {
         match self {
             Self::Column => EntityKey::Column {
@@ -332,6 +344,8 @@ impl TableScopedKind {
 
 /// Discriminant bytes preceding an entity's components in a live key:
 /// subspace, `CurKey::Entity`, entity kind.
+// Only `cur_table_prefix` consumes this, and it has no caller yet.
+#[allow(dead_code)]
 const CUR_KIND_PREFIX_LEN: usize = 3;
 
 /// Byte prefix of every key in a subspace (exactly `TAG_PREFIX_LEN`
@@ -344,6 +358,9 @@ pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
 
 /// Byte prefix of every live key of `kind` scoped to `table_id` —
 /// "everything about table T" for one kind.
+// No caller yet; pinned by the prefix tests below against the day
+// cascading table drop or per-table GC needs it.
+#[allow(dead_code)]
 pub(crate) fn cur_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
     let mut bytes = Key::cur(kind.sample(table_id)).encode();
     bytes.truncate(CUR_KIND_PREFIX_LEN + size_of::<u64>());

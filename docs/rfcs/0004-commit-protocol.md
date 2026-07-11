@@ -121,6 +121,31 @@ surfaced in README-level documentation, and revisited only if a
 multi-writer coordination design (out of scope, per Non-goals) is ever
 taken up.
 
+### Bootstrap — the commit that creates the store
+
+Opening a store that has never been written is itself a commit-shaped
+operation and rides the same machinery. On open, the catalog reads
+`sys/format` through a transaction:
+
+- **Present** → validate: an unknown format version is refused
+  (`Corruption` today; `Migration` once RFC 0015's variant exists), and a
+  present `sys/migration` marker is refused outright (RFC 0002 reserves
+  that check from format v1).
+- **Absent (empty store)** → bootstrap: stage one atomic batch writing
+  `sys/format` (format version 1 plus the writing moraine version),
+  snapshot `0` (empty catalog: no entities, counters at their initial
+  values so the first allocation yields id 0, `schema_version` 0, empty
+  `changes_made`), and `sys/head` → `0`, then commit it under the same
+  head conflict detection as any commit. A same-process race between two
+  bootstrapping opens arbitrates on the head write like any other commit
+  — the loser re-reads and finds the initialized store; across processes
+  the single-writer topology and fencing already exclude a second writer.
+
+Bootstrap mints **no default schema**. DuckLake's own initial catalog
+state (its default `main` schema) is DuckLake-authored and arrives
+through whichever front door the host drives — the core stays agnostic to
+it.
+
 ### The commit sequence
 
 A commit takes a set of staged catalog mutations (entity inserts, entity
@@ -175,6 +200,21 @@ committer may serialize them (see Group commit); across processes, the
 topology above guarantees there is no second writer to race.
 
 ### Conflict detection — table-level
+
+The `changes_made` field of the snap record is written in **DuckLake's
+own grammar**, not a moraine dialect — the field is DuckLake-visible on
+the staged-row path (DuckLake re-parses it mid-retry, and its parser
+*throws* on unknown entry kinds), so the wire format is DuckLake's to
+define. Source-verified (writer `WriteSnapshotChanges` in
+`ducklake_transaction_state.cpp`, parser `ParseChangesMade` in
+`ducklake_transaction_changes.cpp`): comma-separated `kind:payload`
+entries; created entries carry SQL-quoted names (`created_schema:"s"`,
+`created_table:"s"."t"`, quotes doubled for embedded quotes), all other
+entries carry numeric ids (`dropped_schema:1`, `dropped_table:2`,
+`altered_table:3`, `inserted_into_table:4`, …). moraine emits entries in
+DuckLake's writer order and, when *parsing*, treats any entry kind it
+does not model as an unclassifiable change — conservatively a true
+conflict — rather than erroring.
 
 When the head conflict fires, the committer compares the set of
 `table_id`s it touched against those touched by the intervening commits
@@ -492,6 +532,10 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   insert/delete, flush, and mapping registration — carries it forward;
   comment/tag changes increment; `set_option` mints no snapshot and
   changes no version.
+- Bootstrap: the first open of an empty store lands format stamp,
+  snapshot 0, and head in one batch; a second open (concurrent or later)
+  finds the initialized store rather than re-initializing; an
+  unknown-format or mid-migration store is refused.
 - Fresh-reader visibility: after `commit` returns, a newly opened reader
   resolves the new snapshot (the store-harness validation above, run
   against real SlateDB on in-memory `object_store`).
