@@ -115,7 +115,9 @@ columns, so these records are overwritten in place, never transition to
 `hist`, and a time-travel view serves the current stats (stats are
 advisory pruning data, not catalog history). An `fstat` record outlives
 its file's live version — historical snapshots still prune by it — and
-is removed only when RFC 0007 GC prunes the file's history:
+is removed only when RFC 0007 GC prunes the file's history. The `tag`
+kind is a third shape: an unversioned container record whose embedded
+entries are individually begin/end-versioned (see its row below):
 
 | Kind | Key components | DuckLake table(s) |
 |---|---|---|
@@ -129,7 +131,7 @@ is removed only when RFC 0007 GC prunes the file's history:
 | `fstat` | `table_id, data_file_id, column_id` | `ducklake_file_column_stats` (+ variant stats) |
 | `tstat` | `table_id` | `ducklake_table_stats` |
 | `tcstat` | `table_id, column_id` | `ducklake_table_column_stats` |
-| `tag` | `object_id` | `ducklake_tag` (object ids are unique across entity types via the shared counter — no type discriminator needed) |
+| `tag` | `object_id` | `ducklake_tag`, **one container record per tagged object** holding all of the object's tag rows as embedded entries (object ids are unique across entity types via the shared counter — no type discriminator needed). An object can carry many tags, and tag keys are strings that stay out of the keyspace, so the rows cannot each own a store key; they embed instead, exactly as `ducklake_column_tag` embeds in the column value. The container is **overwritten in place** (no `hist` mirror), while each embedded entry carries its own `begin_snapshot`/`end_snapshot` verbatim from its `ducklake_tag` row — a tag change rewrites the container, ending or appending entries; time travel filters entries by begin/end at read; ended entries are pruned from the container when RFC 0007 GC passes the retention horizon. Row-faithfulness holds because entries are `ducklake_tag` rows, not a re-modeling. |
 | `option` | `scope_kind, scope_id` | `ducklake_metadata` / `set_option` scopes. `scope_kind` ∈ {global = 0, schema = 1, table = 2}; global uses `scope_id` 0. One record per scope holding its options as a map (option *names* are strings and stay out of keys); set/unset rewrites the record. Options are **unversioned** — DuckLake's `set_option` writes outside the snapshot protocol, last-write-wins (RFC 0004) — so they never transition to `hist`, and an options-only mutation doesn't advance head. |
 
 Other subspaces:

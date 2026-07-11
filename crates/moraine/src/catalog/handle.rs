@@ -114,10 +114,10 @@ impl Catalog {
 
     /// Commits catalog mutations atomically, producing one new snapshot.
     ///
-    /// The closure stages mutations on the [`Tx`]; reads on the `Tx`
+    /// The closure stages mutations on the [`Transaction`]; reads on the `Transaction`
     /// observe its own staged state. Because a lost race with a
     /// concurrent commit re-runs the closure against the fresh state, the
-    /// closure must be pure: no I/O, no effects other than the `Tx`
+    /// closure must be pure: no I/O, no effects other than the `Transaction`
     /// calls. A closure that stages nothing commits nothing and returns
     /// the unchanged head snapshot id.
     ///
