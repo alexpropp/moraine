@@ -112,6 +112,257 @@ int32_t moraine_snapshot_data_files_of(MoraineSnapshotHandle *snapshot, uint64_t
                                         MoraineDataFileDesc **out_items, size_t *out_len, MoraineError *err);
 void moraine_snapshot_data_files_of_free(MoraineDataFileDesc *items, size_t len);
 
+// Row-faithful ducklake_* dumps (src/dumps.rs): every cur AND hist row of one
+// kind, verbatim, for the DuckLake metadata-table projections. Optional
+// scalar fields carry a `has_<field>` companion flag (no sentinel value is
+// safe for an id/count/flag); optional strings are null for absent, exactly
+// like every other string field here.
+
+// Mirrors `moraine_duckdb::dumps::MoraineSnapshotRow`.
+typedef struct MoraineSnapshotRow {
+	uint64_t snapshot_id;
+	int64_t snapshot_time_micros;
+	uint64_t schema_version;
+	uint64_t next_catalog_id;
+	uint64_t next_file_id;
+	char *changes_made;
+	char *author;
+	char *commit_message;
+	char *commit_extra_info;
+} MoraineSnapshotRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineSchemaRow`.
+typedef struct MoraineSchemaRow {
+	uint64_t schema_id;
+	char *schema_uuid;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	char *schema_name;
+	char *path;
+	bool path_is_relative;
+} MoraineSchemaRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineTableRow`.
+typedef struct MoraineTableRow {
+	uint64_t table_id;
+	char *table_uuid;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	uint64_t schema_id;
+	char *table_name;
+	char *path;
+	bool path_is_relative;
+} MoraineTableRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineViewRow`.
+typedef struct MoraineViewRow {
+	uint64_t view_id;
+	char *view_uuid;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	uint64_t schema_id;
+	char *view_name;
+	char *dialect;
+	char *sql;
+	char *column_aliases;
+} MoraineViewRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineColumnRow`.
+typedef struct MoraineColumnRow {
+	uint64_t column_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	uint64_t table_id;
+	uint64_t column_order;
+	char *column_name;
+	char *column_type;
+	char *initial_default;
+	char *default_value;
+	bool nulls_allowed;
+	bool has_parent_column;
+	uint64_t parent_column;
+	char *default_value_type;
+	char *default_value_dialect;
+} MoraineColumnRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineDataFileRow`.
+typedef struct MoraineDataFileRow {
+	uint64_t data_file_id;
+	uint64_t table_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	bool has_file_order;
+	uint64_t file_order;
+	char *path;
+	bool path_is_relative;
+	char *file_format;
+	uint64_t record_count;
+	uint64_t file_size_bytes;
+	uint64_t footer_size;
+	uint64_t row_id_start;
+	bool has_partition_id;
+	uint64_t partition_id;
+	char *encryption_key;
+	bool has_mapping_id;
+	uint64_t mapping_id;
+	bool has_partial_max;
+	uint64_t partial_max;
+} MoraineDataFileRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineDeleteFileRow`.
+typedef struct MoraineDeleteFileRow {
+	uint64_t delete_file_id;
+	uint64_t table_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	uint64_t data_file_id;
+	char *path;
+	bool path_is_relative;
+	char *format;
+	uint64_t delete_count;
+	uint64_t file_size_bytes;
+	uint64_t footer_size;
+	char *encryption_key;
+	bool has_partial_max;
+	uint64_t partial_max;
+} MoraineDeleteFileRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineTableStatsRow`.
+typedef struct MoraineTableStatsRow {
+	uint64_t table_id;
+	uint64_t record_count;
+	uint64_t next_row_id;
+	uint64_t file_size_bytes;
+} MoraineTableStatsRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineTableColumnStatsRow`.
+typedef struct MoraineTableColumnStatsRow {
+	uint64_t table_id;
+	uint64_t column_id;
+	bool has_contains_null;
+	bool contains_null;
+	bool has_contains_nan;
+	bool contains_nan;
+	char *min_value;
+	char *max_value;
+	char *extra_stats;
+} MoraineTableColumnStatsRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineFileColumnStatsRow`.
+typedef struct MoraineFileColumnStatsRow {
+	uint64_t data_file_id;
+	uint64_t table_id;
+	uint64_t column_id;
+	uint64_t column_size_bytes;
+	uint64_t value_count;
+	uint64_t null_count;
+	char *min_value;
+	char *max_value;
+	bool has_contains_nan;
+	bool contains_nan;
+	char *extra_stats;
+} MoraineFileColumnStatsRow;
+
+int32_t moraine_dump_snapshots(MoraineCatalogHandle *handle, MoraineSnapshotRow **out_items, size_t *out_len,
+                                MoraineError *err);
+void moraine_dump_snapshots_free(MoraineSnapshotRow *items, size_t len);
+
+int32_t moraine_dump_schemas(MoraineCatalogHandle *handle, MoraineSchemaRow **out_items, size_t *out_len,
+                              MoraineError *err);
+void moraine_dump_schemas_free(MoraineSchemaRow *items, size_t len);
+
+int32_t moraine_dump_tables(MoraineCatalogHandle *handle, MoraineTableRow **out_items, size_t *out_len,
+                             MoraineError *err);
+void moraine_dump_tables_free(MoraineTableRow *items, size_t len);
+
+int32_t moraine_dump_columns(MoraineCatalogHandle *handle, MoraineColumnRow **out_items, size_t *out_len,
+                              MoraineError *err);
+void moraine_dump_columns_free(MoraineColumnRow *items, size_t len);
+
+int32_t moraine_dump_views(MoraineCatalogHandle *handle, MoraineViewRow **out_items, size_t *out_len,
+                            MoraineError *err);
+void moraine_dump_views_free(MoraineViewRow *items, size_t len);
+
+int32_t moraine_dump_data_files(MoraineCatalogHandle *handle, MoraineDataFileRow **out_items, size_t *out_len,
+                                 MoraineError *err);
+void moraine_dump_data_files_free(MoraineDataFileRow *items, size_t len);
+
+int32_t moraine_dump_delete_files(MoraineCatalogHandle *handle, MoraineDeleteFileRow **out_items, size_t *out_len,
+                                   MoraineError *err);
+void moraine_dump_delete_files_free(MoraineDeleteFileRow *items, size_t len);
+
+int32_t moraine_dump_table_stats(MoraineCatalogHandle *handle, MoraineTableStatsRow **out_items, size_t *out_len,
+                                  MoraineError *err);
+void moraine_dump_table_stats_free(MoraineTableStatsRow *items, size_t len);
+
+int32_t moraine_dump_table_column_stats(MoraineCatalogHandle *handle, MoraineTableColumnStatsRow **out_items,
+                                         size_t *out_len, MoraineError *err);
+void moraine_dump_table_column_stats_free(MoraineTableColumnStatsRow *items, size_t len);
+
+int32_t moraine_dump_file_column_stats(MoraineCatalogHandle *handle, MoraineFileColumnStatsRow **out_items,
+                                        size_t *out_len, MoraineError *err);
+void moraine_dump_file_column_stats_free(MoraineFileColumnStatsRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::dumps::MoraineSchemaVersionRow`: one
+// ducklake_schema_versions row, flattened from the snapshot records the
+// table-id sets fold into.
+typedef struct MoraineSchemaVersionRow {
+	uint64_t begin_snapshot;
+	uint64_t schema_version;
+	uint64_t table_id;
+} MoraineSchemaVersionRow;
+
+int32_t moraine_dump_schema_versions(MoraineCatalogHandle *handle, MoraineSchemaVersionRow **out_items,
+                                      size_t *out_len, MoraineError *err);
+void moraine_dump_schema_versions_free(MoraineSchemaVersionRow *items, size_t len);
+
+// The staged-row write path (src/staged.rs): DuckLake authors row
+// mutations against the ducklake_* metadata tables over ordinary SQL; the
+// shim translates each row into a MoraineCell array and stages it here,
+// landing every staged row in one atomic batch at commit. No internal
+// retry: a lost race at commit returns MORAINE_COMMIT_CONFLICT with the
+// literal substring "conflict" in the message.
+
+typedef struct MoraineTxnHandle MoraineTxnHandle;
+
+// One value in a staged row. `kind`: 0 = NULL, 1 = u64, 2 = i64, 3 = bool,
+// 4 = string (borrowed, NUL-terminated UTF-8; moraine_txn_stage copies it,
+// never retains the pointer past that call).
+typedef struct MoraineCell {
+	int32_t kind;
+	uint64_t u64_value;
+	int64_t i64_value;
+	bool bool_value;
+	const char *str_value;
+} MoraineCell;
+
+int32_t moraine_txn_begin(MoraineCatalogHandle *handle, MoraineTxnHandle **out, MoraineError *err);
+
+// `table_kind` (moraine::ffi_support::staged::TableKind's discriminant
+// order): 0 ducklake_snapshot, 1 ducklake_snapshot_changes, 2
+// ducklake_schema, 3 ducklake_table, 4 ducklake_view, 5 ducklake_column, 6
+// ducklake_data_file, 7 ducklake_delete_file, 8 ducklake_table_stats, 9
+// ducklake_table_column_stats, 10 ducklake_file_column_stats, 11
+// ducklake_schema_versions.
+// `op_kind`: 0 insert, 1 delete, 2 update-sets-end_snapshot. `cells` are
+// positional in the exact column order metadata_tables.cpp declares for
+// `table_kind`'s table (a delete/update-set-end row carries only the key
+// columns).
+int32_t moraine_txn_stage(MoraineTxnHandle *txn, int32_t table_kind, int32_t op_kind, const MoraineCell *cells,
+                           size_t cells_len, MoraineError *err);
+
+// Consumes `txn`. On success, `*out_snapshot_id` is the new snapshot id.
+int32_t moraine_txn_commit(MoraineTxnHandle *txn, uint64_t *out_snapshot_id, MoraineError *err);
+
+// Consumes `txn`, discarding every staged row. A null `txn` is a no-op.
+void moraine_txn_rollback(MoraineTxnHandle *txn);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

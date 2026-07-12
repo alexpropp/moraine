@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore;
 use slatedb::{Db, DbTransaction, IsolationLevel, config::WriteOptions};
+use uuid::Uuid;
 
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId},
@@ -36,7 +37,7 @@ pub(crate) fn now_micros() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
-fn durable() -> WriteOptions {
+pub(crate) fn durable() -> WriteOptions {
     WriteOptions {
         await_durable: true,
         ..Default::default()
@@ -63,7 +64,10 @@ async fn validate_format(tx: &DbTransaction) -> Result<Option<proto::FormatValue
 }
 
 /// Stages the initial state of an empty store into `tx`: format stamp,
-/// snapshot 0 (empty catalog, counters at zero), and head pointer.
+/// snapshot 0 (carrying the default `main` schema, counters advanced past
+/// its id), the `main` schema record itself, and head pointer. Mints the
+/// same starting catalog shape a fresh DuckLake metadata store carries,
+/// so a moraine store is attachable from birth.
 fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
     let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     stage(
@@ -79,13 +83,26 @@ fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
             snapshot_id: 0,
             snapshot_time_micros: now_micros(),
             schema_version: 0,
-            next_catalog_id: 0,
+            next_catalog_id: 1,
             next_file_id: 0,
             next_deletion_id: 0,
             changes_made: String::new(),
             author: None,
             commit_message: None,
             commit_extra_info: None,
+            schema_changed_table_ids: Vec::new(),
+        }),
+    )?;
+    stage(
+        Key::cur(EntityKey::Schema { schema_id: 0 }),
+        value::encode_value(&proto::SchemaValue {
+            schema_id: 0,
+            schema_uuid: Uuid::new_v4().to_string(),
+            begin_snapshot: 0,
+            end_snapshot: None,
+            schema_name: "main".to_string(),
+            path: "main/".to_string(),
+            path_is_relative: true,
         }),
     )?;
     stage(
@@ -168,7 +185,7 @@ pub(crate) async fn materialize(tx: &DbTransaction, at: Option<u64>) -> Result<C
 }
 
 /// One staged write: `Some` puts, `None` deletes.
-type StagedWrite = (Vec<u8>, Option<Vec<u8>>);
+pub(crate) type StagedWrite = (Vec<u8>, Option<Vec<u8>>);
 
 fn stage_transition<M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
@@ -618,6 +635,7 @@ where
         author: None,
         commit_message: None,
         commit_extra_info: None,
+        schema_changed_table_ids: Vec::new(),
     };
     writes.push((
         Key::Snap {
@@ -641,7 +659,7 @@ where
     })
 }
 
-fn stage_writes(db_tx: &DbTransaction, writes: Vec<StagedWrite>) -> Result<()> {
+pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: Vec<StagedWrite>) -> Result<()> {
     for (key, write) in writes {
         match write {
             Some(bytes) => db_tx.put(key, bytes),
@@ -793,6 +811,7 @@ mod tests {
             author: None,
             commit_message: None,
             commit_extra_info: None,
+            schema_changed_table_ids: Vec::new(),
         };
         let empty = CatalogSnapshot::build(snap0, vec![], vec![], None);
         let mut setup = Transaction::new(empty, 1);

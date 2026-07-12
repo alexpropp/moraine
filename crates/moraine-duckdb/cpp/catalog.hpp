@@ -6,17 +6,14 @@
 
 #include "duckdb.hpp"
 
-// Amalgamation gaps vendored by hand alongside duckdb.hpp; order matters,
-// each depends on the ones before it.
-#include "storage_extension.hpp"
-#include "database_size.hpp"
-#include "create_schema_info.hpp"
-#include "create_table_info.hpp"
-#include "create_view_info.hpp"
-#include "not_null_constraint.hpp"
-#include "table_catalog_entry.hpp"
-#include "thread.hpp"
-#include "view_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/storage/database_size.hpp"
+#include "duckdb/storage/storage_extension.hpp"
 
 #include "moraine_abi.h"
 
@@ -36,9 +33,10 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type);
 
 // A moraine-backed table entry. Column/schema translation happens in
 // MoraineSchemaEntry; this class only supplies the pure virtuals
-// TableCatalogEntry still needs. The scan function resolves the table's
-// live data files through the listing ABI and delegates to DuckDB's own
-// `read_parquet`.
+// TableCatalogEntry still needs. The scan function binds normally (so
+// DESCRIBE/EXPLAIN work) but always redirects to the DuckLake attach at
+// execution time — user-table data is served only through DuckLake, never
+// this standalone attach (see scan.hpp).
 class MoraineTableEntry : public duckdb::TableCatalogEntry {
 public:
 	MoraineTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, duckdb::CreateTableInfo &info,
@@ -56,9 +54,10 @@ private:
 };
 
 // A moraine-backed view entry. Cataloging (name/schema lookup, `DESCRIBE`)
-// works; binding the defining query is deferred (no SQL parser vendored
-// this slice) and throws duckdb::NotImplementedException instead of
-// dereferencing a null query, which the base class would otherwise do.
+// works; binding the defining query is deferred (the full-tree headers
+// make duckdb::Parser reachable, but no parse is wired up yet) and throws
+// duckdb::NotImplementedException instead of dereferencing a null query,
+// which the base class would otherwise do.
 class MoraineViewEntry : public duckdb::ViewCatalogEntry {
 public:
 	MoraineViewEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, duckdb::CreateViewInfo &info);

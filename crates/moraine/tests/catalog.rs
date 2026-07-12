@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use moraine::{Catalog, CatalogOptions, ColumnDef, ColumnId, Error, SnapshotId};
+use moraine::{Catalog, CatalogOptions, ColumnDef, ColumnId, Error, SchemaId, SnapshotId};
 use object_store::memory::InMemory;
 
 #[tokio::test]
@@ -14,7 +14,19 @@ async fn bootstrap_creates_snapshot_zero() {
     let snap = catalog.snapshot().await.unwrap();
     assert_eq!(snap.current_snapshot().id, SnapshotId::new(0));
     assert_eq!(snap.current_snapshot().schema_version, 0);
-    assert!(snap.schemas().is_empty());
+    let schemas = snap.schemas();
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].name, "main");
+
+    // `main` consumed catalog id 0; the first user-created schema follows.
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+    let head = catalog.snapshot().await.unwrap();
+    let sales = head.schema_by_name("sales").unwrap();
+    assert_eq!(sales.id, SchemaId::new(1));
+
     catalog.close().await.unwrap();
 }
 
@@ -132,9 +144,10 @@ async fn ddl_commits_are_visible_and_time_travelable() {
     assert_eq!(old.id, table.id);
     assert_eq!(past.columns_of(old.id).len(), 2);
 
-    // Snapshot 0 sees an empty catalog.
+    // Snapshot 0 sees only the bootstrap-minted `main` schema.
     let zero = catalog.snapshot_at(SnapshotId::new(0)).await.unwrap();
-    assert!(zero.schemas().is_empty());
+    assert_eq!(zero.schemas().len(), 1);
+    assert_eq!(zero.schemas()[0].name, "main");
 
     catalog.close().await.unwrap();
 }
@@ -162,13 +175,15 @@ async fn drop_ends_versions_and_schema_version_tracks_ddl() {
         .unwrap();
 
     let head = catalog.snapshot().await.unwrap();
-    assert!(head.schemas().is_empty());
+    // Only the bootstrap-minted `main` schema remains live.
+    assert_eq!(head.schemas().len(), 1);
+    assert_eq!(head.schemas()[0].name, "main");
     // Every DDL commit advanced the schema version.
     assert_eq!(head.current_snapshot().schema_version, 2);
 
     // The dropped entities are still visible at their snapshot.
     let past = catalog.snapshot_at(s1).await.unwrap();
-    assert_eq!(past.schemas().len(), 1);
+    assert_eq!(past.schemas().len(), 2);
     let _ = s2;
     catalog.close().await.unwrap();
 }

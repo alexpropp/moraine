@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use slatedb::{Db, IsolationLevel};
+use slatedb::{Db, DbTransaction, IsolationLevel};
 
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId},
@@ -59,7 +59,8 @@ impl Catalog {
     /// # use object_store::memory::InMemory;
     /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
     /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// assert!(catalog.snapshot().await?.schemas().is_empty());
+    /// // Bootstrap mints the default `main` schema.
+    /// assert_eq!(catalog.snapshot().await?.schemas().len(), 1);
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
@@ -87,15 +88,25 @@ impl Catalog {
     }
 
     async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
-        let tx = self
-            .db
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(Error::from)?;
+        let tx = self.begin_read_tx().await?;
         let view = commit::materialize(&tx, at).await;
         tx.rollback();
 
         view
+    }
+
+    /// Opens a fresh transaction at the current head, the same isolation
+    /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
+    /// `pub(crate)` rather than a wider seam: [`crate::ffi_support`]'s full
+    /// cur+hist dumps read through a raw transaction directly, and the
+    /// staged-row commit path ([`crate::transaction::staged`]) opens one
+    /// here to both read the premise and stage its writes; every other
+    /// caller goes through `snapshot`/`snapshot_at`/`commit`.
+    pub(crate) async fn begin_read_tx(&self) -> Result<DbTransaction> {
+        self.db
+            .begin(IsolationLevel::Snapshot)
+            .await
+            .map_err(Error::from)
     }
 
     /// Closes the catalog, flushing background work.
@@ -154,7 +165,8 @@ impl Catalog {
     ///         Ok(())
     ///     })
     ///     .await?;
-    /// assert_eq!(catalog.snapshot_at(snapshot).await?.schemas().len(), 1);
+    /// // `main` plus the newly created `sales` schema.
+    /// assert_eq!(catalog.snapshot_at(snapshot).await?.schemas().len(), 2);
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn commit<F>(&self, f: F) -> Result<SnapshotId>

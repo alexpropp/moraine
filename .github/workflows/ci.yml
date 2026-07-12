@@ -19,6 +19,13 @@ jobs:
       - uses: actions/checkout@v7
       - run: cargo fmt --check
 
+  # clippy/test/doc/e2e all compile moraine-duckdb, whose build.rs fetches
+  # DuckDB's src/include/ header tree from GitHub on a cold cache (a ~9 MB
+  # git sparse checkout into target/duckdb-src/ — see that crate's README,
+  # "Where the headers come from"). So every one of those jobs needs git +
+  # network access whenever the cache is cold or pruned; an explicit cache
+  # step for target/duckdb-src/ is a future improvement, not restructured
+  # here.
   clippy:
     runs-on: ubuntu-latest
     steps:

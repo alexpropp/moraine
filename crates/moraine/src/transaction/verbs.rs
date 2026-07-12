@@ -860,6 +860,7 @@ mod tests {
             author: None,
             commit_message: None,
             commit_extra_info: None,
+            schema_changed_table_ids: Vec::new(),
         };
         Transaction::new(CatalogSnapshot::build(snap, vec![], vec![], None), 5)
     }
@@ -1070,6 +1071,7 @@ mod tests {
             author: None,
             commit_message: None,
             commit_extra_info: None,
+            schema_changed_table_ids: Vec::new(),
         };
         let table = TableValue {
             table_id: 1,

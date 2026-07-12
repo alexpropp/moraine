@@ -9,17 +9,42 @@
 namespace moraine_duckdb {
 
 MoraineTransaction::MoraineTransaction(duckdb::TransactionManager &manager, duckdb::ClientContext &context,
-                                       MoraineSnapshotHandle *snapshot)
-    : duckdb::Transaction(manager, context), snapshot_(snapshot) {
+                                       MoraineSnapshotHandle *snapshot, MoraineCatalogHandle *catalog_handle)
+    : duckdb::Transaction(manager, context), snapshot_(snapshot), catalog_handle_(catalog_handle) {
 }
 
 MoraineTransaction::~MoraineTransaction() {
 	// Defensive fallback: normal teardown releases the snapshot via
-	// CommitTransaction/RollbackTransaction's call to ReleaseSnapshot.
+	// CommitTransaction/RollbackTransaction's call to ReleaseSnapshot, and
+	// the staged txn via TakeStagedTxn (commit) or a direct rollback
+	// (RollbackTransaction) — see both below.
 	if (snapshot_ != nullptr) {
 		moraine_snapshot_free(snapshot_);
 		snapshot_ = nullptr;
 	}
+	if (staged_txn_ != nullptr) {
+		moraine_txn_rollback(staged_txn_);
+		staged_txn_ = nullptr;
+	}
+}
+
+MoraineTxnHandle *MoraineTransaction::StagedTxn() {
+	if (staged_txn_ == nullptr) {
+		MoraineTxnHandle *txn = nullptr;
+		MoraineError err{};
+		auto code = moraine_txn_begin(catalog_handle_, &txn, &err);
+		if (code != MORAINE_OK) {
+			ThrowMoraineError(err);
+		}
+		staged_txn_ = txn;
+	}
+	return staged_txn_;
+}
+
+MoraineTxnHandle *MoraineTransaction::TakeStagedTxn() {
+	auto *result = staged_txn_;
+	staged_txn_ = nullptr;
+	return result;
 }
 
 duckdb::optional_ptr<duckdb::SchemaCatalogEntry> MoraineTransaction::GetCachedSchema(uint64_t schema_id) const {
@@ -65,7 +90,7 @@ duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientC
 		ThrowMoraineError(err);
 	}
 
-	auto transaction = duckdb::make_uniq<MoraineTransaction>(*this, context, snapshot);
+	auto transaction = duckdb::make_uniq<MoraineTransaction>(*this, context, snapshot, catalog_.Handle());
 	auto &transaction_ref = *transaction;
 	std::lock_guard<std::mutex> guard(lock_);
 	active_transactions_.push_back(std::move(transaction));
@@ -73,27 +98,59 @@ duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientC
 }
 
 duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientContext &, duckdb::Transaction &transaction) {
-	std::lock_guard<std::mutex> guard(lock_);
-	for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
-		if (it->get() == &transaction) {
-			it->get()->Cast<MoraineTransaction>().ReleaseSnapshot();
-			active_transactions_.erase(it);
-			break;
+	// A staged txn (opened lazily by the first write this DuckDB
+	// transaction made) is taken out from under the lock and committed
+	// after releasing it — moraine_txn_commit blocks on store I/O, which
+	// must not happen while holding `lock_` and blocking every other
+	// transaction on this catalog.
+	MoraineTxnHandle *staged = nullptr;
+	{
+		std::lock_guard<std::mutex> guard(lock_);
+		for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
+			if (it->get() == &transaction) {
+				auto &moraine_txn = it->get()->Cast<MoraineTransaction>();
+				staged = moraine_txn.TakeStagedTxn();
+				moraine_txn.ReleaseSnapshot();
+				active_transactions_.erase(it);
+				break;
+			}
 		}
 	}
-	// Read-only this slice: there is never anything to actually commit, so
-	// this is always a clean success.
+	if (staged == nullptr) {
+		// A read-only transaction (or one whose writes never reached a
+		// writable metadata table) never opened a staged txn: nothing to
+		// commit, always a clean success.
+		return duckdb::ErrorData();
+	}
+	uint64_t new_snapshot_id = 0;
+	MoraineError err{};
+	auto code = moraine_txn_commit(staged, &new_snapshot_id, &err);
+	if (code != MORAINE_OK) {
+		try {
+			ThrowMoraineError(err);
+		} catch (std::exception &ex) {
+			return duckdb::ErrorData(ex);
+		}
+	}
 	return duckdb::ErrorData();
 }
 
 void MoraineTransactionManager::RollbackTransaction(duckdb::Transaction &transaction) {
-	std::lock_guard<std::mutex> guard(lock_);
-	for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
-		if (it->get() == &transaction) {
-			it->get()->Cast<MoraineTransaction>().ReleaseSnapshot();
-			active_transactions_.erase(it);
-			break;
+	MoraineTxnHandle *staged = nullptr;
+	{
+		std::lock_guard<std::mutex> guard(lock_);
+		for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
+			if (it->get() == &transaction) {
+				auto &moraine_txn = it->get()->Cast<MoraineTransaction>();
+				staged = moraine_txn.TakeStagedTxn();
+				moraine_txn.ReleaseSnapshot();
+				active_transactions_.erase(it);
+				break;
+			}
 		}
+	}
+	if (staged != nullptr) {
+		moraine_txn_rollback(staged);
 	}
 }
 

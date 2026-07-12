@@ -33,7 +33,7 @@ use crate::runtime::{MoraineCatalogHandle, MoraineSnapshotHandle, new_runtime};
 ///
 /// `err`, if non-null, must point to a valid, writable [`MoraineError`]
 /// for the duration of this call.
-unsafe fn guard<T>(
+pub(crate) unsafe fn guard<T>(
     err: *mut MoraineError,
     body: impl FnOnce() -> Result<T, AbiError>,
 ) -> Result<T, i32> {
@@ -65,7 +65,7 @@ unsafe fn guard<T>(
 /// convert every string to an owned `CString` first and mint raw
 /// pointers only once the whole collection succeeds, so a failure
 /// part-way through leaks nothing.
-fn to_c_string(s: &str) -> Result<CString, AbiError> {
+pub(crate) fn to_c_string(s: &str) -> Result<CString, AbiError> {
     CString::new(s).map_err(|_| {
         AbiError::new(
             codes::CORRUPTION,
@@ -81,7 +81,7 @@ fn to_c_string(s: &str) -> Result<CString, AbiError> {
 ///
 /// `ptr`, if non-null, must be a pointer previously returned by
 /// `CString::into_raw` and not yet freed.
-unsafe fn free_c_string(ptr: *mut c_char) {
+pub(crate) unsafe fn free_c_string(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
     }
@@ -96,7 +96,7 @@ unsafe fn free_c_string(ptr: *mut c_char) {
 ///
 /// `out_items` and `out_len` must be valid, writable pointers for the
 /// duration of this call.
-unsafe fn write_array<T>(items: Vec<T>, out_items: *mut *mut T, out_len: *mut usize) {
+pub(crate) unsafe fn write_array<T>(items: Vec<T>, out_items: *mut *mut T, out_len: *mut usize) {
     let boxed = items.into_boxed_slice();
     let len = boxed.len();
     let ptr = Box::into_raw(boxed).cast::<T>();
@@ -115,7 +115,7 @@ unsafe fn write_array<T>(items: Vec<T>, out_items: *mut *mut T, out_len: *mut us
 ///
 /// `items`/`len` must be exactly the pointer and length written by a
 /// matching [`write_array`] call, not yet freed.
-unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: impl FnMut(&mut T)) {
+pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: impl FnMut(&mut T)) {
     if items.is_null() {
         return;
     }
@@ -178,7 +178,10 @@ impl StoreKind {
 ///
 /// `ptr`, if non-null, must point to a NUL-terminated C string valid for
 /// reads for the duration of this call.
-unsafe fn borrow_str<'a>(ptr: *const c_char, arg_name: &str) -> Result<&'a str, AbiError> {
+pub(crate) unsafe fn borrow_str<'a>(
+    ptr: *const c_char,
+    arg_name: &str,
+) -> Result<&'a str, AbiError> {
     if ptr.is_null() {
         return Err(AbiError::invalid_argument(format!("`{arg_name}` is null")));
     }
@@ -996,12 +999,17 @@ mod tests {
             moraine_snapshot_schemas(snap, &raw mut schemas, &raw mut schemas_len, &raw mut err)
         };
         assert_eq!(code, codes::OK);
-        assert_eq!(schemas_len, 1);
-        // SAFETY: just populated by `moraine_snapshot_schemas` above.
-        let schema_name = unsafe { CStr::from_ptr((*schemas).name) }.to_str().unwrap();
-        assert_eq!(schema_name, "sales");
-        // SAFETY: same as above.
-        let schema_id = unsafe { (*schemas).id };
+        // Bootstrap mints `main` (id 0); the seeded `sales` follows at id 1.
+        assert_eq!(schemas_len, 2);
+        // SAFETY: just populated above with `schemas_len` live elements.
+        let schema_descs = unsafe { std::slice::from_raw_parts(schemas, schemas_len) };
+        let schema_pairs: Vec<(u64, &str)> = schema_descs
+            .iter()
+            // SAFETY: owned C strings written above, not yet freed.
+            .map(|s| (s.id, unsafe { CStr::from_ptr(s.name) }.to_str().unwrap()))
+            .collect();
+        assert_eq!(schema_pairs, [(0, "main"), (1, "sales")]);
+        let schema_id = schema_descs[1].id;
 
         let mut tables: *mut MoraineTableDesc = ptr::null_mut();
         let mut tables_len: usize = 0;
@@ -1143,9 +1151,11 @@ mod tests {
 
         let mut views: *mut MoraineViewDesc = ptr::null_mut();
         let mut views_len: usize = 0;
+        // Schema `s` has id 1: bootstrap's `main` schema holds id 0.
+        //
         // SAFETY: `snap` is live; outputs are valid local slots.
         let code = unsafe {
-            moraine_snapshot_views_in(snap, 0, &raw mut views, &raw mut views_len, &raw mut err)
+            moraine_snapshot_views_in(snap, 1, &raw mut views, &raw mut views_len, &raw mut err)
         };
         assert_eq!(code, codes::CORRUPTION);
         assert_eq!(err.code, codes::CORRUPTION);
@@ -1211,9 +1221,11 @@ mod tests {
 
         let mut tables: *mut MoraineTableDesc = ptr::null_mut();
         let mut tables_len: usize = 0;
+        // Schema `s` has id 1: bootstrap's `main` schema holds id 0.
+        //
         // SAFETY: `snap` is live; outputs are valid local slots.
         let code = unsafe {
-            moraine_snapshot_tables_in(snap, 0, &raw mut tables, &raw mut tables_len, &raw mut err)
+            moraine_snapshot_tables_in(snap, 1, &raw mut tables, &raw mut tables_len, &raw mut err)
         };
         assert_eq!(code, codes::OK);
         assert_eq!(tables_len, 1);

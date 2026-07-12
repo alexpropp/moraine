@@ -4,8 +4,9 @@
 //! cdylib, packages it into a loadable `.duckdb_extension` (rename +
 //! 512-byte metadata footer — see `crates/moraine-duckdb/README.md`'s
 //! "Extension entry-point contract"), and runs
-//! `crates/moraine-duckdb/tests/duckdb_load.rs` un-ignored against the
-//! real binaries as a hard assertion.
+//! `crates/moraine-duckdb/tests/duckdb_load.rs` and
+//! `crates/moraine-duckdb/tests/ducklake_load.rs` un-ignored against the
+//! real binaries (plus a real `INSTALL ducklake`) as a hard assertion.
 
 use std::{
     fs,
@@ -30,6 +31,15 @@ const EXTENSION_NAME: &str = "moraine_duckdb";
 /// `--exact` to match). Deleting or renaming it fails `e2e` instead of
 /// silently matching zero tests.
 const DUCKDB_LOAD_TEST_NAME: &str = "tests::attach_lists_and_scans_through_real_duckdb";
+
+/// Every `#[ignore]`d test in `ducklake_load.rs`, run together (not
+/// `--exact`, since there are three) — the `moraine:` prefix-attach proof,
+/// the full `ducklake:moraine:` read chain, and the staged-row write proof
+/// (`CREATE TABLE` through `lake`, verified via both DuckLake's own catalog
+/// and the standalone `moraine:` attach). Needs network access to `INSTALL
+/// ducklake`, same class of dependency `e2e` already has for the CLI
+/// download and `moraine-duckdb`'s own header fetch.
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "3 passed";
 
 fn main() -> anyhow::Result<()> {
     let task = std::env::args().nth(1);
@@ -94,6 +104,37 @@ fn e2e() -> anyhow::Result<()> {
          deleted, renamed, or its #[ignore] removed/changed. Got:\n{stdout}"
     );
     println!("ok: real DuckDB loaded moraine_duckdb and drove attach/listing/scan");
+
+    let ducklake_output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "moraine-duckdb",
+            "--release",
+            "--test",
+            "ducklake_load",
+            "--",
+            "--ignored",
+        ])
+        .env("MORAINE_DUCKDB_CLI", &cli)
+        .env("MORAINE_DUCKDB_EXT", &extension)
+        .output()
+        .context("spawning the ducklake_load integration test")?;
+    print!("{}", String::from_utf8_lossy(&ducklake_output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&ducklake_output.stderr));
+    ensure!(
+        ducklake_output.status.success(),
+        "ducklake_load integration test failed"
+    );
+    let ducklake_stdout = String::from_utf8_lossy(&ducklake_output.stdout);
+    ensure!(
+        ducklake_stdout.contains(DUCKLAKE_LOAD_TEST_COUNT),
+        "expected ducklake_load.rs to report `{DUCKLAKE_LOAD_TEST_COUNT}`; a test may have been \
+         deleted or its #[ignore] removed/changed. Got:\n{ducklake_stdout}"
+    );
+    println!(
+        "ok: real DuckDB + ducklake attached through moraine:'s metadata catalog and read the lake"
+    );
 
     Ok(())
 }

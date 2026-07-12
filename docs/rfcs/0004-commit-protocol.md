@@ -141,10 +141,12 @@ operation and rides the same machinery. On open, the catalog reads
   — the loser re-reads and finds the initialized store; across processes
   the single-writer topology and fencing already exclude a second writer.
 
-Bootstrap mints **no default schema**. DuckLake's own initial catalog
-state (its default `main` schema) is DuckLake-authored and arrives
-through whichever front door the host drives — the core stays agnostic to
-it.
+Bootstrap mints the default `main` schema in the same batch, matching
+the initial catalog state a fresh DuckLake metadata store carries: a
+moraine store is DuckLake-attachable from birth, without a DuckLake-side
+bootstrap pass (whose exists-probe always succeeds against moraine — see
+the extension-surface RFC). The `main` row's id comes from the ordinary
+counter, so the first user allocation follows it.
 
 ### The commit sequence
 

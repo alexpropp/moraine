@@ -16,6 +16,7 @@ object_store = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 
 [build-dependencies]
+anyhow = { workspace = true }
 cc = { workspace = true }
 
 [lints]

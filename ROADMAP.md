@@ -16,10 +16,16 @@
 - [x] `cargo xtask e2e` loads the extension into a real DuckDB
 
 ### DuckLake end-to-end
-- [ ] DuckLake SQL operations against moraine as the catalog
-- [ ] Data inlining (RFC 0005): inlined inserts/deletes + flush — launch feature
-- [ ] Real object storage tests (MinIO/localstack)
-- [ ] `cargo-fuzz` targets for store codecs
+- [x] DuckLake SQL operations against moraine as the catalog — `ATTACH
+  'ducklake:moraine:<store>' AS lake (DATA_PATH ...)`; `CREATE`/`INSERT`/
+  `UPDATE`/`DELETE`/rename/`DROP` translate through the staged-row commit
+  path, `SELECT`/`COUNT`/time travel read through DuckLake's own reader
+  over moraine's row-faithful `ducklake_*` projections (RFC 0006)
+- [ ] Data inlining (RFC 0005): inlined inserts/deletes + flush — launch
+  feature; pending (deferred this slice — `ducklake_metadata` serves
+  `data_inlining_row_limit = 0` so ordinary `CREATE TABLE` never needs it)
+- [ ] Real object storage tests (MinIO/localstack) — pending
+- [ ] `cargo-fuzz` targets for store codecs — pending
 
 ### Publish
 - [ ] First crates.io release (switch `release.yml` trigger to `push`)

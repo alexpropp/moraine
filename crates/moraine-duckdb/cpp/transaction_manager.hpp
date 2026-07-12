@@ -7,10 +7,9 @@
 
 #include "duckdb.hpp"
 
-// Amalgamation gap vendored by hand alongside duckdb.hpp: defines
-// duckdb::StorageExtensionInfo, named by MoraineTransactionManager::Create's
-// signature.
-#include "storage_extension.hpp"
+// Defines duckdb::StorageExtensionInfo, named by
+// MoraineTransactionManager::Create's signature.
+#include "duckdb/storage/storage_extension.hpp"
 
 #include "moraine_abi.h"
 
@@ -25,7 +24,7 @@ class MoraineCatalog;
 class MoraineTransaction : public duckdb::Transaction {
 public:
 	MoraineTransaction(duckdb::TransactionManager &manager, duckdb::ClientContext &context,
-	                    MoraineSnapshotHandle *snapshot);
+	                    MoraineSnapshotHandle *snapshot, MoraineCatalogHandle *catalog_handle);
 	~MoraineTransaction() override;
 
 	MoraineSnapshotHandle *Snapshot() const {
@@ -46,10 +45,27 @@ public:
 	// defensive free becomes a no-op.
 	void ReleaseSnapshot();
 
+	// Lazily opens (on the first call) the one staged-row transaction this
+	// DuckDB transaction stages every write into, and returns it. Every
+	// subsequent INSERT/UPDATE/DELETE statement within the same DuckDB
+	// transaction reuses it — DuckLake's own commit batch is exactly one
+	// multi-statement SQL string executed inside one BEGIN/COMMIT on the
+	// metadata connection (verified against the pinned DuckLake source;
+	// see the report), so one moraine staged txn per DuckDB transaction is
+	// the correct granularity.
+	MoraineTxnHandle *StagedTxn();
+
+	// Hands ownership of the staged txn (if one was opened) to the caller,
+	// clearing this transaction's reference so the destructor's defensive
+	// rollback becomes a no-op. Returns null if no write ever opened one.
+	MoraineTxnHandle *TakeStagedTxn();
+
 private:
 	MoraineSnapshotHandle *snapshot_;
+	MoraineCatalogHandle *catalog_handle_;
 	bool schemas_loaded_ = false;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
+	MoraineTxnHandle *staged_txn_ = nullptr;
 };
 
 class MoraineTransactionManager : public duckdb::TransactionManager {

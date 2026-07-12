@@ -3,6 +3,7 @@
 
 pub(crate) mod commit;
 pub(crate) mod operations;
+pub(crate) mod staged;
 mod verbs;
 
 pub use verbs::Transaction;

@@ -1,49 +1,76 @@
-//! Compiles the C++ shim (`cpp/*.cpp`) against the vendored DuckDB v1.5.4
-//! internal header and links it into this crate's cdylib.
+//! Compiles the C++ shim (`cpp/*.cpp`) against DuckDB v1.5.4's full
+//! source-tree headers (`src/include/`, sparse-checked-out from the pinned
+//! git tag and cached under `target/duckdb-src/` — see `ensure_duckdb_headers`
+//! below and the README's "Where the headers come from") and links it into
+//! this crate's cdylib.
 //!
-//! The shim only needs DuckDB's C++ internals header (`duckdb.hpp`,
-//! vendored under `vendor/duckdb-v1.5.4/`) at compile time — it links
-//! against no DuckDB library. A loadable extension is `dlopen`'d into a
-//! process with every DuckDB symbol already resolved, so unresolved
+//! The shim only needs DuckDB's C++ internal headers at compile time — it
+//! links against no DuckDB library. A loadable extension is `dlopen`'d into
+//! a process with every DuckDB symbol already resolved, so unresolved
 //! symbols in the shim are left for the dynamic loader to resolve
 //! (`-undefined dynamic_lookup` on macOS; ELF's default `-shared`
 //! behavior already permits this on Linux, no equivalent flag needed).
 //!
-//! Two linker interventions are required on every platform:
+//! Three linker interventions are required on every platform:
 //!
 //! 1. Nothing in the Rust crate calls the C++ entry point, so the linker
 //!    drops the archive member as unreferenced unless force-loaded.
 //! 2. Rust's cdylib link restricts the dynamic-symbol table to symbols
 //!    rustc knows about, so the C++ entry point must be explicitly added
 //!    to the export list.
+//! 3. The archive must appear on the link line exactly once. `cc`'s
+//!    default cargo metadata would add a second, lazy `-l` mention ahead
+//!    of the force-load one; lld resolves cross-member references by
+//!    fetching from the lazy mention while force-loading the other,
+//!    defining every such symbol twice. So `cc`'s metadata is suppressed
+//!    and what it carried (the C++ standard library) is linked by hand.
 
-use std::path::Path;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
-fn main() {
-    let vendor_dir = Path::new("vendor/duckdb-v1.5.4");
+use anyhow::{Context, bail, ensure};
+
+/// The DuckDB tag whose `src/include/` tree this shim compiles against.
+/// Matches the artifact-footer version pin in `xtask/src/main.rs`
+/// (`DUCKDB_PIN`) — both must name the same release.
+const DUCKDB_PIN: &str = "v1.5.4";
+
+const DUCKDB_GIT_URL: &str = "https://github.com/duckdb/duckdb.git";
+
+fn main() -> anyhow::Result<()> {
+    let include_dir = ensure_duckdb_headers()?;
     let archive_name = "moraine_duckdb_cpp";
 
     cc::Build::new()
         .cpp(true)
         .flag_if_supported("-std=c++17")
-        .include(vendor_dir)
+        .include(&include_dir)
         .include("cpp")
         .file("cpp/extension.cpp")
         .file("cpp/storage_extension.cpp")
         .file("cpp/catalog.cpp")
+        .file("cpp/metadata_tables.cpp")
         .file("cpp/scan.cpp")
+        .file("cpp/staged_write.cpp")
         .file("cpp/transaction_manager.cpp")
         .warnings(false)
+        // `compile` would otherwise emit `cargo:rustc-link-lib=static=…`,
+        // putting the archive on the link line a second time as a lazy
+        // mention ahead of the force-load below — lld then loads
+        // cross-referenced members from both mentions and errors on the
+        // duplicate symbols. Suppressing the metadata drops the C++
+        // standard-library link too; re-added per platform below.
+        .cargo_metadata(false)
         .compile(archive_name);
 
-    // Cargo always sets OUT_DIR for a build script; not a fallible lookup.
-    #[allow(clippy::expect_used)]
-    let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR for every build script");
+    let out_dir = std::env::var("OUT_DIR").context("cargo sets OUT_DIR for every build script")?;
     // Uses the *target* OS (cargo always sets this), not `cfg!(target_os)`
     // which is the host and would be wrong under cross-compilation.
-    #[allow(clippy::expect_used)]
     let target_os = std::env::var("CARGO_CFG_TARGET_OS")
-        .expect("cargo sets CARGO_CFG_TARGET_OS for every build script");
+        .context("cargo sets CARGO_CFG_TARGET_OS for every build script")?;
 
     let archive_path = Path::new(&out_dir).join(format!("lib{archive_name}.a"));
 
@@ -67,6 +94,10 @@ fn main() {
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_moraine_duckdb_duckdb_cpp_init"
             );
+            // The C++ standard library `cc`'s suppressed metadata would
+            // have linked; after the archive so it can satisfy the shim's
+            // references.
+            println!("cargo:rustc-cdylib-link-arg=-lc++");
         }
         "linux" => {
             // GNU ld equivalents of the macOS flags above. `--whole-archive`
@@ -86,6 +117,10 @@ fn main() {
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=moraine_duckdb_duckdb_cpp_init"
             );
+            // The C++ standard library `cc`'s suppressed metadata would
+            // have linked; after the archive so it can satisfy the shim's
+            // references.
+            println!("cargo:rustc-cdylib-link-arg=-lstdc++");
         }
         other => {
             println!(
@@ -97,5 +132,118 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=cpp");
-    println!("cargo:rerun-if-changed=vendor/duckdb-v1.5.4");
+
+    Ok(())
+}
+
+/// Returns the path to a local `src/include/` tree from the DuckDB
+/// `DUCKDB_PIN` tag, downloading and caching it under
+/// `target/duckdb-src/<pin>/` (sibling to `xtask`'s own
+/// `target/duckdb-cli/` CLI cache — same "large downloads live under
+/// `target/`, never committed" rule) if it isn't already cached.
+///
+/// Only `src/include/` is fetched, via a blobless partial clone plus a
+/// sparse checkout of that one path: DuckDB's repository is large
+/// end-to-end (the tagged source tarball is over 100 MB), but the shim
+/// compiles cleanly against `src/include/` alone with zero `third_party/`
+/// headers (verified empirically during the build-model switch this
+/// function landed in — every header the shim's `#include`s reach,
+/// transitively, resolves inside `src/include/duckdb/...`), so there is no
+/// reason to pay for the rest. A sparse checkout of just that directory is
+/// ~9 MB and a few seconds, versus fetching and unpacking the full tree.
+fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
+    let checkout_root = duckdb_src_cache_root()?;
+    let include_dir = checkout_root.join("src/include");
+    if full_tree_marker(&include_dir).exists() {
+        return Ok(include_dir);
+    }
+
+    // A prior attempt may have left a partial checkout; start clean rather
+    // than risk `git clone` failing into a non-empty directory.
+    if checkout_root.exists() {
+        fs::remove_dir_all(&checkout_root)
+            .with_context(|| format!("clearing stale checkout at {}", checkout_root.display()))?;
+    }
+    fs::create_dir_all(&checkout_root)
+        .with_context(|| format!("creating {}", checkout_root.display()))?;
+
+    println!(
+        "cargo:warning=moraine-duckdb: fetching DuckDB {DUCKDB_PIN} headers (src/include/, ~9 \
+         MB) into {} — one-time cost, cached under target/ after this",
+        checkout_root.display()
+    );
+
+    run_git(
+        &checkout_root,
+        [
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            "--depth",
+            "1",
+            "--branch",
+            DUCKDB_PIN,
+            DUCKDB_GIT_URL,
+            ".",
+        ],
+    )?;
+    run_git(&checkout_root, ["sparse-checkout", "set", "src/include"])?;
+    run_git(&checkout_root, ["checkout", DUCKDB_PIN])?;
+
+    ensure!(
+        full_tree_marker(&include_dir).exists(),
+        "checked out DuckDB {DUCKDB_PIN} into {} but {} is still missing",
+        checkout_root.display(),
+        full_tree_marker(&include_dir).display()
+    );
+
+    Ok(include_dir)
+}
+
+/// A file that exists in the full `src/include/` tree but not in the
+/// single-file `duckdb.hpp` amalgamation (which also ships a file named
+/// `duckdb.hpp` — so checking for that alone would accept an
+/// amalgamation-shaped cache and fail confusingly at compile time
+/// instead of here). Used as the cache sanity check, both on the warm
+/// path and after a fresh checkout.
+fn full_tree_marker(include_dir: &Path) -> PathBuf {
+    include_dir.join("duckdb/storage/storage_extension.hpp")
+}
+
+/// The shared cache root for the DuckDB headers, `target/duckdb-src/<pin>/`.
+/// This crate lives at `<workspace_root>/crates/moraine-duckdb`, so the
+/// workspace's single `target/` directory is two levels up from
+/// `CARGO_MANIFEST_DIR` — the same fixed-depth assumption `xtask`'s own
+/// `workspace_root()` makes from its own location.
+fn duckdb_src_cache_root() -> anyhow::Result<PathBuf> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .context("cargo sets CARGO_MANIFEST_DIR for every build script")?;
+    Ok(Path::new(&manifest_dir).join(format!("../../target/duckdb-src/{DUCKDB_PIN}")))
+}
+
+/// Runs `git <args>` with `cwd` as the working directory, failing with a
+/// message naming the command and hinting at connectivity issues on
+/// non-zero exit — `git`'s own diagnostics still reach stderr since stdio
+/// is inherited.
+fn run_git<I, S>(cwd: &Path, args: I) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(cwd);
+    let outcome = cmd.status();
+    match outcome {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => bail!(
+            "{cmd:?} exited with {status}; if this machine is offline, pre-populate \
+             target/duckdb-src/{DUCKDB_PIN}/src/include/ manually with the `src/include/` \
+             directory of a duckdb/duckdb checkout at tag {DUCKDB_PIN} (e.g. \
+             `git clone --depth 1 --branch {DUCKDB_PIN} {DUCKDB_GIT_URL} /tmp/duckdb && \
+             cp -r /tmp/duckdb/src/include target/duckdb-src/{DUCKDB_PIN}/src/`) and rerun. \
+             The `libduckdb-src.zip` release asset is NOT a substitute: it is the single-file \
+             amalgamation, not this header tree"
+        ),
+        Err(e) => bail!("failed to run `git` (required to fetch DuckDB headers): {e}"),
+    }
 }

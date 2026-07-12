@@ -83,6 +83,29 @@ pub(crate) async fn read_snapshot(
     read_singleton(tx, Key::Snap { snapshot_id }).await
 }
 
+/// Every committed snapshot record (`ducklake_snapshot` +
+/// `ducklake_snapshot_changes`, merged), in key order — snapshots are
+/// append-only, so there is no cur/hist split to scan separately.
+pub(crate) async fn scan_snapshots(tx: &DbTransaction) -> Result<Vec<SnapshotValue>> {
+    let mut iter = tx
+        .scan_prefix(subspace_prefix(Subspace::Snap), ..)
+        .await
+        .map_err(Error::from)?;
+    let mut records = Vec::new();
+    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+        match Key::decode(&entry.key)? {
+            Key::Snap { .. } => records.push(value::decode_value(&entry.value)?),
+            other => {
+                return Err(Error::Corruption(format!(
+                    "non-snap key in snap scan: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(records)
+}
+
 fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
     match entity {
         EntityKey::Schema { .. } => Ok(EntityRecord::Schema(value::decode_value(bytes)?)),

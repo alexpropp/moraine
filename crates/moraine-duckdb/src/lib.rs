@@ -11,16 +11,32 @@
 //!    surfaces as an error code, never an unwind into C++;
 //! 3. the async [moraine] core, unaware any of this exists.
 //!
-//! **Works, against a real DuckDB CLI:** `LOAD`; `ATTACH '<path>' AS m
-//! (TYPE moraine)` (a standalone attach type — `ducklake:` chaining is a
-//! later integration); schema/table/view listing (`duckdb_databases()`,
-//! `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`); `SELECT`/
-//! `DESCRIBE` on a table, which scans its live data files by resolving
-//! their paths through the listing ABI and delegating to DuckDB's own
-//! `read_parquet` (see `README.md`'s "Table scans" section).
+//! **Primary path:** `ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH
+//! '<data-path>')` — DuckLake drives moraine as its own metadata catalog.
+//! `CREATE`/`INSERT`/`UPDATE`/`DELETE`/`DROP`/rename against `lake.*`
+//! translate to staged row mutations (the [`staged`] module) committed as
+//! one atomic batch; reads (`SELECT`, time travel, `ducklake_snapshots()`)
+//! go through DuckLake's own reader over the `ducklake_*` rows this crate
+//! projects (the [`dumps`] module). See `README.md`'s "Serving as
+//! DuckLake's metadata catalog" section.
 //!
-//! **Not implemented, throws `NotImplementedException`:** every write
-//! path, and querying a view's definition (no SQL parser vendored).
+//! **Secondary path — metadata-only inspection:** `ATTACH '<path>' AS m
+//! (TYPE moraine)`, or the bare `moraine:<path>` prefix (the same form
+//! DuckLake's nested attach uses internally). Schema/table/view listing
+//! (`duckdb_databases()`, `duckdb_tables()`, `duckdb_views()`,
+//! `duckdb_columns()`), `DESCRIBE`, and every `ducklake_*` metadata table
+//! work through this attach. User-table *data* does not: a `SELECT`
+//! against a real user table binds normally (so `DESCRIBE`/`EXPLAIN` still
+//! work) but raises `InvalidInputException` at execution time, naming the
+//! `ducklake:moraine:` attach to use instead — DuckLake owns delete-file
+//! merging and row lineage, so a second independent data reader here would
+//! silently drift from it. See `README.md`'s "User-table data" section.
+//!
+//! **Not implemented, throws `NotImplementedException`:** DDL issued
+//! directly against a user schema/table (`CREATE`/`DROP`/`ALTER` outside
+//! DuckLake's own `ducklake_*` writes), querying a view's definition (no
+//! SQL parser vendored), and writes against `ducklake_*` kinds this crate
+//! does not model (macros, partitioning, sort orders, tags, name mapping).
 //!
 //! **Single writer.** Attach always opens a read-write [`moraine::Catalog`]
 //! — there is no read-only attach option yet — so only one process may
@@ -30,5 +46,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod abi;
+pub mod dumps;
 pub mod error;
 pub mod runtime;
+pub mod staged;

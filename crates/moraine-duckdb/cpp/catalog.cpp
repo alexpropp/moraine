@@ -1,7 +1,14 @@
 #include "catalog.hpp"
 
+#include "metadata_tables.hpp"
+#include "owned_array.hpp"
 #include "scan.hpp"
+#include "staged_write.hpp"
 #include "transaction_manager.hpp"
+
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 
 #include <cctype>
 #include <cstdlib>
@@ -10,59 +17,12 @@ namespace moraine_duckdb {
 
 namespace {
 
-// RAII wrapper for a caller-owned array from a moraine_snapshot_*_free-paired
-// listing call; frees via the matching free function on destruction.
-template <typename T>
-class OwnedArray {
-public:
-	OwnedArray(void (*free_fn)(T *, size_t)) : items_(nullptr), len_(0), free_fn_(free_fn) {
-	}
-	~OwnedArray() {
-		free_fn_(items_, len_);
-	}
-	OwnedArray(const OwnedArray &) = delete;
-	OwnedArray &operator=(const OwnedArray &) = delete;
-
-	T **OutItems() {
-		return &items_;
-	}
-	size_t *OutLen() {
-		return &len_;
-	}
-	T *begin() const {
-		return items_;
-	}
-	T *end() const {
-		return items_ + len_;
-	}
-	size_t size() const {
-		return len_;
-	}
-
-private:
-	T *items_;
-	size_t len_;
-	void (*free_fn_)(T *, size_t);
-};
-
 std::string ToUpperAscii(const std::string &s) {
 	std::string result = s;
 	for (auto &c : result) {
 		c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 	}
 	return result;
-}
-
-// Joins a directory-ish `base` with a `child` path segment without
-// duplicating a trailing slash on `base`.
-std::string JoinPath(const std::string &base, const std::string &child) {
-	if (base.empty()) {
-		return child;
-	}
-	if (base.back() == '/') {
-		return base + child;
-	}
-	return base + "/" + child;
 }
 
 } // namespace
@@ -116,25 +76,33 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 		throw duckdb::NotImplementedException("moraine: unsupported DuckLake column type \"%s\"", ducklake_type);
 	}
 
-	if (upper == "BIGINT") {
+	// Two vocabularies resolve here, because the store carries
+	// `column_type` row-faithfully in whichever form its author wrote:
+	// DuckDB SQL type names (moraine's own verb path, e.g. "BIGINT") and
+	// DuckLake's own lowercase names (rows DuckLake authors over the
+	// staged-row path, e.g. "int64" — its `DuckLakeTypes::ToString`
+	// vocabulary, uppercased with everything else by the normalization
+	// above). One mapper for both keeps the translation single-sourced;
+	// `DuckLakeColumnType` (metadata_tables.cpp) is its inverse.
+	if (upper == "BIGINT" || upper == "INT64") {
 		return duckdb::LogicalType::BIGINT;
-	} else if (upper == "INTEGER") {
+	} else if (upper == "INTEGER" || upper == "INT32") {
 		return duckdb::LogicalType::INTEGER;
-	} else if (upper == "SMALLINT") {
+	} else if (upper == "SMALLINT" || upper == "INT16") {
 		return duckdb::LogicalType::SMALLINT;
-	} else if (upper == "TINYINT") {
+	} else if (upper == "TINYINT" || upper == "INT8") {
 		return duckdb::LogicalType::TINYINT;
-	} else if (upper == "UBIGINT") {
+	} else if (upper == "UBIGINT" || upper == "UINT64") {
 		return duckdb::LogicalType::UBIGINT;
-	} else if (upper == "UINTEGER") {
+	} else if (upper == "UINTEGER" || upper == "UINT32") {
 		return duckdb::LogicalType::UINTEGER;
-	} else if (upper == "USMALLINT") {
+	} else if (upper == "USMALLINT" || upper == "UINT16") {
 		return duckdb::LogicalType::USMALLINT;
-	} else if (upper == "UTINYINT") {
+	} else if (upper == "UTINYINT" || upper == "UINT8") {
 		return duckdb::LogicalType::UTINYINT;
-	} else if (upper == "DOUBLE") {
+	} else if (upper == "DOUBLE" || upper == "FLOAT64") {
 		return duckdb::LogicalType::DOUBLE;
-	} else if (upper == "FLOAT") {
+	} else if (upper == "FLOAT" || upper == "FLOAT32") {
 		return duckdb::LogicalType::FLOAT;
 	} else if (upper == "REAL") {
 		return duckdb::LogicalType::FLOAT;
@@ -156,7 +124,7 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 		return duckdb::LogicalType::BLOB;
 	} else if (upper == "UUID") {
 		return duckdb::LogicalType::UUID;
-	} else if (upper == "HUGEINT") {
+	} else if (upper == "HUGEINT" || upper == "INT128") {
 		return duckdb::LogicalType::HUGEINT;
 	}
 
@@ -176,29 +144,12 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineTableEntry::GetStatistics(duck
 
 duckdb::TableFunction MoraineTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                           duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
-	OwnedArray<MoraineDataFileDesc> file_descs(moraine_snapshot_data_files_of_free);
-	MoraineError err{};
-	auto code =
-	    moraine_snapshot_data_files_of(snapshot_, table_id_, file_descs.OutItems(), file_descs.OutLen(), &err);
-	if (code != MORAINE_OK) {
-		ThrowMoraineError(err);
-	}
-
-	// A relative data file path resolves against
-	// `<attach_path>/<schema_name>/<table_name>/`; an absolute path passes
-	// through unchanged.
-	std::string table_dir = JoinPath(JoinPath(ParentCatalog().GetDBPath(), ParentSchema().name), name);
-
+	// Binds unconditionally (so DESCRIBE/EXPLAIN work); the scan itself
+	// always redirects to DuckLake at execution time — see scan.hpp.
 	auto scan_bind_data = duckdb::make_uniq<MoraineScanBindData>();
-	scan_bind_data->database = &ParentCatalog().GetDatabase();
-	// Feeds the scan's column-count guard and its error message.
-	scan_bind_data->catalog_column_count = GetColumns().LogicalColumnCount();
-	scan_bind_data->table_name = ParentSchema().name + "." + name;
+	scan_bind_data->qualified_table_name = ParentSchema().name + "." + name;
+	scan_bind_data->store_path = ParentCatalog().GetDBPath();
 	scan_bind_data->table_entry = this;
-	for (auto &file_desc : file_descs) {
-		std::string path(file_desc.path);
-		scan_bind_data->file_paths.push_back(file_desc.path_is_relative ? JoinPath(table_dir, path) : path);
-	}
 	bind_data = std::move(scan_bind_data);
 	return MoraineScanFunction();
 }
@@ -213,8 +164,9 @@ MoraineViewEntry::MoraineViewEntry(duckdb::Catalog &catalog, duckdb::SchemaCatal
 }
 
 const duckdb::SelectStatement &MoraineViewEntry::GetQuery() {
-	// `query` is always null (no SQL parser vendored this slice); the base
-	// implementation dereferences it, so this throws instead of crashing.
+	// `query` is always null (view definitions are never parsed yet); the
+	// base implementation dereferences it, so this throws instead of
+	// crashing.
 	throw duckdb::NotImplementedException("moraine: querying a view's definition is not supported yet");
 }
 
@@ -224,8 +176,8 @@ void MoraineViewEntry::BindView(duckdb::ClientContext &context, duckdb::BindView
 
 std::string MoraineViewEntry::ToSQL() const {
 	// The base implementation stringifies the parsed `query`, which is null
-	// here (no SQL parser this slice); compose the definition textually
-	// from the listing ABI's strings instead.
+	// here (view definitions are never parsed yet); compose the definition
+	// textually from the listing ABI's strings instead.
 	std::string result = "CREATE VIEW ";
 	result += duckdb::KeywordHelper::WriteOptionallyQuoted(name);
 	result += " AS ";
@@ -276,6 +228,18 @@ void MoraineSchemaEntry::EnsureTablesLoaded() {
 		                duckdb::make_uniq<MoraineTableEntry>(catalog, *this, info, snapshot_, table_desc.id));
 	}
 
+	if (duckdb::StringUtil::CIEquals(name, "main")) {
+		// DuckLake's metadata connection queries every `ducklake_*` table
+		// from its default schema (verified against the pinned DuckLake
+		// source: `DuckLakeTransaction::GetDefaultSchemaName` reads the
+		// attached catalog's own `GetDefaultSchema()`, DuckDB's base
+		// `Catalog` default of "main" — MoraineCatalog never overrides it).
+		// A same-named real table (unlikely; not a supported store schema)
+		// wins over the synthesized one via `emplace`'s no-overwrite rule.
+		auto &moraine_catalog = ParentCatalog().Cast<MoraineCatalog>();
+		PopulateMetadataTables(catalog, *this, moraine_catalog.Handle(), tables_);
+	}
+
 	// Set only after full success, so a mid-load exception leaves the next
 	// call to retry rather than serve a partial table set.
 	tables_loaded_ = true;
@@ -296,7 +260,7 @@ void MoraineSchemaEntry::EnsureViewsLoaded() {
 	for (auto &view_desc : view_descs) {
 		duckdb::CreateViewInfo info(*this, view_desc.name);
 		info.sql = view_desc.sql;
-		// `info.query` is left null: no SQL parser is vendored this slice.
+		// `info.query` is left null: view definitions are never parsed yet.
 		// MoraineViewEntry::GetQuery/BindView throw rather than dereference it.
 		views_.emplace(view_desc.name, duckdb::make_uniq<MoraineViewEntry>(catalog, *this, info));
 	}
@@ -502,20 +466,63 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanCreateTableAs(duckdb::ClientContex
 	throw duckdb::NotImplementedException("moraine: CREATE TABLE AS is not supported (read-only catalog)");
 }
 
-duckdb::PhysicalOperator &MoraineCatalog::PlanInsert(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &,
-                                                     duckdb::LogicalInsert &,
-                                                     duckdb::optional_ptr<duckdb::PhysicalOperator>) {
-	throw duckdb::NotImplementedException("moraine: INSERT is not supported (read-only catalog)");
+duckdb::PhysicalOperator &MoraineCatalog::PlanInsert(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &planner,
+                                                     duckdb::LogicalInsert &op,
+                                                     duckdb::optional_ptr<duckdb::PhysicalOperator> plan) {
+	// Only a writable ducklake_* metadata table (a MoraineMetadataTableEntry
+	// whose spec names a moraine_txn_stage table_kind) accepts INSERT; every
+	// other table — the standalone attach's real user-data tables, and the
+	// always-empty/ducklake_metadata stand-ins this slice doesn't model
+	// writes for — stays a read-only catalog, matching the extension
+	// surface's "translate staged ducklake_* rows, author nothing else"
+	// scope.
+	auto *metadata_table = dynamic_cast<MoraineMetadataTableEntry *>(&op.table);
+	if (metadata_table == nullptr) {
+		throw duckdb::NotImplementedException("moraine: INSERT is not supported on \"%s\" (read-only catalog)",
+		                                      op.table.name);
+	}
+	const auto &spec = metadata_table->Spec();
+	if (spec.write_table_kind == kNotWritable) {
+		throw duckdb::NotImplementedException("moraine: INSERT into \"%s\" is not supported this slice", spec.name);
+	}
+	auto &insert_op = PlanMetadataInsert(planner, op, spec);
+	if (plan) {
+		insert_op.children.push_back(*plan);
+	}
+	return insert_op;
 }
 
-duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &,
-                                                     duckdb::LogicalDelete &, duckdb::PhysicalOperator &) {
-	throw duckdb::NotImplementedException("moraine: DELETE is not supported (read-only catalog)");
+duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &planner,
+                                                     duckdb::LogicalDelete &op, duckdb::PhysicalOperator &plan) {
+	// Same target discipline as PlanInsert; which DELETE forms translate
+	// (only the unversioned statistics kinds) is decided in
+	// PlanMetadataDelete — see staged_write.hpp's layout notes.
+	auto *metadata_table = dynamic_cast<MoraineMetadataTableEntry *>(&op.table);
+	if (metadata_table == nullptr || metadata_table->Spec().write_table_kind == kNotWritable) {
+		throw duckdb::NotImplementedException("moraine: DELETE is not supported on \"%s\"", op.table.name);
+	}
+	auto &delete_op = PlanMetadataDelete(planner, op, metadata_table->Spec());
+	delete_op.children.push_back(plan);
+	return delete_op;
 }
 
-duckdb::PhysicalOperator &MoraineCatalog::PlanUpdate(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &,
-                                                     duckdb::LogicalUpdate &, duckdb::PhysicalOperator &) {
-	throw duckdb::NotImplementedException("moraine: UPDATE is not supported (read-only catalog)");
+duckdb::PhysicalOperator &MoraineCatalog::PlanUpdate(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &planner,
+                                                     duckdb::LogicalUpdate &op, duckdb::PhysicalOperator &plan) {
+	// Same target discipline as PlanInsert, but — unlike Insert/Delete —
+	// does not reject a `kNotWritable` target outright: DuckLake's own
+	// DROP/RENAME batch unconditionally issues `SET end_snapshot` against
+	// tables this slice never models as store entities (always empty), and
+	// PlanMetadataUpdate translates exactly that shape as a sound no-op
+	// (see MoraineMetadataVoidUpdate's doc comment in staged_write.cpp).
+	// Every other UPDATE shape against a `kNotWritable` table still throws,
+	// from within PlanMetadataUpdate itself.
+	auto *metadata_table = dynamic_cast<MoraineMetadataTableEntry *>(&op.table);
+	if (metadata_table == nullptr) {
+		throw duckdb::NotImplementedException("moraine: UPDATE is not supported on \"%s\"", op.table.name);
+	}
+	auto &update_op = PlanMetadataUpdate(planner, op, metadata_table->Spec());
+	update_op.children.push_back(plan);
+	return update_op;
 }
 
 duckdb::DatabaseSize MoraineCatalog::GetDatabaseSize(duckdb::ClientContext &) {

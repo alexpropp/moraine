@@ -1,4 +1,4 @@
 -xc++
 -std=c++17
--Ivendor/duckdb-v1.5.4
+-I../../target/duckdb-src/v1.5.4/src/include
 -Icpp

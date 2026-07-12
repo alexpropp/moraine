@@ -252,9 +252,6 @@ pub(crate) enum Subspace {
     #[allow(dead_code)]
     Sys,
     /// Snapshot records.
-    // No production caller prefix-scans every snapshot yet (snapshot
-    // listing lands with expiry/GC); a store-open test exercises it.
-    #[allow(dead_code)]
     Snap,
     /// Live catalog state.
     Cur,

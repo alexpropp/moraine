@@ -1,7 +1,9 @@
 //! Drives a real, pinned DuckDB CLI against a store pre-seeded through the
 //! `moraine` API: `LOAD`s the packaged extension, `ATTACH`es the store, and
-//! exercises listing, `DESCRIBE`, and scans (including an empty table and
-//! a table with a real Parquet file) through actual SQL.
+//! exercises listing and `DESCRIBE` through actual SQL. User-table *data*
+//! is served only through DuckLake now (see `ducklake_load.rs`); a data
+//! scan through this standalone attach must raise a redirect error at
+//! execution time, which this suite also asserts.
 //!
 //! Ignored by default: needs the downloaded DuckDB CLI and the packaged
 //! `.duckdb_extension`, which only `cargo xtask e2e` produces (it sets
@@ -197,6 +199,32 @@ mod tests {
         String::from_utf8(output.stdout).expect("duckdb CLI stdout is not UTF-8")
     }
 
+    /// Like [`run_sql`], but asserts `sql` fails and returns stderr instead
+    /// of asserting success. Used for the standalone attach's data-scan
+    /// redirect, which must raise at execution time.
+    fn run_sql_expect_failure(store_dir: &Path, sql: &str) -> String {
+        let output = Command::new(cli_path())
+            .arg("-unsigned")
+            .arg("-csv")
+            .arg("-c")
+            .arg(format!("LOAD '{}';", ext_path().display()))
+            .arg("-c")
+            .arg(format!(
+                "ATTACH '{}' AS m (TYPE moraine);",
+                store_dir.display()
+            ))
+            .arg("-c")
+            .arg(sql)
+            .output()
+            .expect("failed to spawn duckdb CLI");
+        assert!(
+            !output.status.success(),
+            "expected `{sql}` to fail, but it succeeded:\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8(output.stderr).expect("duckdb CLI stderr is not UTF-8")
+    }
+
     /// Splits CSV output (header line + data lines) into rows of fields,
     /// dropping the header. Assumes no embedded commas or quoting, true
     /// for this test's data.
@@ -230,9 +258,15 @@ mod tests {
         ));
         assert_eq!(databases, vec![vec!["m".to_string()]]);
 
+        // Scoped to schema `s` (the fixture's own schema): `main` (minted
+        // by bootstrap) now also carries the synthesized `ducklake_*`
+        // metadata tables this shim serves for a DuckLake attach — see
+        // `metadata_tables.cpp` — which would otherwise leak into this
+        // listing.
         let tables = csv_rows(&run_sql(
             store,
-            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'm' ORDER BY table_name;",
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'm' AND schema_name = 's' \
+             ORDER BY table_name;",
         ));
         assert_eq!(
             tables,
@@ -277,14 +311,38 @@ mod tests {
             ]]
         );
 
-        // `count(*)` alone hits DuckDB's "virtual columns need projection
-        // pushdown" limitation (see `crates/moraine-duckdb/README.md`);
-        // pairing it with a real column (`sum(amount)`) sidesteps that.
-        let agg = csv_rows(&run_sql(store, "SELECT count(*), sum(amount) FROM m.s.t;"));
-        assert_eq!(agg, vec![vec![ROW_COUNT.to_string(), "15.0".to_string()]]);
+        // User-table data is served only through DuckLake now, never this
+        // standalone attach: the scan binds (DESCRIBE above already proved
+        // that) but raises a redirect error at execution time, naming the
+        // table and the `ducklake:moraine:` attach to use instead. Real
+        // data-scan assertions live in `ducklake_load.rs`'s round-trip test.
+        let stderr = run_sql_expect_failure(store, "SELECT * FROM m.s.t;");
+        assert!(
+            stderr.contains("s.t"),
+            "expected the redirect error to name the table; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("ducklake:moraine:"),
+            "expected the redirect error to name the ducklake:moraine: attach form; got: {stderr}"
+        );
+        assert!(
+            stderr.contains(&store.display().to_string()),
+            "expected the redirect error to include the real store path; got: {stderr}"
+        );
+        // DuckLake's `RetryOnError` treats these substrings as retryable;
+        // the redirect is not a commit race and must never be retried.
+        for substring in ["conflict", "unique", "primary key", "concurrent"] {
+            assert!(
+                !stderr.to_lowercase().contains(substring),
+                "redirect error must not contain DuckLake's retry substring \"{substring}\": {stderr}"
+            );
+        }
 
-        let empty_scan = csv_rows(&run_sql(store, "SELECT count(id) FROM m.s.empty;"));
-        assert_eq!(empty_scan, vec![vec!["0".to_string()]]);
+        let empty_scan_stderr = run_sql_expect_failure(store, "SELECT * FROM m.s.empty;");
+        assert!(
+            empty_scan_stderr.contains("s.empty"),
+            "expected the redirect error to name the empty table; got: {empty_scan_stderr}"
+        );
 
         let views = csv_rows(&run_sql(
             store,

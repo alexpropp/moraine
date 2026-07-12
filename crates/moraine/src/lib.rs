@@ -39,13 +39,13 @@
 //!     })
 //!     .await?;
 //!
-//! // The head sees the latest shape...
+//! // The head sees the latest shape (plus the bootstrap-minted `main`)...
 //! let head = catalog.snapshot().await?;
-//! assert_eq!(head.schemas().len(), 1);
+//! assert_eq!(head.schemas().len(), 2);
 //!
 //! // ...while `v1` remains queryable by time travel, forever.
 //! let past = catalog.snapshot_at(v1).await?;
-//! assert_eq!(past.schemas().len(), 1);
+//! assert_eq!(past.schemas().len(), 2);
 //! # Ok::<(), moraine::Error>(()) }).unwrap();
 //! ```
 //!
@@ -66,6 +66,8 @@
 
 mod catalog;
 mod error;
+#[doc(hidden)]
+pub mod ffi_support;
 mod store;
 mod transaction;
 
