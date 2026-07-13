@@ -1,12 +1,10 @@
 //! Key layout.
 //!
-//! A key is a typed tree — subspace, kind, components — and its on-disk
-//! bytes are `storekey`'s derived order-preserving encoding of that tree:
-//! one discriminant byte per enum level (assigned by declaration order),
-//! then fixed-width big-endian `u64` components in field order. The
-//! structure *is* the format: variant order is permanent once written,
-//! and the golden-vector tests pin the exact bytes so any drift —
-//! reordered variants, a changed derive — fails loudly in CI.
+//! A key is a typed tree — subspace, kind, components — encoded by
+//! `storekey` in order-preserving form: one discriminant byte per enum
+//! level (assigned by declaration order), then fixed-width big-endian
+//! `u64` components in field order. Variant order is permanent once
+//! written; the golden-vector tests pin the exact bytes.
 
 use storekey::{Decode, Encode};
 
@@ -51,8 +49,7 @@ pub(crate) enum SysKey {
 }
 
 /// A live record: a temporally versioned entity, or the `cur`-only
-/// gc-file bookkeeping (which has no begin/end lifecycle and therefore no
-/// `hist` mirror — that stays unrepresentable by construction).
+/// gc-file bookkeeping (no begin/end lifecycle, so no `hist` mirror).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum CurKey {
     /// A live entity version.
@@ -157,11 +154,9 @@ pub(crate) enum EntityKey {
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
-/// record, or the archived (post-flush) form of a live record. Archive
-/// keys are invisible to catalog reads and served only by the recent-row
-/// archive; sharing [`InlineOp`] between `Live` and `Arch` makes "an
-/// archive key has exactly the components of its live form"
-/// compiler-enforced.
+/// record, or the archived (post-flush) form of a live record. `Live` and
+/// `Arch` share [`InlineOp`], so an archive key has exactly the components
+/// of its live form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum InlineKey {
     /// Arrow IPC schema message, once per `(table, schema_version)`. Has
@@ -173,16 +168,16 @@ pub(crate) enum InlineKey {
         schema_version: u64,
     },
     /// A live inlined-data record.
-    Live(InlineOp),
+    Live(InlineOperation),
     /// The archived form of an inlined-data record.
-    Arch(InlineOp),
+    Arch(InlineOperation),
 }
 
 /// An inlined-data record that exists in both live and archived form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
-pub(crate) enum InlineOp {
+pub(crate) enum InlineOperation {
     /// One inlined-insert chunk (Arrow record-batch body).
-    Ins {
+    Insert {
         /// Owning table.
         table_id: u64,
         /// Schema version the chunk was written under.
@@ -193,14 +188,14 @@ pub(crate) enum InlineOp {
         chunk_seq: u64,
     },
     /// Tombstone for an inlined insert row.
-    Idel {
+    InlineDelete {
         /// Owning table.
         table_id: u64,
         /// Deleted row.
         row_id: u64,
     },
     /// Inlined delete against a Parquet-file row.
-    Fdel {
+    FileDelete {
         /// Owning table.
         table_id: u64,
         /// Targeted data file.
@@ -226,9 +221,8 @@ impl Key {
 
     /// Encode to the on-disk byte form.
     pub(crate) fn encode(&self) -> Vec<u8> {
-        // Infallible by construction: a `Vec` sink cannot raise io errors
-        // and the derived `Encode` raises no custom errors
-        // (`storekey::encode_vec` documents the same reasoning).
+        // Infallible by construction: a `Vec` sink raises no io error and
+        // the derived `Encode` raises no custom error.
         #[allow(clippy::expect_used)]
         storekey::encode_vec(self).expect("storekey encode into a Vec cannot fail")
     }
@@ -242,8 +236,8 @@ impl Key {
 }
 
 /// A subspace, fieldless — for building scan prefixes without naming
-/// discriminant bytes (prefixes are derived by encoding a sample key and
-/// truncating, so the derive stays the single source of the bytes).
+/// discriminant bytes; prefixes are derived by encoding a sample key and
+/// truncating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subspace {
     /// Store-level singletons.
@@ -280,8 +274,7 @@ impl Subspace {
 }
 
 /// The kinds whose live keys are scoped `table_id`-first — the only kinds
-/// [`cur_table_prefix`] accepts, so "which kinds are table-scoped" is a
-/// type, not caller knowledge.
+/// [`cur_table_prefix`] accepts.
 // No caller needs "everything about table T" yet (cascading table drop and
 // per-table GC land in later slices); the prefix math is pinned by tests.
 #[allow(dead_code)]
@@ -346,34 +339,33 @@ impl TableScopedKind {
 const CUR_KIND_PREFIX_LEN: usize = 3;
 
 /// The three live-record kinds inside the inline subspace — the only kinds
-/// [`inline_live_table_prefix`] builds a prefix for (`inline/schema` has
-/// its own prefix builder, since it is not an [`InlineOp`]).
+/// [`inline_live_table_prefix`] builds a prefix for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InlineOpKind {
-    /// `inline/ins`.
-    Ins,
-    /// `inline/idel`.
-    Idel,
-    /// `inline/fdel`.
-    Fdel,
+pub(crate) enum InlineOperationKind {
+    /// `inline/insert`.
+    Insert,
+    /// `inline/inline_delete`.
+    InlineDelete,
+    /// `inline/file_delete`.
+    FileDelete,
 }
 
-impl InlineOpKind {
+impl InlineOperationKind {
     /// An op of this kind with its table id set and every other component
     /// zeroed, for prefix derivation.
-    const fn sample(self, table_id: u64) -> InlineOp {
+    const fn sample(self, table_id: u64) -> InlineOperation {
         match self {
-            Self::Ins => InlineOp::Ins {
+            Self::Insert => InlineOperation::Insert {
                 table_id,
                 schema_version: 0,
                 begin_snapshot: 0,
                 chunk_seq: 0,
             },
-            Self::Idel => InlineOp::Idel {
+            Self::InlineDelete => InlineOperation::InlineDelete {
                 table_id,
                 row_id: 0,
             },
-            Self::Fdel => InlineOp::Fdel {
+            Self::FileDelete => InlineOperation::FileDelete {
                 table_id,
                 data_file_id: 0,
                 row_id: 0,
@@ -387,8 +379,8 @@ impl InlineOpKind {
 const INLINE_LIVE_KIND_PREFIX_LEN: usize = 3;
 
 /// Byte prefix of every live `inline/*` key of `kind` scoped to
-/// `table_id` — "everything an inline scan of one kind needs for table T".
-pub(crate) fn inline_live_table_prefix(kind: InlineOpKind, table_id: u64) -> Vec<u8> {
+/// `table_id`.
+pub(crate) fn inline_live_table_prefix(kind: InlineOperationKind, table_id: u64) -> Vec<u8> {
     let mut bytes = Key::Inline(InlineKey::Live(kind.sample(table_id))).encode();
     bytes.truncate(INLINE_LIVE_KIND_PREFIX_LEN + size_of::<u64>());
     bytes
@@ -410,9 +402,7 @@ pub(crate) fn inline_schema_table_prefix(table_id: u64) -> Vec<u8> {
     bytes
 }
 
-/// Byte prefix of every `inline/schema` key, across every table — "every
-/// table with a recorded inline schema", which is what the
-/// `ducklake_inlined_data_tables` projection scans.
+/// Byte prefix of every `inline/schema` key, across every table.
 pub(crate) fn inline_schema_prefix() -> Vec<u8> {
     let mut bytes = Key::Inline(InlineKey::Schema {
         table_id: 0,
@@ -431,10 +421,8 @@ pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
     bytes
 }
 
-/// Byte prefix of every live key of `kind` scoped to `table_id` —
-/// "everything about table T" for one kind.
-// No caller yet; pinned by the prefix tests below against the day
-// cascading table drop or per-table GC needs it.
+/// Byte prefix of every live key of `kind` scoped to `table_id`.
+// No caller yet; pinned by the prefix tests below.
 #[allow(dead_code)]
 pub(crate) fn cur_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
     let mut bytes = Key::cur(kind.sample(table_id)).encode();
@@ -452,10 +440,9 @@ mod tests {
         v.to_be_bytes().to_vec()
     }
 
-    // Golden vectors: the exact on-disk bytes, pinned per kind. The
-    // derive assigns each enum level's discriminant as declaration index
-    // + 2; these tests are what make that assignment — and variant
-    // order — part of the on-disk format rather than an accident.
+    // Golden vectors: the exact on-disk bytes, pinned per kind. The derive
+    // assigns each enum level's discriminant as declaration index + 2;
+    // these tests make that assignment part of the on-disk format.
 
     #[test]
     fn golden_sys_keys() {
@@ -513,7 +500,7 @@ mod tests {
         for v in [7, 3, 11, 0] {
             expect.extend(be(v));
         }
-        let key = Key::Inline(InlineKey::Live(InlineOp::Ins {
+        let key = Key::Inline(InlineKey::Live(InlineOperation::Insert {
             table_id: 7,
             schema_version: 3,
             begin_snapshot: 11,
@@ -525,17 +512,17 @@ mod tests {
     #[test]
     fn golden_arch_kinds_are_distinct_from_live() {
         let ops = [
-            InlineOp::Ins {
+            InlineOperation::Insert {
                 table_id: 7,
                 schema_version: 3,
                 begin_snapshot: 11,
                 chunk_seq: 0,
             },
-            InlineOp::Idel {
+            InlineOperation::InlineDelete {
                 table_id: 7,
                 row_id: 9,
             },
-            InlineOp::Fdel {
+            InlineOperation::FileDelete {
                 table_id: 7,
                 data_file_id: 2,
                 row_id: 9,
@@ -575,12 +562,12 @@ mod tests {
                 8,
             ),
             Key::Cur(CurKey::GcFile { deletion_id: 0 }),
-            Key::Inline(InlineKey::Live(InlineOp::Fdel {
+            Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 table_id: 1,
                 data_file_id: 2,
                 row_id: 3,
             })),
-            Key::Inline(InlineKey::Arch(InlineOp::Fdel {
+            Key::Inline(InlineKey::Arch(InlineOperation::FileDelete {
                 table_id: 1,
                 data_file_id: 2,
                 row_id: 3,
@@ -662,7 +649,11 @@ mod tests {
     /// with the same table id and rejects a different table id or kind.
     #[test]
     fn inline_live_table_prefixes_cover_all_op_kinds() {
-        let kinds = [InlineOpKind::Ins, InlineOpKind::Idel, InlineOpKind::Fdel];
+        let kinds = [
+            InlineOperationKind::Insert,
+            InlineOperationKind::InlineDelete,
+            InlineOperationKind::FileDelete,
+        ];
         for kind in kinds {
             let key = Key::Inline(InlineKey::Live(kind.sample(9)));
             let bytes = key.encode();
@@ -677,12 +668,12 @@ mod tests {
         }
         // Different op kinds must not share a prefix even for the same table.
         assert!(
-            !inline_live_table_prefix(InlineOpKind::Idel, 9)
-                .starts_with(&inline_live_table_prefix(InlineOpKind::Ins, 9))
+            !inline_live_table_prefix(InlineOperationKind::InlineDelete, 9)
+                .starts_with(&inline_live_table_prefix(InlineOperationKind::Insert, 9))
         );
         // An archived key never matches a live prefix.
-        let arch = Key::Inline(InlineKey::Arch(InlineOpKind::Ins.sample(9))).encode();
-        assert!(!arch.starts_with(&inline_live_table_prefix(InlineOpKind::Ins, 9)));
+        let arch = Key::Inline(InlineKey::Arch(InlineOperationKind::Insert.sample(9))).encode();
+        assert!(!arch.starts_with(&inline_live_table_prefix(InlineOperationKind::Insert, 9)));
     }
 
     /// The `inline/schema` prefix matches every schema version of the
@@ -750,21 +741,24 @@ mod tests {
         ]
     }
 
-    fn arb_inline_op() -> impl Strategy<Value = InlineOp> {
+    fn arb_inline_op() -> impl Strategy<Value = InlineOperation> {
         prop_oneof![
             any::<(u64, u64, u64, u64)>().prop_map(
-                |(table_id, schema_version, begin_snapshot, chunk_seq)| InlineOp::Ins {
+                |(table_id, schema_version, begin_snapshot, chunk_seq)| InlineOperation::Insert {
                     table_id,
                     schema_version,
                     begin_snapshot,
                     chunk_seq
                 }
             ),
-            any::<(u64, u64)>().prop_map(|(table_id, row_id)| InlineOp::Idel { table_id, row_id }),
-            any::<(u64, u64, u64)>().prop_map(|(table_id, data_file_id, row_id)| InlineOp::Fdel {
-                table_id,
-                data_file_id,
-                row_id,
+            any::<(u64, u64)>()
+                .prop_map(|(table_id, row_id)| InlineOperation::InlineDelete { table_id, row_id }),
+            any::<(u64, u64, u64)>().prop_map(|(table_id, data_file_id, row_id)| {
+                InlineOperation::FileDelete {
+                    table_id,
+                    data_file_id,
+                    row_id,
+                }
             }),
         ]
     }

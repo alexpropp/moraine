@@ -25,8 +25,7 @@ use crate::{
 /// Structural layout version this binary reads and writes.
 pub(crate) const FORMAT_VERSION: u64 = 1;
 /// Bounded internal retries before a benign race is reported as a
-/// conflict. The attempt count mirrors the composing client's default
-/// retry count; backoff and jitter are deliberately not implemented yet.
+/// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 /// Current time in microseconds since the Unix epoch. Clamped, never
@@ -65,9 +64,8 @@ async fn validate_format(tx: &DbTransaction) -> Result<Option<proto::FormatValue
 
 /// Stages the initial state of an empty store into `tx`: format stamp,
 /// snapshot 0 (carrying the default `main` schema, counters advanced past
-/// its id), the `main` schema record itself, and head pointer. Mints the
-/// same starting catalog shape a fresh DuckLake metadata store carries,
-/// so a moraine store is attachable from birth.
+/// its id), the `main` schema record itself, and head pointer — the same
+/// starting catalog shape a fresh DuckLake metadata store carries.
 fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
     let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     stage(

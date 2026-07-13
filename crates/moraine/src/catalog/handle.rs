@@ -17,8 +17,8 @@ use crate::{
 #[non_exhaustive]
 pub struct CatalogOptions {
     /// Path prefix of the catalog within the bucket. Empty (the default)
-    /// places the catalog at the bucket root, so a deployment is a
-    /// bucket and credentials; set it when several stores share a bucket.
+    /// places the catalog at the bucket root; set it when several stores
+    /// share a bucket.
     pub path: String,
 }
 
@@ -31,8 +31,7 @@ pub struct Catalog {
 }
 
 impl std::fmt::Debug for Catalog {
-    // `slatedb::Db` carries no `Debug` impl; a catalog handle has no
-    // other state worth printing.
+    // `slatedb::Db` carries no `Debug` impl.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Catalog").finish_non_exhaustive()
     }
@@ -97,11 +96,9 @@ impl Catalog {
 
     /// Opens a fresh transaction at the current head, the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
-    /// `pub(crate)` rather than a wider seam: [`crate::ffi_support`]'s full
-    /// cur+hist dumps read through a raw transaction directly, and the
-    /// staged-row commit path ([`crate::transaction::staged`]) opens one
-    /// here to both read the premise and stage its writes; every other
-    /// caller goes through `snapshot`/`snapshot_at`/`commit`.
+    /// Used by [`crate::ffi_support`]'s raw cur+hist dumps and the
+    /// staged-row commit path; every other caller goes through
+    /// `snapshot`/`snapshot_at`/`commit`.
     pub(crate) async fn begin_read_tx(&self) -> Result<DbTransaction> {
         self.db
             .begin(IsolationLevel::Snapshot)
@@ -125,12 +122,12 @@ impl Catalog {
 
     /// Commits catalog mutations atomically, producing one new snapshot.
     ///
-    /// The closure stages mutations on the [`Transaction`]; reads on the `Transaction`
-    /// observe its own staged state. Because a lost race with a
-    /// concurrent commit re-runs the closure against the fresh state, the
-    /// closure must be pure: no I/O, no effects other than the `Transaction`
-    /// calls. A closure that stages nothing commits nothing and returns
-    /// the unchanged head snapshot id.
+    /// The closure stages mutations on the [`Transaction`]; reads on the
+    /// `Transaction` observe its own staged state. It may be re-run against
+    /// fresh state after a lost race with a concurrent commit, so it must
+    /// be pure: no I/O, no effects other than the `Transaction` calls. A
+    /// closure that stages nothing commits nothing and returns the
+    /// unchanged head snapshot id.
     ///
     /// # Errors
     ///

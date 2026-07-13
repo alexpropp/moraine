@@ -2,9 +2,8 @@
 //! store pre-seeded through the `moraine` API, proving the whole nested
 //! attach chain: `ATTACH 'ducklake:moraine:<dir>' AS lake (DATA_PATH
 //! '<dir2>')` resolves DuckLake's metadata connection through this shim's
-//! `moraine:` prefix dispatch and synthesized `ducklake_*` tables (see
-//! `crates/moraine-duckdb/cpp/metadata_tables.cpp`), and DuckLake's own
-//! reader — not this crate's scan — serves the data back.
+//! `moraine:` prefix dispatch and synthesized `ducklake_*` tables, and
+//! DuckLake's own reader — not this crate's scan — serves the data back.
 //!
 //! Ignored by default: needs the downloaded DuckDB CLI, the packaged
 //! `.duckdb_extension`, and network access to `INSTALL ducklake` (cached
@@ -67,9 +66,8 @@ mod tests {
         )
     }
 
-    /// Cache root for `INSTALL ducklake`'s downloaded artifact, matching
-    /// the repo's `target/`-cached-not-committed convention (see
-    /// `crates/moraine-duckdb/README.md`).
+    /// Cache root for `INSTALL ducklake`'s downloaded artifact, gitignored
+    /// under `target/`.
     fn extension_directory() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/duckdb-extensions")
     }
@@ -80,12 +78,9 @@ mod tests {
     /// explicit `create_schema` call), one table `t` with a relative-path
     /// data file, then a rename to give the table row hist depth (two
     /// `ducklake_table` versions). `file_size_bytes`/`footer_size` must be
-    /// the real Parquet file's stats — DuckLake's own reader (unlike this
-    /// crate's `read_parquet`-delegating standalone scan) uses the
-    /// registered `footer_size` to seek straight to the file's metadata
-    /// footer; a placeholder `0` throws `Invalid Input Error: Invalid
-    /// footer length` the moment DuckLake reads the file (discovered
-    /// live).
+    /// the real Parquet file's stats: DuckLake's own reader uses the
+    /// registered `footer_size` to seek to the file's metadata footer, so a
+    /// placeholder `0` throws `Invalid Input Error: Invalid footer length`.
     fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -147,28 +142,20 @@ mod tests {
         });
     }
 
-    /// Writes `<data_path>/main/t_old/data.parquet`. Two path facts,
-    /// discovered live against real DuckLake, drive this:
+    /// Writes `<data_path>/main/t_old/data.parquet`. Two path facts drive
+    /// this:
     ///
     /// - DuckLake resolves a relative data-file path against `<DATA_PATH
     ///   from ATTACH>/<schema.path>/<table.path>/`, never against the
-    ///   metadata store's own directory (that resolution rule is this
-    ///   crate's *standalone*-attach convention only, documented in
-    ///   `crates/moraine-duckdb/README.md`'s "Path resolution" — a
-    ///   different attach, a different base path).
+    ///   metadata store's own directory.
     /// - `table.path` is fixed at `CREATE TABLE` time (here, `t_old/`) and
-    ///   is untouched by a later rename — matches real DuckLake semantics
-    ///   (renaming a catalog entry never moves its files on disk), and
-    ///   moraine's own `rename_table` verb likewise only touches the name.
+    ///   is untouched by a later rename.
     ///
     /// Returns `(file_size_bytes, footer_size)` for the written file, per
     /// the Parquet spec's fixed trailer: the last 4 bytes are the magic
     /// `PAR1`, and the 4 bytes before that are the footer's thrift-encoded
-    /// length as a little-endian `u32` — exactly the `footer_size` DuckLake
-    /// itself registers when it authors a data file (see
-    /// `DuckLakeMetadataManager`'s data-file-append call sites, which read
-    /// this same trailer through DuckDB's own Parquet writer metadata
-    /// rather than recomputing it, but the on-disk encoding is identical).
+    /// length as a little-endian `u32` — the same `footer_size` DuckLake
+    /// registers when it authors a data file.
     fn write_parquet(data_path: &Path) -> (u64, u64) {
         let table_dir = data_path.join("main").join("t_old");
         std::fs::create_dir_all(&table_dir).expect("test setup: create table dir");
@@ -204,15 +191,11 @@ mod tests {
     /// `target/duckdb-extensions`, loads both extensions, attaches the
     /// nested `ducklake:moraine:` chain, then runs `sql`.
     ///
-    /// Pinned single-threaded. DuckLake's catalog re-read after a rename
-    /// is racy under multiple threads — a fresh attach sometimes returns
-    /// an empty table list. The race reproduces against a plain
-    /// duckdb-file-backed DuckLake with no moraine in the chain (~75% of
-    /// runs), so it is upstream, not a moraine translation defect; the
-    /// store moraine writes is verified independently and deterministically
-    /// through the standalone `moraine:` projections below. One thread
-    /// closes the upstream race so these tests exercise moraine's
-    /// translation, not DuckLake's cache concurrency.
+    /// Pinned single-threaded: DuckLake's catalog re-read after a rename is
+    /// racy under multiple threads — a fresh attach sometimes returns an
+    /// empty table list. The race reproduces with no moraine in the chain,
+    /// so it is upstream; one thread closes it so these tests exercise
+    /// moraine's translation, not DuckLake's cache concurrency.
     fn run_ducklake_sql(store_dir: &Path, data_path: &Path, sql: &str) -> String {
         let output = Command::new(cli_path())
             .arg("-unsigned")
@@ -258,11 +241,9 @@ mod tests {
             .collect()
     }
 
-    /// `moraine:` prefix dispatch (no `TYPE moraine` needed) — DuckDB's own
-    /// `PhysicalAttach`/`DBPathAndType::ExtractExtensionPrefix` resolves it
-    /// before this shim ever sees the path (see the report's "prefix
-    /// dispatch" finding); this proves it standalone, independent of
-    /// DuckLake.
+    /// `moraine:` prefix dispatch (no `TYPE moraine` needed): DuckDB
+    /// resolves the prefix before this shim ever sees the path. Proven
+    /// standalone here, independent of DuckLake.
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI and packaged extension; run via `cargo xtask e2e`"]
     fn moraine_prefix_attach_without_type_clause() {
@@ -300,9 +281,8 @@ mod tests {
     fn ducklake_attach_reads_through_moraine_metadata() {
         let dir = TempDir::new("store");
         let data_dir = TempDir::new("data");
-        // Written first: `seed` needs the real file's size/footer stats
-        // (see `write_parquet`'s doc comment) to register a data file
-        // DuckLake's own reader — not this crate's — can actually open.
+        // Written first: `seed` needs the real file's size/footer stats to
+        // register a data file DuckLake's own reader can open.
         let (file_size_bytes, footer_size) = write_parquet(data_dir.path());
         seed(dir.path(), file_size_bytes, footer_size);
         let store = dir.path();
@@ -335,12 +315,11 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
 
         // Time travel: `t` is created, gets its data file, and is renamed
-        // all within bootstrap's snapshot 1 (`seed`'s one `commit` call);
-        // snapshot 0 is bootstrap's own `main`-minting snapshot, before `t`
-        // exists at all. `AT (VERSION => 1)` must see it; `AT (VERSION =>
-        // 0)` must not — proving version-scoped resolution runs through
-        // this shim's synthesized `ducklake_table`/`ducklake_snapshot`
-        // rows, not just "whatever the head happens to be".
+        // all within `seed`'s one commit (snapshot 1); snapshot 0 is
+        // bootstrap's own `main`-minting snapshot, before `t` exists at
+        // all. `AT (VERSION => 1)` must see it; `AT (VERSION => 0)` must
+        // not — proving version-scoped resolution runs through this shim's
+        // synthesized `ducklake_table`/`ducklake_snapshot` rows.
         let at_v1 = csv_rows(&run_ducklake_sql(
             store,
             data_path,
@@ -383,10 +362,10 @@ mod tests {
         );
     }
 
-    /// A helper mirroring `run_ducklake_sql` for the standalone
-    /// metadata-only attach: reads the same store through this crate's own
-    /// dump ABI + metadata-table scan, not DuckLake's reader — the
-    /// independent verification surface for what the staged writes landed.
+    /// Mirrors `run_ducklake_sql` for the standalone metadata-only attach:
+    /// reads the same store through this crate's own metadata-table scan,
+    /// not DuckLake's reader — the independent verification surface for what
+    /// the staged writes landed.
     fn run_standalone_sql(store_dir: &Path, sql: &str) -> String {
         let output = Command::new(cli_path())
             .arg("-unsigned")
@@ -410,31 +389,22 @@ mod tests {
 
     /// The staged-row write path, driven end to end by DuckLake's own SQL:
     ///
-    /// - `CREATE TABLE` **completes** — its metadata batch (INSERT INTO
-    ///   `ducklake_table`/`ducklake_column`/stats/`ducklake_snapshot`/
-    ///   `ducklake_snapshot_changes`) translates through `PlanInsert` and
-    ///   lands as one atomic staged commit. The batch stops short of any
-    ///   `ducklake_inlined_data_tables` registration because the
-    ///   synthesized `ducklake_metadata` serves
-    ///   `data_inlining_row_limit = 0` (see `metadata_tables.cpp`): pinned
-    ///   from the DuckLake source, `WriteNewInlinedTables` skips a table
-    ///   whose `DataInliningRowLimit(...)` is 0, and that limit's only
-    ///   inputs are catalog config options — with a default of 10, so
-    ///   without the served row inlining is ON and CREATE TABLE demands a
-    ///   table this catalog cannot store (discovered live in this test's
-    ///   previous incarnation).
-    /// - `ALTER TABLE ... RENAME TO` drives DuckLake's
-    ///   `UPDATE ducklake_table SET end_snapshot = {SNAPSHOT_ID} WHERE
-    ///   end_snapshot IS NULL AND table_id IN (...)` — the live proof of
-    ///   `PlanUpdate`'s pinned sink-chunk layout (SET result column, rowid
-    ///   last) and of the update-set-end lifecycle translation: the old
-    ///   version must land in hist, the renamed one in cur.
+    /// - `CREATE TABLE` **completes** — its metadata INSERT batch
+    ///   translates through `PlanInsert` and lands as one atomic staged
+    ///   commit. Row inlining is on (the synthesized `ducklake_metadata`
+    ///   serves `data_inlining_row_limit = 10`, DuckLake's default), so
+    ///   `CREATE TABLE` also provisions the dynamic
+    ///   `ducklake_inlined_data_<t>_<v>` entry this shim recognizes and
+    ///   routes into the `inline/*` keyspace rather than materializing.
+    /// - `ALTER TABLE ... RENAME TO` drives DuckLake's `UPDATE
+    ///   ducklake_table SET end_snapshot ... WHERE end_snapshot IS NULL AND
+    ///   table_id IN (...)` — the old version must land in hist, the
+    ///   renamed one in cur.
     /// - `DROP TABLE` drives the same UPDATE convention for the drop.
     ///
     /// Every step is verified through two independent surfaces: DuckLake's
-    /// own catalog in a fresh CLI session (fresh attach, fresh metadata
-    /// read), and the standalone `moraine:` attach's row-faithful
-    /// projections.
+    /// own catalog in a fresh CLI session, and the standalone `moraine:`
+    /// attach's row-faithful projections.
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
     fn ducklake_create_rename_drop_round_trip_through_staged_writes() {
@@ -517,5 +487,130 @@ mod tests {
             "SELECT count(*) FROM m.ducklake_table WHERE end_snapshot IS NULL;",
         ));
         assert_eq!(rows, vec![vec!["0".to_string()]]);
+    }
+
+    /// Data inlining end to end, driven entirely through DuckLake's own
+    /// SQL: small `INSERT`s land in the `inline/*` keyspace (never
+    /// materialized as a real table) and read back through DuckLake's own
+    /// inlined-data reader, not this crate's scan.
+    ///
+    /// - `INSERT` (two statements, two chunks) of mixed types (`BIGINT`,
+    ///   `VARCHAR`, `DOUBLE`, `BOOLEAN`) and `NULL`s inlines; `SELECT`
+    ///   returns every row with the right values and types.
+    /// - `DELETE` of one row stages an `inline/inline_delete`; a follow-up `SELECT`
+    ///   no longer sees it.
+    /// - `CALL ducklake_flush_inlined_data('lake')` moves the remaining
+    ///   rows to a real Parquet file; `SELECT` afterward is still correct
+    ///   (now served by DuckLake's Parquet reader plus its delete-file join
+    ///   for the pre-flush `DELETE`), and the standalone `moraine:`
+    ///   attach's row-faithful projections confirm the `inline/insert` chunk
+    ///   is gone (0 remaining rows in the now-empty
+    ///   `ducklake_inlined_data_<t>_<v>` entry) and a `ducklake_data_file`
+    ///   is registered.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_inline_data_round_trip_through_flush() {
+        let dir = TempDir::new("inline-store");
+        let data_dir = TempDir::new("inline-data");
+        // No fixture seed: bootstrap alone (an empty attach mints `main`)
+        // is enough for a CREATE TABLE; row inlining is on by default
+        // (`data_inlining_row_limit = 10`), so these small inserts inline.
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        run_ducklake_sql(
+            store,
+            data_path,
+            "CREATE TABLE lake.main.t (i BIGINT, s VARCHAR, d DOUBLE, b BOOLEAN);",
+        );
+        run_ducklake_sql(
+            store,
+            data_path,
+            "INSERT INTO lake.main.t VALUES (1, 'a', 1.5, true), (2, NULL, NULL, false), \
+             (3, 'c', 3.25, NULL);",
+        );
+        // A second statement is a second chunk: proves multi-chunk decode.
+        run_ducklake_sql(
+            store,
+            data_path,
+            "INSERT INTO lake.main.t VALUES (4, 'd', 4.5, true), (5, 'e', 5.5, false);",
+        );
+
+        let select = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT * FROM lake.main.t ORDER BY i;",
+        ));
+        assert_eq!(
+            select,
+            vec![
+                vec!["1", "a", "1.5", "true"],
+                vec!["2", "NULL", "NULL", "false"],
+                vec!["3", "c", "3.25", "NULL"],
+                vec!["4", "d", "4.5", "true"],
+                vec!["5", "e", "5.5", "false"],
+            ]
+        );
+        // Every inlined row is served through the dynamic
+        // `ducklake_inlined_data_<t>_<v>` entry, not a real materialized
+        // table: no Parquet file is registered yet.
+        let pre_flush_files = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        ));
+        assert_eq!(pre_flush_files, vec![vec!["0".to_string()]]);
+
+        run_ducklake_sql(store, data_path, "DELETE FROM lake.main.t WHERE i = 3;");
+        let after_delete = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT i FROM lake.main.t ORDER BY i;",
+        ));
+        assert_eq!(
+            after_delete,
+            vec![vec!["1"], vec!["2"], vec!["4"], vec!["5"]]
+        );
+
+        run_ducklake_sql(
+            store,
+            data_path,
+            "CALL ducklake_flush_inlined_data('lake');",
+        );
+        let after_flush = csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT * FROM lake.main.t ORDER BY i;",
+        ));
+        assert_eq!(
+            after_flush,
+            vec![
+                vec!["1", "a", "1.5", "true"],
+                vec!["2", "NULL", "NULL", "false"],
+                vec!["4", "d", "4.5", "true"],
+                vec!["5", "e", "5.5", "false"],
+            ]
+        );
+
+        // Row-faithful check through the standalone surface: the `t`
+        // table's inline entry is drained (the flush's `inline/*` deletes
+        // landed) and exactly one live `ducklake_data_file` now backs it.
+        let table_id = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT table_id FROM m.ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL;",
+        ));
+        assert_eq!(table_id, vec![vec!["1".to_string()]]);
+        let remaining_inline_rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_inlined_data_1_1;",
+        ));
+        assert_eq!(remaining_inline_rows, vec![vec!["0".to_string()]]);
+        let post_flush_files = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*), sum(record_count) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        ));
+        assert_eq!(
+            post_flush_files,
+            vec![vec!["1".to_string(), "5".to_string()]]
+        );
     }
 }

@@ -7,12 +7,12 @@ use crate::{
     store::frame,
 };
 
-/// Encode a message behind the framing header. The message is encoded
-/// directly into the framed buffer — one allocation, no payload copy.
+/// Encode a message behind the framing header, directly into the framed
+/// buffer with no payload copy.
 pub(crate) fn encode_value<M: Message>(msg: &M) -> Vec<u8> {
     let mut buf = frame::header_buf(msg.encoded_len());
-    // Infallible by construction: insufficient buffer capacity is the only
-    // error `encode` returns, and a `Vec`'s `BufMut` capacity is unbounded.
+    // Infallible by construction: insufficient capacity is the only error
+    // `encode` returns, and a `Vec`'s `BufMut` capacity is unbounded.
     #[allow(clippy::expect_used)]
     msg.encode(&mut buf)
         .expect("prost encode into a Vec cannot fail");
@@ -81,6 +81,6 @@ mod tests {
     roundtrip!(roundtrip_migration, MigrationValue);
     roundtrip!(roundtrip_inline_schema, InlineSchemaValue);
     roundtrip!(roundtrip_inline_chunk, InlineChunkValue);
-    roundtrip!(roundtrip_inline_idel, InlineIdelValue);
-    roundtrip!(roundtrip_inline_fdel, InlineFdelValue);
+    roundtrip!(roundtrip_inline_inline_delete, InlineInlineDeleteValue);
+    roundtrip!(roundtrip_inline_file_delete, InlineFileDeleteValue);
 }

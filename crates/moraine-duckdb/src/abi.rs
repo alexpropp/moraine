@@ -59,12 +59,8 @@ pub(crate) unsafe fn guard<T>(
 
 /// Converts a Rust string to an owned [`CString`].
 ///
-/// Catalog strings are not guaranteed free of embedded NUL bytes; that
-/// case is reported as [`codes::CORRUPTION`] rather than panicking.
-/// Returns the owned `CString`, not a raw pointer: listing accessors
-/// convert every string to an owned `CString` first and mint raw
-/// pointers only once the whole collection succeeds, so a failure
-/// part-way through leaks nothing.
+/// An embedded NUL byte is reported as [`codes::CORRUPTION`] rather than
+/// panicking.
 pub(crate) fn to_c_string(s: &str) -> Result<CString, AbiError> {
     CString::new(s).map_err(|_| {
         AbiError::new(
@@ -368,13 +364,9 @@ pub unsafe extern "C" fn moraine_snapshot(
 /// Signals cancellation of the read currently in flight on `handle`, or,
 /// if none is in flight, the very next one.
 ///
-/// A single-use [`tokio::sync::Notify`] permit (`notify_one`), not a
-/// persistent flag: it wakes an already-waiting cancellable read
-/// immediately, or is stored and consumed by the next one, either way
-/// returning [`codes::INTERRUPTED`]. The permit resets per operation —
-/// reads after the one that consumes it are unaffected. Repeated calls
-/// before any read consumes the pending signal coalesce to one pending
-/// interrupt.
+/// The signal is consumed by the read that observes it and does not carry
+/// over, so reads after the one that consumes it are unaffected. Repeated
+/// calls before any read consumes it coalesce to one pending interrupt.
 ///
 /// A null `handle` is a no-op.
 ///
@@ -788,9 +780,7 @@ pub unsafe extern "C" fn moraine_snapshot_views_in_free(items: *mut MoraineViewD
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
-/// One live data file, as returned by [`moraine_snapshot_data_files_of`]
-/// — the scan path's input: DuckDB's Parquet reader binds over these
-/// paths.
+/// One live data file, as returned by [`moraine_snapshot_data_files_of`].
 #[repr(C)]
 pub struct MoraineDataFileDesc {
     /// The file's id.
@@ -1135,9 +1125,7 @@ mod tests {
     /// A catalog string with an embedded NUL (reachable via a view's SQL,
     /// since `moraine` stores `\0` verbatim) cannot cross the C boundary:
     /// the listing call must fail with `CORRUPTION`, leaving the outputs
-    /// untouched. Leak-freedom itself follows from the owned-first shape
-    /// of the listing accessors, not from anything this test observes
-    /// directly.
+    /// untouched.
     #[test]
     fn embedded_nul_in_catalog_data_reports_corruption() {
         let dir = TempDir::new("embedded-nul");
@@ -1483,6 +1471,11 @@ mod tests {
             "moraine_snapshot_views_in_free",
             "moraine_snapshot_data_files_of",
             "moraine_snapshot_data_files_of_free",
+            "moraine_arrow_encode_schema",
+            "moraine_arrow_encode_chunk",
+            "moraine_arrow_decode_stream",
+            "moraine_arrow_bytes_free",
+            "moraine_arrow_error_free",
         ];
         let structs = [
             "MoraineCatalogHandle",
@@ -1493,6 +1486,8 @@ mod tests {
             "MoraineColumnDesc",
             "MoraineViewDesc",
             "MoraineDataFileDesc",
+            "MoraineArrowBytes",
+            "MoraineArrowError",
         ];
         let error_codes = [
             "MORAINE_OK",

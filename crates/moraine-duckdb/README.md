@@ -622,15 +622,12 @@ this table is a human-readable mirror of it.
 | `ducklake_table_column_stats` | `moraine_dump_table_column_stats` | unversioned |
 | `ducklake_file_column_stats` | `moraine_dump_file_column_stats` | unversioned |
 | `ducklake_metadata` | synthesized in C++, no ABI call | see below |
-| `ducklake_tag`, `ducklake_column_tag`, `ducklake_inlined_data_tables`, `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_partition_info`, `ducklake_partition_column`, `ducklake_sort_info`, `ducklake_sort_expression` | always empty | store models none of these kinds this slice — see "Discovered: absence isn't tolerated" below |
+| `ducklake_schema_versions` | `moraine_dump_schema_versions` (`ProvideSchemaVersions`) | one row per `(table_id, schema_version)` transition |
+| `ducklake_inlined_data_tables` | `moraine_inline_registered_tables` (`ProvideInlinedDataTables`) | every `(table_id, schema_version)` with a recorded `inline/schema`; see "Data inlining" below — writable only as a no-op (`kVoidInsertable`), since `CreateInlineDataTable` already stages the registration this table's own `INSERT` would double-register |
+| `ducklake_tag`, `ducklake_column_tag`, `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_partition_info`, `ducklake_partition_column`, `ducklake_sort_info`, `ducklake_sort_expression`, `ducklake_file_partition_value`, `ducklake_file_variant_stats`, `ducklake_files_scheduled_for_deletion`, `ducklake_column_mapping`, `ducklake_name_mapping` | always empty | store models none of these kinds this slice — see "Discovered: absence isn't tolerated" below. The last five were added once `ducklake_flush_inlined_data`'s generic cleanup batch (`DELETE FROM`/`INSERT INTO` unconditionally, not gated on partitioning/variant-stats/mapping actually being in use) proved they must at least exist — see "Data inlining" below |
 
-Tables DuckLake's own schema defines but this shim never serves at all
-(not even empty): `ducklake_file_variant_stats`, `ducklake_file_partition_value`,
-`ducklake_files_scheduled_for_deletion`, `ducklake_column_mapping`,
-`ducklake_name_mapping`, `ducklake_schema_versions`. None were needed by
-the read/count/time-travel proof below; a future task hitting a bind error
-naming one of these is expected, not a regression — add it the same way
-the always-empty list above was discovered.
+Every table DuckLake's own schema defines is served, either with real data
+or as an always-empty stand-in; none are left unbound.
 
 ### `ducklake_column.column_type`: two type vocabularies, one stored string
 
@@ -668,6 +665,67 @@ succeeds:
 
 All rows are global (`scope`/`scope_id` `NULL`) — no schema/table-scoped
 DuckLake settings exist to serve this slice.
+
+### Data inlining
+
+`ducklake_metadata` also serves `data_inlining_row_limit = "10"`
+(DuckLake's compiled default), turning inlining on catalog-wide. With it
+on, DuckLake dynamically creates and drives per-table physical tables in
+the metadata catalog instead of writing fixed `ducklake_*` rows for small
+inserts; `cpp/inline_tables.cpp` recognizes two dynamic name families —
+`ducklake_inlined_data_<table_id>_<schema_version>` (columns `row_id`,
+`begin_snapshot`, `end_snapshot`, the table's user columns) and
+`ducklake_inlined_delete_<table_id>` (columns `file_id`, `row_id`,
+`begin_snapshot`) — and routes `CREATE`/`INSERT`/`UPDATE`/`DELETE`/
+`SELECT` against them into the `inline/*` keyspace over the same
+staged-row commit path the fixed tables ride, instead of materializing
+real tables. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
+(as implemented)" for the exact operation → keyspace mapping.
+
+Chunk bodies (`inline/schema`, `inline/insert`) are Arrow IPC. DuckDB's C++
+has no IPC serializer, so the work splits along the Arrow C Data
+Interface: `inline_tables.cpp` converts a `DataChunk`'s user columns to
+`ArrowArray`/`ArrowSchema` with DuckDB's `ArrowConverter` and hands them
+to the Rust bridge (`src/arrow_ipc.rs`), which serializes them to IPC with
+`arrow-rs`. Decode reverses it — Rust rebuilds the C Data Interface
+structs from the IPC bytes and the shim feeds them to DuckDB's own
+record-batch importer (`ArrowTableFunction::ArrowToDuckDB`). Because DuckDB
+owns both export and import, the encoding is exactly as type-faithful as
+DuckDB's Arrow support, nulls and nested types included.
+
+Two DuckDB-internal contracts the import path depends on (learned the hard
+way, both silent on violation): `ArrowToDuckDB` reads `output.size()` as
+the row count to convert, so the output `DataChunk`'s cardinality must be
+set *before* the call; and the per-column `ColumnArrowToDuckDB` does not
+apply a column's validity itself — its caller must run `SetValidityMask`
+first, or every null silently reads back as a default value. `inline/insert`
+carries a self-contained IPC stream (schema + one batch) per chunk;
+`inline/schema` is a schema-only stream used to reconstruct a looked-up
+table's columns. See RFC 0005 for the encoding rationale and costs.
+
+`ducklake_flush_inlined_data` and DuckLake's compaction/rewrite cleanup
+also unconditionally touch five more fixed tables this shim did not
+previously serve (`ducklake_file_partition_value`,
+`ducklake_file_variant_stats`, `ducklake_files_scheduled_for_deletion`,
+`ducklake_column_mapping`, `ducklake_name_mapping`) even when none of the
+features they back (partitioning, variant stats, name/column mapping) are
+in use — discovered live the same way the always-empty list above was:
+a `CALL ducklake_flush_inlined_data('lake')` failing commit with `Table
+"...ducklake_file_partition_value" could not be found` until it, and then
+each of the other four in turn, was added as an always-empty stand-in.
+
+Live proof (`crates/moraine-duckdb/tests/ducklake_load.rs`'s
+`ducklake_inline_data_round_trip_through_flush`, run un-ignored by
+`cargo xtask e2e`): `CREATE TABLE` + two small `INSERT`s (mixed types,
+`NULL`s, two chunks) inline; `SELECT` returns every row correctly through
+DuckLake's own inlined-data reader (not this crate's scan); `DELETE` of
+one row stages an `inline/idel` and a follow-up `SELECT` no longer sees
+it; `CALL ducklake_flush_inlined_data('lake')` moves the remaining rows
+to a real Parquet file (DuckLake registers a genuine delete file for the
+pre-flush `DELETE`, not a shrunk record count) and a post-flush `SELECT`
+is still correct; the standalone `moraine:` attach confirms the drained
+`ducklake_inlined_data_<t>_<v>` entry (`0` rows) and the newly-registered
+`ducklake_data_file`.
 
 ### Discovered: zero-column scans need `projection_pushdown = true`
 

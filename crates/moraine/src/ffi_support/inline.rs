@@ -1,15 +1,8 @@
-//! The inline read seam: DuckLake's four inline scan variants
-//! (`SCAN_TABLE`/`SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH`)
-//! materialize over the `inline/*` keyspace here, and the ABI decodes
-//! each returned row's Arrow IPC chunk body. Re-exports
-//! [`crate::catalog::inline::InlineScanKind`] (`catalog` is otherwise
-//! private to the crate) and adds the entry points that need a
-//! [`Catalog`]. `#[doc(hidden)]` for the same reason as every other item
-//! in [`crate::ffi_support`] — an unstable seam, not semver surface.
-//!
-//! Every function opens one fresh read-only transaction, scans, and
-//! rolls back — the same one-shot pattern the `dump_*` functions in
-//! [`super`] use.
+//! The inline read seam: materializes DuckLake's four inline scan variants
+//! over the `inline/*` keyspace and re-exports
+//! [`InlineScanKind`](crate::catalog::inline::InlineScanKind) from the
+//! otherwise-private `catalog`. Each function opens a fresh read-only
+//! transaction, scans, and rolls back.
 
 use crate::{
     catalog::{
@@ -23,14 +16,9 @@ use crate::{
 #[doc(hidden)]
 pub use crate::catalog::inline::InlineScanKind;
 
-/// One inlined row selected by [`scan_inline`]: the materialized row
-/// plus an owned copy of its chunk's full Arrow IPC body. Self-contained
-/// (not tied to any other returned row's lifetime) at the cost of
-/// duplicating the chunk body once per row it contains — the ABI mints
-/// one independently-freed C array element per row, so an
-/// independent-ownership shape here avoids threading a second,
-/// index-linked array across the boundary for what is, by design, a
-/// small amount of data.
+/// One inlined row selected by [`scan_inline`]: the materialized row plus
+/// an owned copy of its chunk's full Arrow IPC body, so each row is
+/// self-contained (one independently-freed element per row across the ABI).
 #[doc(hidden)]
 pub struct InlineRowRecord {
     /// The row's dense id.
@@ -63,12 +51,12 @@ pub async fn scan_inline(
 ) -> Result<Vec<InlineRowRecord>> {
     let tx = catalog.begin_read_tx().await?;
     let chunks = store_inline::scan_inline_chunks(&tx, table_id).await;
-    let idels = store_inline::scan_inline_idels(&tx, table_id).await;
+    let inline_deletes = store_inline::scan_inline_inline_deletes(&tx, table_id).await;
     tx.rollback();
     let chunks = chunks?;
-    let idels = idels?;
+    let inline_deletes = inline_deletes?;
 
-    let rows: Vec<InlineRow> = materialize_inline_rows(&chunks, &idels);
+    let rows: Vec<InlineRow> = materialize_inline_rows(&chunks, &inline_deletes);
     Ok(kind
         .select(&rows, snapshot, start)
         .into_iter()
@@ -117,6 +105,23 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
         .into_iter()
         .map(|(table_id, schema_version, _)| (table_id, schema_version))
         .collect())
+}
+
+/// Whether `table_id` has at least one recorded `inline/file_delete` record.
+/// DuckLake probes the inlined-delete table's existence via a catalog bind
+/// that must error until the first `inline/file_delete` is staged, so this reports
+/// the table missing (not merely unreferenced) until then.
+///
+/// # Errors
+///
+/// Returns an error if the underlying store scan fails or decodes
+/// corrupt bytes.
+#[doc(hidden)]
+pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -> Result<bool> {
+    let tx = catalog.begin_read_tx().await?;
+    let file_deletes = store_inline::scan_inline_file_deletes(&tx, table_id).await;
+    tx.rollback();
+    Ok(!file_deletes?.is_empty())
 }
 
 #[cfg(test)]
@@ -202,21 +207,21 @@ mod tests {
         txn.commit().await.unwrap();
 
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
-        let mut idel = StagedTransaction::begin(db_tx2);
-        idel.stage(RowOp::InlineIdel {
+        let mut inline_delete = StagedTransaction::begin(db_tx2);
+        inline_delete.stage(RowOp::InlineInlineDelete {
             table_id: 1,
             row_id: 1,
             end_snapshot: 2,
         });
-        idel.stage(RowOp::Insert {
+        inline_delete.stage(RowOp::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2),
         });
-        idel.stage(RowOp::Insert {
+        inline_delete.stage(RowOp::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2),
         });
-        idel.commit().await.unwrap();
+        inline_delete.commit().await.unwrap();
 
         let rows = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0)
             .await

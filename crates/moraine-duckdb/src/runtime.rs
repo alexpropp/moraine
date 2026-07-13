@@ -18,11 +18,9 @@ pub struct MoraineCatalogHandle {
     /// The cancellation seam [`moraine_interrupt`](crate::abi::moraine_interrupt)
     /// signals and read paths `select!` against.
     ///
-    /// One-shot [`tokio::sync::Notify`] permit: `notify_one` either wakes
-    /// an already-waiting read or stores one permit consumed by the next
-    /// `notified()` call; the signal is consumed by the read that
-    /// observes it and never carries over. Assumes at most one read in
-    /// flight per handle at a time.
+    /// One-shot [`tokio::sync::Notify`] permit: the signal is consumed by
+    /// the read that observes it and never carries over. Assumes at most
+    /// one read in flight per handle at a time.
     pub(crate) interrupt: tokio::sync::Notify,
 }
 

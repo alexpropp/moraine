@@ -81,7 +81,7 @@ and RFC 0009 notes the memory cost of holding them there — which is why
 ### Placement — re-keyed within the `inline` segment
 
 This RFC amends RFC 0005's flush step: where the base semantics delete
-flushed `inline/ins` chunks (and consumed `idel`/`fdel` records), the
+flushed `inline/insert` chunks (and consumed `idel`/`fdel` records), the
 archive re-keys them to a distinct **archive form within the `inline`
 subspace** — same commit batch, same atomicity, and a key shape the
 catalog read paths (live scan *and* time travel) never touch. Bulk row

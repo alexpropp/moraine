@@ -1,6 +1,7 @@
 #include "metadata_tables.hpp"
 
 #include "catalog.hpp"
+#include "inline_tables.hpp"
 #include "owned_array.hpp"
 
 namespace moraine_duckdb {
@@ -51,22 +52,12 @@ duckdb::Value TimestampTz(int64_t micros) {
 	return duckdb::Value::TIMESTAMPTZ(duckdb::timestamp_tz_t(micros));
 }
 
-// `ducklake_column.column_type` is read by DuckLake's own
-// `DuckLakeTypes::FromString` (pinned from the DuckLake source's
-// `common/ducklake_types.cpp`), which accepts only DuckLake's own lowercase
-// vocabulary ("int64", "float64", "timestamptz", ...) — a different naming
-// scheme than the DuckDB SQL type names moraine's own catalog stores in
-// this same field (`ColumnDef::column_type`, e.g. "BIGINT", "DOUBLE"; also
-// what `MapColumnType` above maps from for the standalone attach's
-// `DESCRIBE`). Discovered live: serving the stored string verbatim throws
-// `Invalid Input Error: Failed to parse DuckLake type - unsupported type
-// 'BIGINT'` the moment DuckLake resolves a table's columns. This
-// re-derives the `duckdb::LogicalType` via the same `MapColumnType` the
-// standalone attach already trusts, then names it DuckLake's way — one
-// translation point, not two independently-maintained type tables.
-// `DECIMAL`'s width/scale suffix isn't reproduced (DuckLake's own
-// `ToStringBaseType` returns the bare "decimal" for every precision this
-// slice never exercises live); every other supported type maps exactly.
+// `ducklake_column.column_type` must carry DuckLake's own lowercase type
+// vocabulary ("int64", "float64", "timestamptz", ...), not the DuckDB SQL
+// type names moraine stores in this field. Re-derives the
+// `duckdb::LogicalType` via `MapColumnType`, then names it DuckLake's way.
+// `DECIMAL`'s width/scale suffix is not reproduced (rendered as bare
+// "decimal"); every other supported type maps exactly.
 duckdb::Value DuckLakeColumnType(const char *sql_type) {
 	if (sql_type == nullptr) {
 		return duckdb::Value(duckdb::LogicalType::VARCHAR);
@@ -121,12 +112,9 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 	}
 }
 
-// column order for both tables matches
-// `CREATE TABLE ducklake_snapshot(snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)`
-// and `ducklake_snapshot_changes(snapshot_id, changes_made, author, commit_message, commit_extra_info)`,
-// pinned from `DuckLakeMetadataManager::InitializeDuckLake`. One dump call
-// (`moraine_dump_snapshots`) feeds both, since the store models them as one
-// merged record.
+// One dump call (`moraine_dump_snapshots`) feeds both ProvideSnapshots and
+// ProvideSnapshotChanges, since the store models them as one merged record;
+// each emits its columns in the declared order of its `ducklake_*` table.
 std::vector<std::vector<duckdb::Value>> ProvideSnapshots(MoraineCatalogHandle *handle) {
 	OwnedArray<MoraineSnapshotRow> rows(moraine_dump_snapshots_free);
 	MoraineError err{};
@@ -423,60 +411,31 @@ std::vector<std::vector<duckdb::Value>> ProvideSchemaVersions(MoraineCatalogHand
 	return result;
 }
 
-// Always-empty stand-in for a `ducklake_*` table covering a feature this
-// slice doesn't model in the store (tags, data inlining, column mapping,
-// macros, partitioning, sorting). None of these are optional at the SQL
-// level: `DuckLakeMetadataManager::BuildCatalogForSnapshot` — the query
-// DuckLake's own attach/snapshot-load always runs, discovered live against
-// the real extension, not guessed — correlated-subqueries and joins every
-// one of them unconditionally while resolving basic table/view/schema
-// info, so a *missing* table is a bind-time Catalog Error even though the
-// query would otherwise happily return zero rows for it. "Absent kinds are
-// absent tables" (the plan's stated rule) turned out to mean "absent
-// store-modeled row *data*", not "absent SQL table" — this is that
-// adaptation, recorded here rather than left implicit.
+// Always-empty stand-in for a `ducklake_*` table covering a feature the
+// store doesn't model (tags, data inlining, column mapping, macros,
+// partitioning, sorting). The table must still exist as a SQL table:
+// DuckLake's attach/snapshot-load query joins every one of them
+// unconditionally, so a missing table is a bind-time Catalog Error even
+// where the query would return zero rows for it.
 std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *) {
 	return {};
 }
 
-// `ducklake_metadata` has no store-modeled source of truth (it is
-// DuckLake's own bootstrap bookkeeping, not a store entity kind), so its
-// rows are fixed here rather than read through the dump ABI. Pinned from
-// DuckLakeInitializer::LoadExistingDuckLake (the exact keys read after the
-// exists-probe `SELECT NULL FROM ducklake_metadata LIMIT 1` succeeds):
-//
-//   - "version": compared against "1.0"; anything else triggers migration
-//     logic this slice never needs, or an error if migration is disallowed.
-//     Always "1.0" here, matching the schema shape actually served (every
-//     column DuckLake's v1.0 migrations add is already present).
-//   - "encrypted": "true"/"false", read unconditionally; always "false"
-//     (moraine has no encryption support this slice).
-//   - "data_path" is deliberately NOT served: LoadExistingDuckLake only
-//     acts on it when the row is present (loads/validates
-//     `options.data_path` against it), and moraine has no store-level
-//     source of truth for a lake-wide data path to serve faithfully.
-//     Omitting the row leaves the ATTACH statement's own DATA_PATH option
-//     as the sole authority, which is exactly the value the live proof's
-//     ATTACH already supplies.
-//   - "created_by" is never read back by DuckLake's own init path; included
-//     anyway since DuckLake writes it at bootstrap and it costs nothing to
-//     serve.
-//   - "data_inlining_row_limit": served as "0" to declare, catalog-wide,
-//     that this catalog does not inline row data (data inlining is
-//     unsupported this slice). Load-bearing for the write path:
-//     DuckLake's `WriteNewInlinedTables` gates its per-new-table
-//     `INSERT INTO ducklake_inlined_data_tables` on
-//     `DuckLakeCatalog::DataInliningRowLimit(...) != 0`, whose only input
-//     is this catalog config option (every global-scope
-//     `ducklake_metadata` row lands in `options.config_options` at
-//     attach — `DuckLakeInitializer::LoadExistingDuckLake`) with a
-//     default of **10**: inlining is ON by default, so without this row
-//     every `CREATE TABLE` tries to register an inlined-data table
-//     against a catalog that cannot store one (discovered live; pinned
-//     from the pinned DuckLake source's `DataInliningRowLimit` and
-//     `WriteNewInlinedTables`).
-// All rows are global (scope/scope_id NULL) — moraine has no schema/table-
-// scoped DuckLake settings to serve this slice.
+// `ducklake_metadata` has no store-modeled source of truth, so its rows are
+// fixed here rather than read through the dump ABI. Constraints on the
+// values DuckLake reads back:
+//   - "version": must be "1.0"; any other value triggers migration logic.
+//   - "encrypted": "false" (no encryption support).
+//   - "data_path" is deliberately omitted: DuckLake acts on it only when the
+//     row is present, and there is no store-level lake-wide data path to
+//     serve; omitting it leaves the ATTACH DATA_PATH option as sole authority.
+//   - "created_by": never read back; served because it costs nothing.
+//   - "data_inlining_row_limit": "10" (DuckLake's compiled default). Load-
+//     bearing: a non-zero value is what makes DuckLake's write path emit
+//     `INSERT INTO ducklake_inlined_data_tables`; "0" would suppress inlining
+//     entirely. inline_tables.cpp serves the dynamic inline catalog surface
+//     this drives.
+// All rows are global (scope/scope_id NULL).
 std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *) {
 	auto null_varchar = duckdb::Value(duckdb::LogicalType::VARCHAR);
 	auto null_bigint = duckdb::Value(duckdb::LogicalType::BIGINT);
@@ -484,19 +443,38 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *) 
 	    {Varchar("version"), Varchar("1.0"), null_varchar, null_bigint},
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
 	    {Varchar("encrypted"), Varchar("false"), null_varchar, null_bigint},
-	    {Varchar("data_inlining_row_limit"), Varchar("0"), null_varchar, null_bigint},
+	    {Varchar("data_inlining_row_limit"), Varchar("10"), null_varchar, null_bigint},
 	};
 }
 
-// Column shapes below are transcribed verbatim (name, type, declared
-// nullability) from `DuckLakeMetadataManager::InitializeDuckLake`'s
-// `CREATE TABLE {METADATA_CATALOG}.ducklake_*(...)` text, read from the
-// pinned DuckLake source (commit `d318a545571d7d46eb751fa2aa5f6f4389285d3c`).
-// `not_null` is set only for columns DuckLake itself declares `NOT NULL` or
-// `PRIMARY KEY` (which implies `NOT NULL`); every other column, including
-// ids DuckLake always populates in practice (e.g. `ducklake_table.table_id`,
-// which has no `PRIMARY KEY` in DuckLake's own schema), is left nullable to
-// match DuckLake's literal schema, not its runtime behavior.
+// Feeds `ducklake_inlined_data_tables`: one row per `(table_id,
+// schema_version)` with a recorded `inline/schema`. The table_name column
+// carries `InlinedDataTableName` (inline_tables.cpp), matching DuckLake's
+// own inline-table naming.
+std::vector<std::vector<duckdb::Value>> ProvideInlinedDataTables(MoraineCatalogHandle *handle) {
+	OwnedArray<MoraineInlineTableRow> rows(moraine_inline_registered_tables_free);
+	MoraineError err{};
+	auto code = moraine_inline_registered_tables(handle, rows.OutItems(), rows.OutLen(), &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.table_id),
+		    Varchar(InlinedDataTableName(r.table_id, r.schema_version).c_str()),
+		    Bigint(r.schema_version),
+		});
+	}
+	return result;
+}
+
+// Column shapes below match each `ducklake_*` table's own
+// `CREATE TABLE` shape (name, type, declared nullability). `not_null` is set
+// only for columns DuckLake declares `NOT NULL` or `PRIMARY KEY`; every
+// other column is left nullable to match DuckLake's literal schema, even ids
+// it always populates in practice.
 const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	static const std::vector<MetadataTableSpec> specs = {
 	    {
@@ -695,10 +673,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        /* delete key: data_file_id, table_id, column_id (decoder order) */ {0, 1, 2},
 	    },
 	    {
-	        // Shape pinned from DuckLake's migration path (`CREATE TABLE
-	        // {METADATA_CATALOG}.ducklake_schema_versions(begin_snapshot
-	        // BIGINT, schema_version BIGINT, table_id BIGINT)`), the
-	        // same three-column form v1.0 stores carry.
+	        // Three-column form: (begin_snapshot, schema_version, table_id).
 	        "ducklake_schema_versions",
 	        {
 	            {"begin_snapshot", "BIGINT", false},
@@ -708,10 +683,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        ProvideSchemaVersions,
 	        11,
 	    },
-	    // Always-empty stand-ins (see `ProvideEmpty`'s doc comment): columns
-	    // transcribed the same way as every table above, but no dump ABI
-	    // call backs them — the store models none of these kinds this
-	    // slice.
+	    // Always-empty stand-ins (see `ProvideEmpty`): no dump ABI call backs
+	    // them — the store models none of these kinds.
 	    {
 	        "ducklake_tag",
 	        {
@@ -742,7 +715,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"table_name", "VARCHAR", false},
 	            {"schema_version", "BIGINT", false},
 	        },
-	        ProvideEmpty,
+	        ProvideInlinedDataTables,
+	        kVoidInsertable,
 	    },
 	    {
 	        "ducklake_macro",
@@ -801,6 +775,65 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        ProvideEmpty,
 	    },
 	    {
+	        "ducklake_file_partition_value",
+	        {
+	            {"data_file_id", "BIGINT", false},
+	            {"table_id", "BIGINT", false},
+	            {"partition_key_index", "BIGINT", false},
+	            {"partition_value", "VARCHAR", false},
+	        },
+	        ProvideEmpty,
+	    },
+	    {
+	        "ducklake_file_variant_stats",
+	        {
+	            {"data_file_id", "BIGINT", false},
+	            {"table_id", "BIGINT", false},
+	            {"column_id", "BIGINT", false},
+	            {"variant_path", "VARCHAR", false},
+	            {"shredded_type", "VARCHAR", false},
+	            {"column_size_bytes", "BIGINT", false},
+	            {"value_count", "BIGINT", false},
+	            {"null_count", "BIGINT", false},
+	            {"min_value", "VARCHAR", false},
+	            {"max_value", "VARCHAR", false},
+	            {"contains_nan", "BOOLEAN", false},
+	            {"extra_stats", "VARCHAR", false},
+	        },
+	        ProvideEmpty,
+	    },
+	    {
+	        "ducklake_files_scheduled_for_deletion",
+	        {
+	            {"data_file_id", "BIGINT", false},
+	            {"path", "VARCHAR", false},
+	            {"path_is_relative", "BOOLEAN", false},
+	            {"schedule_start", "TIMESTAMPTZ", false},
+	        },
+	        ProvideEmpty,
+	    },
+	    {
+	        "ducklake_column_mapping",
+	        {
+	            {"mapping_id", "BIGINT", false},
+	            {"table_id", "BIGINT", false},
+	            {"type", "VARCHAR", false},
+	        },
+	        ProvideEmpty,
+	    },
+	    {
+	        "ducklake_name_mapping",
+	        {
+	            {"mapping_id", "BIGINT", false},
+	            {"column_id", "BIGINT", false},
+	            {"source_name", "VARCHAR", false},
+	            {"target_field_id", "BIGINT", false},
+	            {"parent_column", "BIGINT", false},
+	            {"is_partition", "BOOLEAN", false},
+	        },
+	        ProvideEmpty,
+	    },
+	    {
 	        "ducklake_sort_info",
 	        {
 	            {"sort_id", "BIGINT", false},
@@ -837,32 +870,6 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	return specs;
 }
 
-// Bind data for a metadata table scan: every row, already materialized
-// (these tables are metadata-sized, not data-sized, so eager materialization
-// at bind time — unlike the streaming Parquet scan in scan.cpp — is the
-// simplest correct approach).
-struct MetadataScanBindData : public duckdb::FunctionData {
-	std::vector<std::vector<duckdb::Value>> rows;
-	// The synthesized entry this scan reads, exposed through the table
-	// function's `get_bind_info` so `LogicalGet::GetTable()` resolves it —
-	// the binder's UPDATE/DELETE paths require a resolvable base table
-	// ("Can only update base table" otherwise; discovered live driving
-	// DuckLake's own metadata UPDATE, exactly how postgres_scanner's scan
-	// exposes its entries).
-	duckdb::optional_ptr<duckdb::TableCatalogEntry> table_entry;
-
-	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-		auto result = duckdb::make_uniq<MetadataScanBindData>();
-		result->rows = rows;
-		result->table_entry = table_entry;
-		return std::move(result);
-	}
-	bool Equals(const duckdb::FunctionData &other_p) const override {
-		auto &other = other_p.Cast<MetadataScanBindData>();
-		return rows == other.rows && table_entry.get() == other.table_entry.get();
-	}
-};
-
 duckdb::BindInfo MetadataScanBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
 	auto &data = bind_data->Cast<MetadataScanBindData>();
 	duckdb::BindInfo info(duckdb::ScanType::TABLE);
@@ -872,14 +879,10 @@ duckdb::BindInfo MetadataScanBindInfo(const duckdb::optional_ptr<duckdb::Functio
 
 struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	duckdb::idx_t offset = 0;
-	// The columns DuckDB actually asked for, by index into a materialized
-	// row, in output order. Empty for a zero-column "virtual column" probe
-	// (e.g. `ducklake_metadata`'s own exists-probe, `SELECT NULL FROM
-	// ducklake_metadata LIMIT 1`) — DuckDB only takes that plan shape when
-	// the table function advertises `projection_pushdown = true`; without
-	// it, DuckDB throws "Virtual columns require projection pushdown"
-	// before this scan is ever reached (discovered live against the real
-	// probe query — see the report).
+	// The columns DuckDB asked for, by index into a materialized row, in
+	// output order. Empty for a zero-column "virtual column" probe (e.g.
+	// `SELECT NULL FROM ducklake_metadata LIMIT 1`), which DuckDB emits only
+	// when the table function advertises `projection_pushdown = true`.
 	std::vector<duckdb::column_t> column_ids;
 
 	idx_t MaxThreads() const override {
@@ -907,24 +910,20 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 		for (duckdb::idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
 			auto col_id = state.column_ids[out_col];
 			if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-				// The rowid virtual column (the base TableCatalogEntry's
-				// default row identity, which UPDATE/DELETE plans project to
-				// address rows) is the row's index in this scan's
-				// materialized row set: the provider's output order is
-				// deterministic for a fixed committed head (the dump ABI
-				// scans the store in key order), so the staged-write Sink
-				// (staged_write.cpp) can re-materialize the same provider
-				// and resolve this index back to the row's key cells.
+				// The rowid is the row's index in this scan's materialized
+				// row set. The provider's output order is deterministic for a
+				// fixed committed head, so the staged-write Sink
+				// (staged_write.cpp) resolves this index back to the row by
+				// re-materializing the same provider.
 				output.SetValue(out_col, out_row,
 				                duckdb::Value::BIGINT(static_cast<int64_t>(state.offset + out_row)));
 				continue;
 			}
 			if (duckdb::IsVirtualColumn(col_id) || col_id >= row.size()) {
-				// Any other virtual column has no synthesized value; an
-				// out-of-range id would be a DuckDB/shim mismatch. Both
-				// serve an untyped NULL rather than read out of bounds —
-				// `Vector::SetValue` handles a null `Value` regardless of
-				// its own (absent) type, unlike a mismatched non-null one.
+				// Any other virtual column has no synthesized value, and an
+				// out-of-range id would be a DuckDB/shim mismatch. Serve an
+				// untyped NULL rather than read out of bounds:
+				// `Vector::SetValue` accepts a null `Value` of any type.
 				output.SetValue(out_col, out_row, duckdb::Value());
 				continue;
 			}
@@ -935,26 +934,34 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 	output.SetCardinality(count);
 }
 
+} // namespace
+
+duckdb::unique_ptr<duckdb::FunctionData> MetadataScanBindData::Copy() const {
+	auto result = duckdb::make_uniq<MetadataScanBindData>();
+	result->rows = rows;
+	result->table_entry = table_entry;
+	return std::move(result);
+}
+
+bool MetadataScanBindData::Equals(const duckdb::FunctionData &other_p) const {
+	auto &other = other_p.Cast<MetadataScanBindData>();
+	return rows == other.rows && table_entry.get() == other.table_entry.get();
+}
+
 duckdb::TableFunction MetadataScanTableFunction() {
-	// No `bind` callback, same reasoning as `MoraineScanFunction` (scan.cpp):
-	// `MoraineMetadataTableEntry::GetScanFunction` already produces complete
-	// bind data itself.
+	// No `bind` callback (as in `MoraineScanFunction`, scan.cpp): the caller
+	// already produces complete bind data itself.
 	duckdb::TableFunction function("moraine_metadata_scan", {}, MetadataScanFunctionImpl, nullptr,
 	                               MetadataScanInitGlobal, nullptr);
-	// Required for DuckDB's zero-real-column "virtual column" scan shape,
-	// which the exists-probe query actually uses (see
-	// `MetadataScanGlobalState::column_ids`'s doc). Real projection
-	// pushdown (serving only `state.column_ids`' columns instead of every
-	// materialized column) falls out of the same mechanism for free.
+	// Required for the zero-real-column "virtual column" scan shape the
+	// exists-probe query uses (see `MetadataScanGlobalState::column_ids`);
+	// real projection pushdown falls out of the same mechanism.
 	function.projection_pushdown = true;
-	// Resolves `LogicalGet::GetTable()` (see `MetadataScanBindData::
-	// table_entry`'s doc) so UPDATE/DELETE statements bind against these
-	// tables.
+	// Resolves `LogicalGet::GetTable()` so UPDATE/DELETE statements bind
+	// against these tables.
 	function.get_bind_info = MetadataScanBindInfo;
 	return function;
 }
-
-} // namespace
 
 const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs() {
 	return MetadataTableSpecsImpl();

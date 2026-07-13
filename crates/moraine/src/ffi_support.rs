@@ -1,28 +1,17 @@
 //! Internal, unstable seam for the `moraine-duckdb` ABI crate.
 //!
-//! `#[doc(hidden)]` despite the `pub` visibility: this module exists only
-//! so an external crate in the same workspace can reach store-shaped wire
-//! values without `catalog`/`store` growing DuckLake-shaped public
-//! surface of their own. It is not part of the crate's semver contract —
-//! shape and presence may change without notice — and every item is
-//! documented as such.
+//! `#[doc(hidden)]` despite the `pub` visibility: not part of the crate's
+//! semver contract — shape and presence may change without notice.
 //!
-//! Each `dump_*` function returns every record of one kind the store
-//! models, **cur and hist together**, as the wire value type that kind
-//! encodes to (`crate::store::proto`) — row-faithful, unfiltered,
-//! unversioned kinds naturally yielding only their (single, current) row
-//! since they are never mirrored to hist. This is what a DuckLake
-//! `ducklake_*` metadata table scan needs: DuckLake itself filters
-//! lifecycles in SQL.
+//! Each `dump_*` function returns every record of one kind, cur and hist
+//! together, as the wire value type that kind encodes to
+//! (`crate::store::proto`) — row-faithful and unfiltered; unversioned
+//! kinds yield only their single current row since they are never mirrored
+//! to hist. DuckLake filters lifecycles in SQL over these rows.
 //!
 //! Every function opens one fresh read-only transaction, scans, and rolls
-//! back — the same one-shot pattern `transaction::commit::materialize`
-//! uses for an ordinary snapshot read. A snapshot-consistent view spanning several
-//! `dump_*` calls (so two dumped tables agree on the same head) is not
-//! provided here; nothing in this slice's DuckLake read path needs it,
-//! since each dump call reads at whatever the current head is when it
-//! runs. Wiring one is a concern for whichever later task first needs
-//! atomic multi-table consistency.
+//! back. Views spanning several `dump_*` calls are not snapshot-consistent:
+//! each call reads at whatever the current head is when it runs.
 
 use crate::{
     catalog::Catalog,
@@ -162,9 +151,8 @@ pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
 }
 
 /// One `ducklake_schema_versions` row: `(begin_snapshot, schema_version,
-/// table_id)`, flattened from the snap record it folds into (the first
-/// two values are the snapshot's own — see the wire schema's
-/// `schema_changed_table_ids` doc).
+/// table_id)`, flattened from a snapshot record; the first two values are
+/// the snapshot's own.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaVersionRow {

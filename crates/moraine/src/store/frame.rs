@@ -1,11 +1,6 @@
-//! Value framing
-//!
-//! Every stored value begins with a 4-byte magic and a 1-byte
-//! encoding version, then the payload. The magic makes a corrupt,
-//! truncated, or wrong-kind value fail loudly as [`Error::Corruption`];
-//! the version byte is an in-band migration signal distinct from
-//! `sys/format` — a reader that meets a newer encoding version than it
-//! understands errors rather than misreads.
+//! Value framing: every stored value begins with a 4-byte magic and a
+//! 1-byte encoding version, then the payload. A wrong magic or a version
+//! newer than this reader supports fails as [`Error::Corruption`].
 
 use crate::error::{Error, Result};
 
@@ -18,9 +13,8 @@ pub(crate) const ENCODING_VERSION: u8 = 0;
 /// Total header length: magic + version byte.
 pub(crate) const HEADER_LEN: usize = MAGIC.len() + 1;
 
-/// A buffer holding just the framing header, with capacity reserved for a
-/// payload of `payload_len` — append the payload directly to avoid an
-/// intermediate copy.
+/// A buffer holding the framing header, with capacity reserved for a
+/// `payload_len`-byte payload to append directly.
 pub(crate) fn header_buf(payload_len: usize) -> Vec<u8> {
     let mut framed = Vec::with_capacity(HEADER_LEN + payload_len);
     framed.extend_from_slice(&MAGIC);
@@ -28,11 +22,8 @@ pub(crate) fn header_buf(payload_len: usize) -> Vec<u8> {
     framed
 }
 
-/// Prepend the framing header to a payload.
-///
-/// Test-only: production code builds framed buffers through
-/// [`header_buf`] to encode a message directly without a payload copy;
-/// this whole-buffer form only serves fixture construction in tests.
+/// Prepend the framing header to a payload. Test-only fixture helper;
+/// production code frames through [`header_buf`].
 #[cfg(test)]
 pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
     let mut framed = header_buf(payload.len());

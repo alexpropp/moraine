@@ -1,0 +1,19 @@
+# Workspace-root clangd config (editor-only; the cargo build ignores it).
+#
+# moraine-duckdb's build.rs fetches DuckDB's C++ headers into
+# target/duckdb-src/<pin>/. clangd background-indexes that tree and parses
+# each header standalone with no include path (DuckDB's own vendored .clangd
+# there points CompilationDatabase at a .cache/clangd dir absent in this
+# layout), producing hundreds of spurious errors for third-party code no one
+# edits. This fragment applies only to files under target/ and silences them:
+# Suppress hides every diagnostic, and -ferror-limit=0 stops clang emitting
+# the one "too many errors" banner that Suppress cannot reach.
+#
+# PathMatch is a regex against the path relative to this file's directory, so
+# it has no leading slash — `(.*/)?target/.*`, not `.*/target/.*`.
+If:
+  PathMatch: (.*/)?target/.*
+CompileFlags:
+  Add: [-ferror-limit=0]
+Diagnostics:
+  Suppress: '*'

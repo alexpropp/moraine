@@ -4,17 +4,12 @@
 //! `moraine_inline_schemas`/`moraine_inline_registered_tables` serve the
 //! per-table Arrow schema and the `ducklake_inlined_data_tables`
 //! projection. Same conventions as [`crate::dumps`]: `catch_unwind`/null
-//! discipline via [`guard`](crate::abi), owned-first, one `_free`
-//! per array. Write-side staging lives in [`crate::staged`] (extends the
-//! staged-txn handle).
+//! discipline via [`guard`](crate::abi), owned-first, one `_free` per
+//! array. Write-side staging lives in [`crate::staged`].
 //!
-//! `chunk_body` ownership: each returned [`MoraineInlineRow`] owns an
-//! independent copy of its chunk's full Arrow IPC body — rows sharing one
-//! chunk each carry their own copy rather than a shared reference, so
-//! every row frees independently with no cross-element lifetime coupling
-//! (the same independent-ownership shape every other dump array already
-//! has). Inlining is for small data by design, so the duplication this
-//! trades for a simpler ownership story is bounded.
+//! Each returned [`MoraineInlineRow`] owns an independent copy of its
+//! chunk's full Arrow IPC body, so every row frees independently with no
+//! cross-element lifetime coupling.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -37,8 +32,7 @@ fn decode_scan_kind(v: i32) -> Result<InlineScanKind, AbiError> {
 }
 
 /// Hands a `Vec<u8>` to C as an owned heap buffer: `(ptr, len)`, freed via
-/// [`free_owned_bytes`]. Infallible (unlike a `CString` conversion), so no
-/// owned-first staging is needed before minting the pointer.
+/// [`free_owned_bytes`].
 fn into_owned_bytes(bytes: Vec<u8>) -> (*mut u8, usize) {
     let boxed = bytes.into_boxed_slice();
     let len = boxed.len();
@@ -60,9 +54,8 @@ unsafe fn free_owned_bytes(ptr: *mut u8, len: usize) {
 }
 
 /// One inlined row, as returned by [`moraine_inline_scan`]. `chunk_body`
-/// is the owning chunk's full Arrow IPC record-batch body (see the module
-/// doc for the ownership choice); the shim decodes it and reads the row
-/// at `offset_in_chunk`.
+/// is the owning chunk's full Arrow IPC record-batch body; the shim decodes
+/// it and reads the row at `offset_in_chunk`.
 #[repr(C)]
 pub struct MoraineInlineRow {
     /// The row's dense id.
@@ -342,6 +335,54 @@ pub unsafe extern "C" fn moraine_inline_registered_tables_free(
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// Reports whether `table_id` has at least one recorded `inline/file_delete`
+/// record, via `*out_exists`. The shim's catalog lookup for
+/// `ducklake_inlined_delete_<table_id>` uses this to decide whether the
+/// table exists at all, so a probe against a table that never had one must
+/// surface a bind-time catalog error.
+///
+/// # Safety
+///
+/// Same pointer contract as [`moraine_inline_scan`], with `out_exists` in
+/// place of `out_items`/`out_len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_inline_file_delete_table_exists(
+    handle: *mut MoraineCatalogHandle,
+    table_id: u64,
+    out_exists: *mut bool,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<bool, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_exists.is_null() {
+            return Err(AbiError::invalid_argument("`out_exists` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        handle_ref
+            .runtime
+            .block_on(
+                moraine::ffi_support::inline::inline_file_delete_table_exists(
+                    &handle_ref.catalog,
+                    table_id,
+                ),
+            )
+            .map_err(AbiError::from)
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(exists) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { *out_exists = exists };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
@@ -351,7 +392,7 @@ mod tests {
     use crate::abi::{moraine_attach, moraine_detach};
     use crate::staged::{
         MoraineCell, MoraineTxnHandle, moraine_txn_begin, moraine_txn_commit, moraine_txn_stage,
-        moraine_txn_stage_inline_flush_delete, moraine_txn_stage_inline_idel,
+        moraine_txn_stage_inline_flush_delete, moraine_txn_stage_inline_inline_delete,
         moraine_txn_stage_inline_insert, moraine_txn_stage_inline_schema,
     };
 
@@ -519,12 +560,12 @@ mod tests {
     /// `moraine_inline_scan` (`Table`) returns the row with the right
     /// `row_id`/`begin_snapshot`/body, and `moraine_inline_schemas`/
     /// `moraine_inline_registered_tables` see the schema. Staging an
-    /// `inline/idel` then makes the row disappear from a `Table` scan at
+    /// `inline/inline_delete` then makes the row disappear from a `Table` scan at
     /// or after its `end_snapshot`. Staging a flush-delete then empties
     /// the scan and drops the table from the registered-tables list.
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn stage_scan_idel_and_flush_delete_over_the_abi() {
+    fn stage_scan_inline_delete_and_flush_delete_over_the_abi() {
         let dir = TempDir::new("scan");
         let handle = attach_ok(&dir);
 
@@ -650,14 +691,22 @@ mod tests {
 
         // Tombstone row 0; a `Table` scan at snapshot 2 must no longer
         // return it.
-        let idel_txn = begin(handle);
-        let mut idel_err = MoraineError::default();
-        // SAFETY: `idel_txn` is live; outputs are valid local slots.
-        let code = unsafe { moraine_txn_stage_inline_idel(idel_txn, 1, 0, 2, &raw mut idel_err) };
+        let inline_delete_txn = begin(handle);
+        let mut inline_delete_err = MoraineError::default();
+        // SAFETY: `inline_delete_txn` is live; outputs are valid local slots.
+        let code = unsafe {
+            moraine_txn_stage_inline_inline_delete(
+                inline_delete_txn,
+                1,
+                0,
+                2,
+                &raw mut inline_delete_err,
+            )
+        };
         assert_eq!(code, codes::OK);
-        let mut idel_arena = StrArena::new();
-        stage_snapshot(idel_txn, &mut idel_arena, 2);
-        commit(idel_txn);
+        let mut inline_delete_arena = StrArena::new();
+        stage_snapshot(inline_delete_txn, &mut inline_delete_arena, 2);
+        commit(inline_delete_txn);
 
         let mut rows2: *mut MoraineInlineRow = ptr::null_mut();
         let mut len2: usize = 0;
@@ -685,7 +734,7 @@ mod tests {
         unsafe { moraine_inline_scan_free(rows2, len2) };
 
         // Flush: every chunk begun at or before snapshot 2 is removed,
-        // along with its consumed idel.
+        // along with its consumed inline delete.
         let flush_txn = begin(handle);
         let mut flush_err = MoraineError::default();
         // SAFETY: `flush_txn` is live; outputs are valid local slots.
@@ -757,6 +806,7 @@ mod tests {
             "moraine_inline_schemas_free",
             "moraine_inline_registered_tables",
             "moraine_inline_registered_tables_free",
+            "moraine_inline_file_delete_table_exists",
             "MoraineInlineRow",
             "MoraineInlineSchemaRow",
             "MoraineInlineTableRow",

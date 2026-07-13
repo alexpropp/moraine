@@ -1,4 +1,5 @@
 -xc++
 -std=c++17
 -I../../target/duckdb-src/v1.5.4/src/include
+-Ivendor/nanoarrow/include
 -Icpp

@@ -1,5 +1,6 @@
 #include "catalog.hpp"
 
+#include "inline_tables.hpp"
 #include "metadata_tables.hpp"
 #include "owned_array.hpp"
 #include "scan.hpp"
@@ -76,13 +77,8 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 		throw duckdb::NotImplementedException("moraine: unsupported DuckLake column type \"%s\"", ducklake_type);
 	}
 
-	// Two vocabularies resolve here, because the store carries
-	// `column_type` row-faithfully in whichever form its author wrote:
-	// DuckDB SQL type names (moraine's own verb path, e.g. "BIGINT") and
-	// DuckLake's own lowercase names (rows DuckLake authors over the
-	// staged-row path, e.g. "int64" — its `DuckLakeTypes::ToString`
-	// vocabulary, uppercased with everything else by the normalization
-	// above). One mapper for both keeps the translation single-sourced;
+	// Accepts two vocabularies: DuckDB SQL type names (e.g. "BIGINT") and
+	// DuckLake's own lowercase names (e.g. "int64", uppercased above).
 	// `DuckLakeColumnType` (metadata_tables.cpp) is its inverse.
 	if (upper == "BIGINT" || upper == "INT64") {
 		return duckdb::LogicalType::BIGINT;
@@ -164,9 +160,8 @@ MoraineViewEntry::MoraineViewEntry(duckdb::Catalog &catalog, duckdb::SchemaCatal
 }
 
 const duckdb::SelectStatement &MoraineViewEntry::GetQuery() {
-	// `query` is always null (view definitions are never parsed yet); the
-	// base implementation dereferences it, so this throws instead of
-	// crashing.
+	// `query` is always null (view definitions are never parsed yet); throw
+	// rather than let the base implementation dereference it.
 	throw duckdb::NotImplementedException("moraine: querying a view's definition is not supported yet");
 }
 
@@ -175,9 +170,8 @@ void MoraineViewEntry::BindView(duckdb::ClientContext &context, duckdb::BindView
 }
 
 std::string MoraineViewEntry::ToSQL() const {
-	// The base implementation stringifies the parsed `query`, which is null
-	// here (view definitions are never parsed yet); compose the definition
-	// textually from the listing ABI's strings instead.
+	// `query` is null (view definitions are never parsed yet); compose the
+	// definition textually from the listing ABI's strings instead.
 	std::string result = "CREATE VIEW ";
 	result += duckdb::KeywordHelper::WriteOptionallyQuoted(name);
 	result += " AS ";
@@ -229,13 +223,9 @@ void MoraineSchemaEntry::EnsureTablesLoaded() {
 	}
 
 	if (duckdb::StringUtil::CIEquals(name, "main")) {
-		// DuckLake's metadata connection queries every `ducklake_*` table
-		// from its default schema (verified against the pinned DuckLake
-		// source: `DuckLakeTransaction::GetDefaultSchemaName` reads the
-		// attached catalog's own `GetDefaultSchema()`, DuckDB's base
-		// `Catalog` default of "main" — MoraineCatalog never overrides it).
-		// A same-named real table (unlikely; not a supported store schema)
-		// wins over the synthesized one via `emplace`'s no-overwrite rule.
+		// DuckLake's metadata connection queries every `ducklake_*` table from
+		// the default schema, which is "main". A same-named real table wins
+		// over the synthesized one via `emplace`'s no-overwrite rule.
 		auto &moraine_catalog = ParentCatalog().Cast<MoraineCatalog>();
 		PopulateMetadataTables(catalog, *this, moraine_catalog.Handle(), tables_);
 	}
@@ -306,6 +296,21 @@ MoraineSchemaEntry::LookupEntry(duckdb::CatalogTransaction transaction, const du
 		if (view_it != views_.end()) {
 			return view_it->second.get();
 		}
+		// Neither a fixed nor a previously-resolved dynamic entry: try the
+		// two inline name families (only ever driven against the metadata
+		// connection's default schema, matching PopulateMetadataTables).
+		// Cached into `tables_` on success so a repeat lookup within this
+		// transaction is free.
+		if (duckdb::StringUtil::CIEquals(this->name, "main") && transaction.context) {
+			auto &moraine_catalog = ParentCatalog().Cast<MoraineCatalog>();
+			auto inline_entry =
+			    LookupInlineTableEntry(*transaction.context, catalog, *this, moraine_catalog.Handle(), name);
+			if (inline_entry) {
+				auto *entry_ptr = inline_entry.get();
+				tables_.emplace(name, std::move(inline_entry));
+				return entry_ptr;
+			}
+		}
 	} else if (type == duckdb::CatalogType::VIEW_ENTRY) {
 		EnsureViewsLoaded();
 		auto it = views_.find(name);
@@ -329,6 +334,47 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateFunction(du
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckdb::CatalogTransaction transaction,
                                                                           duckdb::BoundCreateTableInfo &info) {
+	auto &table_name = info.Base().table;
+	auto &moraine_catalog = ParentCatalog().Cast<MoraineCatalog>();
+
+	if (auto parsed = ParseInlinedDataTableName(table_name)) {
+		if (!transaction.transaction) {
+			throw duckdb::InternalException("moraine: CREATE TABLE without an active transaction");
+		}
+		if (!transaction.context) {
+			throw duckdb::InternalException("moraine: CREATE TABLE without a client context");
+		}
+		auto &moraine_txn = transaction.transaction->Cast<MoraineTransaction>();
+		auto entry = CreateInlineDataTable(*transaction.context, catalog, *this, moraine_catalog.Handle(),
+		                                   moraine_txn.StagedTxn(), info, parsed->table_id, parsed->schema_version);
+		if (!entry) {
+			// IF NOT EXISTS against an already-registered schema version.
+			return nullptr;
+		}
+		auto *entry_ptr = entry.get();
+		tables_.emplace(table_name, std::move(entry));
+		return entry_ptr;
+	}
+
+	if (auto delete_table_id = ParseInlinedDeleteTableName(table_name)) {
+		// Fixed shape, no store-side schema to stage — existence follows from
+		// the first `inline/fdel` staged against it (see inline_tables.hpp),
+		// so CREATE only builds and caches the entry for the rest of this
+		// transaction. The find below is a defensive re-check; DuckLake
+		// de-duplicates its own CREATE-per-batch.
+		auto found = tables_.find(table_name);
+		if (found != tables_.end()) {
+			if (info.Base().on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT) {
+				return nullptr;
+			}
+			throw duckdb::CatalogException("moraine: \"%s\" already exists", table_name);
+		}
+		auto entry = MakeInlineDeleteTableEntry(catalog, *this, moraine_catalog.Handle(), *delete_table_id);
+		auto *entry_ptr = entry.get();
+		tables_.emplace(table_name, std::move(entry));
+		return entry_ptr;
+	}
+
 	throw duckdb::NotImplementedException("moraine: creating a table is not supported (read-only catalog)");
 }
 
@@ -370,6 +416,25 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateType(duckdb
 }
 
 void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropInfo &info) {
+	// The flush cleanup's `DROP TABLE ducklake_inlined_data_<t>_<v>` is the
+	// only DROP reaching here: deregister just this schema version, leaving
+	// other schema versions' inline/* records untouched. The whole-table
+	// cascade (`moraine_txn_stage_inline_drop`) runs on the DuckLake attach's
+	// own catalog, not this metadata connection's schema.
+	if (info.type == duckdb::CatalogType::TABLE_ENTRY) {
+		if (auto parsed = ParseInlinedDataTableName(info.name)) {
+			auto catalog_transaction = catalog.GetCatalogTransaction(context);
+			auto &moraine_txn = catalog_transaction.transaction->Cast<MoraineTransaction>();
+			MoraineError err{};
+			auto code = moraine_txn_stage_inline_schema_drop(moraine_txn.StagedTxn(), parsed->table_id,
+			                                                 parsed->schema_version, &err);
+			if (code != MORAINE_OK) {
+				ThrowMoraineError(err);
+			}
+			tables_.erase(info.name);
+			return;
+		}
+	}
 	throw duckdb::NotImplementedException("moraine: dropping an entry is not supported (read-only catalog)");
 }
 
@@ -469,13 +534,24 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanCreateTableAs(duckdb::ClientContex
 duckdb::PhysicalOperator &MoraineCatalog::PlanInsert(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &planner,
                                                      duckdb::LogicalInsert &op,
                                                      duckdb::optional_ptr<duckdb::PhysicalOperator> plan) {
-	// Only a writable ducklake_* metadata table (a MoraineMetadataTableEntry
-	// whose spec names a moraine_txn_stage table_kind) accepts INSERT; every
-	// other table — the standalone attach's real user-data tables, and the
-	// always-empty/ducklake_metadata stand-ins this slice doesn't model
-	// writes for — stays a read-only catalog, matching the extension
-	// surface's "translate staged ducklake_* rows, author nothing else"
-	// scope.
+	// A writable ducklake_* metadata table (a MoraineMetadataTableEntry
+	// whose spec names a moraine_txn_stage table_kind) or either dynamic
+	// inline-table family accepts INSERT; every other table stays
+	// read-only.
+	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {
+		auto &insert_op = PlanInlineDataInsert(planner, op, *inline_data_table);
+		if (plan) {
+			insert_op.children.push_back(*plan);
+		}
+		return insert_op;
+	}
+	if (auto *inline_delete_table = dynamic_cast<MoraineInlineDeleteTableEntry *>(&op.table)) {
+		auto &insert_op = PlanInlineDeleteInsert(planner, op, *inline_delete_table);
+		if (plan) {
+			insert_op.children.push_back(*plan);
+		}
+		return insert_op;
+	}
 	auto *metadata_table = dynamic_cast<MoraineMetadataTableEntry *>(&op.table);
 	if (metadata_table == nullptr) {
 		throw duckdb::NotImplementedException("moraine: INSERT is not supported on \"%s\" (read-only catalog)",
@@ -495,8 +571,13 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanInsert(duckdb::ClientContext &, du
 duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &planner,
                                                      duckdb::LogicalDelete &op, duckdb::PhysicalOperator &plan) {
 	// Same target discipline as PlanInsert; which DELETE forms translate
-	// (only the unversioned statistics kinds) is decided in
-	// PlanMetadataDelete — see staged_write.hpp's layout notes.
+	// (only the unversioned statistics kinds, or the inline-data table's
+	// flush cleanup) is decided in PlanMetadataDelete/PlanInlineDataDelete.
+	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {
+		auto &delete_op = PlanInlineDataDelete(planner, op, *inline_data_table);
+		delete_op.children.push_back(plan);
+		return delete_op;
+	}
 	auto *metadata_table = dynamic_cast<MoraineMetadataTableEntry *>(&op.table);
 	if (metadata_table == nullptr || metadata_table->Spec().write_table_kind == kNotWritable) {
 		throw duckdb::NotImplementedException("moraine: DELETE is not supported on \"%s\"", op.table.name);
@@ -508,14 +589,17 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, du
 
 duckdb::PhysicalOperator &MoraineCatalog::PlanUpdate(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &planner,
                                                      duckdb::LogicalUpdate &op, duckdb::PhysicalOperator &plan) {
-	// Same target discipline as PlanInsert, but — unlike Insert/Delete —
-	// does not reject a `kNotWritable` target outright: DuckLake's own
-	// DROP/RENAME batch unconditionally issues `SET end_snapshot` against
-	// tables this slice never models as store entities (always empty), and
-	// PlanMetadataUpdate translates exactly that shape as a sound no-op
-	// (see MoraineMetadataVoidUpdate's doc comment in staged_write.cpp).
-	// Every other UPDATE shape against a `kNotWritable` table still throws,
-	// from within PlanMetadataUpdate itself.
+	// Same target discipline as PlanInsert, but does not reject a
+	// `kNotWritable` target outright: DuckLake's DROP/RENAME batch issues `SET
+	// end_snapshot` against unmodeled (always-empty) tables, which
+	// PlanMetadataUpdate translates as a no-op. Every other UPDATE shape
+	// against a `kNotWritable` table still throws, from within
+	// PlanMetadataUpdate itself.
+	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {
+		auto &update_op = PlanInlineDataUpdate(planner, op, *inline_data_table);
+		update_op.children.push_back(plan);
+		return update_op;
+	}
 	auto *metadata_table = dynamic_cast<MoraineMetadataTableEntry *>(&op.table);
 	if (metadata_table == nullptr) {
 		throw duckdb::NotImplementedException("moraine: UPDATE is not supported on \"%s\"", op.table.name);

@@ -1,10 +1,9 @@
 //! Generated protobuf value messages (see `proto/moraine.proto` and
 //! `build.rs`). One message type per key kind.
 
-// dead_code: this generates the full set of `ducklake_*` value messages;
-// several (table/column stats, options, the inline family) are only
-// exercised by the codec's proptest roundtrips until the catalog features
-// that write them land.
+// dead_code: generates the full set of `ducklake_*` value messages; several
+// are only exercised by the codec's proptest roundtrips until the catalog
+// features that write them land.
 #[allow(
     missing_docs,
     clippy::pedantic,

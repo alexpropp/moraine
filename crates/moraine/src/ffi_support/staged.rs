@@ -2,9 +2,8 @@
 //! instead of `moraine`'s own verb API. Re-exports `transaction::staged`'s
 //! types (`transaction` is otherwise private to the crate) and adds the
 //! one entry point that needs a [`Catalog`]: opening the underlying
-//! transaction. `#[doc(hidden)]` for the same reason as every other item
-//! in [`crate::ffi_support`] — an unstable seam for the `moraine-duckdb`
-//! crate, not semver surface.
+//! transaction. `#[doc(hidden)]`, unstable, as with all of
+//! [`crate::ffi_support`].
 
 use crate::{catalog::Catalog, error::Result};
 

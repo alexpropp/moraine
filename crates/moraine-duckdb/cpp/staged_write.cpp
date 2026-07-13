@@ -15,13 +15,11 @@ namespace moraine_duckdb {
 namespace {
 
 // Converts one scanned cell to a `MoraineCell`, appending any decoded
-// string into `string_storage`. `string_storage` must be reserved to at
-// least the row's full column count by the caller before the first call
-// for that row: `std::string::c_str()` pointers taken here are borrowed by
-// `moraine_txn_stage` for the duration of that one call, and a
-// `std::vector` reallocation on `push_back` would move every already-
-// constructed `std::string` (invalidating pointers taken from it) if
-// capacity were exceeded mid-row.
+// string into `string_storage`. The caller must reserve `string_storage` to
+// at least the row's full column count before the first call for that row:
+// the `std::string::c_str()` pointers taken here are borrowed by
+// `moraine_txn_stage`, and a `std::vector` reallocation on `push_back` would
+// invalidate any already-taken pointer.
 MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType &type,
                           std::vector<std::string> &string_storage) {
 	MoraineCell cell{};
@@ -49,19 +47,15 @@ MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType 
 	case duckdb::LogicalTypeId::VARCHAR:
 	case duckdb::LogicalTypeId::UUID:
 		// `Value::ToString()` renders a VARCHAR verbatim and a UUID in its
-		// canonical text form — exactly the string form moraine's own
-		// store already carries for both (see `decode_schema`'s
-		// `schema_uuid: c.string()?` and this shim's own `Uuid()` dump
-		// helper in metadata_tables.cpp), so one code path serves both
-		// column kinds.
+		// canonical text form — the string form the store carries for both,
+		// so one code path serves both column kinds.
 		cell.kind = 4;
 		string_storage.push_back(value.ToString());
 		cell.str_value = string_storage.back().c_str();
 		return cell;
 	default:
-		// Every `ducklake_*` column this shim declares (metadata_tables.cpp)
-		// uses one of the types above; a fifth type here means a spec/Sink
-		// mismatch, not a value this binary should try to guess at.
+		// Every `ducklake_*` column declared (metadata_tables.cpp) uses one
+		// of the types above; any other type here is a spec/Sink mismatch.
 		throw duckdb::NotImplementedException(
 		    "moraine: staged write hit an unsupported column type (%s) — spec/Sink type mismatch",
 		    type.ToString());
@@ -139,10 +133,9 @@ protected:
 public:
 	duckdb::SourceResultType GetDataInternal(duckdb::ExecutionContext &, duckdb::DataChunk &chunk,
 	                                         duckdb::OperatorSourceInput &) const override {
-		// `sink_state` is the same `MetadataDmlState` `Sink` populated —
-		// the base `PhysicalOperator` carries it from the sink phase into
-		// this later source phase, the same seam `PhysicalInsert` uses to
-		// report its own affected-row count.
+		// `sink_state` is the same `MetadataDmlState` `Sink` populated: the
+		// base `PhysicalOperator` carries it from the sink phase into this
+		// later source phase.
 		auto &state = sink_state->Cast<MetadataDmlState>();
 		if (state.emitted) {
 			chunk.SetCardinality(0);
@@ -189,6 +182,22 @@ public:
 			}
 			state.affected_count++;
 		}
+		return duckdb::SinkResultType::NEED_MORE_INPUT;
+	}
+};
+
+// `spec.write_table_kind == kVoidInsertable`: accepts every row (counts it
+// for the `Count` result DuckLake's own commit path expects) but stages
+// nothing — see `kVoidInsertable`'s doc (metadata_tables.hpp) for why the
+// row is redundant here, not unsupported.
+class MoraineMetadataVoidInsert : public MoraineMetadataDml {
+public:
+	using MoraineMetadataDml::MoraineMetadataDml;
+
+	duckdb::SinkResultType Sink(duckdb::ExecutionContext &, duckdb::DataChunk &chunk,
+	                            duckdb::OperatorSinkInput &input) const override {
+		auto &state = input.global_state.Cast<MetadataDmlState>();
+		state.affected_count += chunk.size();
 		return duckdb::SinkResultType::NEED_MORE_INPUT;
 	}
 };
@@ -315,20 +324,13 @@ public:
 	}
 };
 
-// DuckLake's own DROP/RENAME batch unconditionally issues `UPDATE
-// {table} SET end_snapshot = {SNAPSHOT_ID} WHERE end_snapshot IS NULL AND
-// {id} IN (...)` against every metadata table a dropped/renamed table (or
-// view) could conceivably reference — including tables this slice never
-// models as a store entity (`ducklake_partition_info`,
-// `ducklake_column_tag`, `ducklake_tag`, `ducklake_sort_info`: always
-// `kNotWritable`, always empty per metadata_tables.cpp's `ProvideEmpty`).
-// Since these tables can never have a live row, that UPDATE's own WHERE
-// clause can never match one — the child scan feeding this Sink is
-// structurally guaranteed to produce zero rows. Accepting the statement as
-// a no-op (rather than rejecting it outright) is therefore sound: nothing
-// is translated or staged, and the defensive check below still throws if
-// a row ever *does* arrive, which would mean this table gained a real
-// entity model this operator was never updated to translate.
+// DuckLake's DROP/RENAME batch issues `UPDATE {table} SET end_snapshot ...`
+// against every metadata table a dropped/renamed object could reference,
+// including always-empty stand-ins (`ducklake_partition_info`,
+// `ducklake_column_tag`, `ducklake_tag`, `ducklake_sort_info`). Since those
+// tables can never have a live row, that UPDATE's WHERE clause matches
+// nothing and the child scan produces zero rows, so accepting it as a no-op
+// is sound. The Sink still throws if a row ever does arrive.
 class MoraineMetadataVoidUpdate : public MoraineMetadataDml {
 public:
 	using MoraineMetadataDml::MoraineMetadataDml;
@@ -369,6 +371,9 @@ std::vector<duckdb::idx_t> ExtractSetRefs(duckdb::LogicalUpdate &op) {
 
 duckdb::PhysicalOperator &PlanMetadataInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
                                               const MetadataTableSpec &spec) {
+	if (spec.write_table_kind == kVoidInsertable) {
+		return planner.Make<MoraineMetadataVoidInsert>(op.types, spec, op.table.catalog, op.estimated_cardinality);
+	}
 	return planner.Make<MoraineMetadataInsert>(op.types, spec, op.table.catalog, op.estimated_cardinality);
 }
 
@@ -403,11 +408,10 @@ duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &plan
 		return planner.Make<MoraineMetadataUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality,
 		                                           /* set_end */ false, std::move(set_columns), std::move(set_refs));
 	}
-	// `kNotWritable`: DuckLake's own DROP/RENAME batch still issues `SET
-	// end_snapshot` against tables this slice doesn't model as store
-	// entities (see MoraineMetadataVoidUpdate's doc comment) — translatable
-	// as a no-op precisely because such a table can never have a live row
-	// to match. Anything else against an unwritable table stays rejected.
+	// `kNotWritable`: DuckLake's DROP/RENAME batch still issues `SET
+	// end_snapshot` against unmodeled tables (see MoraineMetadataVoidUpdate),
+	// translatable as a no-op since such a table can never have a live row.
+	// Anything else against an unwritable table stays rejected.
 	if (set_columns.size() == 1 &&
 	    std::string(spec.columns[set_columns[0]].name) == "end_snapshot") {
 		return planner.Make<MoraineMetadataVoidUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality);

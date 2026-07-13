@@ -1,17 +1,10 @@
-// Synthesized `ducklake_*` catalog tables: DuckLake's own metadata
-// connection (a nested `ATTACH 'moraine:<path>' ...` this shim serves)
-// speaks generic SQL against these, not the store's real user tables. Every
-// column shape here is pinned verbatim from DuckLake's own
-// `DuckLakeMetadataManager::InitializeDuckLake` (the `CREATE TABLE
-// {METADATA_CATALOG}.ducklake_*(...)` text), read from the pinned DuckLake
-// source commit — never guessed. `ducklake_metadata` is the one exception:
-// it has no store-modeled source of truth, so its rows are synthesized
-// in-process rather than read from the dump ABI (see metadata_tables.cpp).
-//
-// Only the tables the store models are served; DuckLake tables covering
-// unmodeled features this slice (macros, partitioning, name mapping, data
-// inlining, per-object tags) are absent, matching the plan's "absent kinds
-// are absent tables" rule.
+// Synthesized `ducklake_*` catalog tables: DuckLake's metadata connection
+// speaks generic SQL against these, not the store's real user tables. Each
+// column shape matches the corresponding DuckLake `CREATE TABLE`.
+// `ducklake_metadata` is the one exception: it has no store-modeled source
+// of truth, so its rows are synthesized in-process rather than read from the
+// dump ABI (see metadata_tables.cpp). Tables for unmodeled features (macros,
+// partitioning, name mapping, tags) are served as always-empty stand-ins.
 #pragma once
 
 #include <vector>
@@ -39,11 +32,20 @@ struct MetadataColumnSpec {
 // `handle` and returns fixed rows instead (see metadata_tables.cpp).
 using MetadataRowProvider = std::vector<std::vector<duckdb::Value>> (*)(MoraineCatalogHandle *handle);
 
-// `moraine_txn_stage`'s `table_kind` wire values (moraine_abi.h), mirrored
-// here so `MetadataTableSpec::write_table_kind` and the staged-write Sink
-// (staged_write.cpp) share one source of truth instead of each hand-coding
-// the discriminant order.
+// `moraine_txn_stage`'s "not writable" `table_kind` sentinel (moraine_abi.h),
+// mirrored here so this spec and the staged-write Sink (staged_write.cpp)
+// share one source of truth.
 constexpr int32_t kNotWritable = -1;
+
+// `ducklake_inlined_data_tables`'s sentinel: DuckLake's own inlined-table
+// registration batch always pairs `INSERT INTO ducklake_inlined_data_tables
+// VALUES (...)` with the `CREATE TABLE ducklake_inlined_data_<t>_<v>(...)`
+// this shim intercepts (inline_tables.cpp's `CreateInlineDataTable`, which
+// already stages `inline/schema` — the source `ProvideInlinedDataTables`
+// projects from). The INSERT still has to be *accepted* (this table is a
+// real read projection, not `kNotWritable`), but staging it too would
+// double-register; it lands here as a no-op instead.
+constexpr int32_t kVoidInsertable = -2;
 
 struct MetadataTableSpec {
 	const char *name;
@@ -115,5 +117,25 @@ private:
 // `emplace` — a same-named entry already present wins, never overwritten).
 void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
                              duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::CatalogEntry>> &tables);
+
+// Bind data for a metadata-shaped scan: every row is materialized up front
+// (these tables are metadata/inline-registry sized, not data-sized). Shared
+// by the synthesized `ducklake_*` tables (this file) and the dynamic
+// inline-table entries (inline_tables.cpp), which scan the same way.
+struct MetadataScanBindData : public duckdb::FunctionData {
+	std::vector<std::vector<duckdb::Value>> rows;
+	// The synthesized entry this scan reads, exposed through the table
+	// function's `get_bind_info` so `LogicalGet::GetTable()` resolves it:
+	// the binder's UPDATE/DELETE paths require a resolvable base table.
+	duckdb::optional_ptr<duckdb::TableCatalogEntry> table_entry;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override;
+	bool Equals(const duckdb::FunctionData &other) const override;
+};
+
+// Builds the reusable eager-materialized-rows TableFunction. No `bind`
+// callback (as in `MoraineScanFunction`, scan.hpp): the caller already
+// produces complete `MetadataScanBindData` itself.
+duckdb::TableFunction MetadataScanTableFunction();
 
 } // namespace moraine_duckdb

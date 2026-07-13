@@ -1,24 +1,20 @@
 //! Row-faithful `ducklake_*` dumps: one C array per table kind the store
-//! models, carrying **every** cur and hist row with every lifecycle
-//! column verbatim. This is the data feed the coming metadata-table shim
-//! scans — DuckLake itself filters lifecycles (`begin_snapshot`,
-//! `end_snapshot`) in SQL, so moraine serves everything unfiltered.
+//! models, carrying every cur and hist row with every lifecycle column
+//! verbatim and unfiltered (DuckLake filters `begin_snapshot`/
+//! `end_snapshot` itself, in SQL).
 //!
-//! Split from [`crate::abi`] (already the crate's largest module) but
-//! sharing its conventions: `catch_unwind`/null/UTF-8 discipline via
-//! [`guard`](crate::abi), owned-first `CString` construction, one
-//! `_free` per dump. Every function opens its own fresh transaction
-//! against [`moraine::ffi_support`] — no snapshot handle is involved, and
-//! no two dump calls are guaranteed to observe the same head (see that
-//! module's docs).
+//! Shares [`crate::abi`]'s conventions: `catch_unwind`/null/UTF-8
+//! discipline via [`guard`](crate::abi), owned-first `CString`
+//! construction, one `_free` per dump. Every function opens its own fresh
+//! transaction against [`moraine::ffi_support`] — no snapshot handle is
+//! involved, and no two dump calls are guaranteed to observe the same
+//! head.
 //!
 //! Two nullability conventions cross the C boundary:
-//! - an optional **string** is a null pointer for `None`, exactly like
-//!   every non-optional string field already crossing this boundary;
-//! - an optional **scalar** (`u64`/`bool`) has no sentinel value that
-//!   cannot also be a legitimate id, count, or flag, so it is carried as
-//!   a `has_<field>` companion flag next to the raw field, which is
-//!   meaningless when the flag is `false`.
+//! - an optional **string** is a null pointer for `None`;
+//! - an optional **scalar** (`u64`/`bool`) is carried as a `has_<field>`
+//!   companion flag next to the raw field, meaningless when the flag is
+//!   `false`.
 
 use std::ffi::{CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -111,10 +107,8 @@ pub unsafe extern "C" fn moraine_dump_schemas(
             .runtime
             .block_on(moraine::ffi_support::dump_schemas(&handle_ref.catalog))
             .map_err(AbiError::from)?;
-        // Owned-first: every string in the whole batch converts before
-        // any raw pointer is minted, so a partial failure (one row's
-        // string fails to convert) leaks none of the rows already
-        // processed.
+        // Owned-first: every string in the whole batch converts before any
+        // raw pointer is minted, so a partial failure leaks nothing.
         let owned: Vec<Owned> = rows
             .into_iter()
             .map(|v| -> Result<Owned, AbiError> {
@@ -661,10 +655,8 @@ pub struct MoraineDataFileRow {
 ///
 /// Same pointer contract as [`moraine_dump_schemas`].
 #[unsafe(no_mangle)]
-// `ducklake_data_file` is the widest row this module dumps (21 columns,
-// 6 of them `has_*` optional-scalar flags mirroring `MoraineDataFileRow`
-// field-for-field) — length and bool count are inherent to the row
-// shape, not a design smell.
+// `ducklake_data_file` is the widest row this module dumps; its length is
+// inherent to the row shape.
 #[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn moraine_dump_data_files(
     handle: *mut MoraineCatalogHandle,
@@ -673,9 +665,8 @@ pub unsafe extern "C" fn moraine_dump_data_files(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineDataFileRow>, AbiError> {
-        // `Owned` mirrors `MoraineDataFileRow` field-for-field (see that
-        // struct's docs on the `has_*` optional-scalar convention); its
-        // bool count is inherent to the row shape.
+        // `Owned` mirrors `MoraineDataFileRow` field-for-field; its bool
+        // count is inherent to the row shape.
         #[allow(clippy::struct_excessive_bools)]
         struct Owned {
             data_file_id: u64,
@@ -1772,13 +1763,10 @@ mod tests {
 
     /// A catalog string with an embedded NUL (reachable via a view's SQL)
     /// cannot cross the C boundary: `moraine_dump_views` must fail with
-    /// `CORRUPTION`, leaving the outputs untouched. The dumped views are
-    /// ordered by id, so the earlier, clean view's string converts
-    /// successfully before the later, poisoned one fails — a regression
-    /// test for the owned-first discipline: `moraine_dump_views` must
-    /// finish converting every row's strings before minting any raw
-    /// pointer, or the clean view's already-converted `CString`s would
-    /// leak when the whole call fails.
+    /// `CORRUPTION`, leaving the outputs untouched. The clean view (ordered
+    /// first, by id) converts before the poisoned one fails, so this
+    /// exercises the owned-first discipline: no raw pointer is minted until
+    /// every row's strings convert, or the clean view's `CString`s leak.
     #[test]
     fn embedded_nul_in_view_sql_reports_corruption_and_leaks_nothing() {
         let dir = TempDir::new("embedded-nul");
@@ -1814,9 +1802,7 @@ mod tests {
             unsafe { moraine_dump_views(handle, &raw mut views, &raw mut views_len, &raw mut err) };
         assert_eq!(code, codes::CORRUPTION);
         assert_eq!(err.code, codes::CORRUPTION);
-        // Nothing was handed to the caller, so there is nothing to free —
-        // this is what makes leak-freedom hold by construction rather
-        // than by this test's observation alone.
+        // Nothing was handed to the caller, so there is nothing to free.
         assert!(views.is_null());
         assert_eq!(views_len, 0);
         // SAFETY: just populated above.

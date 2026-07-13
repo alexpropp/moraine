@@ -366,6 +366,14 @@ int32_t moraine_inline_registered_tables(MoraineCatalogHandle *handle, MoraineIn
                                           size_t *out_len, MoraineError *err);
 void moraine_inline_registered_tables_free(MoraineInlineTableRow *items, size_t len);
 
+// Reports via *out_exists whether table_id has at least one recorded
+// inline/fdel record — existence for the ducklake_inlined_delete_<table_id>
+// catalog lookup (DuckLake exists-probes this table with a plain SELECT
+// before trusting it, so a table with no fdel ever staged must not resolve
+// in the catalog at all).
+int32_t moraine_inline_file_delete_table_exists(MoraineCatalogHandle *handle, uint64_t table_id, bool *out_exists,
+                                          MoraineError *err);
+
 // The staged-row write path (src/staged.rs): DuckLake authors row
 // mutations against the ducklake_* metadata tables over ordinary SQL; the
 // shim translates each row into a MoraineCell array and stages it here,
@@ -419,13 +427,13 @@ int32_t moraine_txn_stage_inline_insert(MoraineTxnHandle *txn, uint64_t table_id
                                          uint64_t begin_snapshot, uint64_t row_id_start, uint64_t row_count,
                                          const uint8_t *arrow_body, size_t arrow_body_len, MoraineError *err);
 
-int32_t moraine_txn_stage_inline_idel(MoraineTxnHandle *txn, uint64_t table_id, uint64_t row_id,
+int32_t moraine_txn_stage_inline_inline_delete(MoraineTxnHandle *txn, uint64_t table_id, uint64_t row_id,
                                        uint64_t end_snapshot, MoraineError *err);
 
-int32_t moraine_txn_stage_inline_fdel(MoraineTxnHandle *txn, uint64_t table_id, uint64_t data_file_id,
+int32_t moraine_txn_stage_inline_file_delete(MoraineTxnHandle *txn, uint64_t table_id, uint64_t data_file_id,
                                        uint64_t row_id, uint64_t begin_snapshot, MoraineError *err);
 
-// Removes every inline/ins chunk begun at or before flush_snapshot for
+// Removes every inline/insert chunk begun at or before flush_snapshot for
 // (table_id, schema_version), plus the inline/idel tombstones those chunks'
 // rows consumed.
 int32_t moraine_txn_stage_inline_flush_delete(MoraineTxnHandle *txn, uint64_t table_id, uint64_t schema_version,
@@ -433,6 +441,57 @@ int32_t moraine_txn_stage_inline_flush_delete(MoraineTxnHandle *txn, uint64_t ta
 
 // Removes every inline/* record for table_id.
 int32_t moraine_txn_stage_inline_drop(MoraineTxnHandle *txn, uint64_t table_id, MoraineError *err);
+
+// Removes only the inline/schema record for (table_id, schema_version),
+// leaving any other schema version's inline/* records untouched — the
+// superseded-inlined-table cleanup a flush issues once its chunks are
+// gone. Distinct from moraine_txn_stage_inline_drop, which is table-wide.
+int32_t moraine_txn_stage_inline_schema_drop(MoraineTxnHandle *txn, uint64_t table_id, uint64_t schema_version,
+                                              MoraineError *err);
+
+// Arrow IPC bridge (`src/arrow_ipc.rs`). The shim converts a DuckDB
+// `DataChunk` to the Arrow C Data Interface with DuckDB's own converter and
+// hands those structs here for IPC serialization; decode reverses it. The
+// C Data Interface structs are defined by DuckDB's Arrow headers, so they
+// are only forward-declared here.
+struct ArrowSchema;
+struct ArrowArray;
+
+// Mirrors `moraine_duckdb::arrow_ipc::MoraineArrowBytes`: a heap buffer
+// owned by Rust, freed with `moraine_arrow_bytes_free`.
+typedef struct MoraineArrowBytes {
+	uint8_t *data;
+	size_t len;
+	size_t cap;
+} MoraineArrowBytes;
+
+// Mirrors `moraine_duckdb::arrow_ipc::MoraineArrowError`: a status/message
+// pair; a non-null message is freed with `moraine_arrow_error_free`.
+typedef struct MoraineArrowError {
+	int32_t failed;
+	char *message;
+} MoraineArrowError;
+
+// Serializes an exported Arrow schema to a schema-only IPC stream. Consumes
+// `schema` (releases its buffers); returns non-zero and sets `err` on failure.
+int32_t moraine_arrow_encode_schema(struct ArrowSchema *schema, MoraineArrowBytes *out, MoraineArrowError *err);
+
+// Serializes an exported Arrow array to a self-contained IPC stream (schema
+// and one batch). Consumes both `schema` and `array`.
+int32_t moraine_arrow_encode_chunk(struct ArrowSchema *schema, struct ArrowArray *array, MoraineArrowBytes *out,
+                                    MoraineArrowError *err);
+
+// Decodes an IPC stream into exported C Data Interface structs the caller
+// (via DuckDB's importer) releases. A schema-only stream yields a zero-row
+// array.
+int32_t moraine_arrow_decode_stream(const uint8_t *body, size_t body_len, struct ArrowSchema *out_schema,
+                                    struct ArrowArray *out_array, MoraineArrowError *err);
+
+// Frees a buffer returned by an encode call.
+void moraine_arrow_bytes_free(MoraineArrowBytes bytes);
+
+// Frees a message set by a failed Arrow bridge call.
+void moraine_arrow_error_free(char *message);
 
 #ifdef __cplusplus
 } // extern "C"

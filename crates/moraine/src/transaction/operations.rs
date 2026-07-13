@@ -115,8 +115,8 @@ impl Operation {
     }
 }
 
-/// Wraps `s` in double quotes, doubling any embedded quote — DuckLake's
-/// `SQLIdentifierToString` quoting rule for names in `changes_made`.
+/// Wraps `s` in double quotes, doubling any embedded quote — the SQL
+/// identifier quoting rule for names in `changes_made`.
 fn quote_ident(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -371,9 +371,8 @@ impl ChangeSet {
         entries.join(",")
     }
 
-    /// Parses a stored `changes_made` string written in DuckLake's
-    /// grammar. Kind matching is case-insensitive, matching DuckLake's
-    /// parser.
+    /// Parses a stored `changes_made` string. Kind matching is
+    /// case-insensitive.
     pub(crate) fn parse(changes_made: &str) -> Self {
         let mut set = Self::default();
         for entry in split_entries(changes_made) {

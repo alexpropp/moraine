@@ -33,13 +33,9 @@ const EXTENSION_NAME: &str = "moraine_duckdb";
 const DUCKDB_LOAD_TEST_NAME: &str = "tests::attach_lists_and_scans_through_real_duckdb";
 
 /// Every `#[ignore]`d test in `ducklake_load.rs`, run together (not
-/// `--exact`, since there are three) — the `moraine:` prefix-attach proof,
-/// the full `ducklake:moraine:` read chain, and the staged-row write proof
-/// (`CREATE TABLE` through `lake`, verified via both DuckLake's own catalog
-/// and the standalone `moraine:` attach). Needs network access to `INSTALL
-/// ducklake`, same class of dependency `e2e` already has for the CLI
-/// download and `moraine-duckdb`'s own header fetch.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "3 passed";
+/// `--exact`, since there are four). Needs network access to `INSTALL
+/// ducklake`.
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "4 passed";
 
 fn main() -> anyhow::Result<()> {
     let task = std::env::args().nth(1);

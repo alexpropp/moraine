@@ -183,9 +183,8 @@ impl Transaction {
             path_is_relative: true,
             next_column_id: column_count + 1,
         });
-        // Field
-        //  ids are assigned from 1 in declaration order, matching
-        // DuckLake; column_order (the position) stays 0-based.
+        // Field ids are assigned from 1 in declaration order;
+        // column_order (the position) stays 0-based.
         for (order, def) in columns.iter().enumerate() {
             self.state.put_column(new_column(
                 table_id,

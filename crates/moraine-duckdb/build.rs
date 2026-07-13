@@ -1,29 +1,25 @@
 //! Compiles the C++ shim (`cpp/*.cpp`) against DuckDB v1.5.4's full
 //! source-tree headers (`src/include/`, sparse-checked-out from the pinned
-//! git tag and cached under `target/duckdb-src/` — see `ensure_duckdb_headers`
-//! below and the README's "Where the headers come from") and links it into
-//! this crate's cdylib.
+//! git tag and cached under `target/duckdb-src/`) and links it into this
+//! crate's cdylib.
 //!
-//! The shim only needs DuckDB's C++ internal headers at compile time — it
-//! links against no DuckDB library. A loadable extension is `dlopen`'d into
-//! a process with every DuckDB symbol already resolved, so unresolved
-//! symbols in the shim are left for the dynamic loader to resolve
-//! (`-undefined dynamic_lookup` on macOS; ELF's default `-shared`
-//! behavior already permits this on Linux, no equivalent flag needed).
+//! The shim needs DuckDB's C++ internal headers at compile time but links
+//! against no DuckDB library: a loadable extension is `dlopen`'d into a
+//! process with every DuckDB symbol already resolved, so unresolved symbols
+//! in the shim are left for the dynamic loader (`-undefined dynamic_lookup`
+//! on macOS; ELF's default `-shared` behavior permits this on Linux).
 //!
 //! Three linker interventions are required on every platform:
 //!
-//! 1. Nothing in the Rust crate calls the C++ entry point, so the linker
-//!    drops the archive member as unreferenced unless force-loaded.
+//! 1. Nothing in the Rust crate calls the C++ entry point, so the archive
+//!    member must be force-loaded or the linker drops it.
 //! 2. Rust's cdylib link restricts the dynamic-symbol table to symbols
-//!    rustc knows about, so the C++ entry point must be explicitly added
-//!    to the export list.
-//! 3. The archive must appear on the link line exactly once. `cc`'s
-//!    default cargo metadata would add a second, lazy `-l` mention ahead
-//!    of the force-load one; lld resolves cross-member references by
-//!    fetching from the lazy mention while force-loading the other,
-//!    defining every such symbol twice. So `cc`'s metadata is suppressed
-//!    and what it carried (the C++ standard library) is linked by hand.
+//!    rustc knows about, so the C++ entry point must be explicitly exported.
+//! 3. The archive must appear on the link line exactly once. `cc`'s default
+//!    cargo metadata adds a second, lazy `-l` mention ahead of the
+//!    force-load one, making lld define every cross-referenced symbol
+//!    twice; so `cc`'s metadata is suppressed and the C++ standard library
+//!    it carried is linked by hand.
 
 use std::{
     fs,
@@ -42,6 +38,7 @@ const DUCKDB_GIT_URL: &str = "https://github.com/duckdb/duckdb.git";
 
 fn main() -> anyhow::Result<()> {
     let include_dir = ensure_duckdb_headers()?;
+
     let archive_name = "moraine_duckdb_cpp";
 
     cc::Build::new()
@@ -52,17 +49,16 @@ fn main() -> anyhow::Result<()> {
         .file("cpp/extension.cpp")
         .file("cpp/storage_extension.cpp")
         .file("cpp/catalog.cpp")
+        .file("cpp/inline_tables.cpp")
         .file("cpp/metadata_tables.cpp")
         .file("cpp/scan.cpp")
         .file("cpp/staged_write.cpp")
         .file("cpp/transaction_manager.cpp")
         .warnings(false)
-        // `compile` would otherwise emit `cargo:rustc-link-lib=static=…`,
-        // putting the archive on the link line a second time as a lazy
-        // mention ahead of the force-load below — lld then loads
-        // cross-referenced members from both mentions and errors on the
-        // duplicate symbols. Suppressing the metadata drops the C++
-        // standard-library link too; re-added per platform below.
+        // Suppress `cargo:rustc-link-lib=static=…`, which would put the
+        // archive on the link line a second time ahead of the force-load
+        // below and make lld define cross-referenced symbols twice. This
+        // also drops the C++ standard-library link, re-added per platform.
         .cargo_metadata(false)
         .compile(archive_name);
 
@@ -86,40 +82,35 @@ fn main() -> anyhow::Result<()> {
             // process already has them.
             println!("cargo:rustc-cdylib-link-arg=-undefined");
             println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
-            // Rust's cdylib link auto-generates an `-exported_symbols_list`
-            // containing only `#[no_mangle]` symbols, silently dropping
-            // the C++ entry point even though `-force_load` pulled its
-            // object in. `-exported_symbol` adds to that list rather than
-            // replacing it. Leading underscore is Mach-O's C decoration.
+            // Rust's auto-generated `-exported_symbols_list` lists only
+            // `#[no_mangle]` symbols, dropping the C++ entry point;
+            // `-exported_symbol` adds to that list. Leading underscore is
+            // Mach-O's C decoration.
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_moraine_duckdb_duckdb_cpp_init"
             );
-            // The C++ standard library `cc`'s suppressed metadata would
-            // have linked; after the archive so it can satisfy the shim's
-            // references.
+            // The C++ standard library, after the archive so it can satisfy
+            // the shim's references.
             println!("cargo:rustc-cdylib-link-arg=-lc++");
         }
         "linux" => {
-            // GNU ld equivalents of the macOS flags above. `--whole-archive`
-            // must be switched off again so it doesn't leak onto later
-            // archives on the link line. ELF `-shared` links tolerate
-            // undefined symbols by default, so no `dynamic_lookup` analog
-            // is needed. One `-Wl,` list: the driver comma-splits
-            // everything after `-Wl,` into successive ld arguments.
+            // GNU ld equivalents of the macOS flags. `--whole-archive` must
+            // be switched off again so it doesn't leak onto later archives.
+            // ELF `-shared` tolerates undefined symbols, so no
+            // `dynamic_lookup` analog is needed.
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,--whole-archive,{},--no-whole-archive",
                 archive_path.display()
             );
-            // Rust restricts the dynamic-symbol list on ELF too, via a
-            // version script; `--export-dynamic-symbol` (GNU ld >= 2.35,
-            // also lld) adds the C++ entry point. No leading underscore:
-            // ELF doesn't decorate C symbols.
+            // Rust restricts the dynamic-symbol list on ELF via a version
+            // script; `--export-dynamic-symbol` (GNU ld >= 2.35, also lld)
+            // adds the C++ entry point. No leading underscore: ELF doesn't
+            // decorate C symbols.
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=moraine_duckdb_duckdb_cpp_init"
             );
-            // The C++ standard library `cc`'s suppressed metadata would
-            // have linked; after the archive so it can satisfy the shim's
-            // references.
+            // The C++ standard library, after the archive so it can satisfy
+            // the shim's references.
             println!("cargo:rustc-cdylib-link-arg=-lstdc++");
         }
         other => {
@@ -138,19 +129,12 @@ fn main() -> anyhow::Result<()> {
 
 /// Returns the path to a local `src/include/` tree from the DuckDB
 /// `DUCKDB_PIN` tag, downloading and caching it under
-/// `target/duckdb-src/<pin>/` (sibling to `xtask`'s own
-/// `target/duckdb-cli/` CLI cache — same "large downloads live under
-/// `target/`, never committed" rule) if it isn't already cached.
+/// `target/duckdb-src/<pin>/` if it isn't already cached.
 ///
 /// Only `src/include/` is fetched, via a blobless partial clone plus a
-/// sparse checkout of that one path: DuckDB's repository is large
-/// end-to-end (the tagged source tarball is over 100 MB), but the shim
-/// compiles cleanly against `src/include/` alone with zero `third_party/`
-/// headers (verified empirically during the build-model switch this
-/// function landed in — every header the shim's `#include`s reach,
-/// transitively, resolves inside `src/include/duckdb/...`), so there is no
-/// reason to pay for the rest. A sparse checkout of just that directory is
-/// ~9 MB and a few seconds, versus fetching and unpacking the full tree.
+/// sparse checkout of that one path: the shim compiles cleanly against
+/// `src/include/` alone with zero `third_party/` headers, and that
+/// directory is ~9 MB versus the full tree's 100+ MB.
 fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
     let checkout_root = duckdb_src_cache_root()?;
     let include_dir = checkout_root.join("src/include");
@@ -200,21 +184,17 @@ fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
     Ok(include_dir)
 }
 
-/// A file that exists in the full `src/include/` tree but not in the
-/// single-file `duckdb.hpp` amalgamation (which also ships a file named
-/// `duckdb.hpp` — so checking for that alone would accept an
-/// amalgamation-shaped cache and fail confusingly at compile time
-/// instead of here). Used as the cache sanity check, both on the warm
-/// path and after a fresh checkout.
+/// A file present in the full `src/include/` tree but absent from the
+/// single-file `duckdb.hpp` amalgamation. Used as the cache sanity check
+/// so an amalgamation-shaped cache is rejected here rather than at compile
+/// time.
 fn full_tree_marker(include_dir: &Path) -> PathBuf {
     include_dir.join("duckdb/storage/storage_extension.hpp")
 }
 
 /// The shared cache root for the DuckDB headers, `target/duckdb-src/<pin>/`.
 /// This crate lives at `<workspace_root>/crates/moraine-duckdb`, so the
-/// workspace's single `target/` directory is two levels up from
-/// `CARGO_MANIFEST_DIR` — the same fixed-depth assumption `xtask`'s own
-/// `workspace_root()` makes from its own location.
+/// workspace `target/` is two levels up from `CARGO_MANIFEST_DIR`.
 fn duckdb_src_cache_root() -> anyhow::Result<PathBuf> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .context("cargo sets CARGO_MANIFEST_DIR for every build script")?;
@@ -222,9 +202,8 @@ fn duckdb_src_cache_root() -> anyhow::Result<PathBuf> {
 }
 
 /// Runs `git <args>` with `cwd` as the working directory, failing with a
-/// message naming the command and hinting at connectivity issues on
-/// non-zero exit — `git`'s own diagnostics still reach stderr since stdio
-/// is inherited.
+/// message naming the command on non-zero exit. `git`'s own diagnostics
+/// reach stderr since stdio is inherited.
 fn run_git<I, S>(cwd: &Path, args: I) -> anyhow::Result<()>
 where
     I: IntoIterator<Item = S>,

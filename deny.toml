@@ -13,6 +13,8 @@ allow = [
     "Zlib",
     "BSD-3-Clause",
     "CDLA-Permissive-2.0",
+    # arrow's transitive graph (tiny-keccak) — public-domain dedication:
+    "CC0-1.0",
 ]
 
 [bans]

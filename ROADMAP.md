@@ -21,9 +21,19 @@
   `UPDATE`/`DELETE`/rename/`DROP` translate through the staged-row commit
   path, `SELECT`/`COUNT`/time travel read through DuckLake's own reader
   over moraine's row-faithful `ducklake_*` projections (RFC 0006)
-- [ ] Data inlining (RFC 0005): inlined inserts/deletes + flush — launch
-  feature; pending (deferred this slice — `ducklake_metadata` serves
-  `data_inlining_row_limit = 0` so ordinary `CREATE TABLE` never needs it)
+- [x] Data inlining (RFC 0005): inlined inserts/deletes + flush — launch
+  feature; on by default (`ducklake_metadata` serves
+  `data_inlining_row_limit = 10`, DuckLake's own default). DuckLake's
+  dynamic `ducklake_inlined_data_<t>_<v>`/`ducklake_inlined_delete_<t>`
+  tables route into the `inline/*` keyspace over the staged-row commit
+  path; `INSERT`/`SELECT`/`DELETE`/`ducklake_flush_inlined_data` all
+  verified live (`ducklake_load.rs`'s
+  `ducklake_inline_data_round_trip_through_flush`). Chunk bodies are Arrow
+  IPC: the shim converts a `DataChunk` to the Arrow C Data Interface with
+  DuckDB's `ArrowConverter` and the Rust bridge (`src/arrow_ipc.rs`)
+  serializes to IPC; decode feeds the structs back to DuckDB's own arrow
+  importer. Flush is still a transcode (not zero-copy); see RFC 0005's
+  reconciliations
 - [ ] Real object storage tests (MinIO/localstack) — pending
 - [ ] `cargo-fuzz` targets for store codecs — pending
 
@@ -55,7 +65,7 @@ e2e suite before it is checked off.
 ### Data, deletes & layout
 - [x] Parquet data files on object storage (`data_file`)
 - [x] Row-level deletes via delete files / merge-on-read (`delete_file`)
-- [ ] Data inlining: inlined inserts/deletes + flush (RFC 0005;
+- [x] Data inlining: inlined inserts/deletes + flush (RFC 0005;
   `inlined_data_tables`)
 - [ ] Partitioning: partition definitions, values, and pruning
   (`partition_info`, `partition_column`, `file_partition_value`) (RFC 0013)

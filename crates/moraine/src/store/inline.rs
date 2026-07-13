@@ -8,10 +8,12 @@ use crate::{
     error::{Error, Result},
     store::{
         key::{
-            InlineKey, InlineOp, InlineOpKind, Key, inline_live_table_prefix, inline_schema_prefix,
-            inline_schema_table_prefix,
+            InlineKey, InlineOperation, InlineOperationKind, Key, inline_live_table_prefix,
+            inline_schema_prefix, inline_schema_table_prefix,
         },
-        proto::{InlineChunkValue, InlineFdelValue, InlineIdelValue, InlineSchemaValue},
+        proto::{
+            InlineChunkValue, InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaValue,
+        },
         value,
     },
 };
@@ -22,15 +24,18 @@ use crate::{
 pub(crate) async fn scan_inline_chunks(
     tx: &DbTransaction,
     table_id: u64,
-) -> Result<Vec<(InlineOp, InlineChunkValue)>> {
+) -> Result<Vec<(InlineOperation, InlineChunkValue)>> {
     let mut iter = tx
-        .scan_prefix(inline_live_table_prefix(InlineOpKind::Ins, table_id), ..)
+        .scan_prefix(
+            inline_live_table_prefix(InlineOperationKind::Insert, table_id),
+            ..,
+        )
         .await
         .map_err(Error::from)?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Inline(InlineKey::Live(op @ InlineOp::Ins { .. })) => {
+            Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
                 records.push((op, value::decode_value(&entry.value)?));
             }
             other => {
@@ -44,23 +49,26 @@ pub(crate) async fn scan_inline_chunks(
 }
 
 /// Every inlined-insert-row tombstone for `table_id`, keyed by row id.
-pub(crate) async fn scan_inline_idels(
+pub(crate) async fn scan_inline_inline_deletes(
     tx: &DbTransaction,
     table_id: u64,
-) -> Result<Vec<(u64, InlineIdelValue)>> {
+) -> Result<Vec<(u64, InlineInlineDeleteValue)>> {
     let mut iter = tx
-        .scan_prefix(inline_live_table_prefix(InlineOpKind::Idel, table_id), ..)
+        .scan_prefix(
+            inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
+            ..,
+        )
         .await
         .map_err(Error::from)?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Inline(InlineKey::Live(InlineOp::Idel { row_id, .. })) => {
+            Key::Inline(InlineKey::Live(InlineOperation::InlineDelete { row_id, .. })) => {
                 records.push((row_id, value::decode_value(&entry.value)?));
             }
             other => {
                 return Err(Error::Corruption(format!(
-                    "non-idel key in inline idel scan: {other:?}"
+                    "non-inline_delete key in inline inline_delete scan: {other:?}"
                 )));
             }
         }
@@ -70,18 +78,21 @@ pub(crate) async fn scan_inline_idels(
 
 /// Every inlined Parquet-row delete for `table_id`, keyed by
 /// `(data_file_id, row_id)`.
-pub(crate) async fn scan_inline_fdels(
+pub(crate) async fn scan_inline_file_deletes(
     tx: &DbTransaction,
     table_id: u64,
-) -> Result<Vec<(u64, u64, InlineFdelValue)>> {
+) -> Result<Vec<(u64, u64, InlineFileDeleteValue)>> {
     let mut iter = tx
-        .scan_prefix(inline_live_table_prefix(InlineOpKind::Fdel, table_id), ..)
+        .scan_prefix(
+            inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
+            ..,
+        )
         .await
         .map_err(Error::from)?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Inline(InlineKey::Live(InlineOp::Fdel {
+            Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 data_file_id,
                 row_id,
                 ..
@@ -90,7 +101,7 @@ pub(crate) async fn scan_inline_fdels(
             }
             other => {
                 return Err(Error::Corruption(format!(
-                    "non-fdel key in inline fdel scan: {other:?}"
+                    "non-file_delete key in inline file delete scan: {other:?}"
                 )));
             }
         }
@@ -143,9 +154,7 @@ pub(crate) async fn scan_inline_schemas(
 }
 
 /// Every `inline/schema` record across every table, in key order
-/// (`table_id`, then `schema_version`) — feeds the
-/// `ducklake_inlined_data_tables` projection ("every table with live
-/// inline data").
+/// (`table_id`, then `schema_version`).
 pub(crate) async fn scan_all_inline_schemas(
     tx: &DbTransaction,
 ) -> Result<Vec<(u64, u64, InlineSchemaValue)>> {
@@ -223,8 +232,8 @@ mod tests {
             data_file_id: None,
         };
 
-        let idel = InlineIdelValue { end_snapshot: 9 };
-        let fdel = InlineFdelValue { begin_snapshot: 4 };
+        let inline_delete = InlineInlineDeleteValue { end_snapshot: 9 };
+        let file_delete = InlineFileDeleteValue { begin_snapshot: 4 };
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         tx.put(
@@ -246,7 +255,7 @@ mod tests {
         )
         .unwrap();
         tx.put(
-            Key::Inline(InlineKey::Live(InlineOp::Ins {
+            Key::Inline(InlineKey::Live(InlineOperation::Insert {
                 table_id: 7,
                 schema_version: 0,
                 begin_snapshot: 1,
@@ -257,7 +266,7 @@ mod tests {
         )
         .unwrap();
         tx.put(
-            Key::Inline(InlineKey::Live(InlineOp::Ins {
+            Key::Inline(InlineKey::Live(InlineOperation::Insert {
                 table_id: 7,
                 schema_version: 0,
                 begin_snapshot: 1,
@@ -268,7 +277,7 @@ mod tests {
         )
         .unwrap();
         tx.put(
-            Key::Inline(InlineKey::Live(InlineOp::Ins {
+            Key::Inline(InlineKey::Live(InlineOperation::Insert {
                 table_id: 7,
                 schema_version: 1,
                 begin_snapshot: 2,
@@ -279,27 +288,27 @@ mod tests {
         )
         .unwrap();
         tx.put(
-            Key::Inline(InlineKey::Live(InlineOp::Idel {
+            Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
                 table_id: 7,
                 row_id: 3,
             }))
             .encode(),
-            value::encode_value(&idel),
+            value::encode_value(&inline_delete),
         )
         .unwrap();
         tx.put(
-            Key::Inline(InlineKey::Live(InlineOp::Fdel {
+            Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 table_id: 7,
                 data_file_id: 5,
                 row_id: 1,
             }))
             .encode(),
-            value::encode_value(&fdel),
+            value::encode_value(&file_delete),
         )
         .unwrap();
         // A different table's chunk must not leak into table 7's scans.
         tx.put(
-            Key::Inline(InlineKey::Live(InlineOp::Ins {
+            Key::Inline(InlineKey::Live(InlineOperation::Insert {
                 table_id: 8,
                 schema_version: 0,
                 begin_snapshot: 1,
@@ -324,7 +333,7 @@ mod tests {
             chunks,
             vec![
                 (
-                    InlineOp::Ins {
+                    InlineOperation::Insert {
                         table_id: 7,
                         schema_version: 0,
                         begin_snapshot: 1,
@@ -333,7 +342,7 @@ mod tests {
                     chunk_v0_seq0,
                 ),
                 (
-                    InlineOp::Ins {
+                    InlineOperation::Insert {
                         table_id: 7,
                         schema_version: 0,
                         begin_snapshot: 1,
@@ -342,7 +351,7 @@ mod tests {
                     chunk_v0_seq1,
                 ),
                 (
-                    InlineOp::Ins {
+                    InlineOperation::Insert {
                         table_id: 7,
                         schema_version: 1,
                         begin_snapshot: 2,
@@ -353,11 +362,11 @@ mod tests {
             ]
         );
 
-        let idels = scan_inline_idels(&tx, 7).await.unwrap();
-        assert_eq!(idels, vec![(3, idel)]);
+        let inline_deletes = scan_inline_inline_deletes(&tx, 7).await.unwrap();
+        assert_eq!(inline_deletes, vec![(3, inline_delete)]);
 
-        let fdels = scan_inline_fdels(&tx, 7).await.unwrap();
-        assert_eq!(fdels, vec![(5, 1, fdel)]);
+        let file_deletes = scan_inline_file_deletes(&tx, 7).await.unwrap();
+        assert_eq!(file_deletes, vec![(5, 1, file_delete)]);
 
         let schemas = scan_inline_schemas(&tx, 7).await.unwrap();
         assert_eq!(
@@ -379,7 +388,7 @@ mod tests {
         assert_eq!(
             other_table_chunks,
             vec![(
-                InlineOp::Ins {
+                InlineOperation::Insert {
                     table_id: 8,
                     schema_version: 0,
                     begin_snapshot: 1,

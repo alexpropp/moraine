@@ -1,19 +1,18 @@
 //! Pure materialization of live inlined rows from already-scanned
-//! `inline/ins` chunks and `inline/idel` tombstones (see
-//! [`crate::store::inline`] for the scans). No store I/O here — this is
-//! the read model DuckLake's four inline scan variants select over; the
-//! ABI/shim decodes the opaque chunk body at the returned chunk/offset.
+//! `inline/insert` chunks and `inline/inline_delete` tombstones (see
+//! [`crate::store::inline`] for the scans). No store I/O here; the read
+//! model DuckLake's four inline scan variants select over.
 
 use std::collections::HashMap;
 
 use crate::store::{
-    key::InlineOp,
-    proto::{InlineChunkValue, InlineIdelValue},
+    key::InlineOperation,
+    proto::{InlineChunkValue, InlineInlineDeleteValue},
 };
 
 /// One inlined row, addressed by dense `row_id` and located in its chunk
 /// by index + offset. `end_snapshot` is `None` until a matching
-/// `inline/idel` tombstones the row.
+/// `inline/inline_delete` tombstones the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlineRow {
     /// The row's dense id (`chunk.row_id_start + offset_in_chunk`).
@@ -31,24 +30,24 @@ pub struct InlineRow {
 
 /// Every row across every chunk — one per `(chunk, offset)`, `row_id =
 /// chunk.row_id_start + offset` for `offset` in `0..chunk.row_count` —
-/// with `end_snapshot` resolved from `idels`. Includes tombstoned rows;
+/// with `end_snapshot` resolved from `inline_deletes`. Includes tombstoned rows;
 /// callers apply the scan-kind predicate via [`InlineScanKind::select`].
-/// `chunks` entries that are not `InlineOp::Ins` are skipped (callers
-/// pass `store::inline::scan_inline_chunks`'s output, which is Ins-only).
+/// `chunks` entries that are not `InlineOp::Ins` are skipped.
 pub fn materialize_inline_rows(
-    chunks: &[(InlineOp, InlineChunkValue)],
-    idels: &[(u64, InlineIdelValue)],
+    chunks: &[(InlineOperation, InlineChunkValue)],
+    inline_deletes: &[(u64, InlineInlineDeleteValue)],
 ) -> Vec<InlineRow> {
-    let tombstones: HashMap<u64, u64> = idels
+    let tombstones: HashMap<u64, u64> = inline_deletes
         .iter()
-        .map(|(row_id, idel)| (*row_id, idel.end_snapshot))
+        .map(|(row_id, inline_delete)| (*row_id, inline_delete.end_snapshot))
         .collect();
 
     let mut rows = Vec::new();
     for (chunk_index, (op, value)) in chunks.iter().enumerate() {
-        let InlineOp::Ins { begin_snapshot, .. } = *op else {
+        let InlineOperation::Insert { begin_snapshot, .. } = *op else {
             continue;
         };
+
         for offset in 0..value.row_count {
             let row_id = value.row_id_start + offset;
             rows.push(InlineRow {
@@ -130,8 +129,8 @@ impl InlineScanKind {
 mod tests {
     use super::*;
 
-    fn ins(begin_snapshot: u64) -> InlineOp {
-        InlineOp::Ins {
+    fn insert(begin_snapshot: u64) -> InlineOperation {
+        InlineOperation::Insert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot,
@@ -154,15 +153,15 @@ mod tests {
     /// `select` — not input order — determines the result order.
     fn fixture() -> Vec<InlineRow> {
         let chunks = vec![
-            (ins(5), chunk(4, 1)),
-            (ins(1), chunk(0, 2)),
-            (ins(3), chunk(2, 2)),
+            (insert(5), chunk(4, 1)),
+            (insert(1), chunk(0, 2)),
+            (insert(3), chunk(2, 2)),
         ];
-        let idels = vec![
-            (1, InlineIdelValue { end_snapshot: 4 }),
-            (3, InlineIdelValue { end_snapshot: 6 }),
+        let inline_deletes = vec![
+            (1, InlineInlineDeleteValue { end_snapshot: 4 }),
+            (3, InlineInlineDeleteValue { end_snapshot: 6 }),
         ];
-        materialize_inline_rows(&chunks, &idels)
+        materialize_inline_rows(&chunks, &inline_deletes)
     }
 
     fn row_ids(rows: &[InlineRow]) -> Vec<u64> {

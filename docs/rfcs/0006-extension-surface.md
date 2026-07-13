@@ -211,10 +211,18 @@ into C-ABI calls. This preserves RFC 0001's "thin by policy" intent, restated
 **language-agnostically**: no catalog semantics in the extension layer,
 regardless of the language it is written in.
 
-- **Boundary format: the Arrow C Data Interface.** Scan results and RFC 0005's
-  Arrow-typed inlined data cross the ABI as Arrow arrays rather than marshalled
-  DuckDB `DataChunk`s — a stable, language-neutral, near-zero-copy boundary
-  that both DuckDB and the Rust core already speak.
+- **Boundary format: typed C structs, plus the Arrow C Data Interface for
+  inline chunks.** Metadata and inline *scan* results cross the ABI as
+  owned arrays of `#[repr(C)]` row structs (`crates/moraine-duckdb/src/
+  dumps.rs`/`inline.rs`), one `_free` per array — not Arrow arrays as
+  originally intended here. Inline chunk *bodies* are the exception and do
+  use the Arrow C Data Interface: the shim converts a `DataChunk` to
+  `ArrowArray`/`ArrowSchema` with DuckDB's `ArrowConverter` and the Rust
+  bridge (`src/arrow_ipc.rs`) serializes to Arrow IPC, with the structs
+  crossing the ABI by pointer (`moraine_arrow_encode_*`/`_decode_stream`,
+  consuming on encode and producing on decode; ownership rules in
+  `arrow_ipc.rs`). Moving scan results generally to Arrow crossing the ABI
+  remains open.
 - **Sync↔async bridge lives in the Rust C-ABI layer.** The core is async
   (SlateDB requires tokio, RFC 0001). The C-ABI layer owns the tokio runtime
   and `block_on`s core futures, so the C++ shim only ever calls synchronous C
@@ -364,19 +372,61 @@ write; a lost race at commit returns an error whose message contains the
 literal substring `conflict` (never retried internally, per the C ABI
 error mapping table above).
 
-### `ducklake_metadata` synthesis: `data_inlining_row_limit = 0`
+### `ducklake_metadata` synthesis: `data_inlining_row_limit = 10` and dynamic inline-table interception
 
 Beyond the keys the exists-probe path reads (version, encrypted,
 created_by — see the metadata-catalog section below), the synthesized
-`ducklake_metadata` also serves `data_inlining_row_limit = "0"`. This is
-load-bearing, not informational: DuckLake's `WriteNewInlinedTables`
-(source-verified) skips registering a table's per-schema-version inlined-
-data table when `DataInliningRowLimit(...)` resolves to 0 for that table,
-and that limit's only inputs are catalog configuration options — absent a
-served value the default is 10, which makes every `CREATE TABLE` demand an
-inlined-data table this catalog cannot store (RFC 0005's inlining is
-deferred). Serving `0` declares, catalog-wide, that inlining is off, so
-`CREATE TABLE` and ordinary staged writes never need it.
+`ducklake_metadata` also serves `data_inlining_row_limit = "10"` —
+DuckLake's own compiled default, declaring catalog-wide that inlining is
+**on**. (An earlier revision of this shim served `"0"` to keep inlining
+off while RFC 0005 was unimplemented; that stopgap is gone now that it
+is.) This is load-bearing, not informational: DuckLake's
+`WriteNewInlinedTables` (source-verified) skips registering a table's
+per-schema-version inlined-data table when `DataInliningRowLimit(...)`
+resolves to 0 for that table, and that limit's only inputs are catalog
+configuration options — absent a served value the default is 10 anyway,
+so serving `10` explicitly just makes the choice legible.
+
+With inlining on, DuckLake **dynamically creates and drives per-table
+physical tables** in the metadata catalog rather than writing fixed
+`ducklake_*` rows (RFC 0005's "Extension surface (as implemented)" has
+the full operation → keyspace mapping). This shim recognizes two dynamic
+name families by pattern, not by a fixed catalog-entry list — this is
+the one place moraine's catalog lookup does more than serve the fixed
+`ducklake_*` set B1 describes above:
+
+- `ducklake_inlined_data_<table_id>_<schema_version>` — recognized once
+  `moraine_inline_schemas` has a matching `(table_id, schema_version)`
+  record (so a `CREATE TABLE IF NOT EXISTS` existence probe correctly
+  reports "does not exist" before the first `CREATE`, and the same
+  connection's own `LookupInlineTableEntry` accepts the `CREATE` that
+  follows).
+- `ducklake_inlined_delete_<table_id>` — recognized once at least one
+  `inline/fdel` has been staged for `table_id` (DuckLake probes this
+  table's existence with `SELECT NULL FROM ... LIMIT 1` and treats a
+  bind error as "does not exist"; unlike the data family this one must
+  report missing for a real table_id until its first inlined
+  file-delete, or DuckLake's own existence discipline breaks).
+
+Both route through the same staged-row commit path (`cpp/inline_tables.
+cpp`) as the fixed `ducklake_*` tables, translating into `inline/*`
+records — see RFC 0005 for the exact wire shape and the encoding
+deviation from that RFC's Arrow-IPC design.
+
+`ducklake_flush_inlined_data` and DuckLake's compaction/rewrite cleanup
+paths also touch several fixed `ducklake_*` tables this shim did not
+previously need to serve, even though moraine models none of the
+features they back (partitioning, variant-column stats, name/column
+mapping, scheduled file deletion): `ducklake_file_partition_value`,
+`ducklake_file_variant_stats`, `ducklake_files_scheduled_for_deletion`,
+`ducklake_column_mapping`, `ducklake_name_mapping`. These are served as
+always-empty stand-ins (`metadata_tables.cpp`, same pattern as
+`ducklake_partition_info`/`ducklake_sort_info`/the macro tables) purely
+so DuckLake's generic cleanup `DELETE`/`INSERT` batch — issued
+unconditionally as part of a commit that removes or supersedes data
+files, not gated on any of these features actually being in use — binds
+against an existing table instead of failing the whole commit with a
+"table could not be found" error.
 
 ### Standalone data-scan retirement
 

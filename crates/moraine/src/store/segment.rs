@@ -2,9 +2,8 @@
 //!
 //! Every store is created with this fixed-length one-byte extractor, so
 //! each subspace is a SlateDB segment with its own LSM state. Fixed-length
-//! extraction satisfies SlateDB's no-nesting (antichain) rule by
-//! construction, and SlateDB persists the extractor identity in its
-//! manifest, refusing a mismatched open.
+//! extraction satisfies SlateDB's antichain rule, and SlateDB persists the
+//! extractor identity in its manifest, refusing a mismatched open.
 
 use slatedb::{PrefixExtractor, PrefixTarget};
 
@@ -16,8 +15,7 @@ use crate::store::key::TAG_PREFIX_LEN;
 pub(crate) struct TagSegmentExtractor;
 
 /// Stable extractor identity, persisted by SlateDB in the manifest.
-/// Changing it orphans every existing store; it is part of the on-disk
-/// commitment.
+/// Changing it orphans every existing store.
 pub(crate) const EXTRACTOR_NAME: &str = "moraine-tag-v1";
 
 impl PrefixExtractor for TagSegmentExtractor {
@@ -26,9 +24,8 @@ impl PrefixExtractor for TagSegmentExtractor {
     }
 
     fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
-        // Fixed-length one-byte extraction: the answer depends only on
-        // the first byte existing, so `Point` and `Prefix` agree and
-        // prefix-scan filtering stays enabled.
+        // Fixed-length one-byte extraction: the answer depends only on the
+        // first byte existing, so `Point` and `Prefix` agree.
         let bytes = match target {
             PrefixTarget::Point(bytes) | PrefixTarget::Prefix(bytes) => bytes,
         };

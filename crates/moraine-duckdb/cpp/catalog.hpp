@@ -12,6 +12,8 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
@@ -35,8 +37,7 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type);
 // MoraineSchemaEntry; this class only supplies the pure virtuals
 // TableCatalogEntry still needs. The scan function binds normally (so
 // DESCRIBE/EXPLAIN work) but always redirects to the DuckLake attach at
-// execution time — user-table data is served only through DuckLake, never
-// this standalone attach (see scan.hpp).
+// execution time (see scan.hpp).
 class MoraineTableEntry : public duckdb::TableCatalogEntry {
 public:
 	MoraineTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, duckdb::CreateTableInfo &info,
@@ -54,8 +55,7 @@ private:
 };
 
 // A moraine-backed view entry. Cataloging (name/schema lookup, `DESCRIBE`)
-// works; binding the defining query is deferred (the full-tree headers
-// make duckdb::Parser reachable, but no parse is wired up yet) and throws
+// works; binding the defining query is deferred and throws
 // duckdb::NotImplementedException instead of dereferencing a null query,
 // which the base class would otherwise do.
 class MoraineViewEntry : public duckdb::ViewCatalogEntry {

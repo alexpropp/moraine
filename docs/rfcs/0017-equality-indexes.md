@@ -414,3 +414,76 @@ tests against real SlateDB on in-memory `object_store`:
 - **Uniqueness by scan at commit** (no persistent index; check by scanning
   the table's rows). O(data) per commit and impossible for external Parquet
   moraine cannot read. Rejected.
+
+## Prior art: HelixDB on SlateDB
+
+HelixDB (an OLTP graph-vector database) runs on the same substrate this store
+does — stock SlateDB over object storage — which makes its index surface the
+closest available comparison. The engine is closed; what follows is read from
+its public Rust SDK (`helix-db` 2.0.6: the `IndexSpec` and `SourcePredicate`
+types) and its SlateDB fork, not the storage code — so the *contract* is
+observed and the on-disk *key layout* is not.
+
+**Stock SlateDB was enough.** `HelixDB/slatedb` is a zero-commit mirror of
+upstream: no engine-specific primitives added. HelixDB built its whole index
+family, uniqueness included, on the same `get` / `WriteBatch` / prefix-scan
+surface this RFC assumes — no range-delete, no merge operator. That is direct
+evidence for the Reclamation open question: a batched sweep is the expected
+path, not a stopgap waiting on a SlateDB feature that a peer already proved
+unnecessary.
+
+**A wider taxonomy, the same equality core.** HelixDB's `IndexSpec` spans
+equality, range (with a physical `Asc`/`Desc` direction), vector, and text,
+each on both nodes and edges; vector and text carry a multitenant
+`tenant_property` partition. Only equality carries a `unique` flag, and only on
+nodes — matching this RFC's decision to make uniqueness an equality-index
+property whose entry keys on the value alone. Its doc ("uniqueness for
+supported non-null values") confirms the NULL-exempt semantics chosen here,
+arrived at independently.
+
+**Range is equality plus committed order.** `RangeIndexDirection` is documented
+as "physical ordering for range-index storage" — the sort direction is baked
+into the stored key, not applied at read time. That is exactly the upgrade the
+Encoding section reserves: order-compatible canonical bytes, plus a committed
+order contract, plus a direction bit. HelixDB having shipped it that way is
+evidence the deferral here is a genuine upgrade path, not a rewrite.
+
+**The pushdown boundary is drawn in the same place.** HelixDB splits a
+restricted `SourcePredicate` (the index-friendly subset used at source
+selection: `Eq`/`Neq`/`Gt`/`Between`/`StartsWith`/`And`/`Or`) from a general
+`Predicate` (arbitrary comparisons, run as a scan-time filter). An index serves
+source selection; everything else filters during the scan. This RFC's
+equality-only contract with `.where_` fallback is the same line drawn one notch
+tighter — no range, so no `Between`/`StartsWith` on the fast path.
+
+**Where it diverges — and why.** HelixDB manages indexes as runtime
+control-plane steps (`create_index_if_not_exists`) against a server that holds
+the whole graph; entries are the engine's private business. This store owns no
+copy of externally written Parquet and cannot read data files, so index DDL is
+a commit verb whose entries ride the same `WriteBatch` as the mutation, and
+external coverage is a writer-supplied contract (Coverage). HelixDB owns all
+its data, so it never meets the register-with-entries problem the Coverage
+section exists to solve. The divergence is a property of the embedding, not a
+different answer to the same question.
+
+**Vector and text indexes are also just KV entries — with a cost this one
+does not pay.** HelixDB's `IndexSpec` also spans vector and text, and both are
+modeled as compound-key records over the same ordered KV surface, no engine
+primitive beyond `get`/scan/batch. Its from-scratch HNSW persists vectors under
+a `(id, level)` key and the proximity graph as a separate adjacency subspace
+keyed `(source, level, sink)`; a search is a greedy graph walk expressed as a
+chain of small dependent point-gets. Its from-scratch BM25 is an inverted index
+(`term -> postings`) plus length/frequency tables, each its own KV database.
+(These layouts are read from HelixDB's earlier LMDB-backed engine; the v2 code
+on SlateDB is closed, but the modeling ports directly because both are ordered
+KV stores with prefix scans.) The lesson for this RFC's equality-only contract
+is not that these are hard to *model* — they are the same key-plus-value
+discipline the `idx` subspace already uses — but that they change the *read
+profile*: an equality lookup is one point-get or one bounded prefix scan, cache
+size irrelevant; an HNSW walk is dozens of dependent point-gets down a graph,
+where on an LSM over object storage every hop that misses the block cache
+becomes an object-storage round trip. Equality (and the deferred range upgrade)
+stays inside the read model RFC 0009's caching already serves; vector search
+would import a working-set-resident-or-slow tax the whole live-only, point-get
+design was shaped to avoid. That the substrate would carry them is exactly why
+the boundary is drawn by read cost, not by what SlateDB can store.

@@ -17,8 +17,7 @@ use crate::{
 };
 
 /// A decoded entity record of a kind the catalog currently models.
-/// Reading a kind outside this set fails loudly instead of being silently
-/// dropped: the store contains state this binary does not understand.
+/// Reading a kind outside this set fails loudly rather than dropping it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EntityRecord {
     /// A schema record.
@@ -84,8 +83,7 @@ pub(crate) async fn read_snapshot(
 }
 
 /// Every committed snapshot record (`ducklake_snapshot` +
-/// `ducklake_snapshot_changes`, merged), in key order — snapshots are
-/// append-only, so there is no cur/hist split to scan separately.
+/// `ducklake_snapshot_changes`, merged), in key order.
 pub(crate) async fn scan_snapshots(tx: &DbTransaction) -> Result<Vec<SnapshotValue>> {
     let mut iter = tx
         .scan_prefix(subspace_prefix(Subspace::Snap), ..)
@@ -147,9 +145,7 @@ pub(crate) async fn scan_cur_entities(tx: &DbTransaction) -> Result<Vec<EntityRe
             Key::Cur(CurKey::Entity(entity)) => {
                 records.push(decode_entity(entity, &entry.value)?);
             }
-            // Gc-file bookkeeping has no catalog meaning — unlike an
-            // unrecognized kind, it is skipped by design, not because
-            // this binary fails to understand it.
+            // Gc-file bookkeeping has no catalog meaning; skipped by design.
             Key::Cur(CurKey::GcFile { .. }) => {}
             other => {
                 return Err(Error::Corruption(format!(

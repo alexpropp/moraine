@@ -1,8 +1,8 @@
-// A duckdb::TransactionManager backed by moraine: snapshot-per-transaction,
-// read-only. StartTransaction materializes one moraine_snapshot and hands
-// out a MoraineTransaction that owns it; CommitTransaction and
-// RollbackTransaction both just free the snapshot, since this slice makes
-// no writes.
+// A duckdb::TransactionManager backed by moraine: snapshot-per-transaction.
+// StartTransaction materializes one moraine_snapshot and hands out a
+// MoraineTransaction that owns it; CommitTransaction commits the staged txn
+// (if one was opened) and RollbackTransaction discards it, both releasing
+// the snapshot.
 #pragma once
 
 #include "duckdb.hpp"
@@ -47,12 +47,8 @@ public:
 
 	// Lazily opens (on the first call) the one staged-row transaction this
 	// DuckDB transaction stages every write into, and returns it. Every
-	// subsequent INSERT/UPDATE/DELETE statement within the same DuckDB
-	// transaction reuses it — DuckLake's own commit batch is exactly one
-	// multi-statement SQL string executed inside one BEGIN/COMMIT on the
-	// metadata connection (verified against the pinned DuckLake source;
-	// see the report), so one moraine staged txn per DuckDB transaction is
-	// the correct granularity.
+	// subsequent INSERT/UPDATE/DELETE within the same DuckDB transaction
+	// reuses it: one moraine staged txn per DuckDB transaction.
 	MoraineTxnHandle *StagedTxn();
 
 	// Hands ownership of the staged txn (if one was opened) to the caller,

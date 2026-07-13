@@ -166,7 +166,7 @@ ends, inlined writes) and lands them atomically:
 3. **Stage the batch.** Assemble one atomic write set:
    - new entity records into `cur` (and, for ended versions, delete the
      `cur` key + write the `hist` key — RFC 0002);
-   - inlined `inline/ins` chunks and `inline/idel`/`inline/fdel` records
+   - inlined `inline/insert` chunks and `inline/idel`/`inline/fdel` records
      (RFC 0005);
    - updated `tstat` records carrying advanced `next_row_id`;
    - the new `snap` record `N+1` with advanced global counters,
@@ -477,9 +477,10 @@ Per RFC 0005, an inlined insert/delete is not a separate path: its
 `inline/*` records are added to the same `WriteBatch` in step 3, allocating
 row ids from the same per-table `next_row_id` bump as a Parquet write
 would. An inline flush is itself a commit — Parquet PUTs first, then one
-batch that creates the `file`/`delfile` records and moves consumed inline
-records to `hist`. Nothing about inlining changes the commit sequence or
-the conflict rules; it only adds record kinds to the batch.
+batch that creates the `file`/`delfile` records and deletes the consumed
+`inline/*` records outright (no `hist`; `inline/*` is append-then-delete,
+not begin/end-versioned). Nothing about inlining changes the commit
+sequence or the conflict rules; it only adds record kinds to the batch.
 
 ### Group commit
 

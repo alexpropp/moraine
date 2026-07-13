@@ -3,37 +3,30 @@
 // calls against the DuckDB transaction's lazily-opened staged txn
 // (transaction_manager.hpp's `MoraineTransaction::StagedTxn`).
 //
-// Sink-chunk layouts, pinned by reading DuckDB v1.5.4's own binder and
-// physical-planner sources (`src/planner/binder/statement/bind_update.cpp`
-// / `bind_delete.cpp`, `src/execution/physical_plan/plan_update.cpp` /
-// `plan_delete.cpp` — read from the tagged upstream tree, not vendored):
+// Sink-chunk layouts the operators depend on:
 //
 // - INSERT: the child chunk is the row's values in declared column order
 //   (`LogicalInsert::expected_types`).
 // - UPDATE: the child is a projection emitting [one column per SET
 //   expression (in `LogicalUpdate::columns` order), any extra columns
-//   constraints demanded, then the row-id column(s) appended last by
-//   `Binder::BindRowIdColumns`]. `LogicalUpdate::expressions[i]` is (after
-//   column-binding resolution) a `BoundReferenceExpression` into that
-//   chunk, or a `BoundDefaultExpression` for `SET col = DEFAULT` (which
-//   DuckLake never issues — rejected at plan time). The row id is the last
-//   column — the same convention DuckDB's own `PhysicalUpdate` hardcodes
-//   (`chunk.data[chunk.ColumnCount() - 1]`).
+//   constraints demanded, then the row-id column(s) appended last].
+//   `LogicalUpdate::expressions[i]` is (after column-binding resolution) a
+//   `BoundReferenceExpression` into that chunk, or a `BoundDefaultExpression`
+//   for `SET col = DEFAULT` (which DuckLake never issues — rejected at plan
+//   time). The row id is the last column.
 // - DELETE: the child chunk is the scan/filter output;
 //   `LogicalDelete::expressions[0]` is a `BoundReferenceExpression` whose
-//   `.index` locates the row-id column in it (exactly how
-//   `DuckCatalog::PlanDelete` finds it).
+//   `.index` locates the row-id column in it.
 //
 // Row identity: these tables have no physical row ids, so the base
 // `TableCatalogEntry::GetRowIdColumns()` default applies — one virtual
 // `rowid` BIGINT — and the metadata scan serves it as the row's index into
-// the scan's materialized row set (metadata_tables.cpp). The
-// UPDATE/DELETE Sinks resolve that index back to the row's key cells by
-// re-materializing the same provider: deterministic for a fixed committed
-// head, and the head cannot move between a statement's scan and its Sink
-// in any supported topology (one metadata connection per DuckLake attach,
-// statements sequential on it; a second writer process is excluded by the
-// store's single-writer fencing).
+// the scan's materialized row set (metadata_tables.cpp). The UPDATE/DELETE
+// Sinks resolve that index back to the row's key cells by re-materializing
+// the same provider: deterministic for a fixed committed head, which cannot
+// move between a statement's scan and its Sink in any supported topology
+// (one metadata connection per attach, statements sequential; a second
+// writer is excluded by the store's single-writer fencing).
 #pragma once
 
 #include "duckdb.hpp"

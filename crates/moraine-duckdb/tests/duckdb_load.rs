@@ -1,14 +1,13 @@
 //! Drives a real, pinned DuckDB CLI against a store pre-seeded through the
 //! `moraine` API: `LOAD`s the packaged extension, `ATTACH`es the store, and
-//! exercises listing and `DESCRIBE` through actual SQL. User-table *data*
-//! is served only through DuckLake now (see `ducklake_load.rs`); a data
-//! scan through this standalone attach must raise a redirect error at
-//! execution time, which this suite also asserts.
+//! exercises listing and `DESCRIBE` through actual SQL. A data scan through
+//! this standalone attach must raise a redirect error at execution time
+//! (user-table data is served only through DuckLake); this suite asserts
+//! that too.
 //!
 //! Ignored by default: needs the downloaded DuckDB CLI and the packaged
 //! `.duckdb_extension`, which only `cargo xtask e2e` produces (it sets
-//! `MORAINE_DUCKDB_CLI`/`MORAINE_DUCKDB_EXT` and runs this test
-//! un-ignored). `cargo test --workspace` never depends on either.
+//! `MORAINE_DUCKDB_CLI`/`MORAINE_DUCKDB_EXT` and runs this test un-ignored).
 //!
 //! Run manually after `cargo xtask e2e` has produced the artifacts once:
 //!
@@ -30,8 +29,7 @@ mod tests {
     use object_store::local::LocalFileSystem;
 
     /// A directory under the OS temp dir, unique per call (pid + a
-    /// monotonic counter), removed on drop. Avoids depending on
-    /// `tempfile` for this alone.
+    /// monotonic counter), removed on drop.
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -258,11 +256,9 @@ mod tests {
         ));
         assert_eq!(databases, vec![vec!["m".to_string()]]);
 
-        // Scoped to schema `s` (the fixture's own schema): `main` (minted
-        // by bootstrap) now also carries the synthesized `ducklake_*`
-        // metadata tables this shim serves for a DuckLake attach — see
-        // `metadata_tables.cpp` — which would otherwise leak into this
-        // listing.
+        // Scoped to schema `s`: `main` also carries the synthesized
+        // `ducklake_*` metadata tables this shim serves, which would
+        // otherwise leak into this listing.
         let tables = csv_rows(&run_sql(
             store,
             "SELECT table_name FROM duckdb_tables() WHERE database_name = 'm' AND schema_name = 's' \
@@ -311,11 +307,9 @@ mod tests {
             ]]
         );
 
-        // User-table data is served only through DuckLake now, never this
-        // standalone attach: the scan binds (DESCRIBE above already proved
-        // that) but raises a redirect error at execution time, naming the
-        // table and the `ducklake:moraine:` attach to use instead. Real
-        // data-scan assertions live in `ducklake_load.rs`'s round-trip test.
+        // The scan binds but raises a redirect error at execution time,
+        // naming the table and the `ducklake:moraine:` attach to use
+        // instead.
         let stderr = run_sql_expect_failure(store, "SELECT * FROM m.s.t;");
         assert!(
             stderr.contains("s.t"),

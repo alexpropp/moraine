@@ -1,0 +1,11 @@
+# Editor-only clangd config for the C++ shim. Not consulted by the cargo
+# build (build.rs owns the real compile); it tunes the language server Zed,
+# VS Code, and CLion run so diagnostics match how this code actually builds.
+#
+# Include Cleaner is disabled: the shim includes DuckDB's `duckdb.hpp`
+# amalgamation umbrella header and narrow headers whose types are used only
+# transitively, both of which Include Cleaner reports as "unused" — hundreds
+# of false positives with no true signal here.
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None

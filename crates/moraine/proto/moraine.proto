@@ -255,7 +255,7 @@ message InlineSchemaValue {
   bytes arrow_schema = 1;
 }
 
-// inline/ins and its archive form: an Arrow IPC record-batch body.
+// inline/insert and its archive form: an Arrow IPC record-batch body.
 // data_file_id is set at flush on the archived form — the hook for
 // file-grain archive invalidation.
 message InlineChunkValue {
@@ -265,12 +265,12 @@ message InlineChunkValue {
   optional uint64 data_file_id = 4;
 }
 
-// inline/idel: tombstone for an inlined insert row.
-message InlineIdelValue {
+// inline/inline_delete: tombstone for an inlined insert row.
+message InlineInlineDeleteValue {
   uint64 end_snapshot = 1;
 }
 
-// inline/fdel: inlined delete against a Parquet-file row.
-message InlineFdelValue {
+// inline/file_delete: inlined delete against a Parquet-file row.
+message InlineFileDeleteValue {
   uint64 begin_snapshot = 1;
 }

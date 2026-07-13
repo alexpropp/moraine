@@ -47,14 +47,13 @@ bool MoraineScanBindData::Equals(const duckdb::FunctionData &other_p) const {
 }
 
 duckdb::TableFunction MoraineScanFunction() {
-	// No `bind`/`bind_replace` callback: MoraineTableEntry::GetScanFunction
-	// (the only caller) already produces complete bind data itself; DuckDB's
-	// binder uses that TableFunction + bind_data pair directly.
+	// No `bind`/`bind_replace` callback: the sole caller
+	// (MoraineTableEntry::GetScanFunction) already produces complete bind data.
 	auto function = duckdb::TableFunction("moraine_scan", {}, MoraineScanFunctionImpl, nullptr,
 	                                      MoraineScanInitGlobal, nullptr);
 	// Lets `LogicalGet::GetTable()` find the catalog entry behind this scan,
-	// which is how DESCRIBE/SHOW trace a plan column back to the base table
-	// to read its NOT NULL constraints (otherwise every column looks nullable).
+	// so DESCRIBE/SHOW can read its NOT NULL constraints (otherwise every
+	// column looks nullable).
 	function.get_bind_info = [](const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
 		auto &data = bind_data->Cast<MoraineScanBindData>();
 		if (data.table_entry != nullptr) {

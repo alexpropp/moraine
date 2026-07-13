@@ -1,28 +1,22 @@
-//! The staged-row transaction ABI: DuckLake authors row mutations against
-//! the `ducklake_*` metadata tables through ordinary SQL (INSERT / UPDATE
-//! / DELETE), and the shim translates each row into a [`MoraineCell`]
-//! array and calls into this module. Rows accumulate in memory via
+//! The staged-row transaction ABI: the shim translates each row DuckLake
+//! writes into a [`MoraineCell`] array and calls into this module. Rows
+//! accumulate in memory via
 //! [`moraine::ffi_support::staged::StagedTransaction`] until
-//! [`moraine_txn_commit`] translates and lands them all in one atomic
-//! store batch, or [`moraine_txn_rollback`] discards them.
+//! [`moraine_txn_commit`] lands them all in one atomic store batch, or
+//! [`moraine_txn_rollback`] discards them.
 //!
 //! Same conventions as [`crate::abi`]: `catch_unwind`/null discipline via
-//! `crate::abi::guard`, no internal retry (a lost race at
-//! commit surfaces [`codes::COMMIT_CONFLICT`] with the literal substring
-//! `conflict` in the message — see [`moraine::Error::CommitConflict`]'s
-//! `Display`), and this module is translate-only: it decodes
-//! [`MoraineCell`]s into [`Cell`]s and forwards them, never interpreting
-//! DuckLake's row values itself.
+//! `crate::abi::guard`, no internal retry (a lost race at commit surfaces
+//! [`codes::COMMIT_CONFLICT`] with the literal substring `conflict` in the
+//! message). This module is translate-only: it decodes [`MoraineCell`]s
+//! into [`Cell`]s and forwards them, never interpreting DuckLake's row
+//! values itself.
 //!
-//! [`MoraineTxnHandle`] additionally borrows the owning
-//! [`MoraineCatalogHandle`]'s tokio runtime for [`moraine_txn_begin`] and
-//! [`moraine_txn_commit`] (the only two async operations on this path —
-//! [`moraine::ffi_support::staged::StagedTransaction::stage`] and
-//! `rollback` are synchronous). The borrowed pointer is never
-//! dereferenced after the handle is consumed, and the caller contract
-//! requires the catalog outlive every open transaction on it — the same
-//! discipline the C++ shim already holds for `MoraineSnapshotHandle`
-//! ([`crate::runtime::MoraineSnapshotHandle`]).
+//! [`MoraineTxnHandle`] borrows the owning [`MoraineCatalogHandle`]'s tokio
+//! runtime for [`moraine_txn_begin`] and [`moraine_txn_commit`] (the only
+//! two async operations here; `stage` and `rollback` are synchronous). The
+//! caller contract requires the catalog outlive every open transaction on
+//! it.
 
 use std::ffi::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -33,11 +27,9 @@ use crate::abi::{borrow_bytes, borrow_str, guard};
 use crate::error::{AbiError, MoraineError, codes};
 use crate::runtime::MoraineCatalogHandle;
 
-/// One value in a staged row, as the shim constructs it from a DuckDB
-/// `Value`. Mirrors [`Cell`] but crosses the C boundary as a tagged
-/// struct rather than a Rust enum; `str_value` is borrowed (valid only
-/// for the duration of the [`moraine_txn_stage`] call that reads it,
-/// copied into an owned `String` before returning).
+/// One value in a staged row. Mirrors [`Cell`] as a tagged struct across
+/// the C boundary; `str_value` is borrowed, valid only for the duration of
+/// the [`moraine_txn_stage`] call that reads it.
 #[repr(C)]
 pub struct MoraineCell {
     /// `0` = NULL, `1` = u64, `2` = i64, `3` = bool, `4` = string.
@@ -52,10 +44,10 @@ pub struct MoraineCell {
     pub str_value: *const c_char,
 }
 
-/// A staged-row transaction, opaque to C. Owns one
-/// [`StagedTransaction`] plus a borrowed pointer back to the catalog
-/// handle it was opened on, needed only to `block_on` [`moraine_txn_begin`]
-/// and [`moraine_txn_commit`]'s async core calls.
+/// A staged-row transaction, opaque to C. Owns one [`StagedTransaction`]
+/// plus a borrowed pointer to the catalog handle it was opened on, used to
+/// `block_on` the async core calls in [`moraine_txn_begin`] and
+/// [`moraine_txn_commit`].
 pub struct MoraineTxnHandle {
     catalog: *const MoraineCatalogHandle,
     txn: StagedTransaction,
@@ -81,8 +73,7 @@ fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
     }
 }
 
-/// The three [`RowOp`] shapes, decoded from `op_kind` before the cells
-/// (which every shape needs) are read.
+/// The three [`RowOp`] shapes, decoded from `op_kind`.
 enum OpKind {
     Insert,
     Delete,
@@ -101,9 +92,7 @@ fn decode_op_kind(v: i32) -> Result<OpKind, AbiError> {
 }
 
 /// Decodes a borrowed `MoraineCell` array into owned [`Cell`]s. A null
-/// `cells` pointer is valid only when `len` is `0` (an empty row, e.g. a
-/// zero-key stats delete never occurs today but is not assumed away
-/// here).
+/// `cells` pointer is valid only when `len` is `0`.
 ///
 /// # Safety
 ///
@@ -192,16 +181,15 @@ pub unsafe extern "C" fn moraine_txn_begin(
 }
 
 /// Accumulates one staged row mutation. Nothing touches the store until
-/// [`moraine_txn_commit`]. `table_kind` is
-/// [`TableKind`]'s discriminant order (`0` = `Snapshot`, `1` =
-/// `SnapshotChanges`, `2` = `Schema`, `3` = `Table`, `4` = `View`, `5` =
-/// `Column`, `6` = `DataFile`, `7` = `DeleteFile`, `8` = `TableStats`,
-/// `9` = `TableColumnStats`, `10` = `FileColumnStats`, `11` =
-/// `SchemaVersions`); `op_kind` is `0`
-/// = insert, `1` = delete, `2` = update-sets-`end_snapshot`. `cells` are
-/// positional in the exact column order `crates/moraine-duckdb/cpp/metadata_tables.cpp`
-/// declares for `table_kind`'s table (a delete or update-set-end row
-/// carries only the key columns, per [`RowOp`]'s variants).
+/// [`moraine_txn_commit`]. `table_kind` is [`TableKind`]'s discriminant
+/// order (`0` = `Snapshot`, `1` = `SnapshotChanges`, `2` = `Schema`, `3` =
+/// `Table`, `4` = `View`, `5` = `Column`, `6` = `DataFile`, `7` =
+/// `DeleteFile`, `8` = `TableStats`, `9` = `TableColumnStats`, `10` =
+/// `FileColumnStats`, `11` = `SchemaVersions`); `op_kind` is `0` = insert,
+/// `1` = delete, `2` = update-sets-`end_snapshot`. `cells` are positional
+/// in the column order the shim declares for `table_kind`'s table (a delete
+/// or update-set-end row carries only the key columns, per [`RowOp`]'s
+/// variants).
 ///
 /// # Safety
 ///
@@ -259,11 +247,9 @@ pub unsafe extern "C" fn moraine_txn_stage(
 /// consuming `txn`. On success, writes the new snapshot id to
 /// `*out_snapshot_id`.
 ///
-/// A lost race against a concurrent commit is **never retried
-/// internally**: it returns [`codes::COMMIT_CONFLICT`] with the literal
-/// substring `conflict` in the message, and the store is left unchanged
-/// by the loser (matching DuckLake's own substring-scanning retry
-/// classifier — see [`moraine::Error::CommitConflict`]). `txn` is freed
+/// A lost race against a concurrent commit is never retried internally: it
+/// returns [`codes::COMMIT_CONFLICT`] with the literal substring `conflict`
+/// in the message, and the loser leaves the store unchanged. `txn` is freed
 /// either way; it must not be passed to [`moraine_txn_rollback`]
 /// afterward.
 ///
@@ -375,7 +361,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_schema(
     }
 }
 
-/// Stages `inline/ins`: one Arrow record-batch chunk of inlined rows.
+/// Stages `inline/insert`: one Arrow record-batch chunk of inlined rows.
 ///
 /// # Safety
 ///
@@ -422,7 +408,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
     }
 }
 
-/// Stages `inline/idel`: tombstones one inlined-insert row.
+/// Stages `inline/inline_delete`: tombstones one inlined-insert row.
 ///
 /// # Safety
 ///
@@ -430,7 +416,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
 /// and not yet committed or rolled back. `err`, if non-null, must be a
 /// valid, writable [`MoraineError`]. Both for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_idel(
+pub unsafe extern "C" fn moraine_txn_stage_inline_inline_delete(
     txn: *mut MoraineTxnHandle,
     table_id: u64,
     row_id: u64,
@@ -443,7 +429,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_idel(
         }
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineIdel {
+        txn_ref.txn.stage(RowOp::InlineInlineDelete {
             table_id,
             row_id,
             end_snapshot,
@@ -458,13 +444,13 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_idel(
     }
 }
 
-/// Stages `inline/fdel`: an inlined delete against a Parquet-file row.
+/// Stages `inline/file_delete`: an inlined delete against a Parquet-file row.
 ///
 /// # Safety
 ///
-/// Same contract as [`moraine_txn_stage_inline_idel`].
+/// Same contract as [`moraine_txn_stage_inline_inline_delete`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_fdel(
+pub unsafe extern "C" fn moraine_txn_stage_inline_file_delete(
     txn: *mut MoraineTxnHandle,
     table_id: u64,
     data_file_id: u64,
@@ -478,7 +464,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_fdel(
         }
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineFdel {
+        txn_ref.txn.stage(RowOp::InlineFileDelete {
             table_id,
             data_file_id,
             row_id,
@@ -494,13 +480,13 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_fdel(
     }
 }
 
-/// Stages a flush-delete: removes every `inline/ins` chunk begun at or
+/// Stages a flush-delete: removes every `inline/insert` chunk begun at or
 /// before `flush_snapshot` for `(table_id, schema_version)`, plus the
-/// `inline/idel` tombstones those chunks' rows consumed.
+/// `inline/inline_delete` tombstones those chunks' rows consumed.
 ///
 /// # Safety
 ///
-/// Same contract as [`moraine_txn_stage_inline_idel`].
+/// Same contract as [`moraine_txn_stage_inline_inline_delete`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_txn_stage_inline_flush_delete(
     txn: *mut MoraineTxnHandle,
@@ -550,6 +536,41 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_drop(
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
         txn_ref.txn.stage(RowOp::InlineDrop { table_id });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stages a schema-version-scoped deregistration: removes only the
+/// `inline/schema` record for `(table_id, schema_version)`, leaving any
+/// other schema version's `inline/*` records untouched (unlike
+/// [`moraine_txn_stage_inline_drop`], which is table-wide).
+///
+/// # Safety
+///
+/// Same contract as [`moraine_txn_stage_inline_drop`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_txn_stage_inline_schema_drop(
+    txn: *mut MoraineTxnHandle,
+    table_id: u64,
+    schema_version: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if txn.is_null() {
+            return Err(AbiError::invalid_argument("`txn` is null"));
+        }
+        // SAFETY: caller contract for `txn`.
+        let txn_ref = unsafe { &mut *txn };
+        txn_ref.txn.stage(RowOp::InlineSchemaDrop {
+            table_id,
+            schema_version,
+        });
         Ok(())
     };
 
@@ -1029,10 +1050,8 @@ mod tests {
                     null_cell(),
                 ],
             );
-            // Keep `arena`'s `CString`s alive through every `stage` call
-            // above by leaking it — the process-lifetime test doesn't
-            // need it freed, and dropping early would dangle the borrowed
-            // pointers `stage` already returned from.
+            // Leak `arena` to keep its `CString`s alive past every `stage`
+            // call's borrowed pointers.
             std::mem::forget(arena);
         }
 
@@ -1212,10 +1231,11 @@ mod tests {
             "MoraineCell",
             "moraine_txn_stage_inline_schema",
             "moraine_txn_stage_inline_insert",
-            "moraine_txn_stage_inline_idel",
-            "moraine_txn_stage_inline_fdel",
+            "moraine_txn_stage_inline_inline_delete",
+            "moraine_txn_stage_inline_file_delete",
             "moraine_txn_stage_inline_flush_delete",
             "moraine_txn_stage_inline_drop",
+            "moraine_txn_stage_inline_schema_drop",
         ];
         for name in names {
             assert!(
