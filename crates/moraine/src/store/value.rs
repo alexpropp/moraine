@@ -67,6 +67,7 @@ mod tests {
     roundtrip!(roundtrip_view, ViewValue);
     roundtrip!(roundtrip_column, ColumnValue);
     roundtrip!(roundtrip_partition, PartitionValue);
+    roundtrip!(roundtrip_sort, SortValue);
     roundtrip!(roundtrip_data_file, DataFileValue);
     roundtrip!(roundtrip_delete_file, DeleteFileValue);
     roundtrip!(roundtrip_file_column_stats, FileColumnStatsValue);

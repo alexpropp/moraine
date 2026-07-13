@@ -18,8 +18,9 @@ use crate::{
     error::Result,
     store::{
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, SchemaValue,
-            SnapshotValue, TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, PartitionValue,
+            SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
+            TableValue, ViewValue,
         },
         read::{EntityRecord, scan_current_entities, scan_history_entities, scan_snapshots},
     },
@@ -101,6 +102,28 @@ pub async fn dump_data_files(catalog: &Catalog) -> Result<Vec<DataFileValue>> {
 pub async fn dump_delete_files(catalog: &Catalog) -> Result<Vec<DeleteFileValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::DeleteFile(v) => Some(v),
+        _ => None,
+    })
+    .await
+}
+
+/// Every `ducklake_partition_info` row (with its embedded partition
+/// columns), current and history.
+#[doc(hidden)]
+pub async fn dump_partition_info(catalog: &Catalog) -> Result<Vec<PartitionValue>> {
+    dump_entities(catalog, |r| match r {
+        EntityRecord::Partition(v) => Some(v),
+        _ => None,
+    })
+    .await
+}
+
+/// Every `ducklake_sort_info` row (with its embedded sort expressions),
+/// current and history.
+#[doc(hidden)]
+pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
+    dump_entities(catalog, |r| match r {
+        EntityRecord::Sort(v) => Some(v),
         _ => None,
     })
     .await

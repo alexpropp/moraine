@@ -80,9 +80,24 @@ on that path.
   serializes to IPC; decode feeds the structs back to DuckDB's own arrow
   importer. Flush is still a transcode (not zero-copy); see RFC 0005's
   reconciliations
-- [ ] Partitioning: partition definitions, values, and pruning
-  (`partition_info`, `partition_column`, `file_partition_value`) (RFC 0013)
-- [ ] Sort orders (`sort_info`, `sort_expression`)
+- [x] Partitioning: partition definitions, values, and pruning
+  (`partition_info`, `partition_column`, `file_partition_value`) (RFC 0013).
+  The spec lives at the `partition` kind with its columns embedded;
+  per-file values embed in the `file` record and DuckLake's separate
+  `ducklake_file_partition_value` inserts fold into the file's record at
+  commit. `SET PARTITIONED BY` / repartition / `RESET PARTITIONED BY`,
+  partition-pruned reads (`Total Files Read: 1`), and time travel verified
+  live (`ducklake_load.rs`'s
+  `ducklake_partitioning_specs_values_and_pruning`); moraine serves
+  specs/values verbatim and DuckLake's planner prunes
+- [x] Sort orders (`sort_info`, `sort_expression`) (RFC 0013). The spec
+  lives at the new `sort` kind with its expressions embedded
+  (expression/dialect/direction/null order stored verbatim; moraine never
+  sorts — DuckLake's writer does, on `INSERT`). `SET SORTED BY` / change /
+  `RESET SORTED BY` and drop-with-history verified live
+  (`ducklake_load.rs`'s `ducklake_sort_specs_round_trip_and_reset`); a
+  sort change does not bump `schema_version` (RFC 0004's
+  altered-but-not-schema-versioned class)
 - [x] Statistics for pruning: table, column, per-file, and variant stats
   (`table_stats`, `table_column_stats`, `file_column_stats`,
   `file_variant_stats`) (variant stats pending)

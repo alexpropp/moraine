@@ -8,8 +8,9 @@ use crate::{
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
-            HeadValue, MigrationValue, OptionScopeValue, SchemaValue, SnapshotValue,
-            TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+            HeadValue, MigrationValue, OptionScopeValue, PartitionValue, SchemaValue,
+            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue,
+            ViewValue,
         },
         value,
     },
@@ -31,6 +32,10 @@ pub(crate) enum EntityRecord {
     File(DataFileValue),
     /// A delete file record.
     DeleteFile(DeleteFileValue),
+    /// A partition spec record.
+    Partition(PartitionValue),
+    /// A sort spec record.
+    Sort(SortValue),
     /// File-level column statistics record.
     FileColumnStats(FileColumnStatsValue),
     /// Table-level statistics record.
@@ -112,6 +117,8 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
         EntityKey::Column { .. } => Ok(EntityRecord::Column(value::decode_value(bytes)?)),
         EntityKey::File { .. } => Ok(EntityRecord::File(value::decode_value(bytes)?)),
         EntityKey::DeleteFile { .. } => Ok(EntityRecord::DeleteFile(value::decode_value(bytes)?)),
+        EntityKey::Partition { .. } => Ok(EntityRecord::Partition(value::decode_value(bytes)?)),
+        EntityKey::Sort { .. } => Ok(EntityRecord::Sort(value::decode_value(bytes)?)),
         EntityKey::FileColumnStats { .. } => {
             Ok(EntityRecord::FileColumnStats(value::decode_value(bytes)?))
         }
@@ -127,7 +134,7 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
             scope_id,
             value: value::decode_value(bytes)?,
         }),
-        other => Err(Error::Corruption(format!(
+        other @ EntityKey::Tag { .. } => Err(Error::Corruption(format!(
             "entity kind not modeled by this binary: {other:?}"
         ))),
     }

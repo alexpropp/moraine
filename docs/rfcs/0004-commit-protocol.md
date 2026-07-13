@@ -406,9 +406,12 @@ data (RFC 0003 verb names):
 - **Schema-changing** (`schema_version` bumps): create/drop schema;
   create/rename/drop table and move-to-schema; create/alter/rename/drop
   view; add/remove/rename column, column type change, default and
-  null-constraint changes; set partition key; set sort key; **table and
-  column comments** (they are alters in DuckLake and ride the same path);
-  create/drop macros.
+  null-constraint changes; set partition key; create/drop macros.
+- **Altered but not schema-versioned**: set sort key; table and column
+  comments. DuckLake marks the table altered — conflict detection sees the
+  alter — but does not bump `schema_version` (a sort or comment change
+  never invalidates cross-file compaction, so the
+  `ducklake_schema_versions` grouping is unaffected).
 - **Data-only** (`schema_version` carried forward): `register_data_file` /
   `expire_data_file`, `register_delete_file` / `expire_delete_file`,
   statistics updates, column/name-mapping registration, and the RFC 0005
@@ -422,8 +425,10 @@ data (RFC 0003 verb names):
 
 This classification is source-verified against DuckLake
 (`DuckLakeTransactionState::SchemaChangesMade`, which tests exactly the
-new/dropped table, schema, view, and macro sets — every `AlterEntry`
-variant lands its new entry in `new_tables` and therefore bumps).
+new/dropped table, schema, view, and macro sets; per-table alters route
+through `GetTransactionTableChanges`, which decides per change type
+whether the alter also bumps `schema_version` — `SET_SORT_KEY` and the
+comment changes land in `altered_tables` only).
 
 The flag is an explicit property of the mutation set, not something
 inferred from the batch's key set after the fact — an inference would

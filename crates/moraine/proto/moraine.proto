@@ -93,6 +93,24 @@ message PartitionValue {
   repeated PartitionColumn columns = 5;
 }
 
+// ducklake_sort_expression — embedded in SortValue.
+message SortExpression {
+  uint64 sort_key_index = 1;
+  string expression = 2;
+  string dialect = 3;
+  string sort_direction = 4;
+  string null_order = 5;
+}
+
+// ducklake_sort_info (+ sort expressions embedded).
+message SortValue {
+  uint64 sort_id = 1;
+  uint64 table_id = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  repeated SortExpression expressions = 5;
+}
+
 // ducklake_file_partition_value — embedded in DataFileValue.
 message FilePartitionValue {
   uint64 partition_key_index = 1;

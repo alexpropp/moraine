@@ -482,6 +482,83 @@ fn diff_delete_files(
     }
 }
 
+fn diff_partitions(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    let partition_tables = base
+        .partitions
+        .keys()
+        .chain(state.partitions.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    for &table_id in partition_tables {
+        static EMPTY: std::collections::BTreeMap<u64, proto::PartitionValue> =
+            std::collections::BTreeMap::new();
+
+        let base_specs = base.partitions.get(&table_id).unwrap_or(&EMPTY);
+        let state_specs = state.partitions.get(&table_id).unwrap_or(&EMPTY);
+        for &partition_id in base_specs
+            .keys()
+            .chain(state_specs.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            stage_transition(
+                writes,
+                EntityKey::Partition {
+                    table_id,
+                    partition_id,
+                },
+                base_specs.get(&partition_id),
+                state_specs.get(&partition_id),
+                new_snapshot,
+                |prior| proto::PartitionValue {
+                    end_snapshot: Some(new_snapshot),
+                    ..prior.clone()
+                },
+            );
+        }
+    }
+}
+
+fn diff_sorts(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    let sort_tables = base
+        .sorts
+        .keys()
+        .chain(state.sorts.keys())
+        .collect::<std::collections::BTreeSet<_>>();
+    for &table_id in sort_tables {
+        static EMPTY: std::collections::BTreeMap<u64, proto::SortValue> =
+            std::collections::BTreeMap::new();
+
+        let base_specs = base.sorts.get(&table_id).unwrap_or(&EMPTY);
+        let state_specs = state.sorts.get(&table_id).unwrap_or(&EMPTY);
+        for &sort_id in base_specs
+            .keys()
+            .chain(state_specs.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            stage_transition(
+                writes,
+                EntityKey::Sort { table_id, sort_id },
+                base_specs.get(&sort_id),
+                state_specs.get(&sort_id),
+                new_snapshot,
+                |prior| proto::SortValue {
+                    end_snapshot: Some(new_snapshot),
+                    ..prior.clone()
+                },
+            );
+        }
+    }
+}
+
 fn diff_table_stats(
     writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
@@ -588,6 +665,8 @@ pub(crate) fn diff_writes(
     diff_columns(&mut writes, base, state, new_snapshot);
     diff_data_files(&mut writes, base, state, new_snapshot);
     diff_delete_files(&mut writes, base, state, new_snapshot);
+    diff_partitions(&mut writes, base, state, new_snapshot);
+    diff_sorts(&mut writes, base, state, new_snapshot);
     diff_table_stats(&mut writes, base, state);
     diff_table_column_stats(&mut writes, base, state);
     diff_file_column_stats(&mut writes, base, state);

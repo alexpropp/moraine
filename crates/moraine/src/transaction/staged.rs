@@ -73,6 +73,16 @@ pub enum TableKind {
     /// snapshot record's `schema_changed_table_ids`, with both redundant values
     /// validated against the `ducklake_snapshot` row in the same batch.
     SchemaVersions,
+    /// `ducklake_partition_info`.
+    PartitionInfo,
+    /// `ducklake_partition_column` — folded into its spec's record.
+    PartitionColumn,
+    /// `ducklake_file_partition_value` — folded into its file's record.
+    FilePartitionValue,
+    /// `ducklake_sort_info`.
+    SortInfo,
+    /// `ducklake_sort_expression` — folded into its spec's record.
+    SortExpression,
 }
 
 /// One column value in a staged row, typed to the small set of primitive
@@ -521,9 +531,137 @@ fn decode_file_column_stats(cells: &[Cell]) -> Result<proto::FileColumnStatsValu
     Ok(value)
 }
 
+fn decode_partition_info(cells: &[Cell]) -> Result<proto::PartitionValue> {
+    let mut c = Cursor::new(TableKind::PartitionInfo, cells);
+    let value = proto::PartitionValue {
+        partition_id: c.u64()?,
+        table_id: c.u64()?,
+        begin_snapshot: c.u64()?,
+        end_snapshot: c.opt_u64()?,
+        columns: Vec::new(),
+    };
+    c.finish()?;
+
+    Ok(value)
+}
+
+fn decode_partition_column(cells: &[Cell]) -> Result<(u64, proto::PartitionColumn)> {
+    let mut c = Cursor::new(TableKind::PartitionColumn, cells);
+    let partition_id = c.u64()?;
+    let _table_id = c.u64()?;
+    let column = proto::PartitionColumn {
+        partition_key_index: c.u64()?,
+        column_id: c.u64()?,
+        transform: c.string()?,
+    };
+    c.finish()?;
+
+    Ok((partition_id, column))
+}
+
+fn decode_file_partition_value(cells: &[Cell]) -> Result<((u64, u64), proto::FilePartitionValue)> {
+    let mut c = Cursor::new(TableKind::FilePartitionValue, cells);
+    let data_file_id = c.u64()?;
+    let table_id = c.u64()?;
+    let value = proto::FilePartitionValue {
+        partition_key_index: c.u64()?,
+        partition_value: c.string()?,
+    };
+    c.finish()?;
+
+    Ok(((table_id, data_file_id), value))
+}
+
+fn decode_sort_info(cells: &[Cell]) -> Result<proto::SortValue> {
+    let mut c = Cursor::new(TableKind::SortInfo, cells);
+    let value = proto::SortValue {
+        sort_id: c.u64()?,
+        table_id: c.u64()?,
+        begin_snapshot: c.u64()?,
+        end_snapshot: c.opt_u64()?,
+        expressions: Vec::new(),
+    };
+    c.finish()?;
+
+    Ok(value)
+}
+
+fn decode_sort_expression(cells: &[Cell]) -> Result<(u64, proto::SortExpression)> {
+    let mut c = Cursor::new(TableKind::SortExpression, cells);
+    let sort_id = c.u64()?;
+    let _table_id = c.u64()?;
+    let expression = proto::SortExpression {
+        sort_key_index: c.u64()?,
+        expression: c.string()?,
+        dialect: c.string()?,
+        sort_direction: c.string()?,
+        null_order: c.string()?,
+    };
+    c.finish()?;
+
+    Ok((sort_id, expression))
+}
+
+/// Child-table rows collected before the insert pass: each is folded
+/// into its parent record when the parent's insert applies, and a
+/// leftover after the pass means a child row named a parent this commit
+/// never inserted — a shape error.
+#[derive(Default)]
+struct ChildRows {
+    partition_columns: HashMap<u64, Vec<proto::PartitionColumn>>,
+    sort_expressions: HashMap<u64, Vec<proto::SortExpression>>,
+    file_partition_values: HashMap<(u64, u64), Vec<proto::FilePartitionValue>>,
+}
+
+fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
+    let mut children = ChildRows::default();
+    for op in ops {
+        if let RowOperation::Insert { table, cells } = op {
+            match table {
+                TableKind::PartitionColumn => {
+                    let (partition_id, column) = decode_partition_column(cells)?;
+                    children
+                        .partition_columns
+                        .entry(partition_id)
+                        .or_default()
+                        .push(column);
+                }
+                TableKind::SortExpression => {
+                    let (sort_id, expression) = decode_sort_expression(cells)?;
+                    children
+                        .sort_expressions
+                        .entry(sort_id)
+                        .or_default()
+                        .push(expression);
+                }
+                TableKind::FilePartitionValue => {
+                    let (file, value) = decode_file_partition_value(cells)?;
+                    children
+                        .file_partition_values
+                        .entry(file)
+                        .or_default()
+                        .push(value);
+                }
+                _ => {}
+            }
+        }
+    }
+    for columns in children.partition_columns.values_mut() {
+        columns.sort_by_key(|c| c.partition_key_index);
+    }
+    for expressions in children.sort_expressions.values_mut() {
+        expressions.sort_by_key(|e| e.sort_key_index);
+    }
+    for values in children.file_partition_values.values_mut() {
+        values.sort_by_key(|v| v.partition_key_index);
+    }
+
+    Ok(children)
+}
+
 /// Decodes an `UPDATE ... SET end_snapshot` row into the ended entity's
-/// key and the new `end_snapshot` value. Defined only for the six
-/// versioned kinds.
+/// key and the new `end_snapshot` value. Defined only for the versioned
+/// kinds.
 fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, u64)> {
     let mut c = Cursor::new(table, cells);
     let key = match table {
@@ -544,12 +682,23 @@ fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, u64)> {
             table_id: c.u64()?,
             delete_file_id: c.u64()?,
         },
+        TableKind::PartitionInfo => EntityKey::Partition {
+            table_id: c.u64()?,
+            partition_id: c.u64()?,
+        },
+        TableKind::SortInfo => EntityKey::Sort {
+            table_id: c.u64()?,
+            sort_id: c.u64()?,
+        },
         TableKind::Snapshot
         | TableKind::SnapshotChanges
         | TableKind::SchemaVersions
         | TableKind::TableStats
         | TableKind::TableColumnStats
-        | TableKind::FileColumnStats => {
+        | TableKind::FileColumnStats
+        | TableKind::PartitionColumn
+        | TableKind::FilePartitionValue
+        | TableKind::SortExpression => {
             return Err(Error::Constraint(format!(
                 "update_set_end is not defined for {table:?}"
             )));
@@ -597,9 +746,10 @@ fn apply_op(
     state: &mut CatalogSnapshot,
     op: &RowOperation,
     new_id: u64,
+    children: &mut ChildRows,
 ) -> Result<()> {
     match op {
-        RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells),
+        RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells, children),
         RowOperation::UpdateSetEnd { table, cells } => {
             apply_update_set_end(state, *table, cells, new_id)
         }
@@ -636,16 +786,47 @@ fn apply_insert(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    children: &mut ChildRows,
 ) -> Result<()> {
     match table {
-        // Folded into the snapshot record separately; not an entity mutation.
-        TableKind::Snapshot | TableKind::SnapshotChanges | TableKind::SchemaVersions => {}
+        // Snapshot rows fold into the snapshot record separately; child
+        // rows fold into their parent records via `collect_child_rows`.
+        // Neither is an entity mutation of its own.
+        TableKind::Snapshot
+        | TableKind::SnapshotChanges
+        | TableKind::SchemaVersions
+        | TableKind::PartitionColumn
+        | TableKind::SortExpression
+        | TableKind::FilePartitionValue => {}
         TableKind::Schema => state.put_schema(decode_schema(cells)?),
         TableKind::Table => state.put_table(table_value(base, decode_table(cells)?)),
         TableKind::View => state.put_view(decode_view(cells)?),
         TableKind::Column => state.put_column(decode_column(cells)?),
-        TableKind::DataFile => state.put_data_file(decode_data_file(cells)?),
+        TableKind::DataFile => {
+            let mut value = decode_data_file(cells)?;
+            value.partition_values = children
+                .file_partition_values
+                .remove(&(value.table_id, value.data_file_id))
+                .unwrap_or_default();
+            state.put_data_file(value);
+        }
         TableKind::DeleteFile => state.put_delete_file(decode_delete_file(cells)?),
+        TableKind::PartitionInfo => {
+            let mut value = decode_partition_info(cells)?;
+            value.columns = children
+                .partition_columns
+                .remove(&value.partition_id)
+                .unwrap_or_default();
+            state.put_partition(value);
+        }
+        TableKind::SortInfo => {
+            let mut value = decode_sort_info(cells)?;
+            value.expressions = children
+                .sort_expressions
+                .remove(&value.sort_id)
+                .unwrap_or_default();
+            state.put_sort(value);
+        }
         TableKind::TableStats => state.put_table_stats(decode_table_stats(cells)?),
         TableKind::TableColumnStats => {
             state.put_table_column_stats(decode_table_column_stats(cells)?);
@@ -708,9 +889,15 @@ fn apply_update_set_end(
                 files.remove(&delete_file_id);
             }
         }
-        // decode_end only ever returns the six keys matched above.
+        EntityKey::Partition {
+            table_id,
+            partition_id,
+        } => state.delete_partition(table_id, partition_id),
+        EntityKey::Sort { table_id, sort_id } => state.delete_sort(table_id, sort_id),
+        // decode_end only ever returns the keys matched above.
         _ => return Err(corrupt_row(table, "unreachable entity key")),
     }
+
     Ok(())
 }
 
@@ -953,15 +1140,35 @@ fn translate(
     // separately via `translate_inline`, since `CatalogSnapshot` has no
     // notion of inlined rows to diff.
     let mut state = base.clone();
+    let mut children = collect_child_rows(ops)?;
     for op in ops {
         if !is_inline_op(op) && !matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id)?;
+            apply_op(base, &mut state, op, new_id, &mut children)?;
         }
     }
     for op in ops {
         if matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id)?;
+            apply_op(base, &mut state, op, new_id, &mut children)?;
         }
+    }
+
+    if !children.partition_columns.is_empty() {
+        return Err(corrupt_row(
+            TableKind::PartitionColumn,
+            "partition_column rows without a matching partition_info insert in this commit",
+        ));
+    }
+    if !children.sort_expressions.is_empty() {
+        return Err(corrupt_row(
+            TableKind::SortExpression,
+            "sort_expression rows without a matching sort_info insert in this commit",
+        ));
+    }
+    if !children.file_partition_values.is_empty() {
+        return Err(corrupt_row(
+            TableKind::FilePartitionValue,
+            "file_partition_value rows without a matching data_file insert in this commit",
+        ));
     }
 
     let writes = commit::diff_writes(base, &state, new_id);
@@ -2013,5 +2220,347 @@ mod tests {
             )]
         );
         assert_eq!(chunks.len(), 1, "schema_version 1's chunk must survive");
+    }
+
+    fn partition_info_row(partition_id: u64, table_id: u64, begin: u64) -> Vec<Cell> {
+        vec![
+            Cell::U64(partition_id),
+            Cell::U64(table_id),
+            Cell::U64(begin),
+            Cell::Null,
+        ]
+    }
+
+    fn partition_column_row(
+        partition_id: u64,
+        table_id: u64,
+        index: u64,
+        column_id: u64,
+    ) -> Vec<Cell> {
+        vec![
+            Cell::U64(partition_id),
+            Cell::U64(table_id),
+            Cell::U64(index),
+            Cell::U64(column_id),
+            Cell::Str("identity".to_string()),
+        ]
+    }
+
+    fn file_partition_value_row(
+        data_file_id: u64,
+        table_id: u64,
+        index: u64,
+        value: &str,
+    ) -> Vec<Cell> {
+        vec![
+            Cell::U64(data_file_id),
+            Cell::U64(table_id),
+            Cell::U64(index),
+            Cell::Str(value.to_string()),
+        ]
+    }
+
+    fn data_file_row(data_file_id: u64, table_id: u64, begin: u64) -> Vec<Cell> {
+        vec![
+            Cell::U64(data_file_id),
+            Cell::U64(table_id),
+            Cell::U64(begin),
+            Cell::Null,                       // end_snapshot
+            Cell::Null,                       // file_order
+            Cell::Str("data.parquet".into()), // path
+            Cell::Bool(true),                 // path_is_relative
+            Cell::Str("parquet".into()),      // file_format
+            Cell::U64(10),                    // record_count
+            Cell::U64(1024),                  // file_size_bytes
+            Cell::U64(64),                    // footer_size
+            Cell::U64(0),                     // row_id_start
+            Cell::Null,                       // partition_id
+            Cell::Null,                       // encryption_key
+            Cell::Null,                       // mapping_id
+            Cell::Null,                       // partial_max
+        ]
+    }
+
+    /// A partition spec, its columns, and a file's partition values land
+    /// verbatim; repartitioning ends the old spec; time travel
+    /// reconstructs the spec-in-force, and every file still reports the
+    /// spec it was written under.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn partition_spec_rows_land_fold_and_time_travel() {
+        let catalog = open().await;
+
+        // Commit 1: table + column + spec 10 (identity on column 1) + one
+        // data file written under it, carrying one partition value.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "part_key", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::PartitionInfo,
+            cells: partition_info_row(10, 1, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::PartitionColumn,
+            cells: partition_column_row(10, 1, 0, 1),
+        });
+        let mut file = data_file_row(1, 1, 1);
+        file[12] = Cell::U64(10); // partition_id
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: file,
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilePartitionValue,
+            cells: file_partition_value_row(1, 1, 0, "7"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 11),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let spec = &head.partitions[&1][&10];
+        assert_eq!(spec.begin_snapshot, 1);
+        assert_eq!(spec.columns.len(), 1);
+        assert_eq!(spec.columns[0].column_id, 1);
+        assert_eq!(spec.columns[0].transform, "identity");
+        let stored = &head.data_files[&1][&1];
+        assert_eq!(stored.partition_id, Some(10));
+        assert_eq!(stored.partition_values.len(), 1);
+        assert_eq!(stored.partition_values[0].partition_value, "7");
+
+        // Commit 2: repartition — end spec 10, insert spec 11.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::PartitionInfo,
+            cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(2)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::PartitionInfo,
+            cells: partition_info_row(11, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::PartitionColumn,
+            cells: partition_column_row(11, 1, 0, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 12),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "altered_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        assert!(!head.partitions[&1].contains_key(&10));
+        assert!(head.partitions[&1].contains_key(&11));
+        // The file still names the spec it was written under.
+        assert_eq!(head.data_files[&1][&1].partition_id, Some(10));
+
+        // Time travel reconstructs spec 10 at snapshot 1.
+        let at_one = catalog
+            .snapshot_at(crate::catalog::SnapshotId::new(1))
+            .await
+            .unwrap();
+        assert!(at_one.partitions[&1].contains_key(&10));
+        assert!(!at_one.partitions[&1].contains_key(&11));
+
+        // The dump surface serves current and history rows unfiltered.
+        let specs = crate::ffi_support::dump_partition_info(&catalog)
+            .await
+            .unwrap();
+        assert!(
+            specs
+                .iter()
+                .any(|p| p.partition_id == 10 && p.end_snapshot == Some(2))
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|p| p.partition_id == 11 && p.end_snapshot.is_none())
+        );
+
+        // Commit 3: clear — end spec 11, insert nothing.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::PartitionInfo,
+            cells: vec![Cell::U64(1), Cell::U64(11), Cell::U64(3)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3, 1, 12),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(3, "altered_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        assert!(
+            head.partitions
+                .get(&1)
+                .is_none_or(std::collections::BTreeMap::is_empty)
+        );
+
+        catalog.close().await.unwrap();
+    }
+
+    fn sort_info_row(sort_id: u64, table_id: u64, begin: u64) -> Vec<Cell> {
+        vec![
+            Cell::U64(sort_id),
+            Cell::U64(table_id),
+            Cell::U64(begin),
+            Cell::Null,
+        ]
+    }
+
+    fn sort_expression_row(sort_id: u64, table_id: u64, index: u64, expression: &str) -> Vec<Cell> {
+        vec![
+            Cell::U64(sort_id),
+            Cell::U64(table_id),
+            Cell::U64(index),
+            Cell::Str(expression.to_string()),
+            Cell::Str("duckdb".to_string()),
+            Cell::Str("DESC".to_string()),
+            Cell::Str("NULLS_FIRST".to_string()),
+        ]
+    }
+
+    /// A sort spec and its expressions land verbatim — direction, null
+    /// order, and dialect untouched; re-sorting ends the old spec; time
+    /// travel reconstructs the spec-in-force.
+    #[tokio::test]
+    async fn sort_spec_rows_land_fold_and_time_travel() {
+        let catalog = open().await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "v", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SortInfo,
+            cells: sort_info_row(20, 1, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SortExpression,
+            cells: sort_expression_row(20, 1, 0, "v"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 21),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let spec = &head.sorts[&1][&20];
+        assert_eq!(spec.begin_snapshot, 1);
+        assert_eq!(spec.expressions.len(), 1);
+        assert_eq!(spec.expressions[0].expression, "v");
+        assert_eq!(spec.expressions[0].dialect, "duckdb");
+        assert_eq!(spec.expressions[0].sort_direction, "DESC");
+        assert_eq!(spec.expressions[0].null_order, "NULLS_FIRST");
+
+        // End spec 20, insert spec 21 — the snapshot row keeps the same
+        // schema_version: DuckLake does not bump it for sort changes.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::SortInfo,
+            cells: vec![Cell::U64(1), Cell::U64(20), Cell::U64(2)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SortInfo,
+            cells: sort_info_row(21, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SortExpression,
+            cells: sort_expression_row(21, 1, 0, "v || 'x'"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 22),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "altered_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        assert!(!head.sorts[&1].contains_key(&20));
+        assert_eq!(head.sorts[&1][&21].expressions[0].expression, "v || 'x'");
+
+        let at_one = catalog
+            .snapshot_at(crate::catalog::SnapshotId::new(1))
+            .await
+            .unwrap();
+        assert!(at_one.sorts[&1].contains_key(&20));
+        assert!(!at_one.sorts[&1].contains_key(&21));
+
+        // The dump surface serves current and history rows unfiltered.
+        let specs = crate::ffi_support::dump_sort_info(&catalog).await.unwrap();
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.sort_id == 20 && s.end_snapshot == Some(2))
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|s| s.sort_id == 21 && s.end_snapshot.is_none())
+        );
+
+        catalog.close().await.unwrap();
+    }
+
+    /// A `partition_column` row whose spec is not inserted in the same
+    /// commit is a shape error, not a silent drop.
+    #[tokio::test]
+    async fn orphaned_partition_column_row_is_rejected() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::PartitionColumn,
+            cells: partition_column_row(99, 1, 0, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "none"),
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(err.to_string().contains("partition"), "{err}");
+        catalog.close().await.unwrap();
     }
 }

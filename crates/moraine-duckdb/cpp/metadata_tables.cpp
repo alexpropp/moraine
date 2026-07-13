@@ -437,13 +437,122 @@ std::vector<std::vector<duckdb::Value>> ProvideSchemaVersions(MoraineCatalogHand
 }
 
 // Always-empty stand-in for a `ducklake_*` table covering a feature the
-// store doesn't model (tags, data inlining, column mapping, macros,
-// partitioning, sorting). The table must still exist as a SQL table:
-// DuckLake's attach/snapshot-load query joins every one of them
-// unconditionally, so a missing table is a bind-time Catalog Error even
-// where the query would return zero rows for it.
+// store doesn't model (tags, data inlining, column mapping, macros). The
+// table must still exist as a SQL table: DuckLake's attach/snapshot-load
+// query joins every one of them unconditionally, so a missing table is a
+// bind-time Catalog Error even where the query would return zero rows
+// for it.
 std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *, MoraineInterruptProbe, void *) {
 	return {};
+}
+
+std::vector<std::vector<duckdb::Value>> ProvidePartitionInfo(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MorainePartitionInfoRow> rows(moraine_dump_partition_info_free);
+	MoraineError err{};
+	auto code = moraine_dump_partition_info(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.partition_id),
+		    Bigint(r.table_id),
+		    Bigint(r.begin_snapshot),
+		    OptBigint(r.has_end_snapshot, r.end_snapshot),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvidePartitionColumns(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MorainePartitionColumnRow> rows(moraine_dump_partition_columns_free);
+	MoraineError err{};
+	auto code = moraine_dump_partition_columns(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.partition_id),
+		    Bigint(r.table_id),
+		    Bigint(r.partition_key_index),
+		    Bigint(r.column_id),
+		    Varchar(r.transform),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideFilePartitionValues(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineFilePartitionValueRow> rows(moraine_dump_file_partition_values_free);
+	MoraineError err{};
+	auto code = moraine_dump_file_partition_values(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.data_file_id),
+		    Bigint(r.table_id),
+		    Bigint(r.partition_key_index),
+		    Varchar(r.partition_value),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideSortInfo(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineSortInfoRow> rows(moraine_dump_sort_info_free);
+	MoraineError err{};
+	auto code = moraine_dump_sort_info(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.sort_id),
+		    Bigint(r.table_id),
+		    Bigint(r.begin_snapshot),
+		    OptBigint(r.has_end_snapshot, r.end_snapshot),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideSortExpressions(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineSortExpressionRow> rows(moraine_dump_sort_expressions_free);
+	MoraineError err{};
+	auto code = moraine_dump_sort_expressions(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.sort_id),
+		    Bigint(r.table_id),
+		    Bigint(r.sort_key_index),
+		    Varchar(r.expression),
+		    Varchar(r.dialect),
+		    Varchar(r.sort_direction),
+		    Varchar(r.null_order),
+		});
+	}
+	return result;
 }
 
 // `ducklake_metadata` rows. All are fixed here except `encrypted`, which
@@ -797,7 +906,10 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"begin_snapshot", "BIGINT", false},
 	            {"end_snapshot", "BIGINT", false},
 	        },
-	        ProvideEmpty,
+	        ProvidePartitionInfo,
+	        12,
+	        /* end key: table_id, partition_id (decoder order) */ {1, 0},
+	        /* end_snapshot col */ 3,
 	    },
 	    {
 	        "ducklake_partition_column",
@@ -808,7 +920,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"column_id", "BIGINT", false},
 	            {"transform", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvidePartitionColumns,
+	        13,
 	    },
 	    {
 	        "ducklake_file_partition_value",
@@ -818,7 +931,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"partition_key_index", "BIGINT", false},
 	            {"partition_value", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideFilePartitionValues,
+	        14,
 	    },
 	    {
 	        "ducklake_file_variant_stats",
@@ -877,7 +991,10 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"begin_snapshot", "BIGINT", false},
 	            {"end_snapshot", "BIGINT", false},
 	        },
-	        ProvideEmpty,
+	        ProvideSortInfo,
+	        15,
+	        /* end key: table_id, sort_id (decoder order) */ {1, 0},
+	        /* end_snapshot col */ 3,
 	    },
 	    {
 	        "ducklake_sort_expression",
@@ -890,7 +1007,8 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"sort_direction", "VARCHAR", false},
 	            {"null_order", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideSortExpressions,
+	        16,
 	    },
 	    {
 	        "ducklake_metadata",

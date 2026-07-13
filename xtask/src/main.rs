@@ -35,7 +35,7 @@ const DUCKDB_LOAD_TEST_NAME: &str = "tests::attach_lists_and_scans_through_real_
 /// Every `#[ignore]`d test in `ducklake_load.rs`, run together (not
 /// `--exact`, since there are ten). Needs network access to `INSTALL
 /// ducklake`.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "13 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "15 passed";
 
 fn main() -> anyhow::Result<()> {
     let task = std::env::args().nth(1);

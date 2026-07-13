@@ -12,8 +12,8 @@ use crate::{
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, OptionScopeValue,
-            SchemaValue, SnapshotValue, TableColumnStatsValue, TableStatsValue, TableValue,
-            ViewValue,
+            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
+            TableStatsValue, TableValue, ViewValue,
         },
         read::EntityRecord,
     },
@@ -36,6 +36,8 @@ pub struct CatalogSnapshot {
     pub(crate) view_names: HashMap<(u64, String), u64>,
     pub(crate) data_files: BTreeMap<u64, BTreeMap<u64, DataFileValue>>,
     pub(crate) delete_files: BTreeMap<u64, BTreeMap<u64, DeleteFileValue>>,
+    pub(crate) partitions: BTreeMap<u64, BTreeMap<u64, PartitionValue>>,
+    pub(crate) sorts: BTreeMap<u64, BTreeMap<u64, SortValue>>,
     pub(crate) table_stats: BTreeMap<u64, TableStatsValue>,
     pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
     pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
@@ -83,6 +85,12 @@ impl CatalogSnapshot {
                 EntityRecord::View(v) if included(v.begin_snapshot, v.end_snapshot) => {
                     view.put_view(v);
                 }
+                EntityRecord::Partition(p) if included(p.begin_snapshot, p.end_snapshot) => {
+                    view.put_partition(p);
+                }
+                EntityRecord::Sort(s) if included(s.begin_snapshot, s.end_snapshot) => {
+                    view.put_sort(s);
+                }
                 EntityRecord::FileColumnStats(fcs) => {
                     view.put_file_column_stats(fcs);
                 }
@@ -104,7 +112,9 @@ impl CatalogSnapshot {
                 | EntityRecord::Column(_)
                 | EntityRecord::File(_)
                 | EntityRecord::DeleteFile(_)
-                | EntityRecord::View(_) => {
+                | EntityRecord::View(_)
+                | EntityRecord::Partition(_)
+                | EntityRecord::Sort(_) => {
                     // Filtered out by version range
                 }
             }
@@ -274,6 +284,8 @@ impl CatalogSnapshot {
         self.columns.remove(&table_id);
         self.data_files.remove(&table_id);
         self.delete_files.remove(&table_id);
+        self.partitions.remove(&table_id);
+        self.sorts.remove(&table_id);
         self.table_stats.remove(&table_id);
         self.table_column_stats.remove(&table_id);
         self.remove_option_record(OptionScope::Table(TableId::new(table_id)).key_components());
@@ -363,6 +375,32 @@ impl CatalogSnapshot {
     pub(crate) fn delete_data_file(&mut self, table_id: u64, data_file_id: u64) {
         if let Some(files) = self.data_files.get_mut(&table_id) {
             files.remove(&data_file_id);
+        }
+    }
+
+    pub(crate) fn put_partition(&mut self, value: PartitionValue) {
+        self.partitions
+            .entry(value.table_id)
+            .or_default()
+            .insert(value.partition_id, value);
+    }
+
+    pub(crate) fn delete_partition(&mut self, table_id: u64, partition_id: u64) {
+        if let Some(specs) = self.partitions.get_mut(&table_id) {
+            specs.remove(&partition_id);
+        }
+    }
+
+    pub(crate) fn put_sort(&mut self, value: SortValue) {
+        self.sorts
+            .entry(value.table_id)
+            .or_default()
+            .insert(value.sort_id, value);
+    }
+
+    pub(crate) fn delete_sort(&mut self, table_id: u64, sort_id: u64) {
+        if let Some(specs) = self.sorts.get_mut(&table_id) {
+            specs.remove(&sort_id);
         }
     }
 

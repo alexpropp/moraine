@@ -73,6 +73,11 @@ fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
         9 => Ok(TableKind::TableColumnStats),
         10 => Ok(TableKind::FileColumnStats),
         11 => Ok(TableKind::SchemaVersions),
+        12 => Ok(TableKind::PartitionInfo),
+        13 => Ok(TableKind::PartitionColumn),
+        14 => Ok(TableKind::FilePartitionValue),
+        15 => Ok(TableKind::SortInfo),
+        16 => Ok(TableKind::SortExpression),
         other => Err(AbiError::invalid_argument(format!(
             "moraine_tx_stage: unknown table_kind {other}"
         ))),
@@ -202,7 +207,9 @@ pub unsafe extern "C" fn moraine_tx_begin(
 /// order (`0` = `Snapshot`, `1` = `SnapshotChanges`, `2` = `Schema`, `3` =
 /// `Table`, `4` = `View`, `5` = `Column`, `6` = `DataFile`, `7` =
 /// `DeleteFile`, `8` = `TableStats`, `9` = `TableColumnStats`, `10` =
-/// `FileColumnStats`, `11` = `SchemaVersions`); `operation_kind` is `0` = insert,
+/// `FileColumnStats`, `11` = `SchemaVersions`, `12` = `PartitionInfo`,
+/// `13` = `PartitionColumn`, `14` = `FilePartitionValue`, `15` =
+/// `SortInfo`, `16` = `SortExpression`); `operation_kind` is `0` = insert,
 /// `1` = delete, `2` = update-sets-`end_snapshot`. `cells` are positional
 /// in the column order the shim declares for `table_kind`'s table (a delete
 /// or update-set-end row carries only the key columns, per [`RowOperation`]'s

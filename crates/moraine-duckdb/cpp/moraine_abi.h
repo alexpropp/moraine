@@ -353,6 +353,83 @@ int32_t moraine_dump_schema_versions(MoraineCatalogHandle *handle, MoraineSchema
                 MoraineError *err);
 void moraine_dump_schema_versions_free(MoraineSchemaVersionRow *items, size_t len);
 
+// Mirrors `moraine_duckdb::dumps::MorainePartitionInfoRow`.
+typedef struct MorainePartitionInfoRow {
+	uint64_t partition_id;
+	uint64_t table_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+} MorainePartitionInfoRow;
+
+int32_t moraine_dump_partition_info(MoraineCatalogHandle *handle, MorainePartitionInfoRow **out_items,
+                                     size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_partition_info_free(MorainePartitionInfoRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::dumps::MorainePartitionColumnRow`: one
+// ducklake_partition_column row, flattened from the partition record's
+// embedded columns.
+typedef struct MorainePartitionColumnRow {
+	uint64_t partition_id;
+	uint64_t table_id;
+	uint64_t partition_key_index;
+	uint64_t column_id;
+	char *transform;
+} MorainePartitionColumnRow;
+
+int32_t moraine_dump_partition_columns(MoraineCatalogHandle *handle, MorainePartitionColumnRow **out_items,
+                                        size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_partition_columns_free(MorainePartitionColumnRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::dumps::MoraineFilePartitionValueRow`: one
+// ducklake_file_partition_value row, flattened from the data-file
+// record's embedded partition values.
+typedef struct MoraineFilePartitionValueRow {
+	uint64_t data_file_id;
+	uint64_t table_id;
+	uint64_t partition_key_index;
+	char *partition_value;
+} MoraineFilePartitionValueRow;
+
+int32_t moraine_dump_file_partition_values(MoraineCatalogHandle *handle, MoraineFilePartitionValueRow **out_items,
+                                            size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_file_partition_values_free(MoraineFilePartitionValueRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::dumps::MoraineSortInfoRow`.
+typedef struct MoraineSortInfoRow {
+	uint64_t sort_id;
+	uint64_t table_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+} MoraineSortInfoRow;
+
+int32_t moraine_dump_sort_info(MoraineCatalogHandle *handle, MoraineSortInfoRow **out_items,
+                                size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_sort_info_free(MoraineSortInfoRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::dumps::MoraineSortExpressionRow`: one
+// ducklake_sort_expression row, flattened from the sort record's
+// embedded expressions.
+typedef struct MoraineSortExpressionRow {
+	uint64_t sort_id;
+	uint64_t table_id;
+	uint64_t sort_key_index;
+	char *expression;
+	char *dialect;
+	char *sort_direction;
+	char *null_order;
+} MoraineSortExpressionRow;
+
+int32_t moraine_dump_sort_expressions(MoraineCatalogHandle *handle, MoraineSortExpressionRow **out_items,
+                                       size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_sort_expressions_free(MoraineSortExpressionRow *items, size_t len);
+
 // The inline read ABI (src/inline.rs): materializes DuckLake's four inline
 // scan variants and the per-table Arrow schema / registered-table list over
 // the inline/* keyspace. Owned-first, one _free per array; chunk_body is an
@@ -438,7 +515,9 @@ int32_t moraine_tx_begin(MoraineCatalogHandle *handle, MoraineTxHandle **out, Mo
 // ducklake_schema, 3 ducklake_table, 4 ducklake_view, 5 ducklake_column, 6
 // ducklake_data_file, 7 ducklake_delete_file, 8 ducklake_table_stats, 9
 // ducklake_table_column_stats, 10 ducklake_file_column_stats, 11
-// ducklake_schema_versions.
+// ducklake_schema_versions, 12 ducklake_partition_info, 13
+// ducklake_partition_column, 14 ducklake_file_partition_value, 15
+// ducklake_sort_info, 16 ducklake_sort_expression.
 // `operation_kind`: 0 insert, 1 delete, 2 update-sets-end_snapshot. `cells` are
 // positional in the exact column order metadata_tables.cpp declares for
 // `table_kind`'s table (a delete/update-set-end row carries only the key

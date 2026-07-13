@@ -151,6 +151,13 @@ pub(crate) enum EntityKey {
         /// Scope id (0 for global).
         scope_id: u64,
     },
+    /// `ducklake_sort_info` (+ sort expressions embedded).
+    Sort {
+        /// Owning table.
+        table_id: u64,
+        /// Sort spec id.
+        sort_id: u64,
+    },
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
@@ -294,6 +301,8 @@ pub(crate) enum TableScopedKind {
     TableStats,
     /// `ducklake_table_column_stats`.
     TableColumnStats,
+    /// `ducklake_sort_info`.
+    Sort,
 }
 
 impl TableScopedKind {
@@ -327,6 +336,10 @@ impl TableScopedKind {
             Self::TableColumnStats => EntityKey::TableColumnStats {
                 table_id,
                 column_id: 0,
+            },
+            Self::Sort => EntityKey::Sort {
+                table_id,
+                sort_id: 0,
             },
         }
     }
@@ -466,6 +479,18 @@ mod tests {
         let key = Key::current(EntityKey::File {
             table_id: 1,
             data_file_id: 2,
+        });
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
+    fn golden_current_sort_key() {
+        let mut expect = vec![0x04, 0x02, 0x0e];
+        expect.extend(be(7));
+        expect.extend(be(9));
+        let key = Key::current(EntityKey::Sort {
+            table_id: 7,
+            sort_id: 9,
         });
         assert_eq!(key.encode(), expect);
     }
@@ -630,6 +655,7 @@ mod tests {
             TableScopedKind::FileColumnStats,
             TableScopedKind::TableStats,
             TableScopedKind::TableColumnStats,
+            TableScopedKind::Sort,
         ];
         for kind in kinds {
             let key = Key::current(kind.sample(9));
@@ -733,6 +759,8 @@ mod tests {
                 table_id,
                 column_id
             }),
+            any::<(u64, u64)>()
+                .prop_map(|(table_id, sort_id)| EntityKey::Sort { table_id, sort_id }),
             any::<u64>().prop_map(|object_id| EntityKey::Tag { object_id }),
             any::<(u64, u64)>().prop_map(|(scope_kind, scope_id)| EntityKey::Option {
                 scope_kind,

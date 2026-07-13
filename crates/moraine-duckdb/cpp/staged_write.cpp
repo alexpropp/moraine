@@ -327,11 +327,11 @@ public:
 
 // DuckLake's DROP/RENAME batch issues `UPDATE {table} SET end_snapshot ...`
 // against every metadata table a dropped/renamed object could reference,
-// including always-empty stand-ins (`ducklake_partition_info`,
-// `ducklake_column_tag`, `ducklake_tag`, `ducklake_sort_info`). Since those
-// tables can never have a live row, that UPDATE's WHERE clause matches
-// nothing and the child scan produces zero rows, so accepting it as a no-op
-// is sound. The Sink still throws if a row ever does arrive.
+// including always-empty stand-ins (`ducklake_column_tag`,
+// `ducklake_tag`). Since those tables can never have a live row, that
+// UPDATE's WHERE clause matches nothing and the child scan produces zero
+// rows, so accepting it as a no-op is sound. The Sink still throws if a
+// row ever does arrive.
 class MoraineMetadataVoidUpdate : public MoraineMetadataDml {
 public:
 	using MoraineMetadataDml::MoraineMetadataDml;

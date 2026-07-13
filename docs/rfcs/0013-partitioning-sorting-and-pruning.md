@@ -119,16 +119,26 @@ not by field id — see schema evolution below.
 ### Spec evolution
 
 Partitioning and sorting are set, changed, or cleared over a table's life
-(sorting via `SET SORTED BY` / `RESET SORTED BY`). Each is a
-**schema-changing commit** that bumps `schema_version` and conflicts at
-table level ([RFC 0004](0004-commit-protocol.md)). Both specs are versioned
-temporally like any entity, and the transitions are identical:
+(sorting via `SET SORTED BY` / `RESET SORTED BY`). Both conflict at table
+level as alters, but they differ on `schema_version`
+([RFC 0004](0004-commit-protocol.md)): a partition change is a
+**schema-changing commit** that bumps it, while a sort change does not —
+DuckLake marks the table altered without a bump (source-verified; a sort
+spec never invalidates cross-file compaction). On the staged path moraine
+stores DuckLake's authored `schema_version` verbatim either way. Both
+specs are versioned temporally like any entity, and the transitions are
+identical:
 
 - **Set / change** — end the current spec's `current` version into `history` with
   `end_snapshot` (if one existed) and insert the new spec into `current`, in the
   same `WriteBatch` (RFC 0002 atomicity invariant).
-- **Clear** — end the current spec's `current` version into `history`; the table has
-  no live spec afterward.
+- **Clear** — end the current spec's `current` version into `history`. What
+  DuckLake actually issues differs by feature (source-verified):
+  `RESET SORTED BY` is a genuine clear (end the old spec, insert nothing;
+  no live spec afterward), while `RESET PARTITIONED BY` is a
+  **set-to-empty** — the old spec ends and a new spec with zero columns
+  lands live. moraine stores either shape row-faithfully; the bare
+  end-without-insert also arrives when `DROP TABLE` ends a table's specs.
 
 A data file records, in its `file` value, the `partition_id` of the spec it was
 **written under**. Files written under different specs therefore coexist
