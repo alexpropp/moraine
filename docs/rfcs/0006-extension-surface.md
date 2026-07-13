@@ -100,7 +100,11 @@ and `EXPLAIN` work) and raise a redirect error naming the
 is queryable through the attached catalog, served row-faithfully — `current`
 and `history` rows both, since DuckLake filters lifecycles in SQL; unversioned
 kinds serve current values. DuckDB's executor plans joins over per-table
-scans. `ducklake_metadata` is synthesized from store facts (format
+scans. This row-faithfulness is what makes **time travel** work with no
+time-travel logic in moraine: `AT (VERSION => N)` is DuckLake filtering the
+served rows by begin/end snapshot — reconstructing past *schema* from the
+`ducklake_column` versions as readily as past data — and it is verified live
+across inline inserts, schema evolution, and flush (`ducklake_load.rs`). `ducklake_metadata` is synthesized from store facts (format
 version, options) so DuckLake's exists-probe and version reads succeed on
 any initialized moraine store: a moraine store is a valid DuckLake catalog
 from birth, and DuckLake's bootstrap DDL batch never runs against one.

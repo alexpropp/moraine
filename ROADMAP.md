@@ -86,7 +86,14 @@ e2e suite before it is checked off.
 ### Transactions & time travel
 - [ ] Multi-statement, cross-table ACID transactions with conflict
   detection (RFC 0004)
-- [ ] Snapshots and time travel to any snapshot (`snapshot`)
+- [x] Snapshots and time travel to any snapshot (`snapshot`): DuckLake's
+  `AT (VERSION => N)` reads past data *and* schema, verified live across
+  inline inserts, schema evolution, and flush (`ducklake_load.rs`'s
+  `ducklake_time_travel_reads_past_data_and_schema` and
+  `ducklake_time_travel_survives_flush`). moraine adds no time-travel logic:
+  it serves every `ducklake_*` row current-and-history with begin/end
+  snapshots and backdates flushed files, and DuckLake filters by version in
+  its own SQL
 - [ ] Change data feed: changes between snapshots (`snapshot_changes`)
 
 ### Maintenance & operations
