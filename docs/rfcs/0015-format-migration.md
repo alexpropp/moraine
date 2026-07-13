@@ -292,15 +292,13 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   "trivial" enough to auto-run on open (bounded `system`-only rewrites) versus
   requiring the explicit verb. Getting this wrong in the permissive direction
   reintroduces the rolling-fleet surprise.
-- **Encrypted values (dovetail [RFC 0014](0014-encryption.md)).** If values
-  are envelope-encrypted, they are **opaque** to a migration that needs to
-  relocate a *field* between keys or reshape a value. A key-layout-only
-  migration (move/rename keys, re-tag subspaces) can treat the ciphertext
-  blob as an opaque payload and move it untouched; a migration that must read
-  *into* a value cannot, without the data key. How migration interacts with
-  RFC 0014's key hierarchy — and whether field-touching structural migrations
-  are simply forbidden on encrypted stores — is settled jointly with
-  RFC 0014.
+- **Encrypted stores ([RFC 0014](0014-encryption.md)) pose no constraint.**
+  Catalog-at-rest encryption is delegated to object-store SSE, so a migrator
+  always sees plaintext values through the store client. RFC 0014 rejected
+  value-payload envelope encryption partly *because* it would make values
+  opaque to field-touching structural migrations; any future
+  bucket-independent encryption goes below the value format (SlateDB block
+  layer), where migrations remain unaffected.
 - **Whole-store pre-migration snapshot.** Should the `migrate` verb snapshot
   the entire store before starting, for guaranteed manual rollback? SlateDB
   (pinned 0.14.x) provides the mechanism nearly for free:

@@ -1,244 +1,166 @@
 # RFC 0014: Catalog and data encryption
 
-- **Date:** 2026-07-09
+- **Date:** 2026-07-13
 
 ## Summary
 
-Encryption in a DuckLake-on-moraine deployment has two layers that are
-routinely conflated, and the point of this RFC is to separate them cleanly.
-The first is **data-file encryption**: DuckLake encrypts its Parquet files
-and records the key material in catalog rows. moraine's job there is to be a
-faithful conduit — store and return that material verbatim, decrypt nothing,
-touch no data-file bytes. The second is **catalog-at-rest confidentiality**:
-the SlateDB objects (SSTs, WAL) that hold the catalog itself live in object
+Encryption in a DuckLake-on-moraine deployment has two layers.
+**Data-file encryption** is DuckLake's: it encrypts its Parquet files and
+records the key material in catalog rows; moraine's job is to be a faithful
+conduit — store and return that material verbatim, decrypt nothing, touch no
+data-file bytes. **Catalog-at-rest confidentiality** is moraine's to answer
+for: the SlateDB objects (SSTs, WAL) that hold the catalog live in object
 storage and are, by default, plaintext.
 
-The sharp insight this RFC is built around: **encrypting data files is close
-to pointless while the catalog is plaintext.** The catalog holds the
-data-encryption keys, the plaintext column min/max in `file_column_stats`
-(RFC 0002 stores them verbatim), row counts, table and column names, and the
-full schema. The catalog is as sensitive as the data it describes. Data-file
-encryption is only meaningful *alongside* catalog-at-rest protection. For
-launch we recommend delegating catalog-at-rest to object-store server-side
-encryption and reserve design space in the framing header for moraine-level
-envelope encryption later.
-
-## Goals
-
-- Separate DuckLake-owned data-file crypto from moraine-owned
-  catalog-at-rest crypto, and be explicit about which is which.
-- Carry DuckLake's data-file key material through moraine losslessly (RFC
-  0006 row-faithfulness), inventing no crypto of moraine's own.
-- State a threat model an operator can reason about, rather than an
-  aspirational one.
-- Give catalog-at-rest a recommended launch answer that needs **no new
-  moraine machinery**, and a forward path that fits the existing on-disk
-  format (RFC 0002) without a structural break.
-
-Non-goals:
-
-- moraine acting as a KMS. Keys are generated, stored, and rotated by
-  DuckLake and the operator; moraine holds and uses what it is given.
-- Encrypting Parquet, reading Parquet, or otherwise entering the data-file
-  path — moraine never touches those bytes (RFC 0006, RFC 0007).
-- Protecting against a compromised writer process or live memory scraping —
-  see the threat model.
-- Committing to moraine-level value-payload encryption in v1. This RFC
-  reserves the design space; the decision is an open question.
-
-## Background
-
-DuckLake supports encrypted data files: the Parquet files are written
-encrypted, and the encryption metadata — algorithm, key (or a reference to
-one), IV/nonce — is persisted in the catalog, associated with the data-file
-record. A reader retrieves that metadata from the catalog and decrypts the
-file. The catalog is therefore the custodian of the keys to the data.
-
-moraine is DuckLake's catalog (RFC 0006). It stores DuckLake's rows verbatim
-in SlateDB (RFC 0002) and returns them unchanged; it never re-models or
-interprets them. In particular, `file_column_stats` min/max values are stored
-as DuckLake's exact strings and never parsed (RFC 0002, "statistics values
-are stored faithfully"). SlateDB in turn persists the catalog as objects
-(SSTs, WAL) in an object store.
-
-The consequence, stated plainly: everything sensitive about the data is also
-present, in the clear, in the catalog. So the two encryption layers are not
-independent — the weaker one caps the effective protection of the stronger.
-
-## Design
-
-### Two layers
+The catalog is at least as sensitive as the data it describes: it holds the
+data-file keys themselves, the plaintext column min/max in
+`file_column_stats` (RFC 0002 stores them verbatim), row counts, and the full
+schema. Encrypting data files is pointless while the catalog is plaintext, so
+catalog-at-rest is the load-bearing decision. **Decision: delegate it to
+object-store server-side encryption (SSE-KMS).** This is not a stopgap — it
+is what every surveyed catalog does with its own metadata (see Prior art) —
+and it means no crypto machinery, no on-disk format change, and no key
+material in the moraine core.
 
 | Layer | Owner | Protects | moraine's role |
 |---|---|---|---|
-| Data-file encryption | DuckLake | Parquet bytes in object storage | Faithful conduit: store/return key material verbatim, decrypt nothing |
-| Catalog-at-rest | moraine / operator | SlateDB SSTs + WAL (keys, stats, schema, names) | Choose and apply an at-rest scheme for the store objects |
+| Data-file encryption | DuckLake | Parquet data and delete files | Faithful conduit: round-trip key rows verbatim, decrypt nothing |
+| Catalog-at-rest | Operator, via bucket SSE-KMS | SlateDB SSTs + WAL — the keys, stats, and schema | None: reads and writes plaintext through the store client |
 
-The rest of this section takes each in turn, then the interactions.
+## Design
 
 ### Data-file encryption: moraine as faithful conduit
 
-DuckLake owns data-file crypto end to end. It chooses the algorithm,
-generates the keys, encrypts the Parquet on write, and records the
-encryption metadata in a catalog row (on or beside the `data_file` record).
-On read it retrieves that metadata and decrypts.
+DuckLake owns data-file crypto end to end. With `ENCRYPTED` set it writes
+Parquet data and delete files under Parquet Modular Encryption, generating a
+fresh key per write operation, and stores each key — raw, base64 — in the
+`encryption_key` column of `ducklake_data_file` / `ducklake_delete_file`,
+with an `encrypted` flag in `ducklake_metadata`. There is no KMS indirection
+in DuckLake as of this writing: the catalog holds the actual keys.
 
-moraine's entire responsibility is to **carry that metadata losslessly**. The
-key material is fields of a `ducklake_*` row; RFC 0002 encodes those rows and
-RFC 0006 makes moraine return them exactly as DuckLake wrote them. moraine:
+moraine's entire responsibility is to carry that material losslessly. The
+keys are ordinary fields of `ducklake_*` rows; RFC 0002 encodes the rows and
+RFC 0006 returns them exactly as DuckLake wrote them. moraine never decrypts
+a data file, never derives or validates a key, never reads a Parquet byte
+(RFC 0007), and invents no encryption of its own. Compaction and GC never
+read data bytes, so an encrypted file is scheduled for deletion exactly as a
+plaintext one is.
 
-- stores the encryption metadata as opaque row fields — it is not special to
-  moraine, just more columns;
-- never decrypts a data file, never derives or validates a key, never reads
-  a Parquet byte (RFC 0007: moraine schedules object deletes, it does not
-  read file contents);
-- invents no encryption scheme of its own for data files.
+When is `ENCRYPTED` worth enabling at all? With SSE-KMS on the data bucket
+too, the bucket-reader adversary is already covered for data files, and
+`ENCRYPTED` — whose keys live in the catalog — can never protect more than
+the catalog does. Its marginal value is client-side crypto across **split
+trust domains**: bulk data hosted on a store the operator does not trust,
+catalog and KMS on one they do (DuckLake's "zero-trust data hosting"). In a
+single trust domain it is redundant with SSE. Either way the switch is
+DuckLake's and the operator's; moraine carries one more opaque column and is
+deliberately indifferent to whether it is set.
 
-This is row-faithfulness applied to crypto material: whatever key reference,
-algorithm tag, or IV DuckLake puts in the row, moraine round-trips bit for
-bit. Compaction and GC (RFC 0007) never read data bytes, so data-file
-encryption is transparent to them — an encrypted file is scheduled for
-deletion exactly as a plaintext one is.
+### Catalog-at-rest: SSE-KMS on the bucket
 
-### Catalog-at-rest: the layer that actually matters
+The bucket holding SlateDB's objects is configured with SSE-KMS: the object
+store encrypts every SST and WAL object at rest, keys live in the KMS, and
+moraine reads and writes plaintext through the object-store client. The
+entire cost is bucket configuration.
 
-Because the catalog holds the data keys and the plaintext stats, protecting
-it is the load-bearing decision. Two options:
-
-**(a) Object-store server-side encryption (SSE-KMS).** The bucket encrypts
-SlateDB's objects at rest; keys are managed at the bucket/KMS. moraine writes
-and reads plaintext to the object-store client, and the store handles
-encryption transparently. No moraine crypto, no format change, no key
-handling in the core — the entire cost is bucket configuration.
-
-**(b) moraine-level envelope encryption of value payloads.** moraine encrypts
-the protobuf **payload** of each value with a data-encryption key (DEK),
-itself wrapped by a key-encryption key (KEK) from a KMS. Critically, the
-fixed 5-byte framing header (4-byte `MRNE` magic + 1-byte encoding version,
-RFC 0002) stays **plaintext**, so corruption detection and encoding-version
-negotiation keep working on an encrypted store — a reader still fails loudly
-on a wrong-kind or truncated value, and still refuses an encoding version it
-does not understand, before it ever attempts to decrypt. Only the bytes after
-the header are ciphertext.
-
-| | (a) SSE-KMS | (b) Envelope encryption |
-|---|---|---|
-| New moraine machinery | none | DEK/KEK handling, per-value crypto |
-| Format impact | none | signalled via header; payload opaque |
-| Granularity | whole store object | per value |
-| Key custody | bucket / KMS | moraine + KMS |
-| Migration reads (RFC 0015) | unaffected | constrained — payloads opaque |
-
-**Decision for launch: (a) SSE-KMS.** It gives catalog-at-rest confidentiality
-with no new moraine surface, no on-disk format change, and no key material in
-the core. It is the recommended launch answer, not the only path: (b) is
-reserved as future work for deployments that need the store objects encrypted
-independently of the bucket (e.g. the object store is itself untrusted, or
-per-value key boundaries are required). When (b) is built, it is signalled
-in-band — either through a new value **encoding-version** byte or a reserved
-header bit — so a reader distinguishes an encrypted payload from a plaintext
-one without guessing, exactly as the encoding version already gates format
-evolution (RFC 0002).
+This mirrors DuckLake's own trust model. Its manifesto pitches "zero-trust
+data hosting" with "keys managed by the catalog database", and its FAQ
+delegates catalog protection to the catalog DBMS's authentication (e.g.
+PostgreSQL's, when Postgres is the catalog). moraine's catalog DBMS is
+SlateDB on a bucket; the bucket's access control and SSE are the exact
+equivalent of the Postgres deployment's auth and RDS at-rest encryption.
 
 ### Threat model
 
-State it plainly so operators do not over-trust it.
+- **Protects:** the catalog — and, via DuckLake's scheme, the data files —
+  against an adversary with read access to the bucket: a leaked backup, a
+  stolen credential, a mis-scoped IAM read. SSE ciphertext is inert without
+  the KMS grant.
+- **Does not protect against:** a compromised writer process (it holds the
+  keys it uses) or live memory scraping. And a party that can read the
+  catalog plaintext reads the stats: column min/max are stored verbatim
+  because DuckLake reads them to prune files (RFC 0002, RFC 0009). That leak
+  is the price of usable pruning; no at-rest scheme changes it.
+- **Key custody is not moraine's.** DuckLake generates the data-file keys;
+  the operator owns the KMS. Under SSE, no key material enters moraine at
+  all.
 
-- **Protects:** the catalog and (via DuckLake's own scheme) the data files
-  against an adversary with **read access to the object-store bucket** — a
-  leaked bucket, a stolen backup, a mis-scoped IAM read. With SSE the bucket
-  ciphertext is inert without the KMS grant; with envelope encryption the
-  payloads are inert without the KEK.
-- **Does not protect against:** a **compromised writer process**, which
-  necessarily holds the keys it uses, nor **live memory scraping** of that
-  process. An attacker who is the writer sees plaintext by construction.
-- **Key custody is not moraine's.** DuckLake and the operator generate and
-  rotate keys; moraine is not a KMS and originates no key material (Goals,
-  Non-goals). Under (a) the keys never enter moraine at all; under (b)
-  moraine uses a KEK it is handed to unwrap DEKs.
+### Inlined data
 
-### Interactions
+Inlined data (RFC 0005) lives inside catalog values, not as Parquet in the
+object store, so its confidentiality is a case of catalog-at-rest: covered by
+SSE like every other value, and *not* covered by DuckLake's data-file scheme
+(there is no separate file to encrypt). A deployment that relies on data-file
+encryption and also inlines data has its inlined rows protected exactly as
+well as its catalog — another face of the central insight.
 
-**Inlined data (RFC 0005)** lives *inside* the catalog — it is stored in
-SlateDB values, not as Parquet in the object store. So protecting inlined
-data is a special case of **catalog-at-rest**, not data-file encryption: it
-is covered by (a) or (b) like any other value, and is *not* covered by
-DuckLake's data-file scheme (there is no separate file to encrypt). If a
-deployment relies on data-file encryption for confidentiality and also
-inlines data, the inlined rows are only as protected as the catalog is —
-another face of the central insight.
+## Prior art
 
-**Format migration (RFC 0015)** is genuinely constrained by (b). A structural
-migration that must **read a value's fields** to relocate or reshape it cannot
-do so if the payload is envelope-encrypted and opaque to the migrator — the
-migrator would need the DEK/KEK to decrypt, re-read, re-encode, and
-re-encrypt every value. This is a real limit on what migrations are possible
-over an envelope-encrypted store, and a reason the header (magic + encoding
-version) stays plaintext: header-only and key-only migrations remain possible
-even when payloads are opaque. Flagged for RFC 0015; under (a) migrations are
-unaffected because moraine sees plaintext.
+Surveyed mid-2026. The pattern is uniform: catalogs delegate at-rest
+protection of their own metadata to the platform beneath them, and none does
+application-level encryption of its own store.
 
-**Compaction / GC (RFC 0007)** are transparent to data-file encryption (they
-never read data bytes) and, under (a), to catalog-at-rest (the store handles
-it). Under (b), compaction operates on already-encrypted payloads as opaque
-bytes and needs no keys, since it relocates values without reading their
-fields.
-
-**Inlined-data compression (RFC 0005)** is quietly undermined by (b).
-RFC 0005 keeps Arrow buffer compression off on the grounds that
-"whatever cross-chunk redundancy remains is reclaimed by SlateDB's SST
-block compression at rest" — but ciphertext does not compress, so
-envelope-encrypting value payloads forfeits exactly that reclamation, and
-inlined-data storage inflates by the redundancy SST compression was
-absorbing. Under (a) nothing changes (SSE encrypts post-compression at the
-object layer). If (b) is built, either the inflation is accepted or
-per-value compression-before-encryption is added inside the envelope —
-another cost on (b)'s side of the ledger, recorded here so the choice is
-made with it in view.
+- **DuckLake** stores raw base64 keys in catalog rows and delegates catalog
+  protection to the catalog DBMS's authentication and at-rest story
+  ([encryption docs](https://ducklake.select/docs/stable/duckdb/advanced_features/encryption),
+  [FAQ](https://ducklake.select/faq)).
+- **Apache Iceberg** (spec v3, shipped in 1.11.0) does client-side envelope
+  encryption of data files and the manifest tree, with wrapped keys carried
+  in table metadata — but the root `metadata.json` is *not* encrypted; its
+  protection is an explicit "catalog security requirement" delegated to the
+  catalog and storage
+  ([encryption docs](https://iceberg.apache.org/docs/nightly/encryption/)).
+  The REST catalog spec carries opaque wrapped keys and performs no KMS
+  operations.
+- **AWS Glue Data Catalog** is the one catalog that encrypts its own
+  metadata — as transparent platform-side SSE-KMS, not application-level
+  crypto
+  ([docs](https://docs.aws.amazon.com/glue/latest/dg/encrypt-glue-data-catalog.html)).
+- **Hive Metastore, Apache Polaris, Project Nessie** ship no at-rest
+  encryption of their own; deployments rely on the backing RDBMS or store
+  (TDE, encrypted RDS, and the like).
+- **Unity Catalog and Snowflake** encrypt metadata at the platform layer
+  (with customer-managed-key options); neither defines application-level
+  ciphertext in its catalog model. **Delta Lake**'s transaction log likewise
+  relies on storage SSE; application-level log encryption remains an open
+  proposal ([delta#2269](https://github.com/delta-io/delta/issues/2269)).
+- **SlateDB** ships no encryption of its own, but exposes a
+  `BlockTransformer` hook (v0.10.1) for a user-supplied SST-block cipher —
+  with real gaps today: manifests and SST footers stay plaintext. If store
+  objects ever need encryption independent of the bucket, that hook is the
+  seam: below moraine's value format, invisible to codecs and migration.
 
 ## Open questions
 
-- **Which catalog-at-rest strategy to commit to, and when.** (a) SSE is the
-  launch recommendation; whether and when (b) envelope encryption is built
-  depends on demand for store-object encryption independent of the bucket.
-- **The plaintext-stats leak.** Even with data files encrypted, the catalog
-  exposes column min/max verbatim (RFC 0002), plus row counts and schema.
-  Encrypting the stats *values* would plug the leak but **break DuckLake's
-  pruning**, because DuckLake reads those strings to skip files (RFC 0002,
-  RFC 0009). The tension looks unavoidable: the stats are useful precisely
-  because they are readable, and moraine does not interpret them. Catalog-at-
-  rest (a)/(b) mitigates the leak against a bucket reader; against a party
-  that can already read the catalog plaintext, the stats leak is inherent to
-  having usable pruning. State the tension; do not pretend it away.
-- **KEK source and KMS integration.** For both (a) and (b), where the key
-  material comes from (cloud KMS, HSM, operator-supplied), and how moraine is
-  handed the KEK under (b), is unspecified.
-- **Header signalling and key rotation under (b).** If value-payload
-  encryption is adopted, exactly how it is signalled in the framing header
-  (a distinct encoding-version value vs. a reserved header bit), and how KEK
-  rotation re-wraps values without rewriting payloads (re-wrap the DEK,
-  leaving ciphertext untouched) versus a full re-encrypt.
-- **Inlined encrypted data.** Whether inlined data (RFC 0005) that DuckLake
-  considers "encrypted" needs any distinct handling beyond falling under
-  catalog-at-rest, or whether the two notions collapse entirely.
+- **KMS configuration guidance.** Key policy, grants, and rotation posture
+  for the bucket key are operator documentation, not moraine design, and are
+  unwritten.
+- **Untrusted-bucket deployments.** If demand appears for store objects the
+  bucket operator cannot read, pursue it at the SlateDB layer
+  (`BlockTransformer` or a future native scheme), not in moraine's value
+  format. Nothing is designed.
 
 ## Alternatives considered
 
-- **moraine inventing its own data-file encryption scheme.** Rejected:
-  DuckLake owns data-file crypto, and moraine is row-faithful (RFC 0006) —
-  it must not enter the data-file path (RFC 0007) or reinterpret DuckLake's
-  encryption metadata. moraine carries key material; it does not originate a
-  scheme.
-- **Encrypting the whole SlateDB value opaquely, framing header included.**
-  Rejected: it destroys the two properties the header exists to provide (RFC
-  0002) — a corrupt or wrong-kind value would no longer fail loudly (it would
-  be indistinguishable from ciphertext), and encoding-version negotiation
-  would be impossible because the reader could not read the version without
-  first decrypting. The header must stay plaintext.
-- **Encrypting the stats values to plug the min/max leak.** Rejected: DuckLake
-  reads those strings for file pruning (RFC 0002, RFC 0009); encrypting them
-  breaks pruning. The leak is the cost of usable, uninterpreted stats.
+- **moraine-level envelope encryption of value payloads.** moraine would
+  encrypt each value's protobuf payload with a per-value DEK wrapped by a
+  KMS-held KEK, keeping the 5-byte framing header (RFC 0002) plaintext so
+  corruption detection and encoding-version negotiation survive. Rejected:
+  it defends against the same adversary SSE already handles — a bucket
+  reader — at far higher cost. It puts DEK/KEK handling and a KMS dependency
+  inside the core read/write path; opaque payloads block any migration or
+  tooling that must read a value's fields (RFC 0015); and ciphertext defeats
+  SlateDB's SST block compression, inflating inlined data by exactly the
+  cross-chunk redundancy RFC 0005 counts on reclaiming. No surveyed catalog
+  application-encrypts its own metadata (Prior art); if bucket-independent
+  encryption is ever required, SlateDB's `BlockTransformer` is the right
+  layer, not moraine's value format.
+- **Encrypting the stats values to plug the min/max leak.** Rejected:
+  DuckLake reads those strings for file pruning (RFC 0002, RFC 0009);
+  encrypting them breaks pruning. The leak is the cost of usable,
+  uninterpreted stats.
 - **Treating data-file encryption as sufficient on its own.** Rejected — the
-  spine of this RFC. A plaintext catalog leaks the data keys themselves, plus
-  plaintext stats, row counts, names, and schema. Data-file encryption
-  without catalog-at-rest protection buys far less than it appears to.
+  spine of this RFC. A plaintext catalog leaks the data keys themselves
+  (DuckLake stores them raw), plus stats, row counts, names, and schema.
+  Data-file encryption without catalog-at-rest protection buys far less than
+  it appears to.

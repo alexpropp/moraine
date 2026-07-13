@@ -145,7 +145,7 @@ let new_snapshot: SnapshotId = catalog.commit(|tx| {
 }).await?;
 ```
 
-`commit` reads a fresh `CatalogSnapshot`, constructs a `Txn` over it, runs the
+`commit` reads a fresh `CatalogSnapshot`, constructs a `Tx` over it, runs the
 closure to accumulate mutations, assembles exactly one `WriteBatch` (RFC 0002
 atomicity invariant), and commits it under the protocol of RFC 0004. On a
 transient write-write race it retries the whole cycle — including re-reading

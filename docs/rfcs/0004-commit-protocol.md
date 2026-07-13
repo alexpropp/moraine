@@ -23,7 +23,7 @@ keeping them distinct is load-bearing; this RFC specifies both.
 **Implemented.** Both front doors land commits as one atomic SlateDB batch
 over the shared core. Multi-statement, cross-table ACID transactions work
 end to end through DuckLake: a `BEGIN … COMMIT` spanning tables stages every
-statement's writes into one moraine staged txn (opened lazily on the first
+statement's writes into one moraine staged tx (opened lazily on the first
 write, reused across the transaction) and commits them as one snapshot;
 `ROLLBACK` discards them and mints none. A lost write-write race aborts
 without internal retry on the staged-row path, the loser's error carrying

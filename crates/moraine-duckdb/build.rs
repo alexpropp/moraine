@@ -183,10 +183,14 @@ fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
 /// the release's single-file amalgamation, compiling and caching it under
 /// `target/duckdb-src/<pin>-lib/<target>/` if it isn't already cached.
 ///
-/// Built once per target triple with fixed flags (`-O2`, `NDEBUG`, no debug
+/// Built once per target triple with fixed flags (`-O1`, `NDEBUG`, no debug
 /// info) regardless of cargo profile, so debug and release builds share the
 /// compile — a single translation unit that takes minutes. `NDEBUG` matches
-/// the release CLI the extension loads into.
+/// the release CLI the extension loads into. `-O1`, not `-O2`: gcc at `-O2`
+/// on this one giant translation unit peaks past the memory of a 16 GB CI
+/// runner running parallel rustc jobs (the runner agent gets killed), and
+/// optimization level does not affect the ABI; the linked-in code serves
+/// only the shim's metadata-catalog calls, not the host's query execution.
 fn ensure_duckdb_static_archive() -> anyhow::Result<PathBuf> {
     let target = std::env::var("TARGET").context("cargo sets TARGET for every build script")?;
     let lib_dir = duckdb_src_root()?.join(format!("{DUCKDB_PIN}-lib/{target}"));
@@ -219,7 +223,7 @@ fn ensure_duckdb_static_archive() -> anyhow::Result<PathBuf> {
         .include(&amalgamation_dir)
         .file(amalgamation_dir.join("duckdb.cpp"))
         .define("NDEBUG", None)
-        .opt_level(2)
+        .opt_level(1)
         .debug(false)
         .warnings(false)
         .cargo_metadata(false)

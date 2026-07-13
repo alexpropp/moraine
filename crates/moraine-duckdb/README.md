@@ -290,9 +290,14 @@ DuckDB's internals (`httpfs.duckdb_extension` for linux_amd64 v1.5.4 has
 this crate does the same: `build.rs` downloads the pinned release's
 `libduckdb-src.zip` (the single-file *library* amalgamation:
 `duckdb.cpp` + `duckdb.hpp`), compiles `duckdb.cpp` once per target triple
-with fixed flags (`-O2`, `NDEBUG` to match the release CLI, no debug
+with fixed flags (`-O1`, `NDEBUG` to match the release CLI, no debug
 info — profile-independent, so debug and release builds share it), and
-caches the archive at `target/duckdb-src/v1.5.4-lib/<target>/`. Note the
+caches the archive at `target/duckdb-src/v1.5.4-lib/<target>/`. `-O1`
+rather than `-O2` because gcc at `-O2` on this one giant translation unit
+peaks past a 16 GB CI runner's memory alongside parallel rustc jobs
+(observed as runner-agent deaths, exit 143, in every compiling CI job);
+optimization level does not affect the ABI, and the linked-in code serves
+only the shim's metadata-catalog calls, not the host's query execution. Note the
 split: the *headers* the shim compiles against still come from the full
 `src/include/` tree (the amalgamation's single header cannot express the
 parser types the shim needs); the amalgamation supplies only the linked

@@ -281,9 +281,12 @@ Two signal channels feed the seam:
   callers and tests; the shim does not use it.
 - **Pull** — cancellable entry points take a trailing
   `MoraineInterruptProbe probe, void *probe_ctx` pair
-  (`typedef bool (*MoraineInterruptProbe)(void *)`). The `select!` polls
-  the probe on a ~100 ms interval (DuckDB's own slice convention for
-  interruptible waits) whose first tick fires immediately. A null probe
+  (`typedef bool (*MoraineInterruptProbe)(void *)`). The probe is checked
+  once synchronously before the core future is first polled (a timer's
+  first tick is pending at the poll level even when already elapsed, so a
+  future completing on its first poll would otherwise beat a pending
+  interrupt), then the `select!` polls it on a ~100 ms interval — DuckDB's
+  own slice convention for interruptible waits. A null probe
   means non-cancellable. The probe may run on any of the runtime's
   threads, so it must be thread-safe and `probe_ctx` valid for the
   duration of the call — the shim's probe is a single atomic load of
@@ -302,13 +305,13 @@ cancels a blocked external call; their shipped mitigations are timeouts.
 
 Cancellable entry points are exactly the ones that block on store I/O and
 mutate nothing: `moraine_snapshot`, the `moraine_dump_*` reads, the
-`moraine_inline_*` reads, and `moraine_txn_begin` (reads the head
+`moraine_inline_*` reads, and `moraine_tx_begin` (reads the head
 snapshot; nothing is staged yet, so aborting it leaves no state). The
 snapshot listing calls (`moraine_snapshot_schemas`/`tables_in`/
 `columns_of`/`views_in`/`data_files_of`) walk the already-materialized
 snapshot in memory and take no probe. `moraine_attach`/`moraine_detach`
 are not cancellable this slice. **The commit path is deliberately
-shielded**: `moraine_txn_commit` takes no probe, so an interrupt during
+shielded**: `moraine_tx_commit` takes no probe, so an interrupt during
 `COMMIT` lets the commit finish rather than tear it mid-protocol —
 matching upstream DuckDB's own direction of suppressing interrupts around
 commit irreversibility. Concurrent multi-read cancellation on one handle
@@ -369,8 +372,10 @@ macOS release CLI does export them, which masked this for one platform).
 Official DuckDB C++ extensions carry their own statically linked copy of
 DuckDB's internals for the same reason. `build.rs` therefore downloads the
 pinned release's `libduckdb-src.zip` amalgamation *source*, compiles
-`duckdb.cpp` once per target triple with fixed flags (`-O2`, `NDEBUG`,
-matching the release CLI) into an archive cached under
+`duckdb.cpp` once per target triple with fixed flags (`-O1`, `NDEBUG`,
+matching the release CLI; `-O1` because gcc at `-O2` on the one giant
+translation unit exceeds a 16 GB CI runner's memory, and optimization
+level does not affect the ABI) into an archive cached under
 `target/duckdb-src/`, and links it lazily after the shim archive. Objects
 still cross the extension↔host boundary by pointer between ABI-identical
 builds of the same pinned version — the version pin is what makes this
@@ -410,11 +415,11 @@ build-time discovery, are recorded in `crates/moraine-duckdb/README.md`.
 
 DuckLake's own `INSERT`/`UPDATE`/`DELETE` against `ducklake_*` tables
 reach moraine through four C-ABI entry points (`moraine_abi.h`):
-`moraine_txn_begin(catalog) -> txn`, `moraine_txn_stage(txn, table_kind,
-op_kind, cells)` (accumulates one typed row operation — `insert`, `delete`,
-or `update_set_end` — without touching the store), `moraine_txn_commit(txn)
+`moraine_tx_begin(catalog) -> tx`, `moraine_tx_stage(tx, table_kind,
+operation_kind, cells)` (accumulates one typed row operation — `insert`, `delete`,
+or `update_set_end` — without touching the store), `moraine_tx_commit(tx)
 -> snapshot_id` (translates every staged operation into one atomic SlateDB
-batch and returns the new head), and `moraine_txn_rollback(txn)` (discards
+batch and returns the new head), and `moraine_tx_rollback(tx)` (discards
 the accumulated operations, no store access). The C++ shim's `PlanInsert`/
 `PlanUpdate`/`PlanDelete` (`cpp/catalog.cpp`, `cpp/staged_write.cpp`)
 recognize exactly one target: a `ducklake_*` metadata table entry whose

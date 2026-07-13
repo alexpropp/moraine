@@ -38,7 +38,7 @@ this file is the operational summary.
   constraint, no rationale essays.
 - Use blank lines to group code into readable stanzas.
 - Names prefer full words, for every symbol; abbreviate only when the word
-  is long and the abbreviation is conventional (`txn`, not `tbl`).
+  is long and the abbreviation is conventional (`tx`, not `tbl`).
 - Code and code comments never cite RFCs by number or name. State the
   constraint itself in the comment; RFCs reference code, not the reverse.
 - Features are additive-only and documented in the crate root.

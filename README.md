@@ -69,10 +69,10 @@ protocol — is in [`ARCHITECTURE.md`](ARCHITECTURE.md). Design decisions are
 recorded as RFCs in [`docs/rfcs/`](docs/rfcs/). Where this is going:
 [`ROADMAP.md`](ROADMAP.md).
 
-The bar for **1.0** is parity with the complete DuckLake spec **v1.0**
-catalog feature set: every one of its 28 `ducklake_*` catalog tables mapped
-onto SlateDB and validated against real DuckLake SQL. The
-[roadmap](ROADMAP.md#10--full-ducklake-catalog-parity) tracks each feature.
+The bar for **v0.1** is DuckLake consistency: parity with the complete
+DuckLake spec **v1.0** catalog feature set — every one of its 28
+`ducklake_*` catalog tables mapped onto SlateDB and validated against real
+DuckLake SQL. The [roadmap](ROADMAP.md) tracks each feature.
 
 ## Versioning
 

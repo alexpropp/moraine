@@ -144,8 +144,8 @@ Buffer compression stays off. Arrow's LZ4/ZSTD codecs are framed per
 buffer and lose to their own overhead at these sizes; whatever cross-
 chunk redundancy remains is reclaimed by SlateDB's SST block compression
 at rest, where it costs nothing on the write path. (That reclamation
-assumes plaintext values — RFC 0014 records how envelope encryption of
-value payloads would forfeit it.)
+assumes plaintext values, which holds: RFC 0014 delegates catalog-at-rest
+encryption to the object store, which encrypts post-compression.)
 
 ### Read path
 
