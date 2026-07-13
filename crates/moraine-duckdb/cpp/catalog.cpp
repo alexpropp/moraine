@@ -512,10 +512,14 @@ MoraineCatalog::~MoraineCatalog() {
 duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<duckdb::StorageExtensionInfo>,
                                                            duckdb::ClientContext &, duckdb::AttachedDatabase &db,
                                                            const std::string &, duckdb::AttachInfo &info,
-                                                           duckdb::AttachOptions &) {
+                                                           duckdb::AttachOptions &options) {
 	MoraineCatalogHandle *handle = nullptr;
 	MoraineError err{};
-	auto code = moraine_attach(info.path.c_str(), nullptr, &handle, &err);
+	// DuckDB resolves the attach's `READ_ONLY` flag into this access mode
+	// (including through DuckLake's nested metadata attach); a read-only
+	// catalog opens a `DbReader` and never fences the writer.
+	bool read_only = options.access_mode == duckdb::AccessMode::READ_ONLY;
+	auto code = moraine_attach(info.path.c_str(), nullptr, read_only, &handle, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

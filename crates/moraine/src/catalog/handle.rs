@@ -4,13 +4,24 @@
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use slatedb::{Db, DbTransaction, IsolationLevel};
+use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId},
     error::{Error, Result},
+    store::handle::ReadSession,
     transaction::{Transaction, commit},
 };
+
+/// The open store behind a catalog: the read-write `Db` writer, or a
+/// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
+/// fences a live writer (RFC 0004).
+enum Store {
+    /// The single read-write writer.
+    Writer(Db),
+    /// A read-only reader following the manifest, shared into read sessions.
+    Reader(Arc<DbReader>),
+}
 
 /// Options for opening a catalog.
 #[derive(Debug, Clone, Default)]
@@ -27,7 +38,7 @@ pub struct CatalogOptions {
 /// lives in a bucket reachable through any [`ObjectStore`].
 #[derive(Clone)]
 pub struct Catalog {
-    db: Arc<Db>,
+    store: Arc<Store>,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -64,7 +75,43 @@ impl Catalog {
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
         let db = commit::open_initialized(&options.path, object_store).await?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            store: Arc::new(Store::Writer(db)),
+        })
+    }
+
+    /// Opens the catalog **read-only** in `object_store` at `options.path`,
+    /// as a `DbReader` following the latest manifest.
+    ///
+    /// A read-only catalog never opens the writer `Db`, so it never fences a
+    /// live read-write process — any number of read-only catalogs may attach
+    /// alongside the one writer (RFC 0004). It never bootstraps: opening a
+    /// store no writer has initialized is refused. [`commit`](Self::commit)
+    /// returns [`Error::Constraint`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened, is not an initialized
+    /// moraine catalog, or is stamped with an unknown structural format.
+    pub async fn open_read_only(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<Self> {
+        let reader = commit::open_reader_initialized(&options.path, object_store).await?;
+        Ok(Self {
+            store: Arc::new(Store::Reader(Arc::new(reader))),
+        })
+    }
+
+    /// The read-write writer, or [`Error::Constraint`] if the catalog was
+    /// opened read-only.
+    fn writer(&self) -> Result<&Db> {
+        match self.store.as_ref() {
+            Store::Writer(db) => Ok(db),
+            Store::Reader(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -87,20 +134,33 @@ impl Catalog {
     }
 
     async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
-        let tx = self.begin_read_tx().await?;
-        let view = commit::materialize(&tx, at).await;
-        tx.rollback();
+        let session = self.begin_read().await?;
+        let view = commit::materialize(session.handle(), at).await;
+        session.finish();
 
         view
     }
 
-    /// Opens a fresh transaction at the current head, the same isolation
+    /// Opens a read session at the current head — a read-write transaction or
+    /// the read-only reader — the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
-    /// Used by [`crate::ffi_support`]'s raw current+history dumps and the
-    /// staged-row commit path; every other caller goes through
-    /// `snapshot`/`snapshot_at`/`commit`.
-    pub(crate) async fn begin_read_tx(&self) -> Result<DbTransaction> {
-        self.db
+    /// Used by [`crate::ffi_support`]'s raw current+history dumps and inline
+    /// scans; every other reader goes through `snapshot`/`snapshot_at`.
+    pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
+        match self.store.as_ref() {
+            Store::Writer(db) => Ok(ReadSession::Txn(
+                db.begin(IsolationLevel::Snapshot)
+                    .await
+                    .map_err(Error::from)?,
+            )),
+            Store::Reader(reader) => Ok(ReadSession::Reader(reader.clone())),
+        }
+    }
+
+    /// Opens a read-write transaction for the staged-row commit path. Fails
+    /// with [`Error::Constraint`] on a read-only catalog.
+    pub(crate) async fn begin_write_tx(&self) -> Result<DbTransaction> {
+        self.writer()?
             .begin(IsolationLevel::Snapshot)
             .await
             .map_err(Error::from)
@@ -117,7 +177,10 @@ impl Catalog {
     ///
     /// Returns an error if the underlying store fails to close cleanly.
     pub async fn close(&self) -> Result<()> {
-        self.db.close().await.map_err(Error::from)
+        match self.store.as_ref() {
+            Store::Writer(db) => db.close().await.map_err(Error::from),
+            Store::Reader(reader) => reader.close().await.map_err(Error::from),
+        }
     }
 
     /// Commits catalog mutations atomically, producing one new snapshot.
@@ -170,6 +233,6 @@ impl Catalog {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        commit::commit_cycle(&self.db, &f).await
+        commit::commit_cycle(self.writer()?, &f).await
     }
 }

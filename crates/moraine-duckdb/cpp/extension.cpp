@@ -1,5 +1,8 @@
-// Extension entry point: registers moraine's StorageExtension (attach
-// type `moraine`) against the loading database's config.
+// Extension registration, called from the Rust entry point
+// (`moraine_duckdb_duckdb_cpp_init` in src/entrypoint.rs). The entry point
+// lives in Rust so it lands in the cdylib's dynamic symbol table on every
+// platform; this function does the work: register moraine's StorageExtension
+// (attach type `moraine`) against the loading database's config.
 #include "duckdb.hpp"
 
 namespace moraine_duckdb {
@@ -9,14 +12,12 @@ void RegisterMoraineStorageExtension(duckdb::DBConfig &config);
 
 extern "C" {
 
-// Symbol name contract: the loader dlopen()s the file and calls
-// `<filebase>_duckdb_cpp_init`, where filebase is the artifact's base
-// filename with the `.duckdb_extension` suffix stripped. The artifact
-// here is named `moraine_duckdb`, so the exported symbol must be
-// `moraine_duckdb_duckdb_cpp_init`.
-DUCKDB_EXTENSION_API void moraine_duckdb_duckdb_cpp_init(duckdb::ExtensionLoader &loader) {
-	loader.SetDescription("moraine: a SlateDB-backed DuckLake catalog, read-only this slice");
-	moraine_duckdb::RegisterMoraineStorageExtension(loader.GetDatabaseInstance().config);
+// Not exported from the shared object: the Rust entry point references it, so
+// it is resolved at static-link time. Receives the `ExtensionLoader` DuckDB
+// handed the entry point, forwarded through Rust as a pointer.
+void moraine_duckdb_register(duckdb::ExtensionLoader *loader) {
+	loader->SetDescription("moraine: a SlateDB-backed DuckLake catalog, read-only this slice");
+	moraine_duckdb::RegisterMoraineStorageExtension(loader->GetDatabaseInstance().config);
 }
 
 } // extern "C"

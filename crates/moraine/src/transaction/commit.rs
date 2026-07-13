@@ -7,15 +7,16 @@ use std::{
 };
 
 use object_store::ObjectStore;
-use slatedb::{Db, DbTransaction, IsolationLevel, config::WriteOptions};
+use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
 use uuid::Uuid;
 
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId},
     error::{Error, Result},
     store::{
+        handle::ReadHandle,
         key::{EntityKey, Key, SysKey},
-        open::open_store,
+        open::{open_reader, open_store},
         proto, read, value,
     },
     transaction::{
@@ -48,7 +49,7 @@ pub(crate) fn durable() -> WriteOptions {
 /// Refuses a store this binary must not touch: mid-migration, or a
 /// format newer/older than it understands. `None` format means the store
 /// is empty and needs bootstrap.
-async fn validate_format(tx: &DbTransaction) -> Result<Option<proto::FormatValue>> {
+async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
     if read::read_migration(tx).await?.is_some() {
         return Err(Error::Corruption(
             "store is mid-migration; refusing to open".to_string(),
@@ -121,7 +122,7 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
         .await
         .map_err(Error::from)?;
 
-    match validate_format(&tx).await {
+    match validate_format(ReadHandle::Txn(&tx)).await {
         Ok(Some(_)) => {
             tx.rollback();
             return Ok(db);
@@ -146,7 +147,7 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
                 .begin(IsolationLevel::Snapshot)
                 .await
                 .map_err(Error::from)?;
-            let validated = validate_format(&tx).await;
+            let validated = validate_format(ReadHandle::Txn(&tx)).await;
             tx.rollback();
             if validated?.is_some() {
                 Ok(db)
@@ -160,11 +161,30 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
     }
 }
 
+/// Opens the store read-only as a [`DbReader`], validating the format it
+/// finds. Never opens a `Db`, so it never fences a live writer, and never
+/// bootstraps — a read-only attach against an uninitialized store is refused
+/// (there is nothing committed to read).
+pub(crate) async fn open_reader_initialized(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<DbReader> {
+    let reader = open_reader(path, object_store).await?;
+    match validate_format(ReadHandle::Reader(&reader)).await? {
+        Some(_) => Ok(reader),
+        None => Err(Error::Corruption(
+            "store is not an initialized moraine catalog; a read-only attach \
+             needs a writer to have created it first"
+                .to_string(),
+        )),
+    }
+}
+
 /// Materializes a catalog view through an open transaction, so the view
 /// and any staged writes share one read point. `at: None` reads the head
 /// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
 /// entities live at `s`.
-pub(crate) async fn materialize(tx: &DbTransaction, at: Option<u64>) -> Result<CatalogSnapshot> {
+pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
     let head = read::read_head(tx)
         .await?
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
@@ -618,7 +638,7 @@ async fn prepare_and_stage<F>(db_tx: &DbTransaction, f: &F) -> Result<Prepared>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
-    let base = materialize(db_tx, None).await?;
+    let base = materialize(ReadHandle::Txn(db_tx), None).await?;
     let head = base.snapshot.snapshot_id;
     let new_id = head + 1;
 

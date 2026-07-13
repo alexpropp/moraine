@@ -236,6 +236,7 @@ pub(crate) unsafe fn borrow_bytes<'a>(
 pub unsafe extern "C" fn moraine_attach(
     path: *const c_char,
     object_store_uri: *const c_char,
+    read_only: bool,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -261,12 +262,15 @@ pub unsafe extern "C" fn moraine_attach(
             )
         })?;
         let object_store = store_kind.open(path_str)?;
-        let catalog = runtime
-            .block_on(moraine::Catalog::open(
-                object_store,
-                moraine::CatalogOptions::default(),
-            ))
-            .map_err(AbiError::from)?;
+        let options = moraine::CatalogOptions::default();
+        let open = async {
+            if read_only {
+                moraine::Catalog::open_read_only(object_store, options).await
+            } else {
+                moraine::Catalog::open(object_store, options).await
+            }
+        };
+        let catalog = runtime.block_on(open).map_err(AbiError::from)?;
 
         Ok(Box::new(MoraineCatalogHandle::new(runtime, catalog)))
     };
@@ -998,8 +1002,15 @@ mod tests {
         let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
-        let code =
-            unsafe { moraine_attach(c_path.as_ptr(), ptr::null(), &raw mut handle, &raw mut err) };
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
         // SAFETY: `err.message` is null or just written; `as_ref` allows null.
         assert_eq!(code, codes::OK, "attach failed: {:?}", unsafe {
             err.message.as_ref()
@@ -1304,8 +1315,15 @@ mod tests {
         let mut err = MoraineError::default();
         // SAFETY: `c_path` is a valid NUL-terminated C string; `handle`/`err`
         // are valid, writable local slots.
-        let code =
-            unsafe { moraine_attach(c_path.as_ptr(), ptr::null(), &raw mut handle, &raw mut err) };
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
 
         assert_eq!(code, codes::INVALID_ARGUMENT);
         assert_eq!(err.code, codes::INVALID_ARGUMENT);
@@ -1332,6 +1350,7 @@ mod tests {
             moraine_attach(
                 c_path.as_ptr(),
                 scheme.as_ptr(),
+                false,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1352,8 +1371,15 @@ mod tests {
         let mut err = MoraineError::default();
         // SAFETY: a null `path` is exactly the input this test exercises;
         // `handle`/`err` are valid, writable local slots.
-        let code =
-            unsafe { moraine_attach(ptr::null(), ptr::null(), &raw mut handle, &raw mut err) };
+        let code = unsafe {
+            moraine_attach(
+                ptr::null(),
+                ptr::null(),
+                false,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::INVALID_ARGUMENT);
         assert!(handle.is_null());
         // SAFETY: just populated above.

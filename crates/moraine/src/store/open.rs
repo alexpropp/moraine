@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use slatedb::Db;
+use slatedb::{Db, DbReader};
 
 use crate::error::{Error, Result};
 
@@ -15,6 +15,20 @@ use crate::error::{Error, Result};
 /// with the tag-byte segment extractor.
 pub(crate) async fn open_store(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<Db> {
     Db::builder(path, object_store)
+        .with_segment_extractor(Arc::new(crate::store::segment::TagSegmentExtractor))
+        .build()
+        .await
+        .map_err(Error::from)
+}
+
+/// Open the store read-only as a [`DbReader`] following the latest manifest,
+/// with the same tag-byte segment extractor as the writer. A `DbReader`
+/// never opens the writer `Db`, so it never fences a live writer (RFC 0004).
+pub(crate) async fn open_reader(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+) -> Result<DbReader> {
+    DbReader::builder(path, object_store)
         .with_segment_extractor(Arc::new(crate::store::segment::TagSegmentExtractor))
         .build()
         .await

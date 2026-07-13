@@ -391,6 +391,71 @@ mod tests {
         String::from_utf8(output.stdout).expect("duckdb CLI stdout is not UTF-8")
     }
 
+    /// Like [`run_standalone_sql`] but attaches `moraine:` **read-only**
+    /// (`READ_ONLY`), so moraine opens a `DbReader` rather than the writer
+    /// `Db` (RFC 0017).
+    fn run_standalone_read_only_sql(store_dir: &Path, sql: &str) -> String {
+        let output = Command::new(cli_path())
+            .arg("-unsigned")
+            .arg("-csv")
+            .arg("-c")
+            .arg(format!("LOAD '{}';", ext_path().display()))
+            .arg("-c")
+            .arg(format!(
+                "ATTACH 'moraine:{}' AS m (READ_ONLY);",
+                store_dir.display()
+            ))
+            .arg("-c")
+            .arg(sql)
+            .output()
+            .expect("failed to spawn duckdb CLI");
+        assert!(
+            output.status.success(),
+            "standalone read-only moraine: attach failed for `{sql}`:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("duckdb CLI stdout is not UTF-8")
+    }
+
+    /// Like [`run_ducklake_sql`] but attaches the DuckLake chain **read-only**
+    /// (`READ_ONLY` on the outer attach).
+    fn run_ducklake_read_only_sql(store_dir: &Path, data_path: &Path, sql: &str) -> String {
+        let output = Command::new(cli_path())
+            .arg("-unsigned")
+            .arg("-csv")
+            .arg("-c")
+            .arg("SET threads=1;")
+            .arg("-c")
+            .arg(format!(
+                "SET extension_directory='{}';",
+                extension_directory().display()
+            ))
+            .arg("-c")
+            .arg("INSTALL ducklake;")
+            .arg("-c")
+            .arg("LOAD ducklake;")
+            .arg("-c")
+            .arg(format!("LOAD '{}';", ext_path().display()))
+            .arg("-c")
+            .arg(format!(
+                "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}', READ_ONLY);",
+                store_dir.display(),
+                data_path.display()
+            ))
+            .arg("-c")
+            .arg(sql)
+            .output()
+            .expect("failed to spawn duckdb CLI");
+        assert!(
+            output.status.success(),
+            "read-only ducklake attach failed for `{sql}`:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("duckdb CLI stdout is not UTF-8")
+    }
+
     /// The staged-row write path, driven end to end by DuckLake's own SQL:
     ///
     /// - `CREATE TABLE` **completes** — its metadata INSERT batch
@@ -916,6 +981,140 @@ mod tests {
                 "SELECT a FROM lake.main.t AT (VERSION => 3) ORDER BY a;",
             )),
             vec![vec!["10"], vec!["20"]]
+        );
+    }
+
+    /// Read-only attach (RFC 0017): `READ_ONLY` opens moraine's `DbReader`
+    /// (never the writer `Db`, so it never fences a live writer), and reads
+    /// flow through it end to end. The standalone `moraine: (READ_ONLY)`
+    /// surface is the reference case — DuckDB sets the access mode directly
+    /// from the flag and the shim reads it; a read-only DuckLake chain reads
+    /// the committed data the same way a read-write one does. Write rejection
+    /// and no-fencing are pinned by the core `tests/catalog.rs` suite, and
+    /// DuckDB enforces the outer `READ_ONLY` at the SQL layer.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_read_only_attach_reads_through_a_reader() {
+        let dir = TempDir::new("ro-store");
+        let data_dir = TempDir::new("ro-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        // Seed through a read-write attach.
+        run_ducklake_sql(store, data_path, "CREATE TABLE lake.main.t (a BIGINT);");
+        run_ducklake_sql(store, data_path, "INSERT INTO lake.main.t VALUES (1), (2);");
+
+        // Standalone read-only (moraine's DbReader) serves the metadata
+        // projection — the reference case for the shim's access-mode wiring.
+        assert_eq!(
+            csv_rows(&run_standalone_read_only_sql(
+                store,
+                "SELECT count(*) FROM m.ducklake_table WHERE end_snapshot IS NULL;",
+            )),
+            vec![vec!["1"]]
+        );
+
+        // A read-only DuckLake chain reads the committed rows.
+        assert_eq!(
+            csv_rows(&run_ducklake_read_only_sql(
+                store,
+                data_path,
+                "SELECT a FROM lake.main.t ORDER BY a;",
+            )),
+            vec![vec!["1"], vec!["2"]]
+        );
+    }
+
+    /// Multi-statement, cross-table ACID transactions through DuckLake's own
+    /// `BEGIN`/`COMMIT`/`ROLLBACK`, driven end to end.
+    ///
+    /// Every write a DuckDB transaction makes stages into one moraine
+    /// staged txn (opened lazily on the first write, reused across every
+    /// statement), committed atomically at `COMMIT` — so a transaction that
+    /// writes two different tables mints exactly one `ducklake_snapshot`, and
+    /// both tables' rows appear together or not at all.
+    ///
+    /// - `BEGIN; INSERT a; INSERT b; COMMIT;` across two tables lands both
+    ///   rows and advances the snapshot by exactly one (not one per
+    ///   statement) — the batching proof.
+    /// - `BEGIN; INSERT; ROLLBACK;` discards the write and mints no snapshot.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_multi_statement_transaction_commits_atomically() {
+        let dir = TempDir::new("txn-store");
+        let data_dir = TempDir::new("txn-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        // Two tables to span in one transaction.
+        run_ducklake_sql(
+            store,
+            data_path,
+            "CREATE TABLE lake.main.accounts (id BIGINT); \
+             CREATE TABLE lake.main.ledger (amount BIGINT);",
+        );
+
+        // The two CREATEs above minted snapshots 1 and 2 (bootstrap is 0):
+        // head is now 2.
+        let head_before = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT max(snapshot_id) FROM m.ducklake_snapshot;",
+        ));
+        assert_eq!(head_before, vec![vec!["2".to_string()]]);
+
+        // One transaction, two tables, two writes — committed atomically.
+        run_ducklake_sql(
+            store,
+            data_path,
+            "BEGIN; \
+             INSERT INTO lake.main.accounts VALUES (1); \
+             INSERT INTO lake.main.ledger VALUES (100); \
+             COMMIT;",
+        );
+
+        // Both rows are visible: the transaction landed as a whole.
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                store,
+                data_path,
+                "SELECT (SELECT count(*) FROM lake.main.accounts), \
+                        (SELECT count(*) FROM lake.main.ledger);",
+            )),
+            vec![vec!["1".to_string(), "1".to_string()]]
+        );
+
+        // The two writes advanced the head by exactly one snapshot: they
+        // shared one moraine staged txn, not one per statement.
+        assert_eq!(
+            csv_rows(&run_standalone_sql(
+                store,
+                "SELECT max(snapshot_id) FROM m.ducklake_snapshot;",
+            )),
+            vec![vec!["3".to_string()]]
+        );
+
+        // ROLLBACK discards the write and mints no snapshot.
+        run_ducklake_sql(
+            store,
+            data_path,
+            "BEGIN; \
+             INSERT INTO lake.main.accounts VALUES (2); \
+             ROLLBACK;",
+        );
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                store,
+                data_path,
+                "SELECT count(*) FROM lake.main.accounts;",
+            )),
+            vec![vec!["1".to_string()]]
+        );
+        assert_eq!(
+            csv_rows(&run_standalone_sql(
+                store,
+                "SELECT max(snapshot_id) FROM m.ducklake_snapshot;",
+            )),
+            vec![vec!["3".to_string()]]
         );
     }
 }

@@ -1,11 +1,10 @@
 //! Typed reads over an open transaction: decode keys and values into the
 //! wire types. No interpretation — the domain layer owns meaning.
 
-use slatedb::DbTransaction;
-
 use crate::{
     error::{Error, Result},
     store::{
+        handle::ReadHandle,
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
@@ -50,7 +49,7 @@ pub(crate) enum EntityRecord {
 }
 
 async fn read_singleton<M: prost::Message + Default>(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
     key: Key,
 ) -> Result<Option<M>> {
     tx.get(key.encode())
@@ -61,23 +60,23 @@ async fn read_singleton<M: prost::Message + Default>(
 }
 
 /// The layout-format stamp, if the store has been initialized.
-pub(crate) async fn read_format(tx: &DbTransaction) -> Result<Option<FormatValue>> {
+pub(crate) async fn read_format(tx: ReadHandle<'_>) -> Result<Option<FormatValue>> {
     read_singleton(tx, Key::Sys(SysKey::Format)).await
 }
 
 /// The structural-migration marker, present only mid-migration.
-pub(crate) async fn read_migration(tx: &DbTransaction) -> Result<Option<MigrationValue>> {
+pub(crate) async fn read_migration(tx: ReadHandle<'_>) -> Result<Option<MigrationValue>> {
     read_singleton(tx, Key::Sys(SysKey::Migration)).await
 }
 
 /// The head pointer: the latest committed snapshot id.
-pub(crate) async fn read_head(tx: &DbTransaction) -> Result<Option<HeadValue>> {
+pub(crate) async fn read_head(tx: ReadHandle<'_>) -> Result<Option<HeadValue>> {
     read_singleton(tx, Key::Sys(SysKey::Head)).await
 }
 
 /// One snapshot record.
 pub(crate) async fn read_snapshot(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
     snapshot_id: u64,
 ) -> Result<Option<SnapshotValue>> {
     read_singleton(tx, Key::Snapshot { snapshot_id }).await
@@ -85,7 +84,7 @@ pub(crate) async fn read_snapshot(
 
 /// Every committed snapshot record (`ducklake_snapshot` +
 /// `ducklake_snapshot_changes`, merged), in key order.
-pub(crate) async fn scan_snapshots(tx: &DbTransaction) -> Result<Vec<SnapshotValue>> {
+pub(crate) async fn scan_snapshots(tx: ReadHandle<'_>) -> Result<Vec<SnapshotValue>> {
     let mut iter = tx
         .scan_prefix(subspace_prefix(Subspace::Snapshot), ..)
         .await
@@ -135,7 +134,7 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
 }
 
 /// Every live entity record.
-pub(crate) async fn scan_current_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
+pub(crate) async fn scan_current_entities(tx: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     let mut iter = tx
         .scan_prefix(subspace_prefix(Subspace::Current), ..)
         .await
@@ -159,7 +158,7 @@ pub(crate) async fn scan_current_entities(tx: &DbTransaction) -> Result<Vec<Enti
 }
 
 /// Every ended entity-version record.
-pub(crate) async fn scan_history_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
+pub(crate) async fn scan_history_entities(tx: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     let mut iter = tx
         .scan_prefix(subspace_prefix(Subspace::History), ..)
         .await
@@ -301,12 +300,12 @@ mod tests {
         .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        assert_eq!(read_head(&tx).await.unwrap(), Some(head));
-        assert_eq!(read_format(&tx).await.unwrap(), None);
-        assert_eq!(read_migration(&tx).await.unwrap(), None);
-        assert_eq!(read_snapshot(&tx, 0).await.unwrap(), None);
+        assert_eq!(read_head(ReadHandle::Txn(&tx)).await.unwrap(), Some(head));
+        assert_eq!(read_format(ReadHandle::Txn(&tx)).await.unwrap(), None);
+        assert_eq!(read_migration(ReadHandle::Txn(&tx)).await.unwrap(), None);
+        assert_eq!(read_snapshot(ReadHandle::Txn(&tx), 0).await.unwrap(), None);
 
-        let current = scan_current_entities(&tx).await.unwrap();
+        let current = scan_current_entities(ReadHandle::Txn(&tx)).await.unwrap();
         assert_eq!(current.len(), 5);
         assert!(current.contains(&EntityRecord::Schema(schema)));
         assert!(current.contains(&EntityRecord::File(file)));
@@ -317,7 +316,7 @@ mod tests {
             scope_id: 0,
             value: option,
         }));
-        let history = scan_history_entities(&tx).await.unwrap();
+        let history = scan_history_entities(ReadHandle::Txn(&tx)).await.unwrap();
         assert_eq!(history, vec![EntityRecord::Schema(ended)]);
         tx.rollback();
         db.close().await.unwrap();

@@ -37,10 +37,10 @@ async fn dump_entities<T>(
     catalog: &Catalog,
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    let tx = catalog.begin_read_tx().await?;
-    let current = scan_current_entities(&tx).await;
-    let history = scan_history_entities(&tx).await;
-    tx.rollback();
+    let session = catalog.begin_read().await?;
+    let current = scan_current_entities(session.handle()).await;
+    let history = scan_history_entities(session.handle()).await;
+    session.finish();
     let mut records = current?;
     records.extend(history?);
     Ok(records.into_iter().filter_map(extract).collect())
@@ -144,9 +144,9 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 /// own — this is the full history, not a current/history split.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
-    let tx = catalog.begin_read_tx().await?;
-    let result = scan_snapshots(&tx).await;
-    tx.rollback();
+    let session = catalog.begin_read().await?;
+    let result = scan_snapshots(session.handle()).await;
+    session.finish();
     result
 }
 

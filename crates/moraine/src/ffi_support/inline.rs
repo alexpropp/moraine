@@ -51,10 +51,10 @@ pub async fn scan_inline(
     snapshot: u64,
     start: u64,
 ) -> Result<Vec<InlineRowRecord>> {
-    let tx = catalog.begin_read_tx().await?;
-    let chunks = store_inline::scan_inline_chunks(&tx, table_id).await;
-    let inline_deletes = store_inline::scan_inline_inline_deletes(&tx, table_id).await;
-    tx.rollback();
+    let session = catalog.begin_read().await?;
+    let chunks = store_inline::scan_inline_chunks(session.handle(), table_id).await;
+    let inline_deletes = store_inline::scan_inline_inline_deletes(session.handle(), table_id).await;
+    session.finish();
     let chunks = chunks?;
     let inline_deletes = inline_deletes?;
 
@@ -92,9 +92,9 @@ fn chunk_schema_version(op: &InlineOperation) -> u64 {
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, Vec<u8>)>> {
-    let tx = catalog.begin_read_tx().await?;
-    let schemas = store_inline::scan_inline_schemas(&tx, table_id).await;
-    tx.rollback();
+    let session = catalog.begin_read().await?;
+    let schemas = store_inline::scan_inline_schemas(session.handle(), table_id).await;
+    session.finish();
     Ok(schemas?
         .into_iter()
         .map(|(schema_version, value)| (schema_version, value.arrow_schema))
@@ -111,9 +111,9 @@ pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64)>> {
-    let tx = catalog.begin_read_tx().await?;
-    let schemas = store_inline::scan_all_inline_schemas(&tx).await;
-    tx.rollback();
+    let session = catalog.begin_read().await?;
+    let schemas = store_inline::scan_all_inline_schemas(session.handle()).await;
+    session.finish();
     Ok(schemas?
         .into_iter()
         .map(|(table_id, schema_version, _)| (table_id, schema_version))
@@ -131,9 +131,9 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -> Result<bool> {
-    let tx = catalog.begin_read_tx().await?;
-    let file_deletes = store_inline::scan_inline_file_deletes(&tx, table_id).await;
-    tx.rollback();
+    let session = catalog.begin_read().await?;
+    let file_deletes = store_inline::scan_inline_file_deletes(session.handle(), table_id).await;
+    session.finish();
     Ok(!file_deletes?.is_empty())
 }
 
@@ -185,7 +185,7 @@ mod tests {
     #[tokio::test]
     async fn scan_inline_materializes_rows_with_chunk_bodies() {
         let catalog = open().await;
-        let db_tx = catalog.begin_read_tx().await.unwrap();
+        let db_tx = catalog.begin_write_tx().await.unwrap();
         let mut txn = StagedTransaction::begin(db_tx);
 
         txn.stage(RowOperation::InlineSchema {
@@ -219,7 +219,7 @@ mod tests {
         });
         txn.commit().await.unwrap();
 
-        let db_tx2 = catalog.begin_read_tx().await.unwrap();
+        let db_tx2 = catalog.begin_write_tx().await.unwrap();
         let mut inline_delete = StagedTransaction::begin(db_tx2);
         inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,

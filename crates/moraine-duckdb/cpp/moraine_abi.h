@@ -85,7 +85,8 @@ typedef struct MoraineDataFileDesc {
 	uint64_t footer_size;
 } MoraineDataFileDesc;
 
-int32_t moraine_attach(const char *path, const char *object_store_uri, MoraineCatalogHandle **out, MoraineError *err);
+int32_t moraine_attach(const char *path, const char *object_store_uri, bool read_only, MoraineCatalogHandle **out,
+                       MoraineError *err);
 void moraine_detach(MoraineCatalogHandle *handle);
 
 int32_t moraine_snapshot(MoraineCatalogHandle *handle, MoraineSnapshotHandle **out, MoraineError *err);

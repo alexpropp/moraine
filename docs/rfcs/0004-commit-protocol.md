@@ -20,6 +20,22 @@ because moraine authors the mutations) and the staged-row path of RFC 0006
 surfaces to DuckLake). The two paths have different retry rights, and
 keeping them distinct is load-bearing; this RFC specifies both.
 
+**Implemented.** Both front doors land commits as one atomic SlateDB batch
+over the shared core. Multi-statement, cross-table ACID transactions work
+end to end through DuckLake: a `BEGIN … COMMIT` spanning tables stages every
+statement's writes into one moraine staged txn (opened lazily on the first
+write, reused across the transaction) and commits them as one snapshot;
+`ROLLBACK` discards them and mints none. A lost write-write race aborts
+without internal retry on the staged-row path, the loser's error carrying
+the `conflict` substring DuckLake's retry loop scans for. Verified live
+(`ducklake_load.rs`'s `ducklake_multi_statement_transaction_commits_atomically`,
+which pins that two writes across two tables advance the head by exactly one
+snapshot) and at the core (`staged.rs`'s
+`lost_race_is_not_retried_and_carries_conflict_text`). A genuine concurrent
+race is not reachable through DuckLake's single serialized metadata
+connection — a second read-write attach fences rather than races (the
+single-writer topology below) — so that path is pinned at the core, not live.
+
 ## Goals
 
 - Every commit is exactly one SlateDB `WriteBatch` (RFC 0002). Snapshot

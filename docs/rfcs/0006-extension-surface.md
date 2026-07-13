@@ -113,7 +113,8 @@ from birth, and DuckLake's bootstrap DDL batch never runs against one.
 the attach surface. An attach is either **read-write** — opening the one
 SlateDB `Db` writer — or **read-only** (`READ_ONLY`, mapped to SlateDB's
 `DbReader`), which never becomes a writer and never participates in
-fencing. This distinction is not cosmetic: SlateDB fencing means *the
+fencing. The plumbing that carries the `READ_ONLY` flag from `ATTACH`
+through the shim to the store open is specified and implemented in RFC 0017. This distinction is not cosmetic: SlateDB fencing means *the
 newest writer wins* — a second read-write attach from another process
 fences the incumbent's committer rather than failing itself, so two
 processes attaching read-write take turns breaking each other. A

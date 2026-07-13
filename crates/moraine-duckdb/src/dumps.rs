@@ -1696,8 +1696,15 @@ mod tests {
         let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
-        let code =
-            unsafe { moraine_attach(c_path.as_ptr(), ptr::null(), &raw mut handle, &raw mut err) };
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
         // SAFETY: `err.message` is null or was just written by the call above.
         let err_message = unsafe { err.message.as_ref() };
         assert_eq!(code, codes::OK, "attach failed: {err_message:?}");

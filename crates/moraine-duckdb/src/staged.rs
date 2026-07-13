@@ -626,8 +626,15 @@ mod tests {
         let mut err = MoraineError::default();
         let c_path = dir.c_path();
         // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
-        let code =
-            unsafe { moraine_attach(c_path.as_ptr(), ptr::null(), &raw mut handle, &raw mut err) };
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::OK);
         assert!(!handle.is_null());
         handle

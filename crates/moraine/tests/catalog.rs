@@ -254,3 +254,94 @@ async fn dropped_column_field_ids_are_not_reused_across_commits() {
         .unwrap();
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn read_only_reads_the_committed_catalog_but_rejects_writes() {
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+
+    let writer = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+
+    // A read-only attach sees the committed state.
+    let reader = Catalog::open_read_only(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let snap = reader.snapshot().await.unwrap();
+    assert!(snap.schema_by_name("sales").is_some());
+
+    // A write through the read-only catalog is refused (a typed error, not a
+    // fence): the writer was never opened, so nothing could be fenced.
+    let err = reader
+        .commit(|tx| tx.create_schema("more").map(|_| ()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "got {err:?}");
+
+    writer.close().await.unwrap();
+    reader.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_only_attach_does_not_fence_the_live_writer() {
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+
+    let writer = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| tx.create_schema("first").map(|_| ()))
+        .await
+        .unwrap();
+
+    // Attach a reader while the writer is live.
+    let reader = Catalog::open_read_only(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        reader
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("first")
+            .is_some()
+    );
+
+    // The reader did not fence the writer: its next durable commit still lands.
+    writer
+        .commit(|tx| tx.create_schema("second").map(|_| ()))
+        .await
+        .unwrap();
+
+    // A freshly attached reader sees the newer state.
+    let reader2 = Catalog::open_read_only(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        reader2
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("second")
+            .is_some()
+    );
+
+    writer.close().await.unwrap();
+    reader.close().await.unwrap();
+    reader2.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_only_refuses_an_uninitialized_store() {
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+    // No writer ever created the catalog: a read-only attach has nothing to
+    // read — the store has no manifest to follow, so the open is refused.
+    let err = Catalog::open_read_only(store, CatalogOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Store(_)), "got {err:?}");
+}

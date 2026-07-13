@@ -48,6 +48,7 @@
 pub mod abi;
 pub mod arrow_ipc;
 pub mod dumps;
+pub mod entrypoint;
 pub mod error;
 pub mod inline;
 pub mod runtime;

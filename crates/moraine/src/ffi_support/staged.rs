@@ -16,6 +16,6 @@ use crate::{catalog::Catalog, error::Result};
 /// Returns an error if the underlying store transaction cannot be opened.
 #[doc(hidden)]
 pub async fn staged_begin(catalog: &Catalog) -> Result<StagedTransaction> {
-    let db_tx = catalog.begin_read_tx().await?;
+    let db_tx = catalog.begin_write_tx().await?;
     Ok(StagedTransaction::begin(db_tx))
 }

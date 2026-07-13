@@ -10,10 +10,16 @@
 - [x] First runnable example in `crates/moraine/examples/` once the API exists
 
 ### DuckDB extension loads
-- [ ] RFC 0006: extension surface (moraine as a DuckLake catalog via a DuckDB `StorageExtension`)
+- [ ] RFC 0006: extension surface (moraine as a DuckLake catalog via a DuckDB `StorageExtension`) — done except query interruption (`moraine_interrupt` is wired but the shim does not yet call it on cancellation)
 - [x] C++ shim registering the `StorageExtension`/`Catalog`/`TransactionManager`, over a C ABI to the Rust core
 - [x] Extension entry points in `moraine-duckdb`
 - [x] `cargo xtask e2e` loads the extension into a real DuckDB
+- [x] Read-write and read-only attach (RFC 0017): the `READ_ONLY` attach
+  flag threads through the shim's `AttachOptions::access_mode` to
+  `Catalog::open_read_only`, opening a SlateDB `DbReader` (never the writer
+  `Db`, so it never fences the live writer) behind a `ReadHandle` read
+  abstraction. Reads verified live standalone and through a read-only
+  DuckLake chain; reads/write-rejection/no-fence pinned by the core suite
 
 ### DuckLake end-to-end
 - [x] DuckLake SQL operations against moraine as the catalog — `ATTACH
@@ -84,8 +90,21 @@ e2e suite before it is checked off.
   `file_variant_stats`) (variant stats pending)
 
 ### Transactions & time travel
-- [ ] Multi-statement, cross-table ACID transactions with conflict
-  detection (RFC 0004)
+- [x] Multi-statement, cross-table ACID transactions with conflict
+  detection (RFC 0004): a DuckLake `BEGIN … COMMIT` spanning tables stages
+  every statement's writes into one moraine staged txn (opened lazily on
+  the first write, reused across the transaction) and lands them as one
+  atomic snapshot; `ROLLBACK` discards them and mints none. Verified live
+  end to end (`ducklake_load.rs`'s
+  `ducklake_multi_statement_transaction_commits_atomically` — two writes
+  across two tables advance the head by exactly one snapshot). A lost
+  write-write race aborts without internal retry, the loser's error
+  carrying the `conflict` substring DuckLake's retry loop scans for
+  (`staged.rs`'s `lost_race_is_not_retried_and_carries_conflict_text`); a
+  genuine concurrent race is not reachable through DuckLake's single
+  serialized metadata connection (a second read-write attach fences rather
+  than races — RFC 0004's single-writer topology), so it is pinned at the
+  core
 - [x] Snapshots and time travel to any snapshot (`snapshot`): DuckLake's
   `AT (VERSION => N)` reads past data *and* schema, verified live across
   inline inserts, schema evolution, and flush (`ducklake_load.rs`'s

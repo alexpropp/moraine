@@ -9,13 +9,15 @@
 //! in the shim are left for the dynamic loader (`-undefined dynamic_lookup`
 //! on macOS; ELF's default `-shared` behavior permits this on Linux).
 //!
-//! Three linker interventions are required on every platform:
+//! The extension entry point is a Rust `#[no_mangle]` function (see
+//! `src/entrypoint.rs`) that forwards to the C++ shim, so rustc lists it
+//! among the cdylib's exported symbols on every platform — the C++ side
+//! exports nothing. Two linker interventions remain:
 //!
-//! 1. Nothing in the Rust crate calls the C++ entry point, so the archive
-//!    member must be force-loaded or the linker drops it.
-//! 2. Rust's cdylib link restricts the dynamic-symbol table to symbols
-//!    rustc knows about, so the C++ entry point must be explicitly exported.
-//! 3. The archive must appear on the link line exactly once. `cc`'s default
+//! 1. Only the C++ translation units the entry point transitively references
+//!    would otherwise be pulled from the archive; force-loading the whole
+//!    archive keeps every translation unit present regardless.
+//! 2. The archive must appear on the link line exactly once. `cc`'s default
 //!    cargo metadata adds a second, lazy `-l` mention ahead of the
 //!    force-load one, making lld define every cross-referenced symbol
 //!    twice; so `cc`'s metadata is suppressed and the C++ standard library
@@ -72,8 +74,9 @@ fn main() -> anyhow::Result<()> {
 
     match target_os.as_str() {
         "macos" => {
-            // `-force_load` pulls in the whole archive despite nothing
-            // referencing it.
+            // `-force_load` pulls in the whole archive, keeping every C++
+            // translation unit present, not just those the entry point
+            // transitively references.
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,-force_load,{}",
                 archive_path.display()
@@ -82,13 +85,6 @@ fn main() -> anyhow::Result<()> {
             // process already has them.
             println!("cargo:rustc-cdylib-link-arg=-undefined");
             println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
-            // Rust's auto-generated `-exported_symbols_list` lists only
-            // `#[no_mangle]` symbols, dropping the C++ entry point;
-            // `-exported_symbol` adds to that list. Leading underscore is
-            // Mach-O's C decoration.
-            println!(
-                "cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_moraine_duckdb_duckdb_cpp_init"
-            );
             // The C++ standard library, after the archive so it can satisfy
             // the shim's references.
             println!("cargo:rustc-cdylib-link-arg=-lc++");
@@ -101,13 +97,6 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,--whole-archive,{},--no-whole-archive",
                 archive_path.display()
-            );
-            // Rust restricts the dynamic-symbol list on ELF via a version
-            // script; `--export-dynamic-symbol` (GNU ld >= 2.35, also lld)
-            // adds the C++ entry point. No leading underscore: ELF doesn't
-            // decorate C symbols.
-            println!(
-                "cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=moraine_duckdb_duckdb_cpp_init"
             );
             // The C++ standard library, after the archive so it can satisfy
             // the shim's references.

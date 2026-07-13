@@ -2,11 +2,10 @@
 //! per-schema-version schema records. Mirrors `store::read`'s decode-only
 //! contract — no DuckLake interpretation here.
 
-use slatedb::DbTransaction;
-
 use crate::{
     error::{Error, Result},
     store::{
+        handle::ReadHandle,
         key::{
             InlineKey, InlineOperation, InlineOperationKind, Key, inline_live_table_prefix,
             inline_schema_prefix, inline_schema_table_prefix,
@@ -22,7 +21,7 @@ use crate::{
 /// in key order (schema version, then commit snapshot, then chunk
 /// sequence).
 pub(crate) async fn scan_inline_chunks(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(InlineOperation, InlineChunkValue)>> {
     let mut iter = tx
@@ -52,7 +51,7 @@ pub(crate) async fn scan_inline_chunks(
 
 /// Every inlined-insert-row tombstone for `table_id`, keyed by row id.
 pub(crate) async fn scan_inline_inline_deletes(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineInlineDeleteValue)>> {
     let mut iter = tx
@@ -83,7 +82,7 @@ pub(crate) async fn scan_inline_inline_deletes(
 /// Every inlined Parquet-row delete for `table_id`, keyed by
 /// `(data_file_id, row_id)`.
 pub(crate) async fn scan_inline_file_deletes(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, u64, InlineFileDeleteValue)>> {
     let mut iter = tx
@@ -119,7 +118,7 @@ pub(crate) async fn scan_inline_file_deletes(
 // No production caller yet; see `scan_inline_chunks`.
 #[allow(dead_code)]
 pub(crate) async fn read_inline_schema(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
     table_id: u64,
     schema_version: u64,
 ) -> Result<Option<InlineSchemaValue>> {
@@ -137,7 +136,7 @@ pub(crate) async fn read_inline_schema(
 
 /// Every schema version recorded for `table_id`, in key order.
 pub(crate) async fn scan_inline_schemas(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineSchemaValue)>> {
     let mut iter = tx
@@ -163,7 +162,7 @@ pub(crate) async fn scan_inline_schemas(
 /// Every `inline/schema` record across every table, in key order
 /// (`table_id`, then `schema_version`).
 pub(crate) async fn scan_all_inline_schemas(
-    tx: &DbTransaction,
+    tx: ReadHandle<'_>,
 ) -> Result<Vec<(u64, u64, InlineSchemaValue)>> {
     let mut iter = tx
         .scan_prefix(inline_schema_prefix(), ..)
@@ -335,7 +334,7 @@ mod tests {
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
 
-        let chunks = scan_inline_chunks(&tx, 7).await.unwrap();
+        let chunks = scan_inline_chunks(ReadHandle::Txn(&tx), 7).await.unwrap();
         assert_eq!(
             chunks,
             vec![
@@ -369,29 +368,42 @@ mod tests {
             ]
         );
 
-        let inline_deletes = scan_inline_inline_deletes(&tx, 7).await.unwrap();
+        let inline_deletes = scan_inline_inline_deletes(ReadHandle::Txn(&tx), 7)
+            .await
+            .unwrap();
         assert_eq!(inline_deletes, vec![(3, inline_delete)]);
 
-        let file_deletes = scan_inline_file_deletes(&tx, 7).await.unwrap();
+        let file_deletes = scan_inline_file_deletes(ReadHandle::Txn(&tx), 7)
+            .await
+            .unwrap();
         assert_eq!(file_deletes, vec![(5, 1, file_delete)]);
 
-        let schemas = scan_inline_schemas(&tx, 7).await.unwrap();
+        let schemas = scan_inline_schemas(ReadHandle::Txn(&tx), 7).await.unwrap();
         assert_eq!(
             schemas,
             vec![(0, schema_v0.clone()), (1, schema_v1.clone())]
         );
 
         assert_eq!(
-            read_inline_schema(&tx, 7, 0).await.unwrap(),
+            read_inline_schema(ReadHandle::Txn(&tx), 7, 0)
+                .await
+                .unwrap(),
             Some(schema_v0)
         );
         assert_eq!(
-            read_inline_schema(&tx, 7, 1).await.unwrap(),
+            read_inline_schema(ReadHandle::Txn(&tx), 7, 1)
+                .await
+                .unwrap(),
             Some(schema_v1)
         );
-        assert_eq!(read_inline_schema(&tx, 7, 2).await.unwrap(), None);
+        assert_eq!(
+            read_inline_schema(ReadHandle::Txn(&tx), 7, 2)
+                .await
+                .unwrap(),
+            None
+        );
 
-        let other_table_chunks = scan_inline_chunks(&tx, 8).await.unwrap();
+        let other_table_chunks = scan_inline_chunks(ReadHandle::Txn(&tx), 8).await.unwrap();
         assert_eq!(
             other_table_chunks,
             vec![(
@@ -450,7 +462,7 @@ mod tests {
         .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let all = scan_all_inline_schemas(&tx).await.unwrap();
+        let all = scan_all_inline_schemas(ReadHandle::Txn(&tx)).await.unwrap();
         assert_eq!(
             all,
             vec![
