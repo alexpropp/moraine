@@ -27,12 +27,14 @@ struct MetadataColumnSpec {
 };
 
 // Fetches every row of one `ducklake_*` table, already converted to typed
-// `duckdb::Value`s in column-declaration order. Reads through the Task 3
-// dump ABI for store-backed tables; `ducklake_metadata`'s provider ignores
-// `handle` and returns fixed rows instead (see metadata_tables.cpp).
-using MetadataRowProvider = std::vector<std::vector<duckdb::Value>> (*)(MoraineCatalogHandle *handle);
+// `duckdb::Value`s in column-declaration order. Reads through the
+// dump ABI for store-backed tables, forwarding the probe pair so a blocked
+// read cancels; `ducklake_metadata`'s provider ignores `handle` and the
+// probe pair and returns fixed rows instead (see metadata_tables.cpp).
+using MetadataRowProvider = std::vector<std::vector<duckdb::Value>> (*)(MoraineCatalogHandle *handle,
+                                                                        MoraineInterruptProbe probe, void *probe_ctx);
 
-// `moraine_txn_stage`'s "not writable" `table_kind` sentinel (moraine_abi.h),
+// `moraine_tx_stage`'s "not writable" `table_kind` sentinel (moraine_abi.h),
 // mirrored here so this spec and the staged-write Sink (staged_write.cpp)
 // share one source of truth.
 constexpr int32_t kNotWritable = -1;
@@ -51,7 +53,7 @@ struct MetadataTableSpec {
 	const char *name;
 	std::vector<MetadataColumnSpec> columns;
 	MetadataRowProvider provider;
-	// `moraine_txn_stage`'s `table_kind` for this table, or `kNotWritable`
+	// `moraine_tx_stage`'s `table_kind` for this table, or `kNotWritable`
 	// for the always-empty stand-ins and `ducklake_metadata` (writes to
 	// those are out of scope this slice — DDL/unsupported-DML naming the
 	// statement kind, per PlanInsert's NotImplementedException).
@@ -98,8 +100,8 @@ public:
 
 	// Exposed for the staged-write path (staged_write.cpp): the column
 	// shape and `table_kind` needed to translate an incoming DataChunk row
-	// into a `moraine_txn_stage` call, and the catalog handle
-	// `moraine_txn_begin` opens against.
+	// into a `moraine_tx_stage` call, and the catalog handle
+	// `moraine_tx_begin` opens against.
 	const MetadataTableSpec &Spec() const {
 		return spec_;
 	}

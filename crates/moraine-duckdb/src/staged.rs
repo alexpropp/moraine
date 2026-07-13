@@ -2,8 +2,8 @@
 //! writes into a [`MoraineCell`] array and calls into this module. Rows
 //! accumulate in memory via
 //! [`moraine::ffi_support::staged::StagedTransaction`] until
-//! [`moraine_txn_commit`] lands them all in one atomic store batch, or
-//! [`moraine_txn_rollback`] discards them.
+//! [`moraine_tx_commit`] lands them all in one atomic store batch, or
+//! [`moraine_tx_rollback`] discards them.
 //!
 //! Same conventions as [`crate::abi`]: `catch_unwind`/null discipline via
 //! `crate::abi::guard`, no internal retry (a lost race at commit surfaces
@@ -12,14 +12,14 @@
 //! into [`Cell`]s and forwards them, never interpreting DuckLake's row
 //! values itself.
 //!
-//! [`MoraineTxnHandle`] borrows the owning [`MoraineCatalogHandle`]'s tokio
-//! runtime for [`moraine_txn_begin`] and [`moraine_txn_commit`] (the only
+//! [`MoraineTxHandle`] borrows the owning [`MoraineCatalogHandle`]'s tokio
+//! runtime for [`moraine_tx_begin`] and [`moraine_tx_commit`] (the only
 //! two async operations here; `stage` and `rollback` are synchronous). The
 //! caller contract requires the catalog outlive every open transaction on
 //! it.
 
 use std::{
-    ffi::c_char,
+    ffi::{c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -30,12 +30,12 @@ use moraine::ffi_support::staged::{
 use crate::{
     abi::{borrow_bytes, borrow_str, guard},
     error::{AbiError, MoraineError, codes},
-    runtime::MoraineCatalogHandle,
+    runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
 /// One value in a staged row. Mirrors [`Cell`] as a tagged struct across
 /// the C boundary; `str_value` is borrowed, valid only for the duration of
-/// the [`moraine_txn_stage`] call that reads it.
+/// the [`moraine_tx_stage`] call that reads it.
 #[repr(C)]
 pub struct MoraineCell {
     /// `0` = NULL, `1` = u64, `2` = i64, `3` = bool, `4` = string.
@@ -52,11 +52,11 @@ pub struct MoraineCell {
 
 /// A staged-row transaction, opaque to C. Owns one [`StagedTransaction`]
 /// plus a borrowed pointer to the catalog handle it was opened on, used to
-/// `block_on` the async core calls in [`moraine_txn_begin`] and
-/// [`moraine_txn_commit`].
-pub struct MoraineTxnHandle {
+/// `block_on` the async core calls in [`moraine_tx_begin`] and
+/// [`moraine_tx_commit`].
+pub struct MoraineTxHandle {
     catalog: *const MoraineCatalogHandle,
-    txn: StagedTransaction,
+    tx: StagedTransaction,
 }
 
 fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
@@ -74,25 +74,25 @@ fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
         10 => Ok(TableKind::FileColumnStats),
         11 => Ok(TableKind::SchemaVersions),
         other => Err(AbiError::invalid_argument(format!(
-            "moraine_txn_stage: unknown table_kind {other}"
+            "moraine_tx_stage: unknown table_kind {other}"
         ))),
     }
 }
 
-/// The three [`RowOperation`] shapes, decoded from `op_kind`.
-enum OpKind {
+/// The three [`RowOperation`] shapes, decoded from `operation_kind`.
+enum OperationKind {
     Insert,
     Delete,
     UpdateSetEnd,
 }
 
-fn decode_op_kind(v: i32) -> Result<OpKind, AbiError> {
+fn decode_operation_kind(v: i32) -> Result<OperationKind, AbiError> {
     match v {
-        0 => Ok(OpKind::Insert),
-        1 => Ok(OpKind::Delete),
-        2 => Ok(OpKind::UpdateSetEnd),
+        0 => Ok(OperationKind::Insert),
+        1 => Ok(OperationKind::Delete),
+        2 => Ok(OperationKind::UpdateSetEnd),
         other => Err(AbiError::invalid_argument(format!(
-            "moraine_txn_stage: unknown op_kind {other}"
+            "moraine_tx_stage: unknown operation_kind {other}"
         ))),
     }
 }
@@ -107,54 +107,64 @@ fn decode_op_kind(v: i32) -> Result<OpKind, AbiError> {
 /// NUL-terminated UTF-8 C string, valid for reads for the duration of
 /// this call.
 unsafe fn decode_cells(cells: *const MoraineCell, len: usize) -> Result<Vec<Cell>, AbiError> {
-    if cells.is_null() {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        return Err(AbiError::invalid_argument(
-            "moraine_txn_stage: `cells` is null but `cells_len` is nonzero",
-        ));
+    if cells.is_null() && len == 0 {
+        Ok(Vec::new())
+    } else if cells.is_null() {
+        Err(AbiError::invalid_argument(
+            "moraine_tx_stage: `cells` is null but `cells_len` is nonzero",
+        ))
+    } else {
+        // SAFETY: caller contract above.
+        let slice = unsafe { std::slice::from_raw_parts(cells, len) };
+        slice
+            .iter()
+            .map(|c| match c.kind {
+                0 => Ok(Cell::Null),
+                1 => Ok(Cell::U64(c.u64_value)),
+                2 => Ok(Cell::I64(c.i64_value)),
+                3 => Ok(Cell::Bool(c.bool_value)),
+                4 => {
+                    // SAFETY: caller contract above.
+                    let s = unsafe { borrow_str(c.str_value, "cell.str_value") }?;
+                    Ok(Cell::Str(s.to_string()))
+                }
+                other => Err(AbiError::invalid_argument(format!(
+                    "moraine_tx_stage: unknown cell kind {other}"
+                ))),
+            })
+            .collect()
     }
-    // SAFETY: caller contract above.
-    let slice = unsafe { std::slice::from_raw_parts(cells, len) };
-    slice
-        .iter()
-        .map(|c| match c.kind {
-            0 => Ok(Cell::Null),
-            1 => Ok(Cell::U64(c.u64_value)),
-            2 => Ok(Cell::I64(c.i64_value)),
-            3 => Ok(Cell::Bool(c.bool_value)),
-            4 => {
-                // SAFETY: caller contract above.
-                let s = unsafe { borrow_str(c.str_value, "cell.str_value") }?;
-                Ok(Cell::Str(s.to_string()))
-            }
-            other => Err(AbiError::invalid_argument(format!(
-                "moraine_txn_stage: unknown cell kind {other}"
-            ))),
-        })
-        .collect()
 }
 
 /// Opens a staged-row transaction at the current head and writes the
 /// resulting handle to `*out`.
+///
+/// Cancellable: races the head read against
+/// [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal and
+/// against `probe` (polled immediately, then ~100 ms; a null `probe`
+/// disables polling). If a cancellation wins, returns
+/// [`codes::INTERRUPTED`], `*out` is left unwritten, and nothing is
+/// staged.
 ///
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
 /// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached,
 /// and must outlive every operation on the returned transaction handle
-/// (through [`moraine_txn_commit`] or [`moraine_txn_rollback`]). `out`
-/// must be a valid, writable `*mut *mut MoraineTxnHandle`. `err`, if
-/// non-null, must be a valid, writable [`MoraineError`]. All for the
-/// duration of this call.
+/// (through [`moraine_tx_commit`] or [`moraine_tx_rollback`]). `out`
+/// must be a valid, writable `*mut *mut MoraineTxHandle`. `probe`, if
+/// non-null, must be safe to call with `probe_ctx` from any thread.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
+/// for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_begin(
+pub unsafe extern "C" fn moraine_tx_begin(
     handle: *mut MoraineCatalogHandle,
-    out: *mut *mut MoraineTxnHandle,
+    out: *mut *mut MoraineTxHandle,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Box<MoraineTxnHandle>, AbiError> {
+    let attempt = || -> Result<Box<MoraineTxHandle>, AbiError> {
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -163,13 +173,14 @@ pub unsafe extern "C" fn moraine_txn_begin(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let txn = handle_ref
-            .runtime
-            .block_on(staged_begin(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
-        Ok(Box::new(MoraineTxnHandle {
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let tx = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, staged_begin(&handle_ref.catalog))
+        }?;
+        Ok(Box::new(MoraineTxHandle {
             catalog: handle,
-            txn,
+            tx,
         }))
     };
 
@@ -187,11 +198,11 @@ pub unsafe extern "C" fn moraine_txn_begin(
 }
 
 /// Accumulates one staged row mutation. Nothing touches the store until
-/// [`moraine_txn_commit`]. `table_kind` is [`TableKind`]'s discriminant
+/// [`moraine_tx_commit`]. `table_kind` is [`TableKind`]'s discriminant
 /// order (`0` = `Snapshot`, `1` = `SnapshotChanges`, `2` = `Schema`, `3` =
 /// `Table`, `4` = `View`, `5` = `Column`, `6` = `DataFile`, `7` =
 /// `DeleteFile`, `8` = `TableStats`, `9` = `TableColumnStats`, `10` =
-/// `FileColumnStats`, `11` = `SchemaVersions`); `op_kind` is `0` = insert,
+/// `FileColumnStats`, `11` = `SchemaVersions`); `operation_kind` is `0` = insert,
 /// `1` = delete, `2` = update-sets-`end_snapshot`. `cells` are positional
 /// in the column order the shim declares for `table_kind`'s table (a delete
 /// or update-set-end row carries only the key columns, per [`RowOperation`]'s
@@ -199,46 +210,46 @@ pub unsafe extern "C" fn moraine_txn_begin(
 ///
 /// # Safety
 ///
-/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 /// and not yet committed or rolled back. `cells`, if `cells_len` is
 /// nonzero, must point to `cells_len` valid [`MoraineCell`]s (every
 /// non-null `str_value` inside a valid NUL-terminated UTF-8 C string).
 /// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
 /// for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage(
+    tx: *mut MoraineTxHandle,
     table_kind: i32,
-    op_kind: i32,
+    operation_kind: i32,
     cells: *const MoraineCell,
     cells_len: usize,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
         let table = decode_table_kind(table_kind)?;
-        let kind = decode_op_kind(op_kind)?;
+        let kind = decode_operation_kind(operation_kind)?;
         // SAFETY: caller contract above.
         let row_cells = unsafe { decode_cells(cells, cells_len) }?;
         let op = match kind {
-            OpKind::Insert => RowOperation::Insert {
+            OperationKind::Insert => RowOperation::Insert {
                 table,
                 cells: row_cells,
             },
-            OpKind::Delete => RowOperation::Delete {
+            OperationKind::Delete => RowOperation::Delete {
                 table,
                 cells: row_cells,
             },
-            OpKind::UpdateSetEnd => RowOperation::UpdateSetEnd {
+            OperationKind::UpdateSetEnd => RowOperation::UpdateSetEnd {
                 table,
                 cells: row_cells,
             },
         };
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(op);
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(op);
         Ok(())
     };
 
@@ -250,45 +261,46 @@ pub unsafe extern "C" fn moraine_txn_stage(
 }
 
 /// Translates every staged row and lands them in one atomic batch,
-/// consuming `txn`. On success, writes the new snapshot id to
+/// consuming `tx`. On success, writes the new snapshot id to
 /// `*out_snapshot_id`.
 ///
 /// A lost race against a concurrent commit is never retried internally: it
 /// returns [`codes::COMMIT_CONFLICT`] with the literal substring `conflict`
-/// in the message, and the loser leaves the store unchanged. `txn` is freed
-/// either way; it must not be passed to [`moraine_txn_rollback`]
+/// in the message, and the loser leaves the store unchanged. `tx` is freed
+/// either way; it must not be passed to [`moraine_tx_rollback`]
 /// afterward.
 ///
 /// # Safety
 ///
-/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 /// and not yet committed or rolled back. `out_snapshot_id` must be a
 /// valid, writable `*mut u64`. `err`, if non-null, must be a valid,
 /// writable [`MoraineError`]. All for the duration of this call. The
-/// catalog handle `txn` was opened on ([`moraine_txn_begin`]'s contract)
+/// catalog handle `tx` was opened on ([`moraine_tx_begin`]'s contract)
 /// must still be attached.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_commit(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_commit(
+    tx: *mut MoraineTxHandle,
     out_snapshot_id: *mut u64,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<u64, AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
         if out_snapshot_id.is_null() {
             return Err(AbiError::invalid_argument("`out_snapshot_id` is null"));
         }
-        // SAFETY: caller contract above; `txn` consumed exactly once.
-        let boxed = unsafe { Box::from_raw(txn) };
-        let MoraineTxnHandle { catalog, txn } = *boxed;
-        // SAFETY: `catalog` outlives `txn` per `moraine_txn_begin`'s contract.
+        // SAFETY: caller contract above; `tx` consumed exactly once.
+        let boxed = unsafe { Box::from_raw(tx) };
+        let MoraineTxHandle { catalog, tx } = *boxed;
+        // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
         let catalog_ref = unsafe { &*catalog };
         let id = catalog_ref
             .runtime
-            .block_on(txn.commit())
+            .block_on(tx.commit())
             .map_err(AbiError::from)?;
+
         Ok(id.get())
     };
 
@@ -305,22 +317,22 @@ pub unsafe extern "C" fn moraine_txn_commit(
     }
 }
 
-/// Discards every staged row without writing anything, consuming `txn`.
-/// Best-effort: has no error channel. A null `txn` is a no-op.
+/// Discards every staged row without writing anything, consuming `tx`.
+/// Best-effort: has no error channel. A null `tx` is a no-op.
 ///
 /// # Safety
 ///
-/// `txn`, if non-null, must be a pointer previously returned by
-/// [`moraine_txn_begin`] and not yet committed or rolled back.
+/// `tx`, if non-null, must be a pointer previously returned by
+/// [`moraine_tx_begin`] and not yet committed or rolled back.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_rollback(txn: *mut MoraineTxnHandle) {
-    if txn.is_null() {
+pub unsafe extern "C" fn moraine_tx_rollback(tx: *mut MoraineTxHandle) {
+    if tx.is_null() {
         return;
     }
     let attempt = || {
         // SAFETY: caller contract above.
-        let boxed = unsafe { Box::from_raw(txn) };
-        boxed.txn.rollback();
+        let boxed = unsafe { Box::from_raw(tx) };
+        boxed.tx.rollback();
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
@@ -330,14 +342,14 @@ pub unsafe extern "C" fn moraine_txn_rollback(txn: *mut MoraineTxnHandle) {
 ///
 /// # Safety
 ///
-/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 /// and not yet committed or rolled back. `arrow_schema`, if
 /// `arrow_schema_len` is nonzero, must point to `arrow_schema_len` valid
 /// bytes. `err`, if non-null, must be a valid, writable [`MoraineError`].
 /// All for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_schema(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage_inline_schema(
+    tx: *mut MoraineTxHandle,
     table_id: u64,
     schema_version: u64,
     arrow_schema: *const u8,
@@ -345,18 +357,19 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_schema(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract above.
         let bytes = unsafe { borrow_bytes(arrow_schema, arrow_schema_len, "arrow_schema") }?;
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOperation::InlineSchema {
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineSchema {
             table_id,
             schema_version,
             arrow_schema: bytes.to_vec(),
         });
+
         Ok(())
     };
 
@@ -371,14 +384,14 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_schema(
 ///
 /// # Safety
 ///
-/// Same `txn` contract as [`moraine_txn_stage_inline_schema`].
+/// Same `tx` contract as [`moraine_tx_stage_inline_schema`].
 /// `arrow_body`, if `arrow_body_len` is nonzero, must point to
 /// `arrow_body_len` valid bytes. `err`, if non-null, must be a valid,
 /// writable [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage_inline_insert(
+    tx: *mut MoraineTxHandle,
     table_id: u64,
     schema_version: u64,
     begin_snapshot: u64,
@@ -389,14 +402,14 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
         // SAFETY: caller contract above.
         let bytes = unsafe { borrow_bytes(arrow_body, arrow_body_len, "arrow_body") }?;
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOperation::InlineInsert {
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineInsert {
             table_id,
             schema_version,
             begin_snapshot,
@@ -404,6 +417,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
             row_count,
             arrow_body: bytes.to_vec(),
         });
+
         Ok(())
     };
 
@@ -418,28 +432,29 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
 ///
 /// # Safety
 ///
-/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 /// and not yet committed or rolled back. `err`, if non-null, must be a
 /// valid, writable [`MoraineError`]. Both for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_inline_delete(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage_inline_inline_delete(
+    tx: *mut MoraineTxHandle,
     table_id: u64,
     row_id: u64,
     end_snapshot: u64,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOperation::InlineInlineDelete {
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineInlineDelete {
             table_id,
             row_id,
             end_snapshot,
         });
+
         Ok(())
     };
 
@@ -454,10 +469,10 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_inline_delete(
 ///
 /// # Safety
 ///
-/// Same contract as [`moraine_txn_stage_inline_inline_delete`].
+/// Same contract as [`moraine_tx_stage_inline_inline_delete`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_file_delete(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete(
+    tx: *mut MoraineTxHandle,
     table_id: u64,
     data_file_id: u64,
     row_id: u64,
@@ -465,17 +480,18 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_file_delete(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOperation::InlineFileDelete {
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineFileDelete {
             table_id,
             data_file_id,
             row_id,
             begin_snapshot,
         });
+
         Ok(())
     };
 
@@ -492,22 +508,22 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_file_delete(
 ///
 /// # Safety
 ///
-/// Same contract as [`moraine_txn_stage_inline_inline_delete`].
+/// Same contract as [`moraine_tx_stage_inline_inline_delete`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_flush_delete(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage_inline_flush_delete(
+    tx: *mut MoraineTxHandle,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOperation::InlineFlushDelete {
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineFlushDelete {
             table_id,
             schema_version,
             flush_snapshot,
@@ -526,22 +542,22 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_flush_delete(
 ///
 /// # Safety
 ///
-/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 /// and not yet committed or rolled back. `err`, if non-null, must be a
 /// valid, writable [`MoraineError`]. Both for the duration of this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_drop(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage_inline_drop(
+    tx: *mut MoraineTxHandle,
     table_id: u64,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOperation::InlineDrop { table_id });
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineDrop { table_id });
         Ok(())
     };
 
@@ -555,28 +571,29 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_drop(
 /// Stages a schema-version-scoped deregistration: removes only the
 /// `inline/schema` record for `(table_id, schema_version)`, leaving any
 /// other schema version's `inline/*` records untouched (unlike
-/// [`moraine_txn_stage_inline_drop`], which is table-wide).
+/// [`moraine_tx_stage_inline_drop`], which is table-wide).
 ///
 /// # Safety
 ///
-/// Same contract as [`moraine_txn_stage_inline_drop`].
+/// Same contract as [`moraine_tx_stage_inline_drop`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_txn_stage_inline_schema_drop(
-    txn: *mut MoraineTxnHandle,
+pub unsafe extern "C" fn moraine_tx_stage_inline_schema_drop(
+    tx: *mut MoraineTxHandle,
     table_id: u64,
     schema_version: u64,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<(), AbiError> {
-        if txn.is_null() {
-            return Err(AbiError::invalid_argument("`txn` is null"));
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
         }
-        // SAFETY: caller contract for `txn`.
-        let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOperation::InlineSchemaDrop {
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineSchemaDrop {
             table_id,
             schema_version,
         });
+
         Ok(())
     };
 
@@ -681,7 +698,7 @@ mod tests {
     }
 
     /// Owns the `CString`s a `str_cell` borrows from, so the cells stay
-    /// valid for the `moraine_txn_stage` call that reads them.
+    /// valid for the `moraine_tx_stage` call that reads them.
     struct StrArena(Vec<CString>);
 
     impl StrArena {
@@ -703,45 +720,51 @@ mod tests {
         }
     }
 
-    fn stage(txn: *mut MoraineTxnHandle, table_kind: i32, op_kind: i32, cells: &[MoraineCell]) {
+    fn stage(
+        tx: *mut MoraineTxHandle,
+        table_kind: i32,
+        operation_kind: i32,
+        cells: &[MoraineCell],
+    ) {
         let mut err = MoraineError::default();
-        // SAFETY: `txn` is a live handle from `moraine_txn_begin`; `cells`
+        // SAFETY: `tx` is a live handle from `moraine_tx_begin`; `cells`
         // is a valid slice for the duration of this call.
         let code = unsafe {
-            moraine_txn_stage(
-                txn,
+            moraine_tx_stage(
+                tx,
                 table_kind,
-                op_kind,
+                operation_kind,
                 cells.as_ptr(),
                 cells.len(),
                 &raw mut err,
             )
         };
-        // SAFETY: `err.message` is null or was just written by `moraine_txn_stage`.
+        // SAFETY: `err.message` is null or was just written by `moraine_tx_stage`.
         assert_eq!(code, codes::OK, "stage failed: {:?}", unsafe {
             err.message.as_ref()
         });
     }
 
-    fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxnHandle {
-        let mut txn: *mut MoraineTxnHandle = ptr::null_mut();
+    fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxHandle {
+        let mut tx: *mut MoraineTxHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code = unsafe { moraine_txn_begin(handle, &raw mut txn, &raw mut err) };
-        // SAFETY: `err.message` is null or was just written by `moraine_txn_begin`.
+        let code =
+            unsafe { moraine_tx_begin(handle, &raw mut tx, None, ptr::null_mut(), &raw mut err) };
+        // SAFETY: `err.message` is null or was just written by `moraine_tx_begin`.
         assert_eq!(code, codes::OK, "begin failed: {:?}", unsafe {
             err.message.as_ref()
         });
-        assert!(!txn.is_null());
-        txn
+        assert!(!tx.is_null());
+        tx
     }
 
-    /// Stages a full `ducklake_table` row (`table_kind` 3, `op_kind` 0):
+    /// Stages a full `ducklake_table` row (`table_kind` 3, `operation_kind` 0):
     /// id, a synthetic uuid, begin/end snapshot (`lifecycle`), schema id,
     /// name, path (always relative) — the shape every test that creates or
     /// renames a table needs.
     fn stage_table_row(
-        txn: *mut MoraineTxnHandle,
+        tx: *mut MoraineTxHandle,
         arena: &mut StrArena,
         table_id: u64,
         lifecycle: (u64, Option<u64>),
@@ -751,7 +774,7 @@ mod tests {
     ) {
         let (begin_snapshot, end_snapshot) = lifecycle;
         stage(
-            txn,
+            tx,
             3,
             0,
             &[
@@ -772,7 +795,7 @@ mod tests {
     /// every fixture here), schema version, and `next_catalog_id`, plus the
     /// changes-made text DuckLake records for the same snapshot.
     fn stage_snapshot_and_changes(
-        txn: *mut MoraineTxnHandle,
+        tx: *mut MoraineTxHandle,
         arena: &mut StrArena,
         snapshot_id: u64,
         schema_version: u64,
@@ -780,7 +803,7 @@ mod tests {
         changes_made: &str,
     ) {
         stage(
-            txn,
+            tx,
             0,
             0,
             &[
@@ -792,7 +815,7 @@ mod tests {
             ],
         );
         stage(
-            txn,
+            tx,
             1,
             0,
             &[
@@ -813,16 +836,16 @@ mod tests {
     fn stages_table_create_and_snapshot_bump_over_the_abi() {
         let dir = TempDir::new("create");
         let handle = attach_ok(&dir);
-        let txn = begin(handle);
+        let tx = begin(handle);
 
         let mut arena = StrArena::new();
-        stage_table_row(txn, &mut arena, 1, (1, None), 0, "t", "t/");
+        stage_table_row(tx, &mut arena, 1, (1, None), 0, "t", "t/");
         // ducklake_column: column_id, begin_snapshot, end_snapshot,
         // table_id, column_order, column_name, column_type,
         // initial_default, default_value, nulls_allowed, parent_column,
         // default_value_type, default_value_dialect.
         stage(
-            txn,
+            tx,
             5,
             0,
             &[
@@ -841,17 +864,17 @@ mod tests {
                 null_cell(),
             ],
         );
-        stage_snapshot_and_changes(txn, &mut arena, 1, 1, 2, r#"created_table:"main"."t""#);
+        stage_snapshot_and_changes(tx, &mut arena, 1, 1, 2, r#"created_table:"main"."t""#);
         // ducklake_schema_versions: begin_snapshot, schema_version,
         // table_id — DuckLake writes one per created table, carrying this
         // commit's own snapshot values.
-        stage(txn, 11, 0, &[u64_cell(1), u64_cell(1), u64_cell(1)]);
+        stage(tx, 11, 0, &[u64_cell(1), u64_cell(1), u64_cell(1)]);
 
         let mut snapshot_id: u64 = 0;
         let mut err = MoraineError::default();
-        // SAFETY: `txn` is live; outputs are valid local slots.
-        let code = unsafe { moraine_txn_commit(txn, &raw mut snapshot_id, &raw mut err) };
-        // SAFETY: `err.message` is null or was just written by `moraine_txn_commit`.
+        // SAFETY: `tx` is live; outputs are valid local slots.
+        let code = unsafe { moraine_tx_commit(tx, &raw mut snapshot_id, &raw mut err) };
+        // SAFETY: `err.message` is null or was just written by `moraine_tx_commit`.
         assert_eq!(code, codes::OK, "commit failed: {:?}", unsafe {
             err.message.as_ref()
         });
@@ -866,6 +889,8 @@ mod tests {
                 handle,
                 &raw mut rows,
                 &raw mut len,
+                None,
+                ptr::null_mut(),
                 &raw mut dump_err,
             )
         };
@@ -888,6 +913,8 @@ mod tests {
                 handle,
                 &raw mut versions,
                 &raw mut versions_len,
+                None,
+                ptr::null_mut(),
                 &raw mut versions_err,
             )
         };
@@ -909,9 +936,9 @@ mod tests {
     }
 
     /// The other two op kinds over the wire: an `update_set_end` row
-    /// (`op_kind` 2 — the C++ UPDATE operator's staging for a rename/drop)
+    /// (`operation_kind` 2 — the C++ UPDATE operator's staging for a rename/drop)
     /// moves the old table version to history, and a raw `delete` row
-    /// (`op_kind` 1) removes an unversioned statistics row. Cell layouts
+    /// (`operation_kind` 1) removes an unversioned statistics row. Cell layouts
     /// here are exactly what `cpp/staged_write.cpp`'s Sinks emit: key
     /// cells in decoder order, plus (for `update_set_end`) the new
     /// `end_snapshot`.
@@ -937,22 +964,22 @@ mod tests {
         let mut id: u64 = 0;
         let mut err = MoraineError::default();
         // SAFETY: `setup` is live; outputs are valid local slots.
-        let code = unsafe { moraine_txn_commit(setup, &raw mut id, &raw mut err) };
+        let code = unsafe { moraine_tx_commit(setup, &raw mut id, &raw mut err) };
         assert_eq!(code, codes::OK);
 
         // Snapshot 2: end `t`'s live version (rename shape: end + new
         // version) and delete its stats row.
-        let txn = begin(handle);
+        let tx = begin(handle);
         // update_set_end on ducklake_table: [table_id, new end_snapshot].
-        stage(txn, 3, 2, &[u64_cell(1), u64_cell(2)]);
-        stage_table_row(txn, &mut arena, 1, (2, None), 0, "t2", "t/");
+        stage(tx, 3, 2, &[u64_cell(1), u64_cell(2)]);
+        stage_table_row(tx, &mut arena, 1, (2, None), 0, "t2", "t/");
         // delete on ducklake_table_stats: [table_id].
-        stage(txn, 8, 1, &[u64_cell(1)]);
-        stage_snapshot_and_changes(txn, &mut arena, 2, 2, 2, "altered_table:1");
+        stage(tx, 8, 1, &[u64_cell(1)]);
+        stage_snapshot_and_changes(tx, &mut arena, 2, 2, 2, "altered_table:1");
         let mut id2: u64 = 0;
         let mut err2 = MoraineError::default();
-        // SAFETY: `txn` is live; outputs are valid local slots.
-        let code = unsafe { moraine_txn_commit(txn, &raw mut id2, &raw mut err2) };
+        // SAFETY: `tx` is live; outputs are valid local slots.
+        let code = unsafe { moraine_tx_commit(tx, &raw mut id2, &raw mut err2) };
         // SAFETY: `err2.message` is null or was just written.
         assert_eq!(code, codes::OK, "commit failed: {:?}", unsafe {
             err2.message.as_ref()
@@ -969,6 +996,8 @@ mod tests {
                 handle,
                 &raw mut rows,
                 &raw mut len,
+                None,
+                ptr::null_mut(),
                 &raw mut dump_err,
             )
         };
@@ -995,6 +1024,8 @@ mod tests {
                 handle,
                 &raw mut stats,
                 &raw mut stats_len,
+                None,
+                ptr::null_mut(),
                 &raw mut stats_err,
             )
         };
@@ -1017,15 +1048,15 @@ mod tests {
         let dir = TempDir::new("race");
         let handle = attach_ok(&dir);
 
-        let txn_a = begin(handle);
-        let txn_b = begin(handle);
+        let tx_a = begin(handle);
+        let tx_b = begin(handle);
 
-        for (txn, name) in [(txn_a, "a"), (txn_b, "b")] {
+        for (tx, name) in [(tx_a, "a"), (tx_b, "b")] {
             let mut arena = StrArena::new();
             // ducklake_schema: schema_id, schema_uuid, begin_snapshot,
             // end_snapshot, schema_name, path, path_is_relative.
             stage(
-                txn,
+                tx,
                 2,
                 0,
                 &[
@@ -1039,7 +1070,7 @@ mod tests {
                 ],
             );
             stage(
-                txn,
+                tx,
                 0,
                 0,
                 &[
@@ -1051,7 +1082,7 @@ mod tests {
                 ],
             );
             stage(
-                txn,
+                tx,
                 1,
                 0,
                 &[
@@ -1069,14 +1100,14 @@ mod tests {
 
         let mut id_a: u64 = 0;
         let mut err_a = MoraineError::default();
-        // SAFETY: `txn_a` is live; outputs are valid local slots.
-        let code_a = unsafe { moraine_txn_commit(txn_a, &raw mut id_a, &raw mut err_a) };
+        // SAFETY: `tx_a` is live; outputs are valid local slots.
+        let code_a = unsafe { moraine_tx_commit(tx_a, &raw mut id_a, &raw mut err_a) };
         assert_eq!(code_a, codes::OK);
 
         let mut id_b: u64 = 0;
         let mut err_b = MoraineError::default();
-        // SAFETY: `txn_b` is live; outputs are valid local slots.
-        let code_b = unsafe { moraine_txn_commit(txn_b, &raw mut id_b, &raw mut err_b) };
+        // SAFETY: `tx_b` is live; outputs are valid local slots.
+        let code_b = unsafe { moraine_tx_commit(tx_b, &raw mut id_b, &raw mut err_b) };
         assert_eq!(code_b, codes::COMMIT_CONFLICT);
         assert_eq!(err_b.code, codes::COMMIT_CONFLICT);
         assert!(!err_b.message.is_null());
@@ -1094,16 +1125,16 @@ mod tests {
         }
     }
 
-    /// `moraine_txn_rollback` discards every staged row: nothing lands.
+    /// `moraine_tx_rollback` discards every staged row: nothing lands.
     #[test]
     fn rollback_discards_staged_rows() {
         let dir = TempDir::new("rollback");
         let handle = attach_ok(&dir);
-        let txn = begin(handle);
+        let tx = begin(handle);
 
         let mut arena = StrArena::new();
         stage(
-            txn,
+            tx,
             2,
             0,
             &[
@@ -1117,15 +1148,22 @@ mod tests {
             ],
         );
 
-        // SAFETY: `txn` is live, not yet committed or rolled back.
-        unsafe { moraine_txn_rollback(txn) };
+        // SAFETY: `tx` is live, not yet committed or rolled back.
+        unsafe { moraine_tx_rollback(tx) };
 
         let mut rows: *mut crate::dumps::MoraineSchemaRow = ptr::null_mut();
         let mut len: usize = 0;
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
-            crate::dumps::moraine_dump_schemas(handle, &raw mut rows, &raw mut len, &raw mut err)
+            crate::dumps::moraine_dump_schemas(
+                handle,
+                &raw mut rows,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::OK);
         // Only bootstrap's `main` schema — the rolled-back row never
@@ -1145,12 +1183,12 @@ mod tests {
     fn malformed_row_reports_corruption_not_a_panic() {
         let dir = TempDir::new("malformed");
         let handle = attach_ok(&dir);
-        let txn = begin(handle);
+        let tx = begin(handle);
 
         // Far too few cells for `ducklake_schema`.
-        stage(txn, 2, 0, &[u64_cell(1)]);
+        stage(tx, 2, 0, &[u64_cell(1)]);
         stage(
-            txn,
+            tx,
             0,
             0,
             &[
@@ -1163,7 +1201,7 @@ mod tests {
         );
         let mut arena = StrArena::new();
         stage(
-            txn,
+            tx,
             1,
             0,
             &[
@@ -1177,8 +1215,8 @@ mod tests {
 
         let mut snapshot_id: u64 = 0;
         let mut err = MoraineError::default();
-        // SAFETY: `txn` is live; outputs are valid local slots.
-        let code = unsafe { moraine_txn_commit(txn, &raw mut snapshot_id, &raw mut err) };
+        // SAFETY: `tx` is live; outputs are valid local slots.
+        let code = unsafe { moraine_tx_commit(tx, &raw mut snapshot_id, &raw mut err) };
         assert_eq!(code, codes::CORRUPTION);
 
         // SAFETY: `err.message`/`handle` came from the calls above and are
@@ -1189,41 +1227,105 @@ mod tests {
         }
     }
 
+    /// A probe reporting an interrupt cancels BEGIN before anything is
+    /// staged: out-param unwritten, and the same handle immediately opens
+    /// a transaction once the probe is quiet.
+    #[test]
+    fn probe_cancels_tx_begin_then_quiet_probe_succeeds() {
+        unsafe extern "C" fn probe_always(_probe_ctx: *mut c_void) -> bool {
+            true
+        }
+        unsafe extern "C" fn probe_never(_probe_ctx: *mut c_void) -> bool {
+            false
+        }
+
+        let dir = TempDir::new("probe-tx-begin");
+        let handle = attach_ok(&dir);
+
+        let mut tx: *mut MoraineTxHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; `tx`/`err` are valid local slots;
+        // the probes accept a null context.
+        let code = unsafe {
+            moraine_tx_begin(
+                handle,
+                &raw mut tx,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert_eq!(err.code, codes::INTERRUPTED);
+        assert!(tx.is_null());
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { crate::abi::moraine_error_free(err.message) };
+
+        let mut tx2: *mut MoraineTxHandle = ptr::null_mut();
+        let mut err2 = MoraineError::default();
+        // SAFETY: same contracts as above.
+        let code2 = unsafe {
+            moraine_tx_begin(
+                handle,
+                &raw mut tx2,
+                Some(probe_never),
+                ptr::null_mut(),
+                &raw mut err2,
+            )
+        };
+        assert_eq!(code2, codes::OK);
+        assert!(!tx2.is_null());
+
+        // SAFETY: `tx2` consumed exactly once; `handle` freed exactly once.
+        unsafe {
+            moraine_tx_rollback(tx2);
+            moraine_detach(handle);
+        }
+    }
+
     #[test]
     fn begin_on_null_handle_reports_invalid_argument() {
-        let mut txn: *mut MoraineTxnHandle = ptr::null_mut();
+        let mut tx: *mut MoraineTxHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: a null `handle` is exactly the input this test exercises;
         // outputs are valid local slots.
-        let code = unsafe { moraine_txn_begin(ptr::null_mut(), &raw mut txn, &raw mut err) };
+        let code = unsafe {
+            moraine_tx_begin(
+                ptr::null_mut(),
+                &raw mut tx,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::INVALID_ARGUMENT);
-        assert!(txn.is_null());
+        assert!(tx.is_null());
         // SAFETY: `err.message` was just populated above and not yet freed.
         unsafe { crate::abi::moraine_error_free(err.message) };
     }
 
     #[test]
-    fn rollback_on_null_txn_is_a_no_op() {
-        // SAFETY: a null `txn` is exactly the input this test exercises,
+    fn rollback_on_null_tx_is_a_no_op() {
+        // SAFETY: a null `tx` is exactly the input this test exercises,
         // documented as a no-op.
-        unsafe { moraine_txn_rollback(ptr::null_mut()) };
+        unsafe { moraine_tx_rollback(ptr::null_mut()) };
     }
 
     #[test]
     fn stage_rejects_unknown_table_kind() {
         let dir = TempDir::new("bad-kind");
         let handle = attach_ok(&dir);
-        let txn = begin(handle);
+        let tx = begin(handle);
 
         let mut err = MoraineError::default();
-        // SAFETY: `txn` is live; empty cells slice; outputs are valid.
-        let code = unsafe { moraine_txn_stage(txn, 99, 0, ptr::null(), 0, &raw mut err) };
+        // SAFETY: `tx` is live; empty cells slice; outputs are valid.
+        let code = unsafe { moraine_tx_stage(tx, 99, 0, ptr::null(), 0, &raw mut err) };
         assert_eq!(code, codes::INVALID_ARGUMENT);
 
-        // SAFETY: `err.message`/`txn`/`handle` came from the calls above.
+        // SAFETY: `err.message`/`tx`/`handle` came from the calls above.
         unsafe {
             crate::abi::moraine_error_free(err.message);
-            moraine_txn_rollback(txn);
+            moraine_tx_rollback(tx);
             moraine_detach(handle);
         }
     }
@@ -1232,22 +1334,22 @@ mod tests {
     /// hand (see `crate::abi`'s identical test). Checks textual presence
     /// of each symbol/struct name only.
     #[test]
-    fn header_declares_every_staged_txn_symbol() {
+    fn header_declares_every_staged_tx_symbol() {
         let header = include_str!("../cpp/moraine_abi.h");
         let names = [
-            "moraine_txn_begin",
-            "moraine_txn_stage",
-            "moraine_txn_commit",
-            "moraine_txn_rollback",
-            "MoraineTxnHandle",
+            "moraine_tx_begin",
+            "moraine_tx_stage",
+            "moraine_tx_commit",
+            "moraine_tx_rollback",
+            "MoraineTxHandle",
             "MoraineCell",
-            "moraine_txn_stage_inline_schema",
-            "moraine_txn_stage_inline_insert",
-            "moraine_txn_stage_inline_inline_delete",
-            "moraine_txn_stage_inline_file_delete",
-            "moraine_txn_stage_inline_flush_delete",
-            "moraine_txn_stage_inline_drop",
-            "moraine_txn_stage_inline_schema_drop",
+            "moraine_tx_stage_inline_schema",
+            "moraine_tx_stage_inline_insert",
+            "moraine_tx_stage_inline_inline_delete",
+            "moraine_tx_stage_inline_file_delete",
+            "moraine_tx_stage_inline_flush_delete",
+            "moraine_tx_stage_inline_drop",
+            "moraine_tx_stage_inline_schema_drop",
         ];
         for name in names {
             assert!(

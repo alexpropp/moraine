@@ -11,14 +11,17 @@
 //! chunk's full Arrow IPC body, so every row frees independently with no
 //! cross-element lifetime coupling.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    ffi::c_void,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 
 use moraine::ffi_support::inline::InlineScanKind;
 
 use crate::{
     abi::{free_array, guard, write_array},
     error::{AbiError, MoraineError, codes},
-    runtime::MoraineCatalogHandle,
+    runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
 fn decode_scan_kind(v: i32) -> Result<InlineScanKind, AbiError> {
@@ -86,13 +89,20 @@ pub struct MoraineInlineRow {
 /// `start` for the incremental variants (ignored by `SCAN_TABLE`/
 /// `SCAN_FOR_FLUSH`).
 ///
+/// Cancellable: races the core read
+/// against [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal
+/// and against `probe` (polled immediately, then ~100 ms; a null `probe`
+/// disables polling). If a cancellation wins, returns
+/// [`codes::INTERRUPTED`] and the out-params are left unwritten.
+///
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
 /// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-/// `out_items`/`out_len` must be valid, writable pointers. `err`, if
-/// non-null, must be a valid, writable [`MoraineError`]. All for the
-/// duration of this call.
+/// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
+/// non-null, must be safe to call with `probe_ctx` from any thread.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
+/// for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_inline_scan(
     handle: *mut MoraineCatalogHandle,
@@ -102,6 +112,8 @@ pub unsafe extern "C" fn moraine_inline_scan(
     start: u64,
     out_items: *mut *mut MoraineInlineRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineInlineRow>, AbiError> {
@@ -114,16 +126,21 @@ pub unsafe extern "C" fn moraine_inline_scan(
         let kind = decode_scan_kind(scan_kind)?;
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::inline::scan_inline(
-                &handle_ref.catalog,
-                table_id,
-                kind,
-                snapshot,
-                start,
-            ))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::inline::scan_inline(
+                    &handle_ref.catalog,
+                    table_id,
+                    kind,
+                    snapshot,
+                    start,
+                ),
+            )
+        }?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -197,6 +214,8 @@ pub unsafe extern "C" fn moraine_inline_schemas(
     table_id: u64,
     out_items: *mut *mut MoraineInlineSchemaRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineInlineSchemaRow>, AbiError> {
@@ -208,13 +227,15 @@ pub unsafe extern "C" fn moraine_inline_schemas(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let schemas = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::inline::inline_schemas(
-                &handle_ref.catalog,
-                table_id,
-            ))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let schemas = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::inline::inline_schemas(&handle_ref.catalog, table_id),
+            )
+        }?;
         Ok(schemas
             .into_iter()
             .map(|(schema_version, bytes)| {
@@ -283,6 +304,8 @@ pub unsafe extern "C" fn moraine_inline_registered_tables(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineInlineTableRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineInlineTableRow>, AbiError> {
@@ -294,12 +317,15 @@ pub unsafe extern "C" fn moraine_inline_registered_tables(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let tables = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::inline::inline_registered_tables(
-                &handle_ref.catalog,
-            ))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let tables = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::inline::inline_registered_tables(&handle_ref.catalog),
+            )
+        }?;
         Ok(tables
             .into_iter()
             .map(|(table_id, schema_version)| MoraineInlineTableRow {
@@ -356,6 +382,8 @@ pub unsafe extern "C" fn moraine_inline_file_delete_table_exists(
     handle: *mut MoraineCatalogHandle,
     table_id: u64,
     out_exists: *mut bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<bool, AbiError> {
@@ -367,15 +395,18 @@ pub unsafe extern "C" fn moraine_inline_file_delete_table_exists(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        handle_ref
-            .runtime
-            .block_on(
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
                 moraine::ffi_support::inline::inline_file_delete_table_exists(
                     &handle_ref.catalog,
                     table_id,
                 ),
             )
-            .map_err(AbiError::from)
+        }
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
@@ -397,10 +428,9 @@ mod tests {
     use crate::{
         abi::{moraine_attach, moraine_detach},
         staged::{
-            MoraineCell, MoraineTxnHandle, moraine_txn_begin, moraine_txn_commit,
-            moraine_txn_stage, moraine_txn_stage_inline_flush_delete,
-            moraine_txn_stage_inline_inline_delete, moraine_txn_stage_inline_insert,
-            moraine_txn_stage_inline_schema,
+            MoraineCell, MoraineTxHandle, moraine_tx_begin, moraine_tx_commit, moraine_tx_stage,
+            moraine_tx_stage_inline_flush_delete, moraine_tx_stage_inline_inline_delete,
+            moraine_tx_stage_inline_insert, moraine_tx_stage_inline_schema,
         },
     };
 
@@ -447,16 +477,17 @@ mod tests {
         handle
     }
 
-    fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxnHandle {
-        let mut txn: *mut MoraineTxnHandle = ptr::null_mut();
+    fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxHandle {
+        let mut tx: *mut MoraineTxHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code = unsafe { moraine_txn_begin(handle, &raw mut txn, &raw mut err) };
-        // SAFETY: `err.message` is null or was just written by `moraine_txn_begin`.
+        let code =
+            unsafe { moraine_tx_begin(handle, &raw mut tx, None, ptr::null_mut(), &raw mut err) };
+        // SAFETY: `err.message` is null or was just written by `moraine_tx_begin`.
         assert_eq!(code, codes::OK, "begin failed: {:?}", unsafe {
             err.message.as_ref()
         });
-        txn
+        tx
     }
 
     fn u64_cell(v: u64) -> MoraineCell {
@@ -510,21 +541,26 @@ mod tests {
         }
     }
 
-    fn stage(txn: *mut MoraineTxnHandle, table_kind: i32, op_kind: i32, cells: &[MoraineCell]) {
+    fn stage(
+        tx: *mut MoraineTxHandle,
+        table_kind: i32,
+        operation_kind: i32,
+        cells: &[MoraineCell],
+    ) {
         let mut err = MoraineError::default();
-        // SAFETY: `txn` is a live handle; `cells` is a valid slice for the
+        // SAFETY: `tx` is a live handle; `cells` is a valid slice for the
         // duration of this call.
         let code = unsafe {
-            moraine_txn_stage(
-                txn,
+            moraine_tx_stage(
+                tx,
                 table_kind,
-                op_kind,
+                operation_kind,
                 cells.as_ptr(),
                 cells.len(),
                 &raw mut err,
             )
         };
-        // SAFETY: `err.message` is null or was just written by `moraine_txn_stage`.
+        // SAFETY: `err.message` is null or was just written by `moraine_tx_stage`.
         assert_eq!(code, codes::OK, "stage failed: {:?}", unsafe {
             err.message.as_ref()
         });
@@ -532,9 +568,9 @@ mod tests {
 
     /// Stages the `ducklake_snapshot` + `ducklake_snapshot_changes` pair
     /// every commit needs, regardless of what else is staged alongside it.
-    fn stage_snapshot(txn: *mut MoraineTxnHandle, arena: &mut StrArena, snapshot_id: u64) {
+    fn stage_snapshot(tx: *mut MoraineTxHandle, arena: &mut StrArena, snapshot_id: u64) {
         stage(
-            txn,
+            tx,
             0,
             0,
             &[
@@ -546,7 +582,7 @@ mod tests {
             ],
         );
         stage(
-            txn,
+            tx,
             1,
             0,
             &[
@@ -559,12 +595,12 @@ mod tests {
         );
     }
 
-    fn commit(txn: *mut MoraineTxnHandle) -> u64 {
+    fn commit(tx: *mut MoraineTxHandle) -> u64 {
         let mut id: u64 = 0;
         let mut err = MoraineError::default();
-        // SAFETY: `txn` is live; outputs are valid local slots.
-        let code = unsafe { moraine_txn_commit(txn, &raw mut id, &raw mut err) };
-        // SAFETY: `err.message` is null or was just written by `moraine_txn_commit`.
+        // SAFETY: `tx` is live; outputs are valid local slots.
+        let code = unsafe { moraine_tx_commit(tx, &raw mut id, &raw mut err) };
+        // SAFETY: `err.message` is null or was just written by `moraine_tx_commit`.
         assert_eq!(code, codes::OK, "commit failed: {:?}", unsafe {
             err.message.as_ref()
         });
@@ -573,6 +609,65 @@ mod tests {
 
     /// End-to-end over the ABI: stage an inline schema + insert, commit;
     /// `moraine_inline_scan` (`Table`) returns the row with the right
+    /// One representative inline read pins the pull channel for the
+    /// family — every inline read routes through the same cancellable
+    /// bridge.
+    #[test]
+    fn probe_cancels_inline_registered_tables_then_quiet_probe_succeeds() {
+        unsafe extern "C" fn probe_always(_probe_ctx: *mut c_void) -> bool {
+            true
+        }
+        unsafe extern "C" fn probe_never(_probe_ctx: *mut c_void) -> bool {
+            false
+        }
+
+        let dir = TempDir::new("probe-inline");
+        let handle = attach_ok(&dir);
+
+        let mut items: *mut MoraineInlineTableRow = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; out/err slots are valid; the
+        // probes accept a null context.
+        let code = unsafe {
+            moraine_inline_registered_tables(
+                handle,
+                &raw mut items,
+                &raw mut len,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert_eq!(err.code, codes::INTERRUPTED);
+        assert!(items.is_null());
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { crate::abi::moraine_error_free(err.message) };
+
+        let mut items2: *mut MoraineInlineTableRow = ptr::null_mut();
+        let mut len2: usize = 0;
+        let mut err2 = MoraineError::default();
+        // SAFETY: same contracts as above.
+        let code2 = unsafe {
+            moraine_inline_registered_tables(
+                handle,
+                &raw mut items2,
+                &raw mut len2,
+                Some(probe_never),
+                ptr::null_mut(),
+                &raw mut err2,
+            )
+        };
+        assert_eq!(code2, codes::OK);
+
+        // SAFETY: freed exactly once each.
+        unsafe {
+            moraine_inline_registered_tables_free(items2, len2);
+            moraine_detach(handle);
+        }
+    }
+
     /// `row_id`/`begin_snapshot`/body, and `moraine_inline_schemas`/
     /// `moraine_inline_registered_tables` see the schema. Staging an
     /// `inline/inline_delete` then makes the row disappear from a `Table` scan at
@@ -584,15 +679,15 @@ mod tests {
         let dir = TempDir::new("scan");
         let handle = attach_ok(&dir);
 
-        let txn = begin(handle);
+        let tx = begin(handle);
         let mut arena = StrArena::new();
         let schema_bytes = b"schema";
         let mut err = MoraineError::default();
-        // SAFETY: `txn` is live; `schema_bytes` is a valid slice; outputs
+        // SAFETY: `tx` is live; `schema_bytes` is a valid slice; outputs
         // are valid local slots.
         let code = unsafe {
-            moraine_txn_stage_inline_schema(
-                txn,
+            moraine_tx_stage_inline_schema(
+                tx,
                 1,
                 0,
                 schema_bytes.as_ptr(),
@@ -603,11 +698,11 @@ mod tests {
         assert_eq!(code, codes::OK);
 
         let body = b"chunk-body";
-        // SAFETY: `txn` is live; `body` is a valid slice; outputs are
+        // SAFETY: `tx` is live; `body` is a valid slice; outputs are
         // valid local slots.
         let code = unsafe {
-            moraine_txn_stage_inline_insert(
-                txn,
+            moraine_tx_stage_inline_insert(
+                tx,
                 1,
                 0,
                 1,
@@ -619,8 +714,8 @@ mod tests {
             )
         };
         assert_eq!(code, codes::OK);
-        stage_snapshot(txn, &mut arena, 1);
-        commit(txn);
+        stage_snapshot(tx, &mut arena, 1);
+        commit(tx);
 
         let mut rows: *mut MoraineInlineRow = ptr::null_mut();
         let mut len: usize = 0;
@@ -635,6 +730,8 @@ mod tests {
                 0,
                 &raw mut rows,
                 &raw mut len,
+                None,
+                ptr::null_mut(),
                 &raw mut scan_err,
             )
         };
@@ -665,6 +762,8 @@ mod tests {
                 1,
                 &raw mut schema_rows,
                 &raw mut schema_len,
+                None,
+                ptr::null_mut(),
                 &raw mut schema_err,
             )
         };
@@ -691,6 +790,8 @@ mod tests {
                 handle,
                 &raw mut table_rows,
                 &raw mut table_len,
+                None,
+                ptr::null_mut(),
                 &raw mut table_err,
             )
         };
@@ -706,12 +807,12 @@ mod tests {
 
         // Tombstone row 0; a `Table` scan at snapshot 2 must no longer
         // return it.
-        let inline_delete_txn = begin(handle);
+        let inline_delete_tx = begin(handle);
         let mut inline_delete_err = MoraineError::default();
-        // SAFETY: `inline_delete_txn` is live; outputs are valid local slots.
+        // SAFETY: `inline_delete_tx` is live; outputs are valid local slots.
         let code = unsafe {
-            moraine_txn_stage_inline_inline_delete(
-                inline_delete_txn,
+            moraine_tx_stage_inline_inline_delete(
+                inline_delete_tx,
                 1,
                 0,
                 2,
@@ -720,8 +821,8 @@ mod tests {
         };
         assert_eq!(code, codes::OK);
         let mut inline_delete_arena = StrArena::new();
-        stage_snapshot(inline_delete_txn, &mut inline_delete_arena, 2);
-        commit(inline_delete_txn);
+        stage_snapshot(inline_delete_tx, &mut inline_delete_arena, 2);
+        commit(inline_delete_tx);
 
         let mut rows2: *mut MoraineInlineRow = ptr::null_mut();
         let mut len2: usize = 0;
@@ -736,6 +837,8 @@ mod tests {
                 0,
                 &raw mut rows2,
                 &raw mut len2,
+                None,
+                ptr::null_mut(),
                 &raw mut scan_err2,
             )
         };
@@ -750,16 +853,15 @@ mod tests {
 
         // Flush: every chunk begun at or before snapshot 2 is removed,
         // along with its consumed inline delete.
-        let flush_txn = begin(handle);
+        let flush_tx = begin(handle);
         let mut flush_err = MoraineError::default();
-        // SAFETY: `flush_txn` is live; outputs are valid local slots.
-        let code = unsafe {
-            moraine_txn_stage_inline_flush_delete(flush_txn, 1, 0, 2, &raw mut flush_err)
-        };
+        // SAFETY: `flush_tx` is live; outputs are valid local slots.
+        let code =
+            unsafe { moraine_tx_stage_inline_flush_delete(flush_tx, 1, 0, 2, &raw mut flush_err) };
         assert_eq!(code, codes::OK);
         let mut flush_arena = StrArena::new();
-        stage_snapshot(flush_txn, &mut flush_arena, 3);
-        commit(flush_txn);
+        stage_snapshot(flush_tx, &mut flush_arena, 3);
+        commit(flush_tx);
 
         let mut rows3: *mut MoraineInlineRow = ptr::null_mut();
         let mut len3: usize = 0;
@@ -774,6 +876,8 @@ mod tests {
                 0,
                 &raw mut rows3,
                 &raw mut len3,
+                None,
+                ptr::null_mut(),
                 &raw mut scan_err3,
             )
         };
@@ -792,6 +896,8 @@ mod tests {
                 handle,
                 &raw mut table_rows2,
                 &raw mut table_len2,
+                None,
+                ptr::null_mut(),
                 &raw mut table_err2,
             )
         };

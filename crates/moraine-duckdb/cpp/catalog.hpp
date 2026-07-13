@@ -33,6 +33,13 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type);
 // InternalException) and throws it. Frees `err.message` first if non-null.
 [[noreturn]] void ThrowMoraineError(MoraineError &err);
 
+// The shim's MoraineInterruptProbe: reports whether the query driving
+// `client_context` (an opaque duckdb::ClientContext*) has been
+// interrupted. One atomic load — the same flag DuckDB's executor polls —
+// so it is safe from any thread. C linkage to match the ABI's C function
+// pointer type.
+extern "C" bool moraine_shim_is_interrupted(void *client_context);
+
 // A moraine-backed table entry. Column/schema translation happens in
 // MoraineSchemaEntry; this class only supplies the pure virtuals
 // TableCatalogEntry still needs. The scan function binds normally (so
@@ -180,7 +187,7 @@ private:
 	// Ensures the active transaction's schema cache is populated from the
 	// listing ABI, then returns it.
 	static duckdb::vector<duckdb::reference<duckdb::SchemaCatalogEntry>> LoadedSchemas(duckdb::Catalog &catalog,
-	                                                                                    duckdb::Transaction &txn);
+	                                                                                    duckdb::Transaction &tx);
 };
 
 } // namespace moraine_duckdb

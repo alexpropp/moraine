@@ -69,6 +69,10 @@ std::string ToUpperAscii(const std::string &s) {
 
 } // namespace
 
+extern "C" bool moraine_shim_is_interrupted(void *client_context) {
+	return static_cast<duckdb::ClientContext *>(client_context)->IsInterrupted();
+}
+
 void ThrowMoraineError(MoraineError &err) {
 	std::string message = err.message ? std::string(err.message) : std::string("moraine: unknown error");
 	int32_t code = err.code;
@@ -163,6 +167,8 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 		return duckdb::LogicalType::UUID;
 	} else if (upper == "HUGEINT" || upper == "INT128") {
 		return duckdb::LogicalType::HUGEINT;
+	} else if (upper == "INTERVAL") {
+		return duckdb::LogicalType::INTERVAL;
 	}
 
 	throw duckdb::NotImplementedException("moraine: unsupported DuckLake column type \"%s\"", ducklake_type);
@@ -400,9 +406,9 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 		if (!transaction.context) {
 			throw duckdb::InternalException("moraine: CREATE TABLE without a client context");
 		}
-		auto &moraine_txn = transaction.transaction->Cast<MoraineTransaction>();
+		auto &moraine_tx = transaction.transaction->Cast<MoraineTransaction>();
 		auto entry = CreateInlineDataTable(*transaction.context, catalog, *this, moraine_catalog.Handle(),
-		                                   moraine_txn.StagedTxn(), info, parsed->table_id, parsed->schema_version);
+		                                   moraine_tx.StagedTx(), info, parsed->table_id, parsed->schema_version);
 		if (!entry) {
 			// IF NOT EXISTS against an already-registered schema version.
 			return nullptr;
@@ -475,14 +481,14 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 	// The flush cleanup's `DROP TABLE ducklake_inlined_data_<t>_<v>` is the
 	// only DROP reaching here: deregister just this schema version, leaving
 	// other schema versions' inline/* records untouched. The whole-table
-	// cascade (`moraine_txn_stage_inline_drop`) runs on the DuckLake attach's
+	// cascade (`moraine_tx_stage_inline_drop`) runs on the DuckLake attach's
 	// own catalog, not this metadata connection's schema.
 	if (info.type == duckdb::CatalogType::TABLE_ENTRY) {
 		if (auto parsed = ParseInlinedDataTableName(info.name)) {
 			auto catalog_transaction = catalog.GetCatalogTransaction(context);
-			auto &moraine_txn = catalog_transaction.transaction->Cast<MoraineTransaction>();
+			auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
 			MoraineError err{};
-			auto code = moraine_txn_stage_inline_schema_drop(moraine_txn.StagedTxn(), parsed->table_id,
+			auto code = moraine_tx_stage_inline_schema_drop(moraine_tx.StagedTx(), parsed->table_id,
 			                                                 parsed->schema_version, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
@@ -545,26 +551,26 @@ MoraineCatalog::LookupSchema(duckdb::CatalogTransaction transaction, const duckd
 	if (!transaction.transaction) {
 		throw duckdb::InternalException("moraine: schema lookup without an active transaction");
 	}
-	auto &txn = transaction.transaction->Cast<MoraineTransaction>();
+	auto &tx = transaction.transaction->Cast<MoraineTransaction>();
 
-	if (!txn.SchemasLoaded()) {
+	if (!tx.SchemasLoaded()) {
 		OwnedArray<MoraineSchemaDesc> schema_descs(moraine_snapshot_schemas_free);
 		MoraineError err{};
-		auto code = moraine_snapshot_schemas(txn.Snapshot(), schema_descs.OutItems(), schema_descs.OutLen(), &err);
+		auto code = moraine_snapshot_schemas(tx.Snapshot(), schema_descs.OutItems(), schema_descs.OutLen(), &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
 		for (auto &schema_desc : schema_descs) {
 			duckdb::CreateSchemaInfo info;
 			info.schema = schema_desc.name;
-			txn.PutSchema(schema_desc.id,
-			              duckdb::make_uniq<MoraineSchemaEntry>(*this, info, txn.Snapshot(), schema_desc.id));
+			tx.PutSchema(schema_desc.id,
+			              duckdb::make_uniq<MoraineSchemaEntry>(*this, info, tx.Snapshot(), schema_desc.id));
 		}
-		txn.SetSchemasLoaded();
+		tx.SetSchemasLoaded();
 	}
 
 	duckdb::optional_ptr<duckdb::SchemaCatalogEntry> found;
-	txn.ForEachSchema([&](duckdb::SchemaCatalogEntry &entry) {
+	tx.ForEachSchema([&](duckdb::SchemaCatalogEntry &entry) {
 		if (!found && duckdb::StringUtil::CIEquals(entry.name, schema_lookup.GetEntryName())) {
 			found = &entry;
 		}
@@ -582,8 +588,8 @@ void MoraineCatalog::ScanSchemas(duckdb::ClientContext &context,
 	LookupSchema(GetCatalogTransaction(context), duckdb::EntryLookupInfo(duckdb::CatalogType::SCHEMA_ENTRY, ""),
 	             duckdb::OnEntryNotFound::RETURN_NULL);
 
-	auto &txn = GetCatalogTransaction(context).transaction->Cast<MoraineTransaction>();
-	txn.ForEachSchema(callback);
+	auto &tx = GetCatalogTransaction(context).transaction->Cast<MoraineTransaction>();
+	tx.ForEachSchema(callback);
 }
 
 duckdb::PhysicalOperator &MoraineCatalog::PlanCreateTableAs(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &,
@@ -595,7 +601,7 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanInsert(duckdb::ClientContext &, du
                                                      duckdb::LogicalInsert &op,
                                                      duckdb::optional_ptr<duckdb::PhysicalOperator> plan) {
 	// A writable ducklake_* metadata table (a MoraineMetadataTableEntry
-	// whose spec names a moraine_txn_stage table_kind) or either dynamic
+	// whose spec names a moraine_tx_stage table_kind) or either dynamic
 	// inline-table family accepts INSERT; every other table stays
 	// read-only.
 	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {

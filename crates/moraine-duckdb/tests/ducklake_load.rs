@@ -130,6 +130,7 @@ mod tests {
                             record_count: ROW_COUNT,
                             file_size_bytes,
                             footer_size,
+                            encryption_key: None,
                             column_stats: vec![],
                         },
                     )?;
@@ -576,6 +577,147 @@ mod tests {
     ///   is gone (0 remaining rows in the now-empty
     ///   `ducklake_inlined_data_<t>_<v>` entry) and a `ducklake_data_file`
     ///   is registered.
+    ///
+    /// The full DuckLake scalar type matrix — every scalar moraine maps —
+    /// created, inlined, and round-tripped live through DuckLake's own SQL,
+    /// both before flush (served from the `inline/*` keyspace via Arrow IPC)
+    /// and after (transcoded to Parquet and read by DuckLake's own reader).
+    ///
+    /// Covers every integer width (signed and unsigned), `FLOAT`/`DOUBLE`,
+    /// `DECIMAL(w,s)` (width/scale preserved through the type round trip),
+    /// `VARCHAR`/`BLOB`/`BOOLEAN`, the temporal types
+    /// (`DATE`/`TIME`/`TIMESTAMP`/`TIMESTAMPTZ`/`INTERVAL`), and `UUID`. A
+    /// second all-`NULL` row proves null handling for each. The stored
+    /// `ducklake_column.column_type` is checked in DuckLake's own vocabulary
+    /// through the standalone projection, so a type that reads back but
+    /// mis-names itself (a dropped `DECIMAL` suffix) is caught too.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    #[allow(clippy::too_many_lines)]
+    fn ducklake_scalar_type_matrix_round_trip_through_flush() {
+        let dir = TempDir::new("scalars-store");
+        let data_dir = TempDir::new("scalars-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        run_ducklake_sql(
+            store,
+            data_path,
+            "CREATE TABLE lake.main.t (\
+             c_tinyint TINYINT, c_smallint SMALLINT, c_integer INTEGER, c_bigint BIGINT, \
+             c_hugeint HUGEINT, c_utinyint UTINYINT, c_usmallint USMALLINT, c_uinteger UINTEGER, \
+             c_ubigint UBIGINT, c_float FLOAT, c_double DOUBLE, c_decimal DECIMAL(18,4), \
+             c_varchar VARCHAR, c_blob BLOB, c_boolean BOOLEAN, c_date DATE, c_time TIME, \
+             c_timestamp TIMESTAMP, c_timestamptz TIMESTAMPTZ, c_interval INTERVAL, c_uuid UUID);",
+        );
+        run_ducklake_sql(
+            store,
+            data_path,
+            "INSERT INTO lake.main.t VALUES (\
+             1, 2, 3, 4, 5, 6, 7, 8, 9, 1.5, 2.5, 12345.6789, 'hello', '\\x01\\x02'::BLOB, true, \
+             DATE '2020-01-02', TIME '03:04:05', TIMESTAMP '2020-01-02 03:04:05', \
+             TIMESTAMPTZ '2020-01-02 03:04:05+00', INTERVAL '1' MONTH, \
+             '12345678-1234-5678-1234-567812345678'::UUID), \
+             (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+             NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+        );
+
+        // TIMESTAMPTZ renders in the session zone; pin UTC so it is stable.
+        let select = "SET TimeZone='UTC'; \
+             SELECT c_tinyint::VARCHAR, c_smallint::VARCHAR, c_integer::VARCHAR, \
+             c_bigint::VARCHAR, c_hugeint::VARCHAR, c_utinyint::VARCHAR, c_usmallint::VARCHAR, \
+             c_uinteger::VARCHAR, c_ubigint::VARCHAR, c_float::VARCHAR, c_double::VARCHAR, \
+             c_decimal::VARCHAR, c_varchar, c_blob::VARCHAR, c_boolean::VARCHAR, c_date::VARCHAR, \
+             c_time::VARCHAR, c_timestamp::VARCHAR, c_timestamptz::VARCHAR, c_interval::VARCHAR, \
+             c_uuid::VARCHAR FROM lake.main.t ORDER BY c_bigint NULLS LAST;";
+        let values_row = vec![
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "1.5",
+            "2.5",
+            "12345.6789",
+            "hello",
+            "\\x01\\x02",
+            "true",
+            "2020-01-02",
+            "03:04:05",
+            "2020-01-02 03:04:05",
+            "2020-01-02 03:04:05+00",
+            "1 month",
+            "12345678-1234-5678-1234-567812345678",
+        ];
+        let null_row = vec!["NULL"; 21];
+        let want = vec![values_row.clone(), null_row.clone()];
+
+        // Pre-flush: served from the inline keyspace, no Parquet file yet.
+        assert_eq!(csv_rows(&run_ducklake_sql(store, data_path, select)), want);
+        assert_eq!(
+            csv_rows(&run_standalone_sql(
+                store,
+                "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+            )),
+            vec![vec!["0".to_string()]]
+        );
+
+        // The stored type names round-trip in DuckLake's own vocabulary.
+        // `decimal(18,4)` is checked separately below: its comma would split
+        // under `csv_rows`, and it is the one type whose parameters must
+        // survive the round trip.
+        assert_eq!(
+            csv_rows(&run_standalone_sql(
+                store,
+                "SELECT column_type FROM m.ducklake_column WHERE end_snapshot IS NULL \
+                 AND column_name <> 'c_decimal' ORDER BY column_order;",
+            )),
+            vec![
+                vec!["int8"],
+                vec!["int16"],
+                vec!["int32"],
+                vec!["int64"],
+                vec!["int128"],
+                vec!["uint8"],
+                vec!["uint16"],
+                vec!["uint32"],
+                vec!["uint64"],
+                vec!["float32"],
+                vec!["float64"],
+                vec!["varchar"],
+                vec!["blob"],
+                vec!["boolean"],
+                vec!["date"],
+                vec!["time"],
+                vec!["timestamp"],
+                vec!["timestamptz"],
+                vec!["interval"],
+                vec!["uuid"],
+            ]
+        );
+        assert_eq!(
+            csv_rows(&run_standalone_sql(
+                store,
+                "SELECT column_type = 'decimal(18,4)' FROM m.ducklake_column \
+                 WHERE column_name = 'c_decimal' AND end_snapshot IS NULL;",
+            )),
+            vec![vec!["true".to_string()]]
+        );
+
+        // Post-flush: the same values, now read through DuckLake's Parquet
+        // reader after the transcode.
+        run_ducklake_sql(
+            store,
+            data_path,
+            "CALL ducklake_flush_inlined_data('lake');",
+        );
+        assert_eq!(csv_rows(&run_ducklake_sql(store, data_path, select)), want);
+    }
+
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
     fn ducklake_inline_data_round_trip_through_flush() {
@@ -1029,7 +1171,7 @@ mod tests {
     /// `BEGIN`/`COMMIT`/`ROLLBACK`, driven end to end.
     ///
     /// Every write a DuckDB transaction makes stages into one moraine
-    /// staged txn (opened lazily on the first write, reused across every
+    /// staged tx (opened lazily on the first write, reused across every
     /// statement), committed atomically at `COMMIT` — so a transaction that
     /// writes two different tables mints exactly one `ducklake_snapshot`, and
     /// both tables' rows appear together or not at all.
@@ -1041,8 +1183,8 @@ mod tests {
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
     fn ducklake_multi_statement_transaction_commits_atomically() {
-        let dir = TempDir::new("txn-store");
-        let data_dir = TempDir::new("txn-data");
+        let dir = TempDir::new("tx-store");
+        let data_dir = TempDir::new("tx-data");
         let store = dir.path();
         let data_path = data_dir.path();
 
@@ -1084,7 +1226,7 @@ mod tests {
         );
 
         // The two writes advanced the head by exactly one snapshot: they
-        // shared one moraine staged txn, not one per statement.
+        // shared one moraine staged tx, not one per statement.
         assert_eq!(
             csv_rows(&run_standalone_sql(
                 store,

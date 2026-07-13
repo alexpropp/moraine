@@ -17,7 +17,7 @@
 //!   `false`.
 
 use std::{
-    ffi::{CString, c_char},
+    ffi::{CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
 };
@@ -25,7 +25,7 @@ use std::{
 use crate::{
     abi::{free_array, free_c_string, guard, to_c_string, write_array},
     error::{AbiError, MoraineError, codes},
-    runtime::MoraineCatalogHandle,
+    runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
 /// Splits an optional `u64` into the `(has, value)` pair the C structs
@@ -74,18 +74,27 @@ pub struct MoraineSchemaRow {
 /// Dumps every `ducklake_schema` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
+/// Cancellable, like every dump in this module: races the core read
+/// against [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal
+/// and against `probe` (polled immediately, then ~100 ms; a null `probe`
+/// disables polling). If a cancellation wins, returns
+/// [`codes::INTERRUPTED`] and the out-params are left unwritten.
+///
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by
 /// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-/// `out_items`/`out_len` must be valid, writable pointers. `err`, if
-/// non-null, must be a valid, writable [`MoraineError`]. All for the
-/// duration of this call.
+/// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
+/// non-null, must be safe to call with `probe_ctx` from any thread.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
+/// for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_schemas(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineSchemaRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineSchemaRow>, AbiError> {
@@ -107,10 +116,15 @@ pub unsafe extern "C" fn moraine_dump_schemas(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_schemas(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_schemas(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first: every string in the whole batch converts before any
         // raw pointer is minted, so a partial failure leaks nothing.
         let owned: Vec<Owned> = rows
@@ -212,6 +226,8 @@ pub unsafe extern "C" fn moraine_dump_tables(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineTableRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineTableRow>, AbiError> {
@@ -234,10 +250,15 @@ pub unsafe extern "C" fn moraine_dump_tables(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_tables(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_tables(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -341,6 +362,8 @@ pub unsafe extern "C" fn moraine_dump_views(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineViewRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineViewRow>, AbiError> {
@@ -364,10 +387,15 @@ pub unsafe extern "C" fn moraine_dump_views(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_views(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_views(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -487,6 +515,8 @@ pub unsafe extern "C" fn moraine_dump_columns(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineColumnRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineColumnRow>, AbiError> {
@@ -515,10 +545,15 @@ pub unsafe extern "C" fn moraine_dump_columns(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_columns(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_columns(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -666,6 +701,8 @@ pub unsafe extern "C" fn moraine_dump_data_files(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineDataFileRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineDataFileRow>, AbiError> {
@@ -703,10 +740,15 @@ pub unsafe extern "C" fn moraine_dump_data_files(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_data_files(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_data_files(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -849,6 +891,8 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineDeleteFileRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineDeleteFileRow>, AbiError> {
@@ -877,10 +921,15 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_delete_files(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_delete_files(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -989,6 +1038,8 @@ pub unsafe extern "C" fn moraine_dump_table_stats(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineTableStatsRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineTableStatsRow>, AbiError> {
@@ -1000,10 +1051,15 @@ pub unsafe extern "C" fn moraine_dump_table_stats(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_table_stats(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_table_stats(&handle_ref.catalog),
+            )
+        }?;
         Ok(rows
             .into_iter()
             .map(|v| MoraineTableStatsRow {
@@ -1082,6 +1138,8 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineTableColumnStatsRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineTableColumnStatsRow>, AbiError> {
@@ -1107,12 +1165,15 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_table_column_stats(
-                &handle_ref.catalog,
-            ))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_table_column_stats(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -1225,6 +1286,8 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineFileColumnStatsRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineFileColumnStatsRow>, AbiError> {
@@ -1249,12 +1312,15 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_file_column_stats(
-                &handle_ref.catalog,
-            ))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_file_column_stats(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -1367,6 +1433,8 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineSnapshotRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineSnapshotRow>, AbiError> {
@@ -1389,10 +1457,15 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_snapshots(&handle_ref.catalog))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_snapshots(&handle_ref.catalog),
+            )
+        }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
         let owned: Vec<Owned> = rows
@@ -1485,6 +1558,8 @@ pub unsafe extern "C" fn moraine_dump_schema_versions(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineSchemaVersionRow,
     out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineSchemaVersionRow>, AbiError> {
@@ -1496,12 +1571,15 @@ pub unsafe extern "C" fn moraine_dump_schema_versions(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
-        let rows = handle_ref
-            .runtime
-            .block_on(moraine::ffi_support::dump_schema_versions(
-                &handle_ref.catalog,
-            ))
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_schema_versions(&handle_ref.catalog),
+            )
+        }?;
         Ok(rows
             .into_iter()
             .map(|v| MoraineSchemaVersionRow {
@@ -1637,6 +1715,7 @@ mod tests {
                             record_count: 10,
                             file_size_bytes: 1024,
                             footer_size: 64,
+                            encryption_key: Some("a2V5LWRhdGE=".into()),
                             column_stats: vec![FileColumnStats {
                                 column_id: column,
                                 column_size_bytes: 100,
@@ -1659,6 +1738,7 @@ mod tests {
                             delete_count: 2,
                             file_size_bytes: 128,
                             footer_size: 32,
+                            encryption_key: Some("a2V5LWRlbA==".into()),
                         },
                     )?;
                     tx.update_column_stats(
@@ -1712,6 +1792,65 @@ mod tests {
         handle
     }
 
+    /// One representative dump pins the pull channel for the whole family —
+    /// every dump entry point routes through the same cancellable bridge.
+    #[test]
+    fn probe_cancels_dump_schemas_then_quiet_probe_succeeds() {
+        unsafe extern "C" fn probe_always(_probe_ctx: *mut c_void) -> bool {
+            true
+        }
+        unsafe extern "C" fn probe_never(_probe_ctx: *mut c_void) -> bool {
+            false
+        }
+
+        let dir = TempDir::new("probe-dump");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let mut items: *mut MoraineSchemaRow = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; out/err slots are valid; the
+        // probes accept a null context.
+        let code = unsafe {
+            moraine_dump_schemas(
+                handle,
+                &raw mut items,
+                &raw mut len,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert_eq!(err.code, codes::INTERRUPTED);
+        assert!(items.is_null());
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        let mut items2: *mut MoraineSchemaRow = ptr::null_mut();
+        let mut len2: usize = 0;
+        let mut err2 = MoraineError::default();
+        // SAFETY: same contracts as above.
+        let code2 = unsafe {
+            moraine_dump_schemas(
+                handle,
+                &raw mut items2,
+                &raw mut len2,
+                Some(probe_never),
+                ptr::null_mut(),
+                &raw mut err2,
+            )
+        };
+        assert_eq!(code2, codes::OK);
+
+        // SAFETY: freed exactly once each.
+        unsafe {
+            moraine_dump_schemas_free(items2, len2);
+            moraine_detach(handle);
+        }
+    }
+
     #[test]
     fn dump_schemas_and_tables_return_current_and_history_rows() {
         let dir = TempDir::new("schemas-tables");
@@ -1723,7 +1862,14 @@ mod tests {
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
-            moraine_dump_schemas(handle, &raw mut schemas, &raw mut schemas_len, &raw mut err)
+            moraine_dump_schemas(
+                handle,
+                &raw mut schemas,
+                &raw mut schemas_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::OK);
         // `main` (bootstrap) + `sales`; the rename never touched a
@@ -1737,7 +1883,14 @@ mod tests {
         let mut tables_len: usize = 0;
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
-            moraine_dump_tables(handle, &raw mut tables, &raw mut tables_len, &raw mut err)
+            moraine_dump_tables(
+                handle,
+                &raw mut tables,
+                &raw mut tables_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::OK);
         assert_eq!(
@@ -1813,8 +1966,16 @@ mod tests {
         let mut views_len: usize = 0;
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code =
-            unsafe { moraine_dump_views(handle, &raw mut views, &raw mut views_len, &raw mut err) };
+        let code = unsafe {
+            moraine_dump_views(
+                handle,
+                &raw mut views,
+                &raw mut views_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::CORRUPTION);
         assert_eq!(err.code, codes::CORRUPTION);
         // Nothing was handed to the caller, so there is nothing to free.
@@ -1843,7 +2004,14 @@ mod tests {
         let mut columns_len: usize = 0;
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
-            moraine_dump_columns(handle, &raw mut columns, &raw mut columns_len, &raw mut err)
+            moraine_dump_columns(
+                handle,
+                &raw mut columns,
+                &raw mut columns_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::OK);
         assert_eq!(columns_len, 2);
@@ -1855,8 +2023,16 @@ mod tests {
         let mut views: *mut MoraineViewRow = ptr::null_mut();
         let mut views_len: usize = 0;
         // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code =
-            unsafe { moraine_dump_views(handle, &raw mut views, &raw mut views_len, &raw mut err) };
+        let code = unsafe {
+            moraine_dump_views(
+                handle,
+                &raw mut views,
+                &raw mut views_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::OK);
         assert_eq!(views_len, 1);
         // SAFETY: just populated above.
@@ -1869,7 +2045,14 @@ mod tests {
         let mut files_len: usize = 0;
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
-            moraine_dump_data_files(handle, &raw mut files, &raw mut files_len, &raw mut err)
+            moraine_dump_data_files(
+                handle,
+                &raw mut files,
+                &raw mut files_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::OK);
         assert_eq!(files_len, 1);
@@ -1887,7 +2070,14 @@ mod tests {
         let mut deletes_len: usize = 0;
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
-            moraine_dump_delete_files(handle, &raw mut deletes, &raw mut deletes_len, &raw mut err)
+            moraine_dump_delete_files(
+                handle,
+                &raw mut deletes,
+                &raw mut deletes_len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::OK);
         assert_eq!(deletes_len, 1);
@@ -1921,6 +2111,8 @@ mod tests {
                 handle,
                 &raw mut tstat_rows,
                 &raw mut tstat_rows_len,
+                None,
+                ptr::null_mut(),
                 &raw mut err,
             )
         };
@@ -1937,6 +2129,8 @@ mod tests {
                 handle,
                 &raw mut col_stat_rows,
                 &raw mut col_stat_rows_len,
+                None,
+                ptr::null_mut(),
                 &raw mut err,
             )
         };
@@ -1955,6 +2149,8 @@ mod tests {
                 handle,
                 &raw mut file_stat_rows,
                 &raw mut file_stat_rows_len,
+                None,
+                ptr::null_mut(),
                 &raw mut err,
             )
         };
@@ -1974,6 +2170,8 @@ mod tests {
                 handle,
                 &raw mut snapshots,
                 &raw mut snapshots_len,
+                None,
+                ptr::null_mut(),
                 &raw mut err,
             )
         };
@@ -2008,7 +2206,14 @@ mod tests {
         let mut len: usize = 0;
         // SAFETY: a null `handle` is exactly the input this test exercises.
         let code = unsafe {
-            moraine_dump_schemas(ptr::null_mut(), &raw mut out, &raw mut len, &raw mut err)
+            moraine_dump_schemas(
+                ptr::null_mut(),
+                &raw mut out,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::INVALID_ARGUMENT);
         assert!(out.is_null());

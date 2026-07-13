@@ -15,7 +15,7 @@
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
 use std::{
-    ffi::{CStr, CString, c_char},
+    ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Arc,
@@ -25,7 +25,7 @@ use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
-    runtime::{MoraineCatalogHandle, MoraineSnapshotHandle, new_runtime},
+    runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle, new_runtime},
 };
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
@@ -316,21 +316,25 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
 /// handle to `*out`.
 ///
 /// Cancellable: races the core read against [`moraine_interrupt`]'s
-/// signal. If the interrupt wins (pending already, or arriving mid-read),
-/// returns [`codes::INTERRUPTED`] and `*out` is left unwritten. The
-/// signal is consumed either way, so the next `moraine_snapshot` call is
-/// unaffected.
+/// signal and against `probe` (polled immediately, then ~100 ms; a null
+/// `probe` disables polling). If a cancellation wins (pending already, or
+/// arriving mid-read), returns [`codes::INTERRUPTED`] and `*out` is left
+/// unwritten. The interrupt signal is consumed either way, so the next
+/// `moraine_snapshot` call is unaffected.
 ///
 /// # Safety
 ///
 /// `handle` must be a pointer previously returned by [`moraine_attach`]
 /// and not yet detached. `out` must be a valid, writable
-/// `*mut *mut MoraineSnapshotHandle`. `err`, if non-null, must be a
-/// valid, writable [`MoraineError`]. All for the duration of this call.
+/// `*mut *mut MoraineSnapshotHandle`. `probe`, if non-null, must be safe
+/// to call with `probe_ctx` from any thread. `err`, if non-null, must be
+/// a valid, writable [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_snapshot(
     handle: *mut MoraineCatalogHandle,
     out: *mut *mut MoraineSnapshotHandle,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Box<MoraineSnapshotHandle>, AbiError> {
@@ -342,15 +346,11 @@ pub unsafe extern "C" fn moraine_snapshot(
         }
         // SAFETY: `handle` validity is this function's own safety contract.
         let handle_ref = unsafe { &*handle };
-        let snapshot = handle_ref.runtime.block_on(async {
-            // `biased`: the interrupt branch wins whenever ready, even if
-            // the core future is also immediately ready.
-            tokio::select! {
-                biased;
-                () = handle_ref.interrupt.notified() => Err(AbiError::interrupted()),
-                result = handle_ref.catalog.snapshot() => result.map_err(AbiError::from),
-            }
-        })?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
         Ok(Box::new(MoraineSnapshotHandle::new(snapshot)))
     };
 
@@ -984,6 +984,7 @@ mod tests {
                             record_count: 10,
                             file_size_bytes: 1024,
                             footer_size: 64,
+                            encryption_key: None,
                             column_stats: vec![],
                         },
                     )?;
@@ -1030,7 +1031,15 @@ mod tests {
         let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
-        let code = unsafe { moraine_snapshot(handle, &raw mut snapshot, &raw mut err) };
+        let code = unsafe {
+            moraine_snapshot(
+                handle,
+                &raw mut snapshot,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::OK);
         assert!(!snapshot.is_null());
 
@@ -1191,7 +1200,8 @@ mod tests {
         let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
-        let code = unsafe { moraine_snapshot(handle, &raw mut snap, &raw mut err) };
+        let code =
+            unsafe { moraine_snapshot(handle, &raw mut snap, None, ptr::null_mut(), &raw mut err) };
         assert_eq!(code, codes::OK);
 
         let mut views: *mut MoraineViewDesc = ptr::null_mut();
@@ -1261,7 +1271,8 @@ mod tests {
         let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
-        let code = unsafe { moraine_snapshot(handle, &raw mut snap, &raw mut err) };
+        let code =
+            unsafe { moraine_snapshot(handle, &raw mut snap, None, ptr::null_mut(), &raw mut err) };
         assert_eq!(code, codes::OK);
 
         let mut tables: *mut MoraineTableDesc = ptr::null_mut();
@@ -1395,7 +1406,15 @@ mod tests {
         let mut err = MoraineError::default();
         // SAFETY: a null `handle` is exactly the input this test exercises;
         // `snapshot`/`err` are valid, writable local slots.
-        let code = unsafe { moraine_snapshot(ptr::null_mut(), &raw mut snapshot, &raw mut err) };
+        let code = unsafe {
+            moraine_snapshot(
+                ptr::null_mut(),
+                &raw mut snapshot,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::INVALID_ARGUMENT);
         assert!(snapshot.is_null());
         // SAFETY: `err.message` was just populated above and not yet freed.
@@ -1457,7 +1476,15 @@ mod tests {
         let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
-        let code = unsafe { moraine_snapshot(handle, &raw mut snapshot, &raw mut err) };
+        let code = unsafe {
+            moraine_snapshot(
+                handle,
+                &raw mut snapshot,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::INTERRUPTED);
         assert_eq!(err.code, codes::INTERRUPTED);
         assert!(snapshot.is_null());
@@ -1471,7 +1498,9 @@ mod tests {
         let mut err2 = MoraineError::default();
         // SAFETY: `handle` is still attached and live; `snap2`/`err2` are
         // valid, writable local slots.
-        let code2 = unsafe { moraine_snapshot(handle, &raw mut snap2, &raw mut err2) };
+        let code2 = unsafe {
+            moraine_snapshot(handle, &raw mut snap2, None, ptr::null_mut(), &raw mut err2)
+        };
         // SAFETY: `err2.message` was either just written by `moraine_snapshot`
         // above or is still null on success; `as_ref` on a possibly-null raw
         // pointer is exactly what it is documented to support.
@@ -1492,6 +1521,171 @@ mod tests {
         // SAFETY: a null `handle` is exactly the input this test
         // exercises, documented as a no-op.
         unsafe { moraine_interrupt(ptr::null_mut()) };
+    }
+
+    unsafe extern "C" fn probe_never(_probe_ctx: *mut c_void) -> bool {
+        false
+    }
+
+    unsafe extern "C" fn probe_always(_probe_ctx: *mut c_void) -> bool {
+        true
+    }
+
+    /// A probe that stays quiet forever must leave the core future to win.
+    #[test]
+    fn cancellable_block_on_completes_when_probe_never_fires() {
+        let dir = TempDir::new("probe-quiet");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe_never` is callable with a null context from any
+        // thread.
+        let result = unsafe {
+            handle_ref.block_on_cancellable(Some(probe_never), ptr::null_mut(), async {
+                Ok::<_, moraine::Error>(7u32)
+            })
+        };
+        assert_eq!(result.unwrap(), 7);
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// A null probe is the non-cancellable configuration: the future runs.
+    #[test]
+    fn cancellable_block_on_with_null_probe_completes() {
+        let dir = TempDir::new("probe-null");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: a `None` probe never dereferences `probe_ctx`.
+        let result = unsafe {
+            handle_ref.block_on_cancellable(None, ptr::null_mut(), async {
+                Ok::<_, moraine::Error>(7u32)
+            })
+        };
+        assert_eq!(result.unwrap(), 7);
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// A probe firing while the future is pending cancels it: the poll
+    /// loop, not just the immediate first check, is live. The future never
+    /// resolves, so only the probe can end this call.
+    #[test]
+    fn cancellable_block_on_cancels_pending_future_when_probe_fires() {
+        // First poll false (the immediate pre-flight check), every later
+        // poll true.
+        unsafe extern "C" fn probe_true_after_first(probe_ctx: *mut c_void) -> bool {
+            // SAFETY: this test passes a valid `AtomicU64` pointer below.
+            let calls = unsafe { &*probe_ctx.cast::<AtomicU64>() };
+            calls.fetch_add(1, Ordering::SeqCst) >= 1
+        }
+
+        let dir = TempDir::new("probe-mid-flight");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let calls = AtomicU64::new(0);
+
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `calls` outlives the call; the probe only reads it
+        // atomically.
+        let result: Result<(), AbiError> = unsafe {
+            handle_ref.block_on_cancellable(
+                Some(probe_true_after_first),
+                (&raw const calls).cast_mut().cast(),
+                std::future::pending::<Result<(), moraine::Error>>(),
+            )
+        };
+        let error = result.unwrap_err();
+        assert_eq!(error.code, codes::INTERRUPTED);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The pull channel end to end: a probe reporting an interrupt cancels
+    /// the snapshot (out-param unwritten), and the same handle with a
+    /// quiet probe succeeds right after — the signal is level-triggered
+    /// and scoped to the call that observed it.
+    #[test]
+    fn probe_cancels_snapshot_then_quiet_probe_succeeds() {
+        let dir = TempDir::new("probe-snapshot");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; `snapshot`/`err` are valid local
+        // slots; `probe_always` accepts a null context.
+        let code = unsafe {
+            moraine_snapshot(
+                handle,
+                &raw mut snapshot,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert_eq!(err.code, codes::INTERRUPTED);
+        assert!(snapshot.is_null());
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        let mut snap2: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut err2 = MoraineError::default();
+        // SAFETY: same contracts; `probe_never` accepts a null context.
+        let code2 = unsafe {
+            moraine_snapshot(
+                handle,
+                &raw mut snap2,
+                Some(probe_never),
+                ptr::null_mut(),
+                &raw mut err2,
+            )
+        };
+        assert_eq!(code2, codes::OK);
+        assert!(!snap2.is_null());
+
+        // SAFETY: freed exactly once each.
+        unsafe {
+            moraine_snapshot_free(snap2);
+            moraine_detach(handle);
+        }
+    }
+
+    /// A pending push signal (`moraine_interrupt`) wins before the future
+    /// starts, exactly as it does for the probe-less path.
+    #[test]
+    fn cancellable_block_on_pending_interrupt_signal_wins() {
+        let dir = TempDir::new("probe-push");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        unsafe { moraine_interrupt(handle) };
+
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: a `None` probe never dereferences `probe_ctx`.
+        let result: Result<u32, AbiError> = unsafe {
+            handle_ref.block_on_cancellable(None, ptr::null_mut(), async {
+                Ok::<_, moraine::Error>(7u32)
+            })
+        };
+        assert_eq!(result.unwrap_err().code, codes::INTERRUPTED);
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
     }
 
     /// `cpp/moraine_abi.h` is a hand-written C mirror of this module's
@@ -1529,6 +1723,7 @@ mod tests {
         let structs = [
             "MoraineCatalogHandle",
             "MoraineSnapshotHandle",
+            "MoraineInterruptProbe",
             "MoraineError",
             "MoraineSchemaDesc",
             "MoraineTableDesc",

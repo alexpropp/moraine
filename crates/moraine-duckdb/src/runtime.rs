@@ -1,7 +1,22 @@
 //! Opaque handles owned across the FFI boundary, and the sync↔async
 //! bridge: one tokio multi-threaded runtime per attached catalog.
 
+use std::{ffi::c_void, future::Future, time::Duration};
+
 use moraine::{Catalog, CatalogSnapshot};
+
+use crate::error::AbiError;
+
+/// A C-side cancellation probe polled while a cancellable call's core
+/// future is pending; returning `true` cancels the call. `None` disables
+/// the pull channel for that call. Mirrors `MoraineInterruptProbe` in
+/// `cpp/moraine_abi.h`.
+pub type MoraineInterruptProbe = Option<unsafe extern "C" fn(probe_ctx: *mut c_void) -> bool>;
+
+/// How often a cancellable call polls its interrupt probe while the core
+/// future is pending. The first poll fires immediately, so a pending
+/// interrupt cancels before the future does any work.
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// An attached catalog: owns the tokio runtime created at `ATTACH` and
 /// the [`Catalog`] handle opened on it.
@@ -15,8 +30,11 @@ use moraine::{Catalog, CatalogSnapshot};
 pub struct MoraineCatalogHandle {
     pub(crate) runtime: tokio::runtime::Runtime,
     pub(crate) catalog: Catalog,
-    /// The cancellation seam [`moraine_interrupt`](crate::abi::moraine_interrupt)
-    /// signals and read paths `select!` against.
+    /// The cancellation seam's push channel:
+    /// [`moraine_interrupt`](crate::abi::moraine_interrupt) signals it and
+    /// [`block_on_cancellable`](Self::block_on_cancellable) `select!`s
+    /// against it, alongside the pull channel (the per-call interrupt
+    /// probe).
     ///
     /// One-shot [`tokio::sync::Notify`] permit: the signal is consumed by
     /// the read that observes it and never carries over. Assumes at most
@@ -31,6 +49,64 @@ impl MoraineCatalogHandle {
             catalog,
             interrupt: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Runs `future` on the handle's runtime unless cancelled first — by a
+    /// pending or arriving [`moraine_interrupt`](crate::abi::moraine_interrupt)
+    /// signal, or by `probe` returning `true` (polled immediately, then
+    /// every [`INTERRUPT_POLL_INTERVAL`]). Cancellation drops the future
+    /// and returns the interrupted error.
+    ///
+    /// # Safety
+    ///
+    /// `probe`, if `Some`, must be safe to call with `probe_ctx` from any
+    /// thread for the duration of this call.
+    pub(crate) unsafe fn block_on_cancellable<T, E>(
+        &self,
+        probe: MoraineInterruptProbe,
+        probe_ctx: *mut c_void,
+        future: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, AbiError>
+    where
+        AbiError: From<E>,
+    {
+        // Checked before the future is first polled, not left to the
+        // interval below: a timer's first tick is pending at the poll
+        // level even when already elapsed, and a future that completes on
+        // its first poll would otherwise win over a pending interrupt.
+        if let Some(probe) = probe {
+            // SAFETY: caller contract — `probe` is callable with
+            // `probe_ctx` for the duration of this call.
+            if unsafe { probe(probe_ctx) } {
+                return Err(AbiError::interrupted());
+            }
+        }
+
+        self.runtime.block_on(async {
+            let probe_fired = async {
+                let Some(probe) = probe else {
+                    return std::future::pending::<()>().await;
+                };
+                let mut ticks = tokio::time::interval(INTERRUPT_POLL_INTERVAL);
+                loop {
+                    ticks.tick().await;
+                    // SAFETY: caller contract — `probe` is callable with
+                    // `probe_ctx` for the duration of this call.
+                    if unsafe { probe(probe_ctx) } {
+                        return;
+                    }
+                }
+            };
+
+            // `biased`: a cancellation signal wins whenever ready, even if
+            // the core future is also immediately ready.
+            tokio::select! {
+                biased;
+                () = self.interrupt.notified() => Err(AbiError::interrupted()),
+                () = probe_fired => Err(AbiError::interrupted()),
+                result = future => result.map_err(AbiError::from),
+            }
+        })
     }
 }
 
