@@ -1,41 +1,47 @@
-# RFC 0013: Partitioning and pruning
+# RFC 0013: Partitioning, sorting, and pruning
 
-- **Date:** 2026-07-09
+- **Date:** 2026-07-09 (sort orders added 2026-07-13)
 
 ## Summary
 
-Places DuckLake's partitioning tables in the moraine keyspace and fixes
-moraine's stance on partition pruning. Three DuckLake tables are in scope:
-`ducklake_partition_info` (a table's partition **spec**),
+Places DuckLake's partitioning and sorting tables in the moraine keyspace and
+fixes moraine's stance on partition pruning. Five DuckLake tables are in
+scope. Partitioning: `ducklake_partition_info` (a table's partition **spec**),
 `ducklake_partition_column` (the **columns and transforms** of a spec), and
 `ducklake_file_partition_value` (a data file's partition **values**). The spec
 already has a home — the `partition` kind of [RFC 0002](0002-slatedb-key-encoding.md);
 this RFC confirms its lifecycle, embeds partition columns per RFC 0002's
 convention, and embeds per-file partition values into the `file` record so a
-table's files and their partition values are one contiguous scan. On pruning it
-mirrors RFC 0002 exactly: moraine stores specs, transforms, and values
-**verbatim** and serves them efficiently; DuckLake's planner does the pruning.
-Server-side partition pruning is deferred, and is the same open question as
-RFC 0002's stats-pruning pushdown.
+table's files and their partition values are one contiguous scan. Sorting:
+`ducklake_sort_info` (a table's sort **spec**) and `ducklake_sort_expression`
+(the **ordered expressions** of a spec) mirror that placement exactly — a
+`sort` kind for the spec, expressions embedded. On pruning it mirrors RFC 0002
+exactly: moraine stores specs, transforms, expressions, and values
+**verbatim** and serves them efficiently; DuckLake's planner does the pruning
+and DuckLake's writer does the sorting. Server-side partition pruning is
+deferred, and is the same open question as RFC 0002's stats-pruning pushdown.
 
 ## Goals
 
-- Every partitioning table has a defined home, validated against real DuckLake
-  SQL in the e2e suite.
+- Every partitioning and sorting table has a defined home, validated against
+  real DuckLake SQL in the e2e suite.
 - A planner's core question — "scan the files of table T with their partition
   values" — is one contiguous `table_id`-first `current` range, no join, no second
   subspace.
-- Partition specs evolve over a table's life (set, change, clear) and time
-  travel reconstructs the spec-in-force at any snapshot for free.
-- A data file keeps the spec it was written under, so files under different
-  specs coexist correctly.
+- Partition and sort specs evolve over a table's life (set, change, clear) and
+  time travel reconstructs the spec-in-force at any snapshot for free.
+- A data file keeps the partition spec it was written under, so files under
+  different specs coexist correctly.
 
 Non-goals:
 
 - Server-side partition pruning — deferred (see Open questions), the same
   posture RFC 0002 takes on stats pruning.
-- Evaluating transforms. moraine stores transform definitions verbatim and
-  never applies them (RFC 0006 row-faithfulness).
+- Evaluating transforms or sort expressions. moraine stores transform
+  definitions and sort expressions verbatim and never applies them (RFC 0006
+  row-faithfulness).
+- Sorting data. DuckLake's writer sorts rows on `INSERT` against the table's
+  sort spec; moraine only serves the spec.
 - Compaction planning across partitions — [RFC 0008](0008-compaction.md) owns
   the rewrite; this RFC only states what partition state a rewrite must carry.
 - Hidden/implicit partitioning schemes beyond DuckLake's spec.
@@ -52,6 +58,17 @@ remain valid. DuckLake models this with `ducklake_partition_info` (the spec,
 temporally versioned like every catalog entity), `ducklake_partition_column`
 (spec columns), and `ducklake_file_partition_value` (per-file values).
 
+DuckLake sorts a table by a **sort spec**: an ordered list of sort keys, each
+pairing a SQL **expression** (a verbatim string, tagged with the dialect it is
+written in) with a sort direction and a null order. The spec is set with
+`ALTER TABLE … SET SORTED BY (…)` and cleared with `RESET SORTED BY`; when a
+spec is live, DuckLake's own writer sorts incoming rows on `INSERT` (its
+`sort_on_insert` option). DuckLake models this with `ducklake_sort_info` (the
+spec, temporally versioned like every catalog entity) and
+`ducklake_sort_expression` (the spec's ordered keys). Unlike partitioning,
+no per-file record exists: a data file does not name the sort spec it was
+written under — the spec is a write-time instruction, not file provenance.
+
 RFC 0002 already reserves the `partition` kind for the spec and states the
 embedding convention this RFC applies. RFC 0002 also fixes the pruning stance
 this RFC extends from stats to partitions: min/max are stored verbatim, the
@@ -67,6 +84,8 @@ type-aware rather than a naive lexicographic compare.
 | `ducklake_partition_info` | `partition` kind (RFC 0002), `(table_id, partition_id)`, in `current`/`history` | The spec has an independent lifecycle — a table repartitions over time — so it earns its own kind and is temporally versioned. |
 | `ducklake_partition_column` | **Embedded** in the `partition` value | Pure child of the spec, no independent lifecycle: columns + transforms live and die with their spec (RFC 0002 convention). |
 | `ducklake_file_partition_value` | **Embedded** in the `file` value | Per-data-file, 1:N (one value per partition column), no independent lifecycle: values live and die with their data file (RFC 0002 convention). |
+| `ducklake_sort_info` | `sort` kind, `(table_id, sort_id)`, in `current`/`history` | The sort spec has an independent lifecycle — a table re-sorts over time — so it earns its own kind and is temporally versioned, exactly like `partition`. |
+| `ducklake_sort_expression` | **Embedded** in the `sort` value | Pure child of the spec, no independent lifecycle: expressions live and die with their `sort_id` (RFC 0002 convention). |
 
 The load-bearing choice is embedding `file_partition_value` in the `file`
 record rather than giving it its own kind or subspace. A file's partition
@@ -86,12 +105,24 @@ stored **verbatim** as DuckLake defines them (the transform name and its
 parameter, e.g. `bucket(16)` or `truncate(10)`); moraine never parses or
 applies them.
 
+### The sort spec record
+
+The `sort` value carries the spec's `begin_snapshot` and its ordered sort
+keys; each key carries the `expression`, its `dialect`, the `sort_direction`,
+and the `null_order`, all stored **verbatim** as DuckLake wrote them, plus the
+explicit `sort_key_index` — the order is implicit in the embedding, but the
+index is a `ducklake_sort_expression` column and row-faithfulness keeps it.
+moraine never parses or evaluates an expression. Note the contrast with
+partition columns: a sort key names its column inside a free-form SQL string,
+not by field id — see schema evolution below.
+
 ### Spec evolution
 
-Partitioning is set, changed, or cleared over a table's life. Each is a
+Partitioning and sorting are set, changed, or cleared over a table's life
+(sorting via `SET SORTED BY` / `RESET SORTED BY`). Each is a
 **schema-changing commit** that bumps `schema_version` and conflicts at
-table level ([RFC 0004](0004-commit-protocol.md)). The spec is versioned
-temporally like any entity:
+table level ([RFC 0004](0004-commit-protocol.md)). Both specs are versioned
+temporally like any entity, and the transitions are identical:
 
 - **Set / change** — end the current spec's `current` version into `history` with
   `end_snapshot` (if one existed) and insert the new spec into `current`, in the
@@ -105,6 +136,11 @@ unambiguously: each names its own spec. Reconstructing the spec-in-force at
 snapshot `S` is the ordinary `current`+`history` temporal filter (RFC 0002) — no
 special path. Time travel gets the historical spec, and each file's values, for
 free.
+
+Sort specs have no per-file counterpart: DuckLake records no link from a data
+file to the sort spec in force when it was written, so there is nothing for
+moraine to embed. Time travel reconstructs the sort spec-in-force by the same
+temporal filter, and that is the whole story.
 
 ### Pruning — moraine does not prune, DuckLake does
 
@@ -129,6 +165,17 @@ silently drops correct rows — the exact failure RFC 0002 warns against. Until
 there is e2e evidence that a real DuckLake access pattern demands it, moraine
 stays row-faithful.
 
+### Sorting — moraine does not sort, DuckLake does
+
+The same spine, applied to write-time ordering. moraine **serves** the sort
+spec — DuckLake loads it as one `sort_info ⋈ sort_expression` join, which
+moraine answers from the single contiguous `sort` kind scan — and **never
+sorts data**. DuckLake's writer reads the spec, evaluates the expressions,
+and orders rows on `INSERT`; a sort spec never changes what moraine stores
+about a data file, only what DuckLake writes into it. There is no server-side
+work to defer here: sorting has no pruning analog, because a spec constrains
+writes, not reads.
+
 ### Interaction with schema evolution (RFC 0012)
 
 Partition columns reference source columns by **field id** (`column_id`), and
@@ -137,13 +184,20 @@ exactly what keeps a spec valid across column renames and reorders: the spec
 names field 7, and field 7 remains field 7 whatever it is called or wherever it
 sits. This is why keying by name would be wrong (see Alternatives).
 
-Whether a column that a live spec partitions on **may be dropped or altered** is
-a DuckLake rule, not moraine's. moraine follows DuckLake row-faithfully: it
-does not invent its own validation that could drift from DuckLake's. The
-validation boundary sits in DuckLake's planner/executor, which issues (or
-refuses to issue) the commit; moraine records whatever committed state results.
-Where DuckLake relies on catalog constraints to enforce this, those are the
-constraints RFC 0006 discusses enforcing at the catalog layer.
+Sort specs sit on the other side of that contrast: a sort key names its
+column **inside a verbatim SQL expression string**, and no field-id
+indirection can protect a string from a rename. Whether a rename or drop
+invalidates a live sort expression — and what DuckLake does about it — is
+DuckLake's rule; moraine stores the expression untouched and records whatever
+committed state results.
+
+Whether a column that a live spec partitions or sorts on **may be dropped or
+altered** is a DuckLake rule, not moraine's. moraine follows DuckLake
+row-faithfully: it does not invent its own validation that could drift from
+DuckLake's. The validation boundary sits in DuckLake's planner/executor, which
+issues (or refuses to issue) the commit; moraine records whatever committed
+state results. Where DuckLake relies on catalog constraints to enforce this,
+those are the constraints RFC 0006 discusses enforcing at the catalog layer.
 
 ### Interaction with compaction (RFC 0008)
 
@@ -155,22 +209,27 @@ usual. If moraine ever drives compaction planning, partition boundaries
 constrain which files may merge — a merge must not cross partitions whose values
 differ under the governing spec. That constraint is noted here and specified in
 RFC 0008; this RFC only fixes that the partition state a rewrite needs is
-already present in the per-table file scan.
+already present in the per-table file scan. Sort specs impose no such
+constraint: whether a rewrite re-sorts merged data against the live spec is
+DuckLake's (or RFC 0008's) choice, and nothing in the catalog records the
+outcome either way.
 
 ### Property-test and e2e obligations
 
 Per RFC 0001, `store`-layer encoding ships with proptest coverage, and the
-partitioning tables extend it:
+partitioning and sorting tables extend it:
 
-- **Spec + values round-trip.** A partition spec (columns + transforms) and a
-  file's partition values encode and decode verbatim, byte-for-byte against
-  what DuckLake wrote — transforms included, unparsed.
-- **Evolution time-travels.** Set → change → clear a table's partitioning
-  across snapshots; time travel to each snapshot reconstructs the
-  spec-in-force, and every file still reports the spec it was written under and
-  the values under it.
+- **Spec + values round-trip.** A partition spec (columns + transforms), a
+  sort spec (expressions + dialects + directions + null orders), and a file's
+  partition values encode and decode verbatim, byte-for-byte against what
+  DuckLake wrote — transforms and expressions included, unparsed.
+- **Evolution time-travels.** Set → change → clear a table's partitioning and
+  sorting across snapshots; time travel to each snapshot reconstructs the
+  spec-in-force, and every file still reports the partition spec it was
+  written under and the values under it.
 - **Access pattern captured in e2e.** DuckLake's own partition-pruning queries
-  are captured in the e2e suite, both to validate the mapping against real
+  and `SET SORTED BY` / sorted-`INSERT` / `RESET SORTED BY` round trips are
+  captured in the e2e suite, both to validate the mapping against real
   DuckLake SQL and to settle the file-partition-value placement (below) against
   observed reads.
 
@@ -187,9 +246,12 @@ partitioning tables extend it:
   against the captured DuckLake partition queries in the e2e suite before the
   collection grows large enough that reversing it means a migration. Embedded
   stands until then.
-- **Drop/alter of a partitioned column.** Where exactly DuckLake draws the line,
-  and whether moraine must enforce any part of it at the catalog-constraint
-  layer (RFC 0006) or purely follows DuckLake's committed state.
+- **Drop/alter of a partitioned or sorted column.** Where exactly DuckLake
+  draws the line (for sort specs the column reference is a verbatim expression
+  string, so the question includes what DuckLake does with a stale
+  expression), and whether moraine must enforce any part of it at the
+  catalog-constraint layer (RFC 0006) or purely follows DuckLake's committed
+  state.
 - **Hidden/implicit partitioning.** Whether DuckLake grows partitioning schemes
   beyond the explicit spec (e.g. derived or hidden partitions) that would need
   their own representation.
@@ -216,3 +278,13 @@ partitioning tables extend it:
   would have nowhere to point, and reconstructing a past catalog would report
   the wrong partitioning. The temporal `current`/`history` spec is what makes both
   correct.
+- **Embedding the sort spec in the `table` value.** Rejected: `sort_info`
+  carries its own `begin_snapshot`/`end_snapshot`, independent of the table
+  row's — a `SET SORTED BY` must not force a new version of the table record,
+  and time-traveling a sort spec must not entangle table history. An
+  independent lifecycle earns its own kind (RFC 0002's rule).
+- **A separate kind for `ducklake_sort_expression`.** Rejected for the same
+  reason as a separate `pval` subspace: expressions have no independent
+  lifecycle (no begin/end of their own — they live and die with their
+  `sort_id`), and a second kind would split DuckLake's one spec-load join
+  across two ranges. Embedding serves it from one contiguous scan.

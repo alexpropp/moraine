@@ -57,7 +57,8 @@ Non-goals:
   [RFC 0006](0006-extension-surface.md)).
 - Physical rewrite of data files on drop — that is compaction,
   [RFC 0008](0008-compaction.md).
-- Partition-spec evolution — [RFC 0013](0013-partitioning-and-pruning.md).
+- Partition- and sort-spec evolution —
+  [RFC 0013](0013-partitioning-sorting-and-pruning.md).
 
 ## Background
 

@@ -126,6 +126,7 @@ entries are individually begin/end-versioned (see its row below):
 | `view` | `view_id` | `ducklake_view` |
 | `column` | `table_id, column_id` | `ducklake_column` (+ `ducklake_column_tag` embedded). One record per row, **nested fields included** — struct members / list elements / map key-value are their own rows with per-table field ids; `parent_column` lives in the value (RFC 0012). |
 | `partition` | `table_id, partition_id` | `ducklake_partition_info` (+ `ducklake_partition_column` embedded) |
+| `sort` | `table_id, sort_id` | `ducklake_sort_info` (+ `ducklake_sort_expression` embedded) |
 | `file` | `table_id, data_file_id` | `ducklake_data_file` |
 | `delfile` | `table_id, delete_file_id` | `ducklake_delete_file` |
 | `fstat` | `table_id, data_file_id, column_id` | `ducklake_file_column_stats` (+ variant stats) |
@@ -147,7 +148,8 @@ Other subspaces:
 
 Two mapping conventions apply throughout: **1:1 side tables merge** into
 their parent record, and **pure child tables with no independent lifecycle
-embed** in the parent's value (partition columns, column tags). A DuckLake
+embed** in the parent's value (partition columns, sort expressions, column
+tags). A DuckLake
 table earns its own kind only when its rows have an independent begin/end
 lifecycle. The v1.0 spec has ~28 tables; the remainder (e.g. column/name
 mapping) follow the same key structure and are added here as implementation
