@@ -254,7 +254,7 @@ an unwind into C++. The shim translates codes to DuckDB exceptions:
 | 6 | `STORE` | `Error::Store` (and, conservatively, any future core variant) | `IOException` |
 | 7 | `INVALID_ARGUMENT` | ABI-layer validation: null pointer, invalid UTF-8, unsupported store scheme | `InvalidInputException` |
 | 8 | `INTERNAL` | a panic caught at the FFI boundary | `InternalException` |
-| 9 | `INTERRUPTED` | `moraine_interrupt` cancelled the read in flight (or about to start) on the handle | `InterruptException` |
+| 9 | `INTERRUPTED` | cancellation — `moraine_interrupt` or the call's interrupt probe — cancelled the read in flight (or about to start) on the handle | `InterruptException` |
 
 Wire contract: the `COMMIT_CONFLICT` message always contains the literal
 substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
@@ -265,19 +265,54 @@ is part of the ABI contract, not incidental diagnostics.
 
 Pinned by the extension-loads slice (`moraine-duckdb/src/{abi,runtime}.rs`).
 Each attached handle owns one `tokio::sync::Notify` (`runtime.rs`) alongside
-its runtime and catalog. `moraine_interrupt(handle)` calls `notify_one`;
-cancellable read entry points (`moraine_snapshot`) `block_on` a `select!`
-between the core future and `notify.notified()`, `biased` toward the
-interrupt so a pending signal always wins a tie. `Notify`'s `notify_one`
-semantics make the signal single-use without extra bookkeeping: it either
-wakes a read already waiting, or stores exactly one permit consumed by the
-next `notified()` call — either way it is consumed by the read that
-observes it, so an interrupt never carries over to a later, unrelated read.
-This assumes at most one cancellable read in flight per handle at a time;
-concurrent multi-read cancellation and commit-path shielding (no commit
-path exists in the ABI yet) are both out of scope for this slice. The seam
-is scaffolding only: the C++ shim does not yet call `moraine_interrupt`
-anywhere, so Ctrl-C during a blocked snapshot read is not wired up yet.
+its runtime and catalog; every cancellable entry point `block_on`s a
+`select!` between the core future and the cancellation signals, `biased`
+toward the signals so a pending interrupt always wins a tie and aborts
+before the core future does any work. A cancelled call returns
+`INTERRUPTED`, which the shim raises as `InterruptException`; the handle
+stays fully usable and the next call is unaffected.
+
+Two signal channels feed the seam:
+
+- **Push** — `moraine_interrupt(handle)` calls `notify_one`. `Notify`'s
+  semantics make the signal single-use without extra bookkeeping: it
+  either wakes a read already waiting, or stores exactly one permit
+  consumed by the next `notified()` call. Edge-triggered, for external
+  callers and tests; the shim does not use it.
+- **Pull** — cancellable entry points take a trailing
+  `MoraineInterruptProbe probe, void *probe_ctx` pair
+  (`typedef bool (*MoraineInterruptProbe)(void *)`). The `select!` polls
+  the probe on a ~100 ms interval (DuckDB's own slice convention for
+  interruptible waits) whose first tick fires immediately. A null probe
+  means non-cancellable. The probe may run on any of the runtime's
+  threads, so it must be thread-safe and `probe_ctx` valid for the
+  duration of the call — the shim's probe is a single atomic load of
+  `ClientContext::interrupted`, the flag DuckDB's own executor polls.
+  Level-triggered, so a signal cannot leak past the call that observed it:
+  the probe is only consulted while a call is in flight, and DuckDB clears
+  the flag before the next query issues one.
+
+This is how the shim wires Ctrl-C: DuckDB offers no interrupt callback to
+a storage extension (cancellation is cooperative polling of a public
+atomic flag; a thread blocked in an FFI call never reaches the executor's
+poll sites), so the poll moves inside the blocked call, where the async
+core makes cancellation a dropped future. No first-party remote-catalog
+extension (postgres, mysql, iceberg, delta, httpfs — or DuckLake itself)
+cancels a blocked external call; their shipped mitigations are timeouts.
+
+Cancellable entry points are exactly the ones that block on store I/O and
+mutate nothing: `moraine_snapshot`, the `moraine_dump_*` reads, the
+`moraine_inline_*` reads, and `moraine_txn_begin` (reads the head
+snapshot; nothing is staged yet, so aborting it leaves no state). The
+snapshot listing calls (`moraine_snapshot_schemas`/`tables_in`/
+`columns_of`/`views_in`/`data_files_of`) walk the already-materialized
+snapshot in memory and take no probe. `moraine_attach`/`moraine_detach`
+are not cancellable this slice. **The commit path is deliberately
+shielded**: `moraine_txn_commit` takes no probe, so an interrupt during
+`COMMIT` lets the commit finish rather than tear it mid-protocol —
+matching upstream DuckDB's own direction of suppressing interrupts around
+commit irreversibility. Concurrent multi-read cancellation on one handle
+remains out of scope.
 
 ### Version pinning and distribution
 
@@ -323,18 +358,35 @@ plus a handful of hand-fetched supplementary headers; that approach hit a
 hard wall once the write path needed DuckDB's parser/physical-operator
 types (`TableFunctionRef`, `LogicalInsert`/`LogicalUpdate`/`LogicalDelete`
 subclassing), which the amalgamation never exposes at all — the full tree
-was the fix, and it superseded the amalgamation outright rather than
-supplementing it. No DuckDB library is linked and `duckdb.cpp` itself is
-never compiled: a loadable extension is `dlopen`'d into a process that has
-already resolved every DuckDB symbol, so the shim only needs to compile
-against declarations, not link definitions (`-undefined dynamic_lookup` on
-macOS; tolerated by default on Linux `-shared` links) — this keeps the
-build to a few seconds regardless of which header source feeds it.
+was the fix for *compilation*, and it superseded the amalgamation's header
+outright.
+
+**DuckDB is linked statically, from the amalgamation.** The extension
+cannot leave `duckdb::` symbols undefined for the dynamic loader: the
+stock Linux release CLI is a statically linked executable that exports
+none of its C++ internals, so `dlopen` can never resolve them there (the
+macOS release CLI does export them, which masked this for one platform).
+Official DuckDB C++ extensions carry their own statically linked copy of
+DuckDB's internals for the same reason. `build.rs` therefore downloads the
+pinned release's `libduckdb-src.zip` amalgamation *source*, compiles
+`duckdb.cpp` once per target triple with fixed flags (`-O2`, `NDEBUG`,
+matching the release CLI) into an archive cached under
+`target/duckdb-src/`, and links it lazily after the shim archive. Objects
+still cross the extension↔host boundary by pointer between ABI-identical
+builds of the same pinned version — the version pin is what makes this
+sound. The one-translation-unit compile takes minutes, paid once per
+machine per target and cached thereafter; the shim's own compile stays a
+few seconds.
 
 **Entry point and packaging.** DuckDB's loader `dlsym`s a fixed entry
 symbol derived from the artifact's filename with every `.`-suffix
 stripped, so the packaged file must carry exactly one dot
-(`moraine_duckdb.duckdb_extension` → `moraine_duckdb_duckdb_cpp_init`). The
+(`moraine_duckdb.duckdb_extension` → `moraine_duckdb_duckdb_cpp_init`).
+That symbol must sit in the cdylib's *dynamic* symbol table, and on ELF
+rustc's cdylib link binds every non-Rust symbol `local` via a version
+script no linker flag overrides — so the entry point is defined in Rust
+(`src/entrypoint.rs`, `#[no_mangle]`, which rustc exports on every
+platform) and forwards to the C++ shim's registration function. The
 loader also requires a trailing 512-byte metadata footer (ABI type,
 extension version, the exact DuckDB version string, target platform, magic
 value, and a signature region left zero for unsigned local loading)

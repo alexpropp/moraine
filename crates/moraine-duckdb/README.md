@@ -41,6 +41,7 @@ DuckDB v1.5.4 source, the real pinned DuckLake source, and a real CLI
 |---|---|
 | DuckDB | **v1.5.4** (git hash `08e34c447b`, codename Variegata) |
 | Header source | `src/include/` from the `duckdb/duckdb` git tag `v1.5.4`, sparse-checked-out by `build.rs` and cached at `target/duckdb-src/v1.5.4/src/include/` (never committed) |
+| Library source | the `libduckdb-src.zip` amalgamation from the same release, compiled once per target by `build.rs` into a static archive cached at `target/duckdb-src/v1.5.4-lib/<target>/` (never committed) — see "Why DuckDB is statically linked" |
 | C++ standard | C++17 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
 | DuckLake extension (for the coming e2e) | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
@@ -101,7 +102,9 @@ and re-fetched instead). If `git` can't reach GitHub, the build fails
 with an offline-friendly message naming exactly what to pre-populate:
 the `src/include/` directory of a `duckdb/duckdb` checkout at tag
 `v1.5.4` — **not** `libduckdb-src.zip`, which is the single-file
-amalgamation, not this tree. Nothing under `target/` is committed —
+amalgamation, not this tree (that asset *is* used, separately, as the
+statically linked library source — see "Why DuckDB is statically
+linked"). Nothing under `target/` is committed —
 matches the project's rule that large, reproducible downloads live under
 `target/`, never in git.
 
@@ -204,6 +207,18 @@ Verified by reading `ExtensionHelper::LoadExternalExtensionInternal` and
   nothing that throws past the loader without being an intentional init
   failure; `loader.FinalizeLoad()` runs automatically after the function
   returns.
+- The symbol must sit in the shared object's **dynamic** symbol table, and
+  on ELF rustc's cdylib link emits a version script binding every symbol it
+  doesn't own to `local` — no additive linker flag
+  (`--export-dynamic-symbol`, `--dynamic-list`, `--undefined`) overrides
+  that wildcard, and a second `--version-script` is rejected outright. So
+  the entry point is defined in **Rust** (`src/entrypoint.rs`,
+  `#[no_mangle]`, exported by rustc on every platform) and forwards the
+  `ExtensionLoader *` to the C++ shim's registration function
+  (`moraine_duckdb_register` in `cpp/extension.cpp`), which stays
+  unexported. A C++-side export worked on macOS only because ld64's
+  `-exported_symbol` *adds* to the export list — that asymmetry kept the
+  local gate green while every Linux CI load failed at `dlsym`.
 - A file loaded via `LOAD '<path>'` (full path) **must** end in literally
   `.duckdb_extension` or the loader rejects it before even opening it.
 - **512-byte metadata footer**, appended to the end of the file
@@ -244,63 +259,66 @@ Verified by reading `ExtensionHelper::LoadExternalExtensionInternal` and
 
 `build.rs`'s `ensure_duckdb_headers` runs first (fetching/caching
 `target/duckdb-src/v1.5.4/src/include/` per "Where the headers come from"
-above), then compiles with the `cc` crate (`cc::Build`), `cpp(true)`,
-`-std=c++17`, two include paths (the fetched `src/include/`, and `cpp`),
-every `.cpp` source file under `cpp/` (`extension.cpp`,
-`storage_extension.cpp`, `catalog.cpp`, `metadata_tables.cpp`, `scan.cpp`,
-`staged_write.cpp`, `transaction_manager.cpp`), producing one static
-archive linked into this crate's `cdylib`. Only `extension.cpp`'s entry
-symbol needs the force-load/exported-symbol treatment below — the other
-files are pulled in normally because `extension.cpp` calls into
-`moraine_duckdb::RegisterMoraineStorageExtension` (a real reference, not an
-unreferenced entry point), and the C ABI functions those files call
-(`moraine_attach`, `moraine_snapshot`, …) are ordinary same-binary Rust
-symbols resolved by the normal link step, not `dynamic_lookup`.
+above), then `ensure_duckdb_static_archive` (below), then compiles with
+the `cc` crate (`cc::Build`), `cpp(true)`, `-std=c++17`, two include paths
+(the fetched `src/include/`, and `cpp`), every `.cpp` source file under
+`cpp/` (`extension.cpp`, `storage_extension.cpp`, `catalog.cpp`,
+`metadata_tables.cpp`, `scan.cpp`, `staged_write.cpp`,
+`transaction_manager.cpp`), producing one static archive linked into this
+crate's `cdylib` alongside the DuckDB archive. The C ABI functions the
+shim calls (`moraine_attach`, `moraine_snapshot`, …) are ordinary
+same-binary Rust symbols resolved by the normal link step.
 
-**Total build time against the fetched full tree stayed a few seconds**
-(all five `.cpp` files together, cold cache excluded: well under 15
-seconds; the plan's escalation trigger was a *compiled-from-source*
-DuckDB taking 15+ minutes, which never applies here since no DuckDB
-library is compiled — see "Why no DuckDB library is linked" below).
+The shim's own compile stays a few seconds; the one-time DuckDB
+amalgamation compile below is the slow step, paid once per machine per
+target and cached under `target/` thereafter.
 
-**Linker flags: unchanged, still needed.** The header-source switch alone
-doesn't change what symbols the shim resolves at compile time versus what
-the host process resolves at `dlopen` time — the gotchas below are about
-the *linker's* view of the archive and Rust's cdylib export list, neither
-of which depends on where the headers came from. Re-verified empirically
-after the switch (see "How the C++ shim compiles" build output and the
-`LOAD` proof below): both the force-load/whole-archive step and the
-explicit exported-symbol step are still required, unmodified.
+**Why DuckDB is statically linked.** A loadable extension is `dlopen`'d
+into a host process (the DuckDB CLI, or any embedding application), and
+the shim's ~185 undefined `duckdb::` symbols resolve only if that host
+*exports* its C++ internals. The macOS release CLI does (23k+ `duckdb::`
+symbols in its export table) — but the stock Linux release CLI is a
+statically linked executable built without `-rdynamic`: its `.dynsym`
+carries ~450 entries, none of them DuckDB's own classes, and no
+`libduckdb.so` ships in the release zip. An extension that defers DuckDB
+symbol resolution to `dlopen` time (the earlier `-undefined
+dynamic_lookup` approach) can therefore never load into the stock Linux
+CLI — it dies with `undefined symbol: _ZTVN6duckdb18SchemaCatalogEntryE`.
+Official DuckDB C++ extensions solve this by carrying their own copy of
+DuckDB's internals (`httpfs.duckdb_extension` for linux_amd64 v1.5.4 has
+**zero** undefined `duckdb::` symbols and ~11k defined ones in 21 MB), so
+this crate does the same: `build.rs` downloads the pinned release's
+`libduckdb-src.zip` (the single-file *library* amalgamation:
+`duckdb.cpp` + `duckdb.hpp`), compiles `duckdb.cpp` once per target triple
+with fixed flags (`-O2`, `NDEBUG` to match the release CLI, no debug
+info — profile-independent, so debug and release builds share it), and
+caches the archive at `target/duckdb-src/v1.5.4-lib/<target>/`. Note the
+split: the *headers* the shim compiles against still come from the full
+`src/include/` tree (the amalgamation's single header cannot express the
+parser types the shim needs); the amalgamation supplies only the linked
+*definitions*. Same pinned version on both sides, so the symbols agree.
 
-**Why no DuckDB library is linked.** A loadable extension is `dlopen`'d into
-a process (the DuckDB CLI, or any embedding application) that has already
-resolved every DuckDB symbol — the extension doesn't need its own copy.
-Confirmed empirically: the shim compiles and links into a `.dylib`
-with **zero** DuckDB library dependencies (`otool -L` shows only system
-libs), using the macOS linker flag `-undefined dynamic_lookup` (passed as
-two separate driver args, `-undefined` then `dynamic_lookup`) to defer
-resolution of DuckDB symbols to load time. This is the same technique
-DuckDB's own build tooling uses for loadable extensions. On Linux no
-equivalent flag is needed: ELF `-shared` links tolerate undefined symbols by
-default.
+Objects still cross the extension↔host boundary by pointer (DuckDB hands
+the shim an `ExtensionLoader &`, catalog entries, and so on): the host's
+objects carry host vtables, the extension's carry its own, and both are
+layouts of the same pinned version compiled for the same platform — the
+version pin is what makes the mix sound, exactly as it is for every
+official extension shaped this way.
 
-**Three link-time gotchas found empirically** (the first two required
-capturing the real linker invocation via a `cc`-wrapper shim logging its own
-`argv`, since `cargo build`'s default output hides it; the third surfaced as
-duplicate-symbol errors from lld on Linux CI):
+**Link-time gotchas found empirically** (the first required capturing the
+real linker invocation via a `cc`-wrapper shim logging its own `argv`,
+since `cargo build`'s default output hides it; the second surfaced as
+duplicate-symbol errors from lld on Linux CI; the third as the Linux CI
+`dlsym` failure):
 
-1. Nothing in the Rust crate *calls* the C++ entry point, so the linker
-   drops the whole static-archive member as unreferenced before it even gets
-   to symbol visibility. Fix: `-Wl,-force_load,<path-to-archive>` forces the
-   whole archive in regardless of references.
-2. Rust's own cdylib link step passes `-Wl,-dead_strip` *and* an
-   auto-generated `-Wl,-exported_symbols_list <file>` containing only
-   symbols rustc knows about (`#[no_mangle]` Rust items) — which strips the
-   C++ symbol again even after `-force_load` included it. Fix:
-   `-Wl,-exported_symbol,_moraine_duckdb_duckdb_cpp_init` (note the leading
-   underscore, Mach-O's C symbol-mangling convention) adds to that list
-   rather than replacing it.
-3. The archive must appear on the link line exactly once. `cc`'s
+1. Nothing in the Rust crate *calls* most of the C++ shim (only the entry
+   point's forward target), so the linker would drop unreferenced archive
+   members. Fix: `-Wl,-force_load,<shim-archive>` (ld64) /
+   `-Wl,--whole-archive,<shim-archive>,--no-whole-archive` (GNU ld)
+   forces the whole shim archive in. The DuckDB archive is deliberately
+   *not* force-loaded — it is one giant member that the shim's references
+   pull in lazily.
+2. Each archive must appear on the link line exactly once. `cc`'s
    `compile()` normally emits `cargo:rustc-link-lib=static=…`, adding a
    second, *lazy* mention of the same archive ahead of the force-load one.
    lld resolves cross-member references (e.g. `catalog.o` calling
@@ -312,20 +330,19 @@ duplicate-symbol errors from lld on Linux CI):
    fetch). Fix: `cargo_metadata(false)` on the `cc::Build`, plus linking
    the C++ standard library by hand (`-lc++`/`-lstdc++`), which that
    metadata had been contributing.
+3. The extension entry point cannot be exported from C++ on ELF: rustc's
+   cdylib link emits a version script binding every non-Rust symbol
+   `local`, no additive linker flag overrides that wildcard, and a second
+   `--version-script` is a hard linker error. See "Extension entry-point
+   contract" above — the entry point lives in `src/entrypoint.rs` as
+   `#[no_mangle]` Rust, which rustc exports on every platform, so no
+   export-related linker flag exists anymore on either OS.
 
-The flags above are macOS (`ld64`) spellings. `build.rs` branches on
-`CARGO_CFG_TARGET_OS` (the *target* platform — `cfg!(target_os)` in a build
-script would describe the host, which is wrong under cross-compilation) and
-wires the GNU ld equivalents for Linux: `-Wl,--whole-archive,<archive>,
---no-whole-archive` for gotcha 1 and
-`-Wl,--export-dynamic-symbol=moraine_duckdb_duckdb_cpp_init` (GNU ld >=
-2.35, also honored by lld; no leading underscore — ELF does not decorate C
-symbols) for gotcha 2, since Rust restricts the ELF cdylib's
-dynamic-symbol list via a version script the same way. **The Linux branch
-is written to GNU ld semantics but untested** — no Linux machine in this
-discovery loop — until the CI `LOAD` assertion lands in Task 7. Any other
-target OS gets a `cargo:warning` at build time stating extension linkage
-is unverified there.
+`build.rs` branches on `CARGO_CFG_TARGET_OS` (the *target* platform —
+`cfg!(target_os)` in a build script would describe the host, which is
+wrong under cross-compilation); the macOS and Linux branches are both
+exercised by the e2e suite. Any other target OS gets a `cargo:warning` at
+build time stating extension linkage is unverified there.
 
 ## Obtaining a DuckDB v1.5.4 CLI for testing
 
@@ -436,7 +453,7 @@ with `"...signature is either missing or invalid and unsigned extensions are
 disabled..."` — confirming the clean run above is a genuine, non-silent
 success and that the unsigned-extension gate is real.
 
-## `ATTACH` proof (Task 4)
+## `ATTACH` proof
 
 Seeded a store through the `moraine` API directly (one schema `s`, tables
 `orders` (two columns, `BIGINT`/`DOUBLE`) and `empty` (no data files), one
@@ -591,7 +608,7 @@ prefix dispatch above fires again, unmodified.
 when no explicit `METADATA_SCHEMA` option is given, which reads
 `metadb->GetCatalog().GetDefaultSchema()` on the attached moraine catalog —
 `duckdb::Catalog`'s own base-class default, `"main"`, which `MoraineCatalog`
-never overrides. This is also the schema Task 2 (bootstrap) mints from
+never overrides. This is also the schema bootstrap mints from
 snapshot 0, so every moraine store is DuckLake-attachable from birth: the
 synthesized `ducklake_*` tables and any user-created tables/schemas share
 the *same* attached catalog and the *same* `main` schema namespace (a
@@ -777,8 +794,7 @@ renamed to `t`, yet its data still resolves under `.../t_old/`.
 
 ### Live proof
 
-Seeded a store through the `moraine` API directly: `main` from bootstrap
-(Task 2), table `t_old` (columns `id BIGINT`/`amount DOUBLE`), a
+Seeded a store through the `moraine` API directly: `main` from bootstrap, table `t_old` (columns `id BIGINT`/`amount DOUBLE`), a
 relative-path data file registered against it (real stats — see below),
 then `rename_table` to `t` (history depth: `ducklake_table` now carries both
 the `t_old` and `t` versions). The Parquet file's bytes come from the

@@ -22,15 +22,24 @@ jobs:
   # clippy/test/doc/e2e all compile moraine-duckdb, whose build.rs fetches
   # DuckDB's src/include/ header tree from GitHub on a cold cache (a ~9 MB
   # git sparse checkout into target/duckdb-src/ — see that crate's README,
-  # "Where the headers come from"). So every one of those jobs needs git +
-  # network access whenever the cache is cold or pruned; an explicit cache
-  # step for target/duckdb-src/ is a future improvement, not restructured
-  # here.
+  # "Where the headers come from") and compiles the DuckDB amalgamation
+  # into a static archive there (minutes of compile — see "Why DuckDB is
+  # statically linked"). target/duckdb-src/ is cached with its own
+  # actions/cache step, not rust-cache's cache-directories: rust-cache's
+  # post-step cleanup deletes directories under target/ it doesn't
+  # recognize, so the extra step must be declared *after* rust-cache —
+  # post steps run in reverse order, making its save fire before that
+  # cleanup. Keyed on build.rs, which owns the DuckDB pin and the compile
+  # flags.
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/duckdb-src
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -38,6 +47,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/duckdb-src
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
       - run: cargo test --workspace --locked
 
   doc:
@@ -47,6 +60,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/duckdb-src
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
       - run: cargo doc --workspace --no-deps
 
   deny:
@@ -60,4 +77,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/duckdb-src
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
+      # The pinned DuckDB CLI xtask downloads (~20 MB, re-fetched every run
+      # otherwise, for the same rust-cache cleanup reason). Keyed on
+      # xtask/src/main.rs, which owns that pin.
+      - uses: actions/cache@v4
+        with:
+          path: target/duckdb-cli/cli
+          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('xtask/src/main.rs') }}
       - run: cargo xtask e2e
