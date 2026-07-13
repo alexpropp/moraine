@@ -12,7 +12,7 @@ cargo install cargo-deny
 Everything CI enforces, runnable locally:
 
 ```bash
-cargo fmt --check
+cargo +nightly fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

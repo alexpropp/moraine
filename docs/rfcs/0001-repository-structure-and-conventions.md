@@ -126,7 +126,7 @@ One workflow (`ci.yml`), parallel jobs, all required:
 
 | Job | Enforces |
 |---|---|
-| `fmt` | `cargo fmt --check` |
+| `fmt` | `cargo +nightly fmt --check` |
 | `clippy` | `cargo clippy --workspace --all-targets`, warnings denied |
 | `test` | `cargo test --workspace --locked` (Unit + Integration, doctests, examples) |
 | `doc` | `cargo doc` with `RUSTDOCFLAGS="-D warnings"` |

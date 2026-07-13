@@ -57,7 +57,7 @@ this file is the operational summary.
 ## The local gate
 
 ```bash
-cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
+cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
   && cargo deny check && cargo xtask e2e
