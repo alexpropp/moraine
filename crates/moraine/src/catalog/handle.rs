@@ -96,7 +96,7 @@ impl Catalog {
 
     /// Opens a fresh transaction at the current head, the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
-    /// Used by [`crate::ffi_support`]'s raw cur+hist dumps and the
+    /// Used by [`crate::ffi_support`]'s raw current+history dumps and the
     /// staged-row commit path; every other caller goes through
     /// `snapshot`/`snapshot_at`/`commit`.
     pub(crate) async fn begin_read_tx(&self) -> Result<DbTransaction> {

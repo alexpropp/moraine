@@ -57,7 +57,7 @@ Non-goals:
 
 ## Background
 
-`sys/format` lives in the `sys` subspace (RFC 0002) and records two things:
+`sys/format` lives in the `system` subspace (RFC 0002) and records two things:
 the **structural format version** (RFC 0002's layout = 1) and the moraine
 version that wrote the store. The structural version is bumped only by a
 change to the subspace tag set or the key structure — precisely the changes a
@@ -247,7 +247,7 @@ from ordinary attach), **not** a silent auto-run on open. The reasoning:
   operational decision with a maintenance-window shape; the operator owns it.
 
 The boundary: a **trivial metadata migration** (bounded, O(1)-ish, e.g.
-rewriting only the `sys` records with no keyspace walk) *could* auto-run on
+rewriting only the `system` records with no keyspace walk) *could* auto-run on
 open, because it carries none of the surprise. Where exactly that boundary
 sits — what qualifies as "trivial enough to auto-run" — is an Open question.
 The default is explicit.
@@ -273,7 +273,7 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   against an already-migrated store is a no-op (no marker, format already at
   target), not a re-rewrite.
 - **Migrate-then-time-travel.** After migration, resolving the catalog at a
-  pre-migration snapshot (RFC 0002 `hist`/`snap`) still returns the correct
+  pre-migration snapshot (RFC 0002 `history`/`snapshot`) still returns the correct
   historical state — the rewrite preserves temporal semantics, it does not
   flatten history.
 
@@ -289,7 +289,7 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   unavailability the permanent answer? This RFC assumes the latter and flags
   the former as unsolved.
 - **Auto-vs-explicit trigger boundary.** Precisely which migrations are
-  "trivial" enough to auto-run on open (bounded `sys`-only rewrites) versus
+  "trivial" enough to auto-run on open (bounded `system`-only rewrites) versus
   requiring the explicit verb. Getting this wrong in the permissive direction
   reintroduces the rolling-fleet surprise.
 - **Encrypted values (dovetail [RFC 0014](0014-encryption.md)).** If values
@@ -318,7 +318,7 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   upgraded node to attach begins rewriting the keyspace under every
   still-running old-binary reader, surprising a rolling fleet and coupling an
   operational decision to an incidental attach. Explicit opt-in makes the
-  cost and timing owned. (Trivial `sys`-only migrations are the noted
+  cost and timing owned. (Trivial `system`-only migrations are the noted
   exception — Open questions.)
 - **Lazy / online per-key migration on read.** Translate old keys to the new
   layout on the fly, forever, the way axis 1 translates old *values*.

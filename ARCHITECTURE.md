@@ -107,17 +107,17 @@ How DuckLake catalog state is laid out in SlateDB is the single
 most expensive-to-reverse decision in the project; it is
 [RFC 0002](docs/rfcs/0002-slatedb-key-encoding.md).
 
-- **Keyspace partitioned by a leading tag byte** into subspaces: `sys` (format
-  version, head pointer), `snap` (one immutable record per snapshot), `cur`
-  (live catalog entities), `hist` (ended entity versions), `inline` (inlined
+- **Keyspace partitioned by a leading tag byte** into subspaces: `system` (format
+  version, head pointer), `snapshot` (one immutable record per snapshot), `current`
+  (live catalog entities), `history` (ended entity versions), `inline` (inlined
   data, [RFC 0003](docs/rfcs/0003-data-inlining.md)).
-- **The `cur`/`hist` split is the load-bearing decision.** DuckLake versions
+- **The `current`/`history` split is the load-bearing decision.** DuckLake versions
   entities temporally (`begin_snapshot`/`end_snapshot`). Rather than store one
   history stream and filter it on every read, moraine keeps *live* versions in
-  `cur` and moves *ended* versions to `hist` atomically as part of the same
+  `current` and moves *ended* versions to `history` atomically as part of the same
   commit. Loading the current catalog — the hot path, every attach — scans
-  `cur` only, at a cost proportional to the live catalog, never its history.
-  Time travel scans the relevant `hist` ranges too.
+  `current` only, at a cost proportional to the live catalog, never its history.
+  Time travel scans the relevant `history` ranges too.
 - **Keys are `tag · kind · u64 components`**, big-endian fixed-width so byte
   order equals numeric order. No strings in keys; entities are keyed by
   DuckLake-allocated ids, names live in values. Per-table collections are
@@ -182,7 +182,7 @@ The RFCs also specify the operations a catalog needs past open/read/commit:
   tiny-Parquet-file tax. A launch feature: the workload an LSM is built for, and
   where a KV catalog beats a SQL one rather than merely matching it.
 - **Snapshot expiry & GC** ([RFC 0007](docs/rfcs/0007-snapshot-expiry-and-gc.md))
-  — reclaiming `hist`/`snap`/flushed-inline records and cleaning up orphaned
+  — reclaiming `history`/`snapshot`/flushed-inline records and cleaning up orphaned
   object-store files, as ordinary commits guarded by a retention horizon and a
   grace window.
 - **Compaction** ([RFC 0008](docs/rfcs/0008-compaction.md)) — merging small data

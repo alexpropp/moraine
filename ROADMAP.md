@@ -53,10 +53,19 @@ e2e suite before it is checked off.
 ### Catalog & schema
 - [x] Hierarchy: schemas, tables, views (`schema`, `table`, `view`,
   `column`)
-- [ ] Full schema evolution: add / drop / rename / reorder columns, type
-  promotion, schema versioning (`schema_versions`) (RFC 0012)
-- [ ] All DuckLake types including nested `STRUCT`/`LIST`/`MAP`; `VARIANT`
-  where the extension surface allows (RFC 0005 non-goal until proven)
+- [x] Schema evolution (RFC 0012): every column op DuckLake's `ALTER TABLE`
+  can express — `ADD`/`RENAME`/`DROP COLUMN` and `ALTER COLUMN … TYPE`
+  (type promotion, verified over data inlined under the old type) — round
+  trips live end to end (`ducklake_load.rs`'s
+  `ducklake_column_schema_evolution_through_staged_writes` and
+  `ducklake_column_type_promotion_over_inlined_data`), carried by the
+  generic staged-commit version transitions with no dedicated path. Column
+  reorder is not reachable through DuckLake SQL (no reorder `ALTER`); the
+  version-transition machinery supports position changes, but nothing issues
+  them, so it stays a latent core capability, not a shipped surface.
+- [ ] All DuckLake types: scalars and nested `LIST`/`STRUCT`/`MAP` create,
+  inline, and round-trip live (RFC 0005); `VARIANT` awaits the extension
+  surface (RFC 0005 non-goal until proven)
 - [ ] Column and name mapping for externally written Parquet
   (`column_mapping`, `name_mapping`)
 - [ ] Macros: scalar/table macros with parameters (`macro`, `macro_impl`,

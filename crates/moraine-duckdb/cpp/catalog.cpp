@@ -13,10 +13,51 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <unordered_map>
+#include <vector>
 
 namespace moraine_duckdb {
 
 namespace {
+
+// Reconstructs a column's DuckDB `LogicalType` from a table's flat,
+// position-ordered `ducklake_column` rows, folding nested children (linked
+// by `parent_column`) into `LIST`/`STRUCT`/`MAP`. `by_id` maps each column's
+// field id to its row; `children_of` maps a parent id to its child ids in
+// column order. Scalars go through `MapColumnType`.
+duckdb::LogicalType BuildColumnType(const MoraineColumnDesc &column,
+                                    const std::unordered_map<uint64_t, const MoraineColumnDesc *> &by_id,
+                                    const std::unordered_map<uint64_t, std::vector<uint64_t>> &children_of) {
+	auto child_ids = children_of.find(column.id);
+	auto children = child_ids == children_of.end() ? std::vector<uint64_t>{} : child_ids->second;
+
+	if (duckdb::StringUtil::CIEquals(column.sql_type, "list")) {
+		if (children.size() != 1) {
+			throw duckdb::InternalException("moraine: LIST column \"%s\" must have exactly one child", column.name);
+		}
+		auto &element = *by_id.at(children[0]);
+		return duckdb::LogicalType::LIST(BuildColumnType(element, by_id, children_of));
+	}
+	if (duckdb::StringUtil::CIEquals(column.sql_type, "struct")) {
+		duckdb::child_list_t<duckdb::LogicalType> fields;
+		fields.reserve(children.size());
+		for (auto child_id : children) {
+			auto &field = *by_id.at(child_id);
+			fields.emplace_back(field.name, BuildColumnType(field, by_id, children_of));
+		}
+		return duckdb::LogicalType::STRUCT(std::move(fields));
+	}
+	if (duckdb::StringUtil::CIEquals(column.sql_type, "map")) {
+		if (children.size() != 2) {
+			throw duckdb::InternalException("moraine: MAP column \"%s\" must have a key and value child", column.name);
+		}
+		auto &key = *by_id.at(children[0]);
+		auto &value = *by_id.at(children[1]);
+		return duckdb::LogicalType::MAP(BuildColumnType(key, by_id, children_of),
+		                                BuildColumnType(value, by_id, children_of));
+	}
+	return MapColumnType(column.sql_type);
+}
 
 std::string ToUpperAscii(const std::string &s) {
 	std::string result = s;
@@ -207,10 +248,25 @@ void MoraineSchemaEntry::EnsureTablesLoaded() {
 			ThrowMoraineError(column_err);
 		}
 
+		// A nested column arrives as a top-level marker row plus child rows
+		// (`parent_column` set), in column order. Index them so nested types
+		// reconstruct, and add only the top-level columns.
+		std::unordered_map<uint64_t, const MoraineColumnDesc *> by_id;
+		std::unordered_map<uint64_t, std::vector<uint64_t>> children_of;
+		for (auto &column_desc : column_descs) {
+			by_id.emplace(column_desc.id, &column_desc);
+			if (column_desc.has_parent_column) {
+				children_of[column_desc.parent_column].push_back(column_desc.id);
+			}
+		}
+
 		duckdb::CreateTableInfo info(*this, table_desc.name);
 		duckdb::idx_t column_index = 0;
 		for (auto &column_desc : column_descs) {
-			auto type = MapColumnType(column_desc.sql_type);
+			if (column_desc.has_parent_column) {
+				continue;
+			}
+			auto type = BuildColumnType(column_desc, by_id, children_of);
 			info.columns.AddColumn(duckdb::ColumnDefinition(column_desc.name, type));
 			if (!column_desc.nulls_allowed) {
 				info.constraints.push_back(duckdb::make_uniq_base<duckdb::Constraint, duckdb::NotNullConstraint>(

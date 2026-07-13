@@ -6,23 +6,34 @@
 
 Schema evolution in moraine needs **no new store machinery**. Adding,
 dropping, renaming, reordering, or type-promoting a column is expressed as
-`cur`/`hist` version transitions, landed in one `WriteBatch` like
+`current`/`history` version transitions, landed in one `WriteBatch` like
 any other commit ([RFC 0002](0002-slatedb-key-encoding.md),
 [RFC 0004](0004-commit-protocol.md)). This RFC is mostly a proof of that
-claim. The load-bearing decisions it pins are two: **column identity vs.
+claim — and the claim is verified live: every column op DuckLake's `ALTER
+TABLE` can express — `ADD`/`RENAME`/`DROP COLUMN` and `ALTER COLUMN … TYPE`
+(type promotion, including over rows inlined under the old type, which read
+back coerced across the version boundary) — lands as `ducklake_column`
+version transitions over the generic staged-write path, with no
+schema-mutation path in the shim (e2e
+`ducklake_column_schema_evolution_through_staged_writes` and
+`ducklake_column_type_promotion_over_inlined_data`). Column **reorder** is
+not reachable through DuckLake SQL — there is no reorder `ALTER` — so it
+stays a latent capability of the same machinery (a position change is a
+value edit like any other), never issued in the DuckLake-driven surface.
+The load-bearing decisions it pins are two: **column identity vs.
 position** — a column is keyed by its DuckLake-allocated field id, never by
 its ordinal, field ids are never reused, and everything mutable about a
 column (name, position, type) lives in the value — and **every mutation of
 a column record is a temporal version transition**, never an in-place value
 edit, so the record live at any past snapshot is preserved verbatim in
-`hist`. Schema time travel then falls out of RFC 0002's temporal
+`history`. Schema time travel then falls out of RFC 0002's temporal
 reconstruction for free — names and order included — and data files survive
 evolution because they reference columns by field id.
 
 ## Goals
 
 - Every column-level schema operation (`add`/`drop`/`rename`/reorder/type
-  promotion) is a `cur`/`hist` version transition inside a single
+  promotion) is a `current`/`history` version transition inside a single
   commit batch — no dedicated schema-mutation path.
 - Column identity is stable and eternal: reconstructing the schema at any
   past snapshot yields the exact column set, **names**, order, and types at
@@ -73,10 +84,10 @@ cheaply. moraine does not copy the derivation — it **persists the counter
 instead**: the table record carries `next_column_id`, seeded past the
 highest id at `CREATE TABLE` and advanced by each `add_column` (the add is
 therefore also a new version of the table record). Deriving from history
-in moraine would force every head materialization to scan `hist` —
-violating RFC 0002's "loading the current catalog is a scan of `cur`
+in moraine would force every head materialization to scan `history` —
+violating RFC 0002's "loading the current catalog is a scan of `current`
 only" — and, fatally, the derived high-water mark would *regress* once
-RFC 0007 expires the very `hist` records it was derived from, silently
+RFC 0007 expires the very `history` records it was derived from, silently
 re-issuing retired field ids. A persisted counter survives history expiry
 by construction. Defensively, allocation never goes below the live
 columns: the next id is `max(next_column_id, max live column_id + 1)`, so
@@ -99,16 +110,16 @@ The `column` key is `(table_id, column_id)` (RFC 0002). The column's
 **ordinal** — its position in the table — is a **value field**, not a key
 component. This split is half the design. The other half: **every change to
 a column record is a version transition** — end the current version into
-`hist` (preserving its value verbatim), write the new version at the *same*
-`cur` key. Each column operation maps mechanically:
+`history` (preserving its value verbatim), write the new version at the *same*
+`current` key. Each column operation maps mechanically:
 
 | Operation | Key effect | Value effect |
 |---|---|---|
-| `add_column` | new `cur` key at a freshly allocated `column_id` | full column record |
-| `drop_column` | end the `cur` version → `hist`; id retired forever | (record moves to `hist` unchanged) |
-| `rename_column` | end old version → `hist`, new version at same `column_id` | new record with new `name` |
-| reorder | end old version → `hist`, new version at same `column_id`, per **moved** column | new record with new `position` |
-| type promotion | end old version → `hist`, new version at same `column_id` | new record with new `type` |
+| `add_column` | new `current` key at a freshly allocated `column_id` | full column record |
+| `drop_column` | end the `current` version → `history`; id retired forever | (record moves to `history` unchanged) |
+| `rename_column` | end old version → `history`, new version at same `column_id` | new record with new `name` |
+| reorder | end old version → `history`, new version at same `column_id`, per **moved** column | new record with new `position` |
+| type promotion | end old version → `history`, new version at same `column_id` | new record with new `type` |
 
 The version transition is not optional bookkeeping — it is what makes the
 old name/position/type recoverable at all. An in-place value edit would
@@ -119,17 +130,17 @@ temporally-versioned catalog never held (DuckLake models these changes as
 new row versions with begin/end snapshots). The temptation to special-case
 the "harmless" mutations is real and is rejected in Alternatives.
 
-The `cur` **key** never changes across any of these — identity is the field
+The `current` **key** never changes across any of these — identity is the field
 id, and the field id is eternal. What churns is bounded and proportional to
-the change: one `hist` record per column actually touched. A rename touches
+the change: one `history` record per column actually touched. A rename touches
 one column. A reorder touches the columns whose position changed — under
 dense ordinals (Open questions) that can be most of the table, but it is
-one small `hist` record per moved column in one batch, O(columns), never
+one small `history` record per moved column in one batch, O(columns), never
 O(data). Untouched siblings produce nothing. `add` allocates the table's
 next per-table `column_id` from the table record's persisted
-`next_column_id` counter (Background). `drop` ends the column's `cur` version
-exactly as any entity end does under RFC 0002 — delete the `cur` key, write
-the `hist` key with `end_snapshot` appended, both in the same batch — and
+`next_column_id` counter (Background). `drop` ends the column's `current` version
+exactly as any entity end does under RFC 0002 — delete the `current` key, write
+the `history` key with `end_snapshot` appended, both in the same batch — and
 the id is never handed out again.
 
 Identity lives in the key; name, position, and type live in the value. A
@@ -146,11 +157,11 @@ and **does not validate the promotion** — row-faithfulness
 lands it.
 
 A type change is modeled as an entity version boundary: end the old column
-version to `hist` (carrying the pre-promotion type), write a new `cur`
+version to `history` (carrying the pre-promotion type), write a new `current`
 record at the **same `column_id`** with the new type. The field id is
 preserved — data files written under either type still project correctly —
 and time travel to a snapshot before the promotion reconstructs the old
-type, because the pre-promotion record is the live one in the `cur`+`hist`
+type, because the pre-promotion record is the live one in the `current`+`history`
 filter at that snapshot.
 
 Rename, reorder, and type promotion are deliberately **uniform**: all three
@@ -164,13 +175,13 @@ row-faithfulness).
 ### Schema time travel is free
 
 Reconstructing the catalog at snapshot `S` already yields, from RFC 0002's
-`cur`+`hist` filter over the `(table_id, *)` column range, the exact set of
+`current`+`history` filter over the `(table_id, *)` column range, the exact set of
 columns live at `S`, each carrying its `name`, `position`, and `type` **as
 of `S`**. There is nothing schema-specific to do: the same filter that
 reconstructs tables and files reconstructs the schema. A dropped column
-reappears (it is in `hist` with `begin <= S < end`); a renamed column shows
+reappears (it is in `history` with `begin <= S < end`); a renamed column shows
 its `S`-era name and a reordered column its `S`-era position (the
-pre-change version is a distinct `hist` record, preserved verbatim by the
+pre-change version is a distinct `history` record, preserved verbatim by the
 version transition); a promoted column shows its `S`-era type. This only
 holds *because* every mutation is a version transition — it is the payoff
 of the uniformity rule above, and it needs nothing extra: the temporal
@@ -213,7 +224,7 @@ storing the tree inside the root column's value would require exploding
 it back into rows on every scan (re-modeling, the thing B1 forbids).
 Nested evolution — adding a struct field, widening a list element — is
 then just column operations on the affected field rows: an added struct
-member is a new `cur` record at a freshly allocated per-table id with
+member is a new `current` record at a freshly allocated per-table id with
 `parent_column` set; a widened element is a version transition on that
 field's row. The uniformity rule above applies to nested field rows
 unchanged.
@@ -289,9 +300,9 @@ SlateDB on in-memory `object_store` and against real DuckLake SQL in e2e:
 - **Rename/reorder are version transitions and time-travel-correct.** After
   a rename (or reorder), reconstruction at a pre-change snapshot yields the
   old name (or order) exactly; at a post-change snapshot, the new. The
-  batch writes exactly one `hist` record per column actually touched.
+  batch writes exactly one `history` record per column actually touched.
 - **Untouched columns churn nothing.** A rename of one column, or a reorder
-  moving `k` columns, writes no `hist` record and no `cur` change for any
+  moving `k` columns, writes no `history` record and no `current` change for any
   other column of the table.
 - **Promotion is time-travel-correct.** After a widening promotion,
   reconstruction at a pre-promotion snapshot yields the old type; at a
@@ -337,34 +348,34 @@ SlateDB on in-memory `object_store` and against real DuckLake SQL in e2e:
   sparse/fractional ordinals (only moved columns transition). Dense is
   simpler and matches DuckLake's `column_order`; sparse minimizes the
   number of version transitions on large reorders — each transition costs
-  one `hist` record, so the totals stay O(columns) per reorder either way.
+  one `history` record, so the totals stay O(columns) per reorder either way.
   Dense stands unless e2e shows DuckLake expects otherwise.
 
 ## Alternatives considered
 
 - **In-place value edits for rename and reorder (no version transition).**
   The seductive "zero key churn" optimization: since the field id does not
-  change, just overwrite the `cur` value. Rejected as a correctness bug,
+  change, just overwrite the `current` value. Rejected as a correctness bug,
   not an optimization: an in-place edit destroys the value that was live at
   earlier snapshots, so time travel to a pre-rename snapshot returns the
   *new* name (and pre-reorder, the new order) — contradicting both this
   RFC's reconstruction goal and RFC 0006 row-faithfulness, since DuckLake's
   own catalog holds these changes as distinct row versions with begin/end
-  snapshots. The churn saved is one small `hist` record per touched column;
+  snapshots. The churn saved is one small `history` record per touched column;
   the price is silent wrong answers under time travel. Every column
   mutation versions, uniformly.
 - **Column position in the key (`table_id, position`).** Rejected: a
   reorder becomes key churn across the *whole table* — every column past the
-  insertion point ends its `cur` version and re-lands, and worse, position
+  insertion point ends its `current` version and re-lands, and worse, position
   is not a stable identity, so data files could not reference columns
   through it. The field id must be the key.
 - **Reusing dropped column ids.** Rejected: it breaks field-id-based reads
   of historical Parquet. A file written against a dropped column's id would
   be silently reinterpreted as the new column that reused the id —
   data corruption, not an error. Ids retire forever.
-- **A separate "schema" snapshot structure distinct from `cur`/`hist`.**
+- **A separate "schema" snapshot structure distinct from `current`/`history`.**
   Rejected: it duplicates the exact temporal machinery RFC 0002 already
   provides. Schema is just another set of temporally-versioned entities;
   giving it a parallel versioning system would mean two reconstruction
   paths to keep consistent, two time-travel filters, and two things to get
-  wrong. Columns live in `cur`/`hist` like everything else.
+  wrong. Columns live in `current`/`history` like everything else.

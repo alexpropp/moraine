@@ -14,17 +14,19 @@
 //! [`Catalog`]: moraine::Catalog
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
-use std::ffi::{CStr, CString, c_char};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr;
-use std::sync::Arc;
+use std::{
+    ffi::{CStr, CString, c_char},
+    panic::{AssertUnwindSafe, catch_unwind},
+    ptr,
+    sync::Arc,
+};
 
-use object_store::ObjectStore;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
+use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
 
-use crate::error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes};
-use crate::runtime::{MoraineCatalogHandle, MoraineSnapshotHandle, new_runtime};
+use crate::{
+    error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
+    runtime::{MoraineCatalogHandle, MoraineSnapshotHandle, new_runtime},
+};
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
 /// results into a `(code, message)` pair written to `err`.
@@ -455,10 +457,10 @@ pub unsafe extern "C" fn moraine_snapshot_schemas(
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         // SAFETY: caller contract for `snapshot`.
-        let snap = unsafe { &(*snapshot).snapshot };
+        let snapshot = unsafe { &(*snapshot).snapshot };
         // Owned-first: no raw pointers until every string converts, so a
         // partial failure leaks nothing.
-        let owned: Vec<(u64, CString)> = snap
+        let owned: Vec<(u64, CString)> = snapshot
             .schemas()
             .into_iter()
             .map(|s| Ok((s.id.get(), to_c_string(&s.name)?)))
@@ -535,10 +537,10 @@ pub unsafe extern "C" fn moraine_snapshot_tables_in(
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         // SAFETY: caller contract for `snapshot`.
-        let snap = unsafe { &(*snapshot).snapshot };
+        let snapshot = unsafe { &(*snapshot).snapshot };
         // Owned-first: no raw pointers until every string converts, so a
         // partial failure leaks nothing.
-        let owned: Vec<(u64, u64, CString)> = snap
+        let owned: Vec<(u64, u64, CString)> = snapshot
             .tables_in(moraine::SchemaId::new(schema_id))
             .into_iter()
             .map(|t| Ok((t.id.get(), t.schema_id.get(), to_c_string(&t.name)?)))
@@ -594,6 +596,11 @@ pub struct MoraineColumnDesc {
     pub sql_type: *mut c_char,
     /// Whether NULL values are allowed.
     pub nulls_allowed: bool,
+    /// Whether this is a nested child column (a `STRUCT` field, `LIST`
+    /// element, or `MAP` key/value); `parent_column` is meaningful iff set.
+    pub has_parent_column: bool,
+    /// The parent column's field id when `has_parent_column`.
+    pub parent_column: u64,
 }
 
 /// Lists the live columns of table `table_id`, ordered by position, into
@@ -619,10 +626,10 @@ pub unsafe extern "C" fn moraine_snapshot_columns_of(
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         // SAFETY: caller contract for `snapshot`.
-        let snap = unsafe { &(*snapshot).snapshot };
+        let snapshot = unsafe { &(*snapshot).snapshot };
         // Owned-first: no raw pointers until every string converts, so a
         // partial failure leaks nothing.
-        let owned: Vec<(u64, CString, CString, bool)> = snap
+        let owned: Vec<(u64, CString, CString, bool, Option<u64>)> = snapshot
             .columns_of(moraine::TableId::new(table_id))
             .into_iter()
             .map(|c| {
@@ -631,17 +638,22 @@ pub unsafe extern "C" fn moraine_snapshot_columns_of(
                     to_c_string(&c.name)?,
                     to_c_string(&c.column_type)?,
                     c.nulls_allowed,
+                    c.parent_column.map(moraine::ColumnId::get),
                 ))
             })
             .collect::<Result<_, AbiError>>()?;
         Ok(owned
             .into_iter()
-            .map(|(id, name, sql_type, nulls_allowed)| MoraineColumnDesc {
-                id,
-                name: name.into_raw(),
-                sql_type: sql_type.into_raw(),
-                nulls_allowed,
-            })
+            .map(
+                |(id, name, sql_type, nulls_allowed, parent)| MoraineColumnDesc {
+                    id,
+                    name: name.into_raw(),
+                    sql_type: sql_type.into_raw(),
+                    nulls_allowed,
+                    has_parent_column: parent.is_some(),
+                    parent_column: parent.unwrap_or(0),
+                },
+            )
             .collect())
     };
 
@@ -720,10 +732,10 @@ pub unsafe extern "C" fn moraine_snapshot_views_in(
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         // SAFETY: caller contract for `snapshot`.
-        let snap = unsafe { &(*snapshot).snapshot };
+        let snapshot = unsafe { &(*snapshot).snapshot };
         // Owned-first: no raw pointers until every string converts, so a
         // partial failure leaks nothing.
-        let owned: Vec<(u64, u64, CString, CString, CString)> = snap
+        let owned: Vec<(u64, u64, CString, CString, CString)> = snapshot
             .views_in(moraine::SchemaId::new(schema_id))
             .into_iter()
             .map(|v| {
@@ -823,10 +835,10 @@ pub unsafe extern "C" fn moraine_snapshot_data_files_of(
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         // SAFETY: caller contract for `snapshot`.
-        let snap = unsafe { &(*snapshot).snapshot };
+        let snapshot = unsafe { &(*snapshot).snapshot };
         // Owned-first: no raw pointers until every string converts, so a
         // partial failure leaks nothing.
-        let owned: Vec<(CString, moraine::DataFileInfo)> = snap
+        let owned: Vec<(CString, moraine::DataFileInfo)> = snapshot
             .data_files_of(moraine::TableId::new(table_id))
             .into_iter()
             .map(|f| Ok((to_c_string(&f.path)?, f)))
@@ -878,9 +890,13 @@ pub unsafe extern "C" fn moraine_snapshot_data_files_of_free(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
 
     use moraine::{ColumnDef, DataFile};
     use object_store::local::LocalFileSystem;
@@ -993,24 +1009,30 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one end-to-end attach→list assertion chain
     fn attach_snapshot_and_list_round_trip() {
         let dir = TempDir::new("roundtrip");
         seed(dir.path());
 
         let handle = attach_ok(dir.path());
 
-        let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
-        // SAFETY: `handle` is attached; `snap`/`err` are valid local slots.
-        let code = unsafe { moraine_snapshot(handle, &raw mut snap, &raw mut err) };
+        // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
+        let code = unsafe { moraine_snapshot(handle, &raw mut snapshot, &raw mut err) };
         assert_eq!(code, codes::OK);
-        assert!(!snap.is_null());
+        assert!(!snapshot.is_null());
 
         let mut schemas: *mut MoraineSchemaDesc = ptr::null_mut();
         let mut schemas_len: usize = 0;
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
-            moraine_snapshot_schemas(snap, &raw mut schemas, &raw mut schemas_len, &raw mut err)
+            moraine_snapshot_schemas(
+                snapshot,
+                &raw mut schemas,
+                &raw mut schemas_len,
+                &raw mut err,
+            )
         };
         assert_eq!(code, codes::OK);
         // Bootstrap mints `main` (id 0); the seeded `sales` follows at id 1.
@@ -1027,10 +1049,10 @@ mod tests {
 
         let mut tables: *mut MoraineTableDesc = ptr::null_mut();
         let mut tables_len: usize = 0;
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
             moraine_snapshot_tables_in(
-                snap,
+                snapshot,
                 schema_id,
                 &raw mut tables,
                 &raw mut tables_len,
@@ -1047,10 +1069,10 @@ mod tests {
 
         let mut columns: *mut MoraineColumnDesc = ptr::null_mut();
         let mut columns_len: usize = 0;
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
             moraine_snapshot_columns_of(
-                snap,
+                snapshot,
                 table_id,
                 &raw mut columns,
                 &raw mut columns_len,
@@ -1072,10 +1094,10 @@ mod tests {
 
         let mut views: *mut MoraineViewDesc = ptr::null_mut();
         let mut views_len: usize = 0;
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
             moraine_snapshot_views_in(
-                snap,
+                snapshot,
                 schema_id,
                 &raw mut views,
                 &raw mut views_len,
@@ -1090,10 +1112,10 @@ mod tests {
 
         let mut files: *mut MoraineDataFileDesc = ptr::null_mut();
         let mut files_len: usize = 0;
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
             moraine_snapshot_data_files_of(
-                snap,
+                snapshot,
                 table_id,
                 &raw mut files,
                 &raw mut files_len,
@@ -1117,7 +1139,7 @@ mod tests {
             moraine_snapshot_columns_of_free(columns, columns_len);
             moraine_snapshot_views_in_free(views, views_len);
             moraine_snapshot_data_files_of_free(files, files_len);
-            moraine_snapshot_free(snap);
+            moraine_snapshot_free(snapshot);
             moraine_detach(handle);
         }
     }
@@ -1157,7 +1179,7 @@ mod tests {
         let handle = attach_ok(dir.path());
         let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
-        // SAFETY: `handle` is attached; `snap`/`err` are valid local slots.
+        // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
         let code = unsafe { moraine_snapshot(handle, &raw mut snap, &raw mut err) };
         assert_eq!(code, codes::OK);
 
@@ -1165,7 +1187,7 @@ mod tests {
         let mut views_len: usize = 0;
         // Schema `s` has id 1: bootstrap's `main` schema holds id 0.
         //
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
             moraine_snapshot_views_in(snap, 1, &raw mut views, &raw mut views_len, &raw mut err)
         };
@@ -1181,7 +1203,7 @@ mod tests {
         assert!(msg.contains("NUL"), "message: {msg}");
 
         // SAFETY: `err.message` was just populated and not yet freed;
-        // `snap`/`handle` came from the calls above and are freed exactly
+        // `snapshot`/`handle` came from the calls above and are freed exactly
         // once.
         unsafe {
             moraine_error_free(err.message);
@@ -1227,7 +1249,7 @@ mod tests {
         let handle = attach_ok(dir.path());
         let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
-        // SAFETY: `handle` is attached; `snap`/`err` are valid local slots.
+        // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
         let code = unsafe { moraine_snapshot(handle, &raw mut snap, &raw mut err) };
         assert_eq!(code, codes::OK);
 
@@ -1235,7 +1257,7 @@ mod tests {
         let mut tables_len: usize = 0;
         // Schema `s` has id 1: bootstrap's `main` schema holds id 0.
         //
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
             moraine_snapshot_tables_in(snap, 1, &raw mut tables, &raw mut tables_len, &raw mut err)
         };
@@ -1246,7 +1268,7 @@ mod tests {
 
         let mut files: *mut MoraineDataFileDesc = ptr::null_mut();
         let mut files_len: usize = 0;
-        // SAFETY: `snap` is live; outputs are valid local slots.
+        // SAFETY: `snapshot` is live; outputs are valid local slots.
         let code = unsafe {
             moraine_snapshot_data_files_of(
                 snap,
@@ -1343,13 +1365,13 @@ mod tests {
 
     #[test]
     fn snapshot_on_null_handle_reports_invalid_argument() {
-        let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
         // SAFETY: a null `handle` is exactly the input this test exercises;
-        // `snap`/`err` are valid, writable local slots.
-        let code = unsafe { moraine_snapshot(ptr::null_mut(), &raw mut snap, &raw mut err) };
+        // `snapshot`/`err` are valid, writable local slots.
+        let code = unsafe { moraine_snapshot(ptr::null_mut(), &raw mut snapshot, &raw mut err) };
         assert_eq!(code, codes::INVALID_ARGUMENT);
-        assert!(snap.is_null());
+        assert!(snapshot.is_null());
         // SAFETY: `err.message` was just populated above and not yet freed.
         unsafe { moraine_error_free(err.message) };
     }
@@ -1406,13 +1428,13 @@ mod tests {
         // still attached.
         unsafe { moraine_interrupt(handle) };
 
-        let mut snap: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
         let mut err = MoraineError::default();
-        // SAFETY: `handle` is attached; `snap`/`err` are valid local slots.
-        let code = unsafe { moraine_snapshot(handle, &raw mut snap, &raw mut err) };
+        // SAFETY: `handle` is attached; `snapshot`/`err` are valid local slots.
+        let code = unsafe { moraine_snapshot(handle, &raw mut snapshot, &raw mut err) };
         assert_eq!(code, codes::INTERRUPTED);
         assert_eq!(err.code, codes::INTERRUPTED);
-        assert!(snap.is_null());
+        assert!(snapshot.is_null());
         assert!(!err.message.is_null());
         // SAFETY: `err.message` was just populated above and not yet
         // freed.
@@ -1474,6 +1496,7 @@ mod tests {
             "moraine_arrow_encode_schema",
             "moraine_arrow_encode_chunk",
             "moraine_arrow_decode_stream",
+            "moraine_arrow_decode_body",
             "moraine_arrow_bytes_free",
             "moraine_arrow_error_free",
         ];

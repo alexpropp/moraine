@@ -612,9 +612,9 @@ this table is a human-readable mirror of it.
 |---|---|---|
 | `ducklake_snapshot` | `moraine_dump_snapshots` | shares one dump call with `ducklake_snapshot_changes` (the store models them as one merged record) |
 | `ducklake_snapshot_changes` | `moraine_dump_snapshots` | see above |
-| `ducklake_schema` | `moraine_dump_schemas` | cur + hist rows |
-| `ducklake_table` | `moraine_dump_tables` | cur + hist rows; `table_id` has no `PRIMARY KEY` in DuckLake's own schema, left nullable to match |
-| `ducklake_view` | `moraine_dump_views` | cur + hist rows |
+| `ducklake_schema` | `moraine_dump_schemas` | current + history rows |
+| `ducklake_table` | `moraine_dump_tables` | current + history rows; `table_id` has no `PRIMARY KEY` in DuckLake's own schema, left nullable to match |
+| `ducklake_view` | `moraine_dump_views` | current + history rows |
 | `ducklake_column` | `moraine_dump_columns` | `column_type` is translated, not passed through verbatim — see below |
 | `ducklake_data_file` | `moraine_dump_data_files` | widest row (16 real columns) |
 | `ducklake_delete_file` | `moraine_dump_delete_files` | |
@@ -699,8 +699,9 @@ the row count to convert, so the output `DataChunk`'s cardinality must be
 set *before* the call; and the per-column `ColumnArrowToDuckDB` does not
 apply a column's validity itself — its caller must run `SetValidityMask`
 first, or every null silently reads back as a default value. `inline/insert`
-carries a self-contained IPC stream (schema + one batch) per chunk;
-`inline/schema` is a schema-only stream used to reconstruct a looked-up
+carries the record-batch body only (no schema message), decoded against the
+version's `inline/schema` schema-only stream so the schema is not
+re-serialized per chunk; `inline/schema` also reconstructs a looked-up
 table's columns. See RFC 0005 for the encoding rationale and costs.
 
 `ducklake_flush_inlined_data` and DuckLake's compaction/rewrite cleanup
@@ -719,7 +720,7 @@ Live proof (`crates/moraine-duckdb/tests/ducklake_load.rs`'s
 `cargo xtask e2e`): `CREATE TABLE` + two small `INSERT`s (mixed types,
 `NULL`s, two chunks) inline; `SELECT` returns every row correctly through
 DuckLake's own inlined-data reader (not this crate's scan); `DELETE` of
-one row stages an `inline/idel` and a follow-up `SELECT` no longer sees
+one row stages an `inline/inline_delete` and a follow-up `SELECT` no longer sees
 it; `CALL ducklake_flush_inlined_data('lake')` moves the remaining rows
 to a real Parquet file (DuckLake registers a genuine delete file for the
 pre-flush `DELETE`, not a shrunk record count) and a post-flush `SELECT`
@@ -779,7 +780,7 @@ renamed to `t`, yet its data still resolves under `.../t_old/`.
 Seeded a store through the `moraine` API directly: `main` from bootstrap
 (Task 2), table `t_old` (columns `id BIGINT`/`amount DOUBLE`), a
 relative-path data file registered against it (real stats — see below),
-then `rename_table` to `t` (hist depth: `ducklake_table` now carries both
+then `rename_table` to `t` (history depth: `ducklake_table` now carries both
 the `t_old` and `t` versions). The Parquet file's bytes come from the
 DuckDB CLI's own `COPY ... TO`, written under
 `<DATA_PATH>/main/t_old/data.parquet` per the path rule above — with its

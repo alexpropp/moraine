@@ -19,12 +19,13 @@
 // schema_version)` record.
 //
 // Wire format for `inline/schema` and `inline/insert` bytes (opaque to the
-// store, encoded and decoded only here): both are Arrow IPC streams. A
-// schema record is a schema-only stream (no batches); a chunk body is a
-// self-contained stream (schema + one record batch) over the table's user
-// columns. DuckDB converts a `DataChunk` to the Arrow C Data Interface and
-// the Rust bridge serializes that to IPC, so nested user column types
-// round-trip.
+// store, encoded and decoded only here): both are Arrow IPC. An
+// `inline/schema` record is a schema-only stream (no batches); an
+// `inline/insert` chunk is a record-batch **body** only (no schema message)
+// over the table's user columns, decoded against its version's
+// `inline/schema` so the schema is not re-serialized per chunk. DuckDB
+// converts a `DataChunk` to the Arrow C Data Interface and the Rust bridge
+// serializes/deserializes the IPC, so nested user column types round-trip.
 #pragma once
 
 #include <cstdint>
@@ -78,15 +79,18 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &context, const uint8_t *data, size_t len);
 
 // Serializes columns `[user_col_start, chunk.ColumnCount())` of every row
-// `0..chunk.size()` as one self-contained Arrow IPC stream.
+// `0..chunk.size()` as one Arrow IPC record-batch body (no schema message).
 std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
                                            duckdb::idx_t user_col_start);
 
 // Inverse of `EncodeInlineChunkRows`: one entry per row, imported through
-// DuckDB's Arrow reader. Throws InternalException on malformed bytes or a
-// column count mismatch against `user_types`.
-std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context, const uint8_t *data,
-                                                                size_t len,
+// DuckDB's Arrow reader. `schema_ipc` is the version's schema-only stream
+// (`inline/schema`), against which the body-only chunk decodes. Throws
+// InternalException on malformed bytes or a column count mismatch against
+// `user_types`.
+std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context,
+                                                                const uint8_t *schema_ipc, size_t schema_ipc_len,
+                                                                const uint8_t *data, size_t len,
                                                                 const std::vector<duckdb::LogicalType> &user_types);
 
 // A synthesized `ducklake_inlined_data_<t>_<v>` entry: columns are

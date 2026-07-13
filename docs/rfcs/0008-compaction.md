@@ -21,7 +21,7 @@ ids** — it carries the input rows' ids through unchanged, so `next_row_id`
 
 - **Compaction is a commit** (RFC 0004): Parquet PUTs of the rewritten files
   first, then one `WriteBatch` that ends the superseded `file` / `delfile` /
-  `fstat` records (→ `hist`), inserts the replacements, updates table stats,
+  `fstat` records (→ `history`), inserts the replacements, updates table stats,
   and advances head. No read-modify-write across batches — the RFC 0005 flush
   skeleton, reused.
 - **Row-id lineage preserved exactly.** Rewritten rows keep their row ids
@@ -37,7 +37,7 @@ ids** — it carries the input rows' ids through unchanged, so `next_row_id`
   aborts with `CommitConflict` — it never silently rewrites over a concurrent
   change.
 - **Time-travel safe.** A snapshot older than the compaction still resolves
-  the pre-compaction files (they survive in `hist` until RFC 0007 expiry), so
+  the pre-compaction files (they survive in `history` until RFC 0007 expiry), so
   compaction is invisible to readers of past snapshots.
 - **Faithful to DuckLake.** moraine implements
   `merge_adjacent_files` / `rewrite_data_files` semantics; the *trigger* and
@@ -47,7 +47,7 @@ ids** — it carries the input rows' ids through unchanged, so `next_row_id`
 Non-goals:
 
 - **Physical deletion of superseded files** — RFC 0007. Compaction only
-  *ends* the old records (moving them to `hist`, whence RFC 0007 reclaims
+  *ends* the old records (moving them to `history`, whence RFC 0007 reclaims
   them); it deletes no bytes.
 - **Auto-compaction policy** (which files, when, target size) — operational,
   like RFC 0005 flush cadence and RFC 0007 expiry policy.
@@ -62,12 +62,12 @@ RFC 0002 keys `file` (`ducklake_data_file`), `delfile`
 (`ducklake_delete_file`), and `fstat` (`ducklake_file_column_stats`)
 `table_id`-first, so "everything about table T" is one contiguous range;
 `tstat` (`ducklake_table_stats`) holds the per-table `next_row_id`. Ending a
-version deletes its `cur` key and writes a `hist` key with `end_snapshot`
+version deletes its `current` key and writes a `history` key with `end_snapshot`
 appended, in the same batch.
 
 RFC 0005 set the precedent this RFC follows: flush writes Parquet PUTs, then
 one batch that creates the new `file` / `delfile` records and moves consumed
-records to `hist` — data before metadata, one `WriteBatch`.
+records to `history` — data before metadata, one `WriteBatch`.
 
 RFC 0004 states the invariant this RFC leans on hardest: `next_row_id` is
 per-table and **"preserved across UPDATE and compaction for row lineage."**
@@ -104,10 +104,10 @@ planned outputs `F_out`:
    rewrite-with-deletes: the surviving subset. Compute per-file column stats
    and the row-id range/mapping for each new file.
 2. **One `WriteBatch`** (RFC 0004 step 3):
-   - **End `F_in`.** For each input file delete its `cur/file` key and write
-     the `hist/file` key with `end_snapshot = N+1`; same for consumed `D_in`
+   - **End `F_in`.** For each input file delete its `current/file` key and write
+     the `history/file` key with `end_snapshot = N+1`; same for consumed `D_in`
      `delfile` records and the inputs' `fstat` records.
-   - **Insert `F_out`.** New `cur/file` records (file ids from `next_file_id`
+   - **Insert `F_out`.** New `current/file` records (file ids from `next_file_id`
      — new files get new ids) and their `fstat` records.
    - **`tstat`.** `next_row_id` is **unchanged** — no row ids allocated. This
      is the invariant that distinguishes compaction from an insert. In the
@@ -115,7 +115,7 @@ planned outputs `F_out`:
      recomputed downward by the number of materialized deletes.
    - **Snapshot + head.** Write `snap/{N+1}` noting the compaction in
      `snapshot_changes`; CAS `sys/head` `N → N+1`.
-3. Superseded `F_in` / `D_in` **bytes are not deleted here.** Their `hist`
+3. Superseded `F_in` / `D_in` **bytes are not deleted here.** Their `history`
    records (`end_snapshot = N+1`) make them reclaimable by RFC 0007 once no
    retained snapshot is `< N+1`.
 
@@ -211,7 +211,7 @@ row ids (new inserts); data-file compaction here touches no `inline` records
 and **never allocates**. They are complementary maintenance ops. A full
 maintenance pass is three independent commits in sequence: flush inline
 (0005) → compact data files (0008) → expire and clean up (0007). Compaction
-produces the superseded `hist` records that 0007 later reclaims; it never
+produces the superseded `history` records that 0007 later reclaims; it never
 deletes bytes itself.
 
 ### Test obligations
@@ -227,7 +227,7 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   `tstat` decreased by exactly the deleted count.
 - **Time travel unaffected.** A snapshot before the compaction resolves the
   pre-compaction files and returns identical results (superseded files still
-  in `hist`).
+  in `history`).
 - **True conflict aborts.** A concurrent `DELETE` on a table under compaction
   makes the compaction return `CommitConflict`; a replan + recommit then
   succeeds and reflects the concurrent delete.
@@ -239,7 +239,7 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   outputs, with stats consistent (mirrors DuckLake's insert-⟂-compaction
   compatibility).
 - **Superseded files become reclaimable.** After compaction the old `file`
-  records are in `hist` with `end_snapshot = N+1`; an RFC 0007 expiry past
+  records are in `history` with `end_snapshot = N+1`; an RFC 0007 expiry past
   that horizon schedules and deletes their bytes.
 - **Lineage survives merge + UPDATE.** An UPDATE issued after a merge still
   resolves row lineage correctly (ids were preserved through the merge).
@@ -273,7 +273,7 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **Deleting superseded bytes inside the compaction commit.** Rejected: a
   past snapshot still references them, so this breaks time travel, and it
   couples object-store `DELETE` to the catalog commit. Superseded files take
-  the same `hist` → `gcfile` → cleanup path as every other ended file (RFC
+  the same `history` → `gcfile` → cleanup path as every other ended file (RFC
   0007).
 - **Compaction as a background mutation outside RFC 0004** (direct puts).
   Rejected for the same reason as RFC 0007 expiry: it violates the

@@ -5,10 +5,9 @@
 //! transaction. `#[doc(hidden)]`, unstable, as with all of
 //! [`crate::ffi_support`].
 
-use crate::{catalog::Catalog, error::Result};
-
 #[doc(hidden)]
-pub use crate::transaction::staged::{Cell, RowOp, StagedTransaction, TableKind};
+pub use crate::transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind};
+use crate::{catalog::Catalog, error::Result};
 
 /// Begins a staged-row transaction at the current head.
 ///

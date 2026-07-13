@@ -257,6 +257,10 @@ pub struct ColumnInfo {
     pub default_value: Option<String>,
     /// Ordinal position in the table (0-based).
     pub position: u64,
+    /// The parent column's field id for a nested child column (a `STRUCT`
+    /// field, `LIST` element, or `MAP` key/value), or `None` for a
+    /// top-level column.
+    pub parent_column: Option<ColumnId>,
 }
 
 /// A change to one column. `None` fields leave the attribute untouched;

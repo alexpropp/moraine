@@ -61,6 +61,8 @@ typedef struct MoraineColumnDesc {
 	char *name;
 	char *sql_type;
 	bool nulls_allowed;
+	bool has_parent_column;
+	uint64_t parent_column;
 } MoraineColumnDesc;
 
 // Mirrors `moraine_duckdb::abi::MoraineViewDesc`.
@@ -331,6 +333,7 @@ void moraine_dump_schema_versions_free(MoraineSchemaVersionRow *items, size_t le
 // Mirrors `moraine_duckdb::inline::MoraineInlineRow`.
 typedef struct MoraineInlineRow {
 	uint64_t row_id;
+	uint64_t schema_version;
 	uint64_t begin_snapshot;
 	bool has_end_snapshot;
 	uint64_t end_snapshot;
@@ -483,9 +486,16 @@ int32_t moraine_arrow_encode_chunk(struct ArrowSchema *schema, struct ArrowArray
 
 // Decodes an IPC stream into exported C Data Interface structs the caller
 // (via DuckDB's importer) releases. A schema-only stream yields a zero-row
-// array.
+// array. Used to reconstruct a table's columns from its `inline/schema` record.
 int32_t moraine_arrow_decode_stream(const uint8_t *body, size_t body_len, struct ArrowSchema *out_schema,
                                     struct ArrowArray *out_array, MoraineArrowError *err);
+
+// Decodes a body-only chunk (from `moraine_arrow_encode_chunk`) against the
+// schema stored for its version; `schema_ipc` is that version's schema-only
+// IPC stream. Produces exported C Data Interface structs the caller releases.
+int32_t moraine_arrow_decode_body(const uint8_t *schema_ipc, size_t schema_ipc_len, const uint8_t *body,
+                                  size_t body_len, struct ArrowSchema *out_schema, struct ArrowArray *out_array,
+                                  MoraineArrowError *err);
 
 // Frees a buffer returned by an encode call.
 void moraine_arrow_bytes_free(MoraineArrowBytes bytes);

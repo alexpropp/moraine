@@ -11,10 +11,10 @@ async fn bootstrap_creates_snapshot_zero() {
     let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap();
-    let snap = catalog.snapshot().await.unwrap();
-    assert_eq!(snap.current_snapshot().id, SnapshotId::new(0));
-    assert_eq!(snap.current_snapshot().schema_version, 0);
-    let schemas = snap.schemas();
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(snapshot.current_snapshot().id, SnapshotId::new(0));
+    assert_eq!(snapshot.current_snapshot().schema_version, 0);
+    let schemas = snapshot.schemas();
     assert_eq!(schemas.len(), 1);
     assert_eq!(schemas[0].name, "main");
 

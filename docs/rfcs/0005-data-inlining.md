@@ -75,9 +75,9 @@ inherit that limitation.
 | Kind | Key components | Value |
 |---|---|---|
 | `inline/schema` | `table_id, schema_version` | Arrow IPC schema-only stream (written once per schema version) |
-| `inline/insert` | `table_id, schema_version, begin_snapshot, chunk_seq` | Arrow IPC stream (schema + one record batch) over the user columns + `row_id_start`, `row_count`. Carrying the schema in every chunk rather than the body alone is a deliberate implementation choice — see "Self-contained IPC stream per chunk" below |
-| `inline/idel` | `table_id, row_id` | `end_snapshot` (tombstone for an inlined insert row) |
-| `inline/fdel` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
+| `inline/insert` | `table_id, schema_version, begin_snapshot, chunk_seq` | Arrow IPC record-batch **body** (the batch message + buffers, no schema) over the user columns + `row_id_start`, `row_count`. Decoded against the version's `inline/schema` stream, so the schema is not re-serialized per chunk |
+| `inline/inline_delete` | `table_id, row_id` | `end_snapshot` (tombstone for an inlined insert row) |
+| `inline/file_delete` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
 
 All three are append-only on the commit path.
 
@@ -102,11 +102,11 @@ evolution never rewrites existing chunks.
 
 Deletes:
 
-- Against an inlined insert row → `inline/idel` tombstone carrying
+- Against an inlined insert row → `inline/inline_delete` tombstone carrying
   `end_snapshot`. DuckLake's SQL form updates the row in place; a
   tombstone is the append-only equivalent and keeps chunks immutable.
 - Against a Parquet-file row, when small enough to inline →
-  `inline/fdel`, matching the spec's inlined deletion table shape.
+  `inline/file_delete`, matching the spec's inlined deletion table shape.
 
 ### Encoding overhead
 
@@ -120,16 +120,14 @@ chunks are smallest — exactly the workload this feature targets. This is
 a deliberate trade for a transcode-free flush, and it is bounded: chunk
 sizes are capped by the row limit and drained by flush cadence.
 
-The schema also rides each chunk. `schema_version` is a key component
-(`inline/insert`), so the reader schema is *recoverable* without re-embedding
-it — and the original design stored the record-batch body alone against a
-schema kept once per `(table_id, schema_version)`. The implementation
-instead writes a self-contained IPC stream (schema + one batch) per chunk:
-an Arrow IPC record-batch message is not decodable without its schema, and
-a self-contained stream is what the FFI bridge round-trips robustly on
-both sides (see Alternatives). The added cost is one small Arrow schema
-message per chunk — tens to low-hundreds of bytes for the narrow tables
-inlining targets — not per row. The body-only optimization remains open.
+The schema is *not* one of these costs, and is not paid per chunk.
+`schema_version` is a key component (`inline/insert`), so the reader schema
+is recoverable without re-embedding it. Each `inline/insert` value carries
+the record-batch **body** only — the batch message (buffer layout, null
+counts) plus the buffers, with no schema message — and decode supplies the
+schema back from the version's `inline/schema` record (arrow-rs's low-level
+`encode`/`read_record_batch`, either side of the FFI bridge). So the WAL
+append for a tiny commit never re-serializes the schema.
 
 An `inline/schema` record is still stored once per `(table_id,
 schema_version)` — the Arrow IPC schema-only stream — written in the same
@@ -152,12 +150,19 @@ value payloads would forfeit it.)
 ### Read path
 
 Live inlined rows of table T at snapshot S: range-scan
-`inline/ins/{table_id}` (all schema versions), keep chunks with
-`begin_snapshot <= S`, subtract row ids from `inline/idel` tombstones with
+`inline/insert/{table_id}` (all schema versions), keep chunks with
+`begin_snapshot <= S`, subtract row ids from `inline/inline_delete` tombstones with
 `end_snapshot <= S`. Inlined file-deletes overlay Parquet scans the same
 way delete files do. The tombstone set for a table is scanned once and
 held in memory — inlined data is bounded by the row limit and flush
 cadence, so these sets are small by construction.
+
+Each chunk carries its `schema_version` (its key component), so a
+body-only chunk is decoded against *its own* version's `inline/schema`,
+never a neighbor's. This matters once a table is schema-evolved and holds
+inline chunks under several versions: DuckLake reads each
+`ducklake_inlined_data_<t>_<v>` separately, and the shim serves it only the
+chunks of version `v`.
 
 ### Flush
 
@@ -171,15 +176,10 @@ that order — data before metadata, like any DuckLake write):
 2. In the commit batch: create the `file` (and `delfile`) records — the
    file record backdated to the minimum per-row snapshot, row-faithfully,
    as DuckLake writes it — and **delete** the flushed `inline/insert` chunks
-   and consumed `inline/idel`/`inline/fdel` records, matching DuckLake's
+   and consumed `inline/inline_delete`/`inline/file_delete` records, matching DuckLake's
    delete-at-flush semantics. Pre-flush time travel is served by the
    flushed Parquet (per-row snapshot columns), not by retained chunks —
    retained chunks visible to any catalog scan would double-count rows.
-
-With the recent-row archive (RFC 0016) enabled, the deletion is
-**deferred**: chunks are re-keyed to an archive form in the `inline`
-segment, invisible to every catalog read at every snapshot, served only
-by the native API, and reclaimed when the archive window passes.
 
 ### Why this is a fit for the substrate
 
@@ -222,11 +222,11 @@ The operation → keyspace mapping (source-verified against DuckLake
 | DuckLake SQL | moraine record |
 |---|---|
 | `CREATE TABLE ducklake_inlined_data_<t>_<v>(...)` (batched with the `INSERT INTO ducklake_inlined_data_tables` registration) | `inline/schema` at `(t, v)` holding the user columns as an Arrow IPC schema-only stream (DuckDB's `ArrowConverter::ToArrowSchema` transcodes the column list; the Rust bridge serializes it); the table appears in the now-live `ducklake_inlined_data_tables` projection |
-| `INSERT INTO ducklake_inlined_data_<t>_<v> VALUES (row_id, {snap}, NULL, <cols>), …` (one multi-row `VALUES` per commit) | one `inline/insert` chunk at `(t, v, begin_snapshot={snap}, chunk_seq)`: the user-column cells as one self-contained Arrow IPC stream (schema + one batch), plus `row_id_start` (first row's `row_id`) and `row_count`. The `row_id`/`begin_snapshot`/`end_snapshot` columns are moraine-derived on read (`row_id = row_id_start + offset`, `begin_snapshot` from the key, `end_snapshot` from `inline/idel`), never stored in the body |
-| `UPDATE ducklake_inlined_data_<t>_<v> SET end_snapshot={snap} WHERE row_id=r …` | `inline/idel` at `(t, r)` holding `end_snapshot={snap}` |
-| `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, subtract `inline/idel` tombstones, project and order by `row_id` |
-| `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/fdel` at `(t, file_id, row_id)` holding `begin_snapshot={snap}` |
-| `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks and consumed `inline/idel`; drop the `inline/schema` and deregister. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
+| `INSERT INTO ducklake_inlined_data_<t>_<v> VALUES (row_id, {snap}, NULL, <cols>), …` (one multi-row `VALUES` per commit) | one `inline/insert` chunk at `(t, v, begin_snapshot={snap}, chunk_seq)`: the user-column cells as one Arrow IPC record-batch body (no schema message; decoded against the version's `inline/schema`), plus `row_id_start` (first row's `row_id`) and `row_count`. The `row_id`/`begin_snapshot`/`end_snapshot` columns are moraine-derived on read (`row_id = row_id_start + offset`, `begin_snapshot` from the key, `end_snapshot` from `inline/inline_delete`), never stored in the body |
+| `UPDATE ducklake_inlined_data_<t>_<v> SET end_snapshot={snap} WHERE row_id=r …` | `inline/inline_delete` at `(t, r)` holding `end_snapshot={snap}` |
+| `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, subtract `inline/inline_delete` tombstones, project and order by `row_id` |
+| `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}` |
+| `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks and consumed `inline/inline_delete`; drop the `inline/schema` and deregister. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
 | `DROP TABLE lake.<schema>.<t>` cascade | drop every `inline/*` record for `t` |
 
 This is served through the same staged-row commit path (RFC 0004): the
@@ -240,15 +240,14 @@ keyspace; nothing is re-derived on write.
 Three reconciliations with the surrounding RFCs, recorded here because they
 governed the implementation:
 
-- **Flush removes inline records; it does not move them to `hist`.**
+- **Flush removes inline records; it does not move them to `history`.**
   RFC 0004's commit-participants note phrases flush as "moves consumed
-  inline records to `hist`"; the accurate behavior — matching DuckLake's
+  inline records to `history`"; the accurate behavior — matching DuckLake's
   hard `DELETE` and RFC 0005's flush section — is that `inline/*` records
   are *deleted* at flush (the data survives as the backdated Parquet
   file). The `inline` subspace is append-then-delete, not begin/end
-  versioned like the entity subspaces. RFC 0016's recent-row archive is
-  the only thing that defers the deletion (by re-keying to `inline/arch`);
-  it is out of scope here, so this slice hard-deletes.
+  versioned like the entity subspaces, so this slice hard-deletes the
+  consumed records at flush.
 - **Schema stored, not derived.** `inline/schema` holds the Arrow schema
   written at `CREATE` time (transcoded from DuckLake's column list), so an
   `inline/insert` chunk decodes self-describingly without coupling to the
@@ -276,20 +275,21 @@ governed the implementation:
 
 ## Open questions
 
-- **Nested-column tables are blocked upstream of inlining.** The Arrow IPC
-  path itself handles nested `LIST`/`STRUCT` columns (the bridge round-trips
-  them), but a table with a nested user column can't be created through
-  moraine at all: `MapColumnType` (the `ducklake_column` metadata
-  projection, `catalog.cpp`) only maps scalar DuckLake type strings and
-  raises `unsupported DuckLake column type "list"` at `CREATE TABLE`, before
-  any inlining. Lifting that barrier — reconstructing nested `LogicalType`s
-  from DuckLake's parent/child `ducklake_column` rows — is a separate slice;
-  the inline encoding is already ready for it.
+- **Nested-column tables** (`LIST`/`STRUCT`/`MAP`) create, inline, and
+  round-trip end to end. DuckLake stores a nested column as a top-level
+  marker row (`list`/`struct`/`map`) plus child `ducklake_column` rows
+  linked by `parent_column`; moraine stores those verbatim, passes the
+  marker through its `ducklake_column` projection, and reconstructs the
+  nested `LogicalType` from the child hierarchy for its own catalog entries
+  (`catalog.cpp`'s `BuildColumnType`). The Arrow IPC inline path carries the
+  values natively. `LIST`, `STRUCT`, and `MAP` are all verified live through
+  inline and flush (e2e `ducklake_inline_nested_types_round_trip_through_flush`).
 - **VARIANT/GEOMETRY inlining.** DuckLake's `CanInlineColumns` excludes
   only `GEOMETRY`; VARIANT is inlinable there. An unsupported column type
   makes the whole table fall back to the non-inlined (Parquet) path, which
   is always correct. The exact inlinable-type set is pinned in the e2e
-  suite (scalar `BIGINT`/`VARCHAR`/`DOUBLE`/`BOOLEAN` with `NULL`s today).
+  suite (scalar `BIGINT`/`VARCHAR`/`DOUBLE`/`BOOLEAN` with `NULL`s, plus
+  nested `LIST`/`STRUCT`/`MAP`, today).
 - **Row-id counter placement — settled by RFC 0004.** The per-table row-id
   high-water mark lives in `tstat`, matching DuckLake, which also aligns
   row-id allocation with conflict granularity (and, via RFC 0004's
@@ -298,7 +298,7 @@ governed the implementation:
 
 ## Alternatives considered
 
-- **Row-per-key inserts (`inline/ins/<table_id>/<row_id>`):** enables
+- **Row-per-key inserts (`inline/insert/<table_id>/<row_id>`):** enables
   point deletes by key but makes every read a per-row decode and bloats
   key overhead for the dominant scan workload. Rejected; chunks match the
   read unit.
@@ -312,18 +312,17 @@ governed the implementation:
   not transfer to row data.
 - **Self-contained IPC stream per chunk (schema embedded in every
   value):** re-serializes the schema into the WAL on every tiny commit for
-  bytes the key already determines via `schema_version` — so in principle
-  the encoding to avoid. **Adopted anyway, deliberately:** an Arrow IPC
-  record-batch message is not self-describing without its schema, and a
-  self-contained stream (schema + one batch) is what both sides of the FFI
-  bridge round-trip robustly, decode included, with no separate schema
-  threaded into the reader. The overhead is one small Arrow schema message
-  (tens to low-hundreds of bytes for the narrow tables inlining targets)
-  per chunk, not per row; the `inline/schema` record is still written and
-  is what reconstructs the table entry's columns for an empty scan. Storing
-  the record-batch **body** alone against a separately keyed schema — the
-  original preference — remains a viable later optimization; nothing in the
-  keyspace shape blocks it.
+  bytes the key already determines via `schema_version` — the encoding to
+  avoid, and avoided. Each `inline/insert` value stores the record-batch
+  **body** alone (via arrow-rs's low-level `encode`), decoded against the
+  version's `inline/schema` stream (`read_record_batch`). The
+  round-trip-robustness a self-contained stream would have bought is instead
+  guaranteed by DuckDB owning both the export and import — the body carries
+  the batch message (buffer layout, null counts), which is all `read_record_
+  batch` needs alongside the stored schema. Dictionary-encoded columns are
+  the one shape the body cannot carry (no dictionary messages); inlined user
+  columns are not dictionary-encoded, and the encoder rejects them if they
+  ever were.
 - **Deriving the reader schema from catalog column metadata** (instead of
   the `inline/schema` record): saves that record, but couples chunk
   decode to a frozen DuckLake-type → Arrow-type mapping — a later mapping

@@ -4,17 +4,16 @@
 //! otherwise-private `catalog`. Each function opens a fresh read-only
 //! transaction, scans, and rolls back.
 
+#[doc(hidden)]
+pub use crate::catalog::inline::InlineScanKind;
 use crate::{
     catalog::{
         Catalog,
         inline::{InlineRow, materialize_inline_rows},
     },
     error::Result,
-    store::inline as store_inline,
+    store::{inline as store_inline, key::InlineOperation},
 };
-
-#[doc(hidden)]
-pub use crate::catalog::inline::InlineScanKind;
 
 /// One inlined row selected by [`scan_inline`]: the materialized row plus
 /// an owned copy of its chunk's full Arrow IPC body, so each row is
@@ -23,6 +22,9 @@ pub use crate::catalog::inline::InlineScanKind;
 pub struct InlineRowRecord {
     /// The row's dense id.
     pub row_id: u64,
+    /// The schema version the owning chunk was written under — selects the
+    /// `inline/schema` record its body decodes against.
+    pub schema_version: u64,
     /// The commit snapshot that inserted this row.
     pub begin_snapshot: u64,
     /// The commit snapshot that tombstoned this row, if any.
@@ -62,12 +64,23 @@ pub async fn scan_inline(
         .into_iter()
         .map(|row| InlineRowRecord {
             row_id: row.row_id,
+            schema_version: chunk_schema_version(&chunks[row.chunk].0),
             begin_snapshot: row.begin_snapshot,
             end_snapshot: row.end_snapshot,
             chunk_body: chunks[row.chunk].1.body.clone(),
             offset_in_chunk: row.offset_in_chunk,
         })
         .collect())
+}
+
+/// The schema version an inline chunk was written under. Every chunk key
+/// `scan_inline_chunks` returns is an `Insert`; the other arms are
+/// unreachable by construction.
+fn chunk_schema_version(op: &InlineOperation) -> u64 {
+    match op {
+        InlineOperation::Insert { schema_version, .. } => *schema_version,
+        InlineOperation::InlineDelete { .. } | InlineOperation::FileDelete { .. } => 0,
+    }
 }
 
 /// Every `(schema_version, arrow_schema)` recorded for `table_id`, in
@@ -133,7 +146,7 @@ mod tests {
     use super::*;
     use crate::{
         catalog::CatalogOptions,
-        transaction::staged::{RowOp, StagedTransaction, TableKind},
+        transaction::staged::{RowOperation, StagedTransaction, TableKind},
     };
 
     fn snapshot_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
@@ -175,12 +188,12 @@ mod tests {
         let db_tx = catalog.begin_read_tx().await.unwrap();
         let mut txn = StagedTransaction::begin(db_tx);
 
-        txn.stage(RowOp::InlineSchema {
+        txn.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 0,
             arrow_schema: b"schema".to_vec(),
         });
-        txn.stage(RowOp::InlineInsert {
+        txn.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -188,7 +201,7 @@ mod tests {
             row_count: 2,
             arrow_body: b"chunk-a".to_vec(),
         });
-        txn.stage(RowOp::InlineInsert {
+        txn.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -196,11 +209,11 @@ mod tests {
             row_count: 1,
             arrow_body: b"chunk-b".to_vec(),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1),
         });
@@ -208,16 +221,16 @@ mod tests {
 
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
         let mut inline_delete = StagedTransaction::begin(db_tx2);
-        inline_delete.stage(RowOp::InlineInlineDelete {
+        inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
             row_id: 1,
             end_snapshot: 2,
         });
-        inline_delete.stage(RowOp::Insert {
+        inline_delete.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2),
         });
-        inline_delete.stage(RowOp::Insert {
+        inline_delete.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2),
         });

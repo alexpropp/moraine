@@ -208,13 +208,14 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	return out;
 }
 
-std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context, const uint8_t *data,
-                                                               size_t len,
+std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context,
+                                                               const uint8_t *schema_ipc, size_t schema_ipc_len,
+                                                               const uint8_t *data, size_t len,
                                                                const std::vector<duckdb::LogicalType> &user_types) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
 	MoraineArrowError err{};
-	if (moraine_arrow_decode_stream(data, len, &c_schema, &c_array, &err) != 0) {
+	if (moraine_arrow_decode_body(schema_ipc, schema_ipc_len, data, len, &c_schema, &c_array, &err) != 0) {
 		ThrowArrowError(err, "decoding inline chunk");
 	}
 
@@ -304,7 +305,32 @@ duckdb::CreateTableInfo BuildInlineDataTableInfo(duckdb::SchemaCatalogEntry &sch
 // here.
 std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientContext &context,
                                                                MoraineCatalogHandle *handle, uint64_t table_id,
+                                                               uint64_t schema_version,
                                                                const std::vector<duckdb::LogicalType> &user_types) {
+	// This entry serves one `(table_id, schema_version)`; body-only chunks of
+	// that version decode against its schema-only stream (`inline/schema`).
+	// The scan below spans every version of the table, so chunks of other
+	// versions — a schema-evolved table holds several — are filtered out.
+	OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
+	MoraineError schema_err{};
+	if (moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(), &schema_err) != MORAINE_OK) {
+		ThrowMoraineError(schema_err);
+	}
+	const uint8_t *schema_ipc = nullptr;
+	size_t schema_ipc_len = 0;
+	for (auto &s : schemas) {
+		if (s.schema_version == schema_version) {
+			schema_ipc = s.arrow_schema;
+			schema_ipc_len = s.arrow_schema_len;
+			break;
+		}
+	}
+	if (!schema_ipc) {
+		throw duckdb::InternalException(
+		    "moraine: no inline schema recorded for table %llu schema version %llu",
+		    static_cast<unsigned long long>(table_id), static_cast<unsigned long long>(schema_version));
+	}
+
 	OwnedArray<MoraineInlineRow> rows(moraine_inline_scan_free);
 	MoraineError err{};
 	auto code = moraine_inline_scan(handle, table_id, /* SCAN_FOR_FLUSH */ 3, std::numeric_limits<uint64_t>::max(), 0,
@@ -315,7 +341,14 @@ std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientCont
 	std::vector<std::vector<duckdb::Value>> result;
 	result.reserve(rows.size());
 	for (auto &r : rows) {
-		auto decoded = DecodeInlineChunkRows(context, r.chunk_body, r.chunk_body_len, user_types);
+		// The scan spans every schema version of the table; this entry serves
+		// exactly its own version's `ducklake_inlined_data_<t>_<v>`, so a chunk
+		// from another version (its columns and schema differ) is not ours.
+		if (r.schema_version != schema_version) {
+			continue;
+		}
+		auto decoded = DecodeInlineChunkRows(context, schema_ipc, schema_ipc_len, r.chunk_body, r.chunk_body_len,
+		                                     user_types);
 		if (r.offset_in_chunk >= decoded.size()) {
 			throw duckdb::InternalException("moraine: inline scan row offset out of range");
 		}
@@ -362,7 +395,7 @@ std::vector<duckdb::LogicalType> MoraineInlineDataTableEntry::UserColumnTypes() 
 duckdb::TableFunction MoraineInlineDataTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                                     duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-	scan_bind_data->rows = ProvideInlineDataRows(context, handle_, table_id_, UserColumnTypes());
+	scan_bind_data->rows = ProvideInlineDataRows(context, handle_, table_id_, schema_version_, UserColumnTypes());
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();
@@ -540,10 +573,11 @@ protected:
 	// re-materializing on first use.
 	const std::vector<duckdb::Value> &ResolveRow(duckdb::ClientContext &context, InlineDmlState &state,
 	                                             MoraineCatalogHandle *handle, uint64_t table_id,
+	                                             uint64_t schema_version,
 	                                             const std::vector<duckdb::LogicalType> &user_types,
 	                                             const duckdb::Value &row_id) const {
 		if (!state.old_rows_loaded) {
-			state.old_rows = ProvideInlineDataRows(context, handle, table_id, user_types);
+			state.old_rows = ProvideInlineDataRows(context, handle, table_id, schema_version, user_types);
 			state.old_rows_loaded = true;
 		}
 		if (row_id.IsNull()) {
@@ -612,13 +646,15 @@ class MoraineInlineDataUpdateOp : public MoraineInlineDml {
 public:
 	MoraineInlineDataUpdateOp(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
 	                          duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality, MoraineCatalogHandle *handle,
-	                          uint64_t table_id, std::vector<duckdb::LogicalType> user_types, duckdb::idx_t set_ref)
+	                          uint64_t table_id, uint64_t schema_version, std::vector<duckdb::LogicalType> user_types,
+	                          duckdb::idx_t set_ref)
 	    : MoraineInlineDml(physical_plan, std::move(types), catalog, estimated_cardinality), handle_(handle),
-	      table_id_(table_id), user_types_(std::move(user_types)), set_ref_(set_ref) {
+	      table_id_(table_id), schema_version_(schema_version), user_types_(std::move(user_types)), set_ref_(set_ref) {
 	}
 
 	MoraineCatalogHandle *handle_;
 	uint64_t table_id_;
+	uint64_t schema_version_;
 	std::vector<duckdb::LogicalType> user_types_;
 	duckdb::idx_t set_ref_;
 
@@ -629,8 +665,8 @@ public:
 		// The row-id column is appended last.
 		auto row_id_col = chunk.ColumnCount() - 1;
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row =
-			    ResolveRow(context.client, state, handle_, table_id_, user_types_, chunk.GetValue(row_id_col, row));
+			auto &old_row = ResolveRow(context.client, state, handle_, table_id_, schema_version_, user_types_,
+			                           chunk.GetValue(row_id_col, row));
 			auto real_row_id = CellAsU64(old_row[0]);
 			auto end_snapshot = CellAsU64(chunk.GetValue(set_ref_, row));
 			MoraineError err{};
@@ -665,7 +701,7 @@ public:
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<InlineDmlState>();
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(context.client, state, handle_, table_id_, user_types_,
+			auto &old_row = ResolveRow(context.client, state, handle_, table_id_, schema_version_, user_types_,
 			                           chunk.GetValue(row_id_chunk_index_, row));
 			auto begin_snapshot = CellAsU64(old_row[1]);
 			if (!state.max_begin_snapshot.has_value() || begin_snapshot > *state.max_begin_snapshot) {
@@ -748,7 +784,7 @@ duckdb::PhysicalOperator &PlanInlineDataUpdate(duckdb::PhysicalPlanGenerator &pl
 	auto set_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>().index;
 	return planner.Make<MoraineInlineDataUpdateOp>(op.types, op.table.catalog, op.estimated_cardinality,
 	                                               table_entry.Handle(), table_entry.TableId(),
-	                                               table_entry.UserColumnTypes(), set_ref);
+	                                               table_entry.SchemaVersion(), table_entry.UserColumnTypes(), set_ref);
 }
 
 duckdb::PhysicalOperator &PlanInlineDataDelete(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalDelete &op,

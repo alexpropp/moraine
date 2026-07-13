@@ -1,4 +1,4 @@
-# RFC 0017: Equality indexes
+# RFC 0016: Equality indexes
 
 - **Date:** 2026-07-10
 
@@ -9,8 +9,8 @@ Adds a moraine-native **equality index**: a catalog object (`create_index` /
 entries live in a new `idx` subspace and serve two reads — **row location**
 (given key values, find the row ids and the files/chunks that hold them) and
 **uniqueness enforcement** at commit time. DuckLake v1.0 models no indexes, so
-this is a native feature in the [RFC 0016](0016-recent-row-archive.md) mold:
-real inside moraine, invisible to every DuckLake catalog scan. The RFC's
+this is a native moraine feature: real inside moraine, served from the store
+and invisible to every DuckLake catalog scan. The RFC's
 weight is on the mechanism. Entries are **live-only** (no temporal
 versioning) and point at **row ids**, which DuckLake preserves across flush,
 update-rewrites, and compaction — so data movement never touches the index.
@@ -58,7 +58,7 @@ Non-goals:
 DuckLake v1.0 has no index tables and its catalog contract knows nothing of
 indexes, so an index cannot be smuggled in as another row-faithful
 `ducklake_*` mapping — it is moraine inventing a capability, and the honest
-shape for that is the one RFC 0016 established: a native feature served by
+shape for that is a native feature served by
 the embedding API, stored where no catalog scan (current or time-traveling)
 can see it.
 
@@ -85,7 +85,7 @@ Three established facts carry most of this design:
 
 ### The index definition — a catalog entity
 
-A new `index` kind in `cur`/`hist`, keyed `(table_id, index_id)` with
+A new `index` kind in `current`/`history`, keyed `(table_id, index_id)` with
 `index_id` allocated from the global `next_catalog_id`. The value carries the
 index name, the **ordered list of indexed columns referenced by field id**
 (never by name — the RFC 0012/0013 rule, so renames are free), the unique
@@ -98,7 +98,7 @@ Verbs on `Transaction`:
 | Verb | Effect |
 |---|---|
 | `create_index(table, name, columns, unique)` | Insert the definition; build entries for every live row (see Coverage) in the same commit. |
-| `drop_index(index)` | End the definition into `hist`. Entries are orphaned and reclaimed lazily (see Reclamation). |
+| `drop_index(index)` | End the definition into `history`. Entries are orphaned and reclaimed lazily (see Reclamation). |
 
 `CatalogSnapshot` gains `indexes_of(table)`; domain types gain `IndexId` and
 `IndexInfo`.
@@ -257,15 +257,15 @@ proportional to moved rows.
 ### Lookups
 
 One accessor family on `CatalogSnapshot`, served under the snapshot's pinned
-read handle (the RFC 0016 pattern — the snapshot's in-memory accessors stay
-I/O-free; this family, like `recent_rows`, reads the store through the pin,
-so the lookup and the catalog it points into are one consistent cut):
+read handle (the snapshot's in-memory accessors stay I/O-free; this family
+reads the store through the pin, so the lookup and the catalog it points into
+are one consistent cut):
 
 - `index_lookup(table, index, key_values) -> Vec<RowLocation>` — point-get
   (unique) or prefix scan (non-unique) in `idx`, then resolve each row id
   against the snapshot's chunk and file ranges. A `RowLocation` names the
-  row id and its holder: an inlined chunk (the row is store-resident and can
-  be materialized via the RFC 0016 machinery) or candidate data file(s) —
+  row id and its holder: an inlined chunk (the row is store-resident in the
+  `inline` subspace) or candidate data file(s) —
   files whose live row-id range contains the id. The consumer applies delete
   files as any DuckLake scan does; moraine does not read them, so it returns
   candidates, not adjudicated rows.
@@ -378,7 +378,7 @@ tests against real SlateDB on in-memory `object_store`:
 
 ## Alternatives considered
 
-- **Temporally versioned entries (`begin`/`end`, cur/hist-style).** Buys
+- **Temporally versioned entries (`begin`/`end`, current/history-style).** Buys
   index-accelerated time travel at the cost of read-modify-move on every row
   death, entry history joining RFC 0007's GC surface, and a uniqueness check
   that must filter dead versions instead of point-getting. Pays a permanent
@@ -409,7 +409,8 @@ tests against real SlateDB on in-memory `object_store`:
 - **Modeling the index as a pseudo-DuckLake table** (an invented
   `ducklake_index` served row-faithfully). Invents non-spec DuckLake surface
   that real DuckLake would never read and future DuckLake versions could
-  collide with. Native-and-invisible is the RFC 0016 precedent for exactly
+  collide with. Native-and-invisible — a moraine capability served from the
+  store, never a synthesized catalog table — is the right shape for exactly
   this situation. Rejected.
 - **Uniqueness by scan at commit** (no persistent index; check by scanning
   the table's rows). O(data) per commit and impossible for external Parquet

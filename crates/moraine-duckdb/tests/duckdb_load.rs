@@ -19,11 +19,15 @@
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        env,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
 
     use moraine::{Catalog, CatalogOptions, ColumnDef, DataFile};
     use object_store::local::LocalFileSystem;

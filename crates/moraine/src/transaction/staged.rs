@@ -4,7 +4,7 @@
 //!
 //! Three rules bound this path: every value DuckLake supplies is stored
 //! **verbatim** except one interpreted convention (an `UPDATE` setting
-//! `end_snapshot` becomes cur-delete + hist-write); one commit is one
+//! `end_snapshot` becomes current-delete + history-write); one commit is one
 //! atomic batch, reusing [`super::commit::diff_writes`]; and a lost race at
 //! commit is **never retried** — DuckLake authored the ids and counters in
 //! the batch. The loser's error always carries the substring `conflict`
@@ -38,7 +38,7 @@ use crate::{
 
 /// Which `ducklake_*` table a staged row targets. `Snapshot`,
 /// `SnapshotChanges`, and `SchemaVersions` all fold into one moraine
-/// `snap` record; every other kind maps to one `EntityKey` variant or one
+/// `snapshot` record; every other kind maps to one `EntityKey` variant or one
 /// of the three unversioned statistics kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableKind {
@@ -69,7 +69,7 @@ pub enum TableKind {
     /// created-or-schema-altered table per commit. The first two values
     /// are always the committing snapshot's own id and `schema_version`,
     /// so the table-id set is the only new information — folded into the
-    /// snap record's `schema_changed_table_ids`, with both redundant values
+    /// snapshot record's `schema_changed_table_ids`, with both redundant values
     /// validated against the `ducklake_snapshot` row in the same batch.
     SchemaVersions,
 }
@@ -96,8 +96,8 @@ pub enum Cell {
 /// the exact `ducklake_*` column order pinned in
 /// `crates/moraine-duckdb/cpp/metadata_tables.cpp`.
 #[derive(Debug, Clone)]
-pub enum RowOp {
-    /// A new row: becomes a live `cur` record (versioned kinds) or
+pub enum RowOperation {
+    /// A new row: becomes a live `current` record (versioned kinds) or
     /// overwrites the current record in place (unversioned statistics
     /// kinds).
     Insert {
@@ -119,7 +119,7 @@ pub enum RowOp {
     },
     /// An `UPDATE ... SET end_snapshot = <v>` row: the one lifecycle
     /// convention this path interprets — ends the live version (moves it
-    /// to `hist`). Defined only for the six versioned kinds.
+    /// to `history`). Defined only for the six versioned kinds.
     UpdateSetEnd {
         /// The row's table.
         table: TableKind,
@@ -594,37 +594,39 @@ fn decode_delete_key(table: TableKind, cells: &[Cell]) -> Result<StatsKey> {
 fn apply_op(
     base: &CatalogSnapshot,
     state: &mut CatalogSnapshot,
-    op: &RowOp,
+    op: &RowOperation,
     new_id: u64,
 ) -> Result<()> {
     match op {
-        RowOp::Insert { table, cells } => apply_insert(base, state, *table, cells),
-        RowOp::UpdateSetEnd { table, cells } => apply_update_set_end(state, *table, cells, new_id),
-        RowOp::Delete { table, cells } => apply_delete(state, *table, cells),
+        RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells),
+        RowOperation::UpdateSetEnd { table, cells } => {
+            apply_update_set_end(state, *table, cells, new_id)
+        }
+        RowOperation::Delete { table, cells } => apply_delete(state, *table, cells),
         // Inline ops never reach here — `translate` routes them to
         // `translate_inline`. Kept only for match exhaustiveness.
-        RowOp::InlineSchema { .. }
-        | RowOp::InlineInsert { .. }
-        | RowOp::InlineInlineDelete { .. }
-        | RowOp::InlineFileDelete { .. }
-        | RowOp::InlineFlushDelete { .. }
-        | RowOp::InlineDrop { .. }
-        | RowOp::InlineSchemaDrop { .. } => Ok(()),
+        RowOperation::InlineSchema { .. }
+        | RowOperation::InlineInsert { .. }
+        | RowOperation::InlineInlineDelete { .. }
+        | RowOperation::InlineFileDelete { .. }
+        | RowOperation::InlineFlushDelete { .. }
+        | RowOperation::InlineDrop { .. }
+        | RowOperation::InlineSchemaDrop { .. } => Ok(()),
     }
 }
 
 /// Whether `op` is one of the seven inline variants — routed to
 /// `translate_inline`, never to [`apply_op`]'s `CatalogSnapshot` diff.
-fn is_inline_op(op: &RowOp) -> bool {
+fn is_inline_op(op: &RowOperation) -> bool {
     matches!(
         op,
-        RowOp::InlineSchema { .. }
-            | RowOp::InlineInsert { .. }
-            | RowOp::InlineInlineDelete { .. }
-            | RowOp::InlineFileDelete { .. }
-            | RowOp::InlineFlushDelete { .. }
-            | RowOp::InlineDrop { .. }
-            | RowOp::InlineSchemaDrop { .. }
+        RowOperation::InlineSchema { .. }
+            | RowOperation::InlineInsert { .. }
+            | RowOperation::InlineInlineDelete { .. }
+            | RowOperation::InlineFileDelete { .. }
+            | RowOperation::InlineFlushDelete { .. }
+            | RowOperation::InlineDrop { .. }
+            | RowOperation::InlineSchemaDrop { .. }
     )
 }
 
@@ -732,11 +734,11 @@ fn apply_delete(state: &mut CatalogSnapshot, table: TableKind, cells: &[Cell]) -
 
 /// The `ducklake_snapshot` and `ducklake_snapshot_changes` rows DuckLake
 /// always inserts as one pair; both are required for a staged commit.
-fn find_snapshot_rows(ops: &[RowOp]) -> Result<(&[Cell], &[Cell])> {
+fn find_snapshot_rows(ops: &[RowOperation]) -> Result<(&[Cell], &[Cell])> {
     let mut snapshot = None;
     let mut changes = None;
     for op in ops {
-        if let RowOp::Insert { table, cells } = op {
+        if let RowOperation::Insert { table, cells } = op {
             match table {
                 TableKind::Snapshot => snapshot = Some(cells.as_slice()),
                 TableKind::SnapshotChanges => changes = Some(cells.as_slice()),
@@ -753,7 +755,10 @@ fn find_snapshot_rows(ops: &[RowOp]) -> Result<(&[Cell], &[Cell])> {
     Ok((snapshot, changes))
 }
 
-fn build_snapshot_value(ops: &[RowOp], next_deletion_id: u64) -> Result<proto::SnapshotValue> {
+fn build_snapshot_value(
+    ops: &[RowOperation],
+    next_deletion_id: u64,
+) -> Result<proto::SnapshotValue> {
     let (snapshot_cells, changes_cells) = find_snapshot_rows(ops)?;
 
     let mut s = Cursor::new(TableKind::Snapshot, snapshot_cells);
@@ -784,18 +789,21 @@ fn build_snapshot_value(ops: &[RowOp], next_deletion_id: u64) -> Result<proto::S
     // `ducklake_schema_versions` rows fold in as the table-id set; the two
     // redundant columns are validated against this commit's own snapshot
     // values rather than trusted, so a mismatch is drift caught loudly.
-    let mut schema_changed_table_ids = Vec::new();
-    for op in ops {
-        if let RowOp::Insert {
-            table: TableKind::SchemaVersions,
-            cells,
-        } = op
-        {
-            let mut v = Cursor::new(TableKind::SchemaVersions, cells);
-            let begin_snapshot = v.u64()?;
-            let row_schema_version = v.u64()?;
-            let table_id = v.u64()?;
-            v.finish()?;
+    let schema_changed_table_ids = ops
+        .iter()
+        .filter_map(|op| match op {
+            RowOperation::Insert {
+                table: TableKind::SchemaVersions,
+                cells,
+            } => Some(cells),
+            _ => None,
+        })
+        .map(|cells| {
+            let mut cursor = Cursor::new(TableKind::SchemaVersions, cells);
+            let begin_snapshot = cursor.u64()?;
+            let row_schema_version = cursor.u64()?;
+            let table_id = cursor.u64()?;
+            cursor.finish()?;
             if begin_snapshot != snapshot_id || row_schema_version != schema_version {
                 return Err(corrupt_row(
                     TableKind::SchemaVersions,
@@ -805,9 +813,9 @@ fn build_snapshot_value(ops: &[RowOp], next_deletion_id: u64) -> Result<proto::S
                     ),
                 ));
             }
-            schema_changed_table_ids.push(table_id);
-        }
-    }
+            Ok(table_id)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(proto::SnapshotValue {
         snapshot_id,
@@ -826,13 +834,13 @@ fn build_snapshot_value(ops: &[RowOp], next_deletion_id: u64) -> Result<proto::S
 
 /// A staged-row transaction: one SlateDB transaction opened by
 /// `begin` (crate-internal; [`crate::ffi_support::staged::staged_begin`]
-/// is the entry point outside this crate), accumulating [`RowOp`]s via
+/// is the entry point outside this crate), accumulating [`RowOperation`]s via
 /// [`stage`](Self::stage) until [`commit`](Self::commit) translates and
 /// lands them all in one atomic batch, or [`rollback`](Self::rollback)
 /// discards them.
 pub struct StagedTransaction {
     db_tx: DbTransaction,
-    ops: Vec<RowOp>,
+    ops: Vec<RowOperation>,
 }
 
 impl StagedTransaction {
@@ -847,7 +855,7 @@ impl StagedTransaction {
 
     /// Accumulates one row mutation. Nothing touches the store until
     /// [`commit`](Self::commit).
-    pub fn stage(&mut self, op: RowOp) {
+    pub fn stage(&mut self, op: RowOperation) {
         self.ops.push(op);
     }
 
@@ -892,7 +900,7 @@ impl StagedTransaction {
             Ok((new_id, mut writes, snap)) => {
                 writes.extend(inline_writes);
                 writes.push((
-                    Key::Snap {
+                    Key::Snapshot {
                         snapshot_id: new_id,
                     }
                     .encode(),
@@ -931,32 +939,32 @@ impl StagedTransaction {
 /// a verb-path commit diffs its closure's output.
 fn translate(
     base: &CatalogSnapshot,
-    ops: &[RowOp],
+    ops: &[RowOperation],
 ) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
-    let snap = build_snapshot_value(ops, base.snap.next_deletion_id)?;
-    let new_id = snap.snapshot_id;
+    let snapshot = build_snapshot_value(ops, base.snapshot.next_deletion_id)?;
+    let new_id = snapshot.snapshot_id;
 
     // Ends and deletes apply before inserts, independent of DuckLake's
     // emit order: a rename ends the old version and inserts a new one
-    // under the same id, and the insert must win their shared `cur` key —
+    // under the same id, and the insert must win their shared `current` key —
     // an end applied afterward would delete the id and erase the new row.
     // Inline ops are skipped here entirely — `commit` translates them
     // separately via `translate_inline`, since `CatalogSnapshot` has no
     // notion of inlined rows to diff.
     let mut state = base.clone();
     for op in ops {
-        if !is_inline_op(op) && !matches!(op, RowOp::Insert { .. }) {
+        if !is_inline_op(op) && !matches!(op, RowOperation::Insert { .. }) {
             apply_op(base, &mut state, op, new_id)?;
         }
     }
     for op in ops {
-        if matches!(op, RowOp::Insert { .. }) {
+        if matches!(op, RowOperation::Insert { .. }) {
             apply_op(base, &mut state, op, new_id)?;
         }
     }
 
     let writes = commit::diff_writes(base, &state, new_id);
-    Ok((new_id, writes, snap))
+    Ok((new_id, writes, snapshot))
 }
 
 /// Allocates `inline/insert` chunk sequence numbers within one commit: the
@@ -1162,14 +1170,14 @@ fn inline_file_delete_write(
 
 async fn translate_inline(
     db_tx: &DbTransaction,
-    ops: &[RowOp],
+    ops: &[RowOperation],
 ) -> Result<Vec<commit::StagedWrite>> {
     let mut writes = Vec::new();
     let mut chunk_seqs = ChunkSeqAllocator::default();
 
     for op in ops {
         match op {
-            RowOp::InlineSchema {
+            RowOperation::InlineSchema {
                 table_id,
                 schema_version,
                 arrow_schema,
@@ -1178,7 +1186,7 @@ async fn translate_inline(
                 *schema_version,
                 arrow_schema,
             )),
-            RowOp::InlineInsert {
+            RowOperation::InlineInsert {
                 table_id,
                 schema_version,
                 begin_snapshot,
@@ -1197,7 +1205,7 @@ async fn translate_inline(
                     arrow_body,
                 ));
             }
-            RowOp::InlineInlineDelete {
+            RowOperation::InlineInlineDelete {
                 table_id,
                 row_id,
                 end_snapshot,
@@ -1206,7 +1214,7 @@ async fn translate_inline(
                 *row_id,
                 *end_snapshot,
             )),
-            RowOp::InlineFileDelete {
+            RowOperation::InlineFileDelete {
                 table_id,
                 data_file_id,
                 row_id,
@@ -1217,7 +1225,7 @@ async fn translate_inline(
                 *row_id,
                 *begin_snapshot,
             )),
-            RowOp::InlineFlushDelete {
+            RowOperation::InlineFlushDelete {
                 table_id,
                 schema_version,
                 flush_snapshot,
@@ -1231,10 +1239,10 @@ async fn translate_inline(
                 )
                 .await?;
             }
-            RowOp::InlineDrop { table_id } => {
+            RowOperation::InlineDrop { table_id } => {
                 translate_inline_drop(db_tx, *table_id, &mut writes).await?;
             }
-            RowOp::InlineSchemaDrop {
+            RowOperation::InlineSchemaDrop {
                 table_id,
                 schema_version,
             } => {
@@ -1247,7 +1255,9 @@ async fn translate_inline(
                     None,
                 ));
             }
-            RowOp::Insert { .. } | RowOp::Delete { .. } | RowOp::UpdateSetEnd { .. } => {}
+            RowOperation::Insert { .. }
+            | RowOperation::Delete { .. }
+            | RowOperation::UpdateSetEnd { .. } => {}
         }
     }
 
@@ -1342,19 +1352,19 @@ mod tests {
         let db_tx = catalog.begin_read_tx().await.unwrap();
         let mut txn = StagedTransaction::begin(db_tx);
 
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::Table,
             cells: table_row(1, 0, "t", 1, None),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::Column,
             cells: column_row(1, 1, "a", 0),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 1, 2),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
         });
@@ -1362,38 +1372,38 @@ mod tests {
         let id = txn.commit().await.unwrap();
         assert_eq!(id.get(), 1);
 
-        let snap = catalog.snapshot().await.unwrap();
-        let tables = snap.tables_in(crate::catalog::SchemaId::new(0));
+        let snapshot = catalog.snapshot().await.unwrap();
+        let tables = snapshot.tables_in(crate::catalog::SchemaId::new(0));
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "t");
-        let cols = snap.columns_of(tables[0].id);
+        let cols = snapshot.columns_of(tables[0].id);
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].name, "a");
     }
 
     /// An `UPDATE ... SET end_snapshot` row ends a live table version:
-    /// the old row moves to `hist`, the new one lands in `cur`, exactly
+    /// the old row moves to `history`, the new one lands in `current`, exactly
     /// the lifecycle convention this path interprets.
     #[tokio::test]
-    async fn update_set_end_moves_the_old_version_to_hist() {
+    async fn update_set_end_moves_the_old_version_to_history() {
         let catalog = open().await;
 
         // Seed schema `s` (id 1) and table `t` (id 1) via a plain insert.
         let db_tx1 = catalog.begin_read_tx().await.unwrap();
         let mut setup = StagedTransaction::begin(db_tx1);
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Schema,
             cells: schema_row(1, "s", 1),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Table,
             cells: table_row(1, 1, "t_old", 1, None),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 1, 2),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, r#"created_schema:"s""#),
         });
@@ -1402,19 +1412,19 @@ mod tests {
         // Rename: end the old table version, insert the renamed one.
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
         let mut rename = StagedTransaction::begin(db_tx2);
-        rename.stage(RowOp::UpdateSetEnd {
+        rename.stage(RowOperation::UpdateSetEnd {
             table: TableKind::Table,
             cells: vec![Cell::U64(1), Cell::U64(2)],
         });
-        rename.stage(RowOp::Insert {
+        rename.stage(RowOperation::Insert {
             table: TableKind::Table,
             cells: table_row(1, 1, "t_new", 2, None),
         });
-        rename.stage(RowOp::Insert {
+        rename.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 1, 2),
         });
-        rename.stage(RowOp::Insert {
+        rename.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, "altered_table:1"),
         });
@@ -1438,7 +1448,7 @@ mod tests {
 
     /// A rename staged in DuckLake's live order — the new version's
     /// insert *before* the old version's end — keeps the new version
-    /// live. Translation applies ends before inserts, so the shared `cur`
+    /// live. Translation applies ends before inserts, so the shared `current`
     /// key resolves to the insert regardless of stage order.
     #[tokio::test]
     async fn rename_survives_insert_before_end_order() {
@@ -1446,19 +1456,19 @@ mod tests {
 
         let db_tx1 = catalog.begin_read_tx().await.unwrap();
         let mut setup = StagedTransaction::begin(db_tx1);
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Schema,
             cells: schema_row(1, "s", 1),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Table,
             cells: table_row(1, 1, "t_old", 1, None),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 1, 2),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, r#"created_schema:"s""#),
         });
@@ -1468,19 +1478,19 @@ mod tests {
         // reverse of the safe order, matching what DuckLake emits.
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
         let mut rename = StagedTransaction::begin(db_tx2);
-        rename.stage(RowOp::Insert {
+        rename.stage(RowOperation::Insert {
             table: TableKind::Table,
             cells: table_row(1, 1, "t_new", 2, None),
         });
-        rename.stage(RowOp::UpdateSetEnd {
+        rename.stage(RowOperation::UpdateSetEnd {
             table: TableKind::Table,
             cells: vec![Cell::U64(1), Cell::U64(2)],
         });
-        rename.stage(RowOp::Insert {
+        rename.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 1, 2),
         });
-        rename.stage(RowOp::Insert {
+        rename.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, "altered_table:1"),
         });
@@ -1505,15 +1515,15 @@ mod tests {
         let mut b = StagedTransaction::begin(tx_b);
 
         for (txn, name) in [(&mut a, "a"), (&mut b, "b")] {
-            txn.stage(RowOp::Insert {
+            txn.stage(RowOperation::Insert {
                 table: TableKind::Schema,
                 cells: schema_row(1, name, 1),
             });
-            txn.stage(RowOp::Insert {
+            txn.stage(RowOperation::Insert {
                 table: TableKind::Snapshot,
                 cells: snapshot_row(1, 1, 2),
             });
-            txn.stage(RowOp::Insert {
+            txn.stage(RowOperation::Insert {
                 table: TableKind::SnapshotChanges,
                 cells: snapshot_changes_row(1, format!(r#"created_schema:"{name}""#).as_str()),
             });
@@ -1539,15 +1549,15 @@ mod tests {
         let catalog = open().await;
         let db_tx = catalog.begin_read_tx().await.unwrap();
         let mut txn = StagedTransaction::begin(db_tx);
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::Schema,
             cells: vec![Cell::U64(1)], // far too few cells
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 1, 2),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, ""),
         });
@@ -1565,12 +1575,12 @@ mod tests {
         let db_tx = catalog.begin_read_tx().await.unwrap();
         let mut txn = StagedTransaction::begin(db_tx);
 
-        txn.stage(RowOp::InlineSchema {
+        txn.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 0,
             arrow_schema: b"schema".to_vec(),
         });
-        txn.stage(RowOp::InlineInsert {
+        txn.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -1578,7 +1588,7 @@ mod tests {
             row_count: 2,
             arrow_body: b"chunk-a".to_vec(),
         });
-        txn.stage(RowOp::InlineInsert {
+        txn.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -1586,11 +1596,11 @@ mod tests {
             row_count: 1,
             arrow_body: b"chunk-b".to_vec(),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 0, 1),
         });
-        txn.stage(RowOp::Insert {
+        txn.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, "inlined_insert:1"),
         });
@@ -1643,7 +1653,7 @@ mod tests {
 
         let db_tx1 = catalog.begin_read_tx().await.unwrap();
         let mut setup = StagedTransaction::begin(db_tx1);
-        setup.stage(RowOp::InlineInsert {
+        setup.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -1651,11 +1661,11 @@ mod tests {
             row_count: 2,
             arrow_body: b"chunk".to_vec(),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 0, 1),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, "inlined_insert:1"),
         });
@@ -1663,16 +1673,16 @@ mod tests {
 
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
         let mut inline_delete = StagedTransaction::begin(db_tx2);
-        inline_delete.stage(RowOp::InlineInlineDelete {
+        inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
             row_id: 0,
             end_snapshot: 2,
         });
-        inline_delete.stage(RowOp::Insert {
+        inline_delete.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 0, 1),
         });
-        inline_delete.stage(RowOp::Insert {
+        inline_delete.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, "inlined_delete:1"),
         });
@@ -1718,7 +1728,7 @@ mod tests {
 
         let db_tx1 = catalog.begin_read_tx().await.unwrap();
         let mut setup = StagedTransaction::begin(db_tx1);
-        setup.stage(RowOp::InlineInsert {
+        setup.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -1726,16 +1736,16 @@ mod tests {
             row_count: 2,
             arrow_body: b"chunk".to_vec(),
         });
-        setup.stage(RowOp::InlineInlineDelete {
+        setup.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
             row_id: 0,
             end_snapshot: 1,
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 0, 1),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, "inlined_insert:1"),
         });
@@ -1743,16 +1753,16 @@ mod tests {
 
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
         let mut flush = StagedTransaction::begin(db_tx2);
-        flush.stage(RowOp::InlineFlushDelete {
+        flush.stage(RowOperation::InlineFlushDelete {
             table_id: 1,
             schema_version: 0,
             flush_snapshot: 1,
         });
-        flush.stage(RowOp::Insert {
+        flush.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 0, 1),
         });
-        flush.stage(RowOp::Insert {
+        flush.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
         });
@@ -1779,12 +1789,12 @@ mod tests {
 
         let db_tx1 = catalog.begin_read_tx().await.unwrap();
         let mut setup = StagedTransaction::begin(db_tx1);
-        setup.stage(RowOp::InlineSchema {
+        setup.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 0,
             arrow_schema: b"schema".to_vec(),
         });
-        setup.stage(RowOp::InlineInsert {
+        setup.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -1792,17 +1802,17 @@ mod tests {
             row_count: 1,
             arrow_body: b"chunk".to_vec(),
         });
-        setup.stage(RowOp::InlineFileDelete {
+        setup.stage(RowOperation::InlineFileDelete {
             table_id: 1,
             data_file_id: 9,
             row_id: 5,
             begin_snapshot: 1,
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 0, 1),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, "inlined_insert:1"),
         });
@@ -1810,12 +1820,12 @@ mod tests {
 
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
         let mut drop_txn = StagedTransaction::begin(db_tx2);
-        drop_txn.stage(RowOp::InlineDrop { table_id: 1 });
-        drop_txn.stage(RowOp::Insert {
+        drop_txn.stage(RowOperation::InlineDrop { table_id: 1 });
+        drop_txn.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 0, 1),
         });
-        drop_txn.stage(RowOp::Insert {
+        drop_txn.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, r#"dropped_table:"main"."t""#),
         });
@@ -1844,17 +1854,17 @@ mod tests {
 
         let db_tx1 = catalog.begin_read_tx().await.unwrap();
         let mut setup = StagedTransaction::begin(db_tx1);
-        setup.stage(RowOp::InlineSchema {
+        setup.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 0,
             arrow_schema: b"schema-v0".to_vec(),
         });
-        setup.stage(RowOp::InlineSchema {
+        setup.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 1,
             arrow_schema: b"schema-v1".to_vec(),
         });
-        setup.stage(RowOp::InlineInsert {
+        setup.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 1,
             begin_snapshot: 1,
@@ -1862,11 +1872,11 @@ mod tests {
             row_count: 1,
             arrow_body: b"chunk".to_vec(),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 0, 1),
         });
-        setup.stage(RowOp::Insert {
+        setup.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, "inlined_insert:1"),
         });
@@ -1874,15 +1884,15 @@ mod tests {
 
         let db_tx2 = catalog.begin_read_tx().await.unwrap();
         let mut drop_txn = StagedTransaction::begin(db_tx2);
-        drop_txn.stage(RowOp::InlineSchemaDrop {
+        drop_txn.stage(RowOperation::InlineSchemaDrop {
             table_id: 1,
             schema_version: 0,
         });
-        drop_txn.stage(RowOp::Insert {
+        drop_txn.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 0, 1),
         });
-        drop_txn.stage(RowOp::Insert {
+        drop_txn.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
         });

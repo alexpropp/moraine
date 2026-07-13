@@ -4,6 +4,12 @@
   "languages": {
     "Rust": {
       "format_on_save": "on",
+      "formatter": {
+        "external": {
+          "command": "rustfmt",
+          "arguments": ["+nightly", "--edition", "2024", "--emit", "stdout"]
+        }
+      },
       "tab_size": 4,
       "preferred_line_length": 100
     }

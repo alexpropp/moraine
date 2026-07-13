@@ -25,14 +25,14 @@ pub(crate) enum Key {
     Sys(SysKey),
     /// One record per snapshot — `ducklake_snapshot` +
     /// `ducklake_snapshot_changes`, merged. Append-only.
-    Snap {
+    Snapshot {
         /// Snapshot id.
         snapshot_id: u64,
     },
     /// Live catalog state.
-    Cur(CurKey),
+    Current(CurrentKey),
     /// Ended entity versions; append-only.
-    Hist(HistKey),
+    History(HistoryKey),
     /// Inlined data and its archive forms.
     Inline(InlineKey),
 }
@@ -48,10 +48,10 @@ pub(crate) enum SysKey {
     Migration,
 }
 
-/// A live record: a temporally versioned entity, or the `cur`-only
-/// gc-file bookkeeping (no begin/end lifecycle, so no `hist` mirror).
+/// A live record: a temporally versioned entity, or the `current`-only
+/// gc-file bookkeeping (no begin/end lifecycle, so no `history` mirror).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
-pub(crate) enum CurKey {
+pub(crate) enum CurrentKey {
     /// A live entity version.
     Entity(EntityKey),
     /// `ducklake_files_scheduled_for_deletion`.
@@ -64,15 +64,15 @@ pub(crate) enum CurKey {
 /// An ended entity version; `end_snapshot` is the final key component,
 /// so a single entity's versions sort by when they ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct HistKey {
+pub(crate) struct HistoryKey {
     /// The ended entity.
     pub(crate) entity: EntityKey,
     /// Snapshot at which the version ended.
     pub(crate) end_snapshot: u64,
 }
 
-/// A temporally versioned catalog entity. Lives in `cur` while live; its
-/// `hist` mirror appends `end_snapshot`.
+/// A temporally versioned catalog entity. Lives in `current` while live; its
+/// `history` mirror appends `end_snapshot`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub(crate) enum EntityKey {
     /// `ducklake_schema`.
@@ -207,13 +207,13 @@ pub(crate) enum InlineOperation {
 
 impl Key {
     /// A live entity key.
-    pub(crate) const fn cur(entity: EntityKey) -> Self {
-        Self::Cur(CurKey::Entity(entity))
+    pub(crate) const fn current(entity: EntityKey) -> Self {
+        Self::Current(CurrentKey::Entity(entity))
     }
 
     /// An ended entity-version key.
-    pub(crate) const fn hist(entity: EntityKey, end_snapshot: u64) -> Self {
-        Self::Hist(HistKey {
+    pub(crate) const fn history(entity: EntityKey, end_snapshot: u64) -> Self {
+        Self::History(HistoryKey {
             entity,
             end_snapshot,
         })
@@ -241,16 +241,16 @@ impl Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subspace {
     /// Store-level singletons.
-    // Sys keys are read/written by exact key today; no caller prefix-scans
+    // System keys are read/written by exact key today; no caller prefix-scans
     // the whole subspace yet.
     #[allow(dead_code)]
-    Sys,
+    System,
     /// Snapshot records.
-    Snap,
+    Snapshot,
     /// Live catalog state.
-    Cur,
+    Current,
     /// Ended entity versions.
-    Hist,
+    History,
     /// Inlined data.
     // Data inlining is not implemented yet.
     #[allow(dead_code)]
@@ -261,10 +261,10 @@ impl Subspace {
     /// A minimal key inside this subspace, for prefix derivation.
     const fn sample(self) -> Key {
         match self {
-            Self::Sys => Key::Sys(SysKey::Format),
-            Self::Snap => Key::Snap { snapshot_id: 0 },
-            Self::Cur => Key::cur(EntityKey::Schema { schema_id: 0 }),
-            Self::Hist => Key::hist(EntityKey::Schema { schema_id: 0 }, 0),
+            Self::System => Key::Sys(SysKey::Format),
+            Self::Snapshot => Key::Snapshot { snapshot_id: 0 },
+            Self::Current => Key::current(EntityKey::Schema { schema_id: 0 }),
+            Self::History => Key::history(EntityKey::Schema { schema_id: 0 }, 0),
             Self::Inline => Key::Inline(InlineKey::Schema {
                 table_id: 0,
                 schema_version: 0,
@@ -274,7 +274,7 @@ impl Subspace {
 }
 
 /// The kinds whose live keys are scoped `table_id`-first — the only kinds
-/// [`cur_table_prefix`] accepts.
+/// [`current_table_prefix`] accepts.
 // No caller needs "everything about table T" yet (cascading table drop and
 // per-table GC land in later slices); the prefix math is pinned by tests.
 #[allow(dead_code)]
@@ -333,8 +333,8 @@ impl TableScopedKind {
 }
 
 /// Discriminant bytes preceding an entity's components in a live key:
-/// subspace, `CurKey::Entity`, entity kind.
-// Only `cur_table_prefix` consumes this, and it has no caller yet.
+/// subspace, `CurrentKey::Entity`, entity kind.
+// Only `current_table_prefix` consumes this, and it has no caller yet.
 #[allow(dead_code)]
 const CUR_KIND_PREFIX_LEN: usize = 3;
 
@@ -424,8 +424,8 @@ pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
 /// Byte prefix of every live key of `kind` scoped to `table_id`.
 // No caller yet; pinned by the prefix tests below.
 #[allow(dead_code)]
-pub(crate) fn cur_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
-    let mut bytes = Key::cur(kind.sample(table_id)).encode();
+pub(crate) fn current_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
+    let mut bytes = Key::current(kind.sample(table_id)).encode();
     bytes.truncate(CUR_KIND_PREFIX_LEN + size_of::<u64>());
     bytes
 }
@@ -455,15 +455,15 @@ mod tests {
     fn golden_snapshot_key() {
         let mut expect = vec![0x03];
         expect.extend(be(42));
-        assert_eq!(Key::Snap { snapshot_id: 42 }.encode(), expect);
+        assert_eq!(Key::Snapshot { snapshot_id: 42 }.encode(), expect);
     }
 
     #[test]
-    fn golden_cur_file_key() {
+    fn golden_current_file_key() {
         let mut expect = vec![0x04, 0x02, 0x07];
         expect.extend(be(1));
         expect.extend(be(2));
-        let key = Key::cur(EntityKey::File {
+        let key = Key::current(EntityKey::File {
             table_id: 1,
             data_file_id: 2,
         });
@@ -471,12 +471,12 @@ mod tests {
     }
 
     #[test]
-    fn golden_hist_file_key_appends_end_snapshot() {
+    fn golden_history_file_key_appends_end_snapshot() {
         let mut expect = vec![0x05, 0x07];
         expect.extend(be(1));
         expect.extend(be(2));
         expect.extend(be(9));
-        let key = Key::hist(
+        let key = Key::history(
             EntityKey::File {
                 table_id: 1,
                 data_file_id: 2,
@@ -490,7 +490,7 @@ mod tests {
     fn golden_gcfile_key() {
         let mut expect = vec![0x04, 0x03];
         expect.extend(be(5));
-        let key = Key::Cur(CurKey::GcFile { deletion_id: 5 });
+        let key = Key::Current(CurrentKey::GcFile { deletion_id: 5 });
         assert_eq!(key.encode(), expect);
     }
 
@@ -547,21 +547,21 @@ mod tests {
     fn decode_roundtrips_representative_keys() {
         let keys = [
             Key::Sys(SysKey::Head),
-            Key::Snap {
+            Key::Snapshot {
                 snapshot_id: u64::MAX,
             },
-            Key::cur(EntityKey::Column {
+            Key::current(EntityKey::Column {
                 table_id: 3,
                 column_id: 4,
             }),
-            Key::hist(
+            Key::history(
                 EntityKey::Option {
                     scope_kind: 2,
                     scope_id: 3,
                 },
                 8,
             ),
-            Key::Cur(CurKey::GcFile { deletion_id: 0 }),
+            Key::Current(CurrentKey::GcFile { deletion_id: 0 }),
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 table_id: 1,
                 data_file_id: 2,
@@ -588,7 +588,7 @@ mod tests {
         assert!(Key::decode(&[0x02, 0x7f]).is_err());
         assert!(Key::decode(&[0x06, 0x7f]).is_err());
         // Truncated components.
-        let mut short = Key::Snap { snapshot_id: 1 }.encode();
+        let mut short = Key::Snapshot { snapshot_id: 1 }.encode();
         short.pop();
         assert!(Key::decode(&short).is_err());
         // Trailing bytes.
@@ -605,17 +605,17 @@ mod tests {
 
     #[test]
     fn prefixes_are_byte_prefixes_of_full_keys() {
-        let key = Key::cur(EntityKey::File {
+        let key = Key::current(EntityKey::File {
             table_id: 1,
             data_file_id: 2,
         });
         let bytes = key.encode();
-        assert!(bytes.starts_with(&subspace_prefix(Subspace::Cur)));
-        assert!(bytes.starts_with(&cur_table_prefix(TableScopedKind::File, 1)));
+        assert!(bytes.starts_with(&subspace_prefix(Subspace::Current)));
+        assert!(bytes.starts_with(&current_table_prefix(TableScopedKind::File, 1)));
         // A different table's prefix must not match.
-        assert!(!bytes.starts_with(&cur_table_prefix(TableScopedKind::File, 2)));
+        assert!(!bytes.starts_with(&current_table_prefix(TableScopedKind::File, 2)));
         // A different kind's prefix must not match.
-        assert!(!bytes.starts_with(&cur_table_prefix(TableScopedKind::DeleteFile, 1)));
+        assert!(!bytes.starts_with(&current_table_prefix(TableScopedKind::DeleteFile, 1)));
     }
 
     /// Every table-scoped kind's prefix matches a live key of that kind
@@ -632,14 +632,14 @@ mod tests {
             TableScopedKind::TableColumnStats,
         ];
         for kind in kinds {
-            let key = Key::cur(kind.sample(9));
+            let key = Key::current(kind.sample(9));
             let bytes = key.encode();
             assert!(
-                bytes.starts_with(&cur_table_prefix(kind, 9)),
+                bytes.starts_with(&current_table_prefix(kind, 9)),
                 "{kind:?} prefix must match its own key"
             );
             assert!(
-                !bytes.starts_with(&cur_table_prefix(kind, 10)),
+                !bytes.starts_with(&current_table_prefix(kind, 10)),
                 "{kind:?} prefix must not match another table"
             );
         }
@@ -768,10 +768,10 @@ mod tests {
             Just(Key::Sys(SysKey::Format)),
             Just(Key::Sys(SysKey::Head)),
             Just(Key::Sys(SysKey::Migration)),
-            any::<u64>().prop_map(|snapshot_id| Key::Snap { snapshot_id }),
-            arb_entity().prop_map(Key::cur),
-            (arb_entity(), any::<u64>()).prop_map(|(entity, end)| Key::hist(entity, end)),
-            any::<u64>().prop_map(|deletion_id| Key::Cur(CurKey::GcFile { deletion_id })),
+            any::<u64>().prop_map(|snapshot_id| Key::Snapshot { snapshot_id }),
+            arb_entity().prop_map(Key::current),
+            (arb_entity(), any::<u64>()).prop_map(|(entity, end)| Key::history(entity, end)),
+            any::<u64>().prop_map(|deletion_id| Key::Current(CurrentKey::GcFile { deletion_id })),
             any::<(u64, u64)>().prop_map(|(table_id, schema_version)| {
                 Key::Inline(InlineKey::Schema {
                     table_id,

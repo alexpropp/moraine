@@ -33,9 +33,9 @@ const EXTENSION_NAME: &str = "moraine_duckdb";
 const DUCKDB_LOAD_TEST_NAME: &str = "tests::attach_lists_and_scans_through_real_duckdb";
 
 /// Every `#[ignore]`d test in `ducklake_load.rs`, run together (not
-/// `--exact`, since there are four). Needs network access to `INSTALL
+/// `--exact`, since there are seven). Needs network access to `INSTALL
 /// ducklake`.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "4 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "7 passed";
 
 fn main() -> anyhow::Result<()> {
     let task = std::env::args().nth(1);

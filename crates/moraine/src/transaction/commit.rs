@@ -1,8 +1,10 @@
 //! Opening, bootstrap, and snapshot materialization. The commit cycle
 //! itself builds on these.
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use object_store::ObjectStore;
 use slatedb::{Db, DbTransaction, IsolationLevel, config::WriteOptions};
@@ -76,7 +78,7 @@ fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
         }),
     )?;
     stage(
-        Key::Snap { snapshot_id: 0 },
+        Key::Snapshot { snapshot_id: 0 },
         value::encode_value(&proto::SnapshotValue {
             snapshot_id: 0,
             snapshot_time_micros: now_micros(),
@@ -92,7 +94,7 @@ fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
         }),
     )?;
     stage(
-        Key::cur(EntityKey::Schema { schema_id: 0 }),
+        Key::current(EntityKey::Schema { schema_id: 0 }),
         value::encode_value(&proto::SchemaValue {
             schema_id: 0,
             schema_uuid: Uuid::new_v4().to_string(),
@@ -118,6 +120,7 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
         .begin(IsolationLevel::Snapshot)
         .await
         .map_err(Error::from)?;
+
     match validate_format(&tx).await {
         Ok(Some(_)) => {
             tx.rollback();
@@ -129,10 +132,12 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
             return Err(err);
         }
     }
+
     if let Err(err) = stage_bootstrap(&tx) {
         tx.rollback();
         return Err(err);
     }
+
     match tx.commit_with_options(&durable()).await {
         Ok(_) => Ok(db),
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
@@ -157,7 +162,7 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
 
 /// Materializes a catalog view through an open transaction, so the view
 /// and any staged writes share one read point. `at: None` reads the head
-/// (`cur` only); `at: Some(s)` also scans `hist` to reconstruct the
+/// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
 /// entities live at `s`.
 pub(crate) async fn materialize(tx: &DbTransaction, at: Option<u64>) -> Result<CatalogSnapshot> {
     let head = read::read_head(tx)
@@ -165,21 +170,29 @@ pub(crate) async fn materialize(tx: &DbTransaction, at: Option<u64>) -> Result<C
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
         .snapshot_id;
     let target = match at {
-        Some(s) if s > head => {
-            return Err(Error::NotFound(format!("snapshot {s} (head is {head})")));
+        Some(requested) if requested > head => {
+            return Err(Error::NotFound(format!(
+                "snapshot {requested} (head is {head})"
+            )));
         }
-        Some(s) => s,
+        Some(requested) => requested,
         None => head,
     };
-    let snap = read::read_snapshot(tx, target)
+    let snapshot = read::read_snapshot(tx, target)
         .await?
         .ok_or_else(|| Error::Corruption(format!("snapshot record {target} missing")))?;
-    let cur = read::scan_cur_entities(tx).await?;
-    let hist = match at {
-        Some(_) => read::scan_hist_entities(tx).await?,
+    let current = read::scan_current_entities(tx).await?;
+    let history = match at {
+        Some(_) => read::scan_history_entities(tx).await?,
         None => Vec::new(),
     };
-    Ok(CatalogSnapshot::build(snap, cur, hist, at.map(|_| target)))
+
+    Ok(CatalogSnapshot::build(
+        snapshot,
+        current,
+        history,
+        at.map(|_| target),
+    ))
 }
 
 /// One staged write: `Some` puts, `None` deletes.
@@ -194,22 +207,28 @@ fn stage_transition<M: prost::Message + Clone + PartialEq>(
     set_end: impl Fn(&M) -> M,
 ) {
     match (base, state) {
-        (Some(b), None) => {
-            writes.push((Key::cur(entity).encode(), None));
+        (Some(base), None) => {
+            writes.push((Key::current(entity).encode(), None));
             writes.push((
-                Key::hist(entity, new_snapshot).encode(),
-                Some(value::encode_value(&set_end(b))),
+                Key::history(entity, new_snapshot).encode(),
+                Some(value::encode_value(&set_end(base))),
             ));
         }
-        (Some(b), Some(s)) if b != s => {
+        (Some(base), Some(state)) if base != state => {
             writes.push((
-                Key::hist(entity, new_snapshot).encode(),
-                Some(value::encode_value(&set_end(b))),
+                Key::history(entity, new_snapshot).encode(),
+                Some(value::encode_value(&set_end(base))),
             ));
-            writes.push((Key::cur(entity).encode(), Some(value::encode_value(s))));
+            writes.push((
+                Key::current(entity).encode(),
+                Some(value::encode_value(state)),
+            ));
         }
-        (None, Some(s)) => {
-            writes.push((Key::cur(entity).encode(), Some(value::encode_value(s))));
+        (None, Some(state)) => {
+            writes.push((
+                Key::current(entity).encode(),
+                Some(value::encode_value(state)),
+            ));
         }
         _ => {}
     }
@@ -224,9 +243,12 @@ fn stage_overwrite<M: prost::Message + PartialEq>(
     state: Option<&M>,
 ) {
     match (base, state) {
-        (Some(_), None) => writes.push((Key::cur(entity).encode(), None)),
-        (base, Some(s)) if base != Some(s) => {
-            writes.push((Key::cur(entity).encode(), Some(value::encode_value(s))));
+        (Some(_), None) => writes.push((Key::current(entity).encode(), None)),
+        (base, Some(state)) if base != Some(state) => {
+            writes.push((
+                Key::current(entity).encode(),
+                Some(value::encode_value(state)),
+            ));
         }
         _ => {}
     }
@@ -246,9 +268,9 @@ fn diff_schemas(
             base.schemas.get(&schema_id),
             state.schemas.get(&schema_id),
             new_snapshot,
-            |b| proto::SchemaValue {
+            |prior| proto::SchemaValue {
                 end_snapshot: Some(new_snapshot),
-                ..b.clone()
+                ..prior.clone()
             },
         );
     }
@@ -268,9 +290,9 @@ fn diff_tables(
             base.tables.get(&table_id),
             state.tables.get(&table_id),
             new_snapshot,
-            |b| proto::TableValue {
+            |prior| proto::TableValue {
                 end_snapshot: Some(new_snapshot),
-                ..b.clone()
+                ..prior.clone()
             },
         );
     }
@@ -290,9 +312,9 @@ fn diff_views(
             base.views.get(&view_id),
             state.views.get(&view_id),
             new_snapshot,
-            |b| proto::ViewValue {
+            |prior| proto::ViewValue {
                 end_snapshot: Some(new_snapshot),
-                ..b.clone()
+                ..prior.clone()
             },
         );
     }
@@ -339,9 +361,9 @@ fn diff_columns(
                 base_cols.get(&column_id),
                 state_cols.get(&column_id),
                 new_snapshot,
-                |b| proto::ColumnValue {
+                |prior| proto::ColumnValue {
                     end_snapshot: Some(new_snapshot),
-                    ..b.clone()
+                    ..prior.clone()
                 },
             );
         }
@@ -374,9 +396,9 @@ fn diff_data_files(
                 base_files.get(&data_file_id),
                 state_files.get(&data_file_id),
                 new_snapshot,
-                |b| proto::DataFileValue {
+                |prior| proto::DataFileValue {
                     end_snapshot: Some(new_snapshot),
-                    ..b.clone()
+                    ..prior.clone()
                 },
             );
         }
@@ -409,9 +431,9 @@ fn diff_delete_files(
                 base_files.get(&delete_file_id),
                 state_files.get(&delete_file_id),
                 new_snapshot,
-                |b| proto::DeleteFileValue {
+                |prior| proto::DeleteFileValue {
                     end_snapshot: Some(new_snapshot),
-                    ..b.clone()
+                    ..prior.clone()
                 },
             );
         }
@@ -597,7 +619,7 @@ where
     F: Fn(&mut Transaction) -> Result<()>,
 {
     let base = materialize(db_tx, None).await?;
-    let head = base.snap.snapshot_id;
+    let head = base.snapshot.snapshot_id;
     let new_id = head + 1;
 
     let mut tx = Transaction::new(base.clone(), new_id);
@@ -622,13 +644,13 @@ where
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let ours = ChangeSet::from_operations(&operations);
 
-    let snap = proto::SnapshotValue {
+    let snapshot = proto::SnapshotValue {
         snapshot_id: new_id,
         snapshot_time_micros: now_micros(),
-        schema_version: base.snap.schema_version + u64::from(schema_changed),
+        schema_version: base.snapshot.schema_version + u64::from(schema_changed),
         next_catalog_id,
         next_file_id,
-        next_deletion_id: base.snap.next_deletion_id,
+        next_deletion_id: base.snapshot.next_deletion_id,
         changes_made: ours.to_changes_made(),
         author: None,
         commit_message: None,
@@ -636,11 +658,11 @@ where
         schema_changed_table_ids: Vec::new(),
     };
     writes.push((
-        Key::Snap {
+        Key::Snapshot {
             snapshot_id: new_id,
         }
         .encode(),
-        Some(value::encode_value(&snap)),
+        Some(value::encode_value(&snapshot)),
     ));
     writes.push((
         Key::Sys(SysKey::Head).encode(),
@@ -729,12 +751,12 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
 
     for snapshot_id in (head_before + 1)..=head.snapshot_id {
         let bytes = db
-            .get(Key::Snap { snapshot_id }.encode())
+            .get(Key::Snapshot { snapshot_id }.encode())
             .await
             .map_err(Error::from)?
             .ok_or_else(|| Error::Corruption(format!("snapshot record {snapshot_id} missing")))?;
-        let snap: proto::SnapshotValue = value::decode_value(&bytes)?;
-        changes.push((snapshot_id, ChangeSet::parse(&snap.changes_made)));
+        let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
+        changes.push((snapshot_id, ChangeSet::parse(&snapshot.changes_made)));
     }
 
     Ok(changes)
@@ -795,8 +817,10 @@ mod tests {
     /// orphaned and must never be staged as a write.
     #[test]
     fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
-        use crate::catalog::{ColumnDef, DataFile, FileColumnStats};
-        use crate::store::key::{CurKey, HistKey};
+        use crate::{
+            catalog::{ColumnDef, DataFile, FileColumnStats},
+            store::key::{CurrentKey, HistoryKey},
+        };
 
         let snap0 = proto::SnapshotValue {
             snapshot_id: 0,
@@ -863,8 +887,8 @@ mod tests {
             let key = Key::decode(key_bytes).unwrap();
             let is_file_column_stats = matches!(
                 key,
-                Key::Cur(CurKey::Entity(EntityKey::FileColumnStats { .. }))
-                    | Key::Hist(HistKey {
+                Key::Current(CurrentKey::Entity(EntityKey::FileColumnStats { .. }))
+                    | Key::History(HistoryKey {
                         entity: EntityKey::FileColumnStats { .. },
                         ..
                     })
@@ -881,8 +905,9 @@ mod tests {
     /// handles.
     #[tokio::test]
     async fn fresh_reader_sees_committed_head() {
-        use crate::catalog::{Catalog, CatalogOptions};
         use slatedb::DbReader;
+
+        use crate::catalog::{Catalog, CatalogOptions};
 
         let object_store: Arc<InMemory> = Arc::new(InMemory::new());
         let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())

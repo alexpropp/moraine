@@ -15,9 +15,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use moraine::ffi_support::inline::InlineScanKind;
 
-use crate::abi::{free_array, guard, write_array};
-use crate::error::{AbiError, MoraineError, codes};
-use crate::runtime::MoraineCatalogHandle;
+use crate::{
+    abi::{free_array, guard, write_array},
+    error::{AbiError, MoraineError, codes},
+    runtime::MoraineCatalogHandle,
+};
 
 fn decode_scan_kind(v: i32) -> Result<InlineScanKind, AbiError> {
     match v {
@@ -60,6 +62,9 @@ unsafe fn free_owned_bytes(ptr: *mut u8, len: usize) {
 pub struct MoraineInlineRow {
     /// The row's dense id.
     pub row_id: u64,
+    /// The schema version the owning chunk was written under — selects the
+    /// `inline/schema` its body decodes against.
+    pub schema_version: u64,
     /// The commit snapshot that inserted this row.
     pub begin_snapshot: u64,
     /// Whether `end_snapshot` is present (the row is live for `Table`
@@ -127,6 +132,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
                 let (chunk_body, chunk_body_len) = into_owned_bytes(row.chunk_body);
                 MoraineInlineRow {
                     row_id: row.row_id,
+                    schema_version: row.schema_version,
                     begin_snapshot: row.begin_snapshot,
                     has_end_snapshot,
                     end_snapshot,
@@ -385,15 +391,17 @@ pub unsafe extern "C" fn moraine_inline_file_delete_table_exists(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
-    use std::ptr;
+    use std::{ffi::CString, ptr};
 
     use super::*;
-    use crate::abi::{moraine_attach, moraine_detach};
-    use crate::staged::{
-        MoraineCell, MoraineTxnHandle, moraine_txn_begin, moraine_txn_commit, moraine_txn_stage,
-        moraine_txn_stage_inline_flush_delete, moraine_txn_stage_inline_inline_delete,
-        moraine_txn_stage_inline_insert, moraine_txn_stage_inline_schema,
+    use crate::{
+        abi::{moraine_attach, moraine_detach},
+        staged::{
+            MoraineCell, MoraineTxnHandle, moraine_txn_begin, moraine_txn_commit,
+            moraine_txn_stage, moraine_txn_stage_inline_flush_delete,
+            moraine_txn_stage_inline_inline_delete, moraine_txn_stage_inline_insert,
+            moraine_txn_stage_inline_schema,
+        },
     };
 
     struct TempDir(std::path::PathBuf);

@@ -32,6 +32,7 @@ pub(crate) async fn scan_inline_chunks(
         )
         .await
         .map_err(Error::from)?;
+
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
@@ -45,6 +46,7 @@ pub(crate) async fn scan_inline_chunks(
             }
         }
     }
+
     Ok(records)
 }
 
@@ -60,6 +62,7 @@ pub(crate) async fn scan_inline_inline_deletes(
         )
         .await
         .map_err(Error::from)?;
+
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
@@ -73,6 +76,7 @@ pub(crate) async fn scan_inline_inline_deletes(
             }
         }
     }
+
     Ok(records)
 }
 
@@ -89,6 +93,7 @@ pub(crate) async fn scan_inline_file_deletes(
         )
         .await
         .map_err(Error::from)?;
+
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
@@ -106,6 +111,7 @@ pub(crate) async fn scan_inline_file_deletes(
             }
         }
     }
+
     Ok(records)
 }
 
@@ -122,6 +128,7 @@ pub(crate) async fn read_inline_schema(
         schema_version,
     })
     .encode();
+
     match tx.get(key).await.map_err(Error::from)? {
         Some(bytes) => Ok(Some(value::decode_value(&bytes)?)),
         None => Ok(None),

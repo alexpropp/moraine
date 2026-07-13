@@ -3,11 +3,11 @@
 //! `#[doc(hidden)]` despite the `pub` visibility: not part of the crate's
 //! semver contract — shape and presence may change without notice.
 //!
-//! Each `dump_*` function returns every record of one kind, cur and hist
+//! Each `dump_*` function returns every record of one kind, current and history
 //! together, as the wire value type that kind encodes to
 //! (`crate::store::proto`) — row-faithful and unfiltered; unversioned
 //! kinds yield only their single current row since they are never mirrored
-//! to hist. DuckLake filters lifecycles in SQL over these rows.
+//! to history. DuckLake filters lifecycles in SQL over these rows.
 //!
 //! Every function opens one fresh read-only transaction, scans, and rolls
 //! back. Views spanning several `dump_*` calls are not snapshot-consistent:
@@ -21,7 +21,7 @@ use crate::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, SchemaValue,
             SnapshotValue, TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
-        read::{EntityRecord, scan_cur_entities, scan_hist_entities, scan_snapshots},
+        read::{EntityRecord, scan_current_entities, scan_history_entities, scan_snapshots},
     },
 };
 
@@ -30,7 +30,7 @@ pub mod inline;
 #[doc(hidden)]
 pub mod staged;
 
-/// Scans `cur` then `hist` in one transaction, keeping only the records
+/// Scans `current` then `history` in one transaction, keeping only the records
 /// `extract` maps to `Some` — the shared engine every entity-kind
 /// `dump_*` function below is a thin, concretely typed wrapper over.
 async fn dump_entities<T>(
@@ -38,15 +38,15 @@ async fn dump_entities<T>(
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
     let tx = catalog.begin_read_tx().await?;
-    let cur = scan_cur_entities(&tx).await;
-    let hist = scan_hist_entities(&tx).await;
+    let current = scan_current_entities(&tx).await;
+    let history = scan_history_entities(&tx).await;
     tx.rollback();
-    let mut records = cur?;
-    records.extend(hist?);
+    let mut records = current?;
+    records.extend(history?);
     Ok(records.into_iter().filter_map(extract).collect())
 }
 
-/// Every `ducklake_schema` row, cur and hist.
+/// Every `ducklake_schema` row, current and history.
 #[doc(hidden)]
 pub async fn dump_schemas(catalog: &Catalog) -> Result<Vec<SchemaValue>> {
     dump_entities(catalog, |r| match r {
@@ -56,7 +56,7 @@ pub async fn dump_schemas(catalog: &Catalog) -> Result<Vec<SchemaValue>> {
     .await
 }
 
-/// Every `ducklake_table` row, cur and hist.
+/// Every `ducklake_table` row, current and history.
 #[doc(hidden)]
 pub async fn dump_tables(catalog: &Catalog) -> Result<Vec<TableValue>> {
     dump_entities(catalog, |r| match r {
@@ -66,7 +66,7 @@ pub async fn dump_tables(catalog: &Catalog) -> Result<Vec<TableValue>> {
     .await
 }
 
-/// Every `ducklake_view` row, cur and hist.
+/// Every `ducklake_view` row, current and history.
 #[doc(hidden)]
 pub async fn dump_views(catalog: &Catalog) -> Result<Vec<ViewValue>> {
     dump_entities(catalog, |r| match r {
@@ -76,7 +76,7 @@ pub async fn dump_views(catalog: &Catalog) -> Result<Vec<ViewValue>> {
     .await
 }
 
-/// Every `ducklake_column` row, cur and hist.
+/// Every `ducklake_column` row, current and history.
 #[doc(hidden)]
 pub async fn dump_columns(catalog: &Catalog) -> Result<Vec<ColumnValue>> {
     dump_entities(catalog, |r| match r {
@@ -86,7 +86,7 @@ pub async fn dump_columns(catalog: &Catalog) -> Result<Vec<ColumnValue>> {
     .await
 }
 
-/// Every `ducklake_data_file` row, cur and hist.
+/// Every `ducklake_data_file` row, current and history.
 #[doc(hidden)]
 pub async fn dump_data_files(catalog: &Catalog) -> Result<Vec<DataFileValue>> {
     dump_entities(catalog, |r| match r {
@@ -96,7 +96,7 @@ pub async fn dump_data_files(catalog: &Catalog) -> Result<Vec<DataFileValue>> {
     .await
 }
 
-/// Every `ducklake_delete_file` row, cur and hist.
+/// Every `ducklake_delete_file` row, current and history.
 #[doc(hidden)]
 pub async fn dump_delete_files(catalog: &Catalog) -> Result<Vec<DeleteFileValue>> {
     dump_entities(catalog, |r| match r {
@@ -107,7 +107,7 @@ pub async fn dump_delete_files(catalog: &Catalog) -> Result<Vec<DeleteFileValue>
 }
 
 /// Every `ducklake_table_stats` row. Unversioned (overwritten in place,
-/// never mirrored to hist), so this is always exactly the live rows.
+/// never mirrored to history), so this is always exactly the live rows.
 #[doc(hidden)]
 pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>> {
     dump_entities(catalog, |r| match r {
@@ -141,7 +141,7 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 
 /// Every `ducklake_snapshot`/`ducklake_snapshot_changes` row (merged).
 /// Snapshots are append-only and carry no begin/end lifecycle of their
-/// own — this is the full history, not a cur/hist split.
+/// own — this is the full history, not a current/history split.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
     let tx = catalog.begin_read_tx().await?;
@@ -172,10 +172,11 @@ pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersion
     let snapshots = dump_snapshots(catalog).await?;
     Ok(snapshots
         .into_iter()
-        .flat_map(|snap| {
-            let begin_snapshot = snap.snapshot_id;
-            let schema_version = snap.schema_version;
-            snap.schema_changed_table_ids
+        .flat_map(|snapshot| {
+            let begin_snapshot = snapshot.snapshot_id;
+            let schema_version = snapshot.schema_version;
+            snapshot
+                .schema_changed_table_ids
                 .into_iter()
                 .map(move |table_id| SchemaVersionRow {
                     begin_snapshot,
@@ -200,7 +201,7 @@ mod tests {
     /// Seeds a store whose second commit renames a table — the fixture
     /// every assertion below reads from, so a table, a schema, a view, a
     /// data file, a delete file, and every statistics kind all carry both
-    /// a cur row and (for the versioned kinds) a hist row with exact
+    /// a current row and (for the versioned kinds) a history row with exact
     /// lifecycle values.
     async fn seed() -> Catalog {
         let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
@@ -291,11 +292,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dump_schemas_returns_bootstrap_and_seeded_schemas_with_no_hist() {
+    async fn dump_schemas_returns_bootstrap_and_seeded_schemas_with_no_history() {
         let catalog = seed().await;
         let rows = dump_schemas(&catalog).await.unwrap();
         // `main` (bootstrap) and `sales`; the rename touched only the
-        // table, so neither schema ever moved to hist.
+        // table, so neither schema ever moved to history.
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.end_snapshot.is_none()));
         let names: Vec<&str> = rows.iter().map(|r| r.schema_name.as_str()).collect();
@@ -309,14 +310,14 @@ mod tests {
         assert_eq!(
             rows.len(),
             2,
-            "rename must yield exactly one cur + one hist row"
+            "rename must yield exactly one current + one history row"
         );
 
         let ended = rows.iter().find(|r| r.end_snapshot.is_some()).unwrap();
         let live = rows.iter().find(|r| r.end_snapshot.is_none()).unwrap();
         assert_eq!(ended.table_name, "orders");
         assert_eq!(live.table_name, "orders2");
-        // Same entity, same uuid, exact lifecycle stitching: the hist
+        // Same entity, same uuid, exact lifecycle stitching: the history
         // row's end_snapshot is the live row's (new) begin_snapshot.
         assert_eq!(ended.table_id, live.table_id);
         assert_eq!(ended.table_uuid, live.table_uuid);
@@ -364,7 +365,7 @@ mod tests {
         let catalog = seed().await;
 
         // The rename commit did not touch statistics, and stats are
-        // never mirrored to hist regardless — one row each, live values.
+        // never mirrored to history regardless — one row each, live values.
         let table_rows = dump_table_stats(&catalog).await.unwrap();
         assert_eq!(table_rows.len(), 1);
         assert_eq!(table_rows[0].record_count, 10);

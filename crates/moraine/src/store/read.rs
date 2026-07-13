@@ -6,7 +6,7 @@ use slatedb::DbTransaction;
 use crate::{
     error::{Error, Result},
     store::{
-        key::{CurKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
+        key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
             HeadValue, MigrationValue, OptionScopeValue, SchemaValue, SnapshotValue,
@@ -53,10 +53,11 @@ async fn read_singleton<M: prost::Message + Default>(
     tx: &DbTransaction,
     key: Key,
 ) -> Result<Option<M>> {
-    match tx.get(key.encode()).await.map_err(Error::from)? {
-        Some(bytes) => Ok(Some(value::decode_value(&bytes)?)),
-        None => Ok(None),
-    }
+    tx.get(key.encode())
+        .await
+        .map_err(Error::from)?
+        .map(|bytes| value::decode_value(&bytes))
+        .transpose()
 }
 
 /// The layout-format stamp, if the store has been initialized.
@@ -79,23 +80,23 @@ pub(crate) async fn read_snapshot(
     tx: &DbTransaction,
     snapshot_id: u64,
 ) -> Result<Option<SnapshotValue>> {
-    read_singleton(tx, Key::Snap { snapshot_id }).await
+    read_singleton(tx, Key::Snapshot { snapshot_id }).await
 }
 
 /// Every committed snapshot record (`ducklake_snapshot` +
 /// `ducklake_snapshot_changes`, merged), in key order.
 pub(crate) async fn scan_snapshots(tx: &DbTransaction) -> Result<Vec<SnapshotValue>> {
     let mut iter = tx
-        .scan_prefix(subspace_prefix(Subspace::Snap), ..)
+        .scan_prefix(subspace_prefix(Subspace::Snapshot), ..)
         .await
         .map_err(Error::from)?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Snap { .. } => records.push(value::decode_value(&entry.value)?),
+            Key::Snapshot { .. } => records.push(value::decode_value(&entry.value)?),
             other => {
                 return Err(Error::Corruption(format!(
-                    "non-snap key in snap scan: {other:?}"
+                    "non-snapshot key in snapshot scan: {other:?}"
                 )));
             }
         }
@@ -134,22 +135,22 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
 }
 
 /// Every live entity record.
-pub(crate) async fn scan_cur_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
+pub(crate) async fn scan_current_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
     let mut iter = tx
-        .scan_prefix(subspace_prefix(Subspace::Cur), ..)
+        .scan_prefix(subspace_prefix(Subspace::Current), ..)
         .await
         .map_err(Error::from)?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Cur(CurKey::Entity(entity)) => {
+            Key::Current(CurrentKey::Entity(entity)) => {
                 records.push(decode_entity(entity, &entry.value)?);
             }
             // Gc-file bookkeeping has no catalog meaning; skipped by design.
-            Key::Cur(CurKey::GcFile { .. }) => {}
+            Key::Current(CurrentKey::GcFile { .. }) => {}
             other => {
                 return Err(Error::Corruption(format!(
-                    "non-cur key in cur scan: {other:?}"
+                    "non-current key in current scan: {other:?}"
                 )));
             }
         }
@@ -158,18 +159,18 @@ pub(crate) async fn scan_cur_entities(tx: &DbTransaction) -> Result<Vec<EntityRe
 }
 
 /// Every ended entity-version record.
-pub(crate) async fn scan_hist_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
+pub(crate) async fn scan_history_entities(tx: &DbTransaction) -> Result<Vec<EntityRecord>> {
     let mut iter = tx
-        .scan_prefix(subspace_prefix(Subspace::Hist), ..)
+        .scan_prefix(subspace_prefix(Subspace::History), ..)
         .await
         .map_err(Error::from)?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Hist(hist) => records.push(decode_entity(hist.entity, &entry.value)?),
+            Key::History(history) => records.push(decode_entity(history.entity, &entry.value)?),
             other => {
                 return Err(Error::Corruption(format!(
-                    "non-hist key in hist scan: {other:?}"
+                    "non-history key in history scan: {other:?}"
                 )));
             }
         }
@@ -213,12 +214,12 @@ mod tests {
         tx.put(Key::Sys(SysKey::Head).encode(), value::encode_value(&head))
             .unwrap();
         tx.put(
-            Key::cur(EntityKey::Schema { schema_id: 1 }).encode(),
+            Key::current(EntityKey::Schema { schema_id: 1 }).encode(),
             value::encode_value(&schema),
         )
         .unwrap();
         tx.put(
-            Key::hist(EntityKey::Schema { schema_id: 0 }, 2).encode(),
+            Key::history(EntityKey::Schema { schema_id: 0 }, 2).encode(),
             value::encode_value(&ended),
         )
         .unwrap();
@@ -229,7 +230,7 @@ mod tests {
             file_size_bytes: 1024,
         };
         tx.put(
-            Key::cur(EntityKey::TableStats { table_id: 7 }).encode(),
+            Key::current(EntityKey::TableStats { table_id: 7 }).encode(),
             value::encode_value(&tstat),
         )
         .unwrap();
@@ -253,7 +254,7 @@ mod tests {
             partition_values: vec![],
         };
         tx.put(
-            Key::cur(EntityKey::File {
+            Key::current(EntityKey::File {
                 table_id: 7,
                 data_file_id: 3,
             })
@@ -274,7 +275,7 @@ mod tests {
             column_aliases: None,
         };
         tx.put(
-            Key::cur(EntityKey::View { view_id: 4 }).encode(),
+            Key::current(EntityKey::View { view_id: 4 }).encode(),
             value::encode_value(&view),
         )
         .unwrap();
@@ -283,7 +284,7 @@ mod tests {
         options.insert("key1".into(), "value1".into());
         let option = OptionScopeValue { options };
         tx.put(
-            Key::cur(EntityKey::Option {
+            Key::current(EntityKey::Option {
                 scope_kind: 0,
                 scope_id: 0,
             })
@@ -305,19 +306,19 @@ mod tests {
         assert_eq!(read_migration(&tx).await.unwrap(), None);
         assert_eq!(read_snapshot(&tx, 0).await.unwrap(), None);
 
-        let cur = scan_cur_entities(&tx).await.unwrap();
-        assert_eq!(cur.len(), 5);
-        assert!(cur.contains(&EntityRecord::Schema(schema)));
-        assert!(cur.contains(&EntityRecord::File(file)));
-        assert!(cur.contains(&EntityRecord::TableStats(tstat)));
-        assert!(cur.contains(&EntityRecord::View(view)));
-        assert!(cur.contains(&EntityRecord::Option {
+        let current = scan_current_entities(&tx).await.unwrap();
+        assert_eq!(current.len(), 5);
+        assert!(current.contains(&EntityRecord::Schema(schema)));
+        assert!(current.contains(&EntityRecord::File(file)));
+        assert!(current.contains(&EntityRecord::TableStats(tstat)));
+        assert!(current.contains(&EntityRecord::View(view)));
+        assert!(current.contains(&EntityRecord::Option {
             scope_kind: 0,
             scope_id: 0,
             value: option,
         }));
-        let hist = scan_hist_entities(&tx).await.unwrap();
-        assert_eq!(hist, vec![EntityRecord::Schema(ended)]);
+        let history = scan_history_entities(&tx).await.unwrap();
+        assert_eq!(history, vec![EntityRecord::Schema(ended)]);
         tx.rollback();
         db.close().await.unwrap();
     }

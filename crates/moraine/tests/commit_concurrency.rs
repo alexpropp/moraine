@@ -46,10 +46,10 @@ async fn seeded() -> (Catalog, SchemaId, TableId, TableId) {
         })
         .await
         .unwrap();
-    let snap = catalog.snapshot().await.unwrap();
-    let s = snap.schema_by_name("s").unwrap().id;
-    let a = snap.table_by_name(s, "a").unwrap().id;
-    let b = snap.table_by_name(s, "b").unwrap().id;
+    let snapshot = catalog.snapshot().await.unwrap();
+    let s = snapshot.schema_by_name("s").unwrap().id;
+    let a = snapshot.table_by_name(s, "a").unwrap().id;
+    let b = snapshot.table_by_name(s, "b").unwrap().id;
     (catalog, s, a, b)
 }
 

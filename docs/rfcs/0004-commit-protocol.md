@@ -46,13 +46,13 @@ Non-goals:
 - **Key layout and value codec** — RFC 0002.
 - **Inlined data record formats** — RFC 0005. This RFC covers only how
   inlined writes participate in a commit.
-- **Snapshot expiry / GC** of `hist` and flushed inline data — RFC 0007.
+- **Snapshot expiry / GC** of `history` and flushed inline data — RFC 0007.
 
 ## Background
 
 RFC 0002 established the keyspace: `sys/head` holds the latest committed
-`snapshot_id`; the `snap` subspace is append-only snapshot records; `cur`
-and `hist` split live from ended entity versions; commits are atomic
+`snapshot_id`; the `snapshot` subspace is append-only snapshot records; `current`
+and `history` split live from ended entity versions; commits are atomic
 `WriteBatch` writes under a single fenced SlateDB writer.
 
 SlateDB (pinned at 0.14.x) provides the concrete primitives this protocol
@@ -164,12 +164,12 @@ ends, inlined writes) and lands them atomically:
    `next_catalog_id`/`next_file_id` from the snapshot record, `next_row_id`
    from each touched table's `tstat`. No store writes yet.
 3. **Stage the batch.** Assemble one atomic write set:
-   - new entity records into `cur` (and, for ended versions, delete the
-     `cur` key + write the `hist` key — RFC 0002);
-   - inlined `inline/insert` chunks and `inline/idel`/`inline/fdel` records
+   - new entity records into `current` (and, for ended versions, delete the
+     `current` key + write the `history` key — RFC 0002);
+   - inlined `inline/insert` chunks and `inline/inline_delete`/`inline/file_delete` records
      (RFC 0005);
    - updated `tstat` records carrying advanced `next_row_id`;
-   - the new `snap` record `N+1` with advanced global counters,
+   - the new `snapshot` record `N+1` with advanced global counters,
      `schema_version` (bumped or carried forward per the rule below), and
      merged `snapshot_changes`;
    - the `sys/head` update `N → N+1`.
@@ -203,7 +203,7 @@ topology above guarantees there is no second writer to race.
 
 ### Conflict detection — table-level
 
-The `changes_made` field of the snap record is written in **DuckLake's
+The `changes_made` field of the snaphot record is written in **DuckLake's
 own grammar**, not a moraine dialect — the field is DuckLake-visible on
 the staged-row path (DuckLake re-parses it mid-retry, and its parser
 *throws* on unknown entry kinds), so the wire format is DuckLake's to
@@ -350,7 +350,7 @@ hang.
 
 ### Id allocation
 
-- **`next_catalog_id`, `next_file_id`** — global, in the `snap` record,
+- **`next_catalog_id`, `next_file_id`** — global, in the `snapshot` record,
   matching DuckLake. Allocated by bumping the in-memory copy from head and
   writing the advanced value in the new snapshot record. Shared reads of
   these counters are benign (re-derived on retry), never conflicts.
@@ -434,9 +434,9 @@ stages**. moraine's job on this path is narrower and different from the
 verb path:
 
 - **Translate, don't author.** moraine maps each staged row onto the
-  RFC 0002 keyed layout — an INSERT becomes a `cur` record; an UPDATE that
-  sets `end_snapshot` becomes the end-version bookkeeping (delete `cur`
-  key, write `hist` key); the snapshot row becomes the `snap` record and
+  RFC 0002 keyed layout — an INSERT becomes a `current` record; an UPDATE that
+  sets `end_snapshot` becomes the end-version bookkeeping (delete `current`
+  key, write `history` key); the snapshot row becomes the `snapshot` record and
   the `sys/head` advance. This begin/end-lifecycle translation is the one
   semantic convention moraine interprets (RFC 0006 states and bounds it);
   ids, counters, and `schema_version` are DuckLake's values, stored
@@ -478,7 +478,7 @@ Per RFC 0005, an inlined insert/delete is not a separate path: its
 row ids from the same per-table `next_row_id` bump as a Parquet write
 would. An inline flush is itself a commit — Parquet PUTs first, then one
 batch that creates the `file`/`delfile` records and deletes the consumed
-`inline/*` records outright (no `hist`; `inline/*` is append-then-delete,
+`inline/*` records outright (no `history`; `inline/*` is append-then-delete,
 not begin/end-versioned). Nothing about inlining changes the commit
 sequence or the conflict rules; it only adds record kinds to the batch.
 
@@ -653,7 +653,7 @@ the open questions below.
   make every insert into any table contend on one counter, turning benign
   cross-table concurrency into counter churn. Per-table placement aligns
   allocation with conflict granularity.
-- **Pessimistic locking (a lease/lock record in `sys` a writer must hold).**
+- **Pessimistic locking (a lease/lock record in `system` a writer must hold).**
   Rejected: reintroduces coordination state and a liveness problem (crashed
   lock-holder) that the optimistic head-CAS avoids. SlateDB fencing already
   provides the safety a lock would; optimism provides the concurrency.

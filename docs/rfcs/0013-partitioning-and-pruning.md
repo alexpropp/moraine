@@ -23,7 +23,7 @@ RFC 0002's stats-pruning pushdown.
 - Every partitioning table has a defined home, validated against real DuckLake
   SQL in the e2e suite.
 - A planner's core question — "scan the files of table T with their partition
-  values" — is one contiguous `table_id`-first `cur` range, no join, no second
+  values" — is one contiguous `table_id`-first `current` range, no join, no second
   subspace.
 - Partition specs evolve over a table's life (set, change, clear) and time
   travel reconstructs the spec-in-force at any snapshot for free.
@@ -64,15 +64,15 @@ type-aware rather than a naive lexicographic compare.
 
 | DuckLake table | Home | Rationale |
 |---|---|---|
-| `ducklake_partition_info` | `partition` kind (RFC 0002), `(table_id, partition_id)`, in `cur`/`hist` | The spec has an independent lifecycle — a table repartitions over time — so it earns its own kind and is temporally versioned. |
+| `ducklake_partition_info` | `partition` kind (RFC 0002), `(table_id, partition_id)`, in `current`/`history` | The spec has an independent lifecycle — a table repartitions over time — so it earns its own kind and is temporally versioned. |
 | `ducklake_partition_column` | **Embedded** in the `partition` value | Pure child of the spec, no independent lifecycle: columns + transforms live and die with their spec (RFC 0002 convention). |
 | `ducklake_file_partition_value` | **Embedded** in the `file` value | Per-data-file, 1:N (one value per partition column), no independent lifecycle: values live and die with their data file (RFC 0002 convention). |
 
 The load-bearing choice is embedding `file_partition_value` in the `file`
 record rather than giving it its own kind or subspace. A file's partition
-values travel with its `cur`/`hist` record. Because per-table collections are
+values travel with its `current`/`history` record. Because per-table collections are
 keyed `table_id`-first (RFC 0002), "scan the files of table T with their
-partition values" is exactly one contiguous `cur` range — no join against a
+partition values" is exactly one contiguous `current` range — no join against a
 second subspace, no scatter. That is the shape a planner needs, and it costs no
 new keyspace.
 
@@ -93,16 +93,16 @@ Partitioning is set, changed, or cleared over a table's life. Each is a
 table level ([RFC 0004](0004-commit-protocol.md)). The spec is versioned
 temporally like any entity:
 
-- **Set / change** — end the current spec's `cur` version into `hist` with
-  `end_snapshot` (if one existed) and insert the new spec into `cur`, in the
+- **Set / change** — end the current spec's `current` version into `history` with
+  `end_snapshot` (if one existed) and insert the new spec into `current`, in the
   same `WriteBatch` (RFC 0002 atomicity invariant).
-- **Clear** — end the current spec's `cur` version into `hist`; the table has
+- **Clear** — end the current spec's `current` version into `history`; the table has
   no live spec afterward.
 
 A data file records, in its `file` value, the `partition_id` of the spec it was
 **written under**. Files written under different specs therefore coexist
 unambiguously: each names its own spec. Reconstructing the spec-in-force at
-snapshot `S` is the ordinary `cur`+`hist` temporal filter (RFC 0002) — no
+snapshot `S` is the ordinary `current`+`history` temporal filter (RFC 0002) — no
 special path. Time travel gets the historical spec, and each file's values, for
 free.
 
@@ -150,7 +150,7 @@ constraints RFC 0006 discusses enforcing at the catalog layer.
 Compaction rewrites data files and must preserve or recompute the correct
 partition values for the rewritten files; RFC 0008 owns that. moraine stores
 whatever partition values the rewrite produces, embedded in the new `file`
-records, and ends the compacted-away files' `cur` versions into `hist` as
+records, and ends the compacted-away files' `current` versions into `history` as
 usual. If moraine ever drives compaction planning, partition boundaries
 constrain which files may merge — a merge must not cross partitions whose values
 differ under the governing spec. That constraint is noted here and specified in
@@ -214,5 +214,5 @@ partitioning tables extend it:
 - **A single global partition spec per table with no history.** Rejected: it
   defeats repartitioning and time travel. Files written under an earlier spec
   would have nowhere to point, and reconstructing a past catalog would report
-  the wrong partitioning. The temporal `cur`/`hist` spec is what makes both
+  the wrong partitioning. The temporal `current`/`history` spec is what makes both
   correct.

@@ -62,6 +62,15 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 	if (sql_type == nullptr) {
 		return duckdb::Value(duckdb::LogicalType::VARCHAR);
 	}
+	// A nested type is stored as its DuckLake marker ("list"/"struct"/"map")
+	// with the element/field types carried by child `ducklake_column` rows
+	// (linked by `parent_column`). Pass the marker through unchanged so
+	// DuckLake reconstructs the type from the hierarchy; there is no scalar
+	// `LogicalType` to normalize it against.
+	if (duckdb::StringUtil::CIEquals(sql_type, "list") || duckdb::StringUtil::CIEquals(sql_type, "struct") ||
+	    duckdb::StringUtil::CIEquals(sql_type, "map")) {
+		return duckdb::Value(duckdb::StringUtil::Lower(sql_type));
+	}
 	auto type = MapColumnType(sql_type);
 	switch (type.id()) {
 	case duckdb::LogicalTypeId::BOOLEAN:

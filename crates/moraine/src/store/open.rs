@@ -41,12 +41,12 @@ mod tests {
         let db = open_store("test/store", memory_store()).await.unwrap();
 
         let head = Key::Sys(SysKey::Head).encode();
-        let snap = Key::Snap { snapshot_id: 1 }.encode();
-        let table = Key::cur(key::EntityKey::Table { table_id: 7 }).encode();
+        let snapshot = Key::Snapshot { snapshot_id: 1 }.encode();
+        let table = Key::current(key::EntityKey::Table { table_id: 7 }).encode();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
         tx.put(&head, b"head").unwrap();
-        tx.put(&snap, b"snap").unwrap();
+        tx.put(&snapshot, b"snap").unwrap();
         tx.put(&table, b"table").unwrap();
         tx.commit_with_options(&WriteOptions {
             await_durable: true,
@@ -59,7 +59,7 @@ mod tests {
 
         // Each subspace scan returns exactly its own keys.
         let mut iter = db
-            .scan_prefix(key::subspace_prefix(key::Subspace::Cur), ..)
+            .scan_prefix(key::subspace_prefix(key::Subspace::Current), ..)
             .await
             .unwrap();
         let entry = iter.next().await.unwrap().unwrap();
@@ -67,11 +67,11 @@ mod tests {
         assert!(iter.next().await.unwrap().is_none());
 
         let mut iter = db
-            .scan_prefix(key::subspace_prefix(key::Subspace::Snap), ..)
+            .scan_prefix(key::subspace_prefix(key::Subspace::Snapshot), ..)
             .await
             .unwrap();
         let entry = iter.next().await.unwrap().unwrap();
-        assert_eq!(entry.key.as_ref(), snap.as_slice());
+        assert_eq!(entry.key.as_ref(), snapshot.as_slice());
         assert!(iter.next().await.unwrap().is_none());
 
         db.close().await.unwrap();

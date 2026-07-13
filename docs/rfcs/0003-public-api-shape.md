@@ -30,7 +30,7 @@ semantics.
   surface
 - The `prost`-generated value types (RFC 0002) stay private to `store`.
 - Every DuckLake v1.0 catalog mutation the entities in RFC 0002 imply has a
-  named, DuckLake-shaped operation on `Transaction`. The version and `cur`↔`hist`
+  named, DuckLake-shaped operation on `Transaction`. The version and `current`↔`history`
   bookkeeping is internal.
 - Errors are matchable per failure domain, so the DuckDB bridge maps each to a
   DuckDB error code without parsing strings.
@@ -41,7 +41,7 @@ Non-goals:
   commit, the CAS/fencing discipline on `sys/head`. That is RFC 0004.
 - The DuckDB extension entry points (RFC 0006) and the sync↔async bridge
   (RFC 0010). This RFC defines the async core surface that bridge wraps.
-- Snapshot expiry / `hist` garbage collection — RFC 0007. No public verb is
+- Snapshot expiry / `history` garbage collection — RFC 0007. No public verb is
   reserved for it here.
 
 ## Background
@@ -59,7 +59,7 @@ spawns no runtime and no threads of its own — the caller drives it, and the
 DuckDB bridge owns the sync↔async translation.
 
 RFC 0002 establishes the read model this API exposes: a client builds an
-in-memory catalog by scanning the `cur` subspace at attach; the live catalog
+in-memory catalog by scanning the `current` subspace at attach; the live catalog
 is small by design, name→id resolution happens against that in-memory
 snapshot, and the hot path never scans history. This RFC turns that model into
 types.
@@ -76,13 +76,13 @@ alongside `Error`/`Result`.
   Constructed once via `open`, cheap to clone (an `Arc` internally), drives
   reads and commits. Lives in `catalog`.
 - **`CatalogSnapshot`** — an immutable, materialized read view built by
-  scanning `cur` (or `cur` + the relevant `hist` ranges, for time travel) per
+  scanning `current` (or `current` + the relevant `history` ranges, for time travel) per
   RFC 0002. All accessors are in-memory; after construction it never touches
   the store. Lives in `catalog`.
 - **`Transaction`** — the mutation handle passed to the commit closure. It `Deref`s to
   `CatalogSnapshot`, so every read accessor is available inside a commit for
   name→id resolution and validation, and adds the mutators. The commit
-  machinery (retry, `WriteBatch` assembly, `cur`↔`hist` bookkeeping) lives in
+  machinery (retry, `WriteBatch` assembly, `current`↔`history` bookkeeping) lives in
   `transaction`; `Transaction` is its public face.
 
 ### Front door
@@ -107,12 +107,12 @@ is opt-in for hosts sharing a bucket.
 ### Reads
 
 ```rust
-let snap = catalog.snapshot().await?;                 // current catalog
+let snaphot = catalog.snapshot().await?;                 // current catalog
 let past = catalog.snapshot_at(snapshot_id).await?;   // time travel
 ```
 
-Both return `CatalogSnapshot`. `snapshot()` scans `cur`; `snapshot_at(S)`
-additionally scans the relevant `hist` ranges and filters by begin/end per RFC
+Both return `CatalogSnapshot`. `snapshot()` scans `current`; `snapshot_at(S)`
+additionally scans the relevant `history` ranges and filters by begin/end per RFC
 0002. Accessors (all in-memory, name→id resolved internally):
 
 | Accessor | Returns |
@@ -129,7 +129,7 @@ additionally scans the relevant `hist` ranges and filters by begin/end per RFC
 | `table_stats(table)` / `column_stats(table, column)` | statistics |
 | `option(scope, key)` | resolved option value |
 | `current_snapshot()` | snapshot id + metadata of this view |
-| `recent_rows(table)` / `recent_row(table, row_id)` | recently inlined rows served from the store, live + archived (RFC 0016) |
+| `recent_rows(table)` / `recent_row(table, row_id)` | recently inlined rows served natively from the store's `inline` subspace |
 
 Reads issue no store I/O after the snapshot is built — a `CatalogSnapshot` is a
 value, not a cursor.
@@ -216,7 +216,7 @@ field evolution stay an internal change instead of a public breaking one.
 ### Operation enumeration
 
 Every mutator is a method on `Transaction`. Operations read as DuckLake catalog verbs,
-not as low-level "put entity version" primitives; the `cur`↔`hist` version
+not as low-level "put entity version" primitives; the `current`↔`history` version
 bookkeeping of RFC 0002 is internal to each. Grounded in DuckLake v1.0
 semantics and the entities RFC 0002 maps:
 
@@ -241,11 +241,11 @@ Notes:
   only ends its live version into history — historical snapshots still
   reference the bytes, so scheduling physical deletion belongs to the
   RFC 0007 expiry commit, which writes `gcfile` records when it prunes the
-  `hist` records below the retention horizon.
+  `history` records below the retention horizon.
 - `alter_column` is one verb taking an optional change per attribute, rather
   than three verbs, because DuckLake models a column alteration as a single
   new column version regardless of which attributes changed.
-- Snapshot expiry / `hist` GC has no verb (deferred, per non-goals).
+- Snapshot expiry / `history` GC has no verb (deferred, per non-goals).
 - This table covers the entities the core models today. As the DuckLake v1.0
   spec's remaining tables and the extension contract (RFC 0005 open question)
   are reached in e2e, operations are added here — this RFC is updated, not
@@ -280,8 +280,8 @@ Per RFC 0001:
   in the core where the in-memory snapshot lives.
 
 - **Lazy read handle** (accessors issue store scans on demand, nothing
-  materialized): contradicts RFC 0002's "scan `cur` at attach" model and
-  reintroduces the hot-path history-filtering cost the `cur`/`hist` split
+  materialized): contradicts RFC 0002's "scan `current` at attach" model and
+  reintroduces the hot-path history-filtering cost the `current`/`history` split
   exists to avoid. Rejected: `CatalogSnapshot` is materialized because the
   live catalog is small by design.
 

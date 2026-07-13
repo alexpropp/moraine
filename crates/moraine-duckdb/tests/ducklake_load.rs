@@ -18,11 +18,15 @@
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        env,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
 
     use moraine::{Catalog, CatalogOptions, ColumnDef, DataFile};
     use object_store::local::LocalFileSystem;
@@ -76,7 +80,7 @@ mod tests {
 
     /// Seeds a store via the `moraine` API: `main` from bootstrap (no
     /// explicit `create_schema` call), one table `t` with a relative-path
-    /// data file, then a rename to give the table row hist depth (two
+    /// data file, then a rename to give the table row history depth (two
     /// `ducklake_table` versions). `file_size_bytes`/`footer_size` must be
     /// the real Parquet file's stats: DuckLake's own reader uses the
     /// registered `footer_size` to seek to the file's metadata footer, so a
@@ -129,8 +133,8 @@ mod tests {
                             column_stats: vec![],
                         },
                     )?;
-                    // Hist depth: `t_old`'s cur row ends, a hist row is
-                    // written, and a new cur row for `t` begins.
+                    // History depth: `t_old`'s current row ends, a history row is
+                    // written, and a new current row for `t` begins.
                     tx.rename_table(t, "t")?;
 
                     Ok(())
@@ -398,8 +402,8 @@ mod tests {
     ///   routes into the `inline/*` keyspace rather than materializing.
     /// - `ALTER TABLE ... RENAME TO` drives DuckLake's `UPDATE
     ///   ducklake_table SET end_snapshot ... WHERE end_snapshot IS NULL AND
-    ///   table_id IN (...)` — the old version must land in hist, the
-    ///   renamed one in cur.
+    ///   table_id IN (...)` — the old version must land in history, the
+    ///   renamed one in current.
     /// - `DROP TABLE` drives the same UPDATE convention for the drop.
     ///
     /// Every step is verified through two independent surfaces: DuckLake's
@@ -452,8 +456,8 @@ mod tests {
         ));
         assert_eq!(tables, vec![vec!["y".to_string()]]);
 
-        // Lifecycle stitching, row-faithfully: one hist row `x` whose
-        // end_snapshot equals the cur row `y`'s begin_snapshot, same
+        // Lifecycle stitching, row-faithfully: one history row `x` whose
+        // end_snapshot equals the current row `y`'s begin_snapshot, same
         // table_id.
         let rows = csv_rows(&run_standalone_sql(
             store,
@@ -611,6 +615,193 @@ mod tests {
         assert_eq!(
             post_flush_files,
             vec![vec!["1".to_string(), "5".to_string()]]
+        );
+    }
+
+    /// Nested user-column types (`LIST`, `STRUCT`, `MAP`) create, inline, and
+    /// round-trip end to end. DuckLake stores a nested column as a marker
+    /// row (`list`/`struct`/`map`) plus child `ducklake_column` rows; moraine
+    /// stores those verbatim and passes the marker through its metadata
+    /// projection, and the Arrow IPC inline path carries the values. Read
+    /// back through scalar extractors so the comma-splitting `csv_rows`
+    /// never sees a nested value's internal commas.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_inline_nested_types_round_trip_through_flush() {
+        let dir = TempDir::new("inline-nested-store");
+        let data_dir = TempDir::new("inline-nested-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        run_ducklake_sql(
+            store,
+            data_path,
+            "CREATE TABLE lake.main.n \
+             (id BIGINT, tags BIGINT[], pt STRUCT(x INTEGER, y INTEGER), mp MAP(VARCHAR, INTEGER));",
+        );
+        run_ducklake_sql(
+            store,
+            data_path,
+            "INSERT INTO lake.main.n VALUES \
+             (1, [10, 20, 30], {'x': 1, 'y': 2}, MAP {'a': 7}), \
+             (2, [], {'x': 3, 'y': 4}, MAP {}), \
+             (3, NULL, NULL, NULL);",
+        );
+
+        let extracted = "SELECT id, len(tags), tags[1], pt.x, pt.y, map_extract(mp, 'a')[1], cardinality(mp) \
+                         FROM lake.main.n ORDER BY id;";
+        let want = vec![
+            vec!["1", "3", "10", "1", "2", "7", "1"],
+            vec!["2", "0", "NULL", "3", "4", "NULL", "0"],
+            vec!["3", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL"],
+        ];
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(store, data_path, extracted)),
+            want
+        );
+
+        // Served through the inline entry, not a materialized Parquet file.
+        let pre_flush_files = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        ));
+        assert_eq!(pre_flush_files, vec![vec!["0".to_string()]]);
+
+        // Flush transcodes the inlined nested rows through the shim's decode
+        // into Parquet; the read afterward is DuckLake's Parquet reader.
+        run_ducklake_sql(
+            store,
+            data_path,
+            "CALL ducklake_flush_inlined_data('lake');",
+        );
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(store, data_path, extracted)),
+            want
+        );
+
+        let remaining_inline_rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_inlined_data_1_1;",
+        ));
+        assert_eq!(remaining_inline_rows, vec![vec!["0".to_string()]]);
+    }
+
+    /// Column-level schema evolution through DuckLake's own `ALTER TABLE`:
+    /// ADD / RENAME / DROP COLUMN. DuckLake expresses each as
+    /// `ducklake_column` version transitions over the staged-write path
+    /// (RFC 0012), so this exercises no dedicated schema-mutation path in
+    /// moraine — the generic staged commit carries it. Verified through the
+    /// standalone row-faithful projection (live columns, ordered) and
+    /// DuckLake's own reflection in a fresh session.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_column_schema_evolution_through_staged_writes() {
+        let dir = TempDir::new("evolve-store");
+        let data_dir = TempDir::new("evolve-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        let live_columns = "SELECT column_name, column_type FROM m.ducklake_column \
+                            WHERE end_snapshot IS NULL ORDER BY column_order;";
+
+        run_ducklake_sql(store, data_path, "CREATE TABLE lake.main.t (a BIGINT);");
+        run_ducklake_sql(
+            store,
+            data_path,
+            "ALTER TABLE lake.main.t ADD COLUMN b VARCHAR;",
+        );
+        assert_eq!(
+            csv_rows(&run_standalone_sql(store, live_columns)),
+            vec![vec!["a", "int64"], vec!["b", "varchar"]]
+        );
+        // DuckLake's own reflection in a fresh attach agrees.
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                store,
+                data_path,
+                "SELECT column_name FROM (DESCRIBE lake.main.t) ORDER BY column_name;",
+            )),
+            vec![vec!["a"], vec!["b"]]
+        );
+
+        run_ducklake_sql(
+            store,
+            data_path,
+            "ALTER TABLE lake.main.t RENAME COLUMN b TO c;",
+        );
+        assert_eq!(
+            csv_rows(&run_standalone_sql(store, live_columns)),
+            vec![vec!["a", "int64"], vec!["c", "varchar"]]
+        );
+
+        run_ducklake_sql(store, data_path, "ALTER TABLE lake.main.t DROP COLUMN c;");
+        assert_eq!(
+            csv_rows(&run_standalone_sql(store, live_columns)),
+            vec![vec!["a", "int64"]]
+        );
+
+        // The evolved schema is functional: a fresh session inserts and reads.
+        run_ducklake_sql(store, data_path, "INSERT INTO lake.main.t VALUES (42);");
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                store,
+                data_path,
+                "SELECT a FROM lake.main.t;"
+            )),
+            vec![vec!["42"]]
+        );
+    }
+
+    /// Type promotion through DuckLake's `ALTER TABLE ... ALTER COLUMN ...
+    /// TYPE` — the remaining column-level op of RFC 0012. The load-bearing
+    /// case is data that predates the change: rows inlined under the old type
+    /// live in their own schema version's chunk (decoded against that
+    /// version's `inline/schema`), and must still read back — coerced to the
+    /// new type by DuckLake — after the column is retyped and newer rows
+    /// inline under the new version.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_column_type_promotion_over_inlined_data() {
+        let dir = TempDir::new("promote-store");
+        let data_dir = TempDir::new("promote-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        run_ducklake_sql(store, data_path, "CREATE TABLE lake.main.t (a INTEGER);");
+        // Inlined under the INTEGER (int32) schema version.
+        run_ducklake_sql(store, data_path, "INSERT INTO lake.main.t VALUES (1), (2);");
+
+        run_ducklake_sql(
+            store,
+            data_path,
+            "ALTER TABLE lake.main.t ALTER COLUMN a TYPE BIGINT;",
+        );
+        // The retyped column is int64 in the live catalog projection.
+        assert_eq!(
+            csv_rows(&run_standalone_sql(
+                store,
+                "SELECT column_type FROM m.ducklake_column WHERE end_snapshot IS NULL;",
+            )),
+            vec![vec!["int64"]]
+        );
+        // Rows inlined before the change still read, coerced to the new type.
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                store,
+                data_path,
+                "SELECT a FROM lake.main.t ORDER BY a;"
+            )),
+            vec![vec!["1"], vec!["2"]]
+        );
+        // New rows inline under the new version and coexist with the old.
+        run_ducklake_sql(store, data_path, "INSERT INTO lake.main.t VALUES (3);");
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                store,
+                data_path,
+                "SELECT a FROM lake.main.t ORDER BY a;"
+            )),
+            vec![vec!["1"], vec!["2"], vec!["3"]]
         );
     }
 }

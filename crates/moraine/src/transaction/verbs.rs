@@ -1,7 +1,9 @@
 //! The mutation handle passed to a commit closure.
 
-use std::collections::BTreeMap;
-use std::ops::Deref;
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Deref,
+};
 
 use uuid::Uuid;
 
@@ -41,8 +43,8 @@ impl Deref for Transaction {
 
 impl Transaction {
     pub(crate) fn new(state: CatalogSnapshot, new_snapshot_id: u64) -> Self {
-        let next_catalog_id = state.snap.next_catalog_id;
-        let next_file_id = state.snap.next_file_id;
+        let next_catalog_id = state.snapshot.next_catalog_id;
+        let next_file_id = state.snapshot.next_file_id;
 
         Self {
             state,
@@ -164,9 +166,10 @@ impl Transaction {
                 "table {name} needs at least one column"
             )));
         }
-        for (i, a) in columns.iter().enumerate() {
-            if columns[..i].iter().any(|b| b.name == a.name) {
-                return Err(Error::Constraint(format!("duplicate column {}", a.name)));
+        let mut seen = HashSet::with_capacity(columns.len());
+        for def in columns {
+            if !seen.insert(&def.name) {
+                return Err(Error::Constraint(format!("duplicate column {}", def.name)));
             }
         }
 
@@ -220,14 +223,9 @@ impl Transaction {
 
     /// Tables and views share one name namespace per schema.
     fn relation_name_free(&self, schema_id: u64, name: &str) -> Result<()> {
-        let taken = self
-            .state
-            .table_names
-            .contains_key(&(schema_id, name.to_owned()))
-            || self
-                .state
-                .view_names
-                .contains_key(&(schema_id, name.to_owned()));
+        let key = (schema_id, name.to_owned());
+        let taken =
+            self.state.table_names.contains_key(&key) || self.state.view_names.contains_key(&key);
         if taken {
             return Err(Error::AlreadyExists(format!("relation {name}")));
         }
@@ -247,12 +245,15 @@ impl Transaction {
     /// Returns [`Error::AlreadyExists`] if a table with that name already
     /// exists in the same schema (including this table itself).
     pub fn rename_table(&mut self, table: TableId, new_name: &str) -> Result<()> {
-        let mut value = self.live_table(table)?;
+        let value = self.live_table(table)?;
         self.relation_name_free(value.schema_id, new_name)?;
-        new_name.clone_into(&mut value.table_name);
-        value.begin_snapshot = self.new_snapshot_id;
-        self.state.put_table(value);
+        self.state.put_table(TableValue {
+            table_name: new_name.to_owned(),
+            begin_snapshot: self.new_snapshot_id,
+            ..value
+        });
         self.mark_altered(table.get());
+
         Ok(())
     }
 
@@ -267,14 +268,16 @@ impl Transaction {
     /// already exists in the target schema (including this table itself
     /// when the target is its current schema).
     pub fn set_table_schema(&mut self, table: TableId, new_schema: SchemaId) -> Result<()> {
-        let mut value = self.live_table(table)?;
         if !self.state.schemas.contains_key(&new_schema.get()) {
             return Err(Error::NotFound(format!("schema {new_schema}")));
         }
+        let value = self.live_table(table)?;
         self.relation_name_free(new_schema.get(), &value.table_name)?;
-        value.schema_id = new_schema.get();
-        value.begin_snapshot = self.new_snapshot_id;
-        self.state.put_table(value);
+        self.state.put_table(TableValue {
+            schema_id: new_schema.get(),
+            begin_snapshot: self.new_snapshot_id,
+            ..value
+        });
         self.mark_altered(table.get());
         Ok(())
     }
@@ -290,6 +293,7 @@ impl Transaction {
         self.ops.push(Operation::DropTable {
             table_id: table.get(),
         });
+
         Ok(())
     }
 
@@ -302,7 +306,7 @@ impl Transaction {
     /// Returns [`Error::AlreadyExists`] if a column with that name already
     /// exists in the table.
     pub fn add_column(&mut self, table: TableId, def: &ColumnDef) -> Result<ColumnId> {
-        let mut value = self.live_table(table)?;
+        let value = self.live_table(table)?;
         self.column_name_free(table, &def.name)?;
         let live_columns = self.state.columns.get(&table.get());
         let live_max_id = live_columns
@@ -320,10 +324,13 @@ impl Transaction {
             self.new_snapshot_id,
             def,
         ));
-        value.next_column_id = column_id + 1;
-        value.begin_snapshot = self.new_snapshot_id;
-        self.state.put_table(value);
+        self.state.put_table(TableValue {
+            next_column_id: column_id + 1,
+            begin_snapshot: self.new_snapshot_id,
+            ..value
+        });
         self.mark_altered(table.get());
+
         Ok(ColumnId::new(column_id))
     }
 
@@ -345,6 +352,7 @@ impl Transaction {
         if taken {
             return Err(Error::AlreadyExists(format!("column {name}")));
         }
+
         Ok(())
     }
 
@@ -362,12 +370,15 @@ impl Transaction {
         column: ColumnId,
         new_name: &str,
     ) -> Result<()> {
-        let mut value = self.live_column(table, column)?;
         self.column_name_free(table, new_name)?;
-        new_name.clone_into(&mut value.column_name);
-        value.begin_snapshot = self.new_snapshot_id;
+        let value = ColumnValue {
+            begin_snapshot: self.new_snapshot_id,
+            column_name: new_name.to_string(),
+            ..self.live_column(table, column)?
+        };
         self.state.put_column(value);
         self.mark_altered(table.get());
+
         Ok(())
     }
 
@@ -382,19 +393,21 @@ impl Transaction {
         column: ColumnId,
         alteration: ColumnAlteration,
     ) -> Result<()> {
-        let mut value = self.live_column(table, column)?;
-        if let Some(column_type) = alteration.column_type {
-            value.column_type = column_type;
-        }
-        if let Some(nulls_allowed) = alteration.nulls_allowed {
-            value.nulls_allowed = nulls_allowed;
-        }
-        if let Some(default_value) = alteration.default_value {
-            value.default_value = default_value;
-        }
-        value.begin_snapshot = self.new_snapshot_id;
-        self.state.put_column(value);
+        let value = self.live_column(table, column)?;
+        let ColumnAlteration {
+            column_type,
+            nulls_allowed,
+            default_value,
+        } = alteration;
+        self.state.put_column(ColumnValue {
+            column_type: column_type.unwrap_or(value.column_type),
+            nulls_allowed: nulls_allowed.unwrap_or(value.nulls_allowed),
+            default_value: default_value.unwrap_or(value.default_value),
+            begin_snapshot: self.new_snapshot_id,
+            ..value
+        });
         self.mark_altered(table.get());
+
         Ok(())
     }
 
@@ -419,10 +432,11 @@ impl Transaction {
         }
         self.state.delete_column(table.get(), column.get());
         self.mark_altered(table.get());
+
         Ok(())
     }
 
-    fn live_tstat(&self, table: TableId) -> Result<TableStatsValue> {
+    fn live_table_stats(&self, table: TableId) -> Result<TableStatsValue> {
         self.state
             .table_stats
             .get(&table.get())
@@ -448,12 +462,14 @@ impl Transaction {
             self.live_column(table, entry.column_id)?;
         }
         let data_file_id = self.alloc_file_id();
-        let mut tstat = self.live_tstat(table)?;
+        let tstat = self.live_table_stats(table)?;
         let row_id_start = tstat.next_row_id;
-        tstat.next_row_id = tstat.next_row_id.saturating_add(file.record_count);
-        tstat.record_count = tstat.record_count.saturating_add(file.record_count);
-        tstat.file_size_bytes = tstat.file_size_bytes.saturating_add(file.file_size_bytes);
-        self.state.put_table_stats(tstat);
+        self.state.put_table_stats(TableStatsValue {
+            next_row_id: tstat.next_row_id.saturating_add(file.record_count),
+            record_count: tstat.record_count.saturating_add(file.record_count),
+            file_size_bytes: tstat.file_size_bytes.saturating_add(file.file_size_bytes),
+            ..tstat
+        });
         self.state.put_data_file(DataFileValue {
             data_file_id,
             table_id: table.get(),
@@ -524,12 +540,14 @@ impl Transaction {
 
         self.state.delete_data_file(table.get(), file.get());
 
-        let mut tstat = self.live_tstat(table)?;
-        tstat.record_count = tstat.record_count.saturating_sub(data_file.record_count);
-        tstat.file_size_bytes = tstat
-            .file_size_bytes
-            .saturating_sub(data_file.file_size_bytes);
-        self.state.put_table_stats(tstat);
+        let tstat = self.live_table_stats(table)?;
+        self.state.put_table_stats(TableStatsValue {
+            record_count: tstat.record_count.saturating_sub(data_file.record_count),
+            file_size_bytes: tstat
+                .file_size_bytes
+                .saturating_sub(data_file.file_size_bytes),
+            ..tstat
+        });
 
         self.ops.push(Operation::ExpireDataFile {
             table_id: table.get(),
@@ -627,10 +645,12 @@ impl Transaction {
         file_size_bytes: u64,
     ) -> Result<()> {
         self.live_table(table)?;
-        let mut tstat = self.live_tstat(table)?;
-        tstat.record_count = record_count;
-        tstat.file_size_bytes = file_size_bytes;
-        self.state.put_table_stats(tstat);
+        let tstat = self.live_table_stats(table)?;
+        self.state.put_table_stats(TableStatsValue {
+            record_count,
+            file_size_bytes,
+            ..tstat
+        });
         self.ops.push(Operation::UpdateStats {
             table_id: table.get(),
         });
@@ -714,16 +734,18 @@ impl Transaction {
     ///
     /// Returns [`Error::NotFound`] if the view does not exist.
     pub fn alter_view(&mut self, view: ViewId, dialect: &str, sql: &str) -> Result<()> {
-        let mut value = self
+        let value = self
             .state
             .views
             .get(&view.get())
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("view {view}")))?;
-        dialect.clone_into(&mut value.dialect);
-        sql.clone_into(&mut value.sql);
-        value.begin_snapshot = self.new_snapshot_id;
-        self.state.put_view(value);
+        self.state.put_view(ViewValue {
+            dialect: dialect.to_owned(),
+            sql: sql.to_owned(),
+            begin_snapshot: self.new_snapshot_id,
+            ..value
+        });
         self.ops.push(Operation::AlterView {
             view_id: view.get(),
         });
@@ -844,11 +866,13 @@ fn new_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CatalogSnapshot, FileColumnStats};
-    use crate::store::proto::SnapshotValue;
+    use crate::{
+        catalog::{CatalogSnapshot, FileColumnStats},
+        store::proto::SnapshotValue,
+    };
 
     fn empty_transaction() -> Transaction {
-        let snap = SnapshotValue {
+        let snapshot = SnapshotValue {
             snapshot_id: 4,
             snapshot_time_micros: 1,
             schema_version: 2,
@@ -861,7 +885,7 @@ mod tests {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
         };
-        Transaction::new(CatalogSnapshot::build(snap, vec![], vec![], None), 5)
+        Transaction::new(CatalogSnapshot::build(snapshot, vec![], vec![], None), 5)
     }
 
     fn col(name: &str) -> ColumnDef {
@@ -1056,10 +1080,9 @@ mod tests {
         // A table version authored without the counter (next_column_id
         // absent, i.e. 0) must not let allocation regress below the ids
         // already live on the table.
-        use crate::catalog::CatalogSnapshot;
-        use crate::store::read::EntityRecord;
+        use crate::{catalog::CatalogSnapshot, store::read::EntityRecord};
 
-        let snap = SnapshotValue {
+        let snapshot = SnapshotValue {
             snapshot_id: 4,
             snapshot_time_micros: 1,
             schema_version: 0,
@@ -1101,9 +1124,9 @@ mod tests {
                 tags: vec![],
             })
         });
-        let mut cur = vec![EntityRecord::Table(table)];
-        cur.extend(columns);
-        let state = CatalogSnapshot::build(snap, cur, vec![], None);
+        let mut current = vec![EntityRecord::Table(table)];
+        current.extend(columns);
+        let state = CatalogSnapshot::build(snapshot, current, vec![], None);
         let mut transaction = Transaction::new(state, 5);
         let c = transaction.add_column(TableId::new(1), &col("c")).unwrap();
         assert_eq!(c, ColumnId::new(3));

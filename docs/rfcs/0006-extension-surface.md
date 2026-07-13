@@ -97,8 +97,8 @@ and `EXPLAIN` work) and raise a redirect error naming the
 `ducklake:moraine:` attach at execution time. No opt-out option exists.
 
 **Metadata projections.** Every `ducklake_*` table the keyed store models
-is queryable through the attached catalog, served row-faithfully — `cur`
-and `hist` rows both, since DuckLake filters lifecycles in SQL; unversioned
+is queryable through the attached catalog, served row-faithfully — `current`
+and `history` rows both, since DuckLake filters lifecycles in SQL; unversioned
 kinds serve current values. DuckDB's executor plans joins over per-table
 scans. `ducklake_metadata` is synthesized from store facts (format
 version, options) so DuckLake's exists-probe and version reads succeed on
@@ -173,11 +173,11 @@ reconciled. This keeps moraine robust to DuckLake evolving its SQL: the same sca
 hooks serve new access patterns over the same tables.
 
 "No semantic re-modeling" comes with **exactly one interpreted
-convention**, stated so its scope is bounded. The RFC 0002 `cur`/`hist`
+convention**, stated so its scope is bounded. The RFC 0002 `current`/`history`
 split physically encodes the begin/end-snapshot lifecycle columns, so
 moraine must *recognize* the lifecycle in DuckLake's DML — an `UPDATE` that
 sets a row's `end_snapshot` translates to end-version bookkeeping (delete
-the `cur` key, write the `hist` key), not a blind value overwrite. That is
+the `current` key, write the `history` key), not a blind value overwrite. That is
 a semantic mapping, and it is where the residual drift risk concentrates:
 if DuckLake ever mutates those columns in a shape moraine does not
 recognize (un-ending a row, say), the translation would misfile it. The
@@ -367,7 +367,7 @@ throws `NotImplementedException`, matching the "translate staged rows,
 author nothing else" scope above. Per the staged-row rules: DuckLake
 authors every id/counter/`schema_version`/`begin_snapshot` value, carried
 across the ABI verbatim; the one interpreted convention is an `UPDATE`
-setting `end_snapshot`, translated to a `cur`-key delete plus `hist`-key
+setting `end_snapshot`, translated to a `current`-key delete plus `history`-key
 write; a lost race at commit returns an error whose message contains the
 literal substring `conflict` (never retried internally, per the C ABI
 error mapping table above).
@@ -402,7 +402,7 @@ the one place moraine's catalog lookup does more than serve the fixed
   connection's own `LookupInlineTableEntry` accepts the `CREATE` that
   follows).
 - `ducklake_inlined_delete_<table_id>` — recognized once at least one
-  `inline/fdel` has been staged for `table_id` (DuckLake probes this
+  `inline/file_delete` has been staged for `table_id` (DuckLake probes this
   table's existence with `SELECT NULL FROM ... LIMIT 1` and treats a
   bind error as "does not exist"; unlike the data family this one must
   report missing for a real table_id until its first inlined
@@ -502,7 +502,7 @@ not as a production recommendation.
   enforces is the equivalent backstop: an insert whose id already exists
   as a live record of the same kind (the five keyed kinds above) fails
   with a typed `Constraint` error rather than silently overwriting the
-  `cur` key — one existence check per translated insert, no general
+  `current` key — one existence check per translated insert, no general
   constraint machinery, and no name-uniqueness enforcement (DuckLake owns
   that).
 - **DuckDB version cadence.** How often the pin must move, and the support

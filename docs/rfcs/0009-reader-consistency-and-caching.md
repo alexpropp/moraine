@@ -5,7 +5,7 @@
 ## Summary
 
 RFC 0003 defines `CatalogSnapshot` as "an immutable, materialized read view
-built by scanning `cur` (or `cur` + `hist`)" that "touches the store never"
+built by scanning `current` (or `current` + `history`)" that "touches the store never"
 after construction. It does not say how that view is built *consistently*
 while a committer writes concurrently, how a long-lived reader learns of new
 commits, or what happens to a held view when RFC 0007 reclaims the files it
@@ -19,16 +19,16 @@ is the read-side companion to RFC 0004's write-side commit protocol.
 
 ## Goals
 
-- **Consistent materialization.** The `cur` / `hist` / `snap` scans that build
+- **Consistent materialization.** The `current` / `history` / `snapshot` scans that build
   one `CatalogSnapshot` observe a single, consistent store state — never a mix
   of pre- and post-commit records torn by a concurrent commit.
 - **Snapshot isolation for reads.** Every accessor on a `CatalogSnapshot`
   reflects exactly the catalog at one snapshot id `S`. Reads never block
   writes and a concurrent commit never mutates a held view (RFC 0004
-  append-only + immutable `snap`).
+  append-only + immutable `snapshot`).
 - **Cheap refresh.** Advancing a long-lived reader from `S` to head costs work
   proportional to *churn* (the entities changed between `S` and head), not to
-  live catalog size — using the `snapshot_changes` already in each `snap`
+  live catalog size — using the `snapshot_changes` already in each `snapshot`
   record (RFC 0002).
 - **Committer read-your-writes.** The single committer (RFC 0004) advances its
   own view by folding in the batch it just committed, without a re-read.
@@ -43,7 +43,7 @@ Non-goals:
 
 - **The read *API*** — `CatalogSnapshot`, its accessors, `snapshot()` /
   `snapshot_at()` — RFC 0003. This RFC is the machinery behind them.
-- **The physical `cur` / `hist` layout and the current-vs-time-travel split**
+- **The physical `current` / `history` layout and the current-vs-time-travel split**
   — RFC 0002. This RFC consumes that layout; it does not change it.
 - **Reclamation policy** — RFC 0007. This RFC defines only how a reader
   *reacts* to a view falling outside the retention window.
@@ -51,13 +51,13 @@ Non-goals:
 
 ## Background
 
-RFC 0002 makes the current-catalog load a scan of `cur` and time travel a scan
-of `cur` + the relevant `hist` ranges; it merges `ducklake_snapshot` and
-`ducklake_snapshot_changes` into one immutable `snap` record per snapshot, and
-notes that `snap` is append-only and `sys/head` holds the latest committed
+RFC 0002 makes the current-catalog load a scan of `current` and time travel a scan
+of `current` + the relevant `history` ranges; it merges `ducklake_snapshot` and
+`ducklake_snapshot_changes` into one immutable `snapshot` record per snapshot, and
+notes that `snapshot` is append-only and `sys/head` holds the latest committed
 `snapshot_id`. It also chose *not* to maintain a persistent name index —
 name→id resolution runs "against the in-memory catalog snapshot that a client
-builds by scanning `cur` at attach."
+builds by scanning `current` at attach."
 
 RFC 0004 fixes the topology: readers attach through read-only handles
 (SlateDB `DbReader`) that follow the manifest with no coordination and no
@@ -78,7 +78,7 @@ duration. This RFC honors that contract on the reader side.
 ### Materialization rests on one SlateDB read-snapshot
 
 The correctness foundation: building a `CatalogSnapshot` issues *many* store
-reads (a `cur` range scan, `hist` ranges for time travel, the `snap` record,
+reads (a `current` range scan, `history` ranges for time travel, the `snapshot` record,
 `sys/head`). These must observe one consistent store state, or a commit
 landing mid-build could yield a view that has a table's new `column` record
 but not its new `file` record — a torn read.
@@ -108,7 +108,7 @@ would have no way to know to refuse (RFC 0015).
 
 `snapshot_at(S')` (time travel) pins the same way, reads `sys/head` only to
 validate `S'` is resolvable (≥ RFC 0007's horizon `H`), and materializes from
-`cur` + `hist` filtered by begin/end per RFC 0002.
+`current` + `history` filtered by begin/end per RFC 0002.
 
 **Commit attempts materialize through the transaction, not a
 read-snapshot.** SlateDB's write-write conflict detection sees only commits
@@ -131,7 +131,7 @@ identical in both cases; only the handle it was built through differs.
 
 ### Snapshot isolation is free
 
-Because `snap` is immutable and every entity version is append-only with an
+Because `snapshot` is immutable and every entity version is append-only with an
 `end_snapshot` that is only ever *set once, at commit* (RFC 0002/0004), the set
 of records visible at `S` never changes after `S` exists. A concurrent commit
 `S+1` adds records and ends others *for `S+1`*, but nothing it does alters what
@@ -143,7 +143,7 @@ after build."
 ### Incremental refresh from the changelog
 
 A long-lived reader (or the committer's planning view) advances from `S` to a
-newer head `S+k` without rescanning `cur`:
+newer head `S+k` without rescanning `current`:
 
 1. Pin a fresh read-snapshot; read `sys/head` and the `sys/migration`
    marker under it (refusing with `Migration` if the marker is present, as
@@ -152,25 +152,25 @@ newer head `S+k` without rescanning `cur`:
 2. Otherwise scan `snap/{S+1 .. head}` **under the same pinned handle**.
    Each record carries its `snapshot_changes` (RFC 0002) — the precise set
    of entities the commit touched.
-3. For each changed entity, re-read just that entity's `cur` record (or, if
+3. For each changed entity, re-read just that entity's `current` record (or, if
    it was ended, drop it from the view), still under the same handle — a
    refresh, like a materialization, is one consistent cut, never a mix of
    per-step reads torn by a concurrent commit. Apply to the in-memory
    catalog.
 
 Cost is proportional to churn across the gap, not to catalog size. This is the
-payoff of merging `snapshot_changes` into the `snap` record: the changelog a
+payoff of merging `snapshot_changes` into the `snapshot` record: the changelog a
 reader needs to refresh is exactly the changelog a commit already writes.
 
 **Fallback to full rematerialization** when incremental is impossible or not
 worth it:
 
-- **`S` fell below the horizon** (`S < H`, RFC 0007): the `snap` records for
+- **`S` fell below the horizon** (`S < H`, RFC 0007): the `snapshot` records for
   the gap may have been reclaimed, so there is no changelog to replay. The
   reader rematerializes at head. (If the reader specifically wanted the *old*
   `S`, that snapshot is gone — see validity window.)
 - **The gap is large** relative to catalog size (churn ≥ live entities): a
-  full `cur` rescan is cheaper than replaying a huge changelog. A threshold
+  full `current` rescan is cheaper than replaying a huge changelog. A threshold
   picks the cheaper path; the two produce identical views, so the choice is
   purely a cost optimization.
 
@@ -180,7 +180,7 @@ The single committer (RFC 0004) holds a planning `CatalogSnapshot`. After it
 commits `N → N+1`, it must see its own write to plan the next commit. It does
 **not** re-read: it already assembled the `WriteBatch`, so it folds the exact
 staged mutations into its in-memory view and stamps it `N+1`. This is strictly
-cheaper than incremental refresh (no `snap` scan, no re-read) and is always
+cheaper than incremental refresh (no `snapshot` scan, no re-read) and is always
 correct because the committer *is* the source of the delta. Under RFC 0004
 group commit, the committer folds in the whole committed group at once. A
 committer that loses the CAS and retries simply rebuilds from the new head like
@@ -199,7 +199,7 @@ implies:
 
 - A `CatalogSnapshot` whose `S` is still `≥ H` is fully valid.
 - A reader that tries to materialize or refresh at an `S` that has fallen below
-  `H` — detected because its `snap`/`hist` range is no longer resolvable —
+  `H` — detected because its `snapshot`/`history` range is no longer resolvable —
   receives a typed **`SnapshotExpired`** error (RFC 0003 error taxonomy, one
   variant per failure domain) and must re-resolve from head.
 - The safety margin is the retention window minus the reader's lifetime; RFC
@@ -221,8 +221,8 @@ latest `CatalogSnapshot` and hand out clones; a refresh replaces it. There is:
   logical cache would reintroduce exactly the coordination the topology avoids.
 - **No separate physical cache.** SlateDB's own block cache serves repeated
   physical reads underneath; this RFC's cache is the *logical* materialized
-  catalog, cheap to rebuild from `cur` because RFC 0002 keeps the live catalog
-  small. A cold reader pays one `cur` scan; a warm reader pays incremental
+  catalog, cheap to rebuild from `current` because RFC 0002 keeps the live catalog
+  small. A cold reader pays one `current` scan; a warm reader pays incremental
   refresh.
 
 ### Test obligations
@@ -286,7 +286,7 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   across a concurrent commit can observe a torn view (new `column`, missing
   `file`). A single pinned read-snapshot is the only cheap way to get a
   consistent cut without locking writers.
-- **Re-scanning `cur` on every read (no cache / no incremental refresh).**
+- **Re-scanning `current` on every read (no cache / no incremental refresh).**
   Rejected: defeats RFC 0003's "no store I/O after build" and pays the full
   scan per refresh. `snapshot_changes` gives a precise cheap changelog; use it.
 - **Push-based invalidation (committer notifies readers of new commits).**

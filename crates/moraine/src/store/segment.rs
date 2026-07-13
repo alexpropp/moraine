@@ -57,12 +57,12 @@ mod tests {
     #[test]
     fn extractor_agrees_with_subspace_prefix() {
         use crate::store::key::{self, Key};
-        let key = Key::cur(key::EntityKey::Table { table_id: 7 });
+        let key = Key::current(key::EntityKey::Table { table_id: 7 });
         let encoded = key.encode();
         let len = TagSegmentExtractor
             .prefix_len(&PrefixTarget::Point(Bytes::from(encoded.clone())))
             .unwrap();
-        let prefix = key::subspace_prefix(key::Subspace::Cur);
+        let prefix = key::subspace_prefix(key::Subspace::Current);
         assert_eq!(len, prefix.len());
         assert_eq!(&encoded[..len], prefix.as_slice());
     }

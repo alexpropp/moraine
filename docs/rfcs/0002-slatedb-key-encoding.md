@@ -55,22 +55,22 @@ below the leading byte is moraine convention, opaque to SlateDB.
 
 | Subspace | Contents | Mutability |
 |---|---|---|
-| `sys` | Format version, head pointer, catalog-level options | Overwritten in place |
-| `snap` | One record per snapshot | Append-only, immutable |
-| `cur` | Live catalog entities (no `end_snapshot`) | Insert + delete |
-| `hist` | Ended entity versions | Append-only |
+| `system` | Format version, head pointer, catalog-level options | Overwritten in place |
+| `snapshot` | One record per snapshot | Append-only, immutable |
+| `current` | Live catalog entities (no `end_snapshot`) | Insert + delete |
+| `history` | Ended entity versions | Append-only |
 | `inline` | Inlined data — reserved for RFC 0005 | Per RFC 0005 |
 
 (Subspace declaration order — and therefore each subspace's discriminant
 byte — is fixed by the `Key` type and pinned by golden vectors; see Keys.)
 
-The `cur`/`hist` split is the load-bearing decision. Loading the current
-catalog is a scan of `cur` only. Ending an entity version (drop, alter,
-file compacted away) atomically deletes its `cur` key and writes a `hist`
-key in the same commit batch. History accumulates in `hist`, where the hot
+The `current`/`history` split is the load-bearing decision. Loading the current
+catalog is a scan of `current` only. Ending an entity version (drop, alter,
+file compacted away) atomically deletes its `current` key and writes a `history`
+key in the same commit batch. History accumulates in `history`, where the hot
 path never looks; snapshot expiry (RFC 0007) garbage-collects it.
 Reconstructing the catalog at snapshot `S` scans both and filters: from
-`cur`, keep `begin_snapshot <= S`; from `hist`, keep
+`current`, keep `begin_snapshot <= S`; from `history`, keep
 `begin_snapshot <= S < end_snapshot`.
 
 ### Keys
@@ -96,23 +96,23 @@ bump that alters encoding) fails CI before it can reach a store.
   ids — schemas/tables/views/macros from the global `next_catalog_id`,
   files from `next_file_id`, columns from a per-table counter (RFC 0012).
   Names live in values; name→id resolution runs against the in-memory
-  snapshot built by scanning `cur` at attach (a persistent name index is
+  snapshot built by scanning `current` at attach (a persistent name index is
   complexity without payoff at catalog scale).
-- `hist` keys append the version's `end_snapshot` as the final component,
+- `history` keys append the version's `end_snapshot` as the final component,
   making ended versions of one entity distinct and time-ordered.
 - SlateDB iterates **forward only**; the layout depends on no descending
   scan — `sys/head` is an explicit pointer (never a find-max-key scan),
-  and every range read (`cur` load, time travel, `hist` dead-prefix
-  expiry, `snap` refresh) is ascending by construction. New kinds must
+  and every range read (`current` load, time travel, `history` dead-prefix
+  expiry, `snapshot` refresh) is ascending by construction. New kinds must
   preserve this.
 
 ### Keyspace map
 
-Kinds within `cur`. Temporally versioned kinds are mirrored in `hist`
+Kinds within `current`. Temporally versioned kinds are mirrored in `history`
 with `end_snapshot` appended; the **statistics kinds (`fstat`, `tstat`,
 `tcstat`) are unversioned** — DuckLake's stats tables carry no begin/end
 columns, so these records are overwritten in place, never transition to
-`hist`, and a time-travel view serves the current stats (stats are
+`history`, and a time-travel view serves the current stats (stats are
 advisory pruning data, not catalog history). An `fstat` record outlives
 its file's live version — historical snapshots still prune by it — and
 is removed only when RFC 0007 GC prunes the file's history. The `tag`
@@ -131,8 +131,8 @@ entries are individually begin/end-versioned (see its row below):
 | `fstat` | `table_id, data_file_id, column_id` | `ducklake_file_column_stats` (+ variant stats) |
 | `tstat` | `table_id` | `ducklake_table_stats` |
 | `tcstat` | `table_id, column_id` | `ducklake_table_column_stats` |
-| `tag` | `object_id` | `ducklake_tag`, **one container record per tagged object** holding all of the object's tag rows as embedded entries (object ids are unique across entity types via the shared counter — no type discriminator needed). An object can carry many tags, and tag keys are strings that stay out of the keyspace, so the rows cannot each own a store key; they embed instead, exactly as `ducklake_column_tag` embeds in the column value. The container is **overwritten in place** (no `hist` mirror), while each embedded entry carries its own `begin_snapshot`/`end_snapshot` verbatim from its `ducklake_tag` row — a tag change rewrites the container, ending or appending entries; time travel filters entries by begin/end at read; ended entries are pruned from the container when RFC 0007 GC passes the retention horizon. Row-faithfulness holds because entries are `ducklake_tag` rows, not a re-modeling. |
-| `option` | `scope_kind, scope_id` | `ducklake_metadata` / `set_option` scopes. `scope_kind` ∈ {global = 0, schema = 1, table = 2}; global uses `scope_id` 0. One record per scope holding its options as a map (option *names* are strings and stay out of keys); set/unset rewrites the record. Options are **unversioned** — DuckLake's `set_option` writes outside the snapshot protocol, last-write-wins (RFC 0004) — so they never transition to `hist`, and an options-only mutation doesn't advance head. |
+| `tag` | `object_id` | `ducklake_tag`, **one container record per tagged object** holding all of the object's tag rows as embedded entries (object ids are unique across entity types via the shared counter — no type discriminator needed). An object can carry many tags, and tag keys are strings that stay out of the keyspace, so the rows cannot each own a store key; they embed instead, exactly as `ducklake_column_tag` embeds in the column value. The container is **overwritten in place** (no `history` mirror), while each embedded entry carries its own `begin_snapshot`/`end_snapshot` verbatim from its `ducklake_tag` row — a tag change rewrites the container, ending or appending entries; time travel filters entries by begin/end at read; ended entries are pruned from the container when RFC 0007 GC passes the retention horizon. Row-faithfulness holds because entries are `ducklake_tag` rows, not a re-modeling. |
+| `option` | `scope_kind, scope_id` | `ducklake_metadata` / `set_option` scopes. `scope_kind` ∈ {global = 0, schema = 1, table = 2}; global uses `scope_id` 0. One record per scope holding its options as a map (option *names* are strings and stay out of keys); set/unset rewrites the record. Options are **unversioned** — DuckLake's `set_option` writes outside the snapshot protocol, last-write-wins (RFC 0004) — so they never transition to `history`, and an options-only mutation doesn't advance head. |
 
 Other subspaces:
 
@@ -141,8 +141,8 @@ Other subspaces:
 | `sys/format` | — | Layout format version (this RFC = 1), moraine version that wrote it |
 | `sys/head` | — | Latest committed `snapshot_id` |
 | `sys/migration` | — | Structural-migration marker (RFC 0015): `{from_format, to_format, cursor}`, present only mid-migration. **Reserved from format v1**: every materialization checks it and refuses a mid-migration store (RFC 0009) — the check must predate the first migration ever run. |
-| `snap` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together) |
-| `cur/gcfile` | `deletion_id` | `ducklake_files_scheduled_for_deletion` |
+| `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together) |
+| `current/gcfile` | `deletion_id` | `ducklake_files_scheduled_for_deletion` |
 | `inline/*` | `table_id, schema_version, …` | Reserved — RFC 0005 |
 
 Two mapping conventions apply throughout: **1:1 side tables merge** into
@@ -176,7 +176,7 @@ header.
   changes bump it and require migration, RFC 0015); protobuf field
   evolution and the per-value encoding version do not.
 
-Entity values carry `begin_snapshot` (in `hist`, `end_snapshot` appears in
+Entity values carry `begin_snapshot` (in `history`, `end_snapshot` appears in
 both key and value — values are self-contained). Timestamps are
 microseconds since epoch, UTC.
 
@@ -229,7 +229,7 @@ Per RFC 0001:
 - **Single subspace, begin/end in values:** every current read filters
   full history — the hot path pays for time travel whether used or not,
   degrading without bound between expiries. Rejected.
-- **Version-in-key (`id, begin_snapshot`), no `cur`/`hist` split:**
+- **Version-in-key (`id, begin_snapshot`), no `current`/`history` split:**
   append-only and elegant, but live-version reads become reverse scans and
   the live-catalog load still filters ended versions. Rejected; the split
   buys O(live) reads for one extra delete+put per ended version.

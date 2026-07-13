@@ -18,14 +18,20 @@
 //! caller contract requires the catalog outlive every open transaction on
 //! it.
 
-use std::ffi::c_char;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    ffi::c_char,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 
-use moraine::ffi_support::staged::{Cell, RowOp, StagedTransaction, TableKind, staged_begin};
+use moraine::ffi_support::staged::{
+    Cell, RowOperation, StagedTransaction, TableKind, staged_begin,
+};
 
-use crate::abi::{borrow_bytes, borrow_str, guard};
-use crate::error::{AbiError, MoraineError, codes};
-use crate::runtime::MoraineCatalogHandle;
+use crate::{
+    abi::{borrow_bytes, borrow_str, guard},
+    error::{AbiError, MoraineError, codes},
+    runtime::MoraineCatalogHandle,
+};
 
 /// One value in a staged row. Mirrors [`Cell`] as a tagged struct across
 /// the C boundary; `str_value` is borrowed, valid only for the duration of
@@ -73,7 +79,7 @@ fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
     }
 }
 
-/// The three [`RowOp`] shapes, decoded from `op_kind`.
+/// The three [`RowOperation`] shapes, decoded from `op_kind`.
 enum OpKind {
     Insert,
     Delete,
@@ -188,7 +194,7 @@ pub unsafe extern "C" fn moraine_txn_begin(
 /// `FileColumnStats`, `11` = `SchemaVersions`); `op_kind` is `0` = insert,
 /// `1` = delete, `2` = update-sets-`end_snapshot`. `cells` are positional
 /// in the column order the shim declares for `table_kind`'s table (a delete
-/// or update-set-end row carries only the key columns, per [`RowOp`]'s
+/// or update-set-end row carries only the key columns, per [`RowOperation`]'s
 /// variants).
 ///
 /// # Safety
@@ -217,15 +223,15 @@ pub unsafe extern "C" fn moraine_txn_stage(
         // SAFETY: caller contract above.
         let row_cells = unsafe { decode_cells(cells, cells_len) }?;
         let op = match kind {
-            OpKind::Insert => RowOp::Insert {
+            OpKind::Insert => RowOperation::Insert {
                 table,
                 cells: row_cells,
             },
-            OpKind::Delete => RowOp::Delete {
+            OpKind::Delete => RowOperation::Delete {
                 table,
                 cells: row_cells,
             },
-            OpKind::UpdateSetEnd => RowOp::UpdateSetEnd {
+            OpKind::UpdateSetEnd => RowOperation::UpdateSetEnd {
                 table,
                 cells: row_cells,
             },
@@ -346,7 +352,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_schema(
         let bytes = unsafe { borrow_bytes(arrow_schema, arrow_schema_len, "arrow_schema") }?;
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineSchema {
+        txn_ref.txn.stage(RowOperation::InlineSchema {
             table_id,
             schema_version,
             arrow_schema: bytes.to_vec(),
@@ -390,7 +396,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
         let bytes = unsafe { borrow_bytes(arrow_body, arrow_body_len, "arrow_body") }?;
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineInsert {
+        txn_ref.txn.stage(RowOperation::InlineInsert {
             table_id,
             schema_version,
             begin_snapshot,
@@ -429,7 +435,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_inline_delete(
         }
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineInlineDelete {
+        txn_ref.txn.stage(RowOperation::InlineInlineDelete {
             table_id,
             row_id,
             end_snapshot,
@@ -464,7 +470,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_file_delete(
         }
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineFileDelete {
+        txn_ref.txn.stage(RowOperation::InlineFileDelete {
             table_id,
             data_file_id,
             row_id,
@@ -501,7 +507,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_flush_delete(
         }
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineFlushDelete {
+        txn_ref.txn.stage(RowOperation::InlineFlushDelete {
             table_id,
             schema_version,
             flush_snapshot,
@@ -535,7 +541,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_drop(
         }
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineDrop { table_id });
+        txn_ref.txn.stage(RowOperation::InlineDrop { table_id });
         Ok(())
     };
 
@@ -567,7 +573,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_schema_drop(
         }
         // SAFETY: caller contract for `txn`.
         let txn_ref = unsafe { &mut *txn };
-        txn_ref.txn.stage(RowOp::InlineSchemaDrop {
+        txn_ref.txn.stage(RowOperation::InlineSchemaDrop {
             table_id,
             schema_version,
         });
@@ -583,8 +589,7 @@ pub unsafe extern "C" fn moraine_txn_stage_inline_schema_drop(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
-    use std::ptr;
+    use std::{ffi::CString, ptr};
 
     use super::*;
     use crate::abi::{moraine_attach, moraine_detach};
@@ -898,7 +903,7 @@ mod tests {
 
     /// The other two op kinds over the wire: an `update_set_end` row
     /// (`op_kind` 2 — the C++ UPDATE operator's staging for a rename/drop)
-    /// moves the old table version to hist, and a raw `delete` row
+    /// moves the old table version to history, and a raw `delete` row
     /// (`op_kind` 1) removes an unversioned statistics row. Cell layouts
     /// here are exactly what `cpp/staged_write.cpp`'s Sinks emit: key
     /// cells in decoder order, plus (for `update_set_end`) the new
@@ -947,7 +952,7 @@ mod tests {
         });
         assert_eq!(id2, 2);
 
-        // The dump serves both versions: hist `t` ended at 2, cur `t2`.
+        // The dump serves both versions: history `t` ended at 2, current `t2`.
         let mut rows: *mut crate::dumps::MoraineTableRow = ptr::null_mut();
         let mut len: usize = 0;
         let mut dump_err = MoraineError::default();
@@ -973,7 +978,7 @@ mod tests {
             .unwrap();
         assert_eq!(live_name, "t2");
 
-        // The stats row is gone (unversioned raw delete, no hist mirror).
+        // The stats row is gone (unversioned raw delete, no history mirror).
         let mut stats: *mut crate::dumps::MoraineTableStatsRow = ptr::null_mut();
         let mut stats_len: usize = 0;
         let mut stats_err = MoraineError::default();

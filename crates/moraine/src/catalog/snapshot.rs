@@ -26,7 +26,7 @@ use crate::{
 /// snapshot 0.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
-    pub(crate) snap: SnapshotValue,
+    pub(crate) snapshot: SnapshotValue,
     pub(crate) schemas: BTreeMap<u64, SchemaValue>,
     pub(crate) tables: BTreeMap<u64, TableValue>,
     pub(crate) views: BTreeMap<u64, ViewValue>,
@@ -43,19 +43,19 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
-    /// Builds the view. With `at: None` every `cur` record is live and
-    /// `hist` is unused (allocation reads the table's persisted counter,
+    /// Builds the view. With `at: None` every `current` record is live and
+    /// `history` is unused (allocation reads the table's persisted counter,
     /// not history); with `at: Some(s)` a record is included iff
-    /// `begin_snapshot <= s` and it had not ended by `s` (`cur` records
-    /// never have; `hist` records carry their end).
+    /// `begin_snapshot <= s` and it had not ended by `s` (`current` records
+    /// never have; `history` records carry their end).
     pub(crate) fn build(
-        snap: SnapshotValue,
-        cur: Vec<EntityRecord>,
-        hist: Vec<EntityRecord>,
+        snapshot: SnapshotValue,
+        current: Vec<EntityRecord>,
+        history: Vec<EntityRecord>,
         at: Option<u64>,
     ) -> Self {
         let mut view = Self {
-            snap,
+            snapshot,
             ..Self::default()
         };
 
@@ -63,7 +63,7 @@ impl CatalogSnapshot {
             None => end.is_none(),
             Some(s) => begin <= s && end.is_none_or(|e| e > s),
         };
-        for record in cur.into_iter().chain(hist) {
+        for record in current.into_iter().chain(history) {
             match record {
                 EntityRecord::Schema(s) if included(s.begin_snapshot, s.end_snapshot) => {
                     view.put_schema(s);
@@ -116,9 +116,9 @@ impl CatalogSnapshot {
     #[must_use]
     pub fn current_snapshot(&self) -> SnapshotInfo {
         SnapshotInfo {
-            id: SnapshotId::new(self.snap.snapshot_id),
-            time_micros: self.snap.snapshot_time_micros,
-            schema_version: self.snap.schema_version,
+            id: SnapshotId::new(self.snapshot.snapshot_id),
+            time_micros: self.snapshot.snapshot_time_micros,
+            schema_version: self.snapshot.schema_version,
         }
     }
 
@@ -174,6 +174,7 @@ impl CatalogSnapshot {
         let Some(columns) = self.columns.get(&table.get()) else {
             return Vec::new();
         };
+
         let mut infos: Vec<ColumnInfo> = columns
             .values()
             .map(|c| ColumnInfo {
@@ -183,6 +184,7 @@ impl CatalogSnapshot {
                 nulls_allowed: c.nulls_allowed,
                 default_value: c.default_value.clone(),
                 position: c.column_order,
+                parent_column: c.parent_column.map(ColumnId::new),
             })
             .collect();
         infos.sort_by_key(|c| c.position);
@@ -318,6 +320,7 @@ impl CatalogSnapshot {
         let Some(files) = self.data_files.get(&table.get()) else {
             return Vec::new();
         };
+
         files.values().map(data_file_info).collect()
     }
 
@@ -327,6 +330,7 @@ impl CatalogSnapshot {
         let Some(files) = self.delete_files.get(&table.get()) else {
             return Vec::new();
         };
+
         files.values().map(delete_file_info).collect()
     }
 
@@ -584,13 +588,13 @@ mod tests {
 
     #[test]
     fn head_view_indexes_live_entities() {
-        let cur = vec![
+        let current = vec![
             EntityRecord::Schema(schema_rec(0, "main", 1, None)),
             EntityRecord::Table(table_rec(1, 0, "orders", 2)),
             EntityRecord::Column(column_rec(1, 0, "id", 0, 2)),
             EntityRecord::Column(column_rec(1, 1, "amount", 1, 2)),
         ];
-        let view = CatalogSnapshot::build(snap(2), cur, vec![], None);
+        let view = CatalogSnapshot::build(snap(2), current, vec![], None);
 
         let s = view.schema_by_name("main").unwrap();
         assert_eq!(s.id, SchemaId::new(0));
@@ -608,32 +612,32 @@ mod tests {
     fn time_travel_filters_by_begin_and_end() {
         // Schema 0 lived [1, 3); its replacement version lives [3, ∞).
         // Table 1 was created at 4.
-        let cur = vec![
+        let current = vec![
             EntityRecord::Schema(schema_rec(0, "renamed", 3, None)),
             EntityRecord::Table(table_rec(1, 0, "orders", 4)),
         ];
-        let hist = vec![EntityRecord::Schema(schema_rec(0, "original", 1, Some(3)))];
+        let history = vec![EntityRecord::Schema(schema_rec(0, "original", 1, Some(3)))];
 
-        let at2 = CatalogSnapshot::build(snap(2), cur.clone(), hist.clone(), Some(2));
+        let at2 = CatalogSnapshot::build(snap(2), current.clone(), history.clone(), Some(2));
         assert!(at2.schema_by_name("original").is_some());
         assert!(at2.schema_by_name("renamed").is_none());
         assert!(at2.table_by_id(TableId::new(1)).is_none());
 
-        let at4 = CatalogSnapshot::build(snap(4), cur, hist, Some(4));
+        let at4 = CatalogSnapshot::build(snap(4), current, history, Some(4));
         assert!(at4.schema_by_name("renamed").is_some());
         assert!(at4.table_by_id(TableId::new(1)).is_some());
     }
 
     #[test]
-    fn hist_only_records_are_excluded_from_the_head_view() {
+    fn history_only_records_are_excluded_from_the_head_view() {
         // Column allocation now reads the table's persisted counter, not
-        // `hist` — so `build` at head must not resurrect a dropped column
+        // `history` — so `build` at head must not resurrect a dropped column
         // (or any other purely-historical record) into the live view.
-        let hist = vec![EntityRecord::Column(ColumnValue {
+        let history = vec![EntityRecord::Column(ColumnValue {
             end_snapshot: Some(3),
             ..column_rec(1, 5, "gone", 0, 1)
         })];
-        let view = CatalogSnapshot::build(snap(3), vec![], hist, None);
+        let view = CatalogSnapshot::build(snap(3), vec![], history, None);
         assert!(view.columns_of(TableId::new(1)).is_empty());
     }
 
@@ -661,14 +665,14 @@ mod tests {
 
     #[test]
     fn data_files_filter_by_version_but_stats_do_not() {
-        let cur = vec![
+        let current = vec![
             EntityRecord::File(file_rec(1, 10, 100, 5, None)),
             EntityRecord::TableStats(tstat_rec(1, 100, 100)),
         ];
-        let hist = vec![EntityRecord::File(file_rec(1, 9, 50, 1, Some(5)))];
+        let history = vec![EntityRecord::File(file_rec(1, 9, 50, 1, Some(5)))];
 
         // Head view: only the live file; stats present.
-        let head = CatalogSnapshot::build(snap(6), cur.clone(), vec![], None);
+        let head = CatalogSnapshot::build(snap(6), current.clone(), vec![], None);
         let files = head.data_files_of(TableId::new(1));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, DataFileId::new(10));
@@ -676,7 +680,7 @@ mod tests {
 
         // Time travel to snapshot 3: the ended file was live, the new one
         // not yet; stats are unversioned and served as-is.
-        let past = CatalogSnapshot::build(snap(3), cur, hist, Some(3));
+        let past = CatalogSnapshot::build(snap(3), current, history, Some(3));
         let files = past.data_files_of(TableId::new(1));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].id, DataFileId::new(9));
@@ -764,15 +768,15 @@ mod tests {
 
     #[test]
     fn views_are_versioned_and_indexed() {
-        let cur = vec![EntityRecord::View(view_rec(3, 0, "v2", 4, None))];
-        let hist = vec![EntityRecord::View(view_rec(3, 0, "v1", 1, Some(4)))];
-        let head = CatalogSnapshot::build(snap(5), cur.clone(), vec![], None);
+        let current = vec![EntityRecord::View(view_rec(3, 0, "v2", 4, None))];
+        let history = vec![EntityRecord::View(view_rec(3, 0, "v1", 1, Some(4)))];
+        let head = CatalogSnapshot::build(snap(5), current.clone(), vec![], None);
         assert_eq!(
             head.view_by_name(SchemaId::new(0), "v2").unwrap().id,
             ViewId::new(3)
         );
         assert!(head.view_by_name(SchemaId::new(0), "v1").is_none());
-        let past = CatalogSnapshot::build(snap(2), cur, hist, Some(2));
+        let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
         assert_eq!(past.view_by_id(ViewId::new(3)).unwrap().name, "v1");
     }
 

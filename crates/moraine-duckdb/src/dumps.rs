@@ -1,5 +1,5 @@
 //! Row-faithful `ducklake_*` dumps: one C array per table kind the store
-//! models, carrying every cur and hist row with every lifecycle column
+//! models, carrying every current and history row with every lifecycle column
 //! verbatim and unfiltered (DuckLake filters `begin_snapshot`/
 //! `end_snapshot` itself, in SQL).
 //!
@@ -16,13 +16,17 @@
 //!   companion flag next to the raw field, meaningless when the flag is
 //!   `false`.
 
-use std::ffi::{CString, c_char};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr;
+use std::{
+    ffi::{CString, c_char},
+    panic::{AssertUnwindSafe, catch_unwind},
+    ptr,
+};
 
-use crate::abi::{free_array, free_c_string, guard, to_c_string, write_array};
-use crate::error::{AbiError, MoraineError, codes};
-use crate::runtime::MoraineCatalogHandle;
+use crate::{
+    abi::{free_array, free_c_string, guard, to_c_string, write_array},
+    error::{AbiError, MoraineError, codes},
+    runtime::MoraineCatalogHandle,
+};
 
 /// Splits an optional `u64` into the `(has, value)` pair the C structs
 /// below carry.
@@ -55,7 +59,7 @@ pub struct MoraineSchemaRow {
     pub schema_uuid: *mut c_char,
     /// `begin_snapshot`.
     pub begin_snapshot: u64,
-    /// Whether `end_snapshot` is present (`false` for a live/cur row).
+    /// Whether `end_snapshot` is present (`false` for a live/current row).
     pub has_end_snapshot: bool,
     /// `end_snapshot`, valid iff `has_end_snapshot`.
     pub end_snapshot: u64,
@@ -67,7 +71,7 @@ pub struct MoraineSchemaRow {
     pub path_is_relative: bool,
 }
 
-/// Dumps every `ducklake_schema` row — cur and hist — into
+/// Dumps every `ducklake_schema` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -197,7 +201,7 @@ pub struct MoraineTableRow {
     pub path_is_relative: bool,
 }
 
-/// Dumps every `ducklake_table` row — cur and hist — into
+/// Dumps every `ducklake_table` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -326,7 +330,7 @@ pub struct MoraineViewRow {
     pub column_aliases: *mut c_char,
 }
 
-/// Dumps every `ducklake_view` row — cur and hist — into
+/// Dumps every `ducklake_view` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -472,7 +476,7 @@ pub struct MoraineColumnRow {
     pub default_value_dialect: *mut c_char,
 }
 
-/// Dumps every `ducklake_column` row — cur and hist — into
+/// Dumps every `ducklake_column` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -648,7 +652,7 @@ pub struct MoraineDataFileRow {
     pub partial_max: u64,
 }
 
-/// Dumps every `ducklake_data_file` row — cur and hist — into
+/// Dumps every `ducklake_data_file` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -834,7 +838,7 @@ pub struct MoraineDeleteFileRow {
     pub partial_max: u64,
 }
 
-/// Dumps every `ducklake_delete_file` row — cur and hist — into
+/// Dumps every `ducklake_delete_file` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -1353,7 +1357,7 @@ pub struct MoraineSnapshotRow {
 
 /// Dumps every `ducklake_snapshot` row into `*out_items`/`*out_len`.
 /// Snapshots carry no begin/end lifecycle of their own — this is the
-/// full committed history, not a cur/hist split.
+/// full committed history, not a current/history split.
 ///
 /// # Safety
 ///
@@ -1542,10 +1546,14 @@ pub unsafe extern "C" fn moraine_dump_schema_versions_free(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CStr;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        ffi::CStr,
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
 
     use moraine::{ColumnDef, ColumnStats, DataFile, DeleteFile, FileColumnStats};
     use object_store::local::LocalFileSystem;
@@ -1581,8 +1589,8 @@ mod tests {
     }
 
     /// Seeds a catalog whose second commit renames the table `orders`,
-    /// so `ducklake_table` carries one hist row (the old name, ended)
-    /// alongside its new cur row — the fixture every dump test below
+    /// so `ducklake_table` carries one history row (the old name, ended)
+    /// alongside its new current row — the fixture every dump test below
     /// exercises. Also carries a schema, two columns, a data file, a
     /// delete file, a view, and every statistics kind.
     fn seed(dir: &Path) {
@@ -1698,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn dump_schemas_and_tables_return_cur_and_hist_rows() {
+    fn dump_schemas_and_tables_return_current_and_history_rows() {
         let dir = TempDir::new("schemas-tables");
         seed(dir.path());
         let handle = attach_ok(dir.path());
@@ -1712,7 +1720,7 @@ mod tests {
         };
         assert_eq!(code, codes::OK);
         // `main` (bootstrap) + `sales`; the rename never touched a
-        // schema, so neither carries a hist row.
+        // schema, so neither carries a history row.
         assert_eq!(schemas_len, 2);
         // SAFETY: just populated above with `schemas_len` live elements.
         let schema_slice = unsafe { std::slice::from_raw_parts(schemas, schemas_len) };
@@ -1727,7 +1735,7 @@ mod tests {
         assert_eq!(code, codes::OK);
         assert_eq!(
             tables_len, 2,
-            "rename must yield one cur row + one hist row"
+            "rename must yield one current row + one history row"
         );
         // SAFETY: just populated above with `tables_len` live elements.
         let table_slice = unsafe { std::slice::from_raw_parts(tables, tables_len) };
