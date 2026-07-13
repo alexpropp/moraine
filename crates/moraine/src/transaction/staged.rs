@@ -28,13 +28,19 @@
 //! agree catches drift loudly instead of silently diverging from a future
 //! DuckLake version's behavior.
 
+use std::collections::HashMap;
+
 use slatedb::DbTransaction;
 
 use crate::{
-    catalog::{CatalogSnapshot, SnapshotId},
+    catalog::{
+        CatalogSnapshot, SnapshotId,
+        inline::{InlineScanKind, materialize_inline_rows},
+    },
     error::{Error, Result},
     store::{
-        key::{EntityKey, Key, SysKey},
+        inline as store_inline,
+        key::{EntityKey, InlineKey, InlineOp, Key, SysKey},
         proto, value,
     },
     transaction::commit,
@@ -134,6 +140,77 @@ pub enum RowOp {
         /// The ended row's key columns, in table order, followed by the
         /// new `end_snapshot` value.
         cells: Vec<Cell>,
+    },
+    /// `inline/schema`: the Arrow IPC schema for one `(table_id,
+    /// schema_version)`, written once at inline-table creation. Every
+    /// value here is stored verbatim, per the same rule ordinary rows
+    /// follow.
+    InlineSchema {
+        /// Owning table.
+        table_id: u64,
+        /// Schema version the layout is pinned to.
+        schema_version: u64,
+        /// The Arrow IPC schema message, verbatim.
+        arrow_schema: Vec<u8>,
+    },
+    /// `inline/ins`: one Arrow record-batch chunk of inlined rows.
+    /// `chunk_seq` is not carried here — translation allocates it, so
+    /// several `InlineInsert`s staged in one commit against the same
+    /// `(table_id, schema_version, begin_snapshot)` land as sequential
+    /// chunks in stage order.
+    InlineInsert {
+        /// Owning table.
+        table_id: u64,
+        /// Schema version the chunk was written under.
+        schema_version: u64,
+        /// Commit snapshot of the insert, DuckLake-authored verbatim.
+        begin_snapshot: u64,
+        /// The chunk's first row id; later rows are dense from here.
+        row_id_start: u64,
+        /// Row count carried by `arrow_body`.
+        row_count: u64,
+        /// The user-column cells, encoded as one Arrow IPC record-batch
+        /// body (opaque bytes to this layer).
+        arrow_body: Vec<u8>,
+    },
+    /// `inline/idel`: tombstones one inlined-insert row.
+    InlineIdel {
+        /// Owning table.
+        table_id: u64,
+        /// The tombstoned row.
+        row_id: u64,
+        /// The commit snapshot the row ends at.
+        end_snapshot: u64,
+    },
+    /// `inline/fdel`: an inlined delete against a Parquet-file row.
+    InlineFdel {
+        /// Owning table.
+        table_id: u64,
+        /// Targeted data file.
+        data_file_id: u64,
+        /// Deleted row.
+        row_id: u64,
+        /// The commit snapshot the delete takes effect at.
+        begin_snapshot: u64,
+    },
+    /// Removes every `inline/ins` chunk begun at or before
+    /// `flush_snapshot` for `(table_id, schema_version)`, plus the
+    /// `inline/idel` tombstones those chunks' rows consumed — the
+    /// flushed data survives only as the backdated `ducklake_data_file`
+    /// DuckLake registers through the ordinary file path.
+    InlineFlushDelete {
+        /// Owning table.
+        table_id: u64,
+        /// Schema version being flushed.
+        schema_version: u64,
+        /// Chunks begun at or before this snapshot are flushed.
+        flush_snapshot: u64,
+    },
+    /// Removes every `inline/*` record for `table_id`: schema, chunks,
+    /// and tombstones.
+    InlineDrop {
+        /// The dropped table.
+        table_id: u64,
     },
 }
 
@@ -533,7 +610,32 @@ fn apply_op(
         RowOp::Insert { table, cells } => apply_insert(base, state, *table, cells),
         RowOp::UpdateSetEnd { table, cells } => apply_update_set_end(state, *table, cells, new_id),
         RowOp::Delete { table, cells } => apply_delete(state, *table, cells),
+        // Inline ops never reach here: `translate` routes them to
+        // `translate_inline`, which writes `inline/*` keys directly
+        // rather than diffing `CatalogSnapshot` state (that state has no
+        // notion of inlined rows). Kept only for match exhaustiveness
+        // over `RowOp`.
+        RowOp::InlineSchema { .. }
+        | RowOp::InlineInsert { .. }
+        | RowOp::InlineIdel { .. }
+        | RowOp::InlineFdel { .. }
+        | RowOp::InlineFlushDelete { .. }
+        | RowOp::InlineDrop { .. } => Ok(()),
     }
+}
+
+/// Whether `op` is one of the six inline variants — routed to
+/// `translate_inline`, never to [`apply_op`]'s `CatalogSnapshot` diff.
+fn is_inline_op(op: &RowOp) -> bool {
+    matches!(
+        op,
+        RowOp::InlineSchema { .. }
+            | RowOp::InlineInsert { .. }
+            | RowOp::InlineIdel { .. }
+            | RowOp::InlineFdel { .. }
+            | RowOp::InlineFlushDelete { .. }
+            | RowOp::InlineDrop { .. }
+    )
 }
 
 fn apply_insert(
@@ -792,8 +894,20 @@ impl StagedTransaction {
             }
         };
 
+        // Read before any write in this commit is staged: `InlineFlushDelete`
+        // /`InlineDrop` name a table, not keys, and resolve against
+        // `db_tx`'s current state exactly like `base` above.
+        let inline_writes = match translate_inline(&db_tx, &ops).await {
+            Ok(writes) => writes,
+            Err(err) => {
+                db_tx.rollback();
+                return Err(err);
+            }
+        };
+
         match translate(&base, &ops) {
             Ok((new_id, mut writes, snap)) => {
+                writes.extend(inline_writes);
                 writes.push((
                     Key::Snap {
                         snapshot_id: new_id,
@@ -843,9 +957,12 @@ fn translate(
     // emit order: a rename ends the old version and inserts a new one
     // under the same id, and the insert must win their shared `cur` key —
     // an end applied afterward would delete the id and erase the new row.
+    // Inline ops are skipped here entirely — `commit` translates them
+    // separately via `translate_inline`, since `CatalogSnapshot` has no
+    // notion of inlined rows to diff.
     let mut state = base.clone();
     for op in ops {
-        if !matches!(op, RowOp::Insert { .. }) {
+        if !is_inline_op(op) && !matches!(op, RowOp::Insert { .. }) {
             apply_op(base, &mut state, op, new_id)?;
         }
     }
@@ -857,6 +974,271 @@ fn translate(
 
     let writes = commit::diff_writes(base, &state, new_id);
     Ok((new_id, writes, snap))
+}
+
+/// Allocates `inline/ins` chunk sequence numbers within one commit: the
+/// first [`RowOp::InlineInsert`] staged for a given `(table_id,
+/// schema_version, begin_snapshot)` gets `chunk_seq` `0`, the next `1`,
+/// and so on — disambiguating multiple chunks the same commit stages
+/// against the same key prefix.
+#[derive(Default)]
+struct ChunkSeqAllocator(HashMap<(u64, u64, u64), u64>);
+
+impl ChunkSeqAllocator {
+    fn next(&mut self, table_id: u64, schema_version: u64, begin_snapshot: u64) -> u64 {
+        let seq = self
+            .0
+            .entry((table_id, schema_version, begin_snapshot))
+            .or_insert(0);
+        let allocated = *seq;
+        *seq += 1;
+        allocated
+    }
+}
+
+/// Removes every `inline/ins` chunk begun at or before `flush_snapshot`
+/// for `(table_id, schema_version)`, plus the `inline/idel` tombstones
+/// those chunks' rows consumed. Reads `db_tx`'s current (pre-commit)
+/// inline records — the flush op only ever names the table and snapshot,
+/// never the keys to remove.
+async fn translate_inline_flush_delete(
+    db_tx: &DbTransaction,
+    table_id: u64,
+    schema_version: u64,
+    flush_snapshot: u64,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    let chunks = store_inline::scan_inline_chunks(db_tx, table_id).await?;
+    let idels = store_inline::scan_inline_idels(db_tx, table_id).await?;
+
+    let scoped: Vec<(InlineOp, proto::InlineChunkValue)> = chunks
+        .into_iter()
+        .filter(
+            |(op, _)| matches!(op, InlineOp::Ins { schema_version: v, .. } if *v == schema_version),
+        )
+        .collect();
+
+    for (op, _) in &scoped {
+        if let InlineOp::Ins { begin_snapshot, .. } = op {
+            if *begin_snapshot <= flush_snapshot {
+                writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
+            }
+        }
+    }
+
+    // The rows the flushed chunks carried, including already-tombstoned
+    // ones (`ForFlush`) — their `inline/idel` records become orphaned
+    // once the owning chunk is gone above, and must go with it.
+    let rows = materialize_inline_rows(&scoped, &idels);
+    for row in InlineScanKind::ForFlush.select(&rows, flush_snapshot, 0) {
+        if row.end_snapshot.is_some() {
+            writes.push((
+                Key::Inline(InlineKey::Live(InlineOp::Idel {
+                    table_id,
+                    row_id: row.row_id,
+                }))
+                .encode(),
+                None,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Removes every `inline/*` record for `table_id`: schema, chunks, and
+/// tombstones, read from `db_tx`'s current (pre-commit) state.
+async fn translate_inline_drop(
+    db_tx: &DbTransaction,
+    table_id: u64,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    for (op, _) in store_inline::scan_inline_chunks(db_tx, table_id).await? {
+        writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
+    }
+    for (row_id, _) in store_inline::scan_inline_idels(db_tx, table_id).await? {
+        writes.push((
+            Key::Inline(InlineKey::Live(InlineOp::Idel { table_id, row_id })).encode(),
+            None,
+        ));
+    }
+    for (data_file_id, row_id, _) in store_inline::scan_inline_fdels(db_tx, table_id).await? {
+        writes.push((
+            Key::Inline(InlineKey::Live(InlineOp::Fdel {
+                table_id,
+                data_file_id,
+                row_id,
+            }))
+            .encode(),
+            None,
+        ));
+    }
+    for (schema_version, _) in store_inline::scan_inline_schemas(db_tx, table_id).await? {
+        writes.push((
+            Key::Inline(InlineKey::Schema {
+                table_id,
+                schema_version,
+            })
+            .encode(),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Translates every staged inline op into direct `inline/*` key writes —
+/// a separate pass from [`translate`], since inline records live outside
+/// `CatalogSnapshot`'s entity model and are never diffed. `db_tx` is read
+/// (for `InlineFlushDelete`/`InlineDrop`, which name a table rather than
+/// the keys to remove) at its pre-commit state, before any of this
+/// commit's own writes are staged onto it.
+fn inline_schema_write(
+    table_id: u64,
+    schema_version: u64,
+    arrow_schema: &[u8],
+) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Schema {
+            table_id,
+            schema_version,
+        })
+        .encode(),
+        Some(value::encode_value(&proto::InlineSchemaValue {
+            arrow_schema: arrow_schema.to_vec(),
+        })),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_insert_write(
+    table_id: u64,
+    schema_version: u64,
+    begin_snapshot: u64,
+    chunk_seq: u64,
+    row_id_start: u64,
+    row_count: u64,
+    arrow_body: &[u8],
+) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Live(InlineOp::Ins {
+            table_id,
+            schema_version,
+            begin_snapshot,
+            chunk_seq,
+        }))
+        .encode(),
+        Some(value::encode_value(&proto::InlineChunkValue {
+            body: arrow_body.to_vec(),
+            row_id_start,
+            row_count,
+            data_file_id: None,
+        })),
+    )
+}
+
+fn inline_idel_write(table_id: u64, row_id: u64, end_snapshot: u64) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Live(InlineOp::Idel { table_id, row_id })).encode(),
+        Some(value::encode_value(&proto::InlineIdelValue {
+            end_snapshot,
+        })),
+    )
+}
+
+fn inline_fdel_write(
+    table_id: u64,
+    data_file_id: u64,
+    row_id: u64,
+    begin_snapshot: u64,
+) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Live(InlineOp::Fdel {
+            table_id,
+            data_file_id,
+            row_id,
+        }))
+        .encode(),
+        Some(value::encode_value(&proto::InlineFdelValue {
+            begin_snapshot,
+        })),
+    )
+}
+
+async fn translate_inline(
+    db_tx: &DbTransaction,
+    ops: &[RowOp],
+) -> Result<Vec<commit::StagedWrite>> {
+    let mut writes = Vec::new();
+    let mut chunk_seqs = ChunkSeqAllocator::default();
+
+    for op in ops {
+        match op {
+            RowOp::InlineSchema {
+                table_id,
+                schema_version,
+                arrow_schema,
+            } => writes.push(inline_schema_write(
+                *table_id,
+                *schema_version,
+                arrow_schema,
+            )),
+            RowOp::InlineInsert {
+                table_id,
+                schema_version,
+                begin_snapshot,
+                row_id_start,
+                row_count,
+                arrow_body,
+            } => {
+                let chunk_seq = chunk_seqs.next(*table_id, *schema_version, *begin_snapshot);
+                writes.push(inline_insert_write(
+                    *table_id,
+                    *schema_version,
+                    *begin_snapshot,
+                    chunk_seq,
+                    *row_id_start,
+                    *row_count,
+                    arrow_body,
+                ));
+            }
+            RowOp::InlineIdel {
+                table_id,
+                row_id,
+                end_snapshot,
+            } => writes.push(inline_idel_write(*table_id, *row_id, *end_snapshot)),
+            RowOp::InlineFdel {
+                table_id,
+                data_file_id,
+                row_id,
+                begin_snapshot,
+            } => writes.push(inline_fdel_write(
+                *table_id,
+                *data_file_id,
+                *row_id,
+                *begin_snapshot,
+            )),
+            RowOp::InlineFlushDelete {
+                table_id,
+                schema_version,
+                flush_snapshot,
+            } => {
+                translate_inline_flush_delete(
+                    db_tx,
+                    *table_id,
+                    *schema_version,
+                    *flush_snapshot,
+                    &mut writes,
+                )
+                .await?;
+            }
+            RowOp::InlineDrop { table_id } => {
+                translate_inline_drop(db_tx, *table_id, &mut writes).await?;
+            }
+            RowOp::Insert { .. } | RowOp::Delete { .. } | RowOp::UpdateSetEnd { .. } => {}
+        }
+    }
+
+    Ok(writes)
 }
 
 #[cfg(test)]
@@ -1158,5 +1540,271 @@ mod tests {
         });
         let err = txn.commit().await.unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
+    }
+
+    /// Stages an inline schema plus two inserts against the same
+    /// `(table_id, schema_version, begin_snapshot)` in one commit: the
+    /// chunks land with sequential `chunk_seq` (stage order), and the
+    /// schema is readable back verbatim.
+    #[tokio::test]
+    async fn stages_inline_schema_and_sequential_inserts() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_read_tx().await.unwrap();
+        let mut txn = StagedTransaction::begin(db_tx);
+
+        txn.stage(RowOp::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        });
+        txn.stage(RowOp::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        txn.stage(RowOp::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 2,
+            row_count: 1,
+            arrow_body: b"chunk-b".to_vec(),
+        });
+        txn.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 0, 1),
+        });
+        txn.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "inlined_insert:1"),
+        });
+        txn.commit().await.unwrap();
+
+        let tx = catalog.begin_read_tx().await.unwrap();
+        let chunks = store_inline::scan_inline_chunks(&tx, 1).await.unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0].0,
+            InlineOp::Ins {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                chunk_seq: 0,
+            }
+        );
+        assert_eq!(chunks[0].1.body, b"chunk-a");
+        assert_eq!(chunks[0].1.row_id_start, 0);
+        assert_eq!(chunks[0].1.row_count, 2);
+        assert_eq!(
+            chunks[1].0,
+            InlineOp::Ins {
+                table_id: 1,
+                schema_version: 0,
+                begin_snapshot: 1,
+                chunk_seq: 1,
+            }
+        );
+        assert_eq!(chunks[1].1.body, b"chunk-b");
+
+        let schemas = store_inline::scan_inline_schemas(&tx, 1).await.unwrap();
+        assert_eq!(
+            schemas,
+            vec![(
+                0,
+                proto::InlineSchemaValue {
+                    arrow_schema: b"schema".to_vec(),
+                }
+            )]
+        );
+        tx.rollback();
+    }
+
+    /// An `InlineIdel` tombstones a row: the row is absent from a
+    /// `Table`-kind materialization at or after its `end_snapshot`.
+    #[tokio::test]
+    async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
+        let catalog = open().await;
+
+        let db_tx1 = catalog.begin_read_tx().await.unwrap();
+        let mut setup = StagedTransaction::begin(db_tx1);
+        setup.stage(RowOp::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk".to_vec(),
+        });
+        setup.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 0, 1),
+        });
+        setup.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "inlined_insert:1"),
+        });
+        setup.commit().await.unwrap();
+
+        let db_tx2 = catalog.begin_read_tx().await.unwrap();
+        let mut idel = StagedTransaction::begin(db_tx2);
+        idel.stage(RowOp::InlineIdel {
+            table_id: 1,
+            row_id: 0,
+            end_snapshot: 2,
+        });
+        idel.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 0, 1),
+        });
+        idel.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "inlined_delete:1"),
+        });
+        idel.commit().await.unwrap();
+
+        let tx = catalog.begin_read_tx().await.unwrap();
+        let chunks = store_inline::scan_inline_chunks(&tx, 1).await.unwrap();
+        let idels = store_inline::scan_inline_idels(&tx, 1).await.unwrap();
+        tx.rollback();
+        assert_eq!(idels, vec![(0, proto::InlineIdelValue { end_snapshot: 2 })]);
+
+        let rows = materialize_inline_rows(&chunks, &idels);
+        assert_eq!(
+            InlineScanKind::Table
+                .select(&rows, 1, 0)
+                .iter()
+                .map(|r| r.row_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            InlineScanKind::Table
+                .select(&rows, 2, 0)
+                .iter()
+                .map(|r| r.row_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// `InlineFlushDelete` removes chunks begun at or before the flush
+    /// snapshot for the named schema version, plus the `inline/idel`
+    /// tombstones those chunks' rows consumed — a later schema version's
+    /// chunk (begun after the flush point) survives untouched.
+    #[tokio::test]
+    async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
+        let catalog = open().await;
+
+        let db_tx1 = catalog.begin_read_tx().await.unwrap();
+        let mut setup = StagedTransaction::begin(db_tx1);
+        setup.stage(RowOp::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk".to_vec(),
+        });
+        setup.stage(RowOp::InlineIdel {
+            table_id: 1,
+            row_id: 0,
+            end_snapshot: 1,
+        });
+        setup.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 0, 1),
+        });
+        setup.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "inlined_insert:1"),
+        });
+        setup.commit().await.unwrap();
+
+        let db_tx2 = catalog.begin_read_tx().await.unwrap();
+        let mut flush = StagedTransaction::begin(db_tx2);
+        flush.stage(RowOp::InlineFlushDelete {
+            table_id: 1,
+            schema_version: 0,
+            flush_snapshot: 1,
+        });
+        flush.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 0, 1),
+        });
+        flush.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
+        });
+        flush.commit().await.unwrap();
+
+        let tx = catalog.begin_read_tx().await.unwrap();
+        let chunks = store_inline::scan_inline_chunks(&tx, 1).await.unwrap();
+        let idels = store_inline::scan_inline_idels(&tx, 1).await.unwrap();
+        tx.rollback();
+        assert!(chunks.is_empty(), "flushed chunk must be gone: {chunks:?}");
+        assert!(idels.is_empty(), "consumed idel must be gone: {idels:?}");
+    }
+
+    /// `InlineDrop` removes every `inline/*` record for the table:
+    /// schema, chunks, and tombstones.
+    #[tokio::test]
+    async fn stages_inline_drop_removes_every_record_for_the_table() {
+        let catalog = open().await;
+
+        let db_tx1 = catalog.begin_read_tx().await.unwrap();
+        let mut setup = StagedTransaction::begin(db_tx1);
+        setup.stage(RowOp::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        });
+        setup.stage(RowOp::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 1,
+            arrow_body: b"chunk".to_vec(),
+        });
+        setup.stage(RowOp::InlineFdel {
+            table_id: 1,
+            data_file_id: 9,
+            row_id: 5,
+            begin_snapshot: 1,
+        });
+        setup.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 0, 1),
+        });
+        setup.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "inlined_insert:1"),
+        });
+        setup.commit().await.unwrap();
+
+        let db_tx2 = catalog.begin_read_tx().await.unwrap();
+        let mut drop_txn = StagedTransaction::begin(db_tx2);
+        drop_txn.stage(RowOp::InlineDrop { table_id: 1 });
+        drop_txn.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 0, 1),
+        });
+        drop_txn.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, r#"dropped_table:"main"."t""#),
+        });
+        drop_txn.commit().await.unwrap();
+
+        let tx = catalog.begin_read_tx().await.unwrap();
+        let chunks = store_inline::scan_inline_chunks(&tx, 1).await.unwrap();
+        let fdels = store_inline::scan_inline_fdels(&tx, 1).await.unwrap();
+        let schemas = store_inline::scan_inline_schemas(&tx, 1).await.unwrap();
+        tx.rollback();
+        assert!(chunks.is_empty());
+        assert!(fdels.is_empty());
+        assert!(schemas.is_empty());
     }
 }

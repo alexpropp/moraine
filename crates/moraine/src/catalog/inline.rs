@@ -1,0 +1,255 @@
+//! Pure materialization of live inlined rows from already-scanned
+//! `inline/ins` chunks and `inline/idel` tombstones (see
+//! [`crate::store::inline`] for the scans). No store I/O here — this is
+//! the read model DuckLake's four inline scan variants select over; the
+//! ABI/shim decodes the opaque chunk body at the returned chunk/offset.
+
+use std::collections::HashMap;
+
+use crate::store::{
+    key::InlineOp,
+    proto::{InlineChunkValue, InlineIdelValue},
+};
+
+/// One inlined row, addressed by dense `row_id` and located in its chunk
+/// by index + offset. `end_snapshot` is `None` until a matching
+/// `inline/idel` tombstones the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineRow {
+    /// The row's dense id (`chunk.row_id_start + offset_in_chunk`).
+    pub row_id: u64,
+    /// The commit snapshot that inserted this row.
+    pub begin_snapshot: u64,
+    /// The commit snapshot that tombstoned this row, if any.
+    pub end_snapshot: Option<u64>,
+    /// Index into the `chunks` slice `materialize_inline_rows` was called
+    /// with — the row's owning chunk.
+    pub chunk: usize,
+    /// The row's offset within its chunk's `row_count`.
+    pub offset_in_chunk: u64,
+}
+
+/// Every row across every chunk — one per `(chunk, offset)`, `row_id =
+/// chunk.row_id_start + offset` for `offset` in `0..chunk.row_count` —
+/// with `end_snapshot` resolved from `idels`. Includes tombstoned rows;
+/// callers apply the scan-kind predicate via [`InlineScanKind::select`].
+/// `chunks` entries that are not `InlineOp::Ins` are skipped (callers
+/// pass `store::inline::scan_inline_chunks`'s output, which is Ins-only).
+pub fn materialize_inline_rows(
+    chunks: &[(InlineOp, InlineChunkValue)],
+    idels: &[(u64, InlineIdelValue)],
+) -> Vec<InlineRow> {
+    let tombstones: HashMap<u64, u64> = idels
+        .iter()
+        .map(|(row_id, idel)| (*row_id, idel.end_snapshot))
+        .collect();
+
+    let mut rows = Vec::new();
+    for (chunk_index, (op, value)) in chunks.iter().enumerate() {
+        let InlineOp::Ins { begin_snapshot, .. } = *op else {
+            continue;
+        };
+        for offset in 0..value.row_count {
+            let row_id = value.row_id_start + offset;
+            rows.push(InlineRow {
+                row_id,
+                begin_snapshot,
+                end_snapshot: tombstones.get(&row_id).copied(),
+                chunk: chunk_index,
+                offset_in_chunk: offset,
+            });
+        }
+    }
+    rows
+}
+
+/// The four ways DuckLake's inline reader queries a table, each a
+/// predicate over `(begin_snapshot, end_snapshot)` at snapshot `S`
+/// (optionally windowed from `start` for the incremental variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineScanKind {
+    /// `SCAN_TABLE`: live rows at `S`.
+    Table,
+    /// `SCAN_INSERTIONS`: rows begun in `[start, S]`.
+    Insertions,
+    /// `SCAN_DELETIONS`: rows ended in `[start, S]`.
+    Deletions,
+    /// `SCAN_FOR_FLUSH`: every row begun at or before `S`, including rows
+    /// already tombstoned — the flush input needs the full history to
+    /// write both the data file and its deletion file.
+    ForFlush,
+}
+
+impl InlineScanKind {
+    /// Filters `rows` per this scan's predicate at snapshot `S`, then
+    /// orders them: by `row_id` for every variant, with `begin_snapshot`
+    /// as a tiebreak for `ForFlush` (the only variant that can return
+    /// more than one row per `row_id`). `start` is only read by
+    /// `Insertions`/`Deletions`.
+    #[must_use]
+    pub fn select(self, rows: &[InlineRow], snapshot: u64, start: u64) -> Vec<InlineRow> {
+        let mut selected: Vec<InlineRow> = match self {
+            Self::Table => rows
+                .iter()
+                .copied()
+                .filter(|row| {
+                    row.begin_snapshot <= snapshot
+                        && row.end_snapshot.is_none_or(|end| snapshot < end)
+                })
+                .collect(),
+            Self::Insertions => rows
+                .iter()
+                .copied()
+                .filter(|row| row.begin_snapshot >= start && row.begin_snapshot <= snapshot)
+                .collect(),
+            Self::Deletions => rows
+                .iter()
+                .copied()
+                .filter(|row| {
+                    row.end_snapshot
+                        .is_some_and(|end| end >= start && end <= snapshot)
+                })
+                .collect(),
+            Self::ForFlush => rows
+                .iter()
+                .copied()
+                .filter(|row| row.begin_snapshot <= snapshot)
+                .collect(),
+        };
+        match self {
+            Self::ForFlush => selected.sort_by_key(|row| (row.row_id, row.begin_snapshot)),
+            Self::Table | Self::Insertions | Self::Deletions => {
+                selected.sort_by_key(|row| row.row_id);
+            }
+        }
+        selected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ins(begin_snapshot: u64) -> InlineOp {
+        InlineOp::Ins {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot,
+            chunk_seq: 0,
+        }
+    }
+
+    fn chunk(row_id_start: u64, row_count: u64) -> InlineChunkValue {
+        InlineChunkValue {
+            body: Vec::new(),
+            row_id_start,
+            row_count,
+            data_file_id: None,
+        }
+    }
+
+    /// Three chunks (rows 0-1 begun at 1, rows 2-3 begun at 3, row 4
+    /// begun at 5) and two tombstones (row 1 ends at 4, row 3 ends at
+    /// 6), fed to `materialize_inline_rows` out of row-id order to prove
+    /// `select` — not input order — determines the result order.
+    fn fixture() -> Vec<InlineRow> {
+        let chunks = vec![
+            (ins(5), chunk(4, 1)),
+            (ins(1), chunk(0, 2)),
+            (ins(3), chunk(2, 2)),
+        ];
+        let idels = vec![
+            (1, InlineIdelValue { end_snapshot: 4 }),
+            (3, InlineIdelValue { end_snapshot: 6 }),
+        ];
+        materialize_inline_rows(&chunks, &idels)
+    }
+
+    fn row_ids(rows: &[InlineRow]) -> Vec<u64> {
+        rows.iter().map(|row| row.row_id).collect()
+    }
+
+    #[test]
+    fn materializes_every_row_with_dense_ids_and_resolved_tombstones() {
+        let rows = fixture();
+        assert_eq!(rows.len(), 5);
+
+        let by_id: HashMap<u64, InlineRow> = rows.iter().map(|row| (row.row_id, *row)).collect();
+        assert_eq!(by_id[&0].begin_snapshot, 1);
+        assert_eq!(by_id[&0].end_snapshot, None);
+        assert_eq!(by_id[&0].offset_in_chunk, 0);
+        assert_eq!(by_id[&1].begin_snapshot, 1);
+        assert_eq!(by_id[&1].end_snapshot, Some(4));
+        assert_eq!(by_id[&1].offset_in_chunk, 1);
+        assert_eq!(by_id[&2].begin_snapshot, 3);
+        assert_eq!(by_id[&2].end_snapshot, None);
+        assert_eq!(by_id[&3].begin_snapshot, 3);
+        assert_eq!(by_id[&3].end_snapshot, Some(6));
+        assert_eq!(by_id[&4].begin_snapshot, 5);
+        assert_eq!(by_id[&4].end_snapshot, None);
+    }
+
+    #[test]
+    fn table_scan_excludes_rows_not_yet_begun() {
+        let rows = fixture();
+        assert_eq!(row_ids(&InlineScanKind::Table.select(&rows, 2, 0)), [0, 1]);
+    }
+
+    #[test]
+    fn table_scan_shows_tombstoned_row_only_before_its_end_snapshot() {
+        let rows = fixture();
+        // Row 1 ends at 4: present at 3, absent from 4 onward.
+        assert_eq!(
+            row_ids(&InlineScanKind::Table.select(&rows, 3, 0)),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            row_ids(&InlineScanKind::Table.select(&rows, 4, 0)),
+            [0, 2, 3]
+        );
+    }
+
+    #[test]
+    fn table_scan_at_a_later_snapshot_drops_both_tombstoned_rows_and_orders_by_row_id() {
+        let rows = fixture();
+        assert_eq!(
+            row_ids(&InlineScanKind::Table.select(&rows, 6, 0)),
+            [0, 2, 4]
+        );
+    }
+
+    #[test]
+    fn insertions_scan_returns_rows_begun_in_the_window() {
+        let rows = fixture();
+        assert_eq!(
+            row_ids(&InlineScanKind::Insertions.select(&rows, 4, 2)),
+            [2, 3]
+        );
+    }
+
+    #[test]
+    fn deletions_scan_returns_exactly_the_tombstoned_rows_in_the_window() {
+        let rows = fixture();
+        assert_eq!(row_ids(&InlineScanKind::Deletions.select(&rows, 5, 1)), [1]);
+        assert_eq!(row_ids(&InlineScanKind::Deletions.select(&rows, 6, 5)), [3]);
+        assert_eq!(
+            row_ids(&InlineScanKind::Deletions.select(&rows, 6, 1)),
+            [1, 3]
+        );
+    }
+
+    #[test]
+    fn for_flush_scan_includes_superseded_tombstoned_rows() {
+        let rows = fixture();
+        // Row 1 is tombstoned by snapshot 4, but SCAN_FOR_FLUSH still
+        // needs it to write the deletion file.
+        assert_eq!(
+            row_ids(&InlineScanKind::ForFlush.select(&rows, 4, 0)),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            row_ids(&InlineScanKind::ForFlush.select(&rows, 10, 0)),
+            [0, 1, 2, 3, 4]
+        );
+    }
+}

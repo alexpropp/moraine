@@ -48,5 +48,6 @@
 pub mod abi;
 pub mod dumps;
 pub mod error;
+pub mod inline;
 pub mod runtime;
 pub mod staged;

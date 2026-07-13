@@ -322,6 +322,50 @@ int32_t moraine_dump_schema_versions(MoraineCatalogHandle *handle, MoraineSchema
                                       size_t *out_len, MoraineError *err);
 void moraine_dump_schema_versions_free(MoraineSchemaVersionRow *items, size_t len);
 
+// The inline read ABI (src/inline.rs): materializes DuckLake's four inline
+// scan variants and the per-table Arrow schema / registered-table list over
+// the inline/* keyspace. Owned-first, one _free per array; chunk_body is an
+// owned copy of its chunk's full Arrow IPC body per returned row (see
+// src/inline.rs's module doc for the ownership rationale).
+
+// Mirrors `moraine_duckdb::inline::MoraineInlineRow`.
+typedef struct MoraineInlineRow {
+	uint64_t row_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	uint8_t *chunk_body;
+	size_t chunk_body_len;
+	uint64_t offset_in_chunk;
+} MoraineInlineRow;
+
+// `scan_kind`: 0 SCAN_TABLE, 1 SCAN_INSERTIONS, 2 SCAN_DELETIONS, 3
+// SCAN_FOR_FLUSH. `start` is read only by SCAN_INSERTIONS/SCAN_DELETIONS.
+int32_t moraine_inline_scan(MoraineCatalogHandle *handle, uint64_t table_id, int32_t scan_kind, uint64_t snapshot,
+                             uint64_t start, MoraineInlineRow **out_items, size_t *out_len, MoraineError *err);
+void moraine_inline_scan_free(MoraineInlineRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::inline::MoraineInlineSchemaRow`.
+typedef struct MoraineInlineSchemaRow {
+	uint64_t schema_version;
+	uint8_t *arrow_schema;
+	size_t arrow_schema_len;
+} MoraineInlineSchemaRow;
+
+int32_t moraine_inline_schemas(MoraineCatalogHandle *handle, uint64_t table_id, MoraineInlineSchemaRow **out_items,
+                                size_t *out_len, MoraineError *err);
+void moraine_inline_schemas_free(MoraineInlineSchemaRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::inline::MoraineInlineTableRow`.
+typedef struct MoraineInlineTableRow {
+	uint64_t table_id;
+	uint64_t schema_version;
+} MoraineInlineTableRow;
+
+int32_t moraine_inline_registered_tables(MoraineCatalogHandle *handle, MoraineInlineTableRow **out_items,
+                                          size_t *out_len, MoraineError *err);
+void moraine_inline_registered_tables_free(MoraineInlineTableRow *items, size_t len);
+
 // The staged-row write path (src/staged.rs): DuckLake authors row
 // mutations against the ducklake_* metadata tables over ordinary SQL; the
 // shim translates each row into a MoraineCell array and stages it here,
@@ -362,6 +406,33 @@ int32_t moraine_txn_commit(MoraineTxnHandle *txn, uint64_t *out_snapshot_id, Mor
 
 // Consumes `txn`, discarding every staged row. A null `txn` is a no-op.
 void moraine_txn_rollback(MoraineTxnHandle *txn);
+
+// Inline write ops (src/staged.rs): extend the staged-txn handle with the
+// inline/* record shapes. Every value here is stored verbatim, per the same
+// rule ordinary staged rows follow; `moraine_txn_stage_inline_insert`
+// allocates its chunk's chunk_seq at translate time, not from the caller.
+
+int32_t moraine_txn_stage_inline_schema(MoraineTxnHandle *txn, uint64_t table_id, uint64_t schema_version,
+                                         const uint8_t *arrow_schema, size_t arrow_schema_len, MoraineError *err);
+
+int32_t moraine_txn_stage_inline_insert(MoraineTxnHandle *txn, uint64_t table_id, uint64_t schema_version,
+                                         uint64_t begin_snapshot, uint64_t row_id_start, uint64_t row_count,
+                                         const uint8_t *arrow_body, size_t arrow_body_len, MoraineError *err);
+
+int32_t moraine_txn_stage_inline_idel(MoraineTxnHandle *txn, uint64_t table_id, uint64_t row_id,
+                                       uint64_t end_snapshot, MoraineError *err);
+
+int32_t moraine_txn_stage_inline_fdel(MoraineTxnHandle *txn, uint64_t table_id, uint64_t data_file_id,
+                                       uint64_t row_id, uint64_t begin_snapshot, MoraineError *err);
+
+// Removes every inline/ins chunk begun at or before flush_snapshot for
+// (table_id, schema_version), plus the inline/idel tombstones those chunks'
+// rows consumed.
+int32_t moraine_txn_stage_inline_flush_delete(MoraineTxnHandle *txn, uint64_t table_id, uint64_t schema_version,
+                                               uint64_t flush_snapshot, MoraineError *err);
+
+// Removes every inline/* record for table_id.
+int32_t moraine_txn_stage_inline_drop(MoraineTxnHandle *txn, uint64_t table_id, MoraineError *err);
 
 #ifdef __cplusplus
 } // extern "C"

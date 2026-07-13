@@ -37,6 +37,8 @@ use crate::{
 };
 
 #[doc(hidden)]
+pub mod inline;
+#[doc(hidden)]
 pub mod staged;
 
 /// Scans `cur` then `hist` in one transaction, keeping only the records

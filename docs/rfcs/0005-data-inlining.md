@@ -193,17 +193,72 @@ commits stop costing a Parquet file, a data-file record, and eventual
 compaction debt each. Flush is the explicit analogue of LSM compaction,
 converting accumulated small writes into scan-optimized storage.
 
+### Extension surface (as implemented)
+
+DuckLake does not write inlined rows as fixed `ducklake_*` rows. When
+`data_inlining_row_limit != 0` (its compiled default is 10; moraine
+synthesizes a nonzero value in `ducklake_metadata` to enable inlining, in
+place of the `0` it advertised while inlining was unsupported), DuckLake
+**dynamically creates and drives per-table physical tables** in the
+metadata catalog and issues ordinary SQL against them. moraine's
+`StorageExtension` recognizes these table-name patterns and routes every
+operation into the `inline/*` keyspace instead of materializing real
+tables — the same staged-commit substrate the fixed `ducklake_*` tables
+ride, extended to two dynamic name families:
+
+- `ducklake_inlined_data_<table_id>_<schema_version>` — inlined inserts.
+  Columns `(row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT,
+  <the table's user columns at that schema version>)`.
+- `ducklake_inlined_delete_<table_id>` — inlined deletes against Parquet
+  rows. Columns `(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)`.
+
+The operation → keyspace mapping (source-verified against DuckLake
+`ducklake_metadata_manager.cpp` / `ducklake_inline_data.cpp` /
+`ducklake_flush_inlined_data.cpp`):
+
+| DuckLake SQL | moraine record |
+|---|---|
+| `CREATE TABLE ducklake_inlined_data_<t>_<v>(...)` (batched with the `INSERT INTO ducklake_inlined_data_tables` registration) | `inline/schema` at `(t, v)` holding the Arrow IPC schema of the user columns; the table appears in the now-live `ducklake_inlined_data_tables` projection |
+| `INSERT INTO ducklake_inlined_data_<t>_<v> VALUES (row_id, {snap}, NULL, <cols>), …` (one multi-row `VALUES` per commit) | one `inline/ins` chunk at `(t, v, begin_snapshot={snap}, chunk_seq)`: the user-column cells encoded as one Arrow IPC record-batch body, plus `row_id_start` (first row's `row_id`) and `row_count`. The `row_id`/`begin_snapshot`/`end_snapshot` columns are moraine-derived on read (`row_id = row_id_start + offset`, `begin_snapshot` from the key, `end_snapshot` from `inline/idel`), never stored in the body |
+| `UPDATE ducklake_inlined_data_<t>_<v> SET end_snapshot={snap} WHERE row_id=r …` | `inline/idel` at `(t, r)` holding `end_snapshot={snap}` |
+| `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/ins` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, subtract `inline/idel` tombstones, project and order by `row_id` |
+| `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/fdel` at `(t, file_id, row_id)` holding `begin_snapshot={snap}` |
+| `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/ins` chunks and consumed `inline/idel`; drop the `inline/schema` and deregister. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
+| `DROP TABLE lake.<schema>.<t>` cascade | drop every `inline/*` record for `t` |
+
+This is served through the same staged-row commit path (RFC 0004): the
+inline operations arrive as staged INSERT/UPDATE/DELETE inside DuckLake's
+metadata-commit transaction and translate at commit into one atomic batch
+of `inline/*` records — same one-batch atomicity, same no-internal-retry,
+same `conflict` wire contract. Values DuckLake authors (`row_id`,
+`begin_snapshot`, `end_snapshot`, user cells) are stored verbatim per the
+keyspace; nothing is re-derived on write.
+
+Two reconciliations with the surrounding RFCs, recorded here because they
+governed the implementation:
+
+- **Flush removes inline records; it does not move them to `hist`.**
+  RFC 0004's commit-participants note phrases flush as "moves consumed
+  inline records to `hist`"; the accurate behavior — matching DuckLake's
+  hard `DELETE` and RFC 0005's flush section — is that `inline/*` records
+  are *deleted* at flush (the data survives as the backdated Parquet
+  file). The `inline` subspace is append-then-delete, not begin/end
+  versioned like the entity subspaces. RFC 0016's recent-row archive is
+  the only thing that defers the deletion (by re-keying to `inline/arch`);
+  it is out of scope here, so this slice hard-deletes.
+- **Schema stored, not derived.** `inline/schema` holds the Arrow schema
+  written at `CREATE` time (transcoded from DuckLake's column list), so an
+  `inline/ins` chunk decodes self-describingly without coupling to the
+  mutable `ducklake_column` type mapping — as the Alternatives section
+  requires.
+
 ## Open questions
 
-- **Extension surface.** Settled by RFC 0006: moraine is DuckLake's catalog
-  backend (a DuckDB `StorageExtension`), and the inlined-data tables are
-  served row-faithfully through the same catalog-entry scan path as any other
-  `ducklake_*` table — inlined rows reach scans as Arrow via that hook, not as
-  re-materialized SQL. E2E still validates this against real DuckLake;
-  if DuckLake demands a shape this design can't serve, this RFC is updated,
-  per the RFC process.
-- **VARIANT inlining.** Excluded to match SQL-catalog behavior; Arrow
-  storage may permit it later. Revisit with e2e evidence.
+- **VARIANT/GEOMETRY inlining.** DuckLake's `CanInlineColumns` excludes
+  only `GEOMETRY`; VARIANT is inlinable there. moraine's Arrow transcode
+  bounds what it can store; unsupported column types make the whole table
+  fall back to the non-inlined (Parquet) path, which is always correct.
+  The exact inlinable-type set is pinned in the e2e suite.
 - **Row-id counter placement — settled by RFC 0004.** The per-table row-id
   high-water mark lives in `tstat`, matching DuckLake, which also aligns
   row-id allocation with conflict granularity (and, via RFC 0004's

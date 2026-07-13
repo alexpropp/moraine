@@ -1,0 +1,240 @@
+//! The inline read seam: DuckLake's four inline scan variants
+//! (`SCAN_TABLE`/`SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH`)
+//! materialize over the `inline/*` keyspace here, and the ABI decodes
+//! each returned row's Arrow IPC chunk body. Re-exports
+//! [`crate::catalog::inline::InlineScanKind`] (`catalog` is otherwise
+//! private to the crate) and adds the entry points that need a
+//! [`Catalog`]. `#[doc(hidden)]` for the same reason as every other item
+//! in [`crate::ffi_support`] — an unstable seam, not semver surface.
+//!
+//! Every function opens one fresh read-only transaction, scans, and
+//! rolls back — the same one-shot pattern the `dump_*` functions in
+//! [`super`] use.
+
+use crate::{
+    catalog::{
+        Catalog,
+        inline::{InlineRow, materialize_inline_rows},
+    },
+    error::Result,
+    store::inline as store_inline,
+};
+
+#[doc(hidden)]
+pub use crate::catalog::inline::InlineScanKind;
+
+/// One inlined row selected by [`scan_inline`]: the materialized row
+/// plus an owned copy of its chunk's full Arrow IPC body. Self-contained
+/// (not tied to any other returned row's lifetime) at the cost of
+/// duplicating the chunk body once per row it contains — the ABI mints
+/// one independently-freed C array element per row, so an
+/// independent-ownership shape here avoids threading a second,
+/// index-linked array across the boundary for what is, by design, a
+/// small amount of data.
+#[doc(hidden)]
+pub struct InlineRowRecord {
+    /// The row's dense id.
+    pub row_id: u64,
+    /// The commit snapshot that inserted this row.
+    pub begin_snapshot: u64,
+    /// The commit snapshot that tombstoned this row, if any.
+    pub end_snapshot: Option<u64>,
+    /// The owning chunk's full Arrow IPC record-batch body.
+    pub chunk_body: Vec<u8>,
+    /// The row's offset within `chunk_body`.
+    pub offset_in_chunk: u64,
+}
+
+/// Materializes `table_id`'s inlined rows and selects `kind`'s variant at
+/// `snapshot` (windowed from `start` for the incremental variants) — the
+/// read model behind `moraine_inline_scan`.
+///
+/// # Errors
+///
+/// Returns an error if the underlying store scan fails or decodes
+/// corrupt bytes.
+#[doc(hidden)]
+pub async fn scan_inline(
+    catalog: &Catalog,
+    table_id: u64,
+    kind: InlineScanKind,
+    snapshot: u64,
+    start: u64,
+) -> Result<Vec<InlineRowRecord>> {
+    let tx = catalog.begin_read_tx().await?;
+    let chunks = store_inline::scan_inline_chunks(&tx, table_id).await;
+    let idels = store_inline::scan_inline_idels(&tx, table_id).await;
+    tx.rollback();
+    let chunks = chunks?;
+    let idels = idels?;
+
+    let rows: Vec<InlineRow> = materialize_inline_rows(&chunks, &idels);
+    Ok(kind
+        .select(&rows, snapshot, start)
+        .into_iter()
+        .map(|row| InlineRowRecord {
+            row_id: row.row_id,
+            begin_snapshot: row.begin_snapshot,
+            end_snapshot: row.end_snapshot,
+            chunk_body: chunks[row.chunk].1.body.clone(),
+            offset_in_chunk: row.offset_in_chunk,
+        })
+        .collect())
+}
+
+/// Every `(schema_version, arrow_schema)` recorded for `table_id`, in
+/// schema-version order — the read model behind `moraine_inline_schemas`.
+///
+/// # Errors
+///
+/// Returns an error if the underlying store scan fails or decodes
+/// corrupt bytes.
+#[doc(hidden)]
+pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+    let tx = catalog.begin_read_tx().await?;
+    let schemas = store_inline::scan_inline_schemas(&tx, table_id).await;
+    tx.rollback();
+    Ok(schemas?
+        .into_iter()
+        .map(|(schema_version, value)| (schema_version, value.arrow_schema))
+        .collect())
+}
+
+/// Every `(table_id, schema_version)` with a recorded inline schema,
+/// across every table — feeds the `ducklake_inlined_data_tables`
+/// projection behind `moraine_inline_registered_tables`.
+///
+/// # Errors
+///
+/// Returns an error if the underlying store scan fails or decodes
+/// corrupt bytes.
+#[doc(hidden)]
+pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64)>> {
+    let tx = catalog.begin_read_tx().await?;
+    let schemas = store_inline::scan_all_inline_schemas(&tx).await;
+    tx.rollback();
+    Ok(schemas?
+        .into_iter()
+        .map(|(table_id, schema_version, _)| (table_id, schema_version))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::{
+        catalog::CatalogOptions,
+        transaction::staged::{RowOp, StagedTransaction, TableKind},
+    };
+
+    fn snapshot_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
+        use crate::transaction::staged::Cell;
+        vec![
+            Cell::U64(id),
+            Cell::I64(1),
+            Cell::U64(0),
+            Cell::U64(1),
+            Cell::U64(0),
+        ]
+    }
+
+    fn snapshot_changes_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
+        use crate::transaction::staged::Cell;
+        vec![
+            Cell::U64(id),
+            Cell::Str("inlined_insert:1".to_string()),
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+        ]
+    }
+
+    async fn open() -> Catalog {
+        Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap()
+    }
+
+    /// Two chunks (rows 0-1, row 2) staged in one commit, one tombstone
+    /// on row 1: `scan_inline` with `Table` at the tombstone's snapshot
+    /// returns rows 0 and 2 with their chunk bodies attached, and
+    /// `inline_schemas`/`inline_registered_tables` see the recorded
+    /// schema.
+    #[tokio::test]
+    async fn scan_inline_materializes_rows_with_chunk_bodies() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_read_tx().await.unwrap();
+        let mut txn = StagedTransaction::begin(db_tx);
+
+        txn.stage(RowOp::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        });
+        txn.stage(RowOp::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        txn.stage(RowOp::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 2,
+            row_count: 1,
+            arrow_body: b"chunk-b".to_vec(),
+        });
+        txn.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        txn.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        txn.commit().await.unwrap();
+
+        let db_tx2 = catalog.begin_read_tx().await.unwrap();
+        let mut idel = StagedTransaction::begin(db_tx2);
+        idel.stage(RowOp::InlineIdel {
+            table_id: 1,
+            row_id: 1,
+            end_snapshot: 2,
+        });
+        idel.stage(RowOp::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2),
+        });
+        idel.stage(RowOp::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2),
+        });
+        idel.commit().await.unwrap();
+
+        let rows = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0)
+            .await
+            .unwrap();
+        let mut by_id: Vec<(u64, Vec<u8>, u64)> = rows
+            .iter()
+            .map(|r| (r.row_id, r.chunk_body.clone(), r.offset_in_chunk))
+            .collect();
+        by_id.sort_by_key(|(id, ..)| *id);
+        assert_eq!(
+            by_id,
+            vec![(0, b"chunk-a".to_vec(), 0), (2, b"chunk-b".to_vec(), 0)]
+        );
+
+        let schemas = inline_schemas(&catalog, 1).await.unwrap();
+        assert_eq!(schemas, vec![(0, b"schema".to_vec())]);
+
+        let registered = inline_registered_tables(&catalog).await.unwrap();
+        assert_eq!(registered, vec![(1, 0)]);
+    }
+}

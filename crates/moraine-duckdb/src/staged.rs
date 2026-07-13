@@ -29,7 +29,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use moraine::ffi_support::staged::{Cell, RowOp, StagedTransaction, TableKind, staged_begin};
 
-use crate::abi::{borrow_str, guard};
+use crate::abi::{borrow_bytes, borrow_str, guard};
 use crate::error::{AbiError, MoraineError, codes};
 use crate::runtime::MoraineCatalogHandle;
 
@@ -331,6 +331,233 @@ pub unsafe extern "C" fn moraine_txn_rollback(txn: *mut MoraineTxnHandle) {
         boxed.txn.rollback();
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Stages `inline/schema`: the Arrow IPC schema for one `(table_id,
+/// schema_version)`, written once at inline-table creation.
+///
+/// # Safety
+///
+/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// and not yet committed or rolled back. `arrow_schema`, if
+/// `arrow_schema_len` is nonzero, must point to `arrow_schema_len` valid
+/// bytes. `err`, if non-null, must be a valid, writable [`MoraineError`].
+/// All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_txn_stage_inline_schema(
+    txn: *mut MoraineTxnHandle,
+    table_id: u64,
+    schema_version: u64,
+    arrow_schema: *const u8,
+    arrow_schema_len: usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if txn.is_null() {
+            return Err(AbiError::invalid_argument("`txn` is null"));
+        }
+        // SAFETY: caller contract above.
+        let bytes = unsafe { borrow_bytes(arrow_schema, arrow_schema_len, "arrow_schema") }?;
+        // SAFETY: caller contract for `txn`.
+        let txn_ref = unsafe { &mut *txn };
+        txn_ref.txn.stage(RowOp::InlineSchema {
+            table_id,
+            schema_version,
+            arrow_schema: bytes.to_vec(),
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stages `inline/ins`: one Arrow record-batch chunk of inlined rows.
+///
+/// # Safety
+///
+/// Same `txn` contract as [`moraine_txn_stage_inline_schema`].
+/// `arrow_body`, if `arrow_body_len` is nonzero, must point to
+/// `arrow_body_len` valid bytes. `err`, if non-null, must be a valid,
+/// writable [`MoraineError`]. All for the duration of this call.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_txn_stage_inline_insert(
+    txn: *mut MoraineTxnHandle,
+    table_id: u64,
+    schema_version: u64,
+    begin_snapshot: u64,
+    row_id_start: u64,
+    row_count: u64,
+    arrow_body: *const u8,
+    arrow_body_len: usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if txn.is_null() {
+            return Err(AbiError::invalid_argument("`txn` is null"));
+        }
+        // SAFETY: caller contract above.
+        let bytes = unsafe { borrow_bytes(arrow_body, arrow_body_len, "arrow_body") }?;
+        // SAFETY: caller contract for `txn`.
+        let txn_ref = unsafe { &mut *txn };
+        txn_ref.txn.stage(RowOp::InlineInsert {
+            table_id,
+            schema_version,
+            begin_snapshot,
+            row_id_start,
+            row_count,
+            arrow_body: bytes.to_vec(),
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stages `inline/idel`: tombstones one inlined-insert row.
+///
+/// # Safety
+///
+/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// and not yet committed or rolled back. `err`, if non-null, must be a
+/// valid, writable [`MoraineError`]. Both for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_txn_stage_inline_idel(
+    txn: *mut MoraineTxnHandle,
+    table_id: u64,
+    row_id: u64,
+    end_snapshot: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if txn.is_null() {
+            return Err(AbiError::invalid_argument("`txn` is null"));
+        }
+        // SAFETY: caller contract for `txn`.
+        let txn_ref = unsafe { &mut *txn };
+        txn_ref.txn.stage(RowOp::InlineIdel {
+            table_id,
+            row_id,
+            end_snapshot,
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stages `inline/fdel`: an inlined delete against a Parquet-file row.
+///
+/// # Safety
+///
+/// Same contract as [`moraine_txn_stage_inline_idel`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_txn_stage_inline_fdel(
+    txn: *mut MoraineTxnHandle,
+    table_id: u64,
+    data_file_id: u64,
+    row_id: u64,
+    begin_snapshot: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if txn.is_null() {
+            return Err(AbiError::invalid_argument("`txn` is null"));
+        }
+        // SAFETY: caller contract for `txn`.
+        let txn_ref = unsafe { &mut *txn };
+        txn_ref.txn.stage(RowOp::InlineFdel {
+            table_id,
+            data_file_id,
+            row_id,
+            begin_snapshot,
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stages a flush-delete: removes every `inline/ins` chunk begun at or
+/// before `flush_snapshot` for `(table_id, schema_version)`, plus the
+/// `inline/idel` tombstones those chunks' rows consumed.
+///
+/// # Safety
+///
+/// Same contract as [`moraine_txn_stage_inline_idel`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_txn_stage_inline_flush_delete(
+    txn: *mut MoraineTxnHandle,
+    table_id: u64,
+    schema_version: u64,
+    flush_snapshot: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if txn.is_null() {
+            return Err(AbiError::invalid_argument("`txn` is null"));
+        }
+        // SAFETY: caller contract for `txn`.
+        let txn_ref = unsafe { &mut *txn };
+        txn_ref.txn.stage(RowOp::InlineFlushDelete {
+            table_id,
+            schema_version,
+            flush_snapshot,
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stages a table drop: removes every `inline/*` record for `table_id`.
+///
+/// # Safety
+///
+/// `txn` must be a pointer previously returned by [`moraine_txn_begin`]
+/// and not yet committed or rolled back. `err`, if non-null, must be a
+/// valid, writable [`MoraineError`]. Both for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_txn_stage_inline_drop(
+    txn: *mut MoraineTxnHandle,
+    table_id: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if txn.is_null() {
+            return Err(AbiError::invalid_argument("`txn` is null"));
+        }
+        // SAFETY: caller contract for `txn`.
+        let txn_ref = unsafe { &mut *txn };
+        txn_ref.txn.stage(RowOp::InlineDrop { table_id });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
 }
 
 #[cfg(test)]
@@ -983,6 +1210,12 @@ mod tests {
             "moraine_txn_rollback",
             "MoraineTxnHandle",
             "MoraineCell",
+            "moraine_txn_stage_inline_schema",
+            "moraine_txn_stage_inline_insert",
+            "moraine_txn_stage_inline_idel",
+            "moraine_txn_stage_inline_fdel",
+            "moraine_txn_stage_inline_flush_delete",
+            "moraine_txn_stage_inline_drop",
         ];
         for name in names {
             assert!(

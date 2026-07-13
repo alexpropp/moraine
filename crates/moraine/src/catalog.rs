@@ -4,6 +4,7 @@
 //! [`crate::transaction`] drives it.
 
 mod handle;
+pub(crate) mod inline;
 mod snapshot;
 mod types;
 

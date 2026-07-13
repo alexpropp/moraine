@@ -191,6 +191,30 @@ pub(crate) unsafe fn borrow_str<'a>(
         .map_err(|_| AbiError::invalid_argument(format!("`{arg_name}` is not valid UTF-8")))
 }
 
+/// Borrows a raw byte-buffer argument as a `&[u8]`. A null `ptr` is valid
+/// only when `len` is `0`.
+///
+/// # Safety
+///
+/// `ptr`, if non-null, must point to `len` valid, readable bytes for the
+/// duration of this call.
+pub(crate) unsafe fn borrow_bytes<'a>(
+    ptr: *const u8,
+    len: usize,
+    arg_name: &str,
+) -> Result<&'a [u8], AbiError> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Ok(&[]);
+        }
+        return Err(AbiError::invalid_argument(format!(
+            "`{arg_name}` is null but its length is nonzero"
+        )));
+    }
+    // SAFETY: caller contract above.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
 /// Attaches a moraine catalog: creates the runtime this handle owns for
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.

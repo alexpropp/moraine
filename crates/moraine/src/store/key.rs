@@ -345,6 +345,84 @@ impl TableScopedKind {
 #[allow(dead_code)]
 const CUR_KIND_PREFIX_LEN: usize = 3;
 
+/// The three live-record kinds inside the inline subspace — the only kinds
+/// [`inline_live_table_prefix`] builds a prefix for (`inline/schema` has
+/// its own prefix builder, since it is not an [`InlineOp`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlineOpKind {
+    /// `inline/ins`.
+    Ins,
+    /// `inline/idel`.
+    Idel,
+    /// `inline/fdel`.
+    Fdel,
+}
+
+impl InlineOpKind {
+    /// An op of this kind with its table id set and every other component
+    /// zeroed, for prefix derivation.
+    const fn sample(self, table_id: u64) -> InlineOp {
+        match self {
+            Self::Ins => InlineOp::Ins {
+                table_id,
+                schema_version: 0,
+                begin_snapshot: 0,
+                chunk_seq: 0,
+            },
+            Self::Idel => InlineOp::Idel {
+                table_id,
+                row_id: 0,
+            },
+            Self::Fdel => InlineOp::Fdel {
+                table_id,
+                data_file_id: 0,
+                row_id: 0,
+            },
+        }
+    }
+}
+
+/// Discriminant bytes preceding a live inline op's components: subspace,
+/// `InlineKey::Live`, op kind.
+const INLINE_LIVE_KIND_PREFIX_LEN: usize = 3;
+
+/// Byte prefix of every live `inline/*` key of `kind` scoped to
+/// `table_id` — "everything an inline scan of one kind needs for table T".
+pub(crate) fn inline_live_table_prefix(kind: InlineOpKind, table_id: u64) -> Vec<u8> {
+    let mut bytes = Key::Inline(InlineKey::Live(kind.sample(table_id))).encode();
+    bytes.truncate(INLINE_LIVE_KIND_PREFIX_LEN + size_of::<u64>());
+    bytes
+}
+
+/// Discriminant bytes preceding an `inline/schema` key's components:
+/// subspace, `InlineKey::Schema`.
+const INLINE_SCHEMA_PREFIX_LEN: usize = 2;
+
+/// Byte prefix of every `inline/schema` key scoped to `table_id`, across
+/// all schema versions.
+pub(crate) fn inline_schema_table_prefix(table_id: u64) -> Vec<u8> {
+    let mut bytes = Key::Inline(InlineKey::Schema {
+        table_id,
+        schema_version: 0,
+    })
+    .encode();
+    bytes.truncate(INLINE_SCHEMA_PREFIX_LEN + size_of::<u64>());
+    bytes
+}
+
+/// Byte prefix of every `inline/schema` key, across every table — "every
+/// table with a recorded inline schema", which is what the
+/// `ducklake_inlined_data_tables` projection scans.
+pub(crate) fn inline_schema_prefix() -> Vec<u8> {
+    let mut bytes = Key::Inline(InlineKey::Schema {
+        table_id: 0,
+        schema_version: 0,
+    })
+    .encode();
+    bytes.truncate(INLINE_SCHEMA_PREFIX_LEN);
+    bytes
+}
+
 /// Byte prefix of every key in a subspace (exactly `TAG_PREFIX_LEN`
 /// bytes — the same prefix the segment extractor derives).
 pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
@@ -578,6 +656,55 @@ mod tests {
                 "{kind:?} prefix must not match another table"
             );
         }
+    }
+
+    /// Every inline-op kind's live prefix matches a live key of that kind
+    /// with the same table id and rejects a different table id or kind.
+    #[test]
+    fn inline_live_table_prefixes_cover_all_op_kinds() {
+        let kinds = [InlineOpKind::Ins, InlineOpKind::Idel, InlineOpKind::Fdel];
+        for kind in kinds {
+            let key = Key::Inline(InlineKey::Live(kind.sample(9)));
+            let bytes = key.encode();
+            assert!(
+                bytes.starts_with(&inline_live_table_prefix(kind, 9)),
+                "{kind:?} prefix must match its own key"
+            );
+            assert!(
+                !bytes.starts_with(&inline_live_table_prefix(kind, 10)),
+                "{kind:?} prefix must not match another table"
+            );
+        }
+        // Different op kinds must not share a prefix even for the same table.
+        assert!(
+            !inline_live_table_prefix(InlineOpKind::Idel, 9)
+                .starts_with(&inline_live_table_prefix(InlineOpKind::Ins, 9))
+        );
+        // An archived key never matches a live prefix.
+        let arch = Key::Inline(InlineKey::Arch(InlineOpKind::Ins.sample(9))).encode();
+        assert!(!arch.starts_with(&inline_live_table_prefix(InlineOpKind::Ins, 9)));
+    }
+
+    /// The `inline/schema` prefix matches every schema version of the
+    /// same table and rejects a different table.
+    #[test]
+    fn inline_schema_table_prefix_covers_all_versions() {
+        for schema_version in [0, 1, 42] {
+            let key = Key::Inline(InlineKey::Schema {
+                table_id: 9,
+                schema_version,
+            });
+            assert!(key.encode().starts_with(&inline_schema_table_prefix(9)));
+        }
+        let other_table = Key::Inline(InlineKey::Schema {
+            table_id: 10,
+            schema_version: 0,
+        });
+        assert!(
+            !other_table
+                .encode()
+                .starts_with(&inline_schema_table_prefix(9))
+        );
     }
 
     // Property tests: roundtrip, order preservation, uniqueness.

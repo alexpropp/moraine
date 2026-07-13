@@ -3,6 +3,7 @@
 //! Knows nothing about DuckLake semantics.
 
 pub(crate) mod frame;
+pub(crate) mod inline;
 pub(crate) mod key;
 pub(crate) mod open;
 pub(crate) mod proto;
