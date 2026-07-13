@@ -153,7 +153,7 @@ impl Catalog {
     /// scans; every other reader goes through `snapshot`/`snapshot_at`.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
         match self.store.as_ref() {
-            Store::Writer(db) => Ok(ReadSession::Txn(
+            Store::Writer(db) => Ok(ReadSession::Tx(
                 db.begin(IsolationLevel::Snapshot)
                     .await
                     .map_err(Error::from)?,

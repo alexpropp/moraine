@@ -144,7 +144,7 @@ pub(crate) async fn open_initialized(
         .await
         .map_err(Error::from)?;
 
-    match validate_format(ReadHandle::Txn(&tx)).await {
+    match validate_format(ReadHandle::Tx(&tx)).await {
         Ok(Some(_)) => {
             tx.rollback();
             return Ok(db);
@@ -169,7 +169,7 @@ pub(crate) async fn open_initialized(
                 .begin(IsolationLevel::Snapshot)
                 .await
                 .map_err(Error::from)?;
-            let validated = validate_format(ReadHandle::Txn(&tx)).await;
+            let validated = validate_format(ReadHandle::Tx(&tx)).await;
             tx.rollback();
             if validated?.is_some() {
                 Ok(db)
@@ -660,7 +660,7 @@ async fn prepare_and_stage<F>(db_tx: &DbTransaction, f: &F) -> Result<Prepared>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
-    let base = materialize(ReadHandle::Txn(db_tx), None).await?;
+    let base = materialize(ReadHandle::Tx(db_tx), None).await?;
     let head = base.snapshot.snapshot_id;
     let new_id = head + 1;
 

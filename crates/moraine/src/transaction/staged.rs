@@ -878,7 +878,7 @@ impl StagedTransaction {
     pub async fn commit(self) -> Result<SnapshotId> {
         let Self { db_tx, ops } = self;
 
-        let base = match commit::materialize(ReadHandle::Txn(&db_tx), None).await {
+        let base = match commit::materialize(ReadHandle::Tx(&db_tx), None).await {
             Ok(base) => base,
             Err(err) => {
                 db_tx.rollback();
@@ -1000,9 +1000,9 @@ async fn translate_inline_flush_delete(
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Txn(db_tx), table_id).await?;
+    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
     let inline_deletes =
-        store_inline::scan_inline_inline_deletes(ReadHandle::Txn(db_tx), table_id).await?;
+        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
 
     let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
         .into_iter()
@@ -1046,11 +1046,11 @@ async fn translate_inline_drop(
     table_id: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    for (op, _) in store_inline::scan_inline_chunks(ReadHandle::Txn(db_tx), table_id).await? {
+    for (op, _) in store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await? {
         writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
     }
     for (row_id, _) in
-        store_inline::scan_inline_inline_deletes(ReadHandle::Txn(db_tx), table_id).await?
+        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?
     {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
@@ -1062,7 +1062,7 @@ async fn translate_inline_drop(
         ));
     }
     for (data_file_id, row_id, _) in
-        store_inline::scan_inline_file_deletes(ReadHandle::Txn(db_tx), table_id).await?
+        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
     {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
@@ -1075,7 +1075,7 @@ async fn translate_inline_drop(
         ));
     }
     for (schema_version, _) in
-        store_inline::scan_inline_schemas(ReadHandle::Txn(db_tx), table_id).await?
+        store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id).await?
     {
         writes.push((
             Key::Inline(InlineKey::Schema {
@@ -1357,26 +1357,26 @@ mod tests {
     async fn stages_table_create_and_snapshot_bump() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut txn = StagedTransaction::begin(db_tx);
+        let mut tx = StagedTransaction::begin(db_tx);
 
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::Table,
             cells: table_row(1, 0, "t", 1, None),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::Column,
             cells: column_row(1, 1, "a", 0),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 1, 2),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
         });
 
-        let id = txn.commit().await.unwrap();
+        let id = tx.commit().await.unwrap();
         assert_eq!(id.get(), 1);
 
         let snapshot = catalog.snapshot().await.unwrap();
@@ -1599,16 +1599,16 @@ mod tests {
         let mut a = StagedTransaction::begin(tx_a);
         let mut b = StagedTransaction::begin(tx_b);
 
-        for (txn, name) in [(&mut a, "a"), (&mut b, "b")] {
-            txn.stage(RowOperation::Insert {
+        for (tx, name) in [(&mut a, "a"), (&mut b, "b")] {
+            tx.stage(RowOperation::Insert {
                 table: TableKind::Schema,
                 cells: schema_row(1, name, 1),
             });
-            txn.stage(RowOperation::Insert {
+            tx.stage(RowOperation::Insert {
                 table: TableKind::Snapshot,
                 cells: snapshot_row(1, 1, 2),
             });
-            txn.stage(RowOperation::Insert {
+            tx.stage(RowOperation::Insert {
                 table: TableKind::SnapshotChanges,
                 cells: snapshot_changes_row(1, format!(r#"created_schema:"{name}""#).as_str()),
             });
@@ -1633,20 +1633,20 @@ mod tests {
     async fn malformed_row_is_corruption_not_a_panic() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut txn = StagedTransaction::begin(db_tx);
-        txn.stage(RowOperation::Insert {
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
             table: TableKind::Schema,
             cells: vec![Cell::U64(1)], // far too few cells
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 1, 2),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, ""),
         });
-        let err = txn.commit().await.unwrap_err();
+        let err = tx.commit().await.unwrap_err();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1658,14 +1658,14 @@ mod tests {
     async fn stages_inline_schema_and_sequential_inserts() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut txn = StagedTransaction::begin(db_tx);
+        let mut tx = StagedTransaction::begin(db_tx);
 
-        txn.stage(RowOperation::InlineSchema {
+        tx.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 0,
             arrow_schema: b"schema".to_vec(),
         });
-        txn.stage(RowOperation::InlineInsert {
+        tx.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -1673,7 +1673,7 @@ mod tests {
             row_count: 2,
             arrow_body: b"chunk-a".to_vec(),
         });
-        txn.stage(RowOperation::InlineInsert {
+        tx.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -1681,18 +1681,18 @@ mod tests {
             row_count: 1,
             arrow_body: b"chunk-b".to_vec(),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 0, 1),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1, "inlined_insert:1"),
         });
-        txn.commit().await.unwrap();
+        tx.commit().await.unwrap();
 
         let tx = catalog.begin_write_tx().await.unwrap();
-        let chunks = store_inline::scan_inline_chunks(ReadHandle::Txn(&tx), 1)
+        let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
         assert_eq!(chunks.len(), 2);
@@ -1719,7 +1719,7 @@ mod tests {
         );
         assert_eq!(chunks[1].1.body, b"chunk-b");
 
-        let schemas = store_inline::scan_inline_schemas(ReadHandle::Txn(&tx), 1)
+        let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
         assert_eq!(
@@ -1778,10 +1778,10 @@ mod tests {
         inline_delete.commit().await.unwrap();
 
         let tx = catalog.begin_write_tx().await.unwrap();
-        let chunks = store_inline::scan_inline_chunks(ReadHandle::Txn(&tx), 1)
+        let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
-        let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Txn(&tx), 1)
+        let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
         tx.rollback();
@@ -1860,10 +1860,10 @@ mod tests {
         flush.commit().await.unwrap();
 
         let tx = catalog.begin_write_tx().await.unwrap();
-        let chunks = store_inline::scan_inline_chunks(ReadHandle::Txn(&tx), 1)
+        let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
-        let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Txn(&tx), 1)
+        let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
         tx.rollback();
@@ -1912,26 +1912,26 @@ mod tests {
         setup.commit().await.unwrap();
 
         let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut drop_txn = StagedTransaction::begin(db_tx2);
-        drop_txn.stage(RowOperation::InlineDrop { table_id: 1 });
-        drop_txn.stage(RowOperation::Insert {
+        let mut drop_tx = StagedTransaction::begin(db_tx2);
+        drop_tx.stage(RowOperation::InlineDrop { table_id: 1 });
+        drop_tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 0, 1),
         });
-        drop_txn.stage(RowOperation::Insert {
+        drop_tx.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, r#"dropped_table:"main"."t""#),
         });
-        drop_txn.commit().await.unwrap();
+        drop_tx.commit().await.unwrap();
 
         let tx = catalog.begin_write_tx().await.unwrap();
-        let chunks = store_inline::scan_inline_chunks(ReadHandle::Txn(&tx), 1)
+        let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
-        let file_deletes = store_inline::scan_inline_file_deletes(ReadHandle::Txn(&tx), 1)
+        let file_deletes = store_inline::scan_inline_file_deletes(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
-        let schemas = store_inline::scan_inline_schemas(ReadHandle::Txn(&tx), 1)
+        let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
         tx.rollback();
@@ -1980,26 +1980,26 @@ mod tests {
         setup.commit().await.unwrap();
 
         let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut drop_txn = StagedTransaction::begin(db_tx2);
-        drop_txn.stage(RowOperation::InlineSchemaDrop {
+        let mut drop_tx = StagedTransaction::begin(db_tx2);
+        drop_tx.stage(RowOperation::InlineSchemaDrop {
             table_id: 1,
             schema_version: 0,
         });
-        drop_txn.stage(RowOperation::Insert {
+        drop_tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 0, 1),
         });
-        drop_txn.stage(RowOperation::Insert {
+        drop_tx.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
         });
-        drop_txn.commit().await.unwrap();
+        drop_tx.commit().await.unwrap();
 
         let tx = catalog.begin_write_tx().await.unwrap();
-        let schemas = store_inline::scan_inline_schemas(ReadHandle::Txn(&tx), 1)
+        let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
-        let chunks = store_inline::scan_inline_chunks(ReadHandle::Txn(&tx), 1)
+        let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
             .await
             .unwrap();
         tx.rollback();

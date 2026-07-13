@@ -300,12 +300,12 @@ mod tests {
         .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        assert_eq!(read_head(ReadHandle::Txn(&tx)).await.unwrap(), Some(head));
-        assert_eq!(read_format(ReadHandle::Txn(&tx)).await.unwrap(), None);
-        assert_eq!(read_migration(ReadHandle::Txn(&tx)).await.unwrap(), None);
-        assert_eq!(read_snapshot(ReadHandle::Txn(&tx), 0).await.unwrap(), None);
+        assert_eq!(read_head(ReadHandle::Tx(&tx)).await.unwrap(), Some(head));
+        assert_eq!(read_format(ReadHandle::Tx(&tx)).await.unwrap(), None);
+        assert_eq!(read_migration(ReadHandle::Tx(&tx)).await.unwrap(), None);
+        assert_eq!(read_snapshot(ReadHandle::Tx(&tx), 0).await.unwrap(), None);
 
-        let current = scan_current_entities(ReadHandle::Txn(&tx)).await.unwrap();
+        let current = scan_current_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(current.len(), 5);
         assert!(current.contains(&EntityRecord::Schema(schema)));
         assert!(current.contains(&EntityRecord::File(file)));
@@ -316,7 +316,7 @@ mod tests {
             scope_id: 0,
             value: option,
         }));
-        let history = scan_history_entities(ReadHandle::Txn(&tx)).await.unwrap();
+        let history = scan_history_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(history, vec![EntityRecord::Schema(ended)]);
         tx.rollback();
         db.close().await.unwrap();

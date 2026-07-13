@@ -334,7 +334,7 @@ mod tests {
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
 
-        let chunks = scan_inline_chunks(ReadHandle::Txn(&tx), 7).await.unwrap();
+        let chunks = scan_inline_chunks(ReadHandle::Tx(&tx), 7).await.unwrap();
         assert_eq!(
             chunks,
             vec![
@@ -368,42 +368,36 @@ mod tests {
             ]
         );
 
-        let inline_deletes = scan_inline_inline_deletes(ReadHandle::Txn(&tx), 7)
+        let inline_deletes = scan_inline_inline_deletes(ReadHandle::Tx(&tx), 7)
             .await
             .unwrap();
         assert_eq!(inline_deletes, vec![(3, inline_delete)]);
 
-        let file_deletes = scan_inline_file_deletes(ReadHandle::Txn(&tx), 7)
+        let file_deletes = scan_inline_file_deletes(ReadHandle::Tx(&tx), 7)
             .await
             .unwrap();
         assert_eq!(file_deletes, vec![(5, 1, file_delete)]);
 
-        let schemas = scan_inline_schemas(ReadHandle::Txn(&tx), 7).await.unwrap();
+        let schemas = scan_inline_schemas(ReadHandle::Tx(&tx), 7).await.unwrap();
         assert_eq!(
             schemas,
             vec![(0, schema_v0.clone()), (1, schema_v1.clone())]
         );
 
         assert_eq!(
-            read_inline_schema(ReadHandle::Txn(&tx), 7, 0)
-                .await
-                .unwrap(),
+            read_inline_schema(ReadHandle::Tx(&tx), 7, 0).await.unwrap(),
             Some(schema_v0)
         );
         assert_eq!(
-            read_inline_schema(ReadHandle::Txn(&tx), 7, 1)
-                .await
-                .unwrap(),
+            read_inline_schema(ReadHandle::Tx(&tx), 7, 1).await.unwrap(),
             Some(schema_v1)
         );
         assert_eq!(
-            read_inline_schema(ReadHandle::Txn(&tx), 7, 2)
-                .await
-                .unwrap(),
+            read_inline_schema(ReadHandle::Tx(&tx), 7, 2).await.unwrap(),
             None
         );
 
-        let other_table_chunks = scan_inline_chunks(ReadHandle::Txn(&tx), 8).await.unwrap();
+        let other_table_chunks = scan_inline_chunks(ReadHandle::Tx(&tx), 8).await.unwrap();
         assert_eq!(
             other_table_chunks,
             vec![(
@@ -462,7 +456,7 @@ mod tests {
         .unwrap();
 
         let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-        let all = scan_all_inline_schemas(ReadHandle::Txn(&tx)).await.unwrap();
+        let all = scan_all_inline_schemas(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(
             all,
             vec![

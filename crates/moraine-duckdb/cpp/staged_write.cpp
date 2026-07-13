@@ -18,7 +18,7 @@ namespace {
 // string into `string_storage`. The caller must reserve `string_storage` to
 // at least the row's full column count before the first call for that row:
 // the `std::string::c_str()` pointers taken here are borrowed by
-// `moraine_txn_stage`, and a `std::vector` reallocation on `push_back` would
+// `moraine_tx_stage`, and a `std::vector` reallocation on `push_back` would
 // invalidate any already-taken pointer.
 MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType &type,
                           std::vector<std::string> &string_storage) {
@@ -99,12 +99,12 @@ public:
 	}
 
 protected:
-	// The staged txn every row this operator translates lands in: the
+	// The staged tx every row this operator translates lands in: the
 	// DuckDB transaction's one lazily-opened staged transaction.
-	MoraineTxnHandle *StagedTxn(duckdb::ClientContext &client) const {
+	MoraineTxHandle *StagedTx(duckdb::ClientContext &client) const {
 		auto catalog_transaction = catalog_.GetCatalogTransaction(client);
-		auto &moraine_txn = catalog_transaction.transaction->Cast<MoraineTransaction>();
-		return moraine_txn.StagedTxn();
+		auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
+		return moraine_tx.StagedTx();
 	}
 
 	// Resolves a rowid the metadata scan emitted (the row's index in the
@@ -112,10 +112,11 @@ protected:
 	// the row itself, re-materializing the provider on first use. Head
 	// stability between the statement's scan and this Sink is a topology
 	// property (see staged_write.hpp's doc comment).
-	const std::vector<duckdb::Value> &ResolveRow(MetadataDmlState &state, const duckdb::Value &row_id) const {
+	const std::vector<duckdb::Value> &ResolveRow(MetadataDmlState &state, const duckdb::Value &row_id,
+	                                             duckdb::ClientContext &client) const {
 		if (!state.old_rows_loaded) {
 			auto &moraine_catalog = catalog_.Cast<MoraineCatalog>();
-			state.old_rows = spec_.provider(moraine_catalog.Handle());
+			state.old_rows = spec_.provider(moraine_catalog.Handle(), moraine_shim_is_interrupted, &client);
 			state.old_rows_loaded = true;
 		}
 		if (row_id.IsNull()) {
@@ -152,7 +153,7 @@ public:
 	}
 };
 
-// Translates every row of its input into one `moraine_txn_stage` INSERT
+// Translates every row of its input into one `moraine_tx_stage` INSERT
 // call each. Nothing lands in the store until the DuckDB transaction
 // commits (`MoraineTransactionManager::CommitTransaction`).
 class MoraineMetadataInsert : public MoraineMetadataDml {
@@ -162,7 +163,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		auto *txn = StagedTxn(context.client);
+		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
 			std::vector<std::string> string_storage;
@@ -175,7 +176,7 @@ public:
 				cells.push_back(CellFromValue(value, type, string_storage));
 			}
 			MoraineError err{};
-			auto code = moraine_txn_stage(txn, spec_.write_table_kind, /* insert */ 0, cells.data(), cells.size(),
+			auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* insert */ 0, cells.data(), cells.size(),
 			                              &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
@@ -228,7 +229,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		auto *txn = StagedTxn(context.client);
+		auto *tx = StagedTx(context.client);
 
 		// Pinned layout: the row-id column is the last column of the sink
 		// chunk (`Binder::BindRowIdColumns` appends it after the SET and
@@ -237,7 +238,7 @@ public:
 		auto row_id_col = chunk.ColumnCount() - 1;
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_col, row));
+			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_col, row), context.client);
 			std::vector<std::string> string_storage;
 			string_storage.reserve(spec_.columns.size() + 1);
 			std::vector<MoraineCell> cells;
@@ -252,7 +253,7 @@ public:
 				auto end_type = MapColumnType(spec_.columns[spec_.end_snapshot_column].ducklake_type);
 				cells.push_back(CellFromValue(chunk.GetValue(set_refs_[0], row), end_type, string_storage));
 				MoraineError err{};
-				auto code = moraine_txn_stage(txn, spec_.write_table_kind, /* update_set_end */ 2, cells.data(),
+				auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* update_set_end */ 2, cells.data(),
 				                              cells.size(), &err);
 				if (code != MORAINE_OK) {
 					ThrowMoraineError(err);
@@ -270,7 +271,7 @@ public:
 					cells.push_back(CellFromValue(new_row[col], type, string_storage));
 				}
 				MoraineError err{};
-				auto code = moraine_txn_stage(txn, spec_.write_table_kind, /* insert (overwrite) */ 0, cells.data(),
+				auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* insert (overwrite) */ 0, cells.data(),
 				                              cells.size(), &err);
 				if (code != MORAINE_OK) {
 					ThrowMoraineError(err);
@@ -300,10 +301,10 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		auto *txn = StagedTxn(context.client);
+		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_chunk_index_, row));
+			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_chunk_index_, row), context.client);
 			std::vector<std::string> string_storage;
 			string_storage.reserve(spec_.delete_key_columns.size());
 			std::vector<MoraineCell> cells;
@@ -314,7 +315,7 @@ public:
 			}
 			MoraineError err{};
 			auto code =
-			    moraine_txn_stage(txn, spec_.write_table_kind, /* delete */ 1, cells.data(), cells.size(), &err);
+			    moraine_tx_stage(tx, spec_.write_table_kind, /* delete */ 1, cells.data(), cells.size(), &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
 			}

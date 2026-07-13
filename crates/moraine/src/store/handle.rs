@@ -16,7 +16,7 @@ use slatedb::{ByteRangeBounds, DbIterator, DbReader, DbTransaction};
 #[derive(Clone, Copy)]
 pub(crate) enum ReadHandle<'a> {
     /// A snapshot-isolated read-write transaction (`Db::begin`).
-    Txn(&'a DbTransaction),
+    Tx(&'a DbTransaction),
     /// A read-only reader following the manifest.
     Reader(&'a DbReader),
 }
@@ -28,7 +28,7 @@ impl ReadHandle<'_> {
         key: K,
     ) -> Result<Option<Bytes>, slatedb::Error> {
         match self {
-            Self::Txn(tx) => tx.get(key).await,
+            Self::Tx(tx) => tx.get(key).await,
             Self::Reader(reader) => reader.get(key).await,
         }
     }
@@ -44,7 +44,7 @@ impl ReadHandle<'_> {
         T: ByteRangeBounds + Send,
     {
         match self {
-            Self::Txn(tx) => tx.scan_prefix(prefix, subrange).await,
+            Self::Tx(tx) => tx.scan_prefix(prefix, subrange).await,
             Self::Reader(reader) => reader.scan_prefix(prefix, subrange).await,
         }
     }
@@ -56,7 +56,7 @@ impl ReadHandle<'_> {
 /// to roll back the transaction (a reader has nothing to roll back).
 pub(crate) enum ReadSession {
     /// A read-write transaction, rolled back on `finish`.
-    Txn(DbTransaction),
+    Tx(DbTransaction),
     /// A read-only reader, shared with the catalog.
     Reader(Arc<DbReader>),
 }
@@ -65,14 +65,14 @@ impl ReadSession {
     /// Borrows a read handle over this session.
     pub(crate) fn handle(&self) -> ReadHandle<'_> {
         match self {
-            Self::Txn(tx) => ReadHandle::Txn(tx),
+            Self::Tx(tx) => ReadHandle::Tx(tx),
             Self::Reader(reader) => ReadHandle::Reader(reader),
         }
     }
 
     /// Releases the session, rolling back a read-write transaction.
     pub(crate) fn finish(self) {
-        if let Self::Txn(tx) = self {
+        if let Self::Tx(tx) = self {
             tx.rollback();
         }
     }

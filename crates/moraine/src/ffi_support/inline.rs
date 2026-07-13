@@ -186,14 +186,14 @@ mod tests {
     async fn scan_inline_materializes_rows_with_chunk_bodies() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut txn = StagedTransaction::begin(db_tx);
+        let mut tx = StagedTransaction::begin(db_tx);
 
-        txn.stage(RowOperation::InlineSchema {
+        tx.stage(RowOperation::InlineSchema {
             table_id: 1,
             schema_version: 0,
             arrow_schema: b"schema".to_vec(),
         });
-        txn.stage(RowOperation::InlineInsert {
+        tx.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -201,7 +201,7 @@ mod tests {
             row_count: 2,
             arrow_body: b"chunk-a".to_vec(),
         });
-        txn.stage(RowOperation::InlineInsert {
+        tx.stage(RowOperation::InlineInsert {
             table_id: 1,
             schema_version: 0,
             begin_snapshot: 1,
@@ -209,15 +209,15 @@ mod tests {
             row_count: 1,
             arrow_body: b"chunk-b".to_vec(),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1),
         });
-        txn.stage(RowOperation::Insert {
+        tx.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
             cells: snapshot_changes_row(1),
         });
-        txn.commit().await.unwrap();
+        tx.commit().await.unwrap();
 
         let db_tx2 = catalog.begin_write_tx().await.unwrap();
         let mut inline_delete = StagedTransaction::begin(db_tx2);

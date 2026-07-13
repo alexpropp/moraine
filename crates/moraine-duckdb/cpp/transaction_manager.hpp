@@ -1,6 +1,6 @@
 // A duckdb::TransactionManager backed by moraine: snapshot-per-transaction.
 // StartTransaction materializes one moraine_snapshot and hands out a
-// MoraineTransaction that owns it; CommitTransaction commits the staged txn
+// MoraineTransaction that owns it; CommitTransaction commits the staged tx
 // (if one was opened) and RollbackTransaction discards it, both releasing
 // the snapshot.
 #pragma once
@@ -48,20 +48,20 @@ public:
 	// Lazily opens (on the first call) the one staged-row transaction this
 	// DuckDB transaction stages every write into, and returns it. Every
 	// subsequent INSERT/UPDATE/DELETE within the same DuckDB transaction
-	// reuses it: one moraine staged txn per DuckDB transaction.
-	MoraineTxnHandle *StagedTxn();
+	// reuses it: one moraine staged tx per DuckDB transaction.
+	MoraineTxHandle *StagedTx();
 
-	// Hands ownership of the staged txn (if one was opened) to the caller,
+	// Hands ownership of the staged tx (if one was opened) to the caller,
 	// clearing this transaction's reference so the destructor's defensive
 	// rollback becomes a no-op. Returns null if no write ever opened one.
-	MoraineTxnHandle *TakeStagedTxn();
+	MoraineTxHandle *TakeStagedTx();
 
 private:
 	MoraineSnapshotHandle *snapshot_;
 	MoraineCatalogHandle *catalog_handle_;
 	bool schemas_loaded_ = false;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
-	MoraineTxnHandle *staged_txn_ = nullptr;
+	MoraineTxHandle *staged_tx_ = nullptr;
 };
 
 class MoraineTransactionManager : public duckdb::TransactionManager {

@@ -1,7 +1,7 @@
 // The staged-row write path: `duckdb::PhysicalOperator`s that translate
-// every row a DuckDB DML statement feeds them into `moraine_txn_stage`
-// calls against the DuckDB transaction's lazily-opened staged txn
-// (transaction_manager.hpp's `MoraineTransaction::StagedTxn`).
+// every row a DuckDB DML statement feeds them into `moraine_tx_stage`
+// calls against the DuckDB transaction's lazily-opened staged tx
+// (transaction_manager.hpp's `MoraineTransaction::StagedTx`).
 //
 // Sink-chunk layouts the operators depend on:
 //
@@ -45,10 +45,10 @@ struct MetadataTableSpec;
 // Builds the physical operator `MoraineCatalog::PlanInsert` returns for an
 // INSERT into a writable `MoraineMetadataTableEntry` (`spec.write_table_kind
 // != kNotWritable`): a Sink-only translator feeding rows to
-// `moraine_txn_stage`, dual-rooted as a Source emitting the DuckDB-standard
+// `moraine_tx_stage`, dual-rooted as a Source emitting the DuckDB-standard
 // one-row `Count` result once Sink's input is exhausted. `op.table.catalog`
 // supplies the `MoraineCatalog` the Sink fetches the active
-// `MoraineTransaction` (and its lazily-opened staged txn) from at
+// `MoraineTransaction` (and its lazily-opened staged tx) from at
 // execution time — the operator itself is stateless, per DuckDB's Sink
 // convention.
 duckdb::PhysicalOperator &PlanMetadataInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,

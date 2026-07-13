@@ -1,6 +1,6 @@
 // Dynamic inline-table catalog surface. Recognizes two per-table name
 // families and routes CREATE/INSERT/UPDATE/SELECT against them into the
-// `inline/*` keyspace over the staged-txn ABI instead of materializing real
+// `inline/*` keyspace over the staged-tx ABI instead of materializing real
 // tables (translate-only):
 //
 //   - `ducklake_inlined_data_<table_id>_<schema_version>` — inlined
@@ -180,7 +180,7 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
 // throws CatalogException if already recorded and `ERROR_ON_CONFLICT`.
 duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientContext &context, duckdb::Catalog &catalog,
                                                                 duckdb::SchemaCatalogEntry &schema,
-                                                                MoraineCatalogHandle *handle, MoraineTxnHandle *txn,
+                                                                MoraineCatalogHandle *handle, MoraineTxHandle *tx,
                                                                 duckdb::BoundCreateTableInfo &info, uint64_t table_id,
                                                                 uint64_t schema_version);
 

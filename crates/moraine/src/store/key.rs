@@ -648,7 +648,7 @@ mod tests {
     /// Every inline-op kind's live prefix matches a live key of that kind
     /// with the same table id and rejects a different table id or kind.
     #[test]
-    fn inline_live_table_prefixes_cover_all_op_kinds() {
+    fn inline_live_table_prefixes_cover_all_operation_kinds() {
         let kinds = [
             InlineOperationKind::Insert,
             InlineOperationKind::InlineDelete,
