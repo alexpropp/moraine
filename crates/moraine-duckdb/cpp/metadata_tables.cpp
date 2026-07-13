@@ -446,11 +446,14 @@ std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *, Mor
 	return {};
 }
 
-// `ducklake_metadata` has no store-modeled source of truth, so its rows are
-// fixed here rather than read through the dump ABI. Constraints on the
-// values DuckLake reads back:
+// `ducklake_metadata` rows. All are fixed here except `encrypted`, which
+// is the store's creation-time flag. Constraints on the values DuckLake
+// reads back:
 //   - "version": must be "1.0"; any other value triggers migration logic.
-//   - "encrypted": "false" (no encryption support).
+//   - "encrypted": the stored flag (moraine_catalog_encrypted). DuckLake
+//     compares it against the attach's requested encryption and, when
+//     "true", encrypts new data files and records their keys in
+//     `ducklake_data_file`/`ducklake_delete_file` rows.
 //   - "data_path" is deliberately omitted: DuckLake acts on it only when the
 //     row is present, and there is no store-level lake-wide data path to
 //     serve; omitting it leaves the ATTACH DATA_PATH option as sole authority.
@@ -461,13 +464,20 @@ std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *, Mor
 //     entirely. inline_tables.cpp serves the dynamic inline catalog surface
 //     this drives.
 // All rows are global (scope/scope_id NULL).
-std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *, MoraineInterruptProbe, void *) {
+std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                        void *probe_ctx) {
+	bool encrypted = false;
+	MoraineError err{};
+	auto code = moraine_catalog_encrypted(handle, &encrypted, probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
 	auto null_varchar = duckdb::Value(duckdb::LogicalType::VARCHAR);
 	auto null_bigint = duckdb::Value(duckdb::LogicalType::BIGINT);
 	return {
 	    {Varchar("version"), Varchar("1.0"), null_varchar, null_bigint},
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
-	    {Varchar("encrypted"), Varchar("false"), null_varchar, null_bigint},
+	    {Varchar("encrypted"), Varchar(encrypted ? "true" : "false"), null_varchar, null_bigint},
 	    {Varchar("data_inlining_row_limit"), Varchar("10"), null_varchar, null_bigint},
 	};
 }

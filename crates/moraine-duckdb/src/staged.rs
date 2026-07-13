@@ -648,6 +648,7 @@ mod tests {
                 c_path.as_ptr(),
                 ptr::null(),
                 false,
+                false,
                 &raw mut handle,
                 &raw mut err,
             )

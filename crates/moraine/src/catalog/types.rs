@@ -78,6 +78,9 @@ pub struct DataFile {
     pub file_size_bytes: u64,
     /// Footer size in bytes.
     pub footer_size: u64,
+    /// Encryption key material, verbatim — an opaque string moraine
+    /// stores and returns but never interprets.
+    pub encryption_key: Option<String>,
     /// Per-column statistics carried with the registration. Every entry
     /// must reference a live column of the table.
     pub column_stats: Vec<FileColumnStats>,
@@ -122,6 +125,9 @@ pub struct DeleteFile {
     pub file_size_bytes: u64,
     /// Footer size in bytes.
     pub footer_size: u64,
+    /// Encryption key material, verbatim — an opaque string moraine
+    /// stores and returns but never interprets.
+    pub encryption_key: Option<String>,
 }
 
 /// A live data file, as read from a snapshot.
@@ -143,6 +149,8 @@ pub struct DataFileInfo {
     pub footer_size: u64,
     /// First row id of the file's dense per-table row-id range.
     pub row_id_start: u64,
+    /// Encryption key material, verbatim.
+    pub encryption_key: Option<String>,
 }
 
 /// A live delete file, as read from a snapshot.
@@ -164,6 +172,8 @@ pub struct DeleteFileInfo {
     pub file_size_bytes: u64,
     /// Footer size in bytes.
     pub footer_size: u64,
+    /// Encryption key material, verbatim.
+    pub encryption_key: Option<String>,
 }
 
 /// A table's statistics.

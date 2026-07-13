@@ -484,7 +484,7 @@ impl Transaction {
             footer_size: file.footer_size,
             row_id_start,
             partition_id: None,
-            encryption_key: None,
+            encryption_key: file.encryption_key,
             mapping_id: None,
             partial_max: None,
             partition_values: vec![],
@@ -595,7 +595,7 @@ impl Transaction {
             delete_count: file.delete_count,
             file_size_bytes: file.file_size_bytes,
             footer_size: file.footer_size,
-            encryption_key: None,
+            encryption_key: file.encryption_key,
             partial_max: None,
         });
         self.ops.push(Operation::RegisterDeleteFile {
@@ -1140,6 +1140,7 @@ mod tests {
             record_count: rows,
             file_size_bytes: rows * 10,
             footer_size: 4,
+            encryption_key: None,
             column_stats: stats,
         }
     }
@@ -1213,6 +1214,7 @@ mod tests {
                     delete_count: 5,
                     file_size_bytes: 50,
                     footer_size: 4,
+                    encryption_key: None,
                 },
             )
             .unwrap();
@@ -1251,6 +1253,7 @@ mod tests {
                     delete_count: 1,
                     file_size_bytes: 10,
                     footer_size: 4,
+                    encryption_key: None,
                 },
             ),
             Err(Error::NotFound(_))

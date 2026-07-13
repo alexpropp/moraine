@@ -1388,6 +1388,84 @@ mod tests {
         assert_eq!(cols[0].name, "a");
     }
 
+    /// DuckLake-authored data-file and delete-file rows carry
+    /// `encryption_key` through commit and back out of the snapshot read
+    /// verbatim — the faithful-conduit guarantee for key material.
+    #[tokio::test]
+    async fn encryption_keys_round_trip_through_staged_rows() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "a", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: vec![
+                Cell::U64(1),                     // data_file_id
+                Cell::U64(1),                     // table_id
+                Cell::U64(1),                     // begin_snapshot
+                Cell::Null,                       // end_snapshot
+                Cell::Null,                       // file_order
+                Cell::Str("data.parquet".into()), // path
+                Cell::Bool(true),                 // path_is_relative
+                Cell::Str("parquet".into()),      // file_format
+                Cell::U64(10),                    // record_count
+                Cell::U64(1024),                  // file_size_bytes
+                Cell::U64(64),                    // footer_size
+                Cell::U64(0),                     // row_id_start
+                Cell::Null,                       // partition_id
+                Cell::Str("ZGF0YS1rZXk=".into()), // encryption_key
+                Cell::Null,                       // mapping_id
+                Cell::Null,                       // partial_max
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DeleteFile,
+            cells: vec![
+                Cell::U64(2),                         // delete_file_id
+                Cell::U64(1),                         // table_id
+                Cell::U64(1),                         // begin_snapshot
+                Cell::Null,                           // end_snapshot
+                Cell::U64(1),                         // data_file_id
+                Cell::Str("delete.parquet".into()),   // path
+                Cell::Bool(true),                     // path_is_relative
+                Cell::Str("parquet".into()),          // format
+                Cell::U64(2),                         // delete_count
+                Cell::U64(128),                       // file_size_bytes
+                Cell::U64(32),                        // footer_size
+                Cell::Str("ZGVsZXRlLWtleQ==".into()), // encryption_key
+                Cell::Null,                           // partial_max
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let table = head.tables_in(crate::catalog::SchemaId::new(0))[0].id;
+        assert_eq!(
+            head.data_files_of(table)[0].encryption_key.as_deref(),
+            Some("ZGF0YS1rZXk=")
+        );
+        assert_eq!(
+            head.delete_files_of(table)[0].encryption_key.as_deref(),
+            Some("ZGVsZXRlLWtleQ==")
+        );
+    }
+
     /// An `UPDATE ... SET end_snapshot` row ends a live table version:
     /// the old row moves to `history`, the new one lands in `current`, exactly
     /// the lifecycle convention this path interprets.

@@ -54,7 +54,18 @@ trust domains**: bulk data hosted on a store the operator does not trust,
 catalog and KMS on one they do (DuckLake's "zero-trust data hosting"). In a
 single trust domain it is redundant with SSE. Either way the switch is
 DuckLake's and the operator's; moraine carries one more opaque column and is
-deliberately indifferent to whether it is set.
+otherwise indifferent to whether it is set.
+
+Mechanically, the switch is one bit of catalog metadata moraine does hold:
+DuckLake fixes whether a catalog is encrypted when the catalog is created,
+so moraine records an `encrypted` flag (a stored global option, the
+`ducklake_metadata` row DuckLake reads back) at bootstrap and never
+afterward. It reaches a fresh store through the attach —
+`ATTACH 'ducklake:moraine:…' (DATA_PATH …, ENCRYPTED, META_ENCRYPTED true)`,
+DuckLake's `META_` passthrough handing `ENCRYPTED` to the inner moraine
+attach — and later attaches need no flag: DuckLake adopts the stored value.
+The flag decides nothing inside moraine; it is served back so DuckLake
+knows to encrypt.
 
 ### Catalog-at-rest: SSE-KMS on the bucket
 

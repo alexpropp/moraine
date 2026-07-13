@@ -525,7 +525,16 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// (including through DuckLake's nested metadata attach); a read-only
 	// catalog opens a `DbReader` and never fences the writer.
 	bool read_only = options.access_mode == duckdb::AccessMode::READ_ONLY;
-	auto code = moraine_attach(info.path.c_str(), nullptr, read_only, &handle, &err);
+	// `ENCRYPTED` reaches this attach through DuckLake's `META_` option
+	// passthrough (`META_ENCRYPTED true`). Creation-time only: the ABI
+	// records it when a fresh store bootstraps and ignores it afterward.
+	bool encrypted = false;
+	for (auto &option : info.options) {
+		if (duckdb::StringUtil::Lower(option.first) == "encrypted") {
+			encrypted = option.second.GetValue<bool>();
+		}
+	}
+	auto code = moraine_attach(info.path.c_str(), nullptr, read_only, encrypted, &handle, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

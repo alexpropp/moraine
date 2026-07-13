@@ -27,6 +27,7 @@ fn datafile(rows: u64) -> DataFile {
         record_count: rows,
         file_size_bytes: rows * 10,
         footer_size: 4,
+        encryption_key: None,
         column_stats: vec![],
     }
 }
@@ -107,6 +108,48 @@ async fn expiry_time_travels_and_row_ids_stay_dense() {
 }
 
 #[tokio::test]
+async fn encryption_keys_round_trip_verbatim() {
+    let (catalog, t) = seeded().await;
+
+    catalog
+        .commit(move |tx| {
+            let file = tx.register_data_file(
+                t,
+                DataFile {
+                    encryption_key: Some("ZGF0YS1rZXk=".into()),
+                    ..datafile(10)
+                },
+            )?;
+            tx.register_delete_file(
+                t,
+                DeleteFile {
+                    data_file_id: file,
+                    path: "d.parquet".into(),
+                    path_is_relative: true,
+                    format: "parquet".into(),
+                    delete_count: 1,
+                    file_size_bytes: 50,
+                    footer_size: 4,
+                    encryption_key: Some("ZGVsZXRlLWtleQ==".into()),
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        head.data_files_of(t)[0].encryption_key.as_deref(),
+        Some("ZGF0YS1rZXk=")
+    );
+    assert_eq!(
+        head.delete_files_of(t)[0].encryption_key.as_deref(),
+        Some("ZGVsZXRlLWtleQ==")
+    );
+}
+
+#[tokio::test]
 async fn delete_files_cascade_with_their_data_file() {
     let (catalog, t) = seeded().await;
     catalog
@@ -122,6 +165,7 @@ async fn delete_files_cascade_with_their_data_file() {
                     delete_count: 5,
                     file_size_bytes: 50,
                     footer_size: 4,
+                    encryption_key: None,
                 },
             )?;
             Ok(())
@@ -152,6 +196,7 @@ async fn delete_files_cascade_with_their_data_file() {
                     delete_count: 1,
                     file_size_bytes: 10,
                     footer_size: 4,
+                    encryption_key: None,
                 },
             )
             .map(|_| ())

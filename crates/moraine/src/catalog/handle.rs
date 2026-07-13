@@ -31,6 +31,11 @@ pub struct CatalogOptions {
     /// places the catalog at the bucket root; set it when several stores
     /// share a bucket.
     pub path: String,
+    /// Whether DuckLake encrypts this catalog's data files. Creation-time
+    /// only: recorded as the stored global `encrypted` option when a fresh
+    /// store bootstraps, and ignored on an already-initialized store,
+    /// where the stored value is authoritative.
+    pub encrypted: bool,
 }
 
 /// A handle to a moraine catalog: cheap to clone, drives reads and
@@ -74,7 +79,7 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
-        let db = commit::open_initialized(&options.path, object_store).await?;
+        let db = commit::open_initialized(&options.path, object_store, options.encrypted).await?;
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
         })

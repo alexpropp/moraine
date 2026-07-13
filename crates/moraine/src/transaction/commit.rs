@@ -67,9 +67,15 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
 
 /// Stages the initial state of an empty store into `tx`: format stamp,
 /// snapshot 0 (carrying the default `main` schema, counters advanced past
-/// its id), the `main` schema record itself, and head pointer — the same
-/// starting catalog shape a fresh DuckLake metadata store carries.
-fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
+/// its id), the `main` schema record itself, the global `encrypted`
+/// option, and head pointer — the same starting catalog shape a fresh
+/// DuckLake metadata store carries.
+///
+/// `encrypted` is recorded explicitly (as `"true"`/`"false"`) and only
+/// here: whether data files are encrypted is fixed when the catalog is
+/// created, exactly as DuckLake fixes it when initializing a metadata
+/// store.
+fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
     let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     stage(
         Key::Sys(SysKey::Format),
@@ -107,6 +113,18 @@ fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
         }),
     )?;
     stage(
+        Key::current(EntityKey::Option {
+            scope_kind: 0,
+            scope_id: 0,
+        }),
+        value::encode_value(&proto::OptionScopeValue {
+            options: std::collections::HashMap::from([(
+                "encrypted".to_string(),
+                if encrypted { "true" } else { "false" }.to_string(),
+            )]),
+        }),
+    )?;
+    stage(
         Key::Sys(SysKey::Head),
         value::encode_value(&proto::HeadValue { snapshot_id: 0 }),
     )
@@ -115,7 +133,11 @@ fn stage_bootstrap(tx: &DbTransaction) -> Result<()> {
 /// Opens the store, bootstrapping an empty one in one atomic batch under
 /// conflict detection — a lost bootstrap race re-validates instead of
 /// double-initializing. Every exit that does not commit rolls back.
-pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<Db> {
+pub(crate) async fn open_initialized(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+    encrypted: bool,
+) -> Result<Db> {
     let db = open_store(path, object_store).await?;
     let tx = db
         .begin(IsolationLevel::Snapshot)
@@ -134,7 +156,7 @@ pub(crate) async fn open_initialized(path: &str, object_store: Arc<dyn ObjectSto
         }
     }
 
-    if let Err(err) = stage_bootstrap(&tx) {
+    if let Err(err) = stage_bootstrap(&tx, encrypted) {
         tx.rollback();
         return Err(err);
     }
@@ -807,7 +829,10 @@ mod tests {
 
         // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
         // `Debug` impl; `err().unwrap()` only needs it on the error side.
-        let err = open_initialized("", object_store).await.err().unwrap();
+        let err = open_initialized("", object_store, false)
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -828,7 +853,10 @@ mod tests {
         .unwrap();
         db.close().await.unwrap();
 
-        let err = open_initialized("", object_store).await.err().unwrap();
+        let err = open_initialized("", object_store, false)
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -886,6 +914,7 @@ mod tests {
                     record_count: 10,
                     file_size_bytes: 100,
                     footer_size: 4,
+                    encryption_key: None,
                     column_stats: vec![FileColumnStats {
                         column_id: column,
                         column_size_bytes: 10,

@@ -98,16 +98,6 @@ pub unsafe extern "C" fn moraine_dump_schemas(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineSchemaRow>, AbiError> {
-        struct Owned {
-            schema_id: u64,
-            schema_uuid: CString,
-            begin_snapshot: u64,
-            has_end_snapshot: bool,
-            end_snapshot: u64,
-            schema_name: CString,
-            path: CString,
-            path_is_relative: bool,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -127,33 +117,30 @@ pub unsafe extern "C" fn moraine_dump_schemas(
         }?;
         // Owned-first: every string in the whole batch converts before any
         // raw pointer is minted, so a partial failure leaks nothing.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
+            .map(|v| {
+                let schema_uuid = to_c_string(&v.schema_uuid)?;
+                let schema_name = to_c_string(&v.schema_name)?;
+                let path = to_c_string(&v.path)?;
+                Ok((v, schema_uuid, schema_name, path))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+
+        Ok(owned
+            .into_iter()
+            .map(|(v, schema_uuid, schema_name, path)| {
                 let (has_end, end) = opt_u64(v.end_snapshot);
-                Ok(Owned {
+                MoraineSchemaRow {
                     schema_id: v.schema_id,
-                    schema_uuid: to_c_string(&v.schema_uuid)?,
+                    schema_uuid: schema_uuid.into_raw(),
                     begin_snapshot: v.begin_snapshot,
                     has_end_snapshot: has_end,
                     end_snapshot: end,
-                    schema_name: to_c_string(&v.schema_name)?,
-                    path: to_c_string(&v.path)?,
+                    schema_name: schema_name.into_raw(),
+                    path: path.into_raw(),
                     path_is_relative: v.path_is_relative,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineSchemaRow {
-                schema_id: o.schema_id,
-                schema_uuid: o.schema_uuid.into_raw(),
-                begin_snapshot: o.begin_snapshot,
-                has_end_snapshot: o.has_end_snapshot,
-                end_snapshot: o.end_snapshot,
-                schema_name: o.schema_name.into_raw(),
-                path: o.path.into_raw(),
-                path_is_relative: o.path_is_relative,
+                }
             })
             .collect())
     };
@@ -231,17 +218,6 @@ pub unsafe extern "C" fn moraine_dump_tables(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineTableRow>, AbiError> {
-        struct Owned {
-            table_id: u64,
-            table_uuid: CString,
-            begin_snapshot: u64,
-            has_end_snapshot: bool,
-            end_snapshot: u64,
-            schema_id: u64,
-            table_name: CString,
-            path: CString,
-            path_is_relative: bool,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -261,35 +237,30 @@ pub unsafe extern "C" fn moraine_dump_tables(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
+            .map(|v| {
+                let table_uuid = to_c_string(&v.table_uuid)?;
+                let table_name = to_c_string(&v.table_name)?;
+                let path = to_c_string(&v.path)?;
+                Ok((v, table_uuid, table_name, path))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        Ok(owned
+            .into_iter()
+            .map(|(v, table_uuid, table_name, path)| {
                 let (has_end, end) = opt_u64(v.end_snapshot);
-                Ok(Owned {
+                MoraineTableRow {
                     table_id: v.table_id,
-                    table_uuid: to_c_string(&v.table_uuid)?,
+                    table_uuid: table_uuid.into_raw(),
                     begin_snapshot: v.begin_snapshot,
                     has_end_snapshot: has_end,
                     end_snapshot: end,
                     schema_id: v.schema_id,
-                    table_name: to_c_string(&v.table_name)?,
-                    path: to_c_string(&v.path)?,
+                    table_name: table_name.into_raw(),
+                    path: path.into_raw(),
                     path_is_relative: v.path_is_relative,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineTableRow {
-                table_id: o.table_id,
-                table_uuid: o.table_uuid.into_raw(),
-                begin_snapshot: o.begin_snapshot,
-                has_end_snapshot: o.has_end_snapshot,
-                end_snapshot: o.end_snapshot,
-                schema_id: o.schema_id,
-                table_name: o.table_name.into_raw(),
-                path: o.path.into_raw(),
-                path_is_relative: o.path_is_relative,
+                }
             })
             .collect())
     };
@@ -367,18 +338,6 @@ pub unsafe extern "C" fn moraine_dump_views(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineViewRow>, AbiError> {
-        struct Owned {
-            view_id: u64,
-            view_uuid: CString,
-            begin_snapshot: u64,
-            has_end_snapshot: bool,
-            end_snapshot: u64,
-            schema_id: u64,
-            view_name: CString,
-            dialect: CString,
-            sql: CString,
-            column_aliases: Option<CString>,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -398,37 +357,34 @@ pub unsafe extern "C" fn moraine_dump_views(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
+            .map(|v| {
+                let view_uuid = to_c_string(&v.view_uuid)?;
+                let view_name = to_c_string(&v.view_name)?;
+                let dialect = to_c_string(&v.dialect)?;
+                let sql = to_c_string(&v.sql)?;
+                let column_aliases = opt_c_string(v.column_aliases.as_deref())?;
+                Ok((v, view_uuid, view_name, dialect, sql, column_aliases))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+
+        Ok(owned
+            .into_iter()
+            .map(|(v, view_uuid, view_name, dialect, sql, column_aliases)| {
                 let (has_end, end) = opt_u64(v.end_snapshot);
-                Ok(Owned {
+                MoraineViewRow {
                     view_id: v.view_id,
-                    view_uuid: to_c_string(&v.view_uuid)?,
+                    view_uuid: view_uuid.into_raw(),
                     begin_snapshot: v.begin_snapshot,
                     has_end_snapshot: has_end,
                     end_snapshot: end,
                     schema_id: v.schema_id,
-                    view_name: to_c_string(&v.view_name)?,
-                    dialect: to_c_string(&v.dialect)?,
-                    sql: to_c_string(&v.sql)?,
-                    column_aliases: opt_c_string(v.column_aliases.as_deref())?,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineViewRow {
-                view_id: o.view_id,
-                view_uuid: o.view_uuid.into_raw(),
-                begin_snapshot: o.begin_snapshot,
-                has_end_snapshot: o.has_end_snapshot,
-                end_snapshot: o.end_snapshot,
-                schema_id: o.schema_id,
-                view_name: o.view_name.into_raw(),
-                dialect: o.dialect.into_raw(),
-                sql: o.sql.into_raw(),
-                column_aliases: opt_into_raw(o.column_aliases),
+                    view_name: view_name.into_raw(),
+                    dialect: dialect.into_raw(),
+                    sql: sql.into_raw(),
+                    column_aliases: opt_into_raw(column_aliases),
+                }
             })
             .collect())
     };
@@ -520,23 +476,6 @@ pub unsafe extern "C" fn moraine_dump_columns(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineColumnRow>, AbiError> {
-        struct Owned {
-            column_id: u64,
-            begin_snapshot: u64,
-            has_end_snapshot: bool,
-            end_snapshot: u64,
-            table_id: u64,
-            column_order: u64,
-            column_name: CString,
-            column_type: CString,
-            initial_default: Option<CString>,
-            default_value: Option<CString>,
-            nulls_allowed: bool,
-            has_parent_column: bool,
-            parent_column: u64,
-            default_value_type: Option<CString>,
-            default_value_dialect: Option<CString>,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -556,49 +495,60 @@ pub unsafe extern "C" fn moraine_dump_columns(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
-                let (has_end, end) = opt_u64(v.end_snapshot);
-                let (has_parent, parent) = opt_u64(v.parent_column);
-                Ok(Owned {
-                    column_id: v.column_id,
-                    begin_snapshot: v.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                    table_id: v.table_id,
-                    column_order: v.column_order,
-                    column_name: to_c_string(&v.column_name)?,
-                    column_type: to_c_string(&v.column_type)?,
-                    initial_default: opt_c_string(v.initial_default.as_deref())?,
-                    default_value: opt_c_string(v.default_value.as_deref())?,
-                    nulls_allowed: v.nulls_allowed,
-                    has_parent_column: has_parent,
-                    parent_column: parent,
-                    default_value_type: opt_c_string(v.default_value_type.as_deref())?,
-                    default_value_dialect: opt_c_string(v.default_value_dialect.as_deref())?,
-                })
+            .map(|v| {
+                let column_name = to_c_string(&v.column_name)?;
+                let column_type = to_c_string(&v.column_type)?;
+                let initial_default = opt_c_string(v.initial_default.as_deref())?;
+                let default_value = opt_c_string(v.default_value.as_deref())?;
+                let default_value_type = opt_c_string(v.default_value_type.as_deref())?;
+                let default_value_dialect = opt_c_string(v.default_value_dialect.as_deref())?;
+                Ok((
+                    v,
+                    column_name,
+                    column_type,
+                    initial_default,
+                    default_value,
+                    default_value_type,
+                    default_value_dialect,
+                ))
             })
-            .collect::<Result<_, AbiError>>()?;
+            .collect::<Result<Vec<_>, AbiError>>()?;
         Ok(owned
             .into_iter()
-            .map(|o| MoraineColumnRow {
-                column_id: o.column_id,
-                begin_snapshot: o.begin_snapshot,
-                has_end_snapshot: o.has_end_snapshot,
-                end_snapshot: o.end_snapshot,
-                table_id: o.table_id,
-                column_order: o.column_order,
-                column_name: o.column_name.into_raw(),
-                column_type: o.column_type.into_raw(),
-                initial_default: opt_into_raw(o.initial_default),
-                default_value: opt_into_raw(o.default_value),
-                nulls_allowed: o.nulls_allowed,
-                has_parent_column: o.has_parent_column,
-                parent_column: o.parent_column,
-                default_value_type: opt_into_raw(o.default_value_type),
-                default_value_dialect: opt_into_raw(o.default_value_dialect),
-            })
+            .map(
+                |(
+                    v,
+                    column_name,
+                    column_type,
+                    initial_default,
+                    default_value,
+                    default_value_type,
+                    default_value_dialect,
+                )| {
+                    let (has_end, end) = opt_u64(v.end_snapshot);
+                    let (has_parent, parent) = opt_u64(v.parent_column);
+
+                    MoraineColumnRow {
+                        column_id: v.column_id,
+                        begin_snapshot: v.begin_snapshot,
+                        has_end_snapshot: has_end,
+                        end_snapshot: end,
+                        table_id: v.table_id,
+                        column_order: v.column_order,
+                        column_name: column_name.into_raw(),
+                        column_type: column_type.into_raw(),
+                        initial_default: opt_into_raw(initial_default),
+                        default_value: opt_into_raw(default_value),
+                        nulls_allowed: v.nulls_allowed,
+                        has_parent_column: has_parent,
+                        parent_column: parent,
+                        default_value_type: opt_into_raw(default_value_type),
+                        default_value_dialect: opt_into_raw(default_value_dialect),
+                    }
+                },
+            )
             .collect())
     };
 
@@ -694,9 +644,6 @@ pub struct MoraineDataFileRow {
 ///
 /// Same pointer contract as [`moraine_dump_schemas`].
 #[unsafe(no_mangle)]
-// `ducklake_data_file` is the widest row this module dumps; its length is
-// inherent to the row shape.
-#[allow(clippy::too_many_lines)]
 pub unsafe extern "C" fn moraine_dump_data_files(
     handle: *mut MoraineCatalogHandle,
     out_items: *mut *mut MoraineDataFileRow,
@@ -706,32 +653,6 @@ pub unsafe extern "C" fn moraine_dump_data_files(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineDataFileRow>, AbiError> {
-        // `Owned` mirrors `MoraineDataFileRow` field-for-field; its bool
-        // count is inherent to the row shape.
-        #[allow(clippy::struct_excessive_bools)]
-        struct Owned {
-            data_file_id: u64,
-            table_id: u64,
-            begin_snapshot: u64,
-            has_end_snapshot: bool,
-            end_snapshot: u64,
-            has_file_order: bool,
-            file_order: u64,
-            path: CString,
-            path_is_relative: bool,
-            file_format: CString,
-            record_count: u64,
-            file_size_bytes: u64,
-            footer_size: u64,
-            row_id_start: u64,
-            has_partition_id: bool,
-            partition_id: u64,
-            encryption_key: Option<CString>,
-            has_mapping_id: bool,
-            mapping_id: u64,
-            has_partial_max: bool,
-            partial_max: u64,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -751,15 +672,26 @@ pub unsafe extern "C" fn moraine_dump_data_files(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
+            .map(|v| {
+                let path = to_c_string(&v.path)?;
+                let file_format = to_c_string(&v.file_format)?;
+                let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
+                Ok((v, path, file_format, encryption_key))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+
+        Ok(owned
+            .into_iter()
+            .map(|(v, path, file_format, encryption_key)| {
                 let (has_end, end) = opt_u64(v.end_snapshot);
                 let (has_order, order) = opt_u64(v.file_order);
                 let (has_partition, partition) = opt_u64(v.partition_id);
                 let (has_mapping, mapping) = opt_u64(v.mapping_id);
                 let (has_partial_max, partial_max) = opt_u64(v.partial_max);
-                Ok(Owned {
+
+                MoraineDataFileRow {
                     data_file_id: v.data_file_id,
                     table_id: v.table_id,
                     begin_snapshot: v.begin_snapshot,
@@ -767,47 +699,21 @@ pub unsafe extern "C" fn moraine_dump_data_files(
                     end_snapshot: end,
                     has_file_order: has_order,
                     file_order: order,
-                    path: to_c_string(&v.path)?,
+                    path: path.into_raw(),
                     path_is_relative: v.path_is_relative,
-                    file_format: to_c_string(&v.file_format)?,
+                    file_format: file_format.into_raw(),
                     record_count: v.record_count,
                     file_size_bytes: v.file_size_bytes,
                     footer_size: v.footer_size,
                     row_id_start: v.row_id_start,
                     has_partition_id: has_partition,
                     partition_id: partition,
-                    encryption_key: opt_c_string(v.encryption_key.as_deref())?,
+                    encryption_key: opt_into_raw(encryption_key),
                     has_mapping_id: has_mapping,
                     mapping_id: mapping,
                     has_partial_max,
                     partial_max,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineDataFileRow {
-                data_file_id: o.data_file_id,
-                table_id: o.table_id,
-                begin_snapshot: o.begin_snapshot,
-                has_end_snapshot: o.has_end_snapshot,
-                end_snapshot: o.end_snapshot,
-                has_file_order: o.has_file_order,
-                file_order: o.file_order,
-                path: o.path.into_raw(),
-                path_is_relative: o.path_is_relative,
-                file_format: o.file_format.into_raw(),
-                record_count: o.record_count,
-                file_size_bytes: o.file_size_bytes,
-                footer_size: o.footer_size,
-                row_id_start: o.row_id_start,
-                has_partition_id: o.has_partition_id,
-                partition_id: o.partition_id,
-                encryption_key: opt_into_raw(o.encryption_key),
-                has_mapping_id: o.has_mapping_id,
-                mapping_id: o.mapping_id,
-                has_partial_max: o.has_partial_max,
-                partial_max: o.partial_max,
+                }
             })
             .collect())
     };
@@ -896,23 +802,6 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineDeleteFileRow>, AbiError> {
-        struct Owned {
-            delete_file_id: u64,
-            table_id: u64,
-            begin_snapshot: u64,
-            has_end_snapshot: bool,
-            end_snapshot: u64,
-            data_file_id: u64,
-            path: CString,
-            path_is_relative: bool,
-            format: CString,
-            delete_count: u64,
-            file_size_bytes: u64,
-            footer_size: u64,
-            encryption_key: Option<CString>,
-            has_partial_max: bool,
-            partial_max: u64,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -932,48 +821,37 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
+            .map(|v| {
+                let path = to_c_string(&v.path)?;
+                let format = to_c_string(&v.format)?;
+                let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
+                Ok((v, path, format, encryption_key))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        Ok(owned
+            .into_iter()
+            .map(|(v, path, format, encryption_key)| {
                 let (has_end, end) = opt_u64(v.end_snapshot);
                 let (has_partial_max, partial_max) = opt_u64(v.partial_max);
-                Ok(Owned {
+                MoraineDeleteFileRow {
                     delete_file_id: v.delete_file_id,
                     table_id: v.table_id,
                     begin_snapshot: v.begin_snapshot,
                     has_end_snapshot: has_end,
                     end_snapshot: end,
                     data_file_id: v.data_file_id,
-                    path: to_c_string(&v.path)?,
+                    path: path.into_raw(),
                     path_is_relative: v.path_is_relative,
-                    format: to_c_string(&v.format)?,
+                    format: format.into_raw(),
                     delete_count: v.delete_count,
                     file_size_bytes: v.file_size_bytes,
                     footer_size: v.footer_size,
-                    encryption_key: opt_c_string(v.encryption_key.as_deref())?,
+                    encryption_key: opt_into_raw(encryption_key),
                     has_partial_max,
                     partial_max,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineDeleteFileRow {
-                delete_file_id: o.delete_file_id,
-                table_id: o.table_id,
-                begin_snapshot: o.begin_snapshot,
-                has_end_snapshot: o.has_end_snapshot,
-                end_snapshot: o.end_snapshot,
-                data_file_id: o.data_file_id,
-                path: o.path.into_raw(),
-                path_is_relative: o.path_is_relative,
-                format: o.format.into_raw(),
-                delete_count: o.delete_count,
-                file_size_bytes: o.file_size_bytes,
-                footer_size: o.footer_size,
-                encryption_key: opt_into_raw(o.encryption_key),
-                has_partial_max: o.has_partial_max,
-                partial_max: o.partial_max,
+                }
             })
             .collect())
     };
@@ -1143,20 +1021,6 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineTableColumnStatsRow>, AbiError> {
-        // `Owned` mirrors `MoraineTableColumnStatsRow` field-for-field; its
-        // bool count is inherent to the row's optional-scalar columns.
-        #[allow(clippy::struct_excessive_bools)]
-        struct Owned {
-            table_id: u64,
-            column_id: u64,
-            has_contains_null: bool,
-            contains_null: bool,
-            has_contains_nan: bool,
-            contains_nan: bool,
-            min_value: Option<CString>,
-            max_value: Option<CString>,
-            extra_stats: Option<CString>,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -1176,36 +1040,31 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
+            .map(|v| {
+                let min_value = opt_c_string(v.min_value.as_deref())?;
+                let max_value = opt_c_string(v.max_value.as_deref())?;
+                let extra_stats = opt_c_string(v.extra_stats.as_deref())?;
+                Ok((v, min_value, max_value, extra_stats))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        Ok(owned
+            .into_iter()
+            .map(|(v, min_value, max_value, extra_stats)| {
                 let (has_null, contains_null) = opt_bool(v.contains_null);
                 let (has_nan, contains_nan) = opt_bool(v.contains_nan);
-                Ok(Owned {
+                MoraineTableColumnStatsRow {
                     table_id: v.table_id,
                     column_id: v.column_id,
                     has_contains_null: has_null,
                     contains_null,
                     has_contains_nan: has_nan,
                     contains_nan,
-                    min_value: opt_c_string(v.min_value.as_deref())?,
-                    max_value: opt_c_string(v.max_value.as_deref())?,
-                    extra_stats: opt_c_string(v.extra_stats.as_deref())?,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineTableColumnStatsRow {
-                table_id: o.table_id,
-                column_id: o.column_id,
-                has_contains_null: o.has_contains_null,
-                contains_null: o.contains_null,
-                has_contains_nan: o.has_contains_nan,
-                contains_nan: o.contains_nan,
-                min_value: opt_into_raw(o.min_value),
-                max_value: opt_into_raw(o.max_value),
-                extra_stats: opt_into_raw(o.extra_stats),
+                    min_value: opt_into_raw(min_value),
+                    max_value: opt_into_raw(max_value),
+                    extra_stats: opt_into_raw(extra_stats),
+                }
             })
             .collect())
     };
@@ -1291,19 +1150,6 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineFileColumnStatsRow>, AbiError> {
-        struct Owned {
-            data_file_id: u64,
-            table_id: u64,
-            column_id: u64,
-            column_size_bytes: u64,
-            value_count: u64,
-            null_count: u64,
-            min_value: Option<CString>,
-            max_value: Option<CString>,
-            has_contains_nan: bool,
-            contains_nan: bool,
-            extra_stats: Option<CString>,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -1323,39 +1169,32 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
+            .map(|v| {
+                let min_value = opt_c_string(v.min_value.as_deref())?;
+                let max_value = opt_c_string(v.max_value.as_deref())?;
+                let extra_stats = opt_c_string(v.extra_stats.as_deref())?;
+                Ok((v, min_value, max_value, extra_stats))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        Ok(owned
+            .into_iter()
+            .map(|(v, min_value, max_value, extra_stats)| {
                 let (has_nan, contains_nan) = opt_bool(v.contains_nan);
-                Ok(Owned {
+                MoraineFileColumnStatsRow {
                     data_file_id: v.data_file_id,
                     table_id: v.table_id,
                     column_id: v.column_id,
                     column_size_bytes: v.column_size_bytes,
                     value_count: v.value_count,
                     null_count: v.null_count,
-                    min_value: opt_c_string(v.min_value.as_deref())?,
-                    max_value: opt_c_string(v.max_value.as_deref())?,
+                    min_value: opt_into_raw(min_value),
+                    max_value: opt_into_raw(max_value),
                     has_contains_nan: has_nan,
                     contains_nan,
-                    extra_stats: opt_c_string(v.extra_stats.as_deref())?,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineFileColumnStatsRow {
-                data_file_id: o.data_file_id,
-                table_id: o.table_id,
-                column_id: o.column_id,
-                column_size_bytes: o.column_size_bytes,
-                value_count: o.value_count,
-                null_count: o.null_count,
-                min_value: opt_into_raw(o.min_value),
-                max_value: opt_into_raw(o.max_value),
-                has_contains_nan: o.has_contains_nan,
-                contains_nan: o.contains_nan,
-                extra_stats: opt_into_raw(o.extra_stats),
+                    extra_stats: opt_into_raw(extra_stats),
+                }
             })
             .collect())
     };
@@ -1438,17 +1277,6 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Vec<MoraineSnapshotRow>, AbiError> {
-        struct Owned {
-            snapshot_id: u64,
-            snapshot_time_micros: i64,
-            schema_version: u64,
-            next_catalog_id: u64,
-            next_file_id: u64,
-            changes_made: CString,
-            author: Option<CString>,
-            commit_message: Option<CString>,
-            commit_extra_info: Option<CString>,
-        }
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
@@ -1468,35 +1296,31 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
         }?;
         // Owned-first (see `moraine_dump_schemas`): every string in the
         // whole batch converts before any raw pointer is minted.
-        let owned: Vec<Owned> = rows
+        let owned = rows
             .into_iter()
-            .map(|v| -> Result<Owned, AbiError> {
-                Ok(Owned {
+            .map(|v| {
+                let changes_made = to_c_string(&v.changes_made)?;
+                let author = opt_c_string(v.author.as_deref())?;
+                let commit_message = opt_c_string(v.commit_message.as_deref())?;
+                let commit_extra_info = opt_c_string(v.commit_extra_info.as_deref())?;
+                Ok((v, changes_made, author, commit_message, commit_extra_info))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        Ok(owned
+            .into_iter()
+            .map(
+                |(v, changes_made, author, commit_message, commit_extra_info)| MoraineSnapshotRow {
                     snapshot_id: v.snapshot_id,
                     snapshot_time_micros: v.snapshot_time_micros,
                     schema_version: v.schema_version,
                     next_catalog_id: v.next_catalog_id,
                     next_file_id: v.next_file_id,
-                    changes_made: to_c_string(&v.changes_made)?,
-                    author: opt_c_string(v.author.as_deref())?,
-                    commit_message: opt_c_string(v.commit_message.as_deref())?,
-                    commit_extra_info: opt_c_string(v.commit_extra_info.as_deref())?,
-                })
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|o| MoraineSnapshotRow {
-                snapshot_id: o.snapshot_id,
-                snapshot_time_micros: o.snapshot_time_micros,
-                schema_version: o.schema_version,
-                next_catalog_id: o.next_catalog_id,
-                next_file_id: o.next_file_id,
-                changes_made: o.changes_made.into_raw(),
-                author: opt_into_raw(o.author),
-                commit_message: opt_into_raw(o.commit_message),
-                commit_extra_info: opt_into_raw(o.commit_extra_info),
-            })
+                    changes_made: changes_made.into_raw(),
+                    author: opt_into_raw(author),
+                    commit_message: opt_into_raw(commit_message),
+                    commit_extra_info: opt_into_raw(commit_extra_info),
+                },
+            )
             .collect())
     };
 
@@ -1781,6 +1605,7 @@ mod tests {
                 c_path.as_ptr(),
                 ptr::null(),
                 false,
+                false,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -2062,6 +1887,11 @@ mod tests {
         // SAFETY: same as above.
         assert_eq!(unsafe { (*files).record_count }, 10);
         // SAFETY: same as above.
+        let file_key = unsafe { CStr::from_ptr((*files).encryption_key) }
+            .to_str()
+            .unwrap();
+        assert_eq!(file_key, "a2V5LWRhdGE=");
+        // SAFETY: same as above.
         assert!(!unsafe { (*files).has_partition_id });
         // SAFETY: same as above.
         let data_file_id = unsafe { (*files).data_file_id };
@@ -2085,6 +1915,11 @@ mod tests {
         assert_eq!(unsafe { (*deletes).data_file_id }, data_file_id);
         // SAFETY: same as above.
         assert_eq!(unsafe { (*deletes).delete_count }, 2);
+        // SAFETY: same as above.
+        let delete_key = unsafe { CStr::from_ptr((*deletes).encryption_key) }
+            .to_str()
+            .unwrap();
+        assert_eq!(delete_key, "a2V5LWRlbA==");
 
         // SAFETY: each from its matching allocator; freed exactly once.
         unsafe {

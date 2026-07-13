@@ -221,6 +221,11 @@ pub(crate) unsafe fn borrow_bytes<'a>(
 /// `object_store_uri` selects otherwise. `object_store_uri` may be null
 /// (defaults to `"file"`), `"file"`, or `"memory"`.
 ///
+/// `encrypted` requests DuckLake data-file encryption. Creation-time
+/// only: it is recorded when a fresh store bootstraps and ignored on an
+/// already-initialized store, whose stored flag
+/// ([`moraine_catalog_encrypted`]) is authoritative.
+///
 /// Returns [`codes::OK`] on success. On failure, `*out` is left
 /// unwritten and, if `err` is non-null, `*err` carries the code and a
 /// message.
@@ -237,6 +242,7 @@ pub unsafe extern "C" fn moraine_attach(
     path: *const c_char,
     object_store_uri: *const c_char,
     read_only: bool,
+    encrypted: bool,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -262,7 +268,8 @@ pub unsafe extern "C" fn moraine_attach(
             )
         })?;
         let object_store = store_kind.open(path_str)?;
-        let options = moraine::CatalogOptions::default();
+        let mut options = moraine::CatalogOptions::default();
+        options.encrypted = encrypted;
         let open = async {
             if read_only {
                 moraine::Catalog::open_read_only(object_store, options).await
@@ -282,6 +289,60 @@ pub unsafe extern "C" fn moraine_attach(
             unsafe {
                 *out = Box::into_raw(handle);
             }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Whether the catalog encrypts its data files: the stored global
+/// `encrypted` option, fixed when the store was created. A store created
+/// before the flag existed reads as not encrypted.
+///
+/// Cancellable via `probe`/`probe_ctx` or a pending `moraine_interrupt`
+/// signal, exactly as [`moraine_snapshot`].
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`].
+/// `out_encrypted` must be a valid, writable `*mut bool`. `probe`, if
+/// non-null, must be safe to call with `probe_ctx` from any thread.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
+/// for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_catalog_encrypted(
+    handle: *mut MoraineCatalogHandle,
+    out_encrypted: *mut bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<bool, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_encrypted.is_null() {
+            return Err(AbiError::invalid_argument("`out_encrypted` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+
+        Ok(snapshot
+            .option(moraine::OptionScope::Global, "encrypted")
+            .as_deref()
+            == Some("true"))
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(encrypted) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { *out_encrypted = encrypted };
             codes::OK
         }
         Err(code) => code,
@@ -1008,6 +1069,7 @@ mod tests {
                 c_path.as_ptr(),
                 ptr::null(),
                 false,
+                false,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1018,6 +1080,68 @@ mod tests {
         });
         assert!(!handle.is_null());
         handle
+    }
+
+    /// Reads the stored `encrypted` flag over the ABI.
+    fn catalog_encrypted(handle: *mut MoraineCatalogHandle) -> bool {
+        let mut encrypted = false;
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; outputs are valid local slots; a
+        // null probe disables polling.
+        let code = unsafe {
+            moraine_catalog_encrypted(
+                handle,
+                &raw mut encrypted,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        // SAFETY: `err.message` is null or just written; `as_ref` allows null.
+        assert_eq!(code, codes::OK, "getter failed: {:?}", unsafe {
+            err.message.as_ref()
+        });
+        encrypted
+    }
+
+    /// The `encrypted` flag is fixed by the attach that bootstraps the
+    /// store; later attaches requesting a different value do not flip it,
+    /// and the getter always reports the stored flag.
+    #[test]
+    fn attach_encrypted_is_fixed_at_bootstrap_and_reported() {
+        let dir = TempDir::new("encrypted");
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                true,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+        assert!(catalog_encrypted(handle));
+        // SAFETY: `handle` came from the attach above, detached exactly once.
+        unsafe { moraine_detach(handle) };
+
+        // Re-attach without requesting encryption: the stored flag wins.
+        let handle = attach_ok(dir.path());
+        assert!(catalog_encrypted(handle));
+        // SAFETY: same as above.
+        unsafe { moraine_detach(handle) };
+
+        // A default-attached fresh store reports unencrypted.
+        let dir_plain = TempDir::new("unencrypted");
+        let handle = attach_ok(dir_plain.path());
+        assert!(!catalog_encrypted(handle));
+        // SAFETY: same as above.
+        unsafe { moraine_detach(handle) };
     }
 
     #[test]
@@ -1331,6 +1455,7 @@ mod tests {
                 c_path.as_ptr(),
                 ptr::null(),
                 false,
+                false,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1362,6 +1487,7 @@ mod tests {
                 c_path.as_ptr(),
                 scheme.as_ptr(),
                 false,
+                false,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1386,6 +1512,7 @@ mod tests {
             moraine_attach(
                 ptr::null(),
                 ptr::null(),
+                false,
                 false,
                 &raw mut handle,
                 &raw mut err,
@@ -1698,6 +1825,7 @@ mod tests {
 
         let functions = [
             "moraine_attach",
+            "moraine_catalog_encrypted",
             "moraine_detach",
             "moraine_snapshot",
             "moraine_interrupt",

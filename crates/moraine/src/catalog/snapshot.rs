@@ -441,6 +441,7 @@ fn data_file_info(value: &DataFileValue) -> DataFileInfo {
         file_size_bytes: value.file_size_bytes,
         footer_size: value.footer_size,
         row_id_start: value.row_id_start,
+        encryption_key: value.encryption_key.clone(),
     }
 }
 
@@ -454,6 +455,7 @@ fn delete_file_info(value: &DeleteFileValue) -> DeleteFileInfo {
         delete_count: value.delete_count,
         file_size_bytes: value.file_size_bytes,
         footer_size: value.footer_size,
+        encryption_key: value.encryption_key.clone(),
     }
 }
 

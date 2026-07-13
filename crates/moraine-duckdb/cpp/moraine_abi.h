@@ -93,9 +93,17 @@ typedef struct MoraineDataFileDesc {
 // push-channel alternative.
 typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
 
-int32_t moraine_attach(const char *path, const char *object_store_uri, bool read_only, MoraineCatalogHandle **out,
-                       MoraineError *err);
+// `encrypted` requests DuckLake data-file encryption; creation-time only —
+// recorded when a fresh store bootstraps, ignored on an existing store,
+// whose stored flag (moraine_catalog_encrypted) is authoritative.
+int32_t moraine_attach(const char *path, const char *object_store_uri, bool read_only, bool encrypted,
+                       MoraineCatalogHandle **out, MoraineError *err);
 void moraine_detach(MoraineCatalogHandle *handle);
+
+// The stored `encrypted` flag, fixed when the store was created; stores
+// predating the flag read as false.
+int32_t moraine_catalog_encrypted(MoraineCatalogHandle *handle, bool *out_encrypted, MoraineInterruptProbe probe,
+                                  void *probe_ctx, MoraineError *err);
 
 int32_t moraine_snapshot(MoraineCatalogHandle *handle, MoraineSnapshotHandle **out, MoraineInterruptProbe probe,
                          void *probe_ctx, MoraineError *err);

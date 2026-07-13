@@ -239,6 +239,7 @@ mod tests {
                         record_count: 10,
                         file_size_bytes: 1024,
                         footer_size: 64,
+                        encryption_key: None,
                         column_stats: vec![FileColumnStats {
                             column_id: column,
                             column_size_bytes: 100,
@@ -261,6 +262,7 @@ mod tests {
                         delete_count: 2,
                         file_size_bytes: 128,
                         footer_size: 32,
+                        encryption_key: None,
                     },
                 )?;
                 tx.update_column_stats(

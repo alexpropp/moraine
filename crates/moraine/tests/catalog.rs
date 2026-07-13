@@ -3,8 +3,49 @@
 
 use std::sync::Arc;
 
-use moraine::{Catalog, CatalogOptions, ColumnDef, ColumnId, Error, SchemaId, SnapshotId};
+use moraine::{
+    Catalog, CatalogOptions, ColumnDef, ColumnId, Error, OptionScope, SchemaId, SnapshotId,
+};
 use object_store::memory::InMemory;
+
+#[tokio::test]
+async fn encrypted_flag_is_fixed_at_bootstrap() {
+    // A fresh store bootstraps with the requested flag as the stored
+    // `encrypted` global option.
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+    let mut options = CatalogOptions::default();
+    options.encrypted = true;
+    let catalog = Catalog::open(store.clone(), options).await.unwrap();
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        head.option(OptionScope::Global, "encrypted").as_deref(),
+        Some("true")
+    );
+    catalog.close().await.unwrap();
+
+    // The flag is creation-time only: reopening with a different request
+    // does not flip the stored value.
+    let catalog = Catalog::open(store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        head.option(OptionScope::Global, "encrypted").as_deref(),
+        Some("true")
+    );
+    catalog.close().await.unwrap();
+
+    // The default bootstrap records the flag explicitly as "false".
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        head.option(OptionScope::Global, "encrypted").as_deref(),
+        Some("false")
+    );
+    catalog.close().await.unwrap();
+}
 
 #[tokio::test]
 async fn bootstrap_creates_snapshot_zero() {

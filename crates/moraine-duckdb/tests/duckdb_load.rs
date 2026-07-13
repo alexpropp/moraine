@@ -137,6 +137,7 @@ mod tests {
                             record_count: ROW_COUNT,
                             file_size_bytes: 0,
                             footer_size: 0,
+                            encryption_key: None,
                             column_stats: vec![],
                         },
                     )?;

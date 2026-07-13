@@ -23,6 +23,7 @@ fn datafile(rows: u64) -> DataFile {
         record_count: rows,
         file_size_bytes: rows * 10,
         footer_size: 4,
+        encryption_key: None,
         column_stats: vec![],
     }
 }
@@ -175,6 +176,7 @@ async fn counters_never_regress_or_collide_under_concurrency() {
     for h in handles {
         h.await.unwrap().unwrap();
     }
+
     let head = catalog.snapshot().await.unwrap();
     let mut ids: Vec<u64> = head.tables_in(s).iter().map(|t| t.id.get()).collect();
     ids.sort_unstable();
@@ -209,6 +211,7 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
         .map(|f| (f.row_id_start, f.record_count))
         .collect();
     starts.sort_unstable();
+
     // Dense, disjoint ranges regardless of which commit won the race.
     assert_eq!(starts[0].0, 0);
     assert_eq!(starts[1].0, starts[0].1);
@@ -228,6 +231,7 @@ async fn append_vs_drop_is_a_real_error() {
     let t2 = tokio::spawn(async move { c2.commit(move |tx| tx.drop_table(a)).await });
     let r1 = t1.await.unwrap();
     let r2 = t2.await.unwrap();
+
     // Serialized is fine; a genuine race surfaces CommitConflict or
     // NotFound on the loser.
     for r in [r1, r2] {

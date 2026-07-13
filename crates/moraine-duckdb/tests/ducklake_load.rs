@@ -28,7 +28,7 @@ mod tests {
         },
     };
 
-    use moraine::{Catalog, CatalogOptions, ColumnDef, DataFile};
+    use moraine::{Catalog, CatalogOptions, ColumnDef, DataFile, OptionScope};
     use object_store::local::LocalFileSystem;
 
     struct TempDir(PathBuf);
@@ -202,6 +202,17 @@ mod tests {
     /// so it is upstream; one thread closes it so these tests exercise
     /// moraine's translation, not DuckLake's cache concurrency.
     fn run_ducklake_sql(store_dir: &Path, data_path: &Path, sql: &str) -> String {
+        run_ducklake_sql_with_options(store_dir, data_path, "", sql)
+    }
+
+    /// As [`run_ducklake_sql`], with extra ATTACH options appended after
+    /// `DATA_PATH` (e.g. `", ENCRYPTED, META_ENCRYPTED true"`).
+    fn run_ducklake_sql_with_options(
+        store_dir: &Path,
+        data_path: &Path,
+        attach_options: &str,
+        sql: &str,
+    ) -> String {
         let output = Command::new(cli_path())
             .arg("-unsigned")
             .arg("-csv")
@@ -220,7 +231,7 @@ mod tests {
             .arg(format!("LOAD '{}';", ext_path().display()))
             .arg("-c")
             .arg(format!(
-                "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');",
+                "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{attach_options});",
                 store_dir.display(),
                 data_path.display()
             ))
@@ -1258,5 +1269,107 @@ mod tests {
             )),
             vec![vec!["3".to_string()]]
         );
+    }
+
+    /// Every `.parquet` file under `dir`, recursively.
+    fn parquet_files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut result = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current).expect("read data dir") {
+                let path = entry.expect("read dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "parquet") {
+                    result.push(path);
+                }
+            }
+        }
+        result
+    }
+
+    /// `ENCRYPTED` end to end. The flag travels `ATTACH (ENCRYPTED,
+    /// META_ENCRYPTED true)` → DuckLake's `META_` passthrough → this
+    /// shim's inner attach → the store's creation-time flag, which the
+    /// synthesized `ducklake_metadata` serves back. DuckLake then writes
+    /// Parquet-encrypted data files and records their keys in catalog
+    /// rows; a later plain attach adopts the stored flag and decrypts.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_encrypted_writes_encrypted_files_and_reads_back() {
+        let dir = TempDir::new("enc-store");
+        let data_dir = TempDir::new("enc-data");
+
+        // Create and load in one encrypted session; 100 rows overflows
+        // the inlining limit, forcing a real data file.
+        run_ducklake_sql_with_options(
+            dir.path(),
+            data_dir.path(),
+            ", ENCRYPTED, META_ENCRYPTED true",
+            "CREATE TABLE lake.main.t(id BIGINT); \
+             INSERT INTO lake.main.t SELECT range FROM range(100);",
+        );
+
+        // A plain re-attach adopts the stored flag and reads through
+        // decryption.
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                dir.path(),
+                data_dir.path(),
+                "SELECT count(*) FROM lake.main.t;",
+            )),
+            vec![vec!["100".to_string()]]
+        );
+
+        // The bytes at rest are not plaintext Parquet: an
+        // encrypted-footer file does not end with the plaintext `PAR1`
+        // trailer.
+        let files = parquet_files_under(data_dir.path());
+        assert!(
+            !files.is_empty(),
+            "no data files written under the data path"
+        );
+        for file in &files {
+            let bytes = std::fs::read(file).expect("read data file");
+            assert!(
+                !bytes.ends_with(b"PAR1"),
+                "{} is plaintext Parquet despite ENCRYPTED",
+                file.display()
+            );
+        }
+
+        // The catalog rows carry the stored flag and per-file key
+        // material.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test setup: build tokio runtime");
+        rt.block_on(async {
+            let store =
+                Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("open local store"));
+            let catalog = Catalog::open(store, CatalogOptions::default())
+                .await
+                .expect("open catalog");
+            let head = catalog.snapshot().await.expect("snapshot");
+            assert_eq!(
+                head.option(OptionScope::Global, "encrypted").as_deref(),
+                Some("true")
+            );
+
+            let schema = head.schema_by_name("main").expect("main schema");
+            let table = head.table_by_name(schema.id, "t").expect("table t");
+            let data_files = head.data_files_of(table.id);
+            assert!(!data_files.is_empty());
+            for file in &data_files {
+                assert!(
+                    file.encryption_key
+                        .as_deref()
+                        .is_some_and(|k| !k.is_empty()),
+                    "data file {} carries no encryption key",
+                    file.path
+                );
+            }
+            catalog.close().await.expect("close catalog");
+        });
     }
 }
