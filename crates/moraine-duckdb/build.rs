@@ -183,14 +183,16 @@ fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
 /// the release's single-file amalgamation, compiling and caching it under
 /// `target/duckdb-src/<pin>-lib/<target>/` if it isn't already cached.
 ///
-/// Built once per target triple with fixed flags (`-O1`, `NDEBUG`, no debug
+/// Built once per target triple with fixed flags (`-O0`, `NDEBUG`, no debug
 /// info) regardless of cargo profile, so debug and release builds share the
 /// compile — a single translation unit that takes minutes. `NDEBUG` matches
-/// the release CLI the extension loads into. `-O1`, not `-O2`: gcc at `-O2`
-/// on this one giant translation unit peaks past the memory of a 16 GB CI
-/// runner running parallel rustc jobs (the runner agent gets killed), and
-/// optimization level does not affect the ABI; the linked-in code serves
-/// only the shim's metadata-catalog calls, not the host's query execution.
+/// the release CLI the extension loads into. `-O0` plus aggressive gcc
+/// garbage collection, because gcc's peak memory on this one giant
+/// translation unit kills a 16 GB CI runner at `-O1` and above (the runner
+/// agent gets starved and shut down). Optimization level does not affect
+/// the ABI, and the linked-in code serves only the shim's metadata-catalog
+/// calls, not the host's query execution, so `-O0` costs nothing that
+/// matters.
 fn ensure_duckdb_static_archive() -> anyhow::Result<PathBuf> {
     let target = std::env::var("TARGET").context("cargo sets TARGET for every build script")?;
     let lib_dir = duckdb_src_root()?.join(format!("{DUCKDB_PIN}-lib/{target}"));
@@ -223,7 +225,12 @@ fn ensure_duckdb_static_archive() -> anyhow::Result<PathBuf> {
         .include(&amalgamation_dir)
         .file(amalgamation_dir.join("duckdb.cpp"))
         .define("NDEBUG", None)
-        .opt_level(1)
+        .opt_level(0)
+        // gcc's low-memory knobs: collect garbage early and often instead
+        // of holding the whole translation unit's IR in memory. Ignored by
+        // compilers that don't take them (clang).
+        .flag_if_supported("--param=ggc-min-expand=10")
+        .flag_if_supported("--param=ggc-min-heapsize=32768")
         .debug(false)
         .warnings(false)
         .cargo_metadata(false)

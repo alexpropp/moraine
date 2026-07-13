@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The runner installs nightly with rustup's minimal profile, which
+      # omits rustfmt; add it explicitly.
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt
       - run: cargo +nightly fmt --check
 
   # clippy/test/doc/e2e all compile moraine-duckdb, whose build.rs fetches
