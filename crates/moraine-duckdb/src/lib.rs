@@ -34,9 +34,8 @@
 //!
 //! **Not implemented, throws `NotImplementedException`:** DDL issued
 //! directly against a user schema/table (`CREATE`/`DROP`/`ALTER` outside
-//! DuckLake's own `ducklake_*` writes), querying a view's definition (no
-//! SQL parser vendored), and writes against `ducklake_*` kinds this crate
-//! does not model (name mapping).
+//! DuckLake's own `ducklake_*` writes) and querying a view's definition
+//! (no SQL parser vendored).
 //!
 //! **Single writer.** Attach always opens a read-write [`moraine::Catalog`]
 //! — there is no read-only attach option yet — so only one process may

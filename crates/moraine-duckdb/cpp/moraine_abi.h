@@ -221,6 +221,24 @@ typedef struct MoraineMacroParameterRow {
 	char *default_value_type;
 } MoraineMacroParameterRow;
 
+// Mirrors `moraine_duckdb::dumps::MoraineColumnMappingRow`.
+typedef struct MoraineColumnMappingRow {
+	uint64_t mapping_id;
+	uint64_t table_id;
+	char *map_type;
+} MoraineColumnMappingRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineNameMappingRow`.
+typedef struct MoraineNameMappingRow {
+	uint64_t mapping_id;
+	uint64_t column_id;
+	char *source_name;
+	uint64_t target_field_id;
+	bool has_parent_column;
+	uint64_t parent_column;
+	bool is_partition;
+} MoraineNameMappingRow;
+
 // Mirrors `moraine_duckdb::dumps::MoraineColumnRow`.
 typedef struct MoraineColumnRow {
 	uint64_t column_id;
@@ -360,6 +378,16 @@ int32_t moraine_dump_macro_parameters(MoraineCatalogHandle *handle, MoraineMacro
                                        size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
                 MoraineError *err);
 void moraine_dump_macro_parameters_free(MoraineMacroParameterRow *items, size_t len);
+
+int32_t moraine_dump_column_mappings(MoraineCatalogHandle *handle, MoraineColumnMappingRow **out_items,
+                                      size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_column_mappings_free(MoraineColumnMappingRow *items, size_t len);
+
+int32_t moraine_dump_name_mappings(MoraineCatalogHandle *handle, MoraineNameMappingRow **out_items,
+                                    size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_name_mappings_free(MoraineNameMappingRow *items, size_t len);
 
 int32_t moraine_dump_data_files(MoraineCatalogHandle *handle, MoraineDataFileRow **out_items, size_t *out_len,
                                  MoraineInterruptProbe probe, void *probe_ctx,

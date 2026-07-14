@@ -320,6 +320,49 @@ std::vector<std::vector<duckdb::Value>> ProvideMacroParameters(MoraineCatalogHan
 	return result;
 }
 
+std::vector<std::vector<duckdb::Value>> ProvideColumnMappings(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineColumnMappingRow> rows(moraine_dump_column_mappings_free);
+	MoraineError err{};
+	auto code = moraine_dump_column_mappings(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.mapping_id),
+		    Bigint(r.table_id),
+		    Varchar(r.map_type),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideNameMappings(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineNameMappingRow> rows(moraine_dump_name_mappings_free);
+	MoraineError err{};
+	auto code = moraine_dump_name_mappings(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.mapping_id),
+		    Bigint(r.column_id),
+		    Varchar(r.source_name),
+		    Bigint(r.target_field_id),
+		    OptBigint(r.has_parent_column, r.parent_column),
+		    Boolean(r.is_partition),
+		});
+	}
+	return result;
+}
+
 std::vector<std::vector<duckdb::Value>> ProvideColumns(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                             void *probe_ctx) {
 	OwnedArray<MoraineColumnRow> rows(moraine_dump_columns_free);
@@ -510,11 +553,10 @@ std::vector<std::vector<duckdb::Value>> ProvideSchemaVersions(MoraineCatalogHand
 }
 
 // Always-empty stand-in for a `ducklake_*` table covering a feature the
-// store doesn't model (column and name mapping). The
-// table must still exist as a SQL table: DuckLake's attach/snapshot-load
-// query joins every one of them unconditionally, so a missing table is a
-// bind-time Catalog Error even where the query would return zero rows
-// for it.
+// store doesn't model (variant statistics). The table must still exist
+// as a SQL table: DuckLake's attach/snapshot-load query joins every one
+// of them unconditionally, so a missing table is a bind-time Catalog
+// Error even where the query would return zero rows for it.
 std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *, MoraineInterruptProbe, void *) {
 	return {};
 }
@@ -1157,7 +1199,11 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"table_id", "BIGINT", false},
 	            {"type", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideColumnMappings,
+	        23,
+	        {},
+	        0,
+	        /* delete key: mapping_id, table_id */ {0, 1},
 	    },
 	    {
 	        "ducklake_name_mapping",
@@ -1169,7 +1215,11 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"parent_column", "BIGINT", false},
 	            {"is_partition", "BOOLEAN", false},
 	        },
-	        ProvideEmpty,
+	        ProvideNameMappings,
+	        24,
+	        {},
+	        0,
+	        /* delete key: mapping_id */ {0},
 	    },
 	    {
 	        "ducklake_sort_info",

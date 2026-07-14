@@ -166,6 +166,15 @@ pub(crate) enum EntityKey {
         /// Global catalog id.
         macro_id: u64,
     },
+    /// `ducklake_column_mapping` (+ name-mapping rows embedded).
+    /// Unversioned and immutable: written once, never overwritten, never
+    /// mirrored to history.
+    Mapping {
+        /// Owning table.
+        table_id: u64,
+        /// Mapping id, allocated by DuckLake from the file-id counter.
+        mapping_id: u64,
+    },
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
@@ -311,6 +320,8 @@ pub(crate) enum TableScopedKind {
     TableColumnStats,
     /// `ducklake_sort_info`.
     Sort,
+    /// `ducklake_column_mapping`.
+    Mapping,
 }
 
 impl TableScopedKind {
@@ -348,6 +359,10 @@ impl TableScopedKind {
             Self::Sort => EntityKey::Sort {
                 table_id,
                 sort_id: 0,
+            },
+            Self::Mapping => EntityKey::Mapping {
+                table_id,
+                mapping_id: 0,
             },
         }
     }
@@ -533,6 +548,18 @@ mod tests {
         expect.extend(be(3));
         expect.extend(be(9));
         let key = Key::history(EntityKey::Macro { macro_id: 3 }, 9);
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
+    fn golden_current_mapping_key() {
+        let mut expect = vec![0x04, 0x02, 0x10];
+        expect.extend(be(4));
+        expect.extend(be(21));
+        let key = Key::current(EntityKey::Mapping {
+            table_id: 4,
+            mapping_id: 21,
+        });
         assert_eq!(key.encode(), expect);
     }
 
@@ -792,6 +819,10 @@ mod tests {
                 scope_id
             }),
             any::<u64>().prop_map(|macro_id| EntityKey::Macro { macro_id }),
+            any::<(u64, u64)>().prop_map(|(table_id, mapping_id)| EntityKey::Mapping {
+                table_id,
+                mapping_id
+            }),
         ]
     }
 

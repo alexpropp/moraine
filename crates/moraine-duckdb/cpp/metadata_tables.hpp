@@ -3,8 +3,7 @@
 // column shape matches the corresponding DuckLake `CREATE TABLE`.
 // `ducklake_metadata` is the one exception: it has no store-modeled source
 // of truth, so its rows are synthesized in-process rather than read from the
-// dump ABI (see metadata_tables.cpp). Tables for unmodeled features (name
-// mapping) are served as always-empty stand-ins.
+// dump ABI (see metadata_tables.cpp).
 #pragma once
 
 #include <vector>

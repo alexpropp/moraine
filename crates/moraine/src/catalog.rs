@@ -13,7 +13,7 @@ pub use snapshot::CatalogSnapshot;
 pub use types::{
     ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnStats, DataFile, DataFileId,
     DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, MacroId,
-    MacroImplementationDef, MacroInfo, MacroParameterDef, OptionScope, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId,
-    ViewInfo,
+    MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId, MappingInfo, NameMappingDef,
+    OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId,
+    TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
 };

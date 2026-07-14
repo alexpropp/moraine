@@ -19,7 +19,7 @@ use crate::{
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            MacroValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
+            MacroValue, MappingValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
             TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
         read::{EntityRecord, scan_current_entities, scan_history_entities, scan_snapshots},
@@ -83,6 +83,19 @@ pub async fn dump_views(catalog: &Catalog) -> Result<Vec<ViewValue>> {
 pub async fn dump_macros(catalog: &Catalog) -> Result<Vec<MacroValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::Macro(m) => Some(m),
+        _ => None,
+    })
+    .await
+}
+
+/// Every `ducklake_column_mapping` row with its embedded
+/// `ducklake_name_mapping` rows in `column_id` order. Unversioned
+/// (create-only, never mirrored), so this is always exactly the live
+/// rows.
+#[doc(hidden)]
+pub async fn dump_mappings(catalog: &Catalog) -> Result<Vec<MappingValue>> {
+    dump_entities(catalog, |r| match r {
+        EntityRecord::Mapping(m) => Some(m),
         _ => None,
     })
     .await
@@ -489,6 +502,63 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].sql, "select * from orders");
         assert!(views[0].end_snapshot.is_none());
+    }
+
+    /// A mapping staged through the DuckLake row path dumps back
+    /// row-faithfully, embedded rows in `column_id` order.
+    #[tokio::test]
+    async fn dump_mappings_serves_embedded_rows() {
+        use crate::transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind};
+
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::ColumnMapping,
+            cells: vec![Cell::U64(21), Cell::U64(1), Cell::Str("map_by_name".into())],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::NameMapping,
+            cells: vec![
+                Cell::U64(21),
+                Cell::U64(0),
+                Cell::Str("id".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::Bool(false),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(11),
+                Cell::U64(22),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("inserted_into_table:1".into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.commit().await.unwrap();
+
+        let mappings = dump_mappings(&catalog).await.unwrap();
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].mapping_id, 21);
+        assert_eq!(mappings[0].table_id, 1);
+        assert_eq!(mappings[0].map_type, "map_by_name");
+        assert_eq!(mappings[0].name_mappings.len(), 1);
+        assert_eq!(mappings[0].name_mappings[0].source_name, "id");
     }
 
     /// An ended macro keeps serving its implementation and parameter

@@ -187,6 +187,27 @@ message DeleteFileValue {
   optional uint64 partial_max = 13;
 }
 
+// ducklake_name_mapping — embedded in MappingValue. column_id is a
+// 0-based ordinal local to the mapping; parent_column references a
+// smaller ordinal (preorder: parents precede children).
+message NameMapping {
+  uint64 column_id = 1;
+  string source_name = 2;
+  uint64 target_field_id = 3;
+  optional uint64 parent_column = 4;
+  bool is_partition = 5;
+}
+
+// ducklake_column_mapping (+ name-mapping rows embedded). Written once
+// by an add-data-files commit, never updated; mapping_id comes from the
+// same counter as data_file_id.
+message MappingValue {
+  uint64 mapping_id = 1;
+  uint64 table_id = 2;
+  string map_type = 3;
+  repeated NameMapping name_mappings = 4;
+}
+
 // ducklake_file_variant_stats — embedded in FileColumnStatsValue.
 message FileVariantStats {
   string variant_path = 1;

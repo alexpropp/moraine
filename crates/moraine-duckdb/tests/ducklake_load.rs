@@ -685,6 +685,115 @@ mod tests {
         assert_eq!(rows, vec![vec!["0".to_string()]]);
     }
 
+    /// Column/name mapping end to end: a Parquet file written by plain
+    /// DuckDB `COPY` (no DuckLake field ids), one column short and sitting
+    /// under a hive path, registers through `ducklake_add_data_files` with
+    /// `hive_partitioning`. DuckLake writes the `ducklake_column_mapping` /
+    /// `ducklake_name_mapping` rows (folded into one mapping record) and
+    /// the file row carries its `mapping_id`; reads resolve the body
+    /// column by name and the partition column from the path, time travel
+    /// included; the standalone attach serves the row-faithful
+    /// projections.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_add_data_files_maps_foreign_parquet() {
+        let dir = TempDir::new("mapping-store");
+        let data_dir = TempDir::new("mapping-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        let foreign_dir = data_path.join("foreign").join("region=east");
+        std::fs::create_dir_all(&foreign_dir).expect("test setup: create hive dir");
+        let foreign_file = foreign_dir.join("part.parquet");
+
+        // Create, write the foreign file, register it.
+        run_ducklake_sql(
+            store,
+            data_path,
+            &format!(
+                "CREATE TABLE lake.main.t (id BIGINT, region VARCHAR);\
+                 COPY (SELECT range AS id FROM range(3)) TO '{f}' (FORMAT parquet);\
+                 CALL ducklake_add_data_files('lake', 't', '{f}', hive_partitioning => true);",
+                f = foreign_file.display(),
+            ),
+        );
+
+        // A fresh attach re-reads the mapping from the store: the body
+        // column resolves by name, the partition column from the path.
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT id, region FROM lake.main.t ORDER BY id;",
+        );
+        assert_eq!(
+            csv_rows(&out),
+            vec![
+                vec!["0".to_string(), "east".to_string()],
+                vec!["1".to_string(), "east".to_string()],
+                vec!["2".to_string(), "east".to_string()],
+            ]
+        );
+
+        // A later write advances the head; the registered snapshot stays
+        // readable through the mapping.
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            "USE lake;\
+             SELECT CAST(max(snapshot_id) AS VARCHAR) FROM snapshots();",
+        );
+        let registered_snapshot = csv_rows(&out)[0][0].clone();
+        run_ducklake_sql(
+            store,
+            data_path,
+            "INSERT INTO lake.main.t VALUES (9, 'west');",
+        );
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            &format!(
+                "SELECT count(*), max(id) FROM lake.main.t AT (VERSION => {registered_snapshot});"
+            ),
+        );
+        assert_eq!(csv_rows(&out), vec![vec!["3".to_string(), "2".to_string()]]);
+
+        // Row-faithful projections through the standalone attach: one
+        // mapping, map_by_name.
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT mapping_id, table_id, type FROM m.ducklake_column_mapping;",
+        ));
+        assert_eq!(rows.len(), 1);
+        let mapping_id = rows[0][0].clone();
+        assert_eq!(rows[0][2], "map_by_name");
+
+        // The name rows: `id` resolved from the file body, `region` a
+        // hive-path virtual column; roots carry no parent.
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT column_id, source_name, \
+                    CAST(parent_column IS NULL AS VARCHAR), \
+                    CAST(is_partition AS VARCHAR) \
+             FROM m.ducklake_name_mapping ORDER BY column_id;",
+        ));
+        let sources: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r[1].as_str(), r[3].as_str()))
+            .collect();
+        assert!(sources.contains(&("id", "false")), "{rows:?}");
+        assert!(sources.contains(&("region", "true")), "{rows:?}");
+        assert!(rows.iter().all(|r| r[2] == "true"), "roots only: {rows:?}");
+
+        // The registered file row carries the mapping id; nothing else
+        // does (the inlined INSERT wrote no file).
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT CAST(mapping_id AS VARCHAR) FROM m.ducklake_data_file \
+             WHERE mapping_id IS NOT NULL;",
+        ));
+        assert_eq!(rows, vec![vec![mapping_id]]);
+    }
+
     /// Scalar and table macros end to end, driven entirely through
     /// DuckLake's own SQL: `CREATE MACRO` (arity overloads, a defaulted
     /// parameter, a table macro) folds its `ducklake_macro_impl` /

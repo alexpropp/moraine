@@ -8,9 +8,9 @@ use crate::{
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
-            GcFileValue, HeadValue, MacroValue, MigrationValue, OptionScopeValue, PartitionValue,
-            SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
-            TableValue, TagValue, ViewValue,
+            GcFileValue, HeadValue, MacroValue, MappingValue, MigrationValue, OptionScopeValue,
+            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
+            TableStatsValue, TableValue, TagValue, ViewValue,
         },
         value,
     },
@@ -38,6 +38,8 @@ pub(crate) enum EntityRecord {
     Sort(SortValue),
     /// A macro record.
     Macro(MacroValue),
+    /// A column-mapping record.
+    Mapping(MappingValue),
     /// File-level column statistics record.
     FileColumnStats(FileColumnStatsValue),
     /// Table-level statistics record.
@@ -127,6 +129,7 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
         EntityKey::Partition { .. } => Ok(EntityRecord::Partition(value::decode_value(bytes)?)),
         EntityKey::Sort { .. } => Ok(EntityRecord::Sort(value::decode_value(bytes)?)),
         EntityKey::Macro { .. } => Ok(EntityRecord::Macro(value::decode_value(bytes)?)),
+        EntityKey::Mapping { .. } => Ok(EntityRecord::Mapping(value::decode_value(bytes)?)),
         EntityKey::FileColumnStats { .. } => {
             Ok(EntityRecord::FileColumnStats(value::decode_value(bytes)?))
         }

@@ -64,6 +64,11 @@ id_type!(
     /// Identifies a macro.
     MacroId
 );
+id_type!(
+    /// Identifies a column mapping (allocated by DuckLake from the same
+    /// counter as data-file ids).
+    MappingId
+);
 
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
@@ -286,6 +291,39 @@ pub struct MacroInfo {
     pub name: String,
     /// Implementations in `impl_id` order.
     pub implementations: Vec<MacroImplementationDef>,
+}
+
+/// One `ducklake_name_mapping` row: how one physical column of an
+/// externally written file resolves to a table field. `column_id` is a
+/// 0-based ordinal local to the mapping; `parent_column`, when present,
+/// references a smaller ordinal (parents precede children in preorder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameMappingDef {
+    /// The row's ordinal within its mapping.
+    pub column_id: u64,
+    /// The physical column name in the file (or hive path).
+    pub source_name: String,
+    /// The table field the column resolves to.
+    pub target_field_id: u64,
+    /// The parent row's ordinal for nested columns; `None` for roots.
+    pub parent_column: Option<u64>,
+    /// Whether the value comes from the file's hive path, not its body.
+    pub is_partition: bool,
+}
+
+/// A column mapping for externally written Parquet: immutable once
+/// created, referenced by data files via their `mapping_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingInfo {
+    /// The mapping's id.
+    pub id: MappingId,
+    /// The table the mapping belongs to.
+    pub table_id: TableId,
+    /// The mapping strategy, stored verbatim (DuckLake writes
+    /// `"map_by_name"`).
+    pub map_type: String,
+    /// The mapping's rows in `column_id` order.
+    pub name_mappings: Vec<NameMappingDef>,
 }
 
 /// A column definition: the input to table creation and column addition.

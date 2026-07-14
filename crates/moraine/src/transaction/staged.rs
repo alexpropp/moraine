@@ -96,6 +96,10 @@ pub enum TableKind {
     MacroImpl,
     /// `ducklake_macro_parameters` — folded into its macro's record.
     MacroParameters,
+    /// `ducklake_column_mapping`.
+    ColumnMapping,
+    /// `ducklake_name_mapping` — folded into its mapping's record.
+    NameMapping,
 }
 
 /// One column value in a staged row, typed to the small set of primitive
@@ -713,6 +717,36 @@ fn decode_macro_parameter(cells: &[Cell]) -> Result<((u64, u64), proto::MacroPar
     Ok(((macro_id, impl_id), parameter))
 }
 
+fn decode_column_mapping(cells: &[Cell]) -> Result<proto::MappingValue> {
+    let mut c = Cursor::new(TableKind::ColumnMapping, cells);
+    let mapping_id = c.u64()?;
+    let table_id = c.u64()?;
+    let map_type = c.string()?;
+    c.finish()?;
+
+    Ok(proto::MappingValue {
+        mapping_id,
+        table_id,
+        map_type,
+        name_mappings: Vec::new(),
+    })
+}
+
+fn decode_name_mapping(cells: &[Cell]) -> Result<(u64, proto::NameMapping)> {
+    let mut c = Cursor::new(TableKind::NameMapping, cells);
+    let mapping_id = c.u64()?;
+    let row = proto::NameMapping {
+        column_id: c.u64()?,
+        source_name: c.string()?,
+        target_field_id: c.u64()?,
+        parent_column: c.opt_u64()?,
+        is_partition: c.bool()?,
+    };
+    c.finish()?;
+
+    Ok((mapping_id, row))
+}
+
 /// Child-table rows collected before the insert pass: each is folded
 /// into its parent record when the parent's insert applies, and a
 /// leftover after the pass means a child row named a parent this commit
@@ -724,6 +758,7 @@ struct ChildRows {
     file_partition_values: HashMap<(u64, u64), Vec<proto::FilePartitionValue>>,
     macro_implementations: HashMap<u64, Vec<proto::MacroImplementation>>,
     macro_parameters: HashMap<(u64, u64), Vec<proto::MacroParameter>>,
+    name_mappings: HashMap<u64, Vec<proto::NameMapping>>,
 }
 
 fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
@@ -771,6 +806,14 @@ fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
                         .or_default()
                         .push(parameter);
                 }
+                TableKind::NameMapping => {
+                    let (mapping_id, row) = decode_name_mapping(cells)?;
+                    children
+                        .name_mappings
+                        .entry(mapping_id)
+                        .or_default()
+                        .push(row);
+                }
                 _ => {}
             }
         }
@@ -789,6 +832,9 @@ fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
     }
     for parameters in children.macro_parameters.values_mut() {
         parameters.sort_by_key(|p| p.column_id);
+    }
+    for rows in children.name_mappings.values_mut() {
+        rows.sort_by_key(|r| r.column_id);
     }
 
     Ok(children)
@@ -841,7 +887,9 @@ fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, u64)> {
         | TableKind::ColumnTag
         | TableKind::FilesScheduledForDeletion
         | TableKind::MacroImpl
-        | TableKind::MacroParameters => {
+        | TableKind::MacroParameters
+        | TableKind::ColumnMapping
+        | TableKind::NameMapping => {
             return Err(Error::Constraint(format!(
                 "update_set_end is not defined for {table:?}"
             )));
@@ -928,6 +976,112 @@ fn is_inline_op(op: &RowOperation) -> bool {
     )
 }
 
+/// Folds a `ducklake_macro` insert with its collected impl and parameter
+/// rows into one record: at least one impl, ordinals contiguous from
+/// zero, one `macro_type` across the macro.
+fn apply_macro_insert(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    children: &mut ChildRows,
+) -> Result<()> {
+    let mut value = decode_macro(cells)?;
+    let mut implementations = children
+        .macro_implementations
+        .remove(&value.macro_id)
+        .unwrap_or_default();
+    if implementations.is_empty() {
+        return Err(corrupt_row(
+            TableKind::Macro,
+            "a macro insert requires at least one macro_impl row in the same commit",
+        ));
+    }
+    for (index, implementation) in implementations.iter().enumerate() {
+        if implementation.impl_id != index as u64 {
+            return Err(corrupt_row(
+                TableKind::MacroImpl,
+                "impl_id values must be contiguous from zero",
+            ));
+        }
+        if implementation.macro_type != implementations[0].macro_type {
+            return Err(corrupt_row(
+                TableKind::MacroImpl,
+                "all implementations of one macro must share a type",
+            ));
+        }
+    }
+    for implementation in &mut implementations {
+        let parameters = children
+            .macro_parameters
+            .remove(&(value.macro_id, implementation.impl_id))
+            .unwrap_or_default();
+        for (index, parameter) in parameters.iter().enumerate() {
+            if parameter.column_id != index as u64 {
+                return Err(corrupt_row(
+                    TableKind::MacroParameters,
+                    "column_id values must be contiguous from zero",
+                ));
+            }
+        }
+        implementation.parameters = parameters;
+    }
+    value.implementations = implementations;
+    state.put_macro(value);
+
+    Ok(())
+}
+
+/// Folds a `ducklake_column_mapping` insert with its collected
+/// name-mapping rows into one record: at least one row, unique ordinals,
+/// parents preceding children, and a mapping id never written before.
+fn apply_mapping_insert(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    children: &mut ChildRows,
+) -> Result<()> {
+    let mut value = decode_column_mapping(cells)?;
+    let rows = children
+        .name_mappings
+        .remove(&value.mapping_id)
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return Err(corrupt_row(
+            TableKind::ColumnMapping,
+            "a column_mapping insert requires name_mapping rows in the same commit",
+        ));
+    }
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 && rows[index - 1].column_id == row.column_id {
+            return Err(corrupt_row(
+                TableKind::NameMapping,
+                "column_id values must be unique within a mapping",
+            ));
+        }
+        if row
+            .parent_column
+            .is_some_and(|parent| parent >= row.column_id)
+        {
+            return Err(corrupt_row(
+                TableKind::NameMapping,
+                "parent_column must reference an earlier column_id",
+            ));
+        }
+    }
+    if state
+        .mappings
+        .get(&value.table_id)
+        .is_some_and(|per_table| per_table.contains_key(&value.mapping_id))
+    {
+        return Err(corrupt_row(
+            TableKind::ColumnMapping,
+            "mapping_id already exists for this table",
+        ));
+    }
+    value.name_mappings = rows;
+    state.put_mapping(value);
+
+    Ok(())
+}
+
 fn apply_insert(
     base: &CatalogSnapshot,
     state: &mut CatalogSnapshot,
@@ -946,7 +1100,8 @@ fn apply_insert(
         | TableKind::SortExpression
         | TableKind::FilePartitionValue
         | TableKind::MacroImpl
-        | TableKind::MacroParameters => {}
+        | TableKind::MacroParameters
+        | TableKind::NameMapping => {}
         TableKind::Schema => state.put_schema(decode_schema(cells)?),
         TableKind::Table => state.put_table(table_value(base, decode_table(cells)?)),
         TableKind::View => state.put_view(decode_view(cells)?),
@@ -990,50 +1145,8 @@ fn apply_insert(
                 .unwrap_or_default();
             state.put_sort(value);
         }
-        TableKind::Macro => {
-            let mut value = decode_macro(cells)?;
-            let mut implementations = children
-                .macro_implementations
-                .remove(&value.macro_id)
-                .unwrap_or_default();
-            if implementations.is_empty() {
-                return Err(corrupt_row(
-                    TableKind::Macro,
-                    "a macro insert requires at least one macro_impl row in the same commit",
-                ));
-            }
-            for (index, implementation) in implementations.iter().enumerate() {
-                if implementation.impl_id != index as u64 {
-                    return Err(corrupt_row(
-                        TableKind::MacroImpl,
-                        "impl_id values must be contiguous from zero",
-                    ));
-                }
-                if implementation.macro_type != implementations[0].macro_type {
-                    return Err(corrupt_row(
-                        TableKind::MacroImpl,
-                        "all implementations of one macro must share a type",
-                    ));
-                }
-            }
-            for implementation in &mut implementations {
-                let parameters = children
-                    .macro_parameters
-                    .remove(&(value.macro_id, implementation.impl_id))
-                    .unwrap_or_default();
-                for (index, parameter) in parameters.iter().enumerate() {
-                    if parameter.column_id != index as u64 {
-                        return Err(corrupt_row(
-                            TableKind::MacroParameters,
-                            "column_id values must be contiguous from zero",
-                        ));
-                    }
-                }
-                implementation.parameters = parameters;
-            }
-            value.implementations = implementations;
-            state.put_macro(value);
-        }
+        TableKind::Macro => apply_macro_insert(state, cells, children)?,
+        TableKind::ColumnMapping => apply_mapping_insert(state, cells, children)?,
         TableKind::TableStats => state.put_table_stats(decode_table_stats(cells)?),
         TableKind::TableColumnStats => {
             state.put_table_column_stats(decode_table_column_stats(cells)?);
@@ -1392,6 +1505,25 @@ fn apply_delete(
             c.finish()?;
             Ok(())
         }
+        // Mappings are unversioned create-only records with no history
+        // mirror: cleanup is a direct `current` key delete. The working
+        // state keeps its (now equal-to-base) entry, which the create-only
+        // diff no-ops on.
+        TableKind::ColumnMapping => {
+            let mut c = Cursor::new(table, cells);
+            let mapping_id = c.u64()?;
+            let table_id = c.u64()?;
+            c.finish()?;
+            direct.push((
+                Key::current(EntityKey::Mapping {
+                    table_id,
+                    mapping_id,
+                })
+                .encode(),
+                None,
+            ));
+            Ok(())
+        }
         TableKind::Schema
         | TableKind::Table
         | TableKind::View
@@ -1444,7 +1576,8 @@ fn apply_delete(
         | TableKind::SortExpression
         | TableKind::FilePartitionValue
         | TableKind::MacroImpl
-        | TableKind::MacroParameters => apply_embedded_delete(state, table, cells),
+        | TableKind::MacroParameters
+        | TableKind::NameMapping => apply_embedded_delete(state, table, cells),
         TableKind::SchemaVersions => {
             // Schema-version rows fold into snapshot records; the rows a
             // dead-table cleanup deletes are visible only through
@@ -1529,6 +1662,13 @@ fn apply_embedded_delete(
         TableKind::MacroImpl | TableKind::MacroParameters => {
             let macro_id = c.u64()?;
             state.macros.contains_key(&macro_id)
+        }
+        TableKind::NameMapping => {
+            let mapping_id = c.u64()?;
+            state
+                .mappings
+                .values()
+                .any(|per_table| per_table.contains_key(&mapping_id))
         }
         _ => return Err(corrupt_row(table, "not an embedded kind")),
     };
@@ -1887,6 +2027,12 @@ fn translate(
         return Err(corrupt_row(
             TableKind::MacroParameters,
             "macro_parameters rows without a matching macro_impl in this commit",
+        ));
+    }
+    if !children.name_mappings.is_empty() {
+        return Err(corrupt_row(
+            TableKind::NameMapping,
+            "name_mapping rows without a matching column_mapping insert in this commit",
         ));
     }
 
@@ -4336,6 +4482,224 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("contiguous"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    fn column_mapping_row(mapping_id: u64, table_id: u64) -> Vec<Cell> {
+        vec![
+            Cell::U64(mapping_id),
+            Cell::U64(table_id),
+            Cell::Str("map_by_name".into()),
+        ]
+    }
+
+    fn name_mapping_row(
+        mapping_id: u64,
+        column_id: u64,
+        source_name: &str,
+        target_field_id: u64,
+        parent_column: Option<u64>,
+        is_partition: bool,
+    ) -> Vec<Cell> {
+        vec![
+            Cell::U64(mapping_id),
+            Cell::U64(column_id),
+            Cell::Str(source_name.to_string()),
+            Cell::U64(target_field_id),
+            parent_column.map_or(Cell::Null, Cell::U64),
+            Cell::Bool(is_partition),
+        ]
+    }
+
+    /// Stages one commit's rows plus the snapshot pair and returns the
+    /// commit result.
+    async fn stage_mapping_batch(
+        catalog: &Catalog,
+        snapshot_id: u64,
+        rows: Vec<(TableKind, Vec<Cell>)>,
+    ) -> Result<()> {
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        for (table, cells) in rows {
+            tx.stage(RowOperation::Insert { table, cells });
+        }
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(snapshot_id, 1, 11),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(snapshot_id, "inserted_into_table:1"),
+        });
+        tx.commit().await.map(|_| ())
+    }
+
+    /// A column mapping folds its name-mapping rows (emitted out of
+    /// ordinal order, one nested child, one hive-partition virtual
+    /// column) and the added file carries its `mapping_id`; the record
+    /// is served at any time-travel target.
+    #[tokio::test]
+    async fn mapping_rows_land_fold_and_serve_time_travel() {
+        let catalog = open().await;
+
+        let mut file = data_file_row(7, 1, 1);
+        file[14] = Cell::U64(21); // mapping_id
+        stage_mapping_batch(
+            &catalog,
+            1,
+            vec![
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 2, "region", 3, None, true),
+                ),
+                (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 1, "id", 2, Some(0), false),
+                ),
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 0, "payload", 1, None, false),
+                ),
+                (TableKind::DataFile, file),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let stored = &head.mappings[&1][&21];
+        assert_eq!(stored.map_type, "map_by_name");
+        assert_eq!(stored.name_mappings.len(), 3);
+        assert_eq!(stored.name_mappings[0].source_name, "payload");
+        assert_eq!(stored.name_mappings[1].parent_column, Some(0));
+        assert!(stored.name_mappings[2].is_partition);
+        assert_eq!(head.data_files[&1][&7].mapping_id, Some(21));
+
+        // Unversioned: a time-travel view still serves the mapping.
+        let past = catalog.snapshot_at(SnapshotId::new(1)).await.unwrap();
+        assert_eq!(past.mappings[&1][&21].name_mappings.len(), 3);
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn column_mapping_without_name_rows_is_rejected() {
+        let catalog = open().await;
+        let err = stage_mapping_batch(
+            &catalog,
+            1,
+            vec![(TableKind::ColumnMapping, column_mapping_row(21, 1))],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("name_mapping"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphaned_name_mapping_row_is_rejected() {
+        let catalog = open().await;
+        let err = stage_mapping_batch(
+            &catalog,
+            1,
+            vec![(
+                TableKind::NameMapping,
+                name_mapping_row(99, 0, "id", 1, None, false),
+            )],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("name_mapping"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_name_mapping_ordinals_are_rejected() {
+        let catalog = open().await;
+        let err = stage_mapping_batch(
+            &catalog,
+            1,
+            vec![
+                (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 0, "a", 1, None, false),
+                ),
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 0, "b", 2, None, false),
+                ),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("unique"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn name_mapping_parent_after_child_is_rejected() {
+        let catalog = open().await;
+        let err = stage_mapping_batch(
+            &catalog,
+            1,
+            vec![
+                (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 0, "a", 1, Some(1), false),
+                ),
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 1, "b", 2, None, false),
+                ),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("earlier"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_mapping_id_against_base_is_rejected() {
+        let catalog = open().await;
+        let mapping = || {
+            vec![
+                (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+                (
+                    TableKind::NameMapping,
+                    name_mapping_row(21, 0, "id", 1, None, false),
+                ),
+            ]
+        };
+        stage_mapping_batch(&catalog, 1, mapping()).await.unwrap();
+        let err = stage_mapping_batch(&catalog, 2, mapping())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_set_end_on_column_mapping_is_rejected() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::ColumnMapping,
+            cells: vec![Cell::U64(21), Cell::U64(1)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 11),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "none"),
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(err.to_string().contains("not defined"), "{err}");
         catalog.close().await.unwrap();
     }
 

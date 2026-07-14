@@ -6,15 +6,15 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
-        MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, OptionScope,
-        ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
-        TableStats, TagEntry, ViewId, ViewInfo,
+        MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId, MappingInfo,
+        NameMappingDef, OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
+        SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
     },
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            MacroValue, OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
-            TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
+            MacroValue, MappingValue, OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue,
+            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         read::EntityRecord,
     },
@@ -41,6 +41,7 @@ pub struct CatalogSnapshot {
     pub(crate) delete_files: BTreeMap<u64, BTreeMap<u64, DeleteFileValue>>,
     pub(crate) partitions: BTreeMap<u64, BTreeMap<u64, PartitionValue>>,
     pub(crate) sorts: BTreeMap<u64, BTreeMap<u64, SortValue>>,
+    pub(crate) mappings: BTreeMap<u64, BTreeMap<u64, MappingValue>>,
     pub(crate) table_stats: BTreeMap<u64, TableStatsValue>,
     pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
     pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
@@ -98,6 +99,12 @@ impl CatalogSnapshot {
                 }
                 EntityRecord::Macro(m) if included(m.begin_snapshot, m.end_snapshot) => {
                     view.put_macro(m);
+                }
+                // Mappings are unversioned and immutable: included at any
+                // time-travel target, since a historical file read still
+                // resolves through its mapping.
+                EntityRecord::Mapping(m) => {
+                    view.put_mapping(m);
                 }
                 EntityRecord::FileColumnStats(fcs) => {
                     view.put_file_column_stats(fcs);
@@ -271,6 +278,16 @@ impl CatalogSnapshot {
         self.macros.get(&id.get()).map(macro_info)
     }
 
+    /// A table's column mappings in `mapping_id` order. Mappings are
+    /// unversioned: any time-travel view serves the full set.
+    #[must_use]
+    pub fn mappings_of(&self, table: TableId) -> Vec<MappingInfo> {
+        self.mappings
+            .get(&table.get())
+            .map(|per_table| per_table.values().map(mapping_info).collect())
+            .unwrap_or_default()
+    }
+
     /// A resolved option value: table falls back to its schema, then
     /// global; schema falls back to global. Options are unversioned: a
     /// time-traveled snapshot resolves current values.
@@ -397,6 +414,13 @@ impl CatalogSnapshot {
             self.view_names
                 .remove(&(old.schema_id, old.view_name.clone()));
         }
+    }
+
+    pub(crate) fn put_mapping(&mut self, value: MappingValue) {
+        self.mappings
+            .entry(value.table_id)
+            .or_default()
+            .insert(value.mapping_id, value);
     }
 
     pub(crate) fn put_macro(&mut self, value: MacroValue) {
@@ -572,6 +596,25 @@ fn view_info(value: &ViewValue) -> ViewInfo {
         name: value.view_name.clone(),
         dialect: value.dialect.clone(),
         sql: value.sql.clone(),
+    }
+}
+
+fn mapping_info(value: &MappingValue) -> MappingInfo {
+    MappingInfo {
+        id: MappingId::new(value.mapping_id),
+        table_id: TableId::new(value.table_id),
+        map_type: value.map_type.clone(),
+        name_mappings: value
+            .name_mappings
+            .iter()
+            .map(|row| NameMappingDef {
+                column_id: row.column_id,
+                source_name: row.source_name.clone(),
+                target_field_id: row.target_field_id,
+                parent_column: row.parent_column,
+                is_partition: row.is_partition,
+            })
+            .collect(),
     }
 }
 
@@ -967,6 +1010,35 @@ mod tests {
         assert!(head.view_by_name(SchemaId::new(0), "v1").is_none());
         let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
         assert_eq!(past.view_by_id(ViewId::new(3)).unwrap().name, "v1");
+    }
+
+    #[test]
+    fn mappings_are_table_scoped_and_survive_time_travel() {
+        let mapping = MappingValue {
+            mapping_id: 21,
+            table_id: 4,
+            map_type: "map_by_name".into(),
+            name_mappings: vec![crate::store::proto::NameMapping {
+                column_id: 0,
+                source_name: "id".into(),
+                target_field_id: 1,
+                parent_column: None,
+                is_partition: false,
+            }],
+        };
+        // Unversioned: included regardless of the time-travel target.
+        let past = CatalogSnapshot::build(
+            snap(12),
+            vec![EntityRecord::Mapping(mapping)],
+            vec![],
+            Some(1),
+        );
+        let mappings = past.mappings_of(TableId::new(4));
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].id, MappingId::new(21));
+        assert_eq!(mappings[0].map_type, "map_by_name");
+        assert_eq!(mappings[0].name_mappings[0].source_name, "id");
+        assert!(past.mappings_of(TableId::new(5)).is_empty());
     }
 
     #[test]
