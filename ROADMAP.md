@@ -228,9 +228,11 @@ on that path.
   `ducklake_table_and_column_comments_round_trip`)
 
 ## Hardening & release
-- [ ] Real object storage tests (MinIO/localstack)
-- [ ] Arbitrary-bytes decode proptests for store codecs (never panic on
+- [x] Real object storage tests (MinIO via `cargo xtask s3`)
+- [x] Arbitrary-bytes decode proptests for store codecs (never panic on
   garbage)
-- [ ] v0.1 crates.io release (switch `release.yml` trigger to `push`)
-- [ ] Extension distribution story: per-DuckDB-version build + signing
-  (RFC 0006 pins one supported DuckDB release)
+- [x] v0.1 crates.io release (switch `release.yml` trigger to `push`)
+- [x] Extension distribution: per-DuckDB-version, per-platform builds
+  attached to GitHub releases (unsigned; loaded with `-unsigned` — DuckDB
+  accepts only its own core/community signing keys)
+- [ ] Signed distribution via a duckdb/community-extensions submission
