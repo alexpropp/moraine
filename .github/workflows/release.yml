@@ -1,9 +1,13 @@
 name: Release
 
-# Dormant until first release: manual trigger only. At first release, change
-# to `push: { branches: [main] }` and add CARGO_REGISTRY_TOKEN to repo secrets.
+# Every push to main runs release-plz: it maintains a release PR (version
+# bump + changelog); merging that PR publishes to crates.io, tags
+# `v<version>`, and creates the GitHub release the extension workflow
+# attaches artifacts to. Needs CARGO_REGISTRY_TOKEN in repo secrets.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   release-plz:

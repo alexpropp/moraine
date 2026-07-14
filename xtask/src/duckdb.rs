@@ -12,10 +12,16 @@ use std::{
 use anyhow::{Context, bail, ensure};
 
 /// The DuckDB version xtask downloads and the extension is packaged
-/// against. The packaged footer's DuckDB-version field must equal this
-/// exactly for the loader to accept it (see the README's "Extension
-/// entry-point contract").
-pub const DUCKDB_PIN: &str = "v1.5.4";
+/// against, read from the repo-root `DUCKDB_VERSION` file — the single
+/// source the extension's build script reads too. The packaged footer's
+/// DuckDB-version field must equal it exactly for the loader to accept
+/// the artifact (see the README's "Extension entry-point contract").
+pub fn duckdb_pin() -> anyhow::Result<String> {
+    let path = workspace_root().join("DUCKDB_VERSION");
+    let pin = fs::read_to_string(&path)
+        .with_context(|| format!("reading the DuckDB pin from {}", path.display()))?;
+    Ok(pin.trim().to_string())
+}
 
 const DUCKDB_RELEASE_BASE_URL: &str = "https://github.com/duckdb/duckdb/releases/download";
 
@@ -83,13 +89,14 @@ pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
         return Ok(cli_path);
     }
 
-    let platform = cli_download_platform()?;
+    let pin = duckdb_pin()?;
+    let platform = cli_download_platform(&pin)?;
     let zip_name = format!("duckdb_cli-{platform}.zip");
     let zip_path = duckdb_root.join(&zip_name);
     if !zip_path.exists() {
         fs::create_dir_all(&duckdb_root)
             .with_context(|| format!("creating {}", duckdb_root.display()))?;
-        let url = format!("{DUCKDB_RELEASE_BASE_URL}/{DUCKDB_PIN}/{zip_name}");
+        let url = format!("{DUCKDB_RELEASE_BASE_URL}/{pin}/{zip_name}");
         download(&url, &zip_path)?;
     }
 
@@ -115,19 +122,37 @@ pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
 /// Builds the release cdylib and packages it into a loadable
 /// `.duckdb_extension` in the cache, returning the artifact's path.
 pub fn build_and_package_extension() -> anyhow::Result<PathBuf> {
+    let pin = duckdb_pin()?;
     run(Command::new("cargo").args(["build", "-p", "moraine-duckdb", "--release"]))?;
     let lib = release_dir().join(cdylib_name());
     ensure!(lib.exists(), "expected cdylib at {}", lib.display());
     println!("ok: built {}", lib.display());
 
-    package_extension(&lib, &duckdb_cli_root())
+    package_extension(&lib, &duckdb_cli_root().join("artifact"), &pin)
+}
+
+/// Builds the release cdylib and packages it into
+/// `<out>/<duckdb_version>/<platform>/<EXTENSION_NAME>.duckdb_extension`
+/// — the directory shape DuckDB extension repositories serve, so the
+/// tree is ready to host as one.
+pub fn package(out: &Path) -> anyhow::Result<()> {
+    let pin = duckdb_pin()?;
+
+    run(Command::new("cargo").args(["build", "-p", "moraine-duckdb", "--release"]))?;
+    let lib = release_dir().join(cdylib_name());
+    ensure!(lib.exists(), "expected cdylib at {}", lib.display());
+
+    let platform_dir = out.join(&pin).join(footer_platform()?);
+    let artifact = package_extension(&lib, &platform_dir, &pin)?;
+    println!("ok: packaged {}", artifact.display());
+    Ok(())
 }
 
 /// Downloads `url` to `dest` via the system `curl`, removing any partial
 /// file on failure. Fails with a message naming the URL and hinting at
 /// connectivity issues when offline; curl's own diagnostics still reach
 /// stderr.
-fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
+pub fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
     println!("downloading {url}");
     let outcome = Command::new("curl")
         .args(["--fail", "--location", "--show-error", "-o"])
@@ -151,7 +176,7 @@ fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> anyhow::Result<()> {
+pub fn make_executable(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut perms = fs::metadata(path)
@@ -166,7 +191,7 @@ fn make_executable(path: &Path) -> anyhow::Result<()> {
 /// The `duckdb_cli-<platform>.zip` platform tag for the host, matching
 /// the URL scheme in `crates/moraine-duckdb/README.md`. Scoped to macOS
 /// and Linux, matching `build.rs`'s own linkage support.
-fn cli_download_platform() -> anyhow::Result<&'static str> {
+fn cli_download_platform(pin: &str) -> anyhow::Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("osx-arm64"),
         // No standalone macOS x86_64 asset is published; the universal
@@ -175,7 +200,7 @@ fn cli_download_platform() -> anyhow::Result<&'static str> {
         ("linux", "x86_64") => Ok("linux-amd64"),
         ("linux", "aarch64") => Ok("linux-arm64"),
         (os, arch) => bail!(
-            "no pinned DuckDB {DUCKDB_PIN} CLI mapping for {os}/{arch}; add one in \
+            "no pinned DuckDB {pin} CLI mapping for {os}/{arch}; add one in \
              xtask/src/duckdb.rs (see crates/moraine-duckdb/README.md's CLI URL list)"
         ),
     }
@@ -225,31 +250,30 @@ fn write_footer_field(
 /// `crates/moraine-duckdb/README.md`'s "Extension entry-point contract").
 /// The signature region `[256, 512)` stays zero: unsigned extensions
 /// only, matching this project's `-unsigned` CLI contract.
-fn metadata_footer() -> anyhow::Result<[u8; FOOTER_SIZE]> {
+fn metadata_footer(pin: &str) -> anyhow::Result<[u8; FOOTER_SIZE]> {
     let mut footer = [0u8; FOOTER_SIZE];
     write_footer_field(&mut footer, 96, "CPP")?;
     write_footer_field(&mut footer, 128, EXTENSION_VERSION)?;
-    write_footer_field(&mut footer, 160, DUCKDB_PIN)?;
+    write_footer_field(&mut footer, 160, pin)?;
     write_footer_field(&mut footer, 192, &footer_platform()?)?;
     write_footer_field(&mut footer, 224, "4")?;
     Ok(footer)
 }
 
 /// Packages the built cdylib at `lib` into a loadable
-/// `<EXTENSION_NAME>.duckdb_extension` under `<duckdb_root>/artifact/`:
-/// copies the bytes, then appends the 512-byte metadata footer. The
-/// filename carries exactly one `.`, required for DuckDB's loader to
-/// derive the right init-symbol name (`FileSystem::ExtractBaseName`
-/// splits on the first `.`).
-fn package_extension(lib: &Path, duckdb_root: &Path) -> anyhow::Result<PathBuf> {
-    let artifact_dir = duckdb_root.join("artifact");
-    fs::create_dir_all(&artifact_dir)
+/// `<EXTENSION_NAME>.duckdb_extension` under `artifact_dir`: copies the
+/// bytes, then appends the 512-byte metadata footer. The filename
+/// carries exactly one `.`, required for DuckDB's loader to derive the
+/// right init-symbol name (`FileSystem::ExtractBaseName` splits on the
+/// first `.`).
+fn package_extension(lib: &Path, artifact_dir: &Path, pin: &str) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(artifact_dir)
         .with_context(|| format!("creating {}", artifact_dir.display()))?;
     let extension_path = artifact_dir.join(format!("{EXTENSION_NAME}.duckdb_extension"));
 
     let mut bytes =
         fs::read(lib).with_context(|| format!("reading built cdylib at {}", lib.display()))?;
-    bytes.extend_from_slice(&metadata_footer()?);
+    bytes.extend_from_slice(&metadata_footer(pin)?);
     fs::write(&extension_path, &bytes)
         .with_context(|| format!("writing packaged extension to {}", extension_path.display()))?;
 

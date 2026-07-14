@@ -49,42 +49,90 @@ mod tests {
         assert!(matches!(err, Error::Corruption(_)));
     }
 
-    macro_rules! roundtrip {
-        ($name:ident, $ty:ty) => {
+    proptest! {
+        // Decode is total: arbitrary bytes decode or fail as
+        // `Corruption`, never panic.
+        #[test]
+        fn decode_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let _ = decode_value::<HeadValue>(&bytes);
+        }
+    }
+
+    macro_rules! codec_tests {
+        ($roundtrip:ident, $garbage:ident, $ty:ty) => {
             proptest! {
                 #[test]
-                fn $name(msg in any::<$ty>()) {
+                fn $roundtrip(msg in any::<$ty>()) {
                     let encoded = encode_value(&msg);
                     let decoded: $ty = decode_value(&encoded).unwrap();
                     prop_assert_eq!(decoded, msg);
+                }
+
+                // Decode is total: framed garbage decodes as some
+                // message or fails as `Corruption`, never panics.
+                #[test]
+                fn $garbage(
+                    payload in proptest::collection::vec(any::<u8>(), 0..256),
+                ) {
+                    let _ = decode_value::<$ty>(&frame::frame(&payload));
                 }
             }
         };
     }
 
-    roundtrip!(roundtrip_schema, SchemaValue);
-    roundtrip!(roundtrip_table, TableValue);
-    roundtrip!(roundtrip_view, ViewValue);
-    roundtrip!(roundtrip_column, ColumnValue);
-    roundtrip!(roundtrip_partition, PartitionValue);
-    roundtrip!(roundtrip_sort, SortValue);
-    roundtrip!(roundtrip_macro, MacroValue);
-    roundtrip!(roundtrip_mapping, MappingValue);
-    roundtrip!(roundtrip_data_file, DataFileValue);
-    roundtrip!(roundtrip_delete_file, DeleteFileValue);
-    roundtrip!(roundtrip_file_column_stats, FileColumnStatsValue);
-    roundtrip!(roundtrip_table_stats, TableStatsValue);
-    roundtrip!(roundtrip_table_column_stats, TableColumnStatsValue);
-    roundtrip!(roundtrip_tag, TagValue);
-    roundtrip!(roundtrip_tag_entry, TagEntry);
-    roundtrip!(roundtrip_option_scope, OptionScopeValue);
-    roundtrip!(roundtrip_snapshot, SnapshotValue);
-    roundtrip!(roundtrip_gcfile, GcFileValue);
-    roundtrip!(roundtrip_format, FormatValue);
-    roundtrip!(roundtrip_head, HeadValue);
-    roundtrip!(roundtrip_migration, MigrationValue);
-    roundtrip!(roundtrip_inline_schema, InlineSchemaValue);
-    roundtrip!(roundtrip_inline_chunk, InlineChunkValue);
-    roundtrip!(roundtrip_inline_inline_delete, InlineInlineDeleteValue);
-    roundtrip!(roundtrip_inline_file_delete, InlineFileDeleteValue);
+    codec_tests!(roundtrip_schema, garbage_schema, SchemaValue);
+    codec_tests!(roundtrip_table, garbage_table, TableValue);
+    codec_tests!(roundtrip_view, garbage_view, ViewValue);
+    codec_tests!(roundtrip_column, garbage_column, ColumnValue);
+    codec_tests!(roundtrip_partition, garbage_partition, PartitionValue);
+    codec_tests!(roundtrip_sort, garbage_sort, SortValue);
+    codec_tests!(roundtrip_macro, garbage_macro, MacroValue);
+    codec_tests!(roundtrip_mapping, garbage_mapping, MappingValue);
+    codec_tests!(roundtrip_data_file, garbage_data_file, DataFileValue);
+    codec_tests!(roundtrip_delete_file, garbage_delete_file, DeleteFileValue);
+    codec_tests!(
+        roundtrip_file_column_stats,
+        garbage_file_column_stats,
+        FileColumnStatsValue
+    );
+    codec_tests!(roundtrip_table_stats, garbage_table_stats, TableStatsValue);
+    codec_tests!(
+        roundtrip_table_column_stats,
+        garbage_table_column_stats,
+        TableColumnStatsValue
+    );
+    codec_tests!(roundtrip_tag, garbage_tag, TagValue);
+    codec_tests!(roundtrip_tag_entry, garbage_tag_entry, TagEntry);
+    codec_tests!(
+        roundtrip_option_scope,
+        garbage_option_scope,
+        OptionScopeValue
+    );
+    codec_tests!(roundtrip_snapshot, garbage_snapshot, SnapshotValue);
+    codec_tests!(roundtrip_gcfile, garbage_gcfile, GcFileValue);
+    codec_tests!(roundtrip_format, garbage_format, FormatValue);
+    codec_tests!(roundtrip_head, garbage_head, HeadValue);
+    codec_tests!(roundtrip_migration, garbage_migration, MigrationValue);
+    codec_tests!(
+        roundtrip_inline_schema,
+        garbage_inline_schema,
+        InlineSchemaValue
+    );
+    codec_tests!(
+        roundtrip_inline_chunk,
+        garbage_inline_chunk,
+        InlineChunkValue
+    );
+    codec_tests!(
+        roundtrip_inline_inline_delete,
+        garbage_inline_inline_delete,
+        InlineInlineDeleteValue
+    );
+    codec_tests!(
+        roundtrip_inline_file_delete,
+        garbage_inline_file_delete,
+        InlineFileDeleteValue
+    );
 }

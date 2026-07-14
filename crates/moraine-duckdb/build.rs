@@ -36,16 +36,25 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 
-/// The DuckDB tag whose `src/include/` tree this shim compiles against.
-/// Matches the artifact-footer version pin in `xtask/src/main.rs`
-/// (`DUCKDB_PIN`) — both must name the same release.
-const DUCKDB_PIN: &str = "v1.5.4";
-
 const DUCKDB_GIT_URL: &str = "https://github.com/duckdb/duckdb.git";
 
+/// The DuckDB tag whose `src/include/` tree this shim compiles against,
+/// read from the repo-root `DUCKDB_VERSION` file — the single source
+/// xtask's artifact-footer pin reads too.
+fn duckdb_pin() -> anyhow::Result<String> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .context("cargo sets CARGO_MANIFEST_DIR for every build script")?;
+    let path = Path::new(&manifest_dir).join("../../DUCKDB_VERSION");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let pin = fs::read_to_string(&path)
+        .with_context(|| format!("reading the DuckDB pin from {}", path.display()))?;
+    Ok(pin.trim().to_string())
+}
+
 fn main() -> anyhow::Result<()> {
-    let include_dir = ensure_duckdb_headers()?;
-    let duckdb_archive = ensure_duckdb_static_archive()?;
+    let pin = duckdb_pin()?;
+    let include_dir = ensure_duckdb_headers(&pin)?;
+    let duckdb_archive = ensure_duckdb_static_archive(&pin)?;
 
     let archive_name = "moraine_duckdb_cpp";
 
@@ -122,16 +131,16 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns the path to a local `src/include/` tree from the DuckDB
-/// `DUCKDB_PIN` tag, downloading and caching it under
+/// Returns the path to a local `src/include/` tree from the pinned
+/// DuckDB tag, downloading and caching it under
 /// `target/duckdb-src/<pin>/` if it isn't already cached.
 ///
 /// Only `src/include/` is fetched, via a blobless partial clone plus a
 /// sparse checkout of that one path: the shim compiles cleanly against
 /// `src/include/` alone with zero `third_party/` headers, and that
 /// directory is ~9 MB versus the full tree's 100+ MB.
-fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
-    let checkout_root = duckdb_src_root()?.join(DUCKDB_PIN);
+fn ensure_duckdb_headers(pin: &str) -> anyhow::Result<PathBuf> {
+    let checkout_root = duckdb_src_root()?.join(pin);
     let include_dir = checkout_root.join("src/include");
     if full_tree_marker(&include_dir).exists() {
         return Ok(include_dir);
@@ -147,7 +156,7 @@ fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
         .with_context(|| format!("creating {}", checkout_root.display()))?;
 
     println!(
-        "cargo:warning=moraine-duckdb: fetching DuckDB {DUCKDB_PIN} headers (src/include/, ~9 \
+        "cargo:warning=moraine-duckdb: fetching DuckDB {pin} headers (src/include/, ~9 \
          MB) into {} — one-time cost, cached under target/ after this",
         checkout_root.display()
     );
@@ -161,17 +170,22 @@ fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
             "--depth",
             "1",
             "--branch",
-            DUCKDB_PIN,
+            pin,
             DUCKDB_GIT_URL,
             ".",
         ],
+        pin,
     )?;
-    run_git(&checkout_root, ["sparse-checkout", "set", "src/include"])?;
-    run_git(&checkout_root, ["checkout", DUCKDB_PIN])?;
+    run_git(
+        &checkout_root,
+        ["sparse-checkout", "set", "src/include"],
+        pin,
+    )?;
+    run_git(&checkout_root, ["checkout", pin], pin)?;
 
     ensure!(
         full_tree_marker(&include_dir).exists(),
-        "checked out DuckDB {DUCKDB_PIN} into {} but {} is still missing",
+        "checked out DuckDB {pin} into {} but {} is still missing",
         checkout_root.display(),
         full_tree_marker(&include_dir).display()
     );
@@ -179,9 +193,10 @@ fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
     Ok(include_dir)
 }
 
-/// Returns the path to a static archive of DuckDB `DUCKDB_PIN` built from
-/// the release's single-file amalgamation, compiling and caching it under
-/// `target/duckdb-src/<pin>-lib/<target>/` if it isn't already cached.
+/// Returns the path to a static archive of the pinned DuckDB release
+/// built from its single-file amalgamation, compiling and caching it
+/// under `target/duckdb-src/<pin>-lib/<target>/` if it isn't already
+/// cached.
 ///
 /// Built once per target triple with fixed flags (`-O0`, `NDEBUG`, no debug
 /// info) regardless of cargo profile, so debug and release builds share the
@@ -193,18 +208,18 @@ fn ensure_duckdb_headers() -> anyhow::Result<PathBuf> {
 /// the ABI, and the linked-in code serves only the shim's metadata-catalog
 /// calls, not the host's query execution, so `-O0` costs nothing that
 /// matters.
-fn ensure_duckdb_static_archive() -> anyhow::Result<PathBuf> {
+fn ensure_duckdb_static_archive(pin: &str) -> anyhow::Result<PathBuf> {
     let target = std::env::var("TARGET").context("cargo sets TARGET for every build script")?;
-    let lib_dir = duckdb_src_root()?.join(format!("{DUCKDB_PIN}-lib/{target}"));
+    let lib_dir = duckdb_src_root()?.join(format!("{pin}-lib/{target}"));
     let archive_path = lib_dir.join("libduckdb_amalgamation.a");
     if archive_path.exists() {
         return Ok(archive_path);
     }
 
-    let amalgamation_dir = ensure_duckdb_amalgamation_source()?;
+    let amalgamation_dir = ensure_duckdb_amalgamation_source(pin)?;
 
     println!(
-        "cargo:warning=moraine-duckdb: compiling the DuckDB {DUCKDB_PIN} amalgamation into a \
+        "cargo:warning=moraine-duckdb: compiling the DuckDB {pin} amalgamation into a \
          static archive (one translation unit, takes minutes) — one-time cost per target, \
          cached under target/ after this"
     );
@@ -260,14 +275,14 @@ fn ensure_duckdb_static_archive() -> anyhow::Result<PathBuf> {
     Ok(archive_path)
 }
 
-/// Returns the path to a directory holding the `DUCKDB_PIN` release's
+/// Returns the path to a directory holding the pinned release's
 /// single-file amalgamation (`duckdb.cpp` + `duckdb.hpp`), downloading and
 /// caching it under `target/duckdb-src/<pin>-amalgamation/` if it isn't
 /// already cached. This is the `libduckdb-src.zip` release asset — the
 /// library *source*, distinct from the `src/include/` header tree the shim
 /// compiles against.
-fn ensure_duckdb_amalgamation_source() -> anyhow::Result<PathBuf> {
-    let amalgamation_dir = duckdb_src_root()?.join(format!("{DUCKDB_PIN}-amalgamation"));
+fn ensure_duckdb_amalgamation_source(pin: &str) -> anyhow::Result<PathBuf> {
+    let amalgamation_dir = duckdb_src_root()?.join(format!("{pin}-amalgamation"));
     if amalgamation_dir.join("duckdb.cpp").exists() {
         return Ok(amalgamation_dir);
     }
@@ -280,13 +295,11 @@ fn ensure_duckdb_amalgamation_source() -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&amalgamation_dir)
         .with_context(|| format!("creating {}", amalgamation_dir.display()))?;
 
-    let url = format!(
-        "https://github.com/duckdb/duckdb/releases/download/{DUCKDB_PIN}/libduckdb-src.zip"
-    );
+    let url = format!("https://github.com/duckdb/duckdb/releases/download/{pin}/libduckdb-src.zip");
     let zip_path = amalgamation_dir.join("libduckdb-src.zip");
 
     println!(
-        "cargo:warning=moraine-duckdb: downloading the DuckDB {DUCKDB_PIN} amalgamation \
+        "cargo:warning=moraine-duckdb: downloading the DuckDB {pin} amalgamation \
          ({url}) into {} — one-time cost, cached under target/ after this",
         amalgamation_dir.display()
     );
@@ -300,7 +313,7 @@ fn ensure_duckdb_amalgamation_source() -> anyhow::Result<PathBuf> {
             .arg(&url),
         &format!(
             "downloading {url}; if this machine is offline, pre-populate {} manually with the \
-             unzipped `libduckdb-src.zip` asset of the DuckDB {DUCKDB_PIN} release",
+             unzipped `libduckdb-src.zip` asset of the DuckDB {pin} release",
             amalgamation_dir.display()
         ),
     )?;
@@ -355,7 +368,7 @@ fn run_tool(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
 /// Runs `git <args>` with `cwd` as the working directory, failing with a
 /// message naming the command on non-zero exit. `git`'s own diagnostics
 /// reach stderr since stdio is inherited.
-fn run_git<I, S>(cwd: &Path, args: I) -> anyhow::Result<()>
+fn run_git<I, S>(cwd: &Path, args: I, pin: &str) -> anyhow::Result<()>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -367,10 +380,10 @@ where
         Ok(status) if status.success() => Ok(()),
         Ok(status) => bail!(
             "{cmd:?} exited with {status}; if this machine is offline, pre-populate \
-             target/duckdb-src/{DUCKDB_PIN}/src/include/ manually with the `src/include/` \
-             directory of a duckdb/duckdb checkout at tag {DUCKDB_PIN} (e.g. \
-             `git clone --depth 1 --branch {DUCKDB_PIN} {DUCKDB_GIT_URL} /tmp/duckdb && \
-             cp -r /tmp/duckdb/src/include target/duckdb-src/{DUCKDB_PIN}/src/`) and rerun. \
+             target/duckdb-src/{pin}/src/include/ manually with the `src/include/` \
+             directory of a duckdb/duckdb checkout at tag {pin} (e.g. \
+             `git clone --depth 1 --branch {pin} {DUCKDB_GIT_URL} /tmp/duckdb && \
+             cp -r /tmp/duckdb/src/include target/duckdb-src/{pin}/src/`) and rerun. \
              The `libduckdb-src.zip` release asset is NOT a substitute: it is the single-file \
              amalgamation, not this header tree"
         ),

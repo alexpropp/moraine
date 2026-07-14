@@ -32,8 +32,7 @@ jobs:
   # post-step cleanup deletes directories under target/ it doesn't
   # recognize, so the extra step must be declared *after* rust-cache —
   # post steps run in reverse order, making its save fire before that
-  # cleanup. Keyed on build.rs, which owns the DuckDB pin and the compile
-  # flags.
+  # cleanup. Keyed on DUCKDB_VERSION, the single source of the DuckDB pin.
   clippy:
     runs-on: ubuntu-latest
     steps:
@@ -42,7 +41,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -53,7 +52,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       - run: cargo test --workspace --locked
 
   doc:
@@ -66,7 +65,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       - run: cargo doc --workspace --no-deps
 
   deny:
@@ -83,12 +82,26 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('crates/moraine-duckdb/build.rs') }}
+          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       # The pinned DuckDB CLI xtask downloads (~20 MB, re-fetched every run
       # otherwise, for the same rust-cache cleanup reason). Keyed on
-      # xtask/src/main.rs, which owns that pin.
+      # DUCKDB_VERSION, the single source of the DuckDB pin.
       - uses: actions/cache@v4
         with:
           path: target/duckdb-cli/cli
-          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('xtask/src/main.rs') }}
+          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       - run: cargo xtask e2e
+
+  s3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      # The pinned MinIO binaries xtask downloads, keyed on
+      # xtask/src/s3.rs, which owns those pins (same rust-cache cleanup
+      # caveat as the DuckDB CLI cache above).
+      - uses: actions/cache@v4
+        with:
+          path: target/minio/bin
+          key: minio-${{ runner.os }}-${{ hashFiles('xtask/src/s3.rs') }}
+      - run: cargo xtask s3

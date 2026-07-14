@@ -103,5 +103,14 @@ mod tests {
             let framed = frame(&payload);
             prop_assert_eq!(unframe(&framed).unwrap(), payload.as_slice());
         }
+
+        // Unframe is total: arbitrary bytes unframe or fail as
+        // `Corruption`, never panic.
+        #[test]
+        fn unframe_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let _ = unframe(&bytes);
+        }
     }
 }

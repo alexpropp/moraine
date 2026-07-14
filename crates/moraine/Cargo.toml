@@ -1,6 +1,9 @@
 [package]
 name = "moraine"
 description = "A SlateDB-backed catalog for DuckLake"
+readme = "../../README.md"
+keywords = ["duckdb", "ducklake", "slatedb", "catalog", "lakehouse"]
+categories = ["database-implementations"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -23,6 +26,7 @@ prost-build = { workspace = true }
 protox = { workspace = true }
 
 [dev-dependencies]
+object_store = { workspace = true, features = ["aws"] }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

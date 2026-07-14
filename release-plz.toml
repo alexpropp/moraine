@@ -3,5 +3,15 @@ changelog_update = true
 semver_check = true
 
 [[package]]
+name = "moraine"
+# Pinned so the extension workflow's `v*` tag trigger always matches.
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "moraine-duckdb"
+# Distributed as a prebuilt .duckdb_extension artifact, not a crate.
+release = false
+
+[[package]]
 name = "xtask"
 release = false
