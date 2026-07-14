@@ -37,6 +37,12 @@ DuckDB v1.5.4 source, the real pinned DuckLake source, and a real CLI
 
 ## Pin
 
+The pin's single source is the repo-root `DUCKDB_VERSION` file, read by
+both `build.rs` (headers + amalgamation) and xtask (CLI download +
+artifact footer); CI cache keys hash it. Bumping the pin means editing
+that file — plus the hand-maintained references to the version string in
+this README and `compile_flags.txt`.
+
 | What | Pinned at |
 |---|---|
 | DuckDB | **v1.5.4** (git hash `08e34c447b`, codename Variegata) |
@@ -45,6 +51,25 @@ DuckDB v1.5.4 source, the real pinned DuckLake source, and a real CLI
 | C++ standard | C++17 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
 | DuckLake extension (for the coming e2e) | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
+
+## Installing a released build
+
+Release assets are unsigned: DuckDB verifies extension signatures only
+against its own core/community keys, so a self-distributed build must be
+loaded with signature checks off.
+
+1. Download the asset for your platform and the pinned DuckDB release
+   from the GitHub release, e.g. `moraine_duckdb-v1.5.4-osx_arm64.zip`.
+2. Unzip. The archive holds `moraine_duckdb.duckdb_extension`; the
+   filename is load-bearing (DuckDB derives the entry symbol from it).
+3. Load with signature checks off:
+
+   ```sh
+   duckdb -unsigned -c "LOAD './moraine_duckdb.duckdb_extension';"
+   ```
+
+The same artifact tree is produced locally by `cargo xtask package`
+(`dist/<duckdb_version>/<platform>/`).
 
 ## Where the headers come from
 

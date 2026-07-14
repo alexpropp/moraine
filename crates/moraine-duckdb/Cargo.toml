@@ -1,6 +1,8 @@
 [package]
 name = "moraine-duckdb"
 description = "DuckDB extension exposing the moraine DuckLake catalog"
+# Distributed as a prebuilt .duckdb_extension artifact, not a crate.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
