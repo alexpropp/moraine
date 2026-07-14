@@ -98,10 +98,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       # The pinned MinIO binaries xtask downloads, keyed on
-      # xtask/src/main.rs, which owns those pins (same rust-cache cleanup
+      # xtask/src/s3.rs, which owns those pins (same rust-cache cleanup
       # caveat as the DuckDB CLI cache above).
       - uses: actions/cache@v4
         with:
           path: target/minio/bin
-          key: minio-${{ runner.os }}-${{ hashFiles('xtask/src/main.rs') }}
+          key: minio-${{ runner.os }}-${{ hashFiles('xtask/src/s3.rs') }}
       - run: cargo xtask s3
