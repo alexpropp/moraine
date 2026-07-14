@@ -888,5 +888,40 @@ mod tests {
         fn encoding_preserves_order(a in arb_key(), b in arb_key()) {
             prop_assert_eq!(a.cmp(&b), a.encode().cmp(&b.encode()));
         }
+
+        // Decode is total: arbitrary bytes decode or fail as
+        // `Corruption`, never panic.
+        #[test]
+        fn decode_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let _ = Key::decode(&bytes);
+        }
+
+        // Steer past the subspace discriminant so component parsing
+        // sees the garbage too.
+        #[test]
+        fn decode_garbage_in_valid_subspace_never_panics(
+            subspace in 0x02u8..=0x06,
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let mut encoded = vec![subspace];
+            encoded.extend(&bytes);
+            let _ = Key::decode(&encoded);
+        }
+
+        // One corrupted byte in a valid key decodes to some key or
+        // fails loudly, never panics.
+        #[test]
+        fn decode_corrupted_valid_key_never_panics(
+            key in arb_key(),
+            index in any::<proptest::sample::Index>(),
+            byte in any::<u8>(),
+        ) {
+            let mut bytes = key.encode();
+            let position = index.index(bytes.len());
+            bytes[position] = byte;
+            let _ = Key::decode(&bytes);
+        }
     }
 }
