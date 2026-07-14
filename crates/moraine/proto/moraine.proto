@@ -130,7 +130,9 @@ message DataFileValue {
   uint64 record_count = 9;
   uint64 file_size_bytes = 10;
   uint64 footer_size = 11;
-  uint64 row_id_start = 12;
+  // NULL when the file's rows carry explicit per-row ids (compaction
+  // outputs) instead of a dense range from a start.
+  optional uint64 row_id_start = 12;
   optional uint64 partition_id = 13;
   optional string encryption_key = 14;
   optional uint64 mapping_id = 15;
@@ -203,13 +205,20 @@ message TableColumnStatsValue {
   optional string extra_stats = 7;
 }
 
-// ducklake_tag.
+// ducklake_tag entry: one row, embedded in its object's container.
+message TagEntry {
+  uint64 begin_snapshot = 1;
+  optional uint64 end_snapshot = 2;
+  string key = 3;
+  string value = 4;
+}
+
+// ducklake_tag, one container record per tagged object. The container
+// is overwritten in place; each embedded entry carries its row's
+// begin/end verbatim, so time travel filters entries, not records.
 message TagValue {
   uint64 object_id = 1;
-  uint64 begin_snapshot = 2;
-  optional uint64 end_snapshot = 3;
-  string key = 4;
-  string value = 5;
+  repeated TagEntry entries = 2;
 }
 
 // ducklake_metadata, one record per scope. Options are
@@ -219,8 +228,6 @@ message OptionScopeValue {
 }
 
 // ducklake_snapshot + ducklake_snapshot_changes, merged (1:1).
-// next_deletion_id is moraine's gcfile counter, allocated
-// alongside DuckLake's counters.
 // schema_changed_table_ids also folds in this snapshot's
 // ducklake_schema_versions rows: each row DuckLake writes there is
 // (snapshot_id, schema_version, table_id) with the first two always the
@@ -232,7 +239,9 @@ message SnapshotValue {
   uint64 schema_version = 3;
   uint64 next_catalog_id = 4;
   uint64 next_file_id = 5;
-  uint64 next_deletion_id = 6;
+  // Field 6 held a retired gcfile counter (the schedule is keyed by
+  // DuckLake's data_file_id now); reserved so it is never reused.
+  reserved 6;
   string changes_made = 7;
   optional string author = 8;
   optional string commit_message = 9;

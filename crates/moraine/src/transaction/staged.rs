@@ -32,7 +32,7 @@ use crate::{
         handle::ReadHandle,
         inline as store_inline,
         key::{EntityKey, InlineKey, InlineOperation, Key, SysKey},
-        proto, value,
+        proto, read, value,
     },
     transaction::commit,
 };
@@ -83,6 +83,13 @@ pub enum TableKind {
     SortInfo,
     /// `ducklake_sort_expression` — folded into its spec's record.
     SortExpression,
+    /// `ducklake_tag` — an entry in its object's container record.
+    Tag,
+    /// `ducklake_column_tag` — an entry embedded in its column's record.
+    ColumnTag,
+    /// `ducklake_files_scheduled_for_deletion` — the physical-deletion
+    /// schedule, keyed by the scheduled file's id.
+    FilesScheduledForDeletion,
 }
 
 /// One column value in a staged row, typed to the small set of primitive
@@ -117,10 +124,10 @@ pub enum RowOperation {
         /// The row's column values, in table order.
         cells: Vec<Cell>,
     },
-    /// A row removed with no history mirror. Defined only for the three
-    /// unversioned statistics kinds — DuckLake never issues a raw
-    /// `DELETE` against a versioned kind, always the `UPDATE` convention
-    /// below.
+    /// A row removed with no history mirror: the unversioned statistics
+    /// kinds and the deletion schedule, plus the hard prunes maintenance
+    /// issues — snapshot records, dead entity versions (`current` or
+    /// `history`, named by their `end_snapshot`), and dead tag entries.
     Delete {
         /// The row's table.
         table: TableKind,
@@ -136,6 +143,17 @@ pub enum RowOperation {
         table: TableKind,
         /// The ended row's key columns, in table order, followed by the
         /// new `end_snapshot` value.
+        cells: Vec<Cell>,
+    },
+    /// An `UPDATE ... SET begin_snapshot = <v>` row: rebases a data
+    /// file's visibility window in place. DuckLake issues it only during
+    /// a delete-rewrite, against the replacement file the same
+    /// transaction just inserted — any other target is a shape error.
+    UpdateSetBegin {
+        /// The row's table (only `ducklake_data_file`).
+        table: TableKind,
+        /// The rebased row's key columns, followed by the new
+        /// `begin_snapshot` value.
         cells: Vec<Cell>,
     },
     /// `inline/schema`: the Arrow IPC schema for one `(table_id,
@@ -453,7 +471,7 @@ fn decode_data_file(cells: &[Cell]) -> Result<proto::DataFileValue> {
         record_count: c.u64()?,
         file_size_bytes: c.u64()?,
         footer_size: c.u64()?,
-        row_id_start: c.u64()?,
+        row_id_start: c.opt_u64()?,
         partition_id: c.opt_u64()?,
         encryption_key: c.opt_string()?,
         mapping_id: c.opt_u64()?,
@@ -582,6 +600,48 @@ fn decode_sort_info(cells: &[Cell]) -> Result<proto::SortValue> {
     Ok(value)
 }
 
+fn decode_tag_row(cells: &[Cell]) -> Result<(u64, proto::TagEntry)> {
+    let mut c = Cursor::new(TableKind::Tag, cells);
+    let object_id = c.u64()?;
+    let entry = proto::TagEntry {
+        begin_snapshot: c.u64()?,
+        end_snapshot: c.opt_u64()?,
+        key: c.string()?,
+        value: c.string()?,
+    };
+    c.finish()?;
+
+    Ok((object_id, entry))
+}
+
+fn decode_column_tag_row(cells: &[Cell]) -> Result<((u64, u64), proto::ColumnTag)> {
+    let mut c = Cursor::new(TableKind::ColumnTag, cells);
+    let table_id = c.u64()?;
+    let column_id = c.u64()?;
+    let tag = proto::ColumnTag {
+        begin_snapshot: c.u64()?,
+        end_snapshot: c.opt_u64()?,
+        key: c.string()?,
+        value: c.string()?,
+    };
+    c.finish()?;
+
+    Ok(((table_id, column_id), tag))
+}
+
+fn decode_gc_file_row(cells: &[Cell]) -> Result<proto::GcFileValue> {
+    let mut c = Cursor::new(TableKind::FilesScheduledForDeletion, cells);
+    let value = proto::GcFileValue {
+        data_file_id: c.u64()?,
+        path: c.string()?,
+        path_is_relative: c.bool()?,
+        schedule_start_micros: c.i64()?,
+    };
+    c.finish()?;
+
+    Ok(value)
+}
+
 fn decode_sort_expression(cells: &[Cell]) -> Result<(u64, proto::SortExpression)> {
     let mut c = Cursor::new(TableKind::SortExpression, cells);
     let sort_id = c.u64()?;
@@ -685,6 +745,8 @@ fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, u64)> {
             table_id: c.u64()?,
             sort_id: c.u64()?,
         },
+        // Tag entries end via their own path (`apply_update_set_end`
+        // handles them before this decoder) — reaching here is a bug.
         TableKind::Snapshot
         | TableKind::SnapshotChanges
         | TableKind::SchemaVersions
@@ -693,7 +755,10 @@ fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, u64)> {
         | TableKind::FileColumnStats
         | TableKind::PartitionColumn
         | TableKind::FilePartitionValue
-        | TableKind::SortExpression => {
+        | TableKind::SortExpression
+        | TableKind::Tag
+        | TableKind::ColumnTag
+        | TableKind::FilesScheduledForDeletion => {
             return Err(Error::Constraint(format!(
                 "update_set_end is not defined for {table:?}"
             )));
@@ -742,13 +807,17 @@ fn apply_op(
     op: &RowOperation,
     new_id: u64,
     children: &mut ChildRows,
+    direct: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
     match op {
         RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells, children),
         RowOperation::UpdateSetEnd { table, cells } => {
             apply_update_set_end(state, *table, cells, new_id)
         }
-        RowOperation::Delete { table, cells } => apply_delete(state, *table, cells),
+        RowOperation::UpdateSetBegin { table, cells } => {
+            apply_update_set_begin(base, state, *table, cells, new_id)
+        }
+        RowOperation::Delete { table, cells } => apply_delete(state, *table, cells, direct),
         // Inline ops never reach here — `translate` routes them to
         // `translate_inline`. Kept only for match exhaustiveness.
         RowOperation::InlineSchema { .. }
@@ -796,7 +865,21 @@ fn apply_insert(
         TableKind::Schema => state.put_schema(decode_schema(cells)?),
         TableKind::Table => state.put_table(table_value(base, decode_table(cells)?)),
         TableKind::View => state.put_view(decode_view(cells)?),
-        TableKind::Column => state.put_column(decode_column(cells)?),
+        TableKind::Column => {
+            let mut value = decode_column(cells)?;
+            // Column tags outlive column versions (DuckLake keys them by
+            // (table_id, column_id) with their own lifecycle), so a new
+            // version carries the prior version's entries forward —
+            // DuckLake never re-authors tag rows on a column alter.
+            if let Some(prior) = base
+                .columns
+                .get(&value.table_id)
+                .and_then(|cols| cols.get(&value.column_id))
+            {
+                value.tags.clone_from(&prior.tags);
+            }
+            state.put_column(value);
+        }
         TableKind::DataFile => {
             let mut value = decode_data_file(cells)?;
             value.partition_values = children
@@ -827,8 +910,133 @@ fn apply_insert(
             state.put_table_column_stats(decode_table_column_stats(cells)?);
         }
         TableKind::FileColumnStats => state.put_file_column_stats(decode_file_column_stats(cells)?),
+        TableKind::FilesScheduledForDeletion => {
+            state.put_gc_file(decode_gc_file_row(cells)?);
+        }
+        TableKind::Tag => {
+            let (object_id, entry) = decode_tag_row(cells)?;
+            state
+                .tags
+                .entry(object_id)
+                .or_insert_with(|| proto::TagValue {
+                    object_id,
+                    entries: Vec::new(),
+                })
+                .entries
+                .push(entry);
+        }
+        TableKind::ColumnTag => {
+            let ((table_id, column_id), tag) = decode_column_tag_row(cells)?;
+            let Some(column) = state
+                .columns
+                .get_mut(&table_id)
+                .and_then(|cols| cols.get_mut(&column_id))
+            else {
+                return Err(corrupt_row(
+                    table,
+                    format!("column tag names an absent column ({table_id}, {column_id})"),
+                ));
+            };
+            column.tags.push(tag);
+        }
     }
     Ok(())
+}
+
+/// Ends the one live entry (`end_snapshot IS NULL`) for `key` in
+/// `entries`, in place. `false` means no live entry matched — the caller
+/// reports the shape error (DuckLake's UPDATE only names rows it read).
+fn end_live_entry<E>(
+    entries: &mut [E],
+    is_match: impl Fn(&E) -> bool,
+    set_end: impl Fn(&mut E),
+) -> bool {
+    for entry in entries.iter_mut() {
+        if is_match(entry) {
+            set_end(entry);
+            return true;
+        }
+    }
+    false
+}
+
+/// Rejects a set-end cell whose `end_snapshot` is not this commit's own
+/// snapshot id.
+fn check_end_snapshot(table: TableKind, end_snapshot: u64, new_id: u64) -> Result<()> {
+    if end_snapshot == new_id {
+        Ok(())
+    } else {
+        Err(corrupt_row(
+            table,
+            format!(
+                "end_snapshot {end_snapshot} does not match this commit's snapshot id {new_id}"
+            ),
+        ))
+    }
+}
+
+/// Ends a `ducklake_tag` row: the live entry named by `(object_id, key)`
+/// gets its `end_snapshot` set, in place — containers never move to
+/// history.
+fn apply_tag_set_end(state: &mut CatalogSnapshot, cells: &[Cell], new_id: u64) -> Result<()> {
+    let mut c = Cursor::new(TableKind::Tag, cells);
+    let object_id = c.u64()?;
+    let key = c.string()?;
+    let end_snapshot = c.u64()?;
+    c.finish()?;
+    check_end_snapshot(TableKind::Tag, end_snapshot, new_id)?;
+
+    let ended = state.tags.get_mut(&object_id).is_some_and(|container| {
+        end_live_entry(
+            &mut container.entries,
+            |e| e.key == key && e.end_snapshot.is_none(),
+            |e| e.end_snapshot = Some(new_id),
+        )
+    });
+    if ended {
+        Ok(())
+    } else {
+        Err(corrupt_row(
+            TableKind::Tag,
+            format!("no live tag entry ({object_id}, {key:?}) to end"),
+        ))
+    }
+}
+
+/// Ends a `ducklake_column_tag` row: the live entry named by
+/// `(table_id, column_id, key)` on the current column record.
+fn apply_column_tag_set_end(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    new_id: u64,
+) -> Result<()> {
+    let mut c = Cursor::new(TableKind::ColumnTag, cells);
+    let table_id = c.u64()?;
+    let column_id = c.u64()?;
+    let key = c.string()?;
+    let end_snapshot = c.u64()?;
+    c.finish()?;
+    check_end_snapshot(TableKind::ColumnTag, end_snapshot, new_id)?;
+
+    let ended = state
+        .columns
+        .get_mut(&table_id)
+        .and_then(|cols| cols.get_mut(&column_id))
+        .is_some_and(|column| {
+            end_live_entry(
+                &mut column.tags,
+                |t| t.key == key && t.end_snapshot.is_none(),
+                |t| t.end_snapshot = Some(new_id),
+            )
+        });
+    if ended {
+        Ok(())
+    } else {
+        Err(corrupt_row(
+            TableKind::ColumnTag,
+            format!("no live column tag ({table_id}, {column_id}, {key:?}) to end"),
+        ))
+    }
 }
 
 fn apply_update_set_end(
@@ -837,15 +1045,17 @@ fn apply_update_set_end(
     cells: &[Cell],
     new_id: u64,
 ) -> Result<()> {
-    let (key, end_snapshot) = decode_end(table, cells)?;
-    if end_snapshot != new_id {
-        return Err(corrupt_row(
-            table,
-            format!(
-                "end_snapshot {end_snapshot} does not match this commit's snapshot id {new_id}"
-            ),
-        ));
+    // Tag entries are embedded, not entity records of their own: ending
+    // one rewrites its container in place rather than moving a key to
+    // history.
+    match table {
+        TableKind::Tag => return apply_tag_set_end(state, cells, new_id),
+        TableKind::ColumnTag => return apply_column_tag_set_end(state, cells, new_id),
+        _ => {}
     }
+
+    let (key, end_snapshot) = decode_end(table, cells)?;
+    check_end_snapshot(table, end_snapshot, new_id)?;
     // End only the one row DuckLake named — never a cascade. DuckLake
     // authors every row change explicitly (a rename ends the table row but
     // keeps its columns live); the verb-path `delete_*` helpers would
@@ -909,7 +1119,293 @@ fn apply_update_set_end(
     Ok(())
 }
 
-fn apply_delete(state: &mut CatalogSnapshot, table: TableKind, cells: &[Cell]) -> Result<()> {
+/// Decodes a versioned kind's hard-delete row: the entity's key columns
+/// (decoder order) followed by the row's `end_snapshot` — `NULL` names
+/// the live `current` record, a value names that `history` record.
+fn decode_hard_delete(table: TableKind, cells: &[Cell]) -> Result<(EntityKey, Option<u64>)> {
+    let mut c = Cursor::new(table, cells);
+    let key = match table {
+        TableKind::Schema => EntityKey::Schema {
+            schema_id: c.u64()?,
+        },
+        TableKind::Table => EntityKey::Table { table_id: c.u64()? },
+        TableKind::View => EntityKey::View { view_id: c.u64()? },
+        TableKind::Column => EntityKey::Column {
+            table_id: c.u64()?,
+            column_id: c.u64()?,
+        },
+        TableKind::DataFile => EntityKey::File {
+            table_id: c.u64()?,
+            data_file_id: c.u64()?,
+        },
+        TableKind::DeleteFile => EntityKey::DeleteFile {
+            table_id: c.u64()?,
+            delete_file_id: c.u64()?,
+        },
+        TableKind::PartitionInfo => EntityKey::Partition {
+            table_id: c.u64()?,
+            partition_id: c.u64()?,
+        },
+        TableKind::SortInfo => EntityKey::Sort {
+            table_id: c.u64()?,
+            sort_id: c.u64()?,
+        },
+        // Callers dispatch every other kind before reaching here.
+        _ => return Err(corrupt_row(table, "not a versioned kind")),
+    };
+    let end_snapshot = c.opt_u64()?;
+    c.finish()?;
+    Ok((key, end_snapshot))
+}
+
+/// Rebases a data file's `begin_snapshot` in place. The target must have
+/// been inserted by this same transaction (absent from `base`): DuckLake
+/// only rebases the replacement file a delete-rewrite just created, and
+/// rebasing a pre-existing row would rewrite committed visibility.
+fn apply_update_set_begin(
+    base: &CatalogSnapshot,
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+    new_id: u64,
+) -> Result<()> {
+    if table != TableKind::DataFile {
+        return Err(Error::Constraint(format!(
+            "update_set_begin is not defined for {table:?}"
+        )));
+    }
+    let mut c = Cursor::new(table, cells);
+    let table_id = c.u64()?;
+    let data_file_id = c.u64()?;
+    let begin_snapshot = c.u64()?;
+    c.finish()?;
+    if begin_snapshot != new_id {
+        return Err(corrupt_row(
+            table,
+            format!(
+                "begin_snapshot {begin_snapshot} does not match this commit's snapshot id {new_id}"
+            ),
+        ));
+    }
+    if base
+        .data_files
+        .get(&table_id)
+        .is_some_and(|files| files.contains_key(&data_file_id))
+    {
+        return Err(corrupt_row(
+            table,
+            format!("file ({table_id}, {data_file_id}) predates this commit and cannot be rebased"),
+        ));
+    }
+
+    let Some(file) = state
+        .data_files
+        .get_mut(&table_id)
+        .and_then(|files| files.get_mut(&data_file_id))
+    else {
+        return Err(corrupt_row(
+            table,
+            format!("no data file ({table_id}, {data_file_id}) to rebase"),
+        ));
+    };
+    file.begin_snapshot = begin_snapshot;
+    Ok(())
+}
+
+/// A raw `DELETE` row. Three shapes share the op: unversioned records
+/// (statistics, the deletion schedule) leave the working state and their
+/// removal reaches the store through the diff; versioned rows and
+/// snapshot records are pruned with direct key deletes (`history` keys
+/// exist only in the store, never in the working state); embedded rows
+/// (tag entries, spec columns) rewrite or ride their parent.
+fn apply_delete(
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+    direct: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    match table {
+        TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
+            apply_stats_delete(state, table, cells)
+        }
+        TableKind::FilesScheduledForDeletion => {
+            let mut c = Cursor::new(table, cells);
+            let data_file_id = c.u64()?;
+            c.finish()?;
+            if state.gc_files.remove(&data_file_id).is_none() {
+                return Err(corrupt_row(
+                    table,
+                    format!("no scheduled deletion for file {data_file_id}"),
+                ));
+            }
+            Ok(())
+        }
+        // The merged snapshot record dies with the `ducklake_snapshot`
+        // delete; the paired `ducklake_snapshot_changes` delete names the
+        // same id and stages nothing.
+        TableKind::Snapshot => {
+            let mut c = Cursor::new(table, cells);
+            let snapshot_id = c.u64()?;
+            c.finish()?;
+            if snapshot_id == state.snapshot.snapshot_id {
+                return Err(Error::Constraint(format!(
+                    "snapshot {snapshot_id} is the head and cannot be expired"
+                )));
+            }
+            direct.push((Key::Snapshot { snapshot_id }.encode(), None));
+            Ok(())
+        }
+        TableKind::SnapshotChanges => {
+            let mut c = Cursor::new(table, cells);
+            let _snapshot_id = c.u64()?;
+            c.finish()?;
+            Ok(())
+        }
+        TableKind::Schema
+        | TableKind::Table
+        | TableKind::View
+        | TableKind::Column
+        | TableKind::DataFile
+        | TableKind::DeleteFile
+        | TableKind::PartitionInfo
+        | TableKind::SortInfo => {
+            let (entity, end_snapshot) = decode_hard_delete(table, cells)?;
+            let key = match end_snapshot {
+                Some(end) => Key::history(entity, end),
+                None => Key::current(entity),
+            };
+            // The direct delete is the whole store mutation. The working
+            // state is deliberately left alone: removing a live row from
+            // it would make the diff stage an end-transition — minting a
+            // history mirror DuckLake never authored — on top of this
+            // delete. The cascade never re-touches a row it deleted, so
+            // the stale working-state entry is unread.
+            direct.push((key.encode(), None));
+            Ok(())
+        }
+        TableKind::Tag => apply_tag_delete(state, cells),
+        // Embedded rows ride their parent: the cascade deletes them only
+        // alongside the parent record (a dead table's columns, a dead
+        // file's partition values), so with the parent already pruned
+        // there is nothing left to rewrite. A column-tag entry on a
+        // still-current column is the one live case (its column survives
+        // the entry's death) and rewrites the column in place.
+        TableKind::ColumnTag => {
+            let mut c = Cursor::new(table, cells);
+            let table_id = c.u64()?;
+            let column_id = c.u64()?;
+            let key = c.string()?;
+            let begin_snapshot = c.u64()?;
+            c.finish()?;
+            if let Some(column) = state
+                .columns
+                .get_mut(&table_id)
+                .and_then(|cols| cols.get_mut(&column_id))
+            {
+                column
+                    .tags
+                    .retain(|t| !(t.key == key && t.begin_snapshot == begin_snapshot));
+            }
+            Ok(())
+        }
+        TableKind::PartitionColumn | TableKind::SortExpression | TableKind::FilePartitionValue => {
+            apply_embedded_delete(state, table, cells)
+        }
+        TableKind::SchemaVersions => {
+            // Schema-version rows fold into snapshot records; the rows a
+            // dead-table cleanup deletes are visible only through
+            // snapshots the same transaction deletes, so there is nothing
+            // separate to remove.
+            let mut c = Cursor::new(table, cells);
+            let _begin_snapshot = c.u64()?;
+            let _schema_version = c.u64()?;
+            let _table_id = c.u64()?;
+            c.finish()?;
+            Ok(())
+        }
+    }
+}
+
+/// Removes a dead `ducklake_tag` entry from its container; a container
+/// left empty is removed outright (the key must not linger).
+fn apply_tag_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+    let mut c = Cursor::new(TableKind::Tag, cells);
+    let object_id = c.u64()?;
+    let key = c.string()?;
+    let begin_snapshot = c.u64()?;
+    c.finish()?;
+
+    let removed = state.tags.get_mut(&object_id).is_some_and(|container| {
+        let before = container.entries.len();
+        container
+            .entries
+            .retain(|e| !(e.key == key && e.begin_snapshot == begin_snapshot));
+        container.entries.len() < before
+    });
+    if !removed {
+        return Err(corrupt_row(
+            TableKind::Tag,
+            format!("no tag entry ({object_id}, {key:?}, {begin_snapshot}) to delete"),
+        ));
+    }
+    if state
+        .tags
+        .get(&object_id)
+        .is_some_and(|container| container.entries.is_empty())
+    {
+        state.tags.remove(&object_id);
+    }
+    Ok(())
+}
+
+/// A spec-column / partition-value delete: only ever issued alongside its
+/// parent record's own deletion, so a still-current parent means the
+/// cascade named a row this model says cannot die alone.
+fn apply_embedded_delete(
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+) -> Result<()> {
+    let mut c = Cursor::new(table, cells);
+    let parent_is_current = match table {
+        TableKind::PartitionColumn => {
+            let partition_id = c.u64()?;
+            let table_id = c.u64()?;
+            state
+                .partitions
+                .get(&table_id)
+                .is_some_and(|specs| specs.contains_key(&partition_id))
+        }
+        TableKind::SortExpression => {
+            let sort_id = c.u64()?;
+            let table_id = c.u64()?;
+            state
+                .sorts
+                .get(&table_id)
+                .is_some_and(|specs| specs.contains_key(&sort_id))
+        }
+        TableKind::FilePartitionValue => {
+            let data_file_id = c.u64()?;
+            let table_id = c.u64()?;
+            state
+                .data_files
+                .get(&table_id)
+                .is_some_and(|files| files.contains_key(&data_file_id))
+        }
+        _ => return Err(corrupt_row(table, "not an embedded kind")),
+    };
+    // Remaining identity cells vary by kind and are not needed: the row
+    // dies with its parent.
+    if parent_is_current {
+        return Err(corrupt_row(
+            table,
+            "embedded row deleted while its parent record is still live",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_stats_delete(state: &mut CatalogSnapshot, table: TableKind, cells: &[Cell]) -> Result<()> {
     match decode_delete_key(table, cells)? {
         StatsKey::Table(table_id) => {
             state.table_stats.remove(&table_id);
@@ -951,10 +1447,7 @@ fn find_snapshot_rows(ops: &[RowOperation]) -> Result<(&[Cell], &[Cell])> {
     Ok((snapshot, changes))
 }
 
-fn build_snapshot_value(
-    ops: &[RowOperation],
-    next_deletion_id: u64,
-) -> Result<proto::SnapshotValue> {
+fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::SnapshotValue> {
     let (snapshot_cells, changes_cells) = find_snapshot_rows(ops)?;
 
     let mut s = Cursor::new(TableKind::Snapshot, snapshot_cells);
@@ -1019,7 +1512,6 @@ fn build_snapshot_value(
         schema_version,
         next_catalog_id,
         next_file_id,
-        next_deletion_id,
         changes_made,
         author,
         commit_message,
@@ -1060,16 +1552,54 @@ impl StagedTransaction {
         self.db_tx.rollback();
     }
 
+    /// Snapshot records as this transaction sees them: the committed
+    /// rows at its read point, minus the snapshot deletes staged so far.
+    /// The expiry cascade re-reads `ducklake_snapshot` after staging its
+    /// deletes (its dead-row rule is `NOT EXISTS` over the survivors), so
+    /// the projection must observe the transaction's own writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged snapshot-delete row
+    /// is malformed.
+    pub async fn visible_snapshots(&self) -> Result<Vec<proto::SnapshotValue>> {
+        let committed = read::scan_snapshots(ReadHandle::Tx(&self.db_tx)).await?;
+
+        let mut deleted = std::collections::BTreeSet::new();
+        for op in &self.ops {
+            if let RowOperation::Delete {
+                table: TableKind::Snapshot,
+                cells,
+            } = op
+            {
+                let mut c = Cursor::new(TableKind::Snapshot, cells);
+                deleted.insert(c.u64()?);
+                c.finish()?;
+            }
+        }
+
+        Ok(committed
+            .into_iter()
+            .filter(|s| !deleted.contains(&s.snapshot_id))
+            .collect())
+    }
+
     /// Translates every staged row and lands them in one atomic batch.
+    ///
+    /// A commit with a `ducklake_snapshot` insert mints that snapshot and
+    /// advances head. A commit **without** one is a maintenance commit —
+    /// snapshot expiry / file cleanup, which DuckLake runs without
+    /// minting a snapshot — and lands head-preserving: reclamation
+    /// deletes only, no new snapshot record, `sys/head` untouched.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Constraint`] or [`Error::Corruption`] if the
-    /// staged rows are malformed or omit the required `ducklake_snapshot`
-    /// / `ducklake_snapshot_changes` pair. Returns
-    /// [`Error::CommitConflict`] — **never retried internally** — if a
-    /// concurrent commit advanced the head first; the store is left
-    /// unchanged by the loser.
+    /// staged rows are malformed, mutate entities without the required
+    /// `ducklake_snapshot` / `ducklake_snapshot_changes` pair, or expire
+    /// the head snapshot. Returns [`Error::CommitConflict`] — **never
+    /// retried internally** — if a concurrent commit advanced the head
+    /// first; the store is left unchanged by the loser.
     pub async fn commit(self) -> Result<SnapshotId> {
         let Self { db_tx, ops } = self;
 
@@ -1092,9 +1622,18 @@ impl StagedTransaction {
             }
         };
 
-        match translate(&base, &ops) {
-            Ok((new_id, mut writes, snap)) => {
-                writes.extend(inline_writes);
+        let mints_snapshot = ops.iter().any(|op| {
+            matches!(
+                op,
+                RowOperation::Insert {
+                    table: TableKind::Snapshot,
+                    ..
+                }
+            )
+        });
+
+        let translated = if mints_snapshot {
+            translate(&base, &ops).map(|(new_id, mut writes, snap)| {
                 writes.push((
                     Key::Snapshot {
                         snapshot_id: new_id,
@@ -1108,16 +1647,26 @@ impl StagedTransaction {
                         snapshot_id: new_id,
                     })),
                 ));
+                (new_id, writes)
+            })
+        } else {
+            translate_maintenance(&base, &ops).map(|writes| (base.snapshot.snapshot_id, writes))
+        };
+
+        match translated {
+            Ok((result_id, mut writes)) => {
+                writes.extend(inline_writes);
                 if let Err(err) = commit::stage_writes(&db_tx, writes) {
                     db_tx.rollback();
                     return Err(err);
                 }
                 match db_tx.commit_with_options(&commit::durable()).await {
-                    Ok(_) => Ok(SnapshotId::new(new_id)),
+                    Ok(_) => Ok(SnapshotId::new(result_id)),
                     Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
                         Err(Error::CommitConflict(format!(
-                            "concurrent commit advanced the head past snapshot {new_id}; \
-                             staged-row commits are never retried internally"
+                            "a concurrent commit changed state this one read or wrote \
+                             (attempted snapshot {result_id}); staged-row commits are never \
+                             retried internally"
                         )))
                     }
                     Err(err) => Err(err.into()),
@@ -1137,26 +1686,38 @@ fn translate(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
 ) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
-    let snapshot = build_snapshot_value(ops, base.snapshot.next_deletion_id)?;
+    let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
 
     // Ends and deletes apply before inserts, independent of DuckLake's
     // emit order: a rename ends the old version and inserts a new one
     // under the same id, and the insert must win their shared `current` key —
     // an end applied afterward would delete the id and erase the new row.
-    // Inline ops are skipped here entirely — `commit` translates them
-    // separately via `translate_inline`, since `CatalogSnapshot` has no
-    // notion of inlined rows to diff.
+    // Begin-rebases apply last: their target is the row an insert in this
+    // same commit created. Inline ops are skipped here entirely —
+    // `commit` translates them separately via `translate_inline`, since
+    // `CatalogSnapshot` has no notion of inlined rows to diff.
     let mut state = base.clone();
     let mut children = collect_child_rows(ops)?;
+    let mut direct = Vec::new();
     for op in ops {
-        if !is_inline_op(op) && !matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children)?;
+        if !is_inline_op(op)
+            && !matches!(
+                op,
+                RowOperation::Insert { .. } | RowOperation::UpdateSetBegin { .. }
+            )
+        {
+            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
         }
     }
     for op in ops {
         if matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children)?;
+            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
+        }
+    }
+    for op in ops {
+        if matches!(op, RowOperation::UpdateSetBegin { .. }) {
+            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
         }
     }
 
@@ -1193,8 +1754,49 @@ fn translate(
         }
     }
 
-    let writes = commit::diff_writes(base, &state, new_id);
+    let mut writes = commit::diff_writes(base, &state, new_id);
+    writes.extend(direct);
     Ok((new_id, writes, snapshot))
+}
+
+/// Translates a head-preserving maintenance commit: snapshot expiry and
+/// file cleanup arrive with no `ducklake_snapshot` insert (DuckLake mints
+/// no snapshot for them), so nothing advances head and no snapshot record
+/// is written. Only reclamation-shaped operations are legal — raw
+/// deletes, schedule inserts, and the inline drops a dead table's cleanup
+/// issues; any entity insert or lifecycle update without a snapshot row
+/// is a constraint violation (DuckLake always mints a snapshot for real
+/// catalog changes).
+fn translate_maintenance(
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+) -> Result<Vec<commit::StagedWrite>> {
+    let head = base.snapshot.snapshot_id;
+
+    let mut state = base.clone();
+    let mut children = ChildRows::default();
+    let mut direct = Vec::new();
+    for op in ops {
+        let allowed = matches!(
+            op,
+            RowOperation::Delete { .. }
+                | RowOperation::Insert {
+                    table: TableKind::FilesScheduledForDeletion,
+                    ..
+                }
+        ) || is_inline_op(op);
+        if !allowed {
+            return Err(Error::Constraint(
+                "a staged commit without a ducklake_snapshot insert may only reclaim state                  (maintenance deletes and deletion-schedule inserts)"
+                    .to_string(),
+            ));
+        }
+        apply_op(base, &mut state, op, head, &mut children, &mut direct)?;
+    }
+
+    let mut writes = commit::diff_writes(base, &state, head);
+    writes.extend(direct);
+    Ok(writes)
 }
 
 /// Allocates `inline/insert` chunk sequence numbers within one commit: the
@@ -1493,7 +2095,8 @@ async fn translate_inline(
             }
             RowOperation::Insert { .. }
             | RowOperation::Delete { .. }
-            | RowOperation::UpdateSetEnd { .. } => {}
+            | RowOperation::UpdateSetEnd { .. }
+            | RowOperation::UpdateSetBegin { .. } => {}
         }
     }
 
@@ -2691,6 +3294,662 @@ mod tests {
         });
         let err = tx.commit().await.unwrap_err();
         assert!(err.to_string().contains("partition"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    fn tag_row(object_id: u64, begin: u64, key: &str, value: &str) -> Vec<Cell> {
+        vec![
+            Cell::U64(object_id),
+            Cell::U64(begin),
+            Cell::Null,
+            Cell::Str(key.to_string()),
+            Cell::Str(value.to_string()),
+        ]
+    }
+
+    fn column_tag_row(
+        table_id: u64,
+        column_id: u64,
+        begin: u64,
+        key: &str,
+        value: &str,
+    ) -> Vec<Cell> {
+        vec![
+            Cell::U64(table_id),
+            Cell::U64(column_id),
+            Cell::U64(begin),
+            Cell::Null,
+            Cell::Str(key.to_string()),
+            Cell::Str(value.to_string()),
+        ]
+    }
+
+    async fn seed_table(catalog: &Catalog) {
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "a", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+    }
+
+    /// A re-comment (`COMMENT ON` twice) is DuckLake's set-end + insert
+    /// pair: the old entry ends, the new one lands live, both kept in the
+    /// object's container for time travel.
+    #[tokio::test]
+    async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
+        let catalog = open().await;
+        seed_table(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Tag,
+            cells: tag_row(1, 2, "comment", "first"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "altered_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Tag,
+            cells: vec![Cell::U64(1), Cell::Str("comment".into()), Cell::U64(3)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Tag,
+            cells: tag_row(1, 3, "comment", "second"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(3, "altered_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let tags = head.tags_of(1);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            (tags[0].value.as_str(), tags[0].end_snapshot),
+            ("first", Some(3))
+        );
+        assert_eq!(
+            (tags[1].value.as_str(), tags[1].end_snapshot),
+            ("second", None)
+        );
+        catalog.close().await.unwrap();
+    }
+
+    /// A column tag rides its column's record without minting a column
+    /// version: after tagging, the column still has exactly one row on
+    /// the dump surface, and the tag ends in place on a re-comment.
+    #[tokio::test]
+    async fn column_tags_ride_the_column_record_without_a_version_transition() {
+        let catalog = open().await;
+        seed_table(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::ColumnTag,
+            cells: column_tag_row(1, 1, 2, "comment", "col comment"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "altered_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let columns = crate::ffi_support::dump_columns(&catalog).await.unwrap();
+        let rows: Vec<_> = columns.iter().filter(|c| c.column_id == 1).collect();
+        assert_eq!(rows.len(), 1, "a tag change must not mint a column version");
+        assert_eq!(rows[0].begin_snapshot, 0);
+        assert!(rows[0].end_snapshot.is_none());
+        assert_eq!(rows[0].tags.len(), 1);
+        assert_eq!(rows[0].tags[0].value, "col comment");
+        catalog.close().await.unwrap();
+    }
+
+    /// A column version transition (rename) carries the prior version's
+    /// tag entries onto the new current record — DuckLake keys column
+    /// tags by (table, column) with their own lifecycle, so an alter
+    /// never re-authors them.
+    #[tokio::test]
+    async fn column_alter_carries_tags_forward() {
+        let catalog = open().await;
+        seed_table(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::ColumnTag,
+            cells: column_tag_row(1, 1, 2, "comment", "kept"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "altered_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        // Rename the column: end the old version, insert the new one.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Column,
+            cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(3)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: {
+                let mut cells = column_row(1, 1, "renamed", 0);
+                cells[1] = Cell::U64(3); // begin_snapshot
+                cells
+            },
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3, 2, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(3, "altered_table:1"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SchemaVersions,
+            cells: vec![Cell::U64(3), Cell::U64(2), Cell::U64(1)],
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let column = &head.columns[&1][&1];
+        assert_eq!(column.column_name, "renamed");
+        assert_eq!(column.tags.len(), 1);
+        assert_eq!(column.tags[0].value, "kept");
+        catalog.close().await.unwrap();
+    }
+
+    /// Seeds `t` (table 1) with data file 9 (snapshot 1), then expires the
+    /// file's live version at snapshot 2 — leaving one dead history row,
+    /// the fixture the expiry tests prune.
+    async fn seed_expired_file(catalog: &Catalog) {
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "a", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(9, 1, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(9), Cell::U64(2)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "deleted_from_table:1"),
+        });
+        tx.commit().await.unwrap();
+    }
+
+    /// The expiry cascade's staged shape: delete a dead snapshot, prune
+    /// the history row it alone saw, and schedule the file's bytes — all
+    /// in one head-preserving maintenance commit.
+    #[tokio::test]
+    async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
+        let catalog = open().await;
+        seed_expired_file(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Delete {
+            table: TableKind::Snapshot,
+            cells: vec![Cell::U64(1)],
+        });
+        tx.stage(RowOperation::Delete {
+            table: TableKind::SnapshotChanges,
+            cells: vec![Cell::U64(1)],
+        });
+        tx.stage(RowOperation::Delete {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(9), Cell::U64(2)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilesScheduledForDeletion,
+            cells: vec![
+                Cell::U64(9),
+                Cell::Str("f9.parquet".to_string()),
+                Cell::Bool(true),
+                Cell::I64(1_000),
+            ],
+        });
+        let id = tx.commit().await.unwrap();
+        assert_eq!(id.get(), 2, "maintenance must not advance head");
+
+        let head = catalog.snapshot().await.unwrap();
+        assert_eq!(head.current_snapshot().id.get(), 2);
+        let schedule = head.scheduled_deletions();
+        assert_eq!(schedule.len(), 1);
+        assert_eq!(schedule[0].data_file_id, 9);
+        assert_eq!(schedule[0].path, "f9.parquet");
+
+        // The dead snapshot no longer resolves; the survivor does, and
+        // the pruned history row is gone from the dump surface.
+        let expired = catalog
+            .snapshot_at(crate::catalog::SnapshotId::new(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(expired, Error::NotFound(_)), "{expired}");
+        let surviving = catalog
+            .snapshot_at(crate::catalog::SnapshotId::new(2))
+            .await
+            .unwrap();
+        assert!(
+            surviving
+                .data_files_of(crate::catalog::TableId::new(1))
+                .is_empty()
+        );
+        let files = crate::ffi_support::dump_data_files(&catalog).await.unwrap();
+        assert!(files.is_empty(), "history row must be pruned: {files:?}");
+
+        catalog.close().await.unwrap();
+    }
+
+    /// Cleanup's staged shape: after DuckDB deletes the bytes, the
+    /// schedule row is forgotten in a head-preserving commit.
+    #[tokio::test]
+    async fn cleanup_forgets_the_schedule() {
+        let catalog = open().await;
+        seed_expired_file(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilesScheduledForDeletion,
+            cells: vec![
+                Cell::U64(9),
+                Cell::Str("f9.parquet".to_string()),
+                Cell::Bool(true),
+                Cell::I64(1_000),
+            ],
+        });
+        tx.commit().await.unwrap();
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Delete {
+            table: TableKind::FilesScheduledForDeletion,
+            cells: vec![Cell::U64(9)],
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        assert!(head.scheduled_deletions().is_empty());
+        assert_eq!(head.current_snapshot().id.get(), 2);
+        catalog.close().await.unwrap();
+    }
+
+    /// The head snapshot can never be expired.
+    #[tokio::test]
+    async fn deleting_the_head_snapshot_is_rejected() {
+        let catalog = open().await;
+        seed_expired_file(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Delete {
+            table: TableKind::Snapshot,
+            cells: vec![Cell::U64(2)],
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    /// A commit that mutates entities without minting a snapshot is not a
+    /// maintenance commit — it is a malformed write.
+    #[tokio::test]
+    async fn maintenance_commit_rejects_entity_inserts() {
+        let catalog = open().await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    /// A merge-shaped compaction commit: the merged file lands backdated,
+    /// the source rows (current and history alike) are hard-deleted, the
+    /// source bytes are scheduled, and `next_row_id` is untouched — all
+    /// in one ordinary snapshot-minting commit.
+    #[tokio::test]
+    async fn merge_shaped_commit_replaces_files_and_schedules_sources() {
+        let catalog = open().await;
+
+        // Seed: table 1 with files 9 and 10, both live.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "a", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(9, 1, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(10, 1, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::TableStats,
+            cells: vec![Cell::U64(1), Cell::U64(20), Cell::U64(20), Cell::U64(2048)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        // The merge: insert file 11 backdated to the sources' begin,
+        // hard-delete both sources, schedule their bytes.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(11, 1, 1),
+        });
+        tx.stage(RowOperation::Delete {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(9), Cell::Null],
+        });
+        tx.stage(RowOperation::Delete {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(10), Cell::Null],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilesScheduledForDeletion,
+            cells: vec![
+                Cell::U64(9),
+                Cell::Str("data.parquet".to_string()),
+                Cell::Bool(true),
+                Cell::I64(1_000),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilesScheduledForDeletion,
+            cells: vec![
+                Cell::U64(10),
+                Cell::Str("data.parquet".to_string()),
+                Cell::Bool(true),
+                Cell::I64(1_000),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "merge_adjacent:1"),
+        });
+        let id = tx.commit().await.unwrap();
+        assert_eq!(id.get(), 2, "compaction mints an ordinary snapshot");
+
+        let head = catalog.snapshot().await.unwrap();
+        let files = head.data_files_of(crate::catalog::TableId::new(1));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id.get(), 11);
+        assert_eq!(
+            head.scheduled_deletions()
+                .iter()
+                .map(|d| d.data_file_id)
+                .collect::<Vec<_>>(),
+            vec![9, 10]
+        );
+        assert_eq!(
+            head.table_stats(crate::catalog::TableId::new(1))
+                .unwrap()
+                .next_row_id,
+            20,
+            "compaction never allocates row ids"
+        );
+
+        // The sources are gone outright — no history mirror.
+        let rows = crate::ffi_support::dump_data_files(&catalog).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].data_file_id, 11);
+        assert_eq!(rows[0].begin_snapshot, 1, "the merged file is backdated");
+        catalog.close().await.unwrap();
+    }
+
+    /// A rewrite-shaped commit ends the source file and its delete file
+    /// into history and rebases the replacement's `begin_snapshot` in
+    /// place; nothing is scheduled.
+    #[tokio::test]
+    async fn rewrite_shaped_commit_ends_rows_and_rebases_the_new_file() {
+        let catalog = open().await;
+        seed_expired_file(&catalog).await; // file 9 ended at snapshot 2
+
+        // Re-seed a live file 10 with a delete file 11 over it.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(10, 1, 3),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DeleteFile,
+            cells: vec![
+                Cell::U64(11),
+                Cell::U64(1),
+                Cell::U64(3),
+                Cell::Null,
+                Cell::U64(10),
+                Cell::Str("delete.parquet".to_string()),
+                Cell::Bool(true),
+                Cell::Str("parquet".to_string()),
+                Cell::U64(2),
+                Cell::U64(128),
+                Cell::U64(32),
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(3, "inserted_into_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        // The rewrite: new file 12, end file 10 and delete file 11,
+        // rebase 12's begin to this commit's snapshot.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(12, 1, 4),
+        });
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(4)],
+        });
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::DeleteFile,
+            cells: vec![Cell::U64(1), Cell::U64(11), Cell::U64(4)],
+        });
+        tx.stage(RowOperation::UpdateSetBegin {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(12), Cell::U64(4)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(4, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(4, "rewrite_delete:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let files = head.data_files_of(crate::catalog::TableId::new(1));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id.get(), 12);
+        assert!(
+            head.delete_files_of(crate::catalog::TableId::new(1))
+                .is_empty()
+        );
+        assert!(head.scheduled_deletions().is_empty());
+
+        // The ended rows survive in history; the replacement is rebased.
+        let rows = crate::ffi_support::dump_data_files(&catalog).await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|f| f.data_file_id == 10 && f.end_snapshot == Some(4))
+        );
+        assert!(
+            rows.iter()
+                .any(|f| f.data_file_id == 12 && f.begin_snapshot == 4 && f.end_snapshot.is_none())
+        );
+        catalog.close().await.unwrap();
+    }
+
+    /// Rebasing a file that predates the commit is a shape error —
+    /// DuckLake only rebases the replacement it just inserted.
+    #[tokio::test]
+    async fn set_begin_on_a_preexisting_file_is_rejected() {
+        let catalog = open().await;
+        seed_expired_file(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(10, 1, 3),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(3, "inserted_into_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetBegin {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(4)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(4, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(4, "rewrite_delete:1"),
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(err.to_string().contains("predates this commit"), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    /// Ending a tag entry that does not exist is a shape error — DuckLake
+    /// only updates rows it just read, so a miss means drift.
+    #[tokio::test]
+    async fn ending_an_absent_tag_entry_is_rejected() {
+        let catalog = open().await;
+        seed_table(&catalog).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Tag,
+            cells: vec![Cell::U64(1), Cell::Str("comment".into()), Cell::U64(2)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "altered_table:1"),
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(err.to_string().contains("tag"), "{err}");
         catalog.close().await.unwrap();
     }
 }

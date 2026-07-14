@@ -1020,6 +1020,8 @@ mod tests {
             "moraine_inline_registered_tables",
             "moraine_inline_registered_tables_free",
             "moraine_inline_file_delete_table_exists",
+            "moraine_inline_file_deletes",
+            "moraine_inline_file_deletes_free",
             "MoraineInlineRow",
             "MoraineInlineSchemaRow",
             "MoraineInlineTableRow",

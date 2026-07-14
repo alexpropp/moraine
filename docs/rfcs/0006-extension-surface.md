@@ -476,19 +476,30 @@ records — see RFC 0005 for the exact wire shape and the encoding
 deviation from that RFC's Arrow-IPC design.
 
 `ducklake_flush_inlined_data` and DuckLake's compaction/rewrite cleanup
-paths also touch several fixed `ducklake_*` tables this shim did not
-previously need to serve, even though moraine models none of the
-features they back (partitioning, variant-column stats, name/column
-mapping, scheduled file deletion): `ducklake_file_partition_value`,
-`ducklake_file_variant_stats`, `ducklake_files_scheduled_for_deletion`,
-`ducklake_column_mapping`, `ducklake_name_mapping`. These are served as
-always-empty stand-ins (`metadata_tables.cpp`, same pattern as
-`ducklake_partition_info`/`ducklake_sort_info`/the macro tables) purely
-so DuckLake's generic cleanup `DELETE`/`INSERT` batch — issued
-unconditionally as part of a commit that removes or supersedes data
-files, not gated on any of these features actually being in use — binds
-against an existing table instead of failing the whole commit with a
-"table could not be found" error.
+paths also touch fixed `ducklake_*` tables beyond the entity
+projections. `ducklake_files_scheduled_for_deletion` is served for real
+(the `current/gcfile` schedule, written by expiry/compaction and drained
+by `ducklake_cleanup_old_files`). The tables of still-unmodeled features
+(variant-column stats, name/column mapping, macros) remain always-empty
+stand-ins (`metadata_tables.cpp`) purely so DuckLake's generic cleanup
+`DELETE`/`INSERT` batch — issued unconditionally as part of a commit
+that removes or supersedes data files, not gated on any of these
+features actually being in use — binds against an existing table instead
+of failing the whole commit with a "table could not be found" error.
+Raw `DELETE`s against tables with no delete translation plan as
+void-deletes that throw if a row ever actually matches.
+
+Two obligations of DuckLake's maintenance functions land here rather
+than in the core. **Read-your-writes on the snapshot projection:**
+`ducklake_expire_snapshots` stages its snapshot deletes and then
+re-reads `ducklake_snapshot` in the same transaction (its dead-row rule
+is `NOT EXISTS` over the survivors), so a scan of the snapshot tables
+inside a write transaction with an open staged tx serves the
+transaction's own view (`moraine_tx_dump_snapshots`), not committed
+state. **Head-preserving maintenance commits:** an expiry or cleanup
+transaction inserts no `ducklake_snapshot` row; the staged path commits
+it as reclamation-only, minting no snapshot and leaving `sys/head`
+untouched (RFC 0007).
 
 ### Standalone data-scan retirement
 

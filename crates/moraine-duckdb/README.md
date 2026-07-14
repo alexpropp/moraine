@@ -646,7 +646,15 @@ this table is a human-readable mirror of it.
 | `ducklake_metadata` | synthesized in C++, no ABI call | see below |
 | `ducklake_schema_versions` | `moraine_dump_schema_versions` (`ProvideSchemaVersions`) | one row per `(table_id, schema_version)` transition |
 | `ducklake_inlined_data_tables` | `moraine_inline_registered_tables` (`ProvideInlinedDataTables`) | every `(table_id, schema_version)` with a recorded `inline/schema`; see "Data inlining" below — writable only as a no-op (`kVoidInsertable`), since `CreateInlineDataTable` already stages the registration this table's own `INSERT` would double-register |
-| `ducklake_tag`, `ducklake_column_tag`, `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_partition_info`, `ducklake_partition_column`, `ducklake_sort_info`, `ducklake_sort_expression`, `ducklake_file_partition_value`, `ducklake_file_variant_stats`, `ducklake_files_scheduled_for_deletion`, `ducklake_column_mapping`, `ducklake_name_mapping` | always empty | store models none of these kinds this slice — see "Discovered: absence isn't tolerated" below. The last five were added once `ducklake_flush_inlined_data`'s generic cleanup batch (`DELETE FROM`/`INSERT INTO` unconditionally, not gated on partitioning/variant-stats/mapping actually being in use) proved they must at least exist — see "Data inlining" below |
+| `ducklake_partition_info` | `moraine_dump_partition_info` | current + history rows; partition columns embed in the spec's record |
+| `ducklake_partition_column` | `moraine_dump_partition_columns` | flattened from the spec records' embedded columns |
+| `ducklake_file_partition_value` | `moraine_dump_file_partition_values` | flattened from the data-file records' embedded values |
+| `ducklake_sort_info` | `moraine_dump_sort_info` | current + history rows; expressions embed in the spec's record |
+| `ducklake_sort_expression` | `moraine_dump_sort_expressions` | flattened from the spec records' embedded expressions |
+| `ducklake_tag` | `moraine_dump_tags` | one row per embedded entry of the object's container record, ended entries included (each carries its own begin/end) |
+| `ducklake_column_tag` | `moraine_dump_column_tags` | flattened from each column's latest record — a column version transition carries entries forward, so only that record's set is emitted |
+| `ducklake_files_scheduled_for_deletion` | `moraine_dump_scheduled_deletions` | the physical-deletion schedule (`current/gcfile`, keyed by the scheduled file's id); written by expiry/compaction, drained by `ducklake_cleanup_old_files` |
+| `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_file_variant_stats`, `ducklake_column_mapping`, `ducklake_name_mapping` | always empty | store models none of these kinds this slice — see "Discovered: absence isn't tolerated" below. The last three were added once `ducklake_flush_inlined_data`'s generic cleanup batch (`DELETE FROM`/`INSERT INTO` unconditionally, not gated on variant-stats/mapping actually being in use) proved they must at least exist — see "Data inlining" below |
 
 Every table DuckLake's own schema defines is served, either with real data
 or as an always-empty stand-in; none are left unbound.

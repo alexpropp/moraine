@@ -6,14 +6,14 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
-        OptionScope, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
-        TableStats, ViewId, ViewInfo,
+        OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId,
+        TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
     },
     store::{
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, OptionScopeValue,
-            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
-            TableStatsValue, TableValue, ViewValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
+            OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
+            TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         read::EntityRecord,
     },
@@ -42,6 +42,8 @@ pub struct CatalogSnapshot {
     pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
     pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
     pub(crate) options: BTreeMap<(u64, u64), OptionScopeValue>,
+    pub(crate) tags: BTreeMap<u64, TagValue>,
+    pub(crate) gc_files: BTreeMap<u64, GcFileValue>,
 }
 
 impl CatalogSnapshot {
@@ -106,6 +108,16 @@ impl CatalogSnapshot {
                     value,
                 } => {
                     view.set_option_record((scope_kind, scope_id), value);
+                }
+                // Tag containers are unversioned; their embedded entries
+                // carry begin/end individually and are filtered at read.
+                EntityRecord::Tag(t) => {
+                    view.put_tag(t);
+                }
+                // Deletion-schedule rows are live bookkeeping with no
+                // temporal lifecycle.
+                EntityRecord::GcFile(g) => {
+                    view.put_gc_file(g);
                 }
                 EntityRecord::Schema(_)
                 | EntityRecord::Table(_)
@@ -248,6 +260,50 @@ impl CatalogSnapshot {
                 .get(&c)
                 .and_then(|v| v.options.get(key).cloned())
         })
+    }
+
+    /// Every tag row on `object_id` (a schema/table/view id), ended
+    /// entries included — each entry carries its own begin/end, so
+    /// callers filter by lifecycle where it matters.
+    #[must_use]
+    pub fn tags_of(&self, object_id: u64) -> Vec<TagEntry> {
+        self.tags
+            .get(&object_id)
+            .map(|container| {
+                container
+                    .entries
+                    .iter()
+                    .map(|e| TagEntry {
+                        begin_snapshot: e.begin_snapshot,
+                        end_snapshot: e.end_snapshot,
+                        key: e.key.clone(),
+                        value: e.value.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn put_tag(&mut self, value: TagValue) {
+        self.tags.insert(value.object_id, value);
+    }
+
+    /// Files scheduled for physical deletion, ascending by file id.
+    #[must_use]
+    pub fn scheduled_deletions(&self) -> Vec<ScheduledDeletion> {
+        self.gc_files
+            .values()
+            .map(|g| ScheduledDeletion {
+                data_file_id: g.data_file_id,
+                path: g.path.clone(),
+                path_is_relative: g.path_is_relative,
+                schedule_start_micros: g.schedule_start_micros,
+            })
+            .collect()
+    }
+
+    pub(crate) fn put_gc_file(&mut self, value: GcFileValue) {
+        self.gc_files.insert(value.data_file_id, value);
     }
 
     pub(crate) fn put_schema(&mut self, value: SchemaValue) {
@@ -528,7 +584,6 @@ mod tests {
             schema_version: 0,
             next_catalog_id: 10,
             next_file_id: 0,
-            next_deletion_id: 0,
             changes_made: String::new(),
             author: None,
             commit_message: None,
@@ -595,7 +650,7 @@ mod tests {
             record_count: rows,
             file_size_bytes: rows * 10,
             footer_size: 4,
-            row_id_start: 0,
+            row_id_start: Some(0),
             partition_id: None,
             encryption_key: None,
             mapping_id: None,

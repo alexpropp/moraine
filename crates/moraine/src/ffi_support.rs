@@ -18,9 +18,9 @@ use crate::{
     error::Result,
     store::{
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, PartitionValue,
-            SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
-            TableValue, ViewValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
+            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
+            TableStatsValue, TableValue, ViewValue,
         },
         read::{EntityRecord, scan_current_entities, scan_history_entities, scan_snapshots},
     },
@@ -210,6 +210,118 @@ pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersion
         .collect())
 }
 
+/// Every `ducklake_files_scheduled_for_deletion` row. Live bookkeeping
+/// with no temporal lifecycle: always exactly the rows awaiting physical
+/// deletion.
+#[doc(hidden)]
+pub async fn dump_scheduled_deletions(catalog: &Catalog) -> Result<Vec<GcFileValue>> {
+    dump_entities(catalog, |r| match r {
+        EntityRecord::GcFile(v) => Some(v),
+        _ => None,
+    })
+    .await
+}
+
+/// One `ducklake_tag` row, flattened from its object's container record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRow {
+    /// The tagged object (a schema/table/view id).
+    pub object_id: u64,
+    /// Snapshot at which this tag value became visible.
+    pub begin_snapshot: u64,
+    /// Snapshot at which it was superseded, if it has been.
+    pub end_snapshot: Option<u64>,
+    /// Tag key.
+    pub key: String,
+    /// Tag value.
+    pub value: String,
+}
+
+/// Every `ducklake_tag` row: one per embedded entry, ended entries
+/// included — each row carries its lifecycle verbatim and DuckLake
+/// filters in SQL.
+#[doc(hidden)]
+pub async fn dump_tags(catalog: &Catalog) -> Result<Vec<TagRow>> {
+    let containers = dump_entities(catalog, |r| match r {
+        EntityRecord::Tag(v) => Some(v),
+        _ => None,
+    })
+    .await?;
+    Ok(containers
+        .into_iter()
+        .flat_map(|container| {
+            let object_id = container.object_id;
+            container.entries.into_iter().map(move |e| TagRow {
+                object_id,
+                begin_snapshot: e.begin_snapshot,
+                end_snapshot: e.end_snapshot,
+                key: e.key,
+                value: e.value,
+            })
+        })
+        .collect())
+}
+
+/// One `ducklake_column_tag` row, flattened from its column's record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnTagRow {
+    /// The tagged column's table.
+    pub table_id: u64,
+    /// The tagged column.
+    pub column_id: u64,
+    /// Snapshot at which this tag value became visible.
+    pub begin_snapshot: u64,
+    /// Snapshot at which it was superseded, if it has been.
+    pub end_snapshot: Option<u64>,
+    /// Tag key.
+    pub key: String,
+    /// Tag value.
+    pub value: String,
+}
+
+/// Every `ducklake_column_tag` row. Entries are authoritative on each
+/// column's latest record (a version transition carries them forward),
+/// so rows are emitted from that record only — emitting from every
+/// version would duplicate them.
+#[doc(hidden)]
+pub async fn dump_column_tags(catalog: &Catalog) -> Result<Vec<ColumnTagRow>> {
+    let columns = dump_columns(catalog).await?;
+
+    let mut latest: std::collections::BTreeMap<(u64, u64), &ColumnValue> =
+        std::collections::BTreeMap::new();
+    for column in &columns {
+        let entry = latest
+            .entry((column.table_id, column.column_id))
+            .or_insert(column);
+        // Later than the incumbent: live beats ended, higher end beats
+        // lower.
+        let newer = match (column.end_snapshot, entry.end_snapshot) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a > b,
+        };
+        if newer {
+            *entry = column;
+        }
+    }
+
+    Ok(latest
+        .into_values()
+        .flat_map(|column| {
+            column.tags.iter().map(|t| ColumnTagRow {
+                table_id: column.table_id,
+                column_id: column.column_id,
+                begin_snapshot: t.begin_snapshot,
+                end_snapshot: t.end_snapshot,
+                key: t.key.clone(),
+                value: t.value.clone(),
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -375,7 +487,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "orders/data-1.parquet");
         assert_eq!(files[0].record_count, 10);
-        assert_eq!(files[0].row_id_start, 0);
+        assert_eq!(files[0].row_id_start, Some(0));
         assert!(files[0].end_snapshot.is_none());
 
         let deletes = dump_delete_files(&catalog).await.unwrap();

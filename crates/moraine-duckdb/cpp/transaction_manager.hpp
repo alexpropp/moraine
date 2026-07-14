@@ -51,6 +51,13 @@ public:
 	// reuses it: one moraine staged tx per DuckDB transaction.
 	MoraineTxHandle *StagedTx();
 
+	// The staged tx if one has been opened, else null — a peek for read
+	// paths that must observe the transaction's own staged writes without
+	// ever opening a write transaction themselves.
+	MoraineTxHandle *StagedTxIfOpen() const {
+		return staged_tx_;
+	}
+
 	// Hands ownership of the staged tx (if one was opened) to the caller,
 	// clearing this transaction's reference so the destructor's defensive
 	// rollback becomes a no-op. Returns null if no write ever opened one.

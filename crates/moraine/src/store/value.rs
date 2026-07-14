@@ -74,6 +74,7 @@ mod tests {
     roundtrip!(roundtrip_table_stats, TableStatsValue);
     roundtrip!(roundtrip_table_column_stats, TableColumnStatsValue);
     roundtrip!(roundtrip_tag, TagValue);
+    roundtrip!(roundtrip_tag_entry, TagEntry);
     roundtrip!(roundtrip_option_scope, OptionScopeValue);
     roundtrip!(roundtrip_snapshot, SnapshotValue);
     roundtrip!(roundtrip_gcfile, GcFileValue);

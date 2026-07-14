@@ -619,7 +619,10 @@ pub struct MoraineDataFileRow {
     pub file_size_bytes: u64,
     /// `footer_size`.
     pub footer_size: u64,
-    /// `row_id_start`.
+    /// Whether `row_id_start` is present (absent when the file's rows
+    /// carry explicit per-row ids, e.g. compaction outputs).
+    pub has_row_id_start: bool,
+    /// `row_id_start`, valid iff `has_row_id_start`.
     pub row_id_start: u64,
     /// Whether `partition_id` is present.
     pub has_partition_id: bool,
@@ -705,7 +708,8 @@ pub unsafe extern "C" fn moraine_dump_data_files(
                     record_count: v.record_count,
                     file_size_bytes: v.file_size_bytes,
                     footer_size: v.footer_size,
-                    row_id_start: v.row_id_start,
+                    has_row_id_start: v.row_id_start.is_some(),
+                    row_id_start: v.row_id_start.unwrap_or_default(),
                     has_partition_id: has_partition,
                     partition_id: partition,
                     encryption_key: opt_into_raw(encryption_key),
@@ -1260,6 +1264,55 @@ pub struct MoraineSnapshotRow {
     pub commit_extra_info: *mut c_char,
 }
 
+/// One snapshot record's fields, in `MoraineSnapshotRow` order — the
+/// nameable shape the wire value maps into (its own type is internal to
+/// the core crate).
+pub(crate) type SnapshotRowFields = (
+    u64,
+    i64,
+    u64,
+    u64,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Converts snapshot records to C rows, owned-first (see
+/// `moraine_dump_schemas`): every string in the whole batch converts
+/// before any raw pointer is minted.
+pub(crate) fn snapshot_rows(
+    rows: Vec<SnapshotRowFields>,
+) -> Result<Vec<MoraineSnapshotRow>, AbiError> {
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let changes_made = to_c_string(&v.5)?;
+            let author = opt_c_string(v.6.as_deref())?;
+            let commit_message = opt_c_string(v.7.as_deref())?;
+            let commit_extra_info = opt_c_string(v.8.as_deref())?;
+            Ok((v, changes_made, author, commit_message, commit_extra_info))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+    Ok(owned
+        .into_iter()
+        .map(
+            |(v, changes_made, author, commit_message, commit_extra_info)| MoraineSnapshotRow {
+                snapshot_id: v.0,
+                snapshot_time_micros: v.1,
+                schema_version: v.2,
+                next_catalog_id: v.3,
+                next_file_id: v.4,
+                changes_made: changes_made.into_raw(),
+                author: opt_into_raw(author),
+                commit_message: opt_into_raw(commit_message),
+                commit_extra_info: opt_into_raw(commit_extra_info),
+            },
+        )
+        .collect())
+}
+
 /// Dumps every `ducklake_snapshot` row into `*out_items`/`*out_len`.
 /// Snapshots carry no begin/end lifecycle of their own — this is the
 /// full committed history, not a current/history split.
@@ -1294,34 +1347,23 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
                 moraine::ffi_support::dump_snapshots(&handle_ref.catalog),
             )
         }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = rows
-            .into_iter()
-            .map(|v| {
-                let changes_made = to_c_string(&v.changes_made)?;
-                let author = opt_c_string(v.author.as_deref())?;
-                let commit_message = opt_c_string(v.commit_message.as_deref())?;
-                let commit_extra_info = opt_c_string(v.commit_extra_info.as_deref())?;
-                Ok((v, changes_made, author, commit_message, commit_extra_info))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(
-                |(v, changes_made, author, commit_message, commit_extra_info)| MoraineSnapshotRow {
-                    snapshot_id: v.snapshot_id,
-                    snapshot_time_micros: v.snapshot_time_micros,
-                    schema_version: v.schema_version,
-                    next_catalog_id: v.next_catalog_id,
-                    next_file_id: v.next_file_id,
-                    changes_made: changes_made.into_raw(),
-                    author: opt_into_raw(author),
-                    commit_message: opt_into_raw(commit_message),
-                    commit_extra_info: opt_into_raw(commit_extra_info),
-                },
-            )
-            .collect())
+        snapshot_rows(
+            rows.into_iter()
+                .map(|v| {
+                    (
+                        v.snapshot_id,
+                        v.snapshot_time_micros,
+                        v.schema_version,
+                        v.next_catalog_id,
+                        v.next_file_id,
+                        v.changes_made,
+                        v.author,
+                        v.commit_message,
+                        v.commit_extra_info,
+                    )
+                })
+                .collect(),
+        )
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
@@ -2014,6 +2056,332 @@ pub unsafe extern "C" fn moraine_dump_sort_expressions_free(
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// One `ducklake_files_scheduled_for_deletion` row, as returned by
+/// [`moraine_dump_scheduled_deletions`].
+#[repr(C)]
+pub struct MoraineScheduledDeletionRow {
+    /// `data_file_id`.
+    pub data_file_id: u64,
+    /// `path`, owned.
+    pub path: *mut c_char,
+    /// `path_is_relative`.
+    pub path_is_relative: bool,
+    /// `schedule_start`, microseconds since epoch (UTC).
+    pub schedule_start_micros: i64,
+}
+
+/// Dumps every `ducklake_files_scheduled_for_deletion` row into
+/// `*out_items`/`*out_len`.
+///
+/// # Safety
+///
+/// Same pointer contract as [`moraine_dump_schemas`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_scheduled_deletions(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut MoraineScheduledDeletionRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineScheduledDeletionRow>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_scheduled_deletions(&handle_ref.catalog),
+            )
+        }?;
+        // Owned-first (see `moraine_dump_schemas`): every string in the
+        // whole batch converts before any raw pointer is minted.
+        let owned = rows
+            .into_iter()
+            .map(|row| {
+                let path = to_c_string(&row.path)?;
+                Ok((row, path))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+
+        Ok(owned
+            .into_iter()
+            .map(|(row, path)| MoraineScheduledDeletionRow {
+                data_file_id: row.data_file_id,
+                path: path.into_raw(),
+                path_is_relative: row.path_is_relative,
+                schedule_start_micros: row.schedule_start_micros,
+            })
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees an array returned by [`moraine_dump_scheduled_deletions`].
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_dump_scheduled_deletions`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_scheduled_deletions_free(
+    items: *mut MoraineScheduledDeletionRow,
+    len: usize,
+) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |r| {
+                free_c_string(r.path);
+            });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// One `ducklake_tag` row, as returned by [`moraine_dump_tags`] —
+/// flattened from the object's container record; ended entries included,
+/// lifecycle carried verbatim.
+#[repr(C)]
+pub struct MoraineTagRow {
+    /// `object_id`.
+    pub object_id: u64,
+    /// `begin_snapshot`.
+    pub begin_snapshot: u64,
+    /// Whether `end_snapshot` is present.
+    pub has_end_snapshot: bool,
+    /// `end_snapshot`, valid iff `has_end_snapshot`.
+    pub end_snapshot: u64,
+    /// `key`, owned.
+    pub key: *mut c_char,
+    /// `value`, owned.
+    pub value: *mut c_char,
+}
+
+/// Dumps every `ducklake_tag` row into `*out_items`/`*out_len`.
+///
+/// # Safety
+///
+/// Same pointer contract as [`moraine_dump_schemas`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_tags(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut MoraineTagRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineTagRow>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_tags(&handle_ref.catalog),
+            )
+        }?;
+        // Owned-first (see `moraine_dump_schemas`): every string in the
+        // whole batch converts before any raw pointer is minted.
+        let owned = rows
+            .into_iter()
+            .map(|row| {
+                let key = to_c_string(&row.key)?;
+                let value = to_c_string(&row.value)?;
+                Ok((row, key, value))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+
+        Ok(owned
+            .into_iter()
+            .map(|(row, key, value)| {
+                let (has_end, end) = opt_u64(row.end_snapshot);
+                MoraineTagRow {
+                    object_id: row.object_id,
+                    begin_snapshot: row.begin_snapshot,
+                    has_end_snapshot: has_end,
+                    end_snapshot: end,
+                    key: key.into_raw(),
+                    value: value.into_raw(),
+                }
+            })
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees an array returned by [`moraine_dump_tags`].
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_dump_tags`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_tags_free(items: *mut MoraineTagRow, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |t| {
+                free_c_string(t.key);
+                free_c_string(t.value);
+            });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// One `ducklake_column_tag` row, as returned by
+/// [`moraine_dump_column_tags`] — flattened from the column's latest
+/// record (a version transition carries entries forward, so only the
+/// latest record's set is emitted).
+#[repr(C)]
+pub struct MoraineColumnTagRow {
+    /// `table_id`.
+    pub table_id: u64,
+    /// `column_id`.
+    pub column_id: u64,
+    /// `begin_snapshot`.
+    pub begin_snapshot: u64,
+    /// Whether `end_snapshot` is present.
+    pub has_end_snapshot: bool,
+    /// `end_snapshot`, valid iff `has_end_snapshot`.
+    pub end_snapshot: u64,
+    /// `key`, owned.
+    pub key: *mut c_char,
+    /// `value`, owned.
+    pub value: *mut c_char,
+}
+
+/// Dumps every `ducklake_column_tag` row into `*out_items`/`*out_len`.
+///
+/// # Safety
+///
+/// Same pointer contract as [`moraine_dump_schemas`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_column_tags(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut MoraineColumnTagRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineColumnTagRow>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::dump_column_tags(&handle_ref.catalog),
+            )
+        }?;
+        // Owned-first (see `moraine_dump_schemas`): every string in the
+        // whole batch converts before any raw pointer is minted.
+        let owned = rows
+            .into_iter()
+            .map(|row| {
+                let key = to_c_string(&row.key)?;
+                let value = to_c_string(&row.value)?;
+                Ok((row, key, value))
+            })
+            .collect::<Result<Vec<_>, AbiError>>()?;
+
+        Ok(owned
+            .into_iter()
+            .map(|(row, key, value)| {
+                let (has_end, end) = opt_u64(row.end_snapshot);
+                MoraineColumnTagRow {
+                    table_id: row.table_id,
+                    column_id: row.column_id,
+                    begin_snapshot: row.begin_snapshot,
+                    has_end_snapshot: has_end,
+                    end_snapshot: end,
+                    key: key.into_raw(),
+                    value: value.into_raw(),
+                }
+            })
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees an array returned by [`moraine_dump_column_tags`].
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_dump_column_tags`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_dump_column_tags_free(
+    items: *mut MoraineColumnTagRow,
+    len: usize,
+) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |t| {
+                free_c_string(t.key);
+                free_c_string(t.value);
+            });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2157,6 +2525,94 @@ mod tests {
                 })
                 .await
                 .expect("test setup: rename table");
+
+            catalog.close().await.expect("test setup: close catalog");
+        });
+    }
+
+    /// Seeds a schema + table, then tags both the table and its first
+    /// column over the staged-row path — the only writer for tags, as in
+    /// production (DuckLake's `COMMENT ON` batch).
+    fn seed_with_tags(dir: &Path) {
+        use moraine::ffi_support::staged::{Cell, RowOperation, TableKind, staged_begin};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test setup: build tokio runtime");
+
+        rt.block_on(async {
+            let store = Arc::new(
+                LocalFileSystem::new_with_prefix(dir).expect("test setup: open local store"),
+            );
+            let catalog = moraine::Catalog::open(store, moraine::CatalogOptions::default())
+                .await
+                .expect("test setup: open catalog");
+            catalog
+                .commit(|tx| {
+                    let schema = tx.create_schema("sales")?;
+                    tx.create_table(
+                        schema,
+                        "orders",
+                        &[ColumnDef {
+                            name: "id".into(),
+                            column_type: "BIGINT".into(),
+                            nulls_allowed: false,
+                            default_value: None,
+                        }],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("test setup: commit fixtures");
+
+            // Schema `sales` took global id 1, table `orders` id 2; its
+            // first column has per-table field id 1.
+            let mut tx = staged_begin(&catalog)
+                .await
+                .expect("test setup: begin staged tx");
+            tx.stage(RowOperation::Insert {
+                table: TableKind::Tag,
+                cells: vec![
+                    Cell::U64(2),
+                    Cell::U64(2),
+                    Cell::Null,
+                    Cell::Str("comment".into()),
+                    Cell::Str("our table".into()),
+                ],
+            });
+            tx.stage(RowOperation::Insert {
+                table: TableKind::ColumnTag,
+                cells: vec![
+                    Cell::U64(2),
+                    Cell::U64(1),
+                    Cell::U64(2),
+                    Cell::Null,
+                    Cell::Str("comment".into()),
+                    Cell::Str("our column".into()),
+                ],
+            });
+            tx.stage(RowOperation::Insert {
+                table: TableKind::Snapshot,
+                cells: vec![
+                    Cell::U64(2),
+                    Cell::I64(1),
+                    Cell::U64(1),
+                    Cell::U64(3),
+                    Cell::U64(0),
+                ],
+            });
+            tx.stage(RowOperation::Insert {
+                table: TableKind::SnapshotChanges,
+                cells: vec![
+                    Cell::U64(2),
+                    Cell::Str("altered_table:2".into()),
+                    Cell::Null,
+                    Cell::Null,
+                    Cell::Null,
+                ],
+            });
+            tx.commit().await.expect("test setup: commit tags");
 
             catalog.close().await.expect("test setup: close catalog");
         });
@@ -2615,6 +3071,78 @@ mod tests {
     }
 
     #[test]
+    fn dump_tags_and_column_tags_carry_exact_values() {
+        let dir = TempDir::new("tags");
+        seed_with_tags(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let mut items: *mut MoraineTagRow = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; out/err slots are valid.
+        let code = unsafe {
+            moraine_dump_tags(
+                handle,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+        assert_eq!(len, 1);
+        // SAFETY: `items` points to `len` rows written by the call above.
+        let row = unsafe { &*items };
+        assert_eq!(row.object_id, 2);
+        assert_eq!(row.begin_snapshot, 2);
+        assert!(!row.has_end_snapshot);
+        // SAFETY: owned, NUL-terminated strings written by the dump.
+        unsafe {
+            assert_eq!(CStr::from_ptr(row.key).to_str().unwrap(), "comment");
+            assert_eq!(CStr::from_ptr(row.value).to_str().unwrap(), "our table");
+        }
+
+        let mut column_items: *mut MoraineColumnTagRow = ptr::null_mut();
+        let mut column_len: usize = 0;
+        let mut column_err = MoraineError::default();
+        // SAFETY: same contracts as above.
+        let column_code = unsafe {
+            moraine_dump_column_tags(
+                handle,
+                &raw mut column_items,
+                &raw mut column_len,
+                None,
+                ptr::null_mut(),
+                &raw mut column_err,
+            )
+        };
+        assert_eq!(column_code, codes::OK);
+        assert_eq!(column_len, 1);
+        // SAFETY: `column_items` points to `column_len` rows written above.
+        let column_row = unsafe { &*column_items };
+        assert_eq!(column_row.table_id, 2);
+        assert_eq!(column_row.column_id, 1);
+        assert_eq!(column_row.begin_snapshot, 2);
+        assert!(!column_row.has_end_snapshot);
+        // SAFETY: owned, NUL-terminated strings written by the dump.
+        unsafe {
+            assert_eq!(CStr::from_ptr(column_row.key).to_str().unwrap(), "comment");
+            assert_eq!(
+                CStr::from_ptr(column_row.value).to_str().unwrap(),
+                "our column"
+            );
+        }
+
+        // SAFETY: freed exactly once each.
+        unsafe {
+            moraine_dump_tags_free(items, len);
+            moraine_dump_column_tags_free(column_items, column_len);
+            moraine_detach(handle);
+        }
+    }
+
+    #[test]
     fn dump_on_null_handle_reports_invalid_argument() {
         let mut err = MoraineError::default();
         let mut out: *mut MoraineSchemaRow = ptr::null_mut();
@@ -2702,6 +3230,12 @@ mod tests {
             "moraine_dump_sort_info_free",
             "moraine_dump_sort_expressions",
             "moraine_dump_sort_expressions_free",
+            "moraine_dump_tags",
+            "moraine_dump_tags_free",
+            "moraine_dump_column_tags",
+            "moraine_dump_column_tags_free",
+            "moraine_dump_scheduled_deletions",
+            "moraine_dump_scheduled_deletions_free",
         ];
         let structs = [
             "MoraineSnapshotRow",
@@ -2720,6 +3254,9 @@ mod tests {
             "MoraineFilePartitionValueRow",
             "MoraineSortInfoRow",
             "MoraineSortExpressionRow",
+            "MoraineTagRow",
+            "MoraineColumnTagRow",
+            "MoraineScheduledDeletionRow",
         ];
 
         for name in functions.iter().chain(&structs) {

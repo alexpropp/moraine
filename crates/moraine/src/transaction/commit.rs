@@ -15,7 +15,7 @@ use crate::{
     error::{Error, Result},
     store::{
         handle::ReadHandle,
-        key::{EntityKey, Key, SysKey},
+        key::{CurrentKey, EntityKey, Key, SysKey},
         open::{open_reader, open_store},
         proto, read, value,
     },
@@ -96,7 +96,6 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
             schema_version: 0,
             next_catalog_id: 1,
             next_file_id: 0,
-            next_deletion_id: 0,
             changes_made: bootstrap_changes.to_changes_made(),
             author: None,
             commit_message: None,
@@ -224,9 +223,12 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         Some(requested) => requested,
         None => head,
     };
+    // A missing record at or below head is an expired snapshot, not
+    // corruption: expiry deletes snapshot records without renumbering.
+    // The caller re-resolves from head.
     let snapshot = read::read_snapshot(tx, target)
         .await?
-        .ok_or_else(|| Error::Corruption(format!("snapshot record {target} missing")))?;
+        .ok_or_else(|| Error::NotFound(format!("snapshot {target} (expired or never minted)")))?;
     let current = read::scan_current_entities(tx).await?;
     let history = match at {
         Some(_) => read::scan_history_entities(tx).await?,
@@ -466,12 +468,52 @@ fn diff_options(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &C
     );
 }
 
+fn diff_tags(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
+    let object_ids = base.tags.keys().chain(state.tags.keys());
+    for &object_id in object_ids.collect::<std::collections::BTreeSet<_>>() {
+        stage_overwrite(
+            writes,
+            EntityKey::Tag { object_id },
+            base.tags.get(&object_id),
+            state.tags.get(&object_id),
+        );
+    }
+}
+
+/// Deletion-schedule rows: live bookkeeping under `current/gcfile`,
+/// overwritten or removed in place — never mirrored to history.
+fn diff_gc_files(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
+    let file_ids = base.gc_files.keys().chain(state.gc_files.keys());
+    for &data_file_id in file_ids.collect::<std::collections::BTreeSet<_>>() {
+        let key = Key::Current(CurrentKey::GcFile { data_file_id });
+        match (
+            base.gc_files.get(&data_file_id),
+            state.gc_files.get(&data_file_id),
+        ) {
+            (Some(_), None) => writes.push((key.encode(), None)),
+            (prior, Some(next)) if prior != Some(next) => {
+                writes.push((key.encode(), Some(value::encode_value(next))));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn diff_columns(
     writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
+    // The column row minus its embedded tag entries: the part whose
+    // change means a version transition.
+    fn sans_tags(value: &proto::ColumnValue) -> proto::ColumnValue {
+        proto::ColumnValue {
+            tags: Vec::new(),
+            ..value.clone()
+        }
+    }
+
     let column_tables = base.columns.keys().chain(state.columns.keys());
     for &table_id in column_tables.collect::<std::collections::BTreeSet<_>>() {
         static EMPTY: std::collections::BTreeMap<u64, proto::ColumnValue> =
@@ -483,12 +525,29 @@ fn diff_columns(
             .chain(state_cols.keys())
             .collect::<std::collections::BTreeSet<_>>()
         {
+            let entity = EntityKey::Column {
+                table_id,
+                column_id,
+            };
+
+            // A tags-only change overwrites the record in place: tag
+            // entries carry their own begin/end, so the column row did
+            // not transition and must not mint a history version.
+            if let (Some(prior), Some(next)) =
+                (base_cols.get(&column_id), state_cols.get(&column_id))
+                && prior != next
+                && sans_tags(prior) == sans_tags(next)
+            {
+                writes.push((
+                    Key::current(entity).encode(),
+                    Some(value::encode_value(next)),
+                ));
+                continue;
+            }
+
             stage_transition(
                 writes,
-                EntityKey::Column {
-                    table_id,
-                    column_id,
-                },
+                entity,
                 base_cols.get(&column_id),
                 state_cols.get(&column_id),
                 new_snapshot,
@@ -683,6 +742,8 @@ pub(crate) fn diff_writes(
     diff_table_column_stats(&mut writes, base, state);
     diff_file_column_stats(&mut writes, base, state);
     diff_options(&mut writes, base, state);
+    diff_tags(&mut writes, base, state);
+    diff_gc_files(&mut writes, base, state);
     writes
 }
 
@@ -797,7 +858,6 @@ where
         schema_version: base.snapshot.schema_version + u64::from(schema_changed),
         next_catalog_id,
         next_file_id,
-        next_deletion_id: base.snapshot.next_deletion_id,
         changes_made: ours.to_changes_made(),
         author: None,
         commit_message: None,
@@ -885,8 +945,10 @@ where
 }
 
 /// The change sets of every commit above `head_before`, read outside any
-/// transaction (the loser's is dead). A missing snapshot record below
-/// the head is store damage: [`Error::Corruption`], not a retry.
+/// transaction (the loser's is dead). A record that has already been
+/// expired by a racing maintenance commit classifies as an unknowable
+/// change (forcing the conflict path), never as corruption — the caller
+/// re-drives against the new head.
 async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
     let head_bytes = db
         .get(Key::Sys(SysKey::Head).encode())
@@ -897,13 +959,21 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
     let mut changes = Vec::new();
 
     for snapshot_id in (head_before + 1)..=head.snapshot_id {
-        let bytes = db
+        let change_set = match db
             .get(Key::Snapshot { snapshot_id }.encode())
             .await
             .map_err(Error::from)?
-            .ok_or_else(|| Error::Corruption(format!("snapshot record {snapshot_id} missing")))?;
-        let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
-        changes.push((snapshot_id, ChangeSet::parse(&snapshot.changes_made)));
+        {
+            Some(bytes) => {
+                let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
+                ChangeSet::parse(&snapshot.changes_made)
+            }
+            None => ChangeSet {
+                has_unknown: true,
+                ..ChangeSet::default()
+            },
+        };
+        changes.push((snapshot_id, change_set));
     }
 
     Ok(changes)
@@ -981,7 +1051,6 @@ mod tests {
             schema_version: 0,
             next_catalog_id: 0,
             next_file_id: 0,
-            next_deletion_id: 0,
             changes_made: String::new(),
             author: None,
             commit_message: None,
