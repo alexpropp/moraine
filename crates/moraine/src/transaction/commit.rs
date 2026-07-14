@@ -11,7 +11,10 @@ use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions}
 use uuid::Uuid;
 
 use crate::{
-    catalog::{CatalogSnapshot, SnapshotId},
+    catalog::{
+        CatalogSnapshot, SnapshotId,
+        projection::{ProjectionCache, fold_committed_batch},
+    },
     error::{Error, Result},
     store::{
         handle::ReadHandle,
@@ -811,7 +814,11 @@ enum CommitOutcome {
 /// Runs one commit attempt: materialize, run the closure, stage, commit.
 /// An empty op set commits nothing and returns the unchanged head. Every
 /// exit that does not reach the final commit rolls the transaction back.
-async fn attempt_commit<F>(db: &Db, f: &F) -> Result<CommitOutcome>
+async fn attempt_commit<F>(
+    db: &Db,
+    f: &F,
+    projections: &std::sync::RwLock<ProjectionCache>,
+) -> Result<CommitOutcome>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
@@ -829,7 +836,8 @@ where
             ours,
             head_before,
             commits,
-        }) => finish_commit(db_tx, ours, head_before, commits).await,
+            writes,
+        }) => finish_commit(db_tx, ours, head_before, commits, writes, projections).await,
         Err(err) => {
             db_tx.rollback();
             Err(err)
@@ -852,6 +860,9 @@ enum Prepared {
         head_before: u64,
         /// The snapshot id a successful commit reports.
         commits: u64,
+        /// The staged batch, kept so a successful commit can fold it into
+        /// the maintained projections.
+        writes: Vec<StagedWrite>,
     },
 }
 
@@ -883,11 +894,12 @@ where
             Key::Sys(SysKey::Head).encode(),
             Some(value::encode_value(&proto::HeadValue { snapshot_id: head })),
         ));
-        stage_writes(db_tx, writes)?;
+        stage_writes(db_tx, &writes)?;
         return Ok(Prepared::Staged {
             ours: Box::default(),
             head_before: head,
             commits: head,
+            writes,
         });
     }
 
@@ -926,20 +938,21 @@ where
             snapshot_id: new_id,
         })),
     ));
-    stage_writes(db_tx, writes)?;
+    stage_writes(db_tx, &writes)?;
 
     Ok(Prepared::Staged {
         ours: Box::new(ours),
         head_before: head,
         commits: new_id,
+        writes,
     })
 }
 
-pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: Vec<StagedWrite>) -> Result<()> {
+pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Result<()> {
     for (key, write) in writes {
         match write {
-            Some(bytes) => db_tx.put(key, bytes),
-            None => db_tx.delete(key),
+            Some(bytes) => db_tx.put(key.clone(), bytes.clone()),
+            None => db_tx.delete(key.clone()),
         }
         .map_err(Error::from)?;
     }
@@ -951,9 +964,14 @@ async fn finish_commit(
     ours: Box<ChangeSet>,
     head_before: u64,
     commits: u64,
+    writes: Vec<StagedWrite>,
+    projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<CommitOutcome> {
     match db_tx.commit_with_options(&durable()).await {
-        Ok(_) => Ok(CommitOutcome::Committed(SnapshotId::new(commits))),
+        Ok(_) => {
+            fold_committed_batch(projections, &writes, commits);
+            Ok(CommitOutcome::Committed(SnapshotId::new(commits)))
+        }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             Ok(CommitOutcome::LostRace { ours, head_before })
         }
@@ -965,12 +983,16 @@ async fn finish_commit(
 /// — fresh snapshot, closure, ids — so premises re-validate against the
 /// state that won. True conflicts and an exhausted budget surface as
 /// [`Error::CommitConflict`].
-pub(crate) async fn commit_cycle<F>(db: &Db, f: &F) -> Result<SnapshotId>
+pub(crate) async fn commit_cycle<F>(
+    db: &Db,
+    f: &F,
+    projections: &std::sync::RwLock<ProjectionCache>,
+) -> Result<SnapshotId>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
     for _ in 0..MAX_COMMIT_ATTEMPTS {
-        match attempt_commit(db, f).await? {
+        match attempt_commit(db, f, projections).await? {
             CommitOutcome::Committed(id) => return Ok(id),
             CommitOutcome::LostRace { ours, head_before } => {
                 // An options-only loser is last-write-wins: always benign.

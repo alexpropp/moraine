@@ -283,7 +283,8 @@ mod tests {
     fn moraine_attach_uses_the_nested_prefix() {
         assert_eq!(
             attach_sql(BackendKind::Moraine, &paths(), None).unwrap(),
-            "ATTACH 'ducklake:moraine:/tmp/cat' AS lake (DATA_PATH '/tmp/data');"
+            "ATTACH 'ducklake:moraine:/tmp/cat' AS lake \
+             (DATA_PATH '/tmp/data', META_FLUSH_INTERVAL_MS 1);"
         );
     }
 

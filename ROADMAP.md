@@ -227,6 +227,26 @@ on that path.
   rename are verified live (`ducklake_load.rs`'s
   `ducklake_table_and_column_comments_round_trip`)
 
+## Performance
+- [x] Commit-served projection maintenance: the three projections DuckLake
+  re-reads every transaction (snapshots, table stats, table column stats)
+  are folded forward from each committed batch and served from memory when
+  their head matches, instead of rescanning the store per statement. Cut the
+  three dumps from ~1430 profile samples to ~17 and removed the per-commit
+  latency growth with snapshot history (was +21% over 300 inserts, now flat).
+  Attach-tunable WAL flush cadence (`CatalogOptions::flush_interval`,
+  `ATTACH ... META_FLUSH_INTERVAL_MS`, default 100ms) bounds the per-commit
+  durable wait.
+- [ ] Reduce per-statement FFI/serving overhead. Decomposing a single-row
+  commit (~16.5ms at a 1ms tick): ~9.5ms is DuckDB/DuckLake's own
+  per-statement floor (shared with the file backend), ~2.9ms is the SlateDB
+  durable commit (disk is only ~0.2ms of it; the rest is the flush pipeline +
+  tick), and ~4ms is moraine serving DuckLake's per-transaction metadata
+  queries across the C ABI — each query a round-trip that materializes and
+  marshals rows. With the big projection scans already cache-served, this
+  marshaling is the largest remaining moraine-specific lever: fewer ABI
+  crossings per statement and less per-row copying.
+
 ## Hardening & release
 - [x] Real object storage tests (MinIO via `cargo xtask s3`)
 - [x] Arbitrary-bytes decode proptests for store codecs (never panic on

@@ -225,6 +225,32 @@ latest `CatalogSnapshot` and hand out clones; a refresh replaces it. There is:
   small. A cold reader pays one `current` scan; a warm reader pays incremental
   refresh.
 
+### Maintained served projections
+
+The DuckDB shim serves row-faithful `ducklake_*` projections through the
+`dump_*` functions, and DuckLake re-reads three of them — snapshots, table
+stats, table column stats — at the start of **every** transaction. Rebuilding
+each from a subspace scan per statement makes small-commit latency scale with
+history. Those three projections are therefore *maintained*, by the same
+principle as committer read-your-writes:
+
+- A read-write `Catalog` holds a decoded projection state keyed by the head
+  snapshot id it was built at. The first serve pays the full scan and installs
+  the state; every commit **folds its own committed batch** into it (the
+  committer is the source of the delta), stamping the new head.
+- Every serve re-reads `sys/head` (one point read). If the state's head does
+  not match, the serve rebuilds from a full scan and reinstalls — it never
+  serves a mismatched state. Correctness rests on this head check, not on
+  fold-in completeness: a missed or undecodable fold clears the state and
+  degrades to a rescan, never to wrong rows.
+- The serving contract is row-faithfulness: a maintained projection is equal
+  to a fresh scan at the same head, always.
+- Scope: read-write catalogs only. A read-only catalog (`DbReader`) observes
+  other writers' commits via manifest polls, has no local deltas to fold, and
+  keeps the scan-per-serve path. Extending incremental refresh to readers is
+  the same changelog mechanism as `CatalogSnapshot` refresh, deliberately
+  deferred until reader-side serve cost is shown to matter.
+
 ### Test obligations
 
 Per RFC 0001, integration tests run against real SlateDB on in-memory
@@ -253,6 +279,10 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   premise view includes it) or conflicts on `sys/head`. There is no
   interleaving in which the attempt commits against premises that omit a
   landed commit.
+- **Maintained == scanned.** After every commit in a randomized operation
+  sequence (creates, file registrations, stats updates, renames, expiry), each
+  maintained projection equals a fresh scan of the same subspaces at the same
+  head.
 
 ## Open questions
 

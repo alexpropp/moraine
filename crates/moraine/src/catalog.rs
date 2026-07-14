@@ -5,6 +5,7 @@
 
 mod handle;
 pub(crate) mod inline;
+pub(crate) mod projection;
 mod snapshot;
 mod types;
 

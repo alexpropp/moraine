@@ -206,7 +206,7 @@ mod tests {
     async fn scan_inline_materializes_rows_with_chunk_bodies() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin(db_tx);
+        let mut tx = StagedTransaction::begin_detached(db_tx);
 
         tx.stage(RowOperation::InlineSchema {
             table_id: 1,
@@ -240,7 +240,7 @@ mod tests {
         tx.commit().await.unwrap();
 
         let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut inline_delete = StagedTransaction::begin(db_tx2);
+        let mut inline_delete = StagedTransaction::begin_detached(db_tx2);
         inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
             row_id: 1,
@@ -283,7 +283,7 @@ mod tests {
     async fn inline_file_deletes_read_back_in_key_order() {
         let catalog = open().await;
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin(db_tx);
+        let mut tx = StagedTransaction::begin_detached(db_tx);
 
         tx.stage(RowOperation::InlineFileDelete {
             table_id: 1,

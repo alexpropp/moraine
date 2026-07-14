@@ -57,6 +57,26 @@ fn small_commit_inserts(count: u64) -> impl Iterator<Item = String> {
         .map(|index| format!("INSERT INTO lake.main.events VALUES ({index}, 'event-{index}');"))
 }
 
+/// DuckLake inlines an insert of at most this many rows into the catalog
+/// instead of writing a Parquet data file (its `data_inlining_row_limit`
+/// default). A commit must exceed it to produce a real, mergeable file.
+const INLINE_ROW_LIMIT: u64 = 10;
+
+/// `count` inserts, each writing `INLINE_ROW_LIMIT * 2` rows so every one
+/// exceeds the inline limit and lands a separate small Parquet data file —
+/// the adjacent files `merge` is meant to coalesce. Row ids are disjoint
+/// across batches so the rows are genuinely distinct.
+fn data_file_inserts(count: u64) -> impl Iterator<Item = String> {
+    let rows_each = INLINE_ROW_LIMIT * 2;
+    (0..count).map(move |batch| {
+        let base = batch * rows_each;
+        format!(
+            "INSERT INTO lake.main.events \
+             SELECT {base} + i, 'event-' || i FROM range({rows_each}) t(i);"
+        )
+    })
+}
+
 /// Every workload at `scale`, in report order.
 pub fn workloads(scale: &Scale) -> Vec<Workload> {
     let [create_items, insert_items] = bulk_create_and_insert(scale.bulk_rows);
@@ -121,12 +141,16 @@ pub fn workloads(scale: &Scale) -> Vec<Workload> {
         ],
     };
 
+    // Seeded with one data-file-writing insert per commit (each over the
+    // inline limit), so `merge` has adjacent Parquet files to coalesce
+    // rather than only inlined rows — otherwise it would measure call
+    // overhead, not compaction.
     let maintenance = Workload {
         name: "maintenance",
         seed: std::iter::once(
             "CREATE TABLE lake.main.events (id BIGINT, note VARCHAR);".to_owned(),
         )
-        .chain(small_commit_inserts(scale.small_commits))
+        .chain(data_file_inserts(scale.small_commits))
         .collect(),
         measured: vec![
             Statement::measured("merge", "CALL ducklake_merge_adjacent_files('lake');"),
@@ -224,5 +248,8 @@ mod tests {
             .unwrap();
         assert!(maintenance.seed[0].contains("CREATE TABLE lake.main.events"));
         assert!(maintenance.seed.len() as u64 == 1 + small().small_commits);
+        // Each seed insert must exceed the inline limit so `merge` has
+        // real adjacent data files to coalesce, not just inlined rows.
+        assert!(maintenance.seed[1].contains(&format!("range({})", INLINE_ROW_LIMIT * 2)));
     }
 }

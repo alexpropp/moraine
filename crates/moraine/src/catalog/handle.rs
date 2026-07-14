@@ -7,7 +7,7 @@ use object_store::ObjectStore;
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 
 use crate::{
-    catalog::{CatalogSnapshot, SnapshotId},
+    catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
     store::handle::ReadSession,
     transaction::{Transaction, commit},
@@ -66,6 +66,9 @@ impl Default for CatalogOptions {
 #[derive(Clone)]
 pub struct Catalog {
     store: Arc<Store>,
+    // Shared across handle clones: decoded projections folded forward on
+    // commit, served without rescanning when their head matches.
+    projections: Arc<std::sync::RwLock<ProjectionCache>>,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -110,6 +113,7 @@ impl Catalog {
         .await?;
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
+            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
     }
 
@@ -133,7 +137,20 @@ impl Catalog {
         let reader = commit::open_reader_initialized(&options.path, object_store).await?;
         Ok(Self {
             store: Arc::new(Store::Reader(Arc::new(reader))),
+            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
+    }
+
+    /// The maintained-projection state shared by this handle's clones.
+    pub(crate) fn projections(&self) -> &Arc<std::sync::RwLock<ProjectionCache>> {
+        &self.projections
+    }
+
+    /// Whether this catalog maintains served projections: read-write only —
+    /// a read-only catalog has no local commits to fold, so its dumps
+    /// always scan.
+    pub(crate) fn maintains_projections(&self) -> bool {
+        matches!(self.store.as_ref(), Store::Writer(_))
     }
 
     /// The read-write writer, or [`Error::Constraint`] if the catalog was
@@ -266,6 +283,6 @@ impl Catalog {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        commit::commit_cycle(self.writer()?, &f).await
+        commit::commit_cycle(self.writer()?, &f, &self.projections).await
     }
 }

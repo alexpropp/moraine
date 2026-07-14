@@ -22,9 +22,38 @@ use crate::{
             MacroValue, MappingValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
             TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
-        read::{EntityRecord, scan_current_entities, scan_history_entities, scan_snapshots},
+        read::{
+            EntityRecord, read_head, scan_current_entities, scan_history_entities, scan_snapshots,
+        },
     },
 };
+
+/// The head snapshot id inside an open read session, or `None` on a
+/// store that has no head yet (mid-bootstrap).
+async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Option<u64>> {
+    Ok(read_head(session.handle()).await?.map(|h| h.snapshot_id))
+}
+
+/// Locks the shared projection state for reading, recovering a poisoned
+/// lock (folds never panic mid-flight, so the state is whole).
+fn projections_read(
+    catalog: &Catalog,
+) -> std::sync::RwLockReadGuard<'_, crate::catalog::projection::ProjectionCache> {
+    catalog
+        .projections()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// As [`projections_read`], for writing (installs).
+fn projections_write(
+    catalog: &Catalog,
+) -> std::sync::RwLockWriteGuard<'_, crate::catalog::projection::ProjectionCache> {
+    catalog
+        .projections()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[doc(hidden)]
 pub mod inline;
@@ -32,8 +61,9 @@ pub mod inline;
 pub mod staged;
 
 /// Scans `current` then `history` in one transaction, keeping only the records
-/// `extract` maps to `Some` — the shared engine every entity-kind
-/// `dump_*` function below is a thin, concretely typed wrapper over.
+/// `extract` maps to `Some` — the shared engine every *versioned*
+/// entity-kind `dump_*` function below is a thin, concretely typed
+/// wrapper over.
 async fn dump_entities<T>(
     catalog: &Catalog,
     extract: impl Fn(EntityRecord) -> Option<T>,
@@ -45,6 +75,19 @@ async fn dump_entities<T>(
     let mut records = current?;
     records.extend(history?);
     Ok(records.into_iter().filter_map(extract).collect())
+}
+
+/// As [`dump_entities`], but `current` only — for the unversioned kinds
+/// (statistics, tags, scheduled deletions) that are overwritten in place
+/// and never mirrored to `history`, where that scan is pure waste.
+async fn dump_current_entities<T>(
+    catalog: &Catalog,
+    extract: impl Fn(EntityRecord) -> Option<T>,
+) -> Result<Vec<T>> {
+    let session = catalog.begin_read().await?;
+    let current = scan_current_entities(session.handle()).await;
+    session.finish();
+    Ok(current?.into_iter().filter_map(extract).collect())
 }
 
 /// Every `ducklake_schema` row, current and history.
@@ -155,31 +198,80 @@ pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
 
 /// Every `ducklake_table_stats` row. Unversioned (overwritten in place,
 /// never mirrored to history), so this is always exactly the live rows.
+/// Served from the maintained projection when its head matches; a fresh
+/// scan installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>> {
-    dump_entities(catalog, |r| match r {
-        EntityRecord::TableStats(v) => Some(v),
-        _ => None,
-    })
-    .await
+    let session = catalog.begin_read().await?;
+    let head = session_head(&session).await?;
+    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
+        if let Some(rows) = projections_read(catalog).table_stats_at(head) {
+            session.finish();
+            return Ok(rows);
+        }
+        let current = scan_current_entities(session.handle()).await;
+        session.finish();
+        let rows: Vec<TableStatsValue> = current?
+            .into_iter()
+            .filter_map(|r| match r {
+                EntityRecord::TableStats(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        projections_write(catalog).install_table_stats(head, rows.clone());
+        return Ok(rows);
+    }
+    let current = scan_current_entities(session.handle()).await;
+    session.finish();
+    Ok(current?
+        .into_iter()
+        .filter_map(|r| match r {
+            EntityRecord::TableStats(v) => Some(v),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Every `ducklake_table_column_stats` row. Unversioned, as
-/// [`dump_table_stats`].
+/// [`dump_table_stats`], and served from the maintained projection the
+/// same way.
 #[doc(hidden)]
 pub async fn dump_table_column_stats(catalog: &Catalog) -> Result<Vec<TableColumnStatsValue>> {
-    dump_entities(catalog, |r| match r {
-        EntityRecord::TableColumnStats(v) => Some(v),
-        _ => None,
-    })
-    .await
+    let session = catalog.begin_read().await?;
+    let head = session_head(&session).await?;
+    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
+        if let Some(rows) = projections_read(catalog).table_column_stats_at(head) {
+            session.finish();
+            return Ok(rows);
+        }
+        let current = scan_current_entities(session.handle()).await;
+        session.finish();
+        let rows: Vec<TableColumnStatsValue> = current?
+            .into_iter()
+            .filter_map(|r| match r {
+                EntityRecord::TableColumnStats(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        projections_write(catalog).install_table_column_stats(head, rows.clone());
+        return Ok(rows);
+    }
+    let current = scan_current_entities(session.handle()).await;
+    session.finish();
+    Ok(current?
+        .into_iter()
+        .filter_map(|r| match r {
+            EntityRecord::TableColumnStats(v) => Some(v),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Every `ducklake_file_column_stats` row. Unversioned, as
 /// [`dump_table_stats`].
 #[doc(hidden)]
 pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnStatsValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_current_entities(catalog, |r| match r {
         EntityRecord::FileColumnStats(v) => Some(v),
         _ => None,
     })
@@ -188,10 +280,24 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 
 /// Every `ducklake_snapshot`/`ducklake_snapshot_changes` row (merged).
 /// Snapshots are append-only and carry no begin/end lifecycle of their
-/// own — this is the full history, not a current/history split.
+/// own — this is the full history, not a current/history split. Served
+/// from the maintained projection when its head matches; a fresh scan
+/// installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
     let session = catalog.begin_read().await?;
+    let head = session_head(&session).await?;
+    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
+        if let Some(rows) = projections_read(catalog).snapshots_at(head) {
+            session.finish();
+            return Ok(rows);
+        }
+        let result = scan_snapshots(session.handle()).await;
+        session.finish();
+        let rows = result?;
+        projections_write(catalog).install_snapshots(head, rows.clone());
+        return Ok(rows);
+    }
     let result = scan_snapshots(session.handle()).await;
     session.finish();
     result
@@ -239,7 +345,7 @@ pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersion
 /// deletion.
 #[doc(hidden)]
 pub async fn dump_scheduled_deletions(catalog: &Catalog) -> Result<Vec<GcFileValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_current_entities(catalog, |r| match r {
         EntityRecord::GcFile(v) => Some(v),
         _ => None,
     })
@@ -267,7 +373,7 @@ pub struct TagRow {
 /// filters in SQL.
 #[doc(hidden)]
 pub async fn dump_tags(catalog: &Catalog) -> Result<Vec<TagRow>> {
-    let containers = dump_entities(catalog, |r| match r {
+    let containers = dump_current_entities(catalog, |r| match r {
         EntityRecord::Tag(v) => Some(v),
         _ => None,
     })
@@ -453,6 +559,28 @@ mod tests {
         catalog
     }
 
+    /// Unversioned kinds (statistics, tags, scheduled deletions) live only
+    /// in `current`; their dumps must serve exactly the live rows on a
+    /// catalog whose history is non-empty.
+    #[tokio::test]
+    async fn unversioned_dumps_serve_live_rows_on_a_history_bearing_catalog() {
+        let catalog = seed().await;
+
+        let stats = dump_table_stats(&catalog).await.unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].record_count, 10);
+
+        let column_stats = dump_table_column_stats(&catalog).await.unwrap();
+        assert_eq!(column_stats.len(), 1);
+        assert_eq!(column_stats[0].min_value.as_deref(), Some("1"));
+
+        let file_stats = dump_file_column_stats(&catalog).await.unwrap();
+        assert_eq!(file_stats.len(), 1);
+
+        let deletions = dump_scheduled_deletions(&catalog).await.unwrap();
+        assert!(deletions.is_empty());
+    }
+
     #[tokio::test]
     async fn dump_schemas_returns_bootstrap_and_seeded_schemas_with_no_history() {
         let catalog = seed().await;
@@ -514,7 +642,7 @@ mod tests {
             .await
             .unwrap();
         let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin(db_tx);
+        let mut tx = StagedTransaction::begin_detached(db_tx);
         tx.stage(RowOperation::Insert {
             table: TableKind::ColumnMapping,
             cells: vec![Cell::U64(21), Cell::U64(1), Cell::Str("map_by_name".into())],
