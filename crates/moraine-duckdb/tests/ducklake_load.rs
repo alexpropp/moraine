@@ -329,6 +329,40 @@ mod tests {
         )
     }
 
+    /// As [`run_reference_ducklake_sql`], but for a statement that must
+    /// fail — the reference twin of [`run_ducklake_sql_expect_err`], so a
+    /// refusal can be asserted on both catalogs.
+    fn run_reference_ducklake_sql_expect_err(meta_dir: &Path, data_path: &Path, sql: &str) {
+        let output = Command::new(cli_path())
+            .arg("-csv")
+            .arg("-c")
+            .arg("SET threads=1;")
+            .arg("-c")
+            .arg(format!(
+                "SET extension_directory='{}';",
+                extension_directory().display()
+            ))
+            .arg("-c")
+            .arg("INSTALL ducklake;")
+            .arg("-c")
+            .arg("LOAD ducklake;")
+            .arg("-c")
+            .arg(format!(
+                "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}');",
+                meta_dir.join("meta.ducklake").display(),
+                data_path.display()
+            ))
+            .arg("-c")
+            .arg(sql)
+            .output()
+            .expect("failed to spawn duckdb CLI");
+        assert!(
+            !output.status.success(),
+            "reference: `{sql}` unexpectedly succeeded:\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
+
     fn csv_rows(output: &str) -> Vec<Vec<String>> {
         output
             .lines()
@@ -1925,133 +1959,169 @@ mod tests {
             ]
         );
     }
-    /// Table and column comments end to end: `COMMENT ON` lands
+
+    /// Table and column comments, differential against a stock DuckLake
+    /// catalog fed the identical statements: `COMMENT ON` lands
     /// `ducklake_tag` / `ducklake_column_tag` rows through the staged-row
     /// path, DuckLake reads them back, a re-comment ends the old entry
-    /// and inserts the new one, and the served rows carry both lifecycles
-    /// verbatim.
+    /// and inserts the new one, the served rows carry both lifecycles
+    /// row-for-row identical to the reference, and comments survive a
+    /// column rename.
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
     fn ducklake_table_and_column_comments_round_trip() {
-        let dir = TempDir::new("tags-store");
-        let data_dir = TempDir::new("tags-data");
-        let (store, data) = (dir.path(), data_dir.path());
+        let store = TempDir::new("tags-store");
+        let data = TempDir::new("tags-data");
+        let reference_meta = TempDir::new("tags-ref-meta");
+        let reference_data = TempDir::new("tags-ref-data");
 
-        run_ducklake_sql(
-            store,
-            data,
-            "CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);",
-        );
-        run_ducklake_sql(store, data, "COMMENT ON TABLE lake.main.t IS 'first';");
-        run_ducklake_sql(
-            store,
-            data,
-            "COMMENT ON COLUMN lake.main.t.a IS 'col comment';",
-        );
+        let apply = |sql: &str| {
+            run_ducklake_sql(store.path(), data.path(), sql);
+            run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+        };
+        let probe = |sql: &str| -> Vec<Vec<String>> {
+            let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+            let reference_rows = csv_rows(&run_reference_ducklake_sql(
+                reference_meta.path(),
+                reference_data.path(),
+                sql,
+            ));
+            assert_eq!(
+                moraine_rows, reference_rows,
+                "moraine diverges from stock DuckLake for `{sql}`"
+            );
+            moraine_rows
+        };
 
-        // DuckLake reads both comments back through its own catalog.
-        let table_comment = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT comment FROM duckdb_tables() WHERE table_name = 't';",
-        ));
-        assert_eq!(table_comment, vec![vec!["first".to_string()]]);
-        let column_comment = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT comment FROM duckdb_columns() WHERE table_name = 't' AND column_name = 'a';",
-        ));
-        assert_eq!(column_comment, vec![vec!["col comment".to_string()]]);
+        apply(
+            "CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);\
+             COMMENT ON TABLE lake.main.t IS 'first';\
+             COMMENT ON COLUMN lake.main.t.a IS 'col comment';",
+        );
+        assert_eq!(
+            probe("SELECT comment FROM duckdb_tables() WHERE table_name = 't';"),
+            vec![vec!["first".to_string()]]
+        );
+        assert_eq!(
+            probe(
+                "SELECT comment FROM duckdb_columns() \
+                 WHERE table_name = 't' AND column_name = 'a';"
+            ),
+            vec![vec!["col comment".to_string()]]
+        );
 
         // A re-comment is a set-end + insert pair: the old entry ends,
-        // the new one lands live.
-        run_ducklake_sql(store, data, "COMMENT ON TABLE lake.main.t IS 'second';");
-        let recomment = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT comment FROM duckdb_tables() WHERE table_name = 't';",
-        ));
-        assert_eq!(recomment, vec![vec!["second".to_string()]]);
-
-        // Row-faithful lifecycles on the served projections.
-        let tag_rows = run_standalone_sql(
-            store,
-            "SELECT value, end_snapshot IS NULL FROM m.ducklake_tag ORDER BY begin_snapshot;",
+        // the new one lands live, both rows lifecycle-identical to stock.
+        apply("COMMENT ON TABLE lake.main.t IS 'second';");
+        assert_eq!(
+            probe("SELECT comment FROM duckdb_tables() WHERE table_name = 't';"),
+            vec![vec!["second".to_string()]]
         );
         assert_eq!(
-            csv_rows(&tag_rows),
+            probe(
+                "SELECT object_id, begin_snapshot, end_snapshot, key, value \
+                 FROM __ducklake_metadata_lake.ducklake_tag ORDER BY begin_snapshot;"
+            ),
             vec![
-                vec!["first".to_string(), "false".to_string()],
-                vec!["second".to_string(), "true".to_string()],
+                vec![
+                    "1".to_string(),
+                    "2".to_string(),
+                    "4".to_string(),
+                    "comment".to_string(),
+                    "first".to_string(),
+                ],
+                vec![
+                    "1".to_string(),
+                    "4".to_string(),
+                    "NULL".to_string(),
+                    "comment".to_string(),
+                    "second".to_string(),
+                ],
             ]
         );
-        let column_tag_rows = run_standalone_sql(
-            store,
-            "SELECT column_id, value, end_snapshot IS NULL FROM m.ducklake_column_tag;",
-        );
         assert_eq!(
-            csv_rows(&column_tag_rows),
+            probe(
+                "SELECT table_id, column_id, begin_snapshot, end_snapshot, key, value \
+                 FROM __ducklake_metadata_lake.ducklake_column_tag;"
+            ),
             vec![vec![
                 "1".to_string(),
+                "1".to_string(),
+                "3".to_string(),
+                "NULL".to_string(),
+                "comment".to_string(),
                 "col comment".to_string(),
-                "true".to_string()
             ]]
         );
 
         // Column comments survive a column rename (a version transition
-        // carries the entries forward).
-        run_ducklake_sql(
-            store,
-            data,
-            "ALTER TABLE lake.main.t RENAME COLUMN a TO a2;",
+        // carries the entries forward), identically to stock.
+        apply("ALTER TABLE lake.main.t RENAME COLUMN a TO a2;");
+        assert_eq!(
+            probe(
+                "SELECT comment FROM duckdb_columns() \
+                 WHERE table_name = 't' AND column_name = 'a2';"
+            ),
+            vec![vec!["col comment".to_string()]]
         );
-        let renamed_comment = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT comment FROM duckdb_columns() WHERE table_name = 't' AND column_name = 'a2';",
-        ));
-        assert_eq!(renamed_comment, vec![vec!["col comment".to_string()]]);
     }
 
-    /// Snapshot expiry and file cleanup end to end: a dropped table's
+    /// Snapshot expiry and file cleanup, differential against a stock
+    /// DuckLake catalog fed the identical statements: a dropped table's
     /// snapshots expire (all but head), its rows vanish from every
-    /// projection, its Parquet lands on the deletion schedule with the
-    /// bytes intact, and `ducklake_cleanup_old_files` then deletes the
-    /// bytes and drains the schedule — all without minting snapshots.
+    /// metadata table identically to stock, its Parquet lands on the
+    /// deletion schedule with the bytes intact, and
+    /// `ducklake_cleanup_old_files` then deletes the bytes and drains the
+    /// schedule on both catalogs.
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
     fn ducklake_expire_and_cleanup_reclaims_files() {
-        let dir = TempDir::new("expire-store");
-        let data_dir = TempDir::new("expire-data");
-        let (store, data) = (dir.path(), data_dir.path());
+        let store = TempDir::new("expire-store");
+        let data = TempDir::new("expire-data");
+        let reference_meta = TempDir::new("expire-ref-meta");
+        let reference_data = TempDir::new("expire-ref-data");
 
-        run_ducklake_sql(store, data, "CREATE TABLE lake.main.t(a BIGINT);");
-        run_ducklake_sql(
-            store,
-            data,
-            "INSERT INTO lake.main.t SELECT i FROM range(100) t(i);",
+        let apply = |sql: &str| {
+            run_ducklake_sql(store.path(), data.path(), sql);
+            run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+        };
+        let probe = |sql: &str| -> Vec<Vec<String>> {
+            let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+            let reference_rows = csv_rows(&run_reference_ducklake_sql(
+                reference_meta.path(),
+                reference_data.path(),
+                sql,
+            ));
+            assert_eq!(
+                moraine_rows, reference_rows,
+                "moraine diverges from stock DuckLake for `{sql}`"
+            );
+            moraine_rows
+        };
+
+        apply(
+            "CREATE TABLE lake.main.t(a BIGINT);\
+             INSERT INTO lake.main.t SELECT i FROM range(100) t(i);",
         );
-        let written = parquet_files_under(data);
-        assert!(!written.is_empty(), "the insert must land real Parquet");
-        run_ducklake_sql(store, data, "DROP TABLE lake.main.t;");
+        assert_eq!(parquet_files_under(data.path()).len(), 1);
+        assert_eq!(parquet_files_under(reference_data.path()).len(), 1);
+        apply("DROP TABLE lake.main.t;");
 
         // Expire everything below head: snapshots 1 (create) and 2
-        // (insert) go; 3 (drop) survives as head. The dropped table's
-        // whole row set is now dead.
-        run_ducklake_sql(
-            store,
-            data,
-            "CALL ducklake_expire_snapshots('lake', older_than => now());",
-        );
-
-        let snapshots = run_standalone_sql(store, "SELECT snapshot_id FROM m.ducklake_snapshot;");
-        assert_eq!(csv_rows(&snapshots), vec![vec!["3".to_string()]]);
-        let dead_rows = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_table UNION ALL              SELECT count(*) FROM m.ducklake_column UNION ALL              SELECT count(*) FROM m.ducklake_data_file UNION ALL              SELECT count(*) FROM m.ducklake_table_stats;",
+        // (insert) go; 3 (drop) survives. The dropped table's whole row
+        // set is now dead, and both catalogs agree on the aftermath.
+        apply("CALL ducklake_expire_snapshots('lake', older_than => now());");
+        assert_eq!(
+            probe("SELECT snapshot_id FROM __ducklake_metadata_lake.ducklake_snapshot;"),
+            vec![vec!["3".to_string()]]
         );
         assert_eq!(
-            csv_rows(&dead_rows),
+            probe(
+                "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_table UNION ALL \
+                 SELECT count(*) FROM __ducklake_metadata_lake.ducklake_column UNION ALL \
+                 SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file UNION ALL \
+                 SELECT count(*) FROM __ducklake_metadata_lake.ducklake_table_stats;"
+            ),
             vec![
                 vec!["0".to_string()],
                 vec!["0".to_string()],
@@ -2061,267 +2131,299 @@ mod tests {
         );
 
         // Logical expiry deletes no bytes: the Parquet is scheduled, not
-        // gone.
-        let scheduled = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_files_scheduled_for_deletion;",
+        // gone (paths carry catalog-unique names, so counts compare).
+        assert_eq!(
+            probe(
+                "SELECT count(*), bool_and(path_is_relative) \
+                 FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion;"
+            ),
+            vec![vec!["1".to_string(), "true".to_string()]]
         );
-        assert!(
-            csv_rows(&scheduled)[0][0].parse::<u64>().expect("count") >= 1,
-            "the dead file must be scheduled: {scheduled}"
-        );
-        assert_eq!(parquet_files_under(data), written);
+        assert_eq!(parquet_files_under(data.path()).len(), 1);
+        assert_eq!(parquet_files_under(reference_data.path()).len(), 1);
 
-        // Time travel below the horizon no longer resolves; head still
-        // reads (the table is dropped, so its absence is the answer).
-        let travel = run_ducklake_sql_expect_err(
-            store,
-            data,
+        // Time travel below the horizon no longer resolves — on either.
+        run_ducklake_sql_expect_err(
+            store.path(),
+            data.path(),
             "SELECT count(*) FROM lake.main.t AT (VERSION => 2);",
         );
-        assert!(
-            travel.contains("does not exist") || travel.contains("No snapshot"),
-            "time travel to an expired snapshot must fail: {travel}"
+        run_reference_ducklake_sql_expect_err(
+            reference_meta.path(),
+            reference_data.path(),
+            "SELECT count(*) FROM lake.main.t AT (VERSION => 2);",
         );
 
-        run_ducklake_sql(
-            store,
-            data,
-            "CALL ducklake_cleanup_old_files('lake', cleanup_all => true);",
+        apply("CALL ducklake_cleanup_old_files('lake', cleanup_all => true);");
+        assert!(parquet_files_under(data.path()).is_empty());
+        assert!(parquet_files_under(reference_data.path()).is_empty());
+        assert_eq!(
+            probe(
+                "SELECT count(*) \
+                 FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion;"
+            ),
+            vec![vec!["0".to_string()]]
         );
-        assert!(
-            parquet_files_under(data).is_empty(),
-            "cleanup must delete the scheduled bytes"
-        );
-        let drained = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_files_scheduled_for_deletion;",
-        );
-        assert_eq!(csv_rows(&drained), vec![vec!["0".to_string()]]);
     }
 
-    /// Orphaned-file deletion end to end: a stray Parquet no catalog row
-    /// ever referenced is deleted, while every catalogued file survives
-    /// and still scans.
+    /// Orphaned-file deletion, differential against a stock DuckLake
+    /// catalog: a stray Parquet no catalog row ever referenced is deleted
+    /// on both, while every catalogued file survives and both catalogs
+    /// still answer identically.
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
     fn ducklake_delete_orphaned_files_ignores_catalogued_paths() {
-        let dir = TempDir::new("orphan-store");
-        let data_dir = TempDir::new("orphan-data");
-        let (store, data) = (dir.path(), data_dir.path());
+        let store = TempDir::new("orphan-store");
+        let data = TempDir::new("orphan-data");
+        let reference_meta = TempDir::new("orphan-ref-meta");
+        let reference_data = TempDir::new("orphan-ref-data");
 
-        run_ducklake_sql(store, data, "CREATE TABLE lake.main.t(a BIGINT);");
-        run_ducklake_sql(
-            store,
-            data,
-            "INSERT INTO lake.main.t SELECT i FROM range(100) t(i);",
+        let apply = |sql: &str| {
+            run_ducklake_sql(store.path(), data.path(), sql);
+            run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+        };
+        let probe = |sql: &str| -> Vec<Vec<String>> {
+            let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+            let reference_rows = csv_rows(&run_reference_ducklake_sql(
+                reference_meta.path(),
+                reference_data.path(),
+                sql,
+            ));
+            assert_eq!(
+                moraine_rows, reference_rows,
+                "moraine diverges from stock DuckLake for `{sql}`"
+            );
+            moraine_rows
+        };
+
+        apply(
+            "CREATE TABLE lake.main.t(a BIGINT);\
+             INSERT INTO lake.main.t SELECT i FROM range(100) t(i);",
         );
-        let catalogued = parquet_files_under(data);
-        assert!(!catalogued.is_empty());
+        let catalogued = parquet_files_under(data.path());
+        assert_eq!(catalogued.len(), 1);
 
-        // Plant a stray file under the table's data prefix: never
+        // Plant a stray file under each table's data prefix: never
         // catalogued, so nothing references it.
-        let stray = data.join("main").join("t").join("stray.parquet");
-        std::fs::write(&stray, b"not really parquet").expect("plant stray file");
+        for base in [data.path(), reference_data.path()] {
+            std::fs::write(
+                base.join("main").join("t").join("stray.parquet"),
+                b"not parquet",
+            )
+            .expect("plant stray file");
+        }
 
-        run_ducklake_sql(
-            store,
-            data,
-            "CALL ducklake_delete_orphaned_files('lake', cleanup_all => true);",
+        apply("CALL ducklake_delete_orphaned_files('lake', cleanup_all => true);");
+
+        assert_eq!(parquet_files_under(data.path()), catalogued);
+        assert_eq!(parquet_files_under(reference_data.path()).len(), 1);
+        assert!(
+            !data
+                .path()
+                .join("main")
+                .join("t")
+                .join("stray.parquet")
+                .exists()
         );
-
-        assert!(!stray.exists(), "the stray must be reaped");
-        assert_eq!(parquet_files_under(data), catalogued);
-        let count = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT count(*) FROM lake.main.t;",
-        ));
-        assert_eq!(count, vec![vec!["100".to_string()]]);
+        assert!(
+            !reference_data
+                .path()
+                .join("main")
+                .join("t")
+                .join("stray.parquet")
+                .exists()
+        );
+        assert_eq!(
+            probe("SELECT count(*) FROM lake.main.t;"),
+            vec![vec!["100".to_string()]]
+        );
     }
 
-    /// Merge compaction end to end: three small files merge into one,
-    /// rows and row ids are identical before and after, time travel to a
-    /// pre-merge snapshot still answers pre-merge, the sources land on
-    /// the deletion schedule (bytes intact until cleanup), `next_row_id`
-    /// is untouched, and an UPDATE after the merge still hits the right
-    /// row (lineage held).
+    /// Merge compaction, differential against a stock DuckLake catalog
+    /// fed the identical statements: three small files merge into one,
+    /// rows and row ids are identical to the reference before and after,
+    /// time travel to a pre-merge snapshot still answers pre-merge, the
+    /// sources land on the deletion schedule (bytes intact until
+    /// cleanup), `next_row_id` is untouched, and an UPDATE after the
+    /// merge still hits the right row on both catalogs (lineage held).
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    #[allow(clippy::too_many_lines)]
     fn ducklake_merge_adjacent_files_preserves_rows_and_time_travel() {
-        let dir = TempDir::new("merge-store");
-        let data_dir = TempDir::new("merge-data");
-        let (store, data) = (dir.path(), data_dir.path());
+        let store = TempDir::new("merge-store");
+        let data = TempDir::new("merge-data");
+        let reference_meta = TempDir::new("merge-ref-meta");
+        let reference_data = TempDir::new("merge-ref-data");
 
-        run_ducklake_sql(
-            store,
-            data,
-            "CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);",
-        );
-        for batch in 0..3 {
-            run_ducklake_sql(
-                store,
-                data,
-                &format!(
-                    "INSERT INTO lake.main.t                      SELECT i + {}, concat('v', i) FROM range(100) t(i);",
-                    batch * 100
-                ),
+        let apply = |sql: &str| {
+            run_ducklake_sql(store.path(), data.path(), sql);
+            run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+        };
+        let probe = |sql: &str| -> Vec<Vec<String>> {
+            let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+            let reference_rows = csv_rows(&run_reference_ducklake_sql(
+                reference_meta.path(),
+                reference_data.path(),
+                sql,
+            ));
+            assert_eq!(
+                moraine_rows, reference_rows,
+                "moraine diverges from stock DuckLake for `{sql}`"
             );
+            moraine_rows
+        };
+
+        apply("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+        for batch in 0..3 {
+            apply(&format!(
+                "INSERT INTO lake.main.t \
+                 SELECT i + {}, concat('v', i) FROM range(100) t(i);",
+                batch * 100
+            ));
         }
-        let live_before = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
-        );
-        assert_eq!(csv_rows(&live_before), vec![vec!["3".to_string()]]);
-        let rows_before = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT rowid, a FROM lake.main.t ORDER BY rowid;",
-        ));
-        let next_row_id_before =
-            run_standalone_sql(store, "SELECT next_row_id FROM m.ducklake_table_stats;");
-        let pre_merge = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT count(*) FROM lake.main.t AT (VERSION => 3);",
-        ));
-
-        run_ducklake_sql(store, data, "CALL ducklake_merge_adjacent_files('lake');");
-
-        let live_after = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
-        );
-        assert_eq!(csv_rows(&live_after), vec![vec!["1".to_string()]]);
-        let rows_after = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT rowid, a FROM lake.main.t ORDER BY rowid;",
-        ));
-        assert_eq!(rows_after, rows_before, "rows and row ids must survive");
         assert_eq!(
-            run_standalone_sql(store, "SELECT next_row_id FROM m.ducklake_table_stats;"),
+            probe(
+                "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+                 WHERE end_snapshot IS NULL;"
+            ),
+            vec![vec!["3".to_string()]]
+        );
+        let rows_before = probe("SELECT rowid, a FROM lake.main.t ORDER BY rowid;");
+        let next_row_id_before =
+            probe("SELECT next_row_id FROM __ducklake_metadata_lake.ducklake_table_stats;");
+        let pre_merge = probe("SELECT count(*) FROM lake.main.t AT (VERSION => 3);");
+
+        apply("CALL ducklake_merge_adjacent_files('lake');");
+
+        assert_eq!(
+            probe(
+                "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+                 WHERE end_snapshot IS NULL;"
+            ),
+            vec![vec!["1".to_string()]]
+        );
+        assert_eq!(
+            probe("SELECT rowid, a FROM lake.main.t ORDER BY rowid;"),
+            rows_before,
+            "rows and row ids must survive the merge"
+        );
+        assert_eq!(
+            probe("SELECT next_row_id FROM __ducklake_metadata_lake.ducklake_table_stats;"),
             next_row_id_before,
             "compaction never allocates row ids"
         );
 
         // The sources are scheduled, bytes intact until cleanup.
-        let scheduled = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_files_scheduled_for_deletion;",
-        );
-        assert_eq!(csv_rows(&scheduled), vec![vec!["3".to_string()]]);
         assert_eq!(
-            parquet_files_under(data).len(),
-            4,
-            "merge writes the new file and deletes no bytes"
+            probe(
+                "SELECT count(*) \
+                 FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion;"
+            ),
+            vec![vec!["3".to_string()]]
         );
+        assert_eq!(parquet_files_under(data.path()).len(), 4);
+        assert_eq!(parquet_files_under(reference_data.path()).len(), 4);
 
         // Time travel to a pre-merge snapshot answers exactly as before.
-        let travelled = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT count(*) FROM lake.main.t AT (VERSION => 3);",
-        ));
-        assert_eq!(travelled, pre_merge);
+        assert_eq!(
+            probe("SELECT count(*) FROM lake.main.t AT (VERSION => 3);"),
+            pre_merge
+        );
 
         // Row lineage holds through the merge.
-        run_ducklake_sql(
-            store,
-            data,
-            "UPDATE lake.main.t SET b = 'updated' WHERE a = 150;",
+        apply("UPDATE lake.main.t SET b = 'updated' WHERE a = 150;");
+        assert_eq!(
+            probe("SELECT b FROM lake.main.t WHERE a = 150;"),
+            vec![vec!["updated".to_string()]]
         );
-        let updated = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT b FROM lake.main.t WHERE a = 150;",
-        ));
-        assert_eq!(updated, vec![vec!["updated".to_string()]]);
 
-        run_ducklake_sql(
-            store,
-            data,
-            "CALL ducklake_cleanup_old_files('lake', cleanup_all => true);",
+        apply("CALL ducklake_cleanup_old_files('lake', cleanup_all => true);");
+        assert_eq!(
+            probe(
+                "SELECT count(*) \
+                 FROM __ducklake_metadata_lake.ducklake_files_scheduled_for_deletion;"
+            ),
+            vec![vec!["0".to_string()]]
         );
-        let remaining = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_files_scheduled_for_deletion;",
+        assert_eq!(
+            probe("SELECT count(*) FROM lake.main.t;"),
+            vec![vec!["300".to_string()]]
         );
-        assert_eq!(csv_rows(&remaining), vec![vec!["0".to_string()]]);
-        let count = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT count(*) FROM lake.main.t;",
-        ));
-        assert_eq!(count, vec![vec!["300".to_string()]]);
     }
 
-    /// Delete-rewrite compaction end to end: after a DELETE, the rewrite
+    /// Delete-rewrite compaction, differential against a stock DuckLake
+    /// catalog fed the identical statements: after a DELETE, the rewrite
     /// leaves one live data file and no live delete file, survivors keep
-    /// their row ids, and time travel to the pre-rewrite snapshot still
-    /// shows the deleted rows.
+    /// their row ids row-for-row with the reference, and time travel to
+    /// the pre-rewrite snapshot still shows the deleted rows.
     #[test]
     #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
     fn ducklake_rewrite_data_files_materializes_deletes() {
-        let dir = TempDir::new("rewrite-store");
-        let data_dir = TempDir::new("rewrite-data");
-        let (store, data) = (dir.path(), data_dir.path());
+        let store = TempDir::new("rewrite-store");
+        let data = TempDir::new("rewrite-data");
+        let reference_meta = TempDir::new("rewrite-ref-meta");
+        let reference_data = TempDir::new("rewrite-ref-data");
 
-        run_ducklake_sql(store, data, "CREATE TABLE lake.main.t(a BIGINT);");
-        run_ducklake_sql(
-            store,
-            data,
-            "INSERT INTO lake.main.t SELECT i FROM range(100) t(i);",
-        );
-        run_ducklake_sql(store, data, "DELETE FROM lake.main.t WHERE a % 2 = 0;");
-        let live_deletes = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_delete_file WHERE end_snapshot IS NULL;",
-        );
-        assert_eq!(csv_rows(&live_deletes), vec![vec!["1".to_string()]]);
-        let survivors_before = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT rowid, a FROM lake.main.t ORDER BY rowid;",
-        ));
+        let apply = |sql: &str| {
+            run_ducklake_sql(store.path(), data.path(), sql);
+            run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+        };
+        let probe = |sql: &str| -> Vec<Vec<String>> {
+            let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+            let reference_rows = csv_rows(&run_reference_ducklake_sql(
+                reference_meta.path(),
+                reference_data.path(),
+                sql,
+            ));
+            assert_eq!(
+                moraine_rows, reference_rows,
+                "moraine diverges from stock DuckLake for `{sql}`"
+            );
+            moraine_rows
+        };
 
-        run_ducklake_sql(
-            store,
-            data,
-            "CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.1);",
-        );
-
-        let live_files = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
-        );
-        assert_eq!(csv_rows(&live_files), vec![vec!["1".to_string()]]);
-        let deletes_after = run_standalone_sql(
-            store,
-            "SELECT count(*) FROM m.ducklake_delete_file WHERE end_snapshot IS NULL;",
+        apply(
+            "CREATE TABLE lake.main.t(a BIGINT);\
+             INSERT INTO lake.main.t SELECT i FROM range(100) t(i);\
+             DELETE FROM lake.main.t WHERE a % 2 = 0;",
         );
         assert_eq!(
-            csv_rows(&deletes_after),
+            probe(
+                "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file \
+                 WHERE end_snapshot IS NULL;"
+            ),
+            vec![vec!["1".to_string()]]
+        );
+        let survivors_before = probe("SELECT rowid, a FROM lake.main.t ORDER BY rowid;");
+
+        apply("CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.1);");
+
+        assert_eq!(
+            probe(
+                "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+                 WHERE end_snapshot IS NULL;"
+            ),
+            vec![vec!["1".to_string()]]
+        );
+        assert_eq!(
+            probe(
+                "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file \
+                 WHERE end_snapshot IS NULL;"
+            ),
             vec![vec!["0".to_string()]],
             "the rewrite consumes the delete file"
         );
-        let survivors_after = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT rowid, a FROM lake.main.t ORDER BY rowid;",
-        ));
         assert_eq!(
-            survivors_after, survivors_before,
+            probe("SELECT rowid, a FROM lake.main.t ORDER BY rowid;"),
+            survivors_before,
             "survivors keep their row ids"
         );
 
         // The ended rows stay in history: time travel to the pre-delete
         // snapshot still sees all 100 rows.
-        let travelled = csv_rows(&run_ducklake_sql(
-            store,
-            data,
-            "SELECT count(*) FROM lake.main.t AT (VERSION => 2);",
-        ));
-        assert_eq!(travelled, vec![vec!["100".to_string()]]);
+        assert_eq!(
+            probe("SELECT count(*) FROM lake.main.t AT (VERSION => 2);"),
+            vec![vec!["100".to_string()]]
+        );
     }
 }
