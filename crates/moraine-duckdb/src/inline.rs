@@ -420,6 +420,97 @@ pub unsafe extern "C" fn moraine_inline_file_delete_table_exists(
     }
 }
 
+/// One `ducklake_inlined_delete_<t>` row, as returned by
+/// [`moraine_inline_file_deletes`].
+#[repr(C)]
+pub struct MoraineInlineFileDeleteRow {
+    /// The targeted data file.
+    pub file_id: u64,
+    /// The deleted row.
+    pub row_id: u64,
+    /// The commit snapshot the delete takes effect at.
+    pub begin_snapshot: u64,
+}
+
+/// Dumps every `inline/file_delete` record for `table_id` in
+/// `(file_id, row_id)` order — the rows behind the
+/// `ducklake_inlined_delete_<t>` projection.
+///
+/// # Safety
+///
+/// Same pointer contract as [`moraine_inline_scan`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_inline_file_deletes(
+    handle: *mut MoraineCatalogHandle,
+    table_id: u64,
+    out_items: *mut *mut MoraineInlineFileDeleteRow,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineInlineFileDeleteRow>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let file_deletes = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::inline::inline_file_deletes(&handle_ref.catalog, table_id),
+            )
+        }?;
+        Ok(file_deletes
+            .into_iter()
+            .map(
+                |(file_id, row_id, begin_snapshot)| MoraineInlineFileDeleteRow {
+                    file_id,
+                    row_id,
+                    begin_snapshot,
+                },
+            )
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees an array returned by [`moraine_inline_file_deletes`]. No owned
+/// buffers inside — releases only the backing allocation.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_inline_file_deletes`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_inline_file_deletes_free(
+    items: *mut MoraineInlineFileDeleteRow,
+    len: usize,
+) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |_| {});
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::CString, ptr};

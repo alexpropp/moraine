@@ -133,8 +133,23 @@ on that path.
   it serves every `ducklake_*` row current-and-history with begin/end
   snapshots and backdates flushed files, and DuckLake filters by version in
   its own SQL
-- [ ] Change data feed: changes between snapshots (`snapshot_changes`)
-  (RFC 0020)
+- [x] Change data feed: changes between snapshots (`snapshot_changes`)
+  (RFC 0020): DuckLake's `ducklake_table_changes`/`_insertions`/`_deletions`
+  are DuckLake's own scans over the served projections — moraine adds no
+  feed logic. Verified live *and differentially* against a stock DuckLake
+  catalog fed identical statements (`ducklake_load.rs`'s
+  `ducklake_change_feed_attributes_inline_changes` and
+  `ducklake_change_feed_survives_flush_and_file_deletes`): per-snapshot
+  insert attribution with stable rowids, deletes carrying preimage values,
+  `UPDATE` pre/postimage pairing, ranges crossing a flush (backdating +
+  `partial_max`), timestamp bounds, and insertions/deletions agreeing with
+  the feed. The differential surfaced two serving fixes: an inline
+  `UPDATE`'s tombstone no longer ends the same commit's re-inserted row
+  (`materialize_inline_rows` now mirrors DuckLake's
+  `begin_snapshot != {SNAPSHOT_ID}` writer guard), and
+  `ducklake_inlined_delete_<t>` reads back through the new
+  `moraine_inline_file_deletes` ABI — it was write-only, so the first
+  post-flush `DELETE`/`UPDATE` used to wedge every later attach
 
 ## Maintenance & operations
 - [ ] Compaction / data-file rewriting (RFC 0008)

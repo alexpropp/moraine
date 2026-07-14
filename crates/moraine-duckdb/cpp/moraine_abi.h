@@ -487,6 +487,19 @@ int32_t moraine_inline_file_delete_table_exists(MoraineCatalogHandle *handle, ui
                                           MoraineInterruptProbe probe, void *probe_ctx,
                 MoraineError *err);
 
+// Mirrors `moraine_duckdb::inline::MoraineInlineFileDeleteRow`.
+typedef struct MoraineInlineFileDeleteRow {
+	uint64_t file_id;
+	uint64_t row_id;
+	uint64_t begin_snapshot;
+} MoraineInlineFileDeleteRow;
+
+int32_t moraine_inline_file_deletes(MoraineCatalogHandle *handle, uint64_t table_id,
+                                          MoraineInlineFileDeleteRow **out_items, size_t *out_len,
+                                          MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_inline_file_deletes_free(MoraineInlineFileDeleteRow *items, size_t len);
+
 // The staged-row write path (src/staged.rs): DuckLake authors row
 // mutations against the ducklake_* metadata tables over ordinary SQL; the
 // shim translates each row into a MoraineCell array and stages it here,

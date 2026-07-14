@@ -50,10 +50,18 @@ pub fn materialize_inline_rows(
 
         for offset in 0..value.row_count {
             let row_id = value.row_id_start + offset;
+            // A tombstone ends only a version begun before it: an `UPDATE`
+            // tombstones a row and re-inserts its `row_id` in one commit,
+            // and the re-inserted version must stay live (DuckLake's own
+            // writer guards `begin_snapshot != {SNAPSHOT_ID}`).
+            let end_snapshot = tombstones
+                .get(&row_id)
+                .copied()
+                .filter(|&end| begin_snapshot < end);
             rows.push(InlineRow {
                 row_id,
                 begin_snapshot,
-                end_snapshot: tombstones.get(&row_id).copied(),
+                end_snapshot,
                 chunk: chunk_index,
                 offset_in_chunk: offset,
             });
@@ -235,6 +243,28 @@ mod tests {
             row_ids(&InlineScanKind::Deletions.select(&rows, 6, 1)),
             [1, 3]
         );
+    }
+
+    /// An `UPDATE` tombstones a row and re-inserts the same `row_id` in
+    /// one commit. The tombstone ends only the pre-existing version
+    /// (DuckLake's own writer guards `begin_snapshot != {SNAPSHOT_ID}`);
+    /// the re-inserted version stays live.
+    #[test]
+    fn tombstone_does_not_end_the_same_commit_reinsertion() {
+        let chunks = vec![(insert(2), chunk(0, 1)), (insert(5), chunk(0, 1))];
+        let inline_deletes = vec![(0, InlineInlineDeleteValue { end_snapshot: 5 })];
+        let rows = materialize_inline_rows(&chunks, &inline_deletes);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].begin_snapshot, rows[0].end_snapshot), (2, Some(5)));
+        assert_eq!((rows[1].begin_snapshot, rows[1].end_snapshot), (5, None));
+
+        // The updated row is live at its own snapshot; the deletions scan
+        // reports only the pre-existing version.
+        assert_eq!(InlineScanKind::Table.select(&rows, 5, 0).len(), 1);
+        let deleted = InlineScanKind::Deletions.select(&rows, 5, 5);
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].begin_snapshot, 2);
     }
 
     #[test]
