@@ -48,6 +48,12 @@ fn duckdb_cli_root() -> PathBuf {
     workspace_root().join("target/duckdb-cli")
 }
 
+/// Cache root for `INSTALL ducklake`-style downloaded extensions,
+/// gitignored under `target/`.
+pub fn extension_install_directory() -> PathBuf {
+    workspace_root().join("target/duckdb-extensions")
+}
+
 fn cdylib_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "libmoraine_duckdb.dylib"
