@@ -262,6 +262,50 @@ impl CatalogSnapshot {
         })
     }
 
+    /// Every tag row on `object_id` (a schema/table/view id), ended
+    /// entries included — each entry carries its own begin/end, so
+    /// callers filter by lifecycle where it matters.
+    #[must_use]
+    pub fn tags_of(&self, object_id: u64) -> Vec<TagEntry> {
+        self.tags
+            .get(&object_id)
+            .map(|container| {
+                container
+                    .entries
+                    .iter()
+                    .map(|e| TagEntry {
+                        begin_snapshot: e.begin_snapshot,
+                        end_snapshot: e.end_snapshot,
+                        key: e.key.clone(),
+                        value: e.value.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn put_tag(&mut self, value: TagValue) {
+        self.tags.insert(value.object_id, value);
+    }
+
+    /// Files scheduled for physical deletion, ascending by file id.
+    #[must_use]
+    pub fn scheduled_deletions(&self) -> Vec<ScheduledDeletion> {
+        self.gc_files
+            .values()
+            .map(|g| ScheduledDeletion {
+                data_file_id: g.data_file_id,
+                path: g.path.clone(),
+                path_is_relative: g.path_is_relative,
+                schedule_start_micros: g.schedule_start_micros,
+            })
+            .collect()
+    }
+
+    pub(crate) fn put_gc_file(&mut self, value: GcFileValue) {
+        self.gc_files.insert(value.data_file_id, value);
+    }
+
     pub(crate) fn put_schema(&mut self, value: SchemaValue) {
         if let Some(old) = self.schemas.get(&value.schema_id) {
             self.schema_names.remove(&old.schema_name);
@@ -540,7 +584,6 @@ mod tests {
             schema_version: 0,
             next_catalog_id: 10,
             next_file_id: 0,
-            next_deletion_id: 0,
             changes_made: String::new(),
             author: None,
             commit_message: None,

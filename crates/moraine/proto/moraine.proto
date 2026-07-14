@@ -226,8 +226,6 @@ message OptionScopeValue {
 }
 
 // ducklake_snapshot + ducklake_snapshot_changes, merged (1:1).
-// next_deletion_id is moraine's gcfile counter, allocated
-// alongside DuckLake's counters.
 // schema_changed_table_ids also folds in this snapshot's
 // ducklake_schema_versions rows: each row DuckLake writes there is
 // (snapshot_id, schema_version, table_id) with the first two always the
@@ -239,7 +237,9 @@ message SnapshotValue {
   uint64 schema_version = 3;
   uint64 next_catalog_id = 4;
   uint64 next_file_id = 5;
-  uint64 next_deletion_id = 6;
+  // Field 6 held a retired gcfile counter (the schedule is keyed by
+  // DuckLake's data_file_id now); reserved so it is never reused.
+  reserved 6;
   string changes_made = 7;
   optional string author = 8;
   optional string commit_message = 9;

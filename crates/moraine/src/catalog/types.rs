@@ -298,6 +298,36 @@ pub struct SnapshotInfo {
     pub schema_version: u64,
 }
 
+/// One tag on a catalog object: a key/value row, begin/end-versioned
+/// like any temporal row. Ended entries stay readable for time travel
+/// until garbage-collected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagEntry {
+    /// Snapshot at which this tag value became visible.
+    pub begin_snapshot: u64,
+    /// Snapshot at which it was superseded, if it has been.
+    pub end_snapshot: Option<u64>,
+    /// Tag key (e.g. `comment`).
+    pub key: String,
+    /// Tag value.
+    pub value: String,
+}
+
+/// One `ducklake_files_scheduled_for_deletion` row: a path awaiting
+/// physical deletion, decoupled from the expiry that scheduled it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledDeletion {
+    /// The data or delete file id the path belonged to (the schedule's
+    /// row identity).
+    pub data_file_id: u64,
+    /// Object-store path, relative iff `path_is_relative`.
+    pub path: String,
+    /// Whether `path` is relative to the table's data prefix.
+    pub path_is_relative: bool,
+    /// Microseconds since epoch, UTC, when the file was scheduled.
+    pub schedule_start_micros: i64,
+}
+
 /// An option scope: global, or one schema or table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptionScope {

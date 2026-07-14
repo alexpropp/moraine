@@ -72,11 +72,15 @@ struct MetadataTableSpec {
 	// convention on the staged-row path.
 	duckdb::idx_t end_snapshot_column = 0;
 	// Indices into `columns` of a removed row's key columns, in exactly
-	// the order the staged ABI's raw-delete decoder consumes them.
-	// Non-empty only for the three unversioned statistics kinds; a raw
-	// DELETE against any other table is not translatable and throws at
-	// plan time.
+	// the order the staged ABI's raw-delete decoder consumes them. Empty
+	// means raw DELETEs are not translatable for this table: they plan as
+	// void-deletes that throw if a row ever actually matches.
 	std::vector<duckdb::idx_t> delete_key_columns;
+	// Whether an UPDATE with an arbitrary SET list overlays the row in
+	// place (the unversioned statistics kinds only). Distinct from
+	// `delete_key_columns`: reclamation gave most kinds a delete key, but
+	// overlay updates stay a statistics-table convention.
+	bool overlay_updatable = false;
 };
 
 // The fixed list of synthesized tables, in the order they're registered.

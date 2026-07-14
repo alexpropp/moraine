@@ -645,16 +645,19 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanInsert(duckdb::ClientContext &, du
 
 duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, duckdb::PhysicalPlanGenerator &planner,
                                                      duckdb::LogicalDelete &op, duckdb::PhysicalOperator &plan) {
-	// Same target discipline as PlanInsert; which DELETE forms translate
-	// (only the unversioned statistics kinds, or the inline-data table's
-	// flush cleanup) is decided in PlanMetadataDelete/PlanInlineDataDelete.
+	// Same target discipline as PlanInsert, but does not reject a
+	// `kNotWritable` target outright: the expiry cascade issues DELETEs
+	// against always-empty stand-ins unconditionally, which
+	// PlanMetadataDelete plans as void-deletes (throwing only if a row
+	// ever actually matches). Which DELETE forms translate for real is
+	// decided in PlanMetadataDelete/PlanInlineDataDelete.
 	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {
 		auto &delete_op = PlanInlineDataDelete(planner, op, *inline_data_table);
 		delete_op.children.push_back(plan);
 		return delete_op;
 	}
 	auto *metadata_table = dynamic_cast<MoraineMetadataTableEntry *>(&op.table);
-	if (metadata_table == nullptr || metadata_table->Spec().write_table_kind == kNotWritable) {
+	if (metadata_table == nullptr) {
 		throw duckdb::NotImplementedException("moraine: DELETE is not supported on \"%s\"", op.table.name);
 	}
 	auto &delete_op = PlanMetadataDelete(planner, op, metadata_table->Spec());

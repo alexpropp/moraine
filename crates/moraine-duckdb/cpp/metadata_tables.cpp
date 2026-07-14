@@ -1036,7 +1036,11 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"path_is_relative", "BOOLEAN", false},
 	            {"schedule_start", "TIMESTAMPTZ", false},
 	        },
-	        ProvideEmpty,
+	        ProvideScheduledDeletions,
+	        19,
+	        {},
+	        0,
+	        /* delete key: data_file_id */ {0},
 	    },
 	    {
 	        "ducklake_column_mapping",

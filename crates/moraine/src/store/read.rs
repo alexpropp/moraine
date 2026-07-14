@@ -155,8 +155,9 @@ pub(crate) async fn scan_current_entities(tx: ReadHandle<'_>) -> Result<Vec<Enti
             Key::Current(CurrentKey::Entity(entity)) => {
                 records.push(decode_entity(entity, &entry.value)?);
             }
-            // Gc-file bookkeeping has no catalog meaning; skipped by design.
-            Key::Current(CurrentKey::GcFile { .. }) => {}
+            Key::Current(CurrentKey::GcFile { .. }) => {
+                records.push(EntityRecord::GcFile(value::decode_value(&entry.value)?));
+            }
             other => {
                 return Err(Error::Corruption(format!(
                     "non-current key in current scan: {other:?}"

@@ -273,6 +273,72 @@ pub unsafe extern "C" fn moraine_tx_stage(
     }
 }
 
+/// Dumps every `ducklake_snapshot` row **as this transaction sees it**:
+/// committed rows at the transaction's read point minus the snapshot
+/// deletes staged so far. The expiry cascade's own `NOT EXISTS`
+/// subqueries re-read `ducklake_snapshot` after staging deletes and must
+/// observe them — a committed-state dump would silently under-reclaim.
+/// Freed with `moraine_dump_snapshots_free`.
+///
+/// # Safety
+///
+/// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
+/// and not yet committed or rolled back; its catalog must still be
+/// attached. `out_items`/`out_len` must be valid, writable pointers.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
+/// for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_dump_snapshots(
+    tx: *mut MoraineTxHandle,
+    out_items: *mut *mut MoraineSnapshotRow,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineSnapshotRow>, AbiError> {
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract above.
+        let tx_ref = unsafe { &*tx };
+        // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
+        let catalog_ref = unsafe { &*tx_ref.catalog };
+        let rows = catalog_ref
+            .runtime
+            .block_on(tx_ref.tx.visible_snapshots())
+            .map_err(AbiError::from)?;
+        snapshot_rows(
+            rows.into_iter()
+                .map(|v| {
+                    (
+                        v.snapshot_id,
+                        v.snapshot_time_micros,
+                        v.schema_version,
+                        v.next_catalog_id,
+                        v.next_file_id,
+                        v.changes_made,
+                        v.author,
+                        v.commit_message,
+                        v.commit_extra_info,
+                    )
+                })
+                .collect(),
+        )
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// Translates every staged row and lands them in one atomic batch,
 /// consuming `tx`. On success, writes the new snapshot id to
 /// `*out_snapshot_id`.
@@ -1416,6 +1482,7 @@ mod tests {
         let header = include_str!("../cpp/moraine_abi.h");
         let names = [
             "moraine_tx_begin",
+            "moraine_tx_dump_snapshots",
             "moraine_tx_stage",
             "moraine_tx_commit",
             "moraine_tx_rollback",

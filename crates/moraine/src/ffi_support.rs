@@ -18,9 +18,9 @@ use crate::{
     error::Result,
     store::{
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, PartitionValue,
-            SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue,
-            TableValue, ViewValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
+            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
+            TableStatsValue, TableValue, ViewValue,
         },
         read::{EntityRecord, scan_current_entities, scan_history_entities, scan_snapshots},
     },

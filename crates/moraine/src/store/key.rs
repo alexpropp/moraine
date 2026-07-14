@@ -54,10 +54,13 @@ pub(crate) enum SysKey {
 pub(crate) enum CurrentKey {
     /// A live entity version.
     Entity(EntityKey),
-    /// `ducklake_files_scheduled_for_deletion`.
+    /// `ducklake_files_scheduled_for_deletion`. Keyed by the scheduled
+    /// file's id — the row's identity in DuckLake's own schema (inserts
+    /// carry it, cleanup deletes by it), unique because a file's catalog
+    /// rows are removed in the same transaction that schedules it.
     GcFile {
-        /// Deletion id (global counter).
-        deletion_id: u64,
+        /// The scheduled data or delete file's id.
+        data_file_id: u64,
     },
 }
 
@@ -515,7 +518,7 @@ mod tests {
     fn golden_gcfile_key() {
         let mut expect = vec![0x04, 0x03];
         expect.extend(be(5));
-        let key = Key::Current(CurrentKey::GcFile { deletion_id: 5 });
+        let key = Key::Current(CurrentKey::GcFile { data_file_id: 5 });
         assert_eq!(key.encode(), expect);
     }
 
@@ -586,7 +589,7 @@ mod tests {
                 },
                 8,
             ),
-            Key::Current(CurrentKey::GcFile { deletion_id: 0 }),
+            Key::Current(CurrentKey::GcFile { data_file_id: 0 }),
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 table_id: 1,
                 data_file_id: 2,
@@ -799,7 +802,7 @@ mod tests {
             any::<u64>().prop_map(|snapshot_id| Key::Snapshot { snapshot_id }),
             arb_entity().prop_map(Key::current),
             (arb_entity(), any::<u64>()).prop_map(|(entity, end)| Key::history(entity, end)),
-            any::<u64>().prop_map(|deletion_id| Key::Current(CurrentKey::GcFile { deletion_id })),
+            any::<u64>().prop_map(|data_file_id| Key::Current(CurrentKey::GcFile { data_file_id })),
             any::<(u64, u64)>().prop_map(|(table_id, schema_version)| {
                 Key::Inline(InlineKey::Schema {
                     table_id,

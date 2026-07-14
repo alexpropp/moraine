@@ -348,6 +348,65 @@ public:
 	}
 };
 
+// The expiry cascade's dead-table cleanup deletes each dead table's
+// `ducklake_inlined_data_tables` registration — DuckLake defers
+// inline-table cleanup to expiry, not DROP TABLE, so the row is real.
+// Each matched row stages the registration's removal (the paired dynamic
+// `DROP TABLE IF EXISTS ducklake_inlined_data_<t>_<v>` in the same
+// cascade removes the chunks through the ordinary drop path).
+class MoraineInlineRegistryDelete : public MoraineMetadataDml {
+public:
+	MoraineInlineRegistryDelete(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
+	                            const MetadataTableSpec &spec, duckdb::Catalog &catalog,
+	                            duckdb::idx_t estimated_cardinality, duckdb::idx_t row_id_chunk_index)
+	    : MoraineMetadataDml(physical_plan, std::move(types), spec, catalog, estimated_cardinality),
+	      row_id_chunk_index_(row_id_chunk_index) {
+	}
+
+	duckdb::idx_t row_id_chunk_index_;
+
+	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
+	                            duckdb::OperatorSinkInput &input) const override {
+		auto &state = input.global_state.Cast<MetadataDmlState>();
+		auto *tx = StagedTx(context.client);
+
+		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
+			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_chunk_index_, row), context.client);
+			// Column order: table_id, table_name, schema_version.
+			auto table_id = old_row[0].GetValue<uint64_t>();
+			auto schema_version = old_row[2].GetValue<uint64_t>();
+			MoraineError err{};
+			auto code = moraine_tx_stage_inline_schema_drop(tx, table_id, schema_version, &err);
+			if (code != MORAINE_OK) {
+				ThrowMoraineError(err);
+			}
+			state.affected_count++;
+		}
+		return duckdb::SinkResultType::NEED_MORE_INPUT;
+	}
+};
+
+// Raw DELETEs against tables with no delete translation (always-empty
+// stand-ins, `ducklake_metadata`, the void-insertable inline registry)
+// plan as a no-op that still binds — the expiry cascade issues them
+// unconditionally — but throws if a row ever actually matches, exactly
+// like MoraineMetadataVoidUpdate: silence would lose a real deletion.
+class MoraineMetadataVoidDelete : public MoraineMetadataDml {
+public:
+	using MoraineMetadataDml::MoraineMetadataDml;
+
+	duckdb::SinkResultType Sink(duckdb::ExecutionContext &, duckdb::DataChunk &chunk,
+	                            duckdb::OperatorSinkInput &) const override {
+		if (chunk.size() != 0) {
+			throw duckdb::InternalException(
+			    "moraine: DELETE on \"%s\" unexpectedly matched %llu row(s) — this table has no delete "
+			    "translation on the staged-row path and was assumed to always be empty",
+			    spec_.name, static_cast<unsigned long long>(chunk.size()));
+		}
+		return duckdb::SinkResultType::NEED_MORE_INPUT;
+	}
+};
+
 // Extracts the chunk index each SET expression's value arrives in. After
 // column-binding resolution every SET expression is a plain bound
 // reference (or a BOUND_DEFAULT for `SET col = DEFAULT`, which DuckLake
@@ -436,10 +495,18 @@ duckdb::PhysicalOperator &PlanMetadataDelete(duckdb::PhysicalPlanGenerator &plan
 		                                      op.table.name);
 	}
 	if (spec.delete_key_columns.empty()) {
-		// Versioned kinds are never raw-deleted on the staged-row path
-		// (their rows end via the UPDATE lifecycle convention); DELETEs
-		// against them belong to snapshot-expiry cleanup, deferred.
-		throw duckdb::NotImplementedException("moraine: DELETE is not supported on \"%s\"", spec.name);
+		if (spec.write_table_kind == kVoidInsertable) {
+			// `ducklake_inlined_data_tables`: the one registry-backed
+			// table, deleted for real by the expiry cascade.
+			if (op.expressions.size() != 1) {
+				throw duckdb::InternalException(
+				    "moraine: expected exactly one row-id expression for DELETE on \"%s\"", spec.name);
+			}
+			auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
+			return planner.Make<MoraineInlineRegistryDelete>(op.types, spec, op.table.catalog,
+			                                                 op.estimated_cardinality, bound_ref.index);
+		}
+		return planner.Make<MoraineMetadataVoidDelete>(op.types, spec, op.table.catalog, op.estimated_cardinality);
 	}
 	// Pinned layout: expressions[0] is the bound reference locating the
 	// row-id column in the child chunk (a single rowid — the base

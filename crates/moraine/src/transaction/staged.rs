@@ -83,6 +83,13 @@ pub enum TableKind {
     SortInfo,
     /// `ducklake_sort_expression` — folded into its spec's record.
     SortExpression,
+    /// `ducklake_tag` — an entry in its object's container record.
+    Tag,
+    /// `ducklake_column_tag` — an entry embedded in its column's record.
+    ColumnTag,
+    /// `ducklake_files_scheduled_for_deletion` — the physical-deletion
+    /// schedule, keyed by the scheduled file's id.
+    FilesScheduledForDeletion,
 }
 
 /// One column value in a staged row, typed to the small set of primitive
@@ -117,10 +124,10 @@ pub enum RowOperation {
         /// The row's column values, in table order.
         cells: Vec<Cell>,
     },
-    /// A row removed with no history mirror. Defined only for the three
-    /// unversioned statistics kinds — DuckLake never issues a raw
-    /// `DELETE` against a versioned kind, always the `UPDATE` convention
-    /// below.
+    /// A row removed with no history mirror: the unversioned statistics
+    /// kinds and the deletion schedule, plus the hard prunes maintenance
+    /// issues — snapshot records, dead entity versions (`current` or
+    /// `history`, named by their `end_snapshot`), and dead tag entries.
     Delete {
         /// The row's table.
         table: TableKind,
@@ -1425,10 +1432,7 @@ fn find_snapshot_rows(ops: &[RowOperation]) -> Result<(&[Cell], &[Cell])> {
     Ok((snapshot, changes))
 }
 
-fn build_snapshot_value(
-    ops: &[RowOperation],
-    next_deletion_id: u64,
-) -> Result<proto::SnapshotValue> {
+fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::SnapshotValue> {
     let (snapshot_cells, changes_cells) = find_snapshot_rows(ops)?;
 
     let mut s = Cursor::new(TableKind::Snapshot, snapshot_cells);
@@ -1493,7 +1497,6 @@ fn build_snapshot_value(
         schema_version,
         next_catalog_id,
         next_file_id,
-        next_deletion_id,
         changes_made,
         author,
         commit_message,
@@ -1534,16 +1537,54 @@ impl StagedTransaction {
         self.db_tx.rollback();
     }
 
+    /// Snapshot records as this transaction sees them: the committed
+    /// rows at its read point, minus the snapshot deletes staged so far.
+    /// The expiry cascade re-reads `ducklake_snapshot` after staging its
+    /// deletes (its dead-row rule is `NOT EXISTS` over the survivors), so
+    /// the projection must observe the transaction's own writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged snapshot-delete row
+    /// is malformed.
+    pub async fn visible_snapshots(&self) -> Result<Vec<proto::SnapshotValue>> {
+        let committed = read::scan_snapshots(ReadHandle::Tx(&self.db_tx)).await?;
+
+        let mut deleted = std::collections::BTreeSet::new();
+        for op in &self.ops {
+            if let RowOperation::Delete {
+                table: TableKind::Snapshot,
+                cells,
+            } = op
+            {
+                let mut c = Cursor::new(TableKind::Snapshot, cells);
+                deleted.insert(c.u64()?);
+                c.finish()?;
+            }
+        }
+
+        Ok(committed
+            .into_iter()
+            .filter(|s| !deleted.contains(&s.snapshot_id))
+            .collect())
+    }
+
     /// Translates every staged row and lands them in one atomic batch.
+    ///
+    /// A commit with a `ducklake_snapshot` insert mints that snapshot and
+    /// advances head. A commit **without** one is a maintenance commit —
+    /// snapshot expiry / file cleanup, which DuckLake runs without
+    /// minting a snapshot — and lands head-preserving: reclamation
+    /// deletes only, no new snapshot record, `sys/head` untouched.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Constraint`] or [`Error::Corruption`] if the
-    /// staged rows are malformed or omit the required `ducklake_snapshot`
-    /// / `ducklake_snapshot_changes` pair. Returns
-    /// [`Error::CommitConflict`] — **never retried internally** — if a
-    /// concurrent commit advanced the head first; the store is left
-    /// unchanged by the loser.
+    /// staged rows are malformed, mutate entities without the required
+    /// `ducklake_snapshot` / `ducklake_snapshot_changes` pair, or expire
+    /// the head snapshot. Returns [`Error::CommitConflict`] — **never
+    /// retried internally** — if a concurrent commit advanced the head
+    /// first; the store is left unchanged by the loser.
     pub async fn commit(self) -> Result<SnapshotId> {
         let Self { db_tx, ops } = self;
 
@@ -1677,8 +1718,49 @@ fn translate(
         }
     }
 
-    let writes = commit::diff_writes(base, &state, new_id);
+    let mut writes = commit::diff_writes(base, &state, new_id);
+    writes.extend(direct);
     Ok((new_id, writes, snapshot))
+}
+
+/// Translates a head-preserving maintenance commit: snapshot expiry and
+/// file cleanup arrive with no `ducklake_snapshot` insert (DuckLake mints
+/// no snapshot for them), so nothing advances head and no snapshot record
+/// is written. Only reclamation-shaped operations are legal — raw
+/// deletes, schedule inserts, and the inline drops a dead table's cleanup
+/// issues; any entity insert or lifecycle update without a snapshot row
+/// is a constraint violation (DuckLake always mints a snapshot for real
+/// catalog changes).
+fn translate_maintenance(
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+) -> Result<Vec<commit::StagedWrite>> {
+    let head = base.snapshot.snapshot_id;
+
+    let mut state = base.clone();
+    let mut children = ChildRows::default();
+    let mut direct = Vec::new();
+    for op in ops {
+        let allowed = matches!(
+            op,
+            RowOperation::Delete { .. }
+                | RowOperation::Insert {
+                    table: TableKind::FilesScheduledForDeletion,
+                    ..
+                }
+        ) || is_inline_op(op);
+        if !allowed {
+            return Err(Error::Constraint(
+                "a staged commit without a ducklake_snapshot insert may only reclaim state                  (maintenance deletes and deletion-schedule inserts)"
+                    .to_string(),
+            ));
+        }
+        apply_op(base, &mut state, op, head, &mut children, &mut direct)?;
+    }
+
+    let mut writes = commit::diff_writes(base, &state, head);
+    writes.extend(direct);
+    Ok(writes)
 }
 
 /// Allocates `inline/insert` chunk sequence numbers within one commit: the

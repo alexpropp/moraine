@@ -96,7 +96,6 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
             schema_version: 0,
             next_catalog_id: 1,
             next_file_id: 0,
-            next_deletion_id: 0,
             changes_made: bootstrap_changes.to_changes_made(),
             author: None,
             commit_message: None,
@@ -224,9 +223,12 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         Some(requested) => requested,
         None => head,
     };
+    // A missing record at or below head is an expired snapshot, not
+    // corruption: expiry deletes snapshot records without renumbering.
+    // The caller re-resolves from head.
     let snapshot = read::read_snapshot(tx, target)
         .await?
-        .ok_or_else(|| Error::Corruption(format!("snapshot record {target} missing")))?;
+        .ok_or_else(|| Error::NotFound(format!("snapshot {target} (expired or never minted)")))?;
     let current = read::scan_current_entities(tx).await?;
     let history = match at {
         Some(_) => read::scan_history_entities(tx).await?,
@@ -856,7 +858,6 @@ where
         schema_version: base.snapshot.schema_version + u64::from(schema_changed),
         next_catalog_id,
         next_file_id,
-        next_deletion_id: base.snapshot.next_deletion_id,
         changes_made: ours.to_changes_made(),
         author: None,
         commit_message: None,
@@ -944,8 +945,10 @@ where
 }
 
 /// The change sets of every commit above `head_before`, read outside any
-/// transaction (the loser's is dead). A missing snapshot record below
-/// the head is store damage: [`Error::Corruption`], not a retry.
+/// transaction (the loser's is dead). A record that has already been
+/// expired by a racing maintenance commit classifies as an unknowable
+/// change (forcing the conflict path), never as corruption — the caller
+/// re-drives against the new head.
 async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
     let head_bytes = db
         .get(Key::Sys(SysKey::Head).encode())
@@ -1040,7 +1043,6 @@ mod tests {
             schema_version: 0,
             next_catalog_id: 0,
             next_file_id: 0,
-            next_deletion_id: 0,
             changes_made: String::new(),
             author: None,
             commit_message: None,

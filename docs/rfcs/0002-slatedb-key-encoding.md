@@ -149,7 +149,7 @@ Other subspaces:
 | `sys/head` | — | Latest committed `snapshot_id` |
 | `sys/migration` | — | Structural-migration marker (RFC 0015): `{from_format, to_format, cursor}`, present only mid-migration. **Reserved from format v1**: every materialization checks it and refuses a mid-migration store (RFC 0009) — the check must predate the first migration ever run. |
 | `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together) |
-| `current/gcfile` | `deletion_id` | `ducklake_files_scheduled_for_deletion` |
+| `current/gcfile` | `data_file_id` | `ducklake_files_scheduled_for_deletion` — keyed by the scheduled file's id, the row's identity in DuckLake's own schema (inserts carry it, cleanup deletes by it); unique because a file's catalog rows are removed in the same transaction that schedules it, so no moraine-allocated id or counter exists (RFC 0007) |
 | `inline/*` | `table_id, schema_version, …` | Reserved — RFC 0005 |
 
 Two mapping conventions apply throughout: **1:1 side tables merge** into
