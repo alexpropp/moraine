@@ -413,9 +413,9 @@ mod tests {
         assert_eq!(rows.len(), 3);
         let ids: Vec<u64> = rows.iter().map(|r| r.snapshot_id).collect();
         assert_eq!(ids, vec![0, 1, 2]);
-        // Bootstrap's changes_made is the empty string; both real commits
-        // record something.
-        assert_eq!(rows[0].changes_made, "");
+        // Bootstrap records minting `main`, exactly as DuckLake's own
+        // initialization writes it; both real commits record something.
+        assert_eq!(rows[0].changes_made, "created_schema:\"main\"");
         assert!(!rows[1].changes_made.is_empty());
         assert!(!rows[2].changes_made.is_empty());
     }
