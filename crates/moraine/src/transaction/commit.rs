@@ -84,6 +84,10 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
         }),
     )?;
+    // Bootstrap's snapshot records minting `main`, byte-identical to the
+    // `created_schema:"main"` DuckLake's own initialization writes.
+    let mut bootstrap_changes = ChangeSet::default();
+    bootstrap_changes.created_schemas.insert("main".to_string());
     stage(
         Key::Snapshot { snapshot_id: 0 },
         value::encode_value(&proto::SnapshotValue {
@@ -93,7 +97,7 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
             next_catalog_id: 1,
             next_file_id: 0,
             next_deletion_id: 0,
-            changes_made: String::new(),
+            changes_made: bootstrap_changes.to_changes_made(),
             author: None,
             commit_message: None,
             commit_extra_info: None,

@@ -138,6 +138,25 @@ pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -
     Ok(!file_deletes?.is_empty())
 }
 
+/// Every `inline/file_delete` record for `table_id` as
+/// `(data_file_id, row_id, begin_snapshot)` in key order — the rows behind
+/// the `ducklake_inlined_delete_<t>` projection.
+///
+/// # Errors
+///
+/// Returns an error if the underlying store scan fails or decodes
+/// corrupt bytes.
+#[doc(hidden)]
+pub async fn inline_file_deletes(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, u64, u64)>> {
+    let session = catalog.begin_read().await?;
+    let file_deletes = store_inline::scan_inline_file_deletes(session.handle(), table_id).await;
+    session.finish();
+    Ok(file_deletes?
+        .into_iter()
+        .map(|(data_file_id, row_id, value)| (data_file_id, row_id, value.begin_snapshot))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -255,5 +274,43 @@ mod tests {
 
         let registered = inline_registered_tables(&catalog).await.unwrap();
         assert_eq!(registered, vec![(1, 0)]);
+    }
+
+    /// Staged `inline/file_delete` rows read back as
+    /// `(data_file_id, row_id, begin_snapshot)` in key order — the rows
+    /// behind the `ducklake_inlined_delete_<t>` projection.
+    #[tokio::test]
+    async fn inline_file_deletes_read_back_in_key_order() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+
+        tx.stage(RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 7,
+            row_id: 2,
+            begin_snapshot: 6,
+        });
+        tx.stage(RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 7,
+            row_id: 0,
+            begin_snapshot: 6,
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(6),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(6),
+        });
+        tx.commit().await.unwrap();
+
+        let rows = inline_file_deletes(&catalog, 1).await.unwrap();
+        assert_eq!(rows, vec![(7, 0, 6), (7, 2, 6)]);
+
+        assert!(inline_file_delete_table_exists(&catalog, 1).await.unwrap());
+        assert_eq!(inline_file_deletes(&catalog, 9).await.unwrap(), vec![]);
     }
 }

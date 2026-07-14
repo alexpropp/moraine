@@ -2597,11 +2597,11 @@ mod tests {
         let snap_slice = unsafe { std::slice::from_raw_parts(snapshots, snapshots_len) };
         let ids: Vec<u64> = snap_slice.iter().map(|s| s.snapshot_id).collect();
         assert_eq!(ids, vec![0, 1, 2]);
-        // SAFETY: bootstrap's `changes_made` is a non-null, empty string.
+        // SAFETY: bootstrap's `changes_made` is a non-null string.
         let bootstrap_changes = unsafe { CStr::from_ptr(snap_slice[0].changes_made) }
             .to_str()
             .unwrap();
-        assert_eq!(bootstrap_changes, "");
+        assert_eq!(bootstrap_changes, "created_schema:\"main\"");
         assert!(snap_slice[0].author.is_null());
 
         // SAFETY: each from its matching allocator; freed exactly once.

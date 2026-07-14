@@ -2149,11 +2149,6 @@ mod tests {
             row_count: 2,
             arrow_body: b"chunk".to_vec(),
         });
-        setup.stage(RowOperation::InlineInlineDelete {
-            table_id: 1,
-            row_id: 0,
-            end_snapshot: 1,
-        });
         setup.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(1, 0, 1),
@@ -2164,20 +2159,40 @@ mod tests {
         });
         setup.commit().await.unwrap();
 
+        // A later commit tombstones one row (a tombstone only ever ends a
+        // version begun before it — DuckLake's writer never stamps a row
+        // with its own insertion snapshot).
         let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut flush = StagedTransaction::begin(db_tx2);
-        flush.stage(RowOperation::InlineFlushDelete {
+        let mut delete = StagedTransaction::begin(db_tx2);
+        delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
-            schema_version: 0,
-            flush_snapshot: 1,
+            row_id: 0,
+            end_snapshot: 2,
         });
-        flush.stage(RowOperation::Insert {
+        delete.stage(RowOperation::Insert {
             table: TableKind::Snapshot,
             cells: snapshot_row(2, 0, 1),
         });
+        delete.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, "inlined_delete:1"),
+        });
+        delete.commit().await.unwrap();
+
+        let db_tx3 = catalog.begin_write_tx().await.unwrap();
+        let mut flush = StagedTransaction::begin(db_tx3);
+        flush.stage(RowOperation::InlineFlushDelete {
+            table_id: 1,
+            schema_version: 0,
+            flush_snapshot: 2,
+        });
+        flush.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3, 0, 1),
+        });
         flush.stage(RowOperation::Insert {
             table: TableKind::SnapshotChanges,
-            cells: snapshot_changes_row(2, "flushed_inlined_data:1"),
+            cells: snapshot_changes_row(3, "flushed_inlined_data:1"),
         });
         flush.commit().await.unwrap();
 

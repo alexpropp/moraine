@@ -419,11 +419,25 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineInlineDeleteTableEntry::GetSta
 }
 
 duckdb::TableFunction
-MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &, duckdb::unique_ptr<duckdb::FunctionData> &) {
-	// No read ABI exposes `inline/fdel` rows yet; throwing is safer than an
-	// empty scan, which would silently hide real deletes.
-	throw duckdb::NotImplementedException(
-	    "moraine: reading \"%s\" back is not supported yet (inlined file-deletes are write-only this slice)", name);
+MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
+                                               duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
+	OwnedArray<MoraineInlineFileDeleteRow> file_deletes(moraine_inline_file_deletes_free);
+	MoraineError err{};
+	auto code = moraine_inline_file_deletes(handle_, table_id_, file_deletes.OutItems(), file_deletes.OutLen(),
+	                                        moraine_shim_is_interrupted, &context, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> rows;
+	rows.reserve(file_deletes.size());
+	for (auto &r : file_deletes) {
+		rows.push_back({Bigint(r.file_id), Bigint(r.row_id), Bigint(r.begin_snapshot)});
+	}
+	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
+	scan_bind_data->rows = std::move(rows);
+	scan_bind_data->table_entry = this;
+	bind_data = std::move(scan_bind_data);
+	return MetadataScanTableFunction();
 }
 
 duckdb::TableStorageInfo MoraineInlineDeleteTableEntry::GetStorageInfo(duckdb::ClientContext &) {
