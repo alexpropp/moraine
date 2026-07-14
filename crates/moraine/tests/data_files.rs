@@ -75,6 +75,7 @@ async fn registration_is_data_only_and_visible() {
     assert_eq!(files[0].record_count, 100);
     assert_eq!(files[0].row_id_start, 0);
     assert_eq!(head.table_stats(t).unwrap().next_row_id, 100);
+    catalog.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -105,6 +106,7 @@ async fn expiry_time_travels_and_row_ids_stay_dense() {
         .unwrap();
     let head = catalog.snapshot().await.unwrap();
     assert_eq!(head.data_files_of(t)[0].row_id_start, 100);
+    catalog.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -147,6 +149,7 @@ async fn encryption_keys_round_trip_verbatim() {
         head.delete_files_of(t)[0].encryption_key.as_deref(),
         Some("ZGVsZXRlLWtleQ==")
     );
+    catalog.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -204,6 +207,7 @@ async fn delete_files_cascade_with_their_data_file() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NotFound(_)));
+    catalog.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -254,4 +258,5 @@ async fn column_stats_round_trip_verbatim() {
         .unwrap();
     let after = catalog.snapshot().await.unwrap().current_snapshot();
     assert_eq!(after.id.get(), before.get() + 1);
+    catalog.close().await.unwrap();
 }

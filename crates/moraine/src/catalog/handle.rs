@@ -15,7 +15,7 @@ use crate::{
 
 /// The open store behind a catalog: the read-write `Db` writer, or a
 /// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
-/// fences a live writer (RFC 0004).
+/// fences a live writer.
 enum Store {
     /// The single read-write writer.
     Writer(Db),
@@ -90,7 +90,7 @@ impl Catalog {
     ///
     /// A read-only catalog never opens the writer `Db`, so it never fences a
     /// live read-write process — any number of read-only catalogs may attach
-    /// alongside the one writer (RFC 0004). It never bootstraps: opening a
+    /// alongside the one writer. It never bootstraps: opening a
     /// store no writer has initialized is refused. [`commit`](Self::commit)
     /// returns [`Error::Constraint`].
     ///

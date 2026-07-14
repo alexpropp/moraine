@@ -164,7 +164,10 @@ pub(crate) async fn scan_current_entities(tx: ReadHandle<'_>) -> Result<Vec<Enti
     Ok(records)
 }
 
-/// Every ended entity-version record.
+/// Every ended entity-version record. Unversioned kinds (statistics,
+/// options, tags) are overwritten in place and never mirrored to history;
+/// finding one there is store damage, refused rather than replayed over
+/// the live record.
 pub(crate) async fn scan_history_entities(tx: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     let mut iter = tx
         .scan_prefix(subspace_prefix(Subspace::History), ..)
@@ -173,7 +176,22 @@ pub(crate) async fn scan_history_entities(tx: ReadHandle<'_>) -> Result<Vec<Enti
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::History(history) => records.push(decode_entity(history.entity, &entry.value)?),
+            Key::History(history) => {
+                if matches!(
+                    history.entity,
+                    EntityKey::FileColumnStats { .. }
+                        | EntityKey::TableStats { .. }
+                        | EntityKey::TableColumnStats { .. }
+                        | EntityKey::Option { .. }
+                        | EntityKey::Tag { .. }
+                ) {
+                    return Err(Error::Corruption(format!(
+                        "unversioned key in history scan: {:?}",
+                        history.entity
+                    )));
+                }
+                records.push(decode_entity(history.entity, &entry.value)?);
+            }
             other => {
                 return Err(Error::Corruption(format!(
                     "non-history key in history scan: {other:?}"
@@ -325,6 +343,41 @@ mod tests {
         }));
         let history = scan_history_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(history, vec![EntityRecord::Schema(ended)]);
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// Unversioned kinds are never written to history; one found there is
+    /// store damage. Refusing it keeps the later current-then-history
+    /// replay from silently overwriting the live record.
+    #[tokio::test]
+    async fn unversioned_kind_in_history_is_refused() {
+        let db = open_store("t", Arc::new(InMemory::new())).await.unwrap();
+
+        let stats = TableStatsValue {
+            table_id: 7,
+            record_count: 10,
+            next_row_id: 10,
+            file_size_bytes: 1024,
+        };
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(
+            Key::history(EntityKey::TableStats { table_id: 7 }, 2).encode(),
+            value::encode_value(&stats),
+        )
+        .unwrap();
+        tx.commit_with_options(&WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let err = scan_history_entities(ReadHandle::Tx(&tx))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "{err}");
         tx.rollback();
         db.close().await.unwrap();
     }

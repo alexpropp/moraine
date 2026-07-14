@@ -209,9 +209,11 @@ fn ensure_duckdb_static_archive() -> anyhow::Result<PathBuf> {
          cached under target/ after this"
     );
 
-    // Compile into a scratch directory and rename into place, so an
-    // interrupted compile can't leave a partial archive at the final path.
-    let scratch_dir = lib_dir.with_extension("partial");
+    // Compile into a per-process scratch directory and rename into place:
+    // an interrupted compile can't leave a partial archive at the final
+    // path, and concurrent builds (editor + terminal) can't clobber each
+    // other's scratch.
+    let scratch_dir = lib_dir.with_extension(format!("partial-{}", std::process::id()));
     if scratch_dir.exists() {
         fs::remove_dir_all(&scratch_dir)
             .with_context(|| format!("clearing stale scratch at {}", scratch_dir.display()))?;

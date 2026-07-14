@@ -83,6 +83,7 @@ impl Transaction {
     /// Returns [`Error::AlreadyExists`] if a schema with that name already
     /// exists.
     pub fn create_schema(&mut self, name: &str) -> Result<SchemaId> {
+        nonempty_name("schema", name)?;
         if self.state.schema_names.contains_key(name) {
             return Err(Error::AlreadyExists(format!("schema {name}")));
         }
@@ -160,6 +161,7 @@ impl Transaction {
             return Err(Error::NotFound(format!("schema {schema}")));
         }
 
+        nonempty_name("table", name)?;
         self.relation_name_free(schema.get(), name)?;
         if columns.is_empty() {
             return Err(Error::Constraint(format!(
@@ -168,6 +170,7 @@ impl Transaction {
         }
         let mut seen = HashSet::with_capacity(columns.len());
         for def in columns {
+            nonempty_name("column", &def.name)?;
             if !seen.insert(&def.name) {
                 return Err(Error::Constraint(format!("duplicate column {}", def.name)));
             }
@@ -245,6 +248,7 @@ impl Transaction {
     /// Returns [`Error::AlreadyExists`] if a table with that name already
     /// exists in the same schema (including this table itself).
     pub fn rename_table(&mut self, table: TableId, new_name: &str) -> Result<()> {
+        nonempty_name("table", new_name)?;
         let value = self.live_table(table)?;
         self.relation_name_free(value.schema_id, new_name)?;
         self.state.put_table(TableValue {
@@ -306,6 +310,7 @@ impl Transaction {
     /// Returns [`Error::AlreadyExists`] if a column with that name already
     /// exists in the table.
     pub fn add_column(&mut self, table: TableId, def: &ColumnDef) -> Result<ColumnId> {
+        nonempty_name("column", &def.name)?;
         let value = self.live_table(table)?;
         self.column_name_free(table, &def.name)?;
         let live_columns = self.state.columns.get(&table.get());
@@ -370,6 +375,7 @@ impl Transaction {
         column: ColumnId,
         new_name: &str,
     ) -> Result<()> {
+        nonempty_name("column", new_name)?;
         self.column_name_free(table, new_name)?;
         let value = ColumnValue {
             begin_snapshot: self.new_snapshot_id,
@@ -581,6 +587,25 @@ impl Transaction {
                 file.data_file_id
             )));
         }
+
+        // One live delete file per data file: a new one carries all deletes
+        // and must supersede its predecessor, never sit beside it.
+        let already_targeted = self
+            .state
+            .delete_files
+            .get(&table.get())
+            .is_some_and(|files| {
+                files
+                    .values()
+                    .any(|existing| existing.data_file_id == file.data_file_id.get())
+            });
+        if already_targeted {
+            return Err(Error::Constraint(format!(
+                "data file {} of table {table} already has a live delete file; \
+                 expire it first",
+                file.data_file_id
+            )));
+        }
         let delete_file_id = self.alloc_file_id();
 
         self.state.put_delete_file(DeleteFileValue {
@@ -700,6 +725,7 @@ impl Transaction {
         dialect: &str,
         sql: &str,
     ) -> Result<ViewId> {
+        nonempty_name("view", name)?;
         let Some(schema_rec) = self.state.schemas.get(&schema.get()) else {
             return Err(Error::NotFound(format!("schema {schema}")));
         };
@@ -774,9 +800,12 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the scope's schema or table does
-    /// not exist.
+    /// not exist, or [`Error::Constraint`] for the reserved global
+    /// `encrypted` key.
     pub fn set_option(&mut self, scope: OptionScope, key: &str, value: &str) -> Result<()> {
+        nonempty_name("option key", key)?;
         self.live_scope(scope)?;
+        reserved_option(scope, key)?;
         let components = scope.key_components();
         let mut record = self
             .state
@@ -794,9 +823,11 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the scope's schema or table does
-    /// not exist.
+    /// not exist, or [`Error::Constraint`] for the reserved global
+    /// `encrypted` key.
     pub fn unset_option(&mut self, scope: OptionScope, key: &str) -> Result<()> {
         self.live_scope(scope)?;
+        reserved_option(scope, key)?;
         let components = scope.key_components();
         let Some(mut record) = self.state.options.get(&components).cloned() else {
             return Ok(());
@@ -836,6 +867,26 @@ impl Transaction {
     pub(crate) fn state(&self) -> &CatalogSnapshot {
         &self.state
     }
+}
+
+/// Refuses the global `encrypted` key: whether data files are encrypted is
+/// fixed when the catalog is created and recorded at bootstrap, never
+/// mutated afterward.
+fn reserved_option(scope: OptionScope, key: &str) -> Result<()> {
+    if scope == OptionScope::Global && key == "encrypted" {
+        return Err(Error::Constraint(
+            "the global `encrypted` option is fixed at catalog creation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses an empty name; `what` names the rejected item in the error.
+fn nonempty_name(what: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::Constraint(format!("{what} name must not be empty")));
+    }
+    Ok(())
 }
 
 fn new_column(
@@ -1260,6 +1311,40 @@ mod tests {
         ));
     }
 
+    /// One live delete file per data file: a second registration against
+    /// the same target is refused until the first is expired (a new delete
+    /// file carries all deletes and supersedes its predecessor).
+    #[test]
+    fn second_live_delete_file_for_same_data_file_is_refused() {
+        let delete_file = |f| DeleteFile {
+            data_file_id: f,
+            path: "d.parquet".into(),
+            path_is_relative: true,
+            format: "parquet".into(),
+            delete_count: 1,
+            file_size_bytes: 10,
+            footer_size: 4,
+            encryption_key: None,
+        };
+
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let f = transaction
+            .register_data_file(t, datafile(100, vec![]))
+            .unwrap();
+
+        let first = transaction.register_delete_file(t, delete_file(f)).unwrap();
+        assert!(matches!(
+            transaction.register_delete_file(t, delete_file(f)),
+            Err(Error::Constraint(_))
+        ));
+
+        // Expiring the predecessor frees the slot.
+        transaction.expire_delete_file(t, first).unwrap();
+        transaction.register_delete_file(t, delete_file(f)).unwrap();
+    }
+
     #[test]
     fn stats_verbs_update_verbatim_and_preserve_row_counter() {
         let mut transaction = empty_transaction();
@@ -1395,5 +1480,55 @@ mod tests {
         // Option mutations stage no ops; the two DDL ops remain.
         let (ops, _, _, _) = transaction.into_parts();
         assert_eq!(ops.len(), 2);
+    }
+
+    /// Every name-taking verb refuses the empty string: an empty name is
+    /// unaddressable and an empty schema name persists the path `"/"`.
+    #[test]
+    fn empty_names_are_refused() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let column = transaction.columns_of(t)[0].id;
+
+        let refused = [
+            transaction.create_schema("").err(),
+            transaction.create_table(s, "", &[col("a")]).err(),
+            transaction.create_table(s, "t2", &[col("")]).err(),
+            transaction.rename_table(t, "").err(),
+            transaction.add_column(t, &col("")).err(),
+            transaction.rename_column(t, column, "").err(),
+            transaction.create_view(s, "", "duckdb", "SELECT 1").err(),
+            transaction.set_option(OptionScope::Global, "", "v").err(),
+        ];
+        for err in refused {
+            assert!(matches!(err, Some(Error::Constraint(_))), "{err:?}");
+        }
+    }
+
+    /// The global `encrypted` option is fixed at catalog creation: set and
+    /// unset both refuse it, while a non-global `encrypted` key (or any
+    /// other global key) stays writable.
+    #[test]
+    fn global_encrypted_option_is_reserved() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+
+        assert!(matches!(
+            transaction.set_option(OptionScope::Global, "encrypted", "true"),
+            Err(Error::Constraint(_))
+        ));
+        assert!(matches!(
+            transaction.unset_option(OptionScope::Global, "encrypted"),
+            Err(Error::Constraint(_))
+        ));
+
+        transaction
+            .set_option(OptionScope::Table(t), "encrypted", "x")
+            .unwrap();
+        transaction
+            .set_option(OptionScope::Global, "other", "v")
+            .unwrap();
     }
 }

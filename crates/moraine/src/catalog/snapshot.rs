@@ -302,6 +302,7 @@ impl CatalogSnapshot {
             .insert((value.schema_id, value.view_name.clone()), value.view_id);
         self.views.insert(value.view_id, value);
     }
+
     pub(crate) fn delete_view(&mut self, view_id: u64) {
         if let Some(old) = self.views.remove(&view_id) {
             self.view_names

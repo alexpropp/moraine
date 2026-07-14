@@ -32,7 +32,7 @@ pub struct InlineRow {
 /// chunk.row_id_start + offset` for `offset` in `0..chunk.row_count` —
 /// with `end_snapshot` resolved from `inline_deletes`. Includes tombstoned rows;
 /// callers apply the scan-kind predicate via [`InlineScanKind::select`].
-/// `chunks` entries that are not `InlineOp::Ins` are skipped.
+/// `chunks` entries that are not `InlineOperation::Insert` are skipped.
 pub fn materialize_inline_rows(
     chunks: &[(InlineOperation, InlineChunkValue)],
     inline_deletes: &[(u64, InlineInlineDeleteValue)],

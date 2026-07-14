@@ -4,7 +4,7 @@
 //! `get`/`scan_prefix` surface as a `DbTransaction` but has no `begin`, so
 //! every typed read in `store` takes a [`ReadHandle`] and dispatches. A
 //! read-only catalog holds a `DbReader` and never opens a `Db`, so it never
-//! fences a live writer (RFC 0004's single-writer/many-reader topology).
+//! fences a live writer (single-writer/many-reader topology).
 
 use std::sync::Arc;
 

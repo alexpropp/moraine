@@ -405,7 +405,7 @@ mod tests {
 
     /// Like [`run_standalone_sql`] but attaches `moraine:` **read-only**
     /// (`READ_ONLY`), so moraine opens a `DbReader` rather than the writer
-    /// `Db` (RFC 0017).
+    /// `Db`.
     fn run_standalone_read_only_sql(store_dir: &Path, sql: &str) -> String {
         let output = Command::new(cli_path())
             .arg("-unsigned")
@@ -906,8 +906,8 @@ mod tests {
 
     /// Column-level schema evolution through DuckLake's own `ALTER TABLE`:
     /// ADD / RENAME / DROP COLUMN. DuckLake expresses each as
-    /// `ducklake_column` version transitions over the staged-write path
-    /// (RFC 0012), so this exercises no dedicated schema-mutation path in
+    /// `ducklake_column` version transitions over the staged-write path,
+    /// so this exercises no dedicated schema-mutation path in
     /// moraine — the generic staged commit carries it. Verified through the
     /// standalone row-faithful projection (live columns, ordered) and
     /// DuckLake's own reflection in a fresh session.
@@ -971,7 +971,7 @@ mod tests {
     }
 
     /// Type promotion through DuckLake's `ALTER TABLE ... ALTER COLUMN ...
-    /// TYPE` — the remaining column-level op of RFC 0012. The load-bearing
+    /// TYPE` — the remaining column-level op. The load-bearing
     /// case is data that predates the change: rows inlined under the old type
     /// live in their own schema version's chunk (decoded against that
     /// version's `inline/schema`), and must still read back — coerced to the
@@ -1137,7 +1137,7 @@ mod tests {
         );
     }
 
-    /// Read-only attach (RFC 0017): `READ_ONLY` opens moraine's `DbReader`
+    /// Read-only attach: `READ_ONLY` opens moraine's `DbReader`
     /// (never the writer `Db`, so it never fences a live writer), and reads
     /// flow through it end to end. The standalone `moraine: (READ_ONLY)`
     /// surface is the reference case — DuckDB sets the access mode directly

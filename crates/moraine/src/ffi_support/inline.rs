@@ -11,7 +11,7 @@ use crate::{
         Catalog,
         inline::{InlineRow, materialize_inline_rows},
     },
-    error::Result,
+    error::{Error, Result},
     store::{inline as store_inline, key::InlineOperation},
 };
 
@@ -31,7 +31,7 @@ pub struct InlineRowRecord {
     pub end_snapshot: Option<u64>,
     /// The owning chunk's full Arrow IPC record-batch body.
     pub chunk_body: Vec<u8>,
-    /// The row's offset within `chunk_body`.
+    /// The row's index within its chunk (`0..row_count`).
     pub offset_in_chunk: u64,
 }
 
@@ -59,28 +59,29 @@ pub async fn scan_inline(
     let inline_deletes = inline_deletes?;
 
     let rows: Vec<InlineRow> = materialize_inline_rows(&chunks, &inline_deletes);
-    Ok(kind
-        .select(&rows, snapshot, start)
+    kind.select(&rows, snapshot, start)
         .into_iter()
-        .map(|row| InlineRowRecord {
-            row_id: row.row_id,
-            schema_version: chunk_schema_version(&chunks[row.chunk].0),
-            begin_snapshot: row.begin_snapshot,
-            end_snapshot: row.end_snapshot,
-            chunk_body: chunks[row.chunk].1.body.clone(),
-            offset_in_chunk: row.offset_in_chunk,
-        })
-        .collect())
-}
+        .map(|row| {
+            let (operation, chunk) = &chunks[row.chunk];
+            // Every chunk a row references is an insert — the row was
+            // materialized from it.
+            let InlineOperation::Insert { schema_version, .. } = operation else {
+                return Err(Error::Corruption(format!(
+                    "inline row {} references a non-insert chunk key: {operation:?}",
+                    row.row_id
+                )));
+            };
 
-/// The schema version an inline chunk was written under. Every chunk key
-/// `scan_inline_chunks` returns is an `Insert`; the other arms are
-/// unreachable by construction.
-fn chunk_schema_version(op: &InlineOperation) -> u64 {
-    match op {
-        InlineOperation::Insert { schema_version, .. } => *schema_version,
-        InlineOperation::InlineDelete { .. } | InlineOperation::FileDelete { .. } => 0,
-    }
+            Ok(InlineRowRecord {
+                row_id: row.row_id,
+                schema_version: *schema_version,
+                begin_snapshot: row.begin_snapshot,
+                end_snapshot: row.end_snapshot,
+                chunk_body: chunk.body.clone(),
+                offset_in_chunk: row.offset_in_chunk,
+            })
+        })
+        .collect()
 }
 
 /// Every `(schema_version, arrow_schema)` recorded for `table_id`, in

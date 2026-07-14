@@ -40,7 +40,7 @@ pub(crate) async fn scan_inline_chunks(
             }
             other => {
                 return Err(Error::Corruption(format!(
-                    "non-ins key in inline chunk scan: {other:?}"
+                    "non-insert key in inline chunk scan: {other:?}"
                 )));
             }
         }

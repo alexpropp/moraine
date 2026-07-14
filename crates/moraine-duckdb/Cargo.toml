@@ -11,7 +11,7 @@ rust-version.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "59.1.0", default-features = false, features = ["ffi", "ipc"] }
+arrow = { workspace = true, features = ["ffi", "ipc"] }
 moraine = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }

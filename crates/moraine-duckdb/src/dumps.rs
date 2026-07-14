@@ -2411,7 +2411,19 @@ mod tests {
         // SAFETY: just populated above.
         let col_slice = unsafe { std::slice::from_raw_parts(columns, columns_len) };
         assert!(col_slice.iter().all(|c| !c.has_end_snapshot));
-        assert!(!col_slice[0].nulls_allowed || !col_slice[1].nulls_allowed);
+        // Pin `nulls_allowed` per column by name: `id` was created NOT
+        // NULL, `amount` nullable.
+        for column in col_slice {
+            // SAFETY: populated by the dump above.
+            let name = unsafe { CStr::from_ptr(column.column_name) }
+                .to_str()
+                .unwrap();
+            match name {
+                "id" => assert!(!column.nulls_allowed),
+                "amount" => assert!(column.nulls_allowed),
+                other => panic!("unexpected column {other}"),
+            }
+        }
 
         let mut views: *mut MoraineViewRow = ptr::null_mut();
         let mut views_len: usize = 0;
@@ -2641,6 +2653,12 @@ mod tests {
             moraine_dump_table_column_stats_free(ptr::null_mut(), 0);
             moraine_dump_file_column_stats_free(ptr::null_mut(), 0);
             moraine_dump_snapshots_free(ptr::null_mut(), 0);
+            moraine_dump_schema_versions_free(ptr::null_mut(), 0);
+            moraine_dump_partition_info_free(ptr::null_mut(), 0);
+            moraine_dump_partition_columns_free(ptr::null_mut(), 0);
+            moraine_dump_file_partition_values_free(ptr::null_mut(), 0);
+            moraine_dump_sort_info_free(ptr::null_mut(), 0);
+            moraine_dump_sort_expressions_free(ptr::null_mut(), 0);
         }
     }
 

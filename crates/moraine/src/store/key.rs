@@ -18,7 +18,7 @@ pub(crate) const TAG_PREFIX_LEN: usize = 1;
 /// A fully addressed store key. The five variants are the five
 /// subspaces; each is also a SlateDB segment (the store is created with a
 /// one-byte segment extractor over the leading discriminant).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum Key {
     /// Store-level singletons: format version, head pointer, migration
     /// marker. Overwritten in place.
@@ -38,7 +38,7 @@ pub(crate) enum Key {
 }
 
 /// Store-level singleton keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum SysKey {
     /// Layout format version + moraine version that wrote the store.
     Format,
@@ -50,7 +50,7 @@ pub(crate) enum SysKey {
 
 /// A live record: a temporally versioned entity, or the `current`-only
 /// gc-file bookkeeping (no begin/end lifecycle, so no `history` mirror).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum CurrentKey {
     /// A live entity version.
     Entity(EntityKey),
@@ -63,7 +63,7 @@ pub(crate) enum CurrentKey {
 
 /// An ended entity version; `end_snapshot` is the final key component,
 /// so a single entity's versions sort by when they ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) struct HistoryKey {
     /// The ended entity.
     pub(crate) entity: EntityKey,
@@ -73,7 +73,7 @@ pub(crate) struct HistoryKey {
 
 /// A temporally versioned catalog entity. Lives in `current` while live; its
 /// `history` mirror appends `end_snapshot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum EntityKey {
     /// `ducklake_schema`.
     Schema {
@@ -164,7 +164,7 @@ pub(crate) enum EntityKey {
 /// record, or the archived (post-flush) form of a live record. `Live` and
 /// `Arch` share [`InlineOp`], so an archive key has exactly the components
 /// of its live form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum InlineKey {
     /// Arrow IPC schema message, once per `(table, schema_version)`. Has
     /// no archive form (schemas are never flushed away).
@@ -181,7 +181,7 @@ pub(crate) enum InlineKey {
 }
 
 /// An inlined-data record that exists in both live and archived form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum InlineOperation {
     /// One inlined-insert chunk (Arrow record-batch body).
     Insert {
@@ -823,6 +823,13 @@ mod tests {
             if a != b {
                 prop_assert_ne!(a.encode(), b.encode());
             }
+        }
+
+        /// The encoding preserves the typed order: every prefix scan and
+        /// range bound relies on byte order agreeing with key order.
+        #[test]
+        fn encoding_preserves_order(a in arb_key(), b in arb_key()) {
+            prop_assert_eq!(a.cmp(&b), a.encode().cmp(&b.encode()));
         }
     }
 }

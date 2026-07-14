@@ -4,7 +4,7 @@
 //! and which tables a commit touched — not at entity-payload grain; the
 //! staged entity state lives in the transaction's working snapshot.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One staged mutation, at the grain conflict classification needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +111,29 @@ impl Operation {
             | Operation::ExpireDataFile { .. }
             | Operation::ExpireDeleteFile { .. }
             | Operation::UpdateStats { .. } => false,
+        }
+    }
+
+    /// The table or view whose shape this op changes, if any — the ids a
+    /// snapshot records as its `ducklake_schema_versions` rows. Tables and
+    /// views share the catalog id space; drops mint no new shape.
+    pub(crate) fn schema_changed_table_id(&self) -> Option<u64> {
+        match self {
+            Operation::CreateTable { table_id, .. } | Operation::AlterTable { table_id } => {
+                Some(*table_id)
+            }
+            Operation::CreateView { view_id, .. } | Operation::AlterView { view_id } => {
+                Some(*view_id)
+            }
+            Operation::CreateSchema { .. }
+            | Operation::DropSchema { .. }
+            | Operation::DropTable { .. }
+            | Operation::DropView { .. }
+            | Operation::RegisterDataFile { .. }
+            | Operation::RegisterDeleteFile { .. }
+            | Operation::ExpireDataFile { .. }
+            | Operation::ExpireDeleteFile { .. }
+            | Operation::UpdateStats { .. } => None,
         }
     }
 }
@@ -468,9 +491,8 @@ impl ChangeSet {
             || self.created_view_schema_ids.contains(&schema_id)
     }
 
-    fn table_kinds(&self) -> std::collections::BTreeMap<u64, TableKinds> {
-        let mut kinds: std::collections::BTreeMap<u64, TableKinds> =
-            std::collections::BTreeMap::new();
+    fn table_kinds(&self) -> BTreeMap<u64, TableKinds> {
+        let mut kinds: BTreeMap<u64, TableKinds> = BTreeMap::new();
         for &table_id in &self.inserted_tables {
             kinds.entry(table_id).or_default().inserted = true;
         }
@@ -483,7 +505,7 @@ impl ChangeSet {
         for &table_id in self.dropped_tables.iter().chain(self.dropped_views.iter()) {
             kinds.entry(table_id).or_default().dropped = true;
         }
-        let compacted: std::collections::BTreeSet<u64> = self
+        let compacted: BTreeSet<u64> = self
             .merge_adjacent_tables
             .iter()
             .chain(self.rewrite_delete_tables.iter())

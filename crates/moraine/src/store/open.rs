@@ -23,7 +23,7 @@ pub(crate) async fn open_store(path: &str, object_store: Arc<dyn ObjectStore>) -
 
 /// Open the store read-only as a [`DbReader`] following the latest manifest,
 /// with the same tag-byte segment extractor as the writer. A `DbReader`
-/// never opens the writer `Db`, so it never fences a live writer (RFC 0004).
+/// never opens the writer `Db`, so it never fences a live writer.
 pub(crate) async fn open_reader(
     path: &str,
     object_store: Arc<dyn ObjectStore>,

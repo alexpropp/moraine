@@ -124,6 +124,25 @@ pub unsafe extern "C" fn moraine_arrow_bytes_free(bytes: MoraineArrowBytes) {
     }
 }
 
+fn write_ffi_result(
+    out_schema: *mut FFI_ArrowSchema,
+    out_array: *mut FFI_ArrowArray,
+    err: *mut MoraineArrowError,
+    result: Result<(FFI_ArrowArray, FFI_ArrowSchema), String>,
+) -> i32 {
+    match result {
+        Ok((ffi_array, ffi_schema)) => {
+            // SAFETY: `out_*` are valid writable slots per the caller contract.
+            unsafe {
+                ptr::write(out_array, ffi_array);
+                ptr::write(out_schema, ffi_schema);
+            }
+            clear_error(err)
+        }
+        Err(e) => set_error(err, &e),
+    }
+}
+
 fn write_bytes_result(
     out: *mut MoraineArrowBytes,
     err: *mut MoraineArrowError,
@@ -292,17 +311,7 @@ pub unsafe extern "C" fn moraine_arrow_decode_body(
         to_ffi(&StructArray::from(batch).to_data()).map_err(|e| format!("array export: {e}"))
     }))
     .unwrap_or_else(|_| Err("panic decoding inline chunk body".to_string()));
-    match result {
-        Ok((ffi_array, ffi_schema)) => {
-            // SAFETY: `out_*` are valid writable slots per the caller contract.
-            unsafe {
-                ptr::write(out_array, ffi_array);
-                ptr::write(out_schema, ffi_schema);
-            }
-            clear_error(err)
-        }
-        Err(e) => set_error(err, &e),
-    }
+    write_ffi_result(out_schema, out_array, err, result)
 }
 
 /// Decodes a self-contained IPC stream (from [`moraine_arrow_encode_chunk`],
@@ -337,17 +346,7 @@ pub unsafe extern "C" fn moraine_arrow_decode_stream(
         to_ffi(&StructArray::from(batch).to_data()).map_err(|e| format!("array export: {e}"))
     }))
     .unwrap_or_else(|_| Err("panic decoding arrow stream".to_string()));
-    match result {
-        Ok((ffi_array, ffi_schema)) => {
-            // SAFETY: `out_*` are valid writable slots per the caller contract.
-            unsafe {
-                ptr::write(out_array, ffi_array);
-                ptr::write(out_schema, ffi_schema);
-            }
-            clear_error(err)
-        }
-        Err(e) => set_error(err, &e),
-    }
+    write_ffi_result(out_schema, out_array, err, result)
 }
 
 /// Reads and takes ownership of an exported schema struct.

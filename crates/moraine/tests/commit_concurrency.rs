@@ -54,7 +54,7 @@ async fn seeded() -> (Catalog, SchemaId, TableId, TableId) {
     (catalog, s, a, b)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn disjoint_table_ddl_both_succeed() {
     let (catalog, _s, a, b) = seeded().await;
     let c1 = catalog.clone();
@@ -76,7 +76,7 @@ async fn disjoint_table_ddl_both_succeed() {
     catalog.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn same_table_ddl_races_serialize_or_conflict() {
     let (catalog, _s, a, _b) = seeded().await;
     // Whether a round serializes or conflicts depends on scheduling; the
@@ -129,8 +129,8 @@ async fn same_table_ddl_races_serialize_or_conflict() {
     catalog.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn same_name_create_race_yields_already_exists() {
+#[tokio::test(flavor = "multi_thread")]
+async fn same_name_create_race_yields_one_table() {
     let (catalog, s, _a, _b) = seeded().await;
     let c1 = catalog.clone();
     let c2 = catalog.clone();
@@ -161,7 +161,7 @@ async fn same_name_create_race_yields_already_exists() {
     catalog.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn counters_never_regress_or_collide_under_concurrency() {
     let (catalog, s, _a, _b) = seeded().await;
     let mut handles = Vec::new();
@@ -187,7 +187,7 @@ async fn counters_never_regress_or_collide_under_concurrency() {
     catalog.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn same_table_appends_both_land_with_dense_row_ids() {
     let (catalog, _s, a, _b) = seeded().await;
     let c1 = catalog.clone();
@@ -219,9 +219,9 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
     catalog.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn append_vs_drop_is_a_real_error() {
-    let (catalog, _s, a, _b) = seeded().await;
+    let (catalog, s, a, _b) = seeded().await;
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
@@ -234,11 +234,62 @@ async fn append_vs_drop_is_a_real_error() {
 
     // Serialized is fine; a genuine race surfaces CommitConflict or
     // NotFound on the loser.
-    for r in [r1, r2] {
+    for r in [&r1, &r2] {
         match r {
             Ok(_) | Err(Error::CommitConflict(_) | Error::NotFound(_)) => {}
             Err(other) => panic!("unexpected error: {other}"),
         }
     }
+
+    // Whatever the outcome mix, the head must be consistent with it.
+    let head = catalog.snapshot().await.unwrap();
+    let live = head.tables_in(s).into_iter().any(|t| t.id == a);
+    if r2.is_ok() {
+        assert!(!live, "drop committed, so the table must be gone");
+    } else {
+        assert!(live, "drop failed, so the table must survive");
+        if r1.is_ok() {
+            assert_eq!(head.data_files_of(a).len(), 1);
+        }
+    }
     catalog.close().await.unwrap();
+}
+
+/// An options-only commit re-validates its scope against a racing drop:
+/// whichever order the two land in, a dropped table never keeps a live
+/// option record (which nothing could ever remove again).
+#[tokio::test(flavor = "multi_thread")]
+async fn option_set_vs_drop_leaves_no_orphaned_option() {
+    use moraine::OptionScope;
+
+    for _ in 0..10 {
+        let (catalog, s, a, _b) = seeded().await;
+        let c1 = catalog.clone();
+        let c2 = catalog.clone();
+        let t1 = tokio::spawn(async move {
+            c1.commit(move |tx| tx.set_option(OptionScope::Table(a), "k", "v"))
+                .await
+        });
+        let t2 = tokio::spawn(async move { c2.commit(move |tx| tx.drop_table(a)).await });
+        let set = t1.await.unwrap();
+        let dropped = t2.await.unwrap();
+
+        for r in [&set, &dropped] {
+            match r {
+                Ok(_) | Err(Error::CommitConflict(_) | Error::NotFound(_)) => {}
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+
+        let head = catalog.snapshot().await.unwrap();
+        let live = head.tables_in(s).into_iter().any(|t| t.id == a);
+        if !live {
+            assert_eq!(
+                head.option(OptionScope::Table(a), "k"),
+                None,
+                "dropped table kept an orphaned option record"
+            );
+        }
+        catalog.close().await.unwrap();
+    }
 }

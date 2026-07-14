@@ -33,8 +33,9 @@ const EXTENSION_NAME: &str = "moraine_duckdb";
 const DUCKDB_LOAD_TEST_NAME: &str = "tests::attach_lists_and_scans_through_real_duckdb";
 
 /// Every `#[ignore]`d test in `ducklake_load.rs`, run together (not
-/// `--exact`, since there are ten). Needs network access to `INSTALL
-/// ducklake`.
+/// `--exact`, since there are many). Needs network access to `INSTALL
+/// ducklake`. Adding a test there means bumping this count, or `e2e`
+/// fails — deliberate, so a silently-filtered test can never pass.
 const DUCKLAKE_LOAD_TEST_COUNT: &str = "15 passed";
 
 fn main() -> anyhow::Result<()> {
@@ -149,7 +150,11 @@ fn workspace_root() -> PathBuf {
 }
 
 fn release_dir() -> PathBuf {
-    workspace_root().join("target/release")
+    // Honor a redirected target directory; the cdylib lands there, not in
+    // the workspace tree.
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace_root().join("target"), PathBuf::from)
+        .join("release")
 }
 
 /// Cache root for the downloaded CLI and the packaged extension artifact,
