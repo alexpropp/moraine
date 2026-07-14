@@ -81,9 +81,10 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns [`Error::AlreadyExists`] if a schema with that name already
-    /// exists.
+    /// exists, or [`Error::Constraint`] if the name is empty or unsafe in
+    /// the storage path derived from it.
     pub fn create_schema(&mut self, name: &str) -> Result<SchemaId> {
-        nonempty_name("schema", name)?;
+        path_safe_name("schema", name)?;
         if self.state.schema_names.contains_key(name) {
             return Err(Error::AlreadyExists(format!("schema {name}")));
         }
@@ -110,8 +111,17 @@ impl Transaction {
     ///
     /// Returns [`Error::NotFound`] if the schema does not exist.
     /// Returns [`Error::Constraint`] if the schema still contains live
-    /// tables.
+    /// tables, or is the bootstrap `main` schema (the default DuckDB
+    /// resolves unqualified names against).
     pub fn drop_schema(&mut self, schema: SchemaId) -> Result<()> {
+        // Schema id 0 is the bootstrap `main` schema — the default DuckDB
+        // resolves unqualified names against; a catalog without it is a
+        // shape DuckLake never produces or attaches.
+        if schema.get() == 0 {
+            return Err(Error::Constraint(
+                "the bootstrap `main` schema cannot be dropped".to_string(),
+            ));
+        }
         if !self.state.schemas.contains_key(&schema.get()) {
             return Err(Error::NotFound(format!("schema {schema}")));
         }
@@ -161,7 +171,7 @@ impl Transaction {
             return Err(Error::NotFound(format!("schema {schema}")));
         }
 
-        nonempty_name("table", name)?;
+        path_safe_name("table", name)?;
         self.relation_name_free(schema.get(), name)?;
         if columns.is_empty() {
             return Err(Error::Constraint(format!(
@@ -248,7 +258,7 @@ impl Transaction {
     /// Returns [`Error::AlreadyExists`] if a table with that name already
     /// exists in the same schema (including this table itself).
     pub fn rename_table(&mut self, table: TableId, new_name: &str) -> Result<()> {
-        nonempty_name("table", new_name)?;
+        path_safe_name("table", new_name)?;
         let value = self.live_table(table)?;
         self.relation_name_free(value.schema_id, new_name)?;
         self.state.put_table(TableValue {
@@ -725,7 +735,7 @@ impl Transaction {
         dialect: &str,
         sql: &str,
     ) -> Result<ViewId> {
-        nonempty_name("view", name)?;
+        path_safe_name("view", name)?;
         let Some(schema_rec) = self.state.schemas.get(&schema.get()) else {
             return Err(Error::NotFound(format!("schema {schema}")));
         };
@@ -885,6 +895,19 @@ fn reserved_option(scope: OptionScope, key: &str) -> Result<()> {
 fn nonempty_name(what: &str, name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::Constraint(format!("{what} name must not be empty")));
+    }
+    Ok(())
+}
+
+/// Refuses a relation name unsafe in the storage path derived from it: a
+/// separator nests or collides prefixes, and a dot segment escapes the
+/// catalog root.
+fn path_safe_name(what: &str, name: &str) -> Result<()> {
+    nonempty_name(what, name)?;
+    if name.contains(['/', '\\']) || name == "." || name == ".." {
+        return Err(Error::Constraint(format!(
+            "{what} name {name:?} is unsafe in a storage path"
+        )));
     }
     Ok(())
 }
@@ -1480,6 +1503,89 @@ mod tests {
         // Option mutations stage no ops; the two DDL ops remain.
         let (ops, _, _, _) = transaction.into_parts();
         assert_eq!(ops.len(), 2);
+    }
+
+    /// The bootstrap `main` schema (id 0) is the catalog's default —
+    /// DuckDB resolves unqualified names against it — and must survive
+    /// every commit. Only the verb path could drop it; DuckDB refuses the
+    /// SQL-level drop before it ever reaches the staged path.
+    #[test]
+    fn bootstrap_main_schema_cannot_be_dropped() {
+        let snapshot = SnapshotValue {
+            snapshot_id: 4,
+            snapshot_time_micros: 1,
+            schema_version: 2,
+            next_catalog_id: 10,
+            next_file_id: 0,
+            next_deletion_id: 0,
+            changes_made: String::new(),
+            author: None,
+            commit_message: None,
+            commit_extra_info: None,
+            schema_changed_table_ids: Vec::new(),
+        };
+        let main = SchemaValue {
+            schema_id: 0,
+            schema_uuid: "u".into(),
+            begin_snapshot: 0,
+            end_snapshot: None,
+            schema_name: "main".into(),
+            path: "main/".into(),
+            path_is_relative: true,
+        };
+        let mut transaction = Transaction::new(
+            CatalogSnapshot::build(
+                snapshot,
+                vec![crate::store::read::EntityRecord::Schema(main)],
+                vec![],
+                None,
+            ),
+            5,
+        );
+
+        assert!(matches!(
+            transaction.drop_schema(SchemaId::new(0)),
+            Err(Error::Constraint(_))
+        ));
+
+        // Any other empty schema still drops.
+        let other = transaction.create_schema("other").unwrap();
+        transaction.drop_schema(other).unwrap();
+    }
+
+    /// Relation names flow into derived storage paths: a separator nests
+    /// or collides prefixes and a dot segment escapes the catalog root,
+    /// so schema, table, and view names refuse them.
+    #[test]
+    fn path_unsafe_names_are_refused() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+
+        for name in ["a/b", "a\\b", ".", ".."] {
+            assert!(
+                matches!(transaction.create_schema(name), Err(Error::Constraint(_))),
+                "schema {name:?}"
+            );
+            assert!(
+                matches!(
+                    transaction.create_table(s, name, &[col("a")]),
+                    Err(Error::Constraint(_))
+                ),
+                "table {name:?}"
+            );
+            assert!(
+                matches!(transaction.rename_table(t, name), Err(Error::Constraint(_))),
+                "rename {name:?}"
+            );
+            assert!(
+                matches!(
+                    transaction.create_view(s, name, "duckdb", "SELECT 1"),
+                    Err(Error::Constraint(_))
+                ),
+                "view {name:?}"
+            );
+        }
     }
 
     /// Every name-taking verb refuses the empty string: an empty name is
