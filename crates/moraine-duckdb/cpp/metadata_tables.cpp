@@ -3,6 +3,7 @@
 #include "catalog.hpp"
 #include "inline_tables.hpp"
 #include "owned_array.hpp"
+#include "transaction_manager.hpp"
 
 namespace moraine_duckdb {
 
@@ -300,7 +301,7 @@ std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *h
 		    Bigint(r.record_count),
 		    Bigint(r.file_size_bytes),
 		    Bigint(r.footer_size),
-		    Bigint(r.row_id_start),
+		    OptBigint(r.has_row_id_start, r.row_id_start),
 		    OptBigint(r.has_partition_id, r.partition_id),
 		    OptVarchar(r.encryption_key),
 		    OptBigint(r.has_mapping_id, r.mapping_id),
@@ -699,6 +700,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        },
 	        ProvideSnapshots,
 	        0,
+	        {},
+	        0,
+	        /* delete key: snapshot_id */ {0},
 	    },
 	    {
 	        "ducklake_snapshot_changes",
@@ -711,6 +715,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        },
 	        ProvideSnapshotChanges,
 	        1,
+	        {},
+	        0,
+	        /* delete key: snapshot_id */ {0},
 	    },
 	    {
 	        "ducklake_schema",
@@ -727,6 +734,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        2,
 	        /* end key: schema_id */ {0},
 	        /* end_snapshot col */ 3,
+	        /* delete key: schema_id, end_snapshot */ {0, 3},
 	    },
 	    {
 	        "ducklake_table",
@@ -744,6 +752,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        3,
 	        /* end key: table_id */ {0},
 	        /* end_snapshot col */ 3,
+	        /* delete key: table_id, end_snapshot */ {0, 3},
 	    },
 	    {
 	        "ducklake_view",
@@ -762,6 +771,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        4,
 	        /* end key: view_id */ {0},
 	        /* end_snapshot col */ 3,
+	        /* delete key: view_id, end_snapshot */ {0, 3},
 	    },
 	    {
 	        "ducklake_column",
@@ -784,6 +794,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        5,
 	        /* end key: table_id, column_id (decoder order) */ {3, 0},
 	        /* end_snapshot col */ 2,
+	        /* delete key: table_id, column_id, end_snapshot */ {3, 0, 2},
 	    },
 	    {
 	        "ducklake_data_file",
@@ -809,6 +820,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        6,
 	        /* end key: table_id, data_file_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
+	        /* delete key: table_id, data_file_id, end_snapshot */ {1, 0, 3},
 	    },
 	    {
 	        "ducklake_delete_file",
@@ -831,6 +843,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        7,
 	        /* end key: table_id, delete_file_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
+	        /* delete key: table_id, delete_file_id, end_snapshot */ {1, 0, 3},
 	    },
 	    {
 	        "ducklake_table_stats",
@@ -845,6 +858,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        {},
 	        0,
 	        /* delete key: table_id */ {0},
+	        /* overlay updates */ true,
 	    },
 	    {
 	        "ducklake_table_column_stats",
@@ -862,6 +876,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        {},
 	        0,
 	        /* delete key: table_id, column_id */ {0, 1},
+	        /* overlay updates */ true,
 	    },
 	    {
 	        "ducklake_file_column_stats",
@@ -882,6 +897,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        {},
 	        0,
 	        /* delete key: data_file_id, table_id, column_id (decoder order) */ {0, 1, 2},
+	        /* overlay updates */ true,
 	    },
 	    {
 	        // Three-column form: (begin_snapshot, schema_version, table_id).
@@ -893,9 +909,10 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        },
 	        ProvideSchemaVersions,
 	        11,
+	        {},
+	        0,
+	        /* delete key: begin_snapshot, schema_version, table_id */ {0, 1, 2},
 	    },
-	    // Always-empty stand-ins (see `ProvideEmpty`): no dump ABI call backs
-	    // them — the store models none of these kinds.
 	    {
 	        "ducklake_tag",
 	        {
@@ -986,6 +1003,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        12,
 	        /* end key: table_id, partition_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
+	        /* delete key: table_id, partition_id, end_snapshot */ {1, 0, 3},
 	    },
 	    {
 	        "ducklake_partition_column",
@@ -998,6 +1016,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        },
 	        ProvidePartitionColumns,
 	        13,
+	        {},
+	        0,
+	        /* delete key: partition_id, table_id */ {0, 1},
 	    },
 	    {
 	        "ducklake_file_partition_value",
@@ -1009,6 +1030,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        },
 	        ProvideFilePartitionValues,
 	        14,
+	        {},
+	        0,
+	        /* delete key: data_file_id, table_id */ {0, 1},
 	    },
 	    {
 	        "ducklake_file_variant_stats",
@@ -1075,6 +1099,7 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        15,
 	        /* end key: table_id, sort_id (decoder order) */ {1, 0},
 	        /* end_snapshot col */ 3,
+	        /* delete key: table_id, sort_id, end_snapshot */ {1, 0, 3},
 	    },
 	    {
 	        "ducklake_sort_expression",
@@ -1089,6 +1114,9 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	        },
 	        ProvideSortExpressions,
 	        16,
+	        {},
+	        0,
+	        /* delete key: sort_id, table_id */ {0, 1},
 	    },
 	    {
 	        "ducklake_metadata",

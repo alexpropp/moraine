@@ -619,7 +619,10 @@ pub struct MoraineDataFileRow {
     pub file_size_bytes: u64,
     /// `footer_size`.
     pub footer_size: u64,
-    /// `row_id_start`.
+    /// Whether `row_id_start` is present (absent when the file's rows
+    /// carry explicit per-row ids, e.g. compaction outputs).
+    pub has_row_id_start: bool,
+    /// `row_id_start`, valid iff `has_row_id_start`.
     pub row_id_start: u64,
     /// Whether `partition_id` is present.
     pub has_partition_id: bool,
@@ -705,7 +708,8 @@ pub unsafe extern "C" fn moraine_dump_data_files(
                     record_count: v.record_count,
                     file_size_bytes: v.file_size_bytes,
                     footer_size: v.footer_size,
-                    row_id_start: v.row_id_start,
+                    has_row_id_start: v.row_id_start.is_some(),
+                    row_id_start: v.row_id_start.unwrap_or_default(),
                     has_partition_id: has_partition,
                     partition_id: partition,
                     encryption_key: opt_into_raw(encryption_key),
@@ -1260,6 +1264,55 @@ pub struct MoraineSnapshotRow {
     pub commit_extra_info: *mut c_char,
 }
 
+/// One snapshot record's fields, in `MoraineSnapshotRow` order — the
+/// nameable shape the wire value maps into (its own type is internal to
+/// the core crate).
+pub(crate) type SnapshotRowFields = (
+    u64,
+    i64,
+    u64,
+    u64,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Converts snapshot records to C rows, owned-first (see
+/// `moraine_dump_schemas`): every string in the whole batch converts
+/// before any raw pointer is minted.
+pub(crate) fn snapshot_rows(
+    rows: Vec<SnapshotRowFields>,
+) -> Result<Vec<MoraineSnapshotRow>, AbiError> {
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let changes_made = to_c_string(&v.5)?;
+            let author = opt_c_string(v.6.as_deref())?;
+            let commit_message = opt_c_string(v.7.as_deref())?;
+            let commit_extra_info = opt_c_string(v.8.as_deref())?;
+            Ok((v, changes_made, author, commit_message, commit_extra_info))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+    Ok(owned
+        .into_iter()
+        .map(
+            |(v, changes_made, author, commit_message, commit_extra_info)| MoraineSnapshotRow {
+                snapshot_id: v.0,
+                snapshot_time_micros: v.1,
+                schema_version: v.2,
+                next_catalog_id: v.3,
+                next_file_id: v.4,
+                changes_made: changes_made.into_raw(),
+                author: opt_into_raw(author),
+                commit_message: opt_into_raw(commit_message),
+                commit_extra_info: opt_into_raw(commit_extra_info),
+            },
+        )
+        .collect())
+}
+
 /// Dumps every `ducklake_snapshot` row into `*out_items`/`*out_len`.
 /// Snapshots carry no begin/end lifecycle of their own — this is the
 /// full committed history, not a current/history split.
@@ -1294,34 +1347,23 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
                 moraine::ffi_support::dump_snapshots(&handle_ref.catalog),
             )
         }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = rows
-            .into_iter()
-            .map(|v| {
-                let changes_made = to_c_string(&v.changes_made)?;
-                let author = opt_c_string(v.author.as_deref())?;
-                let commit_message = opt_c_string(v.commit_message.as_deref())?;
-                let commit_extra_info = opt_c_string(v.commit_extra_info.as_deref())?;
-                Ok((v, changes_made, author, commit_message, commit_extra_info))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(
-                |(v, changes_made, author, commit_message, commit_extra_info)| MoraineSnapshotRow {
-                    snapshot_id: v.snapshot_id,
-                    snapshot_time_micros: v.snapshot_time_micros,
-                    schema_version: v.schema_version,
-                    next_catalog_id: v.next_catalog_id,
-                    next_file_id: v.next_file_id,
-                    changes_made: changes_made.into_raw(),
-                    author: opt_into_raw(author),
-                    commit_message: opt_into_raw(commit_message),
-                    commit_extra_info: opt_into_raw(commit_extra_info),
-                },
-            )
-            .collect())
+        snapshot_rows(
+            rows.into_iter()
+                .map(|v| {
+                    (
+                        v.snapshot_id,
+                        v.snapshot_time_micros,
+                        v.schema_version,
+                        v.next_catalog_id,
+                        v.next_file_id,
+                        v.changes_made,
+                        v.author,
+                        v.commit_message,
+                        v.commit_extra_info,
+                    )
+                })
+                .collect(),
+        )
     };
 
     // SAFETY: `err` validity is this function's own safety contract.

@@ -147,8 +147,10 @@ pub struct DataFileInfo {
     pub file_size_bytes: u64,
     /// Footer size in bytes.
     pub footer_size: u64,
-    /// First row id of the file's dense per-table row-id range.
-    pub row_id_start: u64,
+    /// First row id of the file's dense per-table row-id range; `None`
+    /// when the file's rows carry explicit per-row ids instead
+    /// (compaction outputs).
+    pub row_id_start: Option<u64>,
     /// Encryption key material, verbatim.
     pub encryption_key: Option<String>,
 }

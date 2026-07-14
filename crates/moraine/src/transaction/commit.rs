@@ -15,7 +15,7 @@ use crate::{
     error::{Error, Result},
     store::{
         handle::ReadHandle,
-        key::{EntityKey, Key, SysKey},
+        key::{CurrentKey, EntityKey, Key, SysKey},
         open::{open_reader, open_store},
         proto, read, value,
     },
@@ -959,13 +959,21 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
     let mut changes = Vec::new();
 
     for snapshot_id in (head_before + 1)..=head.snapshot_id {
-        let bytes = db
+        let change_set = match db
             .get(Key::Snapshot { snapshot_id }.encode())
             .await
             .map_err(Error::from)?
-            .ok_or_else(|| Error::Corruption(format!("snapshot record {snapshot_id} missing")))?;
-        let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
-        changes.push((snapshot_id, ChangeSet::parse(&snapshot.changes_made)));
+        {
+            Some(bytes) => {
+                let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
+                ChangeSet::parse(&snapshot.changes_made)
+            }
+            None => ChangeSet {
+                has_unknown: true,
+                ..ChangeSet::default()
+            },
+        };
+        changes.push((snapshot_id, change_set));
     }
 
     Ok(changes)

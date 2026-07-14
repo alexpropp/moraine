@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "orders/data-1.parquet");
         assert_eq!(files[0].record_count, 10);
-        assert_eq!(files[0].row_id_start, 0);
+        assert_eq!(files[0].row_id_start, Some(0));
         assert!(files[0].end_snapshot.is_none());
 
         let deletes = dump_delete_files(&catalog).await.unwrap();

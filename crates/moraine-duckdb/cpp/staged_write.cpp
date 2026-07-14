@@ -211,16 +211,17 @@ class MoraineMetadataUpdate : public MoraineMetadataDml {
 public:
 	MoraineMetadataUpdate(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
 	                      const MetadataTableSpec &spec, duckdb::Catalog &catalog,
-	                      duckdb::idx_t estimated_cardinality, bool set_end, std::vector<duckdb::idx_t> set_columns,
-	                      std::vector<duckdb::idx_t> set_refs)
+	                      duckdb::idx_t estimated_cardinality, int32_t lifecycle_op,
+	                      std::vector<duckdb::idx_t> set_columns, std::vector<duckdb::idx_t> set_refs)
 	    : MoraineMetadataDml(physical_plan, std::move(types), spec, catalog, estimated_cardinality),
-	      set_end_(set_end), set_columns_(std::move(set_columns)), set_refs_(std::move(set_refs)) {
+	      lifecycle_op_(lifecycle_op), set_columns_(std::move(set_columns)), set_refs_(std::move(set_refs)) {
 	}
 
-	// True: the update-set-end lifecycle convention. False: statistics
+	// The staged operation_kind for a lifecycle update — 2 (SET
+	// end_snapshot) or 3 (SET begin_snapshot) — or -1 for the statistics
 	// overlay staged as a full-row insert (the in-place overwrite an
 	// insert means for unversioned kinds).
-	bool set_end_;
+	int32_t lifecycle_op_;
 	// Declared column index of each SET target, and the chunk column its
 	// new value arrives in, index-aligned.
 	std::vector<duckdb::idx_t> set_columns_;

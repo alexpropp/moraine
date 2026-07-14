@@ -32,7 +32,7 @@ use crate::{
         handle::ReadHandle,
         inline as store_inline,
         key::{EntityKey, InlineKey, InlineOperation, Key, SysKey},
-        proto, value,
+        proto, read, value,
     },
     transaction::commit,
 };
@@ -143,6 +143,17 @@ pub enum RowOperation {
         table: TableKind,
         /// The ended row's key columns, in table order, followed by the
         /// new `end_snapshot` value.
+        cells: Vec<Cell>,
+    },
+    /// An `UPDATE ... SET begin_snapshot = <v>` row: rebases a data
+    /// file's visibility window in place. DuckLake issues it only during
+    /// a delete-rewrite, against the replacement file the same
+    /// transaction just inserted — any other target is a shape error.
+    UpdateSetBegin {
+        /// The row's table (only `ducklake_data_file`).
+        table: TableKind,
+        /// The rebased row's key columns, followed by the new
+        /// `begin_snapshot` value.
         cells: Vec<Cell>,
     },
     /// `inline/schema`: the Arrow IPC schema for one `(table_id,
@@ -460,7 +471,7 @@ fn decode_data_file(cells: &[Cell]) -> Result<proto::DataFileValue> {
         record_count: c.u64()?,
         file_size_bytes: c.u64()?,
         footer_size: c.u64()?,
-        row_id_start: c.u64()?,
+        row_id_start: c.opt_u64()?,
         partition_id: c.opt_u64()?,
         encryption_key: c.opt_string()?,
         mapping_id: c.opt_u64()?,
@@ -796,13 +807,17 @@ fn apply_op(
     op: &RowOperation,
     new_id: u64,
     children: &mut ChildRows,
+    direct: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
     match op {
         RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells, children),
         RowOperation::UpdateSetEnd { table, cells } => {
             apply_update_set_end(state, *table, cells, new_id)
         }
-        RowOperation::Delete { table, cells } => apply_delete(state, *table, cells),
+        RowOperation::UpdateSetBegin { table, cells } => {
+            apply_update_set_begin(base, state, *table, cells, new_id)
+        }
+        RowOperation::Delete { table, cells } => apply_delete(state, *table, cells, direct),
         // Inline ops never reach here — `translate` routes them to
         // `translate_inline`. Kept only for match exhaustiveness.
         RowOperation::InlineSchema { .. }
@@ -1607,9 +1622,18 @@ impl StagedTransaction {
             }
         };
 
-        match translate(&base, &ops) {
-            Ok((new_id, mut writes, snap)) => {
-                writes.extend(inline_writes);
+        let mints_snapshot = ops.iter().any(|op| {
+            matches!(
+                op,
+                RowOperation::Insert {
+                    table: TableKind::Snapshot,
+                    ..
+                }
+            )
+        });
+
+        let translated = if mints_snapshot {
+            translate(&base, &ops).map(|(new_id, mut writes, snap)| {
                 writes.push((
                     Key::Snapshot {
                         snapshot_id: new_id,
@@ -1662,26 +1686,38 @@ fn translate(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
 ) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
-    let snapshot = build_snapshot_value(ops, base.snapshot.next_deletion_id)?;
+    let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
 
     // Ends and deletes apply before inserts, independent of DuckLake's
     // emit order: a rename ends the old version and inserts a new one
     // under the same id, and the insert must win their shared `current` key —
     // an end applied afterward would delete the id and erase the new row.
-    // Inline ops are skipped here entirely — `commit` translates them
-    // separately via `translate_inline`, since `CatalogSnapshot` has no
-    // notion of inlined rows to diff.
+    // Begin-rebases apply last: their target is the row an insert in this
+    // same commit created. Inline ops are skipped here entirely —
+    // `commit` translates them separately via `translate_inline`, since
+    // `CatalogSnapshot` has no notion of inlined rows to diff.
     let mut state = base.clone();
     let mut children = collect_child_rows(ops)?;
+    let mut direct = Vec::new();
     for op in ops {
-        if !is_inline_op(op) && !matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children)?;
+        if !is_inline_op(op)
+            && !matches!(
+                op,
+                RowOperation::Insert { .. } | RowOperation::UpdateSetBegin { .. }
+            )
+        {
+            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
         }
     }
     for op in ops {
         if matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children)?;
+            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
+        }
+    }
+    for op in ops {
+        if matches!(op, RowOperation::UpdateSetBegin { .. }) {
+            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
         }
     }
 
@@ -2059,7 +2095,8 @@ async fn translate_inline(
             }
             RowOperation::Insert { .. }
             | RowOperation::Delete { .. }
-            | RowOperation::UpdateSetEnd { .. } => {}
+            | RowOperation::UpdateSetEnd { .. }
+            | RowOperation::UpdateSetBegin { .. } => {}
         }
     }
 

@@ -152,9 +152,39 @@ on that path.
   post-flush `DELETE`/`UPDATE` used to wedge every later attach
 
 ## Maintenance & operations
-- [ ] Compaction / data-file rewriting (RFC 0008)
-- [ ] Snapshot expiry and orphaned-file cleanup / deletion scheduling
-  (RFC 0007; `files_scheduled_for_deletion`)
+- [x] Compaction / data-file rewriting (RFC 0008): DuckLake rewrites the
+  Parquet and authors the rows; moraine translates the two shapes its
+  ordinary write path lacked — merge's hard deletes of superseded file
+  rows (current and history alike, no history mirror; time travel
+  survives via the backdated, row-filtered merged file) plus its direct
+  deletion-schedule inserts, and rewrite's `SET begin_snapshot` rebase of
+  the replacement file. `row_id_start` is nullable end to end (compaction
+  and UPDATE outputs carry explicit per-row ids), `next_row_id` is never
+  touched, and reading `ducklake_inlined_delete_<t>` back (the overlay an
+  UPDATE writes) is served for real. `ducklake_merge_adjacent_files`
+  (rows/row ids identical, pre-merge time travel intact, sources
+  scheduled then cleaned, UPDATE-after-merge lineage) and
+  `ducklake_rewrite_data_files` (delete file consumed, survivors keep
+  ids, pre-rewrite time travel intact) verified live (`ducklake_load.rs`'s
+  `ducklake_merge_adjacent_files_preserves_rows_and_time_travel` and
+  `ducklake_rewrite_data_files_materializes_deletes`)
+- [x] Snapshot expiry and orphaned-file cleanup / deletion scheduling
+  (RFC 0007; `files_scheduled_for_deletion`): DuckLake computes the dead
+  set and deletes the bytes; moraine translates the cascade — snapshot
+  records and dead entity versions hard-pruned (`current` or `history`,
+  named by `end_snapshot`), files scheduled into `current/gcfile` (keyed
+  by `data_file_id`, DuckLake's own row identity), dead tables' inline
+  registrations dropped — as head-preserving commits (maintenance mints
+  no snapshot), with the snapshot projection serving read-your-writes
+  inside the transaction (the cascade's `NOT EXISTS` re-reads its own
+  deletes). Expired snapshots resolve as `NotFound`, never corruption,
+  and a racing verb commit treats a vanished intervening snapshot as a
+  conflict. `ducklake_expire_snapshots` → `ducklake_cleanup_old_files`
+  (schedule drains, bytes deleted, current view unchanged, expired time
+  travel refused) and `ducklake_delete_orphaned_files` (stray reaped,
+  catalogued files survive) verified live (`ducklake_load.rs`'s
+  `ducklake_expire_and_cleanup_reclaims_files` and
+  `ducklake_delete_orphaned_files_ignores_catalogued_paths`)
 - [x] Data-file encryption (RFC 0014): moraine is a faithful conduit —
   `ENCRYPTED` reaches a fresh store through DuckLake's `META_` passthrough,
   is recorded once at bootstrap as the stored global `encrypted` option and
@@ -166,9 +196,17 @@ on that path.
   attach → non-plaintext Parquet at rest → plain re-attach decrypts →
   catalog rows carry the keys). Catalog-at-rest stays delegated to bucket
   SSE-KMS per the RFC; moraine holds no crypto
-- [ ] Table/column tags and catalog options (`tag`, `column_tag`,
-  `metadata`) (options done; the tag keyspace is decided — RFC 0002's
-  `tag` kind — implementation pending)
+- [x] Table/column tags and catalog options (`tag`, `column_tag`,
+  `metadata`). Options were done earlier (`option` kind, unversioned
+  last-write-wins). Tags land per RFC 0002's `tag` kind: one container
+  record per tagged object with individually begin/end-versioned embedded
+  entries, column tags embedded in the column record (carried forward
+  across column version transitions, which a tags-only change never
+  mints — the record overwrites in place). `COMMENT ON TABLE/COLUMN`,
+  re-comment end+insert pairs, row-faithful `ducklake_tag`/
+  `ducklake_column_tag` projections, and comments surviving a column
+  rename are verified live (`ducklake_load.rs`'s
+  `ducklake_table_and_column_comments_round_trip`)
 
 ## Hardening & release
 - [ ] Real object storage tests (MinIO/localstack)

@@ -871,7 +871,11 @@ pub struct MoraineDataFileDesc {
     pub path_is_relative: bool,
     /// Number of rows in the file.
     pub record_count: u64,
-    /// First row id of the file's dense per-table row-id range.
+    /// Whether `row_id_start` is present (absent when the file's rows
+    /// carry explicit per-row ids, e.g. compaction outputs).
+    pub has_row_id_start: bool,
+    /// First row id of the file's dense per-table row-id range, valid
+    /// iff `has_row_id_start`.
     pub row_id_start: u64,
     /// Total file size in bytes.
     pub file_size_bytes: u64,
@@ -917,7 +921,8 @@ pub unsafe extern "C" fn moraine_snapshot_data_files_of(
                 path: path.into_raw(),
                 path_is_relative: f.path_is_relative,
                 record_count: f.record_count,
-                row_id_start: f.row_id_start,
+                has_row_id_start: f.row_id_start.is_some(),
+                row_id_start: f.row_id_start.unwrap_or_default(),
                 file_size_bytes: f.file_size_bytes,
                 footer_size: f.footer_size,
             })

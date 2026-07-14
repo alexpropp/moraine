@@ -274,7 +274,7 @@ mod tests {
             record_count: 10,
             file_size_bytes: 1024,
             footer_size: 64,
-            row_id_start: 0,
+            row_id_start: Some(0),
             partition_id: None,
             encryption_key: None,
             mapping_id: None,

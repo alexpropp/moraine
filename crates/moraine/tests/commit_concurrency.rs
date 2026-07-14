@@ -208,7 +208,12 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
     assert_eq!(files.len(), 2);
     let mut starts: Vec<(u64, u64)> = files
         .iter()
-        .map(|f| (f.row_id_start, f.record_count))
+        .map(|f| {
+            (
+                f.row_id_start.expect("verb-registered files carry a start"),
+                f.record_count,
+            )
+        })
         .collect();
     starts.sort_unstable();
 

@@ -73,7 +73,7 @@ async fn registration_is_data_only_and_visible() {
     let files = head.data_files_of(t);
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].record_count, 100);
-    assert_eq!(files[0].row_id_start, 0);
+    assert_eq!(files[0].row_id_start, Some(0));
     assert_eq!(head.table_stats(t).unwrap().next_row_id, 100);
     catalog.close().await.unwrap();
 }
@@ -105,7 +105,7 @@ async fn expiry_time_travels_and_row_ids_stay_dense() {
         .await
         .unwrap();
     let head = catalog.snapshot().await.unwrap();
-    assert_eq!(head.data_files_of(t)[0].row_id_start, 100);
+    assert_eq!(head.data_files_of(t)[0].row_id_start, Some(100));
     catalog.close().await.unwrap();
 }
 

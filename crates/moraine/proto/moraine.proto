@@ -130,7 +130,9 @@ message DataFileValue {
   uint64 record_count = 9;
   uint64 file_size_bytes = 10;
   uint64 footer_size = 11;
-  uint64 row_id_start = 12;
+  // NULL when the file's rows carry explicit per-row ids (compaction
+  // outputs) instead of a dense range from a start.
+  optional uint64 row_id_start = 12;
   optional uint64 partition_id = 13;
   optional string encryption_key = 14;
   optional uint64 mapping_id = 15;

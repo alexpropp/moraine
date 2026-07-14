@@ -498,7 +498,7 @@ impl Transaction {
             record_count: file.record_count,
             file_size_bytes: file.file_size_bytes,
             footer_size: file.footer_size,
-            row_id_start,
+            row_id_start: Some(row_id_start),
             partition_id: None,
             encryption_key: file.encryption_key,
             mapping_id: None,
@@ -1234,8 +1234,8 @@ mod tests {
             .unwrap();
         assert_ne!(f1, f2);
         let files = transaction.data_files_of(t);
-        assert_eq!(files[0].row_id_start, 0);
-        assert_eq!(files[1].row_id_start, 100);
+        assert_eq!(files[0].row_id_start, Some(0));
+        assert_eq!(files[1].row_id_start, Some(100));
         let stats = transaction.table_stats(t).unwrap();
         assert_eq!(stats.record_count, 150);
         assert_eq!(stats.next_row_id, 150);
@@ -1305,7 +1305,7 @@ mod tests {
         let f2 = transaction
             .register_data_file(t, datafile(10, vec![]))
             .unwrap();
-        assert_eq!(transaction.data_files_of(t)[0].row_id_start, 100);
+        assert_eq!(transaction.data_files_of(t)[0].row_id_start, Some(100));
         let _ = f2;
     }
 

@@ -650,7 +650,7 @@ mod tests {
             record_count: rows,
             file_size_bytes: rows * 10,
             footer_size: 4,
-            row_id_start: 0,
+            row_id_start: Some(0),
             partition_id: None,
             encryption_key: None,
             mapping_id: None,

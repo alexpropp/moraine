@@ -28,7 +28,8 @@ use moraine::ffi_support::staged::{
 };
 
 use crate::{
-    abi::{borrow_bytes, borrow_str, guard},
+    abi::{borrow_bytes, borrow_str, guard, write_array},
+    dumps::{MoraineSnapshotRow, snapshot_rows},
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
@@ -100,6 +101,7 @@ fn decode_operation_kind(v: i32) -> Result<OperationKind, AbiError> {
         0 => Ok(OperationKind::Insert),
         1 => Ok(OperationKind::Delete),
         2 => Ok(OperationKind::UpdateSetEnd),
+        3 => Ok(OperationKind::UpdateSetBegin),
         other => Err(AbiError::invalid_argument(format!(
             "moraine_tx_stage: unknown operation_kind {other}"
         ))),
@@ -256,6 +258,10 @@ pub unsafe extern "C" fn moraine_tx_stage(
                 cells: row_cells,
             },
             OperationKind::UpdateSetEnd => RowOperation::UpdateSetEnd {
+                table,
+                cells: row_cells,
+            },
+            OperationKind::UpdateSetBegin => RowOperation::UpdateSetBegin {
                 table,
                 cells: row_cells,
             },

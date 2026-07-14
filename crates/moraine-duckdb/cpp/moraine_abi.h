@@ -80,6 +80,7 @@ typedef struct MoraineDataFileDesc {
 	char *path;
 	bool path_is_relative;
 	uint64_t record_count;
+	bool has_row_id_start;
 	uint64_t row_id_start;
 	uint64_t file_size_bytes;
 	uint64_t footer_size;
@@ -224,6 +225,7 @@ typedef struct MoraineDataFileRow {
 	uint64_t record_count;
 	uint64_t file_size_bytes;
 	uint64_t footer_size;
+	bool has_row_id_start;
 	uint64_t row_id_start;
 	bool has_partition_id;
 	uint64_t partition_id;
