@@ -127,7 +127,7 @@ pub fn build_and_package_extension() -> anyhow::Result<PathBuf> {
 /// file on failure. Fails with a message naming the URL and hinting at
 /// connectivity issues when offline; curl's own diagnostics still reach
 /// stderr.
-fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
+pub fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
     println!("downloading {url}");
     let outcome = Command::new("curl")
         .args(["--fail", "--location", "--show-error", "-o"])
@@ -151,7 +151,7 @@ fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> anyhow::Result<()> {
+pub fn make_executable(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut perms = fs::metadata(path)
