@@ -204,7 +204,13 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn scans_return_inline_records_in_key_order() {
-        let db = open_store("t", Arc::new(InMemory::new())).await.unwrap();
+        let db = open_store(
+            "t",
+            Arc::new(InMemory::new()),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
 
         let schema_v0 = InlineSchemaValue {
             arrow_schema: b"schema-v0".to_vec(),
@@ -420,7 +426,13 @@ mod tests {
     /// table-scoped `scan_inline_schemas`.
     #[tokio::test]
     async fn scan_all_inline_schemas_covers_every_table() {
-        let db = open_store("t", Arc::new(InMemory::new())).await.unwrap();
+        let db = open_store(
+            "t",
+            Arc::new(InMemory::new()),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
 
         let table_one_v0 = InlineSchemaValue {
             arrow_schema: b"a-0".to_vec(),

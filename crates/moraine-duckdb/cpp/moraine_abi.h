@@ -97,8 +97,10 @@ typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
 // `encrypted` requests DuckLake data-file encryption; creation-time only —
 // recorded when a fresh store bootstraps, ignored on an existing store,
 // whose stored flag (moraine_catalog_encrypted) is authoritative.
+// `flush_interval_ms` sets the store's WAL flush cadence (bounds
+// per-commit latency); 0 means "not given" and keeps the default.
 int32_t moraine_attach(const char *path, const char *object_store_uri, bool read_only, bool encrypted,
-                       MoraineCatalogHandle **out, MoraineError *err);
+                       uint64_t flush_interval_ms, MoraineCatalogHandle **out, MoraineError *err);
 void moraine_detach(MoraineCatalogHandle *handle);
 
 // The stored `encrypted` flag, fixed when the store was created; stores

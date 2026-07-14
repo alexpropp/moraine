@@ -140,8 +140,9 @@ pub(crate) async fn open_initialized(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
     encrypted: bool,
+    flush_interval: std::time::Duration,
 ) -> Result<Db> {
-    let db = open_store(path, object_store).await?;
+    let db = open_store(path, object_store, flush_interval).await?;
     let tx = db
         .begin(IsolationLevel::Snapshot)
         .await
@@ -1038,7 +1039,13 @@ mod tests {
     #[tokio::test]
     async fn unknown_format_is_refused() {
         let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-        let db = open_store("", object_store.clone()).await.unwrap();
+        let db = open_store(
+            "",
+            object_store.clone(),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
         db.put(
             &Key::Sys(SysKey::Format).encode(),
             &value::encode_value(&proto::FormatValue {
@@ -1052,10 +1059,15 @@ mod tests {
 
         // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
         // `Debug` impl; `err().unwrap()` only needs it on the error side.
-        let err = open_initialized("", object_store, false)
-            .await
-            .err()
-            .unwrap();
+        let err = open_initialized(
+            "",
+            object_store,
+            false,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1063,7 +1075,13 @@ mod tests {
     #[tokio::test]
     async fn migration_marker_is_refused() {
         let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-        let db = open_store("", object_store.clone()).await.unwrap();
+        let db = open_store(
+            "",
+            object_store.clone(),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
         db.put(
             &Key::Sys(SysKey::Migration).encode(),
             &value::encode_value(&proto::MigrationValue {
@@ -1076,10 +1094,15 @@ mod tests {
         .unwrap();
         db.close().await.unwrap();
 
-        let err = open_initialized("", object_store, false)
-            .await
-            .err()
-            .unwrap();
+        let err = open_initialized(
+            "",
+            object_store,
+            false,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .err()
+        .unwrap();
         assert!(matches!(err, Error::Corruption(_)));
     }
 

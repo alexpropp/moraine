@@ -243,6 +243,7 @@ pub unsafe extern "C" fn moraine_attach(
     object_store_uri: *const c_char,
     read_only: bool,
     encrypted: bool,
+    flush_interval_ms: u64,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -272,6 +273,11 @@ pub unsafe extern "C" fn moraine_attach(
         })?;
         let mut options = moraine::CatalogOptions::default();
         options.encrypted = encrypted;
+        // 0 means "not given": the default cadence stands. An explicit
+        // zero never reaches this ABI — the shim refuses it at bind time.
+        if flush_interval_ms > 0 {
+            options.flush_interval = std::time::Duration::from_millis(flush_interval_ms);
+        }
         let open = async {
             if read_only {
                 moraine::Catalog::open_read_only(object_store, options).await
@@ -1077,6 +1083,7 @@ mod tests {
                 ptr::null(),
                 false,
                 false,
+                0,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1128,6 +1135,7 @@ mod tests {
                 ptr::null(),
                 false,
                 true,
+                0,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1463,6 +1471,7 @@ mod tests {
                 ptr::null(),
                 false,
                 false,
+                0,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1495,6 +1504,7 @@ mod tests {
                 scheme.as_ptr(),
                 false,
                 false,
+                0,
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1521,6 +1531,7 @@ mod tests {
                 ptr::null(),
                 false,
                 false,
+                0,
                 &raw mut handle,
                 &raw mut err,
             )

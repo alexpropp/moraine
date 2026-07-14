@@ -1,7 +1,7 @@
 //! The catalog handle: the entry point a host opens, reads, and commits
 //! through.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use object_store::ObjectStore;
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
@@ -24,7 +24,14 @@ enum Store {
 }
 
 /// Options for opening a catalog.
-#[derive(Debug, Clone, Default)]
+///
+/// # Examples
+///
+/// ```
+/// let options = moraine::CatalogOptions::default();
+/// assert_eq!(options.flush_interval, std::time::Duration::from_millis(100));
+/// ```
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CatalogOptions {
     /// Path prefix of the catalog within the bucket. Empty (the default)
@@ -36,6 +43,21 @@ pub struct CatalogOptions {
     /// store bootstraps, and ignored on an already-initialized store,
     /// where the stored value is authoritative.
     pub encrypted: bool,
+    /// How often the store's write-ahead log is flushed to object
+    /// storage. Durable commits wait for the next flush, so this bounds
+    /// per-commit latency; smaller values mean more frequent (on S3,
+    /// costlier) object-store PUTs. Must be nonzero; defaults to 100ms.
+    pub flush_interval: Duration,
+}
+
+impl Default for CatalogOptions {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            encrypted: false,
+            flush_interval: Duration::from_millis(100),
+        }
+    }
 }
 
 /// A handle to a moraine catalog: cheap to clone, drives reads and
@@ -79,7 +101,13 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
-        let db = commit::open_initialized(&options.path, object_store, options.encrypted).await?;
+        let db = commit::open_initialized(
+            &options.path,
+            object_store,
+            options.encrypted,
+            options.flush_interval,
+        )
+        .await?;
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
         })

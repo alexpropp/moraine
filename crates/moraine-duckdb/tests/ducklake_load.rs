@@ -1666,6 +1666,36 @@ mod tests {
         result
     }
 
+    /// `FLUSH_INTERVAL_MS` end to end: `ATTACH (META_FLUSH_INTERVAL_MS
+    /// 5)` → DuckLake's `META_` passthrough → this shim's inner attach →
+    /// the store's WAL flush cadence. The setting is visible only as
+    /// commit latency, so the assertion is that the option is accepted,
+    /// commits land, and a plain re-attach (default cadence) reads them
+    /// back.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_attach_flush_interval_option_is_applied() {
+        let dir = TempDir::new("flush-store");
+        let data_dir = TempDir::new("flush-data");
+
+        run_ducklake_sql_with_options(
+            dir.path(),
+            data_dir.path(),
+            ", META_FLUSH_INTERVAL_MS 5",
+            "CREATE TABLE lake.main.t(id BIGINT); \
+             INSERT INTO lake.main.t VALUES (1), (2);",
+        );
+
+        assert_eq!(
+            csv_rows(&run_ducklake_sql(
+                dir.path(),
+                data_dir.path(),
+                "SELECT count(*) FROM lake.main.t;",
+            )),
+            vec![vec!["2".to_string()]]
+        );
+    }
+
     /// `ENCRYPTED` end to end. The flag travels `ATTACH (ENCRYPTED,
     /// META_ENCRYPTED true)` → DuckLake's `META_` passthrough → this
     /// shim's inner attach → the store's creation-time flag, which the

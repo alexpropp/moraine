@@ -23,6 +23,7 @@ impl Scale {
             "large" => ("large", 10_000_000, 200, 100),
             other => bail!("unknown scale `{other}`; valid: small, medium, large"),
         };
+
         Ok(Self {
             name,
             bulk_rows,

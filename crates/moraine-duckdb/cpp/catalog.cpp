@@ -525,16 +525,26 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// (including through DuckLake's nested metadata attach); a read-only
 	// catalog opens a `DbReader` and never fences the writer.
 	bool read_only = options.access_mode == duckdb::AccessMode::READ_ONLY;
-	// `ENCRYPTED` reaches this attach through DuckLake's `META_` option
-	// passthrough (`META_ENCRYPTED true`). Creation-time only: the ABI
-	// records it when a fresh store bootstraps and ignores it afterward.
+	// Options reach this attach through DuckLake's `META_` passthrough
+	// (`META_ENCRYPTED true`, `META_FLUSH_INTERVAL_MS 5`), or directly on
+	// a standalone `moraine:` attach. `ENCRYPTED` is creation-time only:
+	// the ABI records it when a fresh store bootstraps and ignores it
+	// afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on the
+	// ABI means "not given", so an explicit zero is refused here.
 	bool encrypted = false;
+	uint64_t flush_interval_ms = 0;
 	for (auto &option : info.options) {
-		if (duckdb::StringUtil::Lower(option.first) == "encrypted") {
+		auto name = duckdb::StringUtil::Lower(option.first);
+		if (name == "encrypted") {
 			encrypted = option.second.GetValue<bool>();
+		} else if (name == "flush_interval_ms") {
+			flush_interval_ms = option.second.GetValue<uint64_t>();
+			if (flush_interval_ms == 0) {
+				throw duckdb::BinderException("FLUSH_INTERVAL_MS must be a positive number of milliseconds");
+			}
 		}
 	}
-	auto code = moraine_attach(info.path.c_str(), nullptr, read_only, encrypted, &handle, &err);
+	auto code = moraine_attach(info.path.c_str(), nullptr, read_only, encrypted, flush_interval_ms, &handle, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

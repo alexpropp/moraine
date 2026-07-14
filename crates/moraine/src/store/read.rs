@@ -226,7 +226,13 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn reads_decode_what_was_written() {
-        let db = open_store("t", Arc::new(InMemory::new())).await.unwrap();
+        let db = open_store(
+            "t",
+            Arc::new(InMemory::new()),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
 
         let head = HeadValue { snapshot_id: 3 };
         let schema = SchemaValue {
@@ -362,7 +368,13 @@ mod tests {
     /// replay from silently overwriting the live record.
     #[tokio::test]
     async fn unversioned_kind_in_history_is_refused() {
-        let db = open_store("t", Arc::new(InMemory::new())).await.unwrap();
+        let db = open_store(
+            "t",
+            Arc::new(InMemory::new()),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
 
         let stats = TableStatsValue {
             table_id: 7,

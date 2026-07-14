@@ -1,10 +1,8 @@
-# RFC 0021: Benchmark suite
-
-- **Date:** 2026-07-13
+# Benchmarking
 
 ## Summary
 
-A `cargo xtask bench` command that runs identical DuckLake workloads against
+`cargo xtask bench` runs identical DuckLake workloads against
 three metadata catalogs — moraine's SlateDB store, a stock DuckDB-file
 catalog, and a stock Postgres catalog — through the same pinned DuckDB CLI,
 and reports per-workload wall-clock timings side by side. The data layer is
@@ -52,6 +50,9 @@ else in the session is shared.
 
 - `moraine` — `ATTACH 'ducklake:moraine:<store_dir>' (DATA_PATH '<data_dir>')`
   after `LOAD`ing the packaged extension. SlateDB over the local filesystem.
+  moraine's per-commit latency is bounded by its WAL flush cadence (100ms by
+  default); `META_FLUSH_INTERVAL_MS <n>` on the attach tunes it, at the cost
+  of more frequent object-store PUTs.
 - `duckdb` — `ATTACH 'ducklake:<dir>/meta.ducklake' (DATA_PATH '<data_dir>')`.
   The stock, all-files DuckLake.
 - `postgres` — `ATTACH 'ducklake:postgres:dbname=<db> host=<socket_dir>
@@ -139,22 +140,4 @@ across checkouts.
 download/build/packaging helpers), and `bench.rs` with `bench/` submodules
 (`backends.rs`, `workloads.rs`, `timing.rs`, `report.rs`). Timer-line
 parsing, statement/phase zipping, statistics, and table formatting are pure
-functions with unit tests; proptest is not required (nothing here is a
-store codec). `xtask` gains no new dependencies beyond `anyhow` unless
-JSON emission demands one — JSON is emitted via a small hand-rolled writer
-to keep the tool dependency-free.
-
-## Alternatives considered
-
-- **Criterion/`duckdb-rs` in-process benches** — rejected: the bundled
-  DuckDB version would drift from the pinned CLI the extension is packaged
-  against, the dependency footprint is large, and it would not exercise the
-  real attach chain users run.
-- **Timing whole CLI invocations from the harness** — rejected: process
-  start-up and `INSTALL`/`LOAD` noise swamps sub-millisecond catalog
-  differences; `.timer on` gives per-statement real time inside one session.
-- **Docker-provisioned Postgres** — rejected: slower to start, requires a
-  running daemon, and local `initdb`/`pg_ctl` is already available wherever
-  libpq-based tooling is; the DSN override covers exotic setups.
-- **Shell-script harness** — rejected by repository policy: automation is
-  Rust under `xtask`.
+functions with unit tests.

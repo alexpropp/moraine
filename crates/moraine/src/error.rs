@@ -28,6 +28,11 @@ pub enum Error {
     #[error("constraint violation: {0}")]
     Constraint(String),
 
+    /// An environment or option value could not be parsed or is out of
+    /// range.
+    #[error("configuration: {0}")]
+    Configuration(String),
+
     /// The underlying store failed (SlateDB / object-store I/O).
     #[error("store error")]
     Store(#[source] Box<slatedb::Error>),

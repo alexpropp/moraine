@@ -61,7 +61,7 @@ pub fn attach_sql(
     let data = paths.data_dir.display();
     Ok(match kind {
         BackendKind::Moraine => format!(
-            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}');",
+            "ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{data}', META_FLUSH_INTERVAL_MS 1);",
             paths.catalog_dir.display()
         ),
         BackendKind::DuckdbFile => format!(

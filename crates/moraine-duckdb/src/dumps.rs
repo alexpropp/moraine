@@ -3204,6 +3204,7 @@ mod tests {
                 ptr::null(),
                 false,
                 false,
+                0,
                 &raw mut handle,
                 &raw mut err,
             )
