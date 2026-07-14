@@ -466,12 +466,52 @@ fn diff_options(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &C
     );
 }
 
+fn diff_tags(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
+    let object_ids = base.tags.keys().chain(state.tags.keys());
+    for &object_id in object_ids.collect::<std::collections::BTreeSet<_>>() {
+        stage_overwrite(
+            writes,
+            EntityKey::Tag { object_id },
+            base.tags.get(&object_id),
+            state.tags.get(&object_id),
+        );
+    }
+}
+
+/// Deletion-schedule rows: live bookkeeping under `current/gcfile`,
+/// overwritten or removed in place — never mirrored to history.
+fn diff_gc_files(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
+    let file_ids = base.gc_files.keys().chain(state.gc_files.keys());
+    for &data_file_id in file_ids.collect::<std::collections::BTreeSet<_>>() {
+        let key = Key::Current(CurrentKey::GcFile { data_file_id });
+        match (
+            base.gc_files.get(&data_file_id),
+            state.gc_files.get(&data_file_id),
+        ) {
+            (Some(_), None) => writes.push((key.encode(), None)),
+            (prior, Some(next)) if prior != Some(next) => {
+                writes.push((key.encode(), Some(value::encode_value(next))));
+            }
+            _ => {}
+        }
+    }
+}
+
 fn diff_columns(
     writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
+    // The column row minus its embedded tag entries: the part whose
+    // change means a version transition.
+    fn sans_tags(value: &proto::ColumnValue) -> proto::ColumnValue {
+        proto::ColumnValue {
+            tags: Vec::new(),
+            ..value.clone()
+        }
+    }
+
     let column_tables = base.columns.keys().chain(state.columns.keys());
     for &table_id in column_tables.collect::<std::collections::BTreeSet<_>>() {
         static EMPTY: std::collections::BTreeMap<u64, proto::ColumnValue> =
@@ -483,12 +523,29 @@ fn diff_columns(
             .chain(state_cols.keys())
             .collect::<std::collections::BTreeSet<_>>()
         {
+            let entity = EntityKey::Column {
+                table_id,
+                column_id,
+            };
+
+            // A tags-only change overwrites the record in place: tag
+            // entries carry their own begin/end, so the column row did
+            // not transition and must not mint a history version.
+            if let (Some(prior), Some(next)) =
+                (base_cols.get(&column_id), state_cols.get(&column_id))
+                && prior != next
+                && sans_tags(prior) == sans_tags(next)
+            {
+                writes.push((
+                    Key::current(entity).encode(),
+                    Some(value::encode_value(next)),
+                ));
+                continue;
+            }
+
             stage_transition(
                 writes,
-                EntityKey::Column {
-                    table_id,
-                    column_id,
-                },
+                entity,
                 base_cols.get(&column_id),
                 state_cols.get(&column_id),
                 new_snapshot,
@@ -683,6 +740,8 @@ pub(crate) fn diff_writes(
     diff_table_column_stats(&mut writes, base, state);
     diff_file_column_stats(&mut writes, base, state);
     diff_options(&mut writes, base, state);
+    diff_tags(&mut writes, base, state);
+    diff_gc_files(&mut writes, base, state);
     writes
 }
 

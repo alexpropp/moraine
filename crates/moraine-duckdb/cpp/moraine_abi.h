@@ -430,6 +430,53 @@ int32_t moraine_dump_sort_expressions(MoraineCatalogHandle *handle, MoraineSortE
                 MoraineError *err);
 void moraine_dump_sort_expressions_free(MoraineSortExpressionRow *items, size_t len);
 
+// Mirrors `moraine_duckdb::dumps::MoraineTagRow`: one ducklake_tag row,
+// flattened from the object's container record; ended entries included.
+typedef struct MoraineTagRow {
+	uint64_t object_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	char *key;
+	char *value;
+} MoraineTagRow;
+
+int32_t moraine_dump_tags(MoraineCatalogHandle *handle, MoraineTagRow **out_items,
+                           size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_tags_free(MoraineTagRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::dumps::MoraineColumnTagRow`: one
+// ducklake_column_tag row, flattened from the column's latest record.
+typedef struct MoraineColumnTagRow {
+	uint64_t table_id;
+	uint64_t column_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	char *key;
+	char *value;
+} MoraineColumnTagRow;
+
+int32_t moraine_dump_column_tags(MoraineCatalogHandle *handle, MoraineColumnTagRow **out_items,
+                                  size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_column_tags_free(MoraineColumnTagRow *items, size_t len);
+
+// Mirrors `moraine_duckdb::dumps::MoraineScheduledDeletionRow`: one
+// ducklake_files_scheduled_for_deletion row.
+typedef struct MoraineScheduledDeletionRow {
+	uint64_t data_file_id;
+	char *path;
+	bool path_is_relative;
+	int64_t schedule_start_micros;
+} MoraineScheduledDeletionRow;
+
+int32_t moraine_dump_scheduled_deletions(MoraineCatalogHandle *handle, MoraineScheduledDeletionRow **out_items,
+                                          size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_scheduled_deletions_free(MoraineScheduledDeletionRow *items, size_t len);
+
 // The inline read ABI (src/inline.rs): materializes DuckLake's four inline
 // scan variants and the per-table Arrow schema / registered-table list over
 // the inline/* keyspace. Owned-first, one _free per array; chunk_body is an
@@ -539,6 +586,12 @@ int32_t moraine_tx_stage(MoraineTxHandle *tx, int32_t table_kind, int32_t operat
                            size_t cells_len, MoraineError *err);
 
 // Consumes `tx`. On success, `*out_snapshot_id` is the new snapshot id.
+// Snapshot rows as `tx` sees them: committed rows at the transaction's
+// read point minus its staged snapshot deletes. Freed with
+// moraine_dump_snapshots_free.
+int32_t moraine_tx_dump_snapshots(MoraineTxHandle *tx, MoraineSnapshotRow **out_items, size_t *out_len,
+                                   MoraineError *err);
+
 int32_t moraine_tx_commit(MoraineTxHandle *tx, uint64_t *out_snapshot_id, MoraineError *err);
 
 // Consumes `tx`, discarding every staged row. A null `tx` is a no-op.

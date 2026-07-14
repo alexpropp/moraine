@@ -78,17 +78,21 @@ fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
         14 => Ok(TableKind::FilePartitionValue),
         15 => Ok(TableKind::SortInfo),
         16 => Ok(TableKind::SortExpression),
+        17 => Ok(TableKind::Tag),
+        18 => Ok(TableKind::ColumnTag),
+        19 => Ok(TableKind::FilesScheduledForDeletion),
         other => Err(AbiError::invalid_argument(format!(
             "moraine_tx_stage: unknown table_kind {other}"
         ))),
     }
 }
 
-/// The three [`RowOperation`] shapes, decoded from `operation_kind`.
+/// The four [`RowOperation`] shapes, decoded from `operation_kind`.
 enum OperationKind {
     Insert,
     Delete,
     UpdateSetEnd,
+    UpdateSetBegin,
 }
 
 fn decode_operation_kind(v: i32) -> Result<OperationKind, AbiError> {
@@ -209,8 +213,10 @@ pub unsafe extern "C" fn moraine_tx_begin(
 /// `DeleteFile`, `8` = `TableStats`, `9` = `TableColumnStats`, `10` =
 /// `FileColumnStats`, `11` = `SchemaVersions`, `12` = `PartitionInfo`,
 /// `13` = `PartitionColumn`, `14` = `FilePartitionValue`, `15` =
-/// `SortInfo`, `16` = `SortExpression`); `operation_kind` is `0` = insert,
-/// `1` = delete, `2` = update-sets-`end_snapshot`. `cells` are positional
+/// `SortInfo`, `16` = `SortExpression`, `17` = `Tag`, `18` =
+/// `ColumnTag`, `19` = `FilesScheduledForDeletion`); `operation_kind` is
+/// `0` = insert, `1` = delete, `2` = update-sets-`end_snapshot`, `3` =
+/// update-sets-`begin_snapshot`. `cells` are positional
 /// in the column order the shim declares for `table_kind`'s table (a delete
 /// or update-set-end row carries only the key columns, per [`RowOperation`]'s
 /// variants).
@@ -1336,6 +1342,67 @@ mod tests {
         // SAFETY: `err.message`/`tx`/`handle` came from the calls above.
         unsafe {
             crate::abi::moraine_error_free(err.message);
+            moraine_tx_rollback(tx);
+            moraine_detach(handle);
+        }
+    }
+
+    /// The tx-aware snapshot dump observes the transaction's own staged
+    /// snapshot deletes; the plain dump keeps serving committed state.
+    #[test]
+    fn tx_dump_snapshots_observes_staged_deletes() {
+        let dir = TempDir::new("rywr");
+        let handle = attach_ok(&dir);
+
+        // Seed snapshot 1 so the store holds {0, 1}.
+        let tx = begin(handle);
+        let mut arena = StrArena::new();
+        stage_table_row(tx, &mut arena, 1, (1, None), 0, "t", "t/");
+        stage_snapshot_and_changes(tx, &mut arena, 1, 1, 2, "created_table:\"main\".\"t\"");
+        let mut snapshot_id: u64 = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `tx` is live; outputs are valid local slots.
+        let code = unsafe { moraine_tx_commit(tx, &raw mut snapshot_id, &raw mut err) };
+        assert_eq!(code, codes::OK);
+
+        // Stage (but do not commit) an expiry of snapshot 0.
+        let tx = begin(handle);
+        stage(tx, 0, 1, &[u64_cell(0)]);
+
+        let mut rows: *mut crate::dumps::MoraineSnapshotRow = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut dump_err = MoraineError::default();
+        // SAFETY: `tx` is live; outputs are valid local slots.
+        let code = unsafe {
+            moraine_tx_dump_snapshots(tx, &raw mut rows, &raw mut len, &raw mut dump_err)
+        };
+        assert_eq!(code, codes::OK);
+        assert_eq!(len, 1, "the staged delete must hide snapshot 0");
+        // SAFETY: just populated above.
+        assert_eq!(unsafe { (*rows).snapshot_id }, 1);
+        // SAFETY: freed exactly once.
+        unsafe { crate::dumps::moraine_dump_snapshots_free(rows, len) };
+
+        // Outside the transaction, committed state is unchanged.
+        let mut committed: *mut crate::dumps::MoraineSnapshotRow = ptr::null_mut();
+        let mut committed_len: usize = 0;
+        let mut committed_err = MoraineError::default();
+        // SAFETY: `handle` is attached; outputs are valid local slots.
+        let code = unsafe {
+            crate::dumps::moraine_dump_snapshots(
+                handle,
+                &raw mut committed,
+                &raw mut committed_len,
+                None,
+                ptr::null_mut(),
+                &raw mut committed_err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+        assert_eq!(committed_len, 2);
+        // SAFETY: freed exactly once; `tx` rolled back exactly once.
+        unsafe {
+            crate::dumps::moraine_dump_snapshots_free(committed, committed_len);
             moraine_tx_rollback(tx);
             moraine_detach(handle);
         }

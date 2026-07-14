@@ -6,14 +6,14 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
-        OptionScope, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
-        TableStats, ViewId, ViewInfo,
+        OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId,
+        TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
     },
     store::{
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, OptionScopeValue,
-            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
-            TableStatsValue, TableValue, ViewValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
+            OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
+            TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         read::EntityRecord,
     },
@@ -42,6 +42,8 @@ pub struct CatalogSnapshot {
     pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
     pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
     pub(crate) options: BTreeMap<(u64, u64), OptionScopeValue>,
+    pub(crate) tags: BTreeMap<u64, TagValue>,
+    pub(crate) gc_files: BTreeMap<u64, GcFileValue>,
 }
 
 impl CatalogSnapshot {
@@ -106,6 +108,16 @@ impl CatalogSnapshot {
                     value,
                 } => {
                     view.set_option_record((scope_kind, scope_id), value);
+                }
+                // Tag containers are unversioned; their embedded entries
+                // carry begin/end individually and are filtered at read.
+                EntityRecord::Tag(t) => {
+                    view.put_tag(t);
+                }
+                // Deletion-schedule rows are live bookkeeping with no
+                // temporal lifecycle.
+                EntityRecord::GcFile(g) => {
+                    view.put_gc_file(g);
                 }
                 EntityRecord::Schema(_)
                 | EntityRecord::Table(_)

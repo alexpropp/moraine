@@ -8,8 +8,8 @@ use crate::{
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
-            HeadValue, MigrationValue, OptionScopeValue, PartitionValue, SchemaValue,
-            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue,
+            GcFileValue, HeadValue, MigrationValue, OptionScopeValue, PartitionValue, SchemaValue,
+            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
             ViewValue,
         },
         value,
@@ -51,6 +51,11 @@ pub(crate) enum EntityRecord {
         /// The scope's options map.
         value: OptionScopeValue,
     },
+    /// A tag container: one record per tagged object, entries embedded.
+    Tag(TagValue),
+    /// A `ducklake_files_scheduled_for_deletion` row — `current`-only
+    /// bookkeeping, not a temporal entity.
+    GcFile(GcFileValue),
 }
 
 async fn read_singleton<M: prost::Message + Default>(
@@ -134,9 +139,7 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
             scope_id,
             value: value::decode_value(bytes)?,
         }),
-        other @ EntityKey::Tag { .. } => Err(Error::Corruption(format!(
-            "entity kind not modeled by this binary: {other:?}"
-        ))),
+        EntityKey::Tag { .. } => Ok(EntityRecord::Tag(value::decode_value(bytes)?)),
     }
 }
 

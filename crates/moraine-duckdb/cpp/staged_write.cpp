@@ -243,17 +243,17 @@ public:
 			string_storage.reserve(spec_.columns.size() + 1);
 			std::vector<MoraineCell> cells;
 
-			if (set_end_) {
-				// [entity key cells in decoder order, new end_snapshot].
+			if (lifecycle_op_ >= 0) {
+				// [entity key cells in decoder order, new snapshot value].
 				cells.reserve(spec_.end_key_columns.size() + 1);
 				for (auto key_col : spec_.end_key_columns) {
 					auto type = MapColumnType(spec_.columns[key_col].ducklake_type);
 					cells.push_back(CellFromValue(old_row[key_col], type, string_storage));
 				}
-				auto end_type = MapColumnType(spec_.columns[spec_.end_snapshot_column].ducklake_type);
-				cells.push_back(CellFromValue(chunk.GetValue(set_refs_[0], row), end_type, string_storage));
+				auto value_type = MapColumnType(spec_.columns[set_columns_[0]].ducklake_type);
+				cells.push_back(CellFromValue(chunk.GetValue(set_refs_[0], row), value_type, string_storage));
 				MoraineError err{};
-				auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* update_set_end */ 2, cells.data(),
+				auto code = moraine_tx_stage(tx, spec_.write_table_kind, lifecycle_op_, cells.data(),
 				                              cells.size(), &err);
 				if (code != MORAINE_OK) {
 					ThrowMoraineError(err);
@@ -392,22 +392,31 @@ duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &plan
 	auto set_refs = ExtractSetRefs(op);
 
 	if (!spec.end_key_columns.empty()) {
-		// A versioned kind: the single translatable UPDATE is the
-		// lifecycle convention, SET end_snapshot alone.
-		if (set_columns.size() != 1 || set_columns[0] != spec.end_snapshot_column) {
-			throw duckdb::NotImplementedException(
-			    "moraine: the only UPDATE supported on \"%s\" is SET end_snapshot (the staged-row lifecycle "
-			    "convention)",
-			    spec.name);
+		// A versioned kind: the translatable UPDATEs are the lifecycle
+		// conventions — SET end_snapshot alone (ends the version) or, for
+		// the delete-rewrite's replacement file, SET begin_snapshot alone
+		// (rebases the visibility window).
+		if (set_columns.size() == 1 && set_columns[0] == spec.end_snapshot_column) {
+			return planner.Make<MoraineMetadataUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality,
+			                                           /* update_set_end */ 2, std::move(set_columns),
+			                                           std::move(set_refs));
 		}
-		return planner.Make<MoraineMetadataUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality,
-		                                           /* set_end */ true, std::move(set_columns), std::move(set_refs));
+		if (set_columns.size() == 1 &&
+		    std::string(spec.columns[set_columns[0]].name) == "begin_snapshot") {
+			return planner.Make<MoraineMetadataUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality,
+			                                           /* update_set_begin */ 3, std::move(set_columns),
+			                                           std::move(set_refs));
+		}
+		throw duckdb::NotImplementedException(
+		    "moraine: the only UPDATEs supported on \"%s\" are SET end_snapshot / SET begin_snapshot (the "
+		    "staged-row lifecycle conventions)",
+		    spec.name);
 	}
-	if (!spec.delete_key_columns.empty()) {
+	if (spec.overlay_updatable) {
 		// An unversioned statistics kind: any SET subset overlays the row
 		// in place.
 		return planner.Make<MoraineMetadataUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality,
-		                                           /* set_end */ false, std::move(set_columns), std::move(set_refs));
+		                                           /* overlay */ -1, std::move(set_columns), std::move(set_refs));
 	}
 	// `kNotWritable`: DuckLake's DROP/RENAME batch still issues `SET
 	// end_snapshot` against unmodeled tables (see MoraineMetadataVoidUpdate),

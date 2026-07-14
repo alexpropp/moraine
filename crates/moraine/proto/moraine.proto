@@ -203,13 +203,20 @@ message TableColumnStatsValue {
   optional string extra_stats = 7;
 }
 
-// ducklake_tag.
+// ducklake_tag entry: one row, embedded in its object's container.
+message TagEntry {
+  uint64 begin_snapshot = 1;
+  optional uint64 end_snapshot = 2;
+  string key = 3;
+  string value = 4;
+}
+
+// ducklake_tag, one container record per tagged object. The container
+// is overwritten in place; each embedded entry carries its row's
+// begin/end verbatim, so time travel filters entries, not records.
 message TagValue {
   uint64 object_id = 1;
-  uint64 begin_snapshot = 2;
-  optional uint64 end_snapshot = 3;
-  string key = 4;
-  string value = 5;
+  repeated TagEntry entries = 2;
 }
 
 // ducklake_metadata, one record per scope. Options are

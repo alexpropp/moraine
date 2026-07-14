@@ -555,6 +555,72 @@ std::vector<std::vector<duckdb::Value>> ProvideSortExpressions(MoraineCatalogHan
 	return result;
 }
 
+std::vector<std::vector<duckdb::Value>> ProvideTags(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineTagRow> rows(moraine_dump_tags_free);
+	MoraineError err{};
+	auto code = moraine_dump_tags(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.object_id),
+		    Bigint(r.begin_snapshot),
+		    OptBigint(r.has_end_snapshot, r.end_snapshot),
+		    Varchar(r.key),
+		    Varchar(r.value),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideColumnTags(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineColumnTagRow> rows(moraine_dump_column_tags_free);
+	MoraineError err{};
+	auto code = moraine_dump_column_tags(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.table_id),
+		    Bigint(r.column_id),
+		    Bigint(r.begin_snapshot),
+		    OptBigint(r.has_end_snapshot, r.end_snapshot),
+		    Varchar(r.key),
+		    Varchar(r.value),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineScheduledDeletionRow> rows(moraine_dump_scheduled_deletions_free);
+	MoraineError err{};
+	auto code = moraine_dump_scheduled_deletions(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.data_file_id),
+		    Varchar(r.path),
+		    duckdb::Value::BOOLEAN(r.path_is_relative),
+		    TimestampTz(r.schedule_start_micros),
+		});
+	}
+	return result;
+}
+
 // `ducklake_metadata` rows. All are fixed here except `encrypted`, which
 // is the store's creation-time flag. Constraints on the values DuckLake
 // reads back:
@@ -839,7 +905,11 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"key", "VARCHAR", false},
 	            {"value", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideTags,
+	        17,
+	        /* end key: object_id, key (decoder order) */ {0, 3},
+	        /* end_snapshot col */ 2,
+	        /* delete key: object_id, key, begin_snapshot */ {0, 3, 1},
 	    },
 	    {
 	        "ducklake_column_tag",
@@ -851,8 +921,14 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"key", "VARCHAR", false},
 	            {"value", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideColumnTags,
+	        18,
+	        /* end key: table_id, column_id, key (decoder order) */ {0, 1, 4},
+	        /* end_snapshot col */ 3,
+	        /* delete key: table_id, column_id, key, begin_snapshot */ {0, 1, 4, 2},
 	    },
+	    // Always-empty stand-ins (see `ProvideEmpty`): no dump ABI call backs
+	    // them — the store models none of these kinds.
 	    {
 	        "ducklake_inlined_data_tables",
 	        {
@@ -1132,11 +1208,60 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineMetadataTableEntry::GetStatist
 	throw duckdb::NotImplementedException("moraine: column statistics are not supported yet");
 }
 
+// The two snapshot-backed tables share one dump; a scan inside a write
+// transaction that already staged rows must observe that transaction's
+// own snapshot deletes (the expiry cascade's `NOT EXISTS` subqueries
+// re-read `ducklake_snapshot` after staging them), so their rows come
+// from the tx-aware dump when a staged tx is open. Every other kind — and
+// every scan outside a write transaction — serves committed state.
+static std::vector<std::vector<duckdb::Value>> TxAwareSnapshotRows(MoraineTxHandle *tx, bool changes_shape) {
+	OwnedArray<MoraineSnapshotRow> rows(moraine_dump_snapshots_free);
+	MoraineError err{};
+	auto code = moraine_tx_dump_snapshots(tx, rows.OutItems(), rows.OutLen(), &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		if (changes_shape) {
+			result.push_back({
+			    Bigint(r.snapshot_id),
+			    Varchar(r.changes_made),
+			    OptVarchar(r.author),
+			    OptVarchar(r.commit_message),
+			    OptVarchar(r.commit_extra_info),
+			});
+		} else {
+			result.push_back({
+			    Bigint(r.snapshot_id),
+			    TimestampTz(r.snapshot_time_micros),
+			    Bigint(r.schema_version),
+			    Bigint(r.next_catalog_id),
+			    Bigint(r.next_file_id),
+			});
+		}
+	}
+	return result;
+}
+
 duckdb::TableFunction
 MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                            duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-	scan_bind_data->rows = spec_.provider(handle_, moraine_shim_is_interrupted, &context);
+
+	// write_table_kind 0/1 are ducklake_snapshot / ducklake_snapshot_changes.
+	MoraineTxHandle *staged_tx = nullptr;
+	if (spec_.write_table_kind == 0 || spec_.write_table_kind == 1) {
+		auto catalog_transaction = ParentCatalog().GetCatalogTransaction(context);
+		staged_tx = catalog_transaction.transaction->Cast<MoraineTransaction>().StagedTxIfOpen();
+	}
+	if (staged_tx != nullptr) {
+		scan_bind_data->rows = TxAwareSnapshotRows(staged_tx, spec_.write_table_kind == 1);
+	} else {
+		scan_bind_data->rows = spec_.provider(handle_, moraine_shim_is_interrupted, &context);
+	}
+
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();
