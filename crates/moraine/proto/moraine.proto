@@ -51,6 +51,36 @@ message ViewValue {
   optional string column_aliases = 9;
 }
 
+// ducklake_macro_parameters — embedded in MacroImplementation.
+message MacroParameter {
+  uint64 column_id = 1;
+  string parameter_name = 2;
+  string parameter_type = 3;
+  optional string default_value = 4;
+  string default_value_type = 5;
+}
+
+// ducklake_macro_impl — embedded in MacroValue.
+message MacroImplementation {
+  uint64 impl_id = 1;
+  string dialect = 2;
+  string sql = 3;
+  string macro_type = 4;
+  repeated MacroParameter parameters = 5;
+}
+
+// ducklake_macro (+ impls and parameters embedded). Implementations are
+// stored in impl_id order and parameters in column_id order; DuckLake's
+// reader consumes them positionally with no ORDER BY.
+message MacroValue {
+  uint64 macro_id = 1;
+  uint64 begin_snapshot = 2;
+  optional uint64 end_snapshot = 3;
+  uint64 schema_id = 4;
+  string macro_name = 5;
+  repeated MacroImplementation implementations = 6;
+}
+
 // ducklake_column_tag — embedded in ColumnValue
 message ColumnTag {
   uint64 begin_snapshot = 1;
@@ -155,6 +185,27 @@ message DeleteFileValue {
   uint64 footer_size = 11;
   optional string encryption_key = 12;
   optional uint64 partial_max = 13;
+}
+
+// ducklake_name_mapping — embedded in MappingValue. column_id is a
+// 0-based ordinal local to the mapping; parent_column references a
+// smaller ordinal (preorder: parents precede children).
+message NameMapping {
+  uint64 column_id = 1;
+  string source_name = 2;
+  uint64 target_field_id = 3;
+  optional uint64 parent_column = 4;
+  bool is_partition = 5;
+}
+
+// ducklake_column_mapping (+ name-mapping rows embedded). Written once
+// by an add-data-files commit, never updated; mapping_id comes from the
+// same counter as data_file_id.
+message MappingValue {
+  uint64 mapping_id = 1;
+  uint64 table_id = 2;
+  string map_type = 3;
+  repeated NameMapping name_mappings = 4;
 }
 
 // ducklake_file_variant_stats — embedded in FileColumnStatsValue.

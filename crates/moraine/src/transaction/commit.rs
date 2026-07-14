@@ -499,6 +499,52 @@ fn diff_gc_files(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &
     }
 }
 
+fn diff_macros(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    let macro_ids = base.macros.keys().chain(state.macros.keys());
+    for &macro_id in macro_ids.collect::<std::collections::BTreeSet<_>>() {
+        stage_transition(
+            writes,
+            EntityKey::Macro { macro_id },
+            base.macros.get(&macro_id),
+            state.macros.get(&macro_id),
+            new_snapshot,
+            |prior| proto::MacroValue {
+                end_snapshot: Some(new_snapshot),
+                ..prior.clone()
+            },
+        );
+    }
+}
+
+/// Mappings are immutable create-only records: `stage_overwrite`'s
+/// `(None, Some)` arm writes the `current` key with no history mirror,
+/// and its equality guard makes a base-present record (always
+/// byte-identical — the staged path rejects re-insertion) a no-op.
+/// Iterating `state` alone suffices: mappings are never removed from the
+/// working state, so the delete arm is unreachable.
+fn diff_mappings(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
+    for (&table_id, per_table) in &state.mappings {
+        for (&mapping_id, value) in per_table {
+            stage_overwrite(
+                writes,
+                EntityKey::Mapping {
+                    table_id,
+                    mapping_id,
+                },
+                base.mappings
+                    .get(&table_id)
+                    .and_then(|b| b.get(&mapping_id)),
+                Some(value),
+            );
+        }
+    }
+}
+
 fn diff_columns(
     writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
@@ -738,6 +784,8 @@ pub(crate) fn diff_writes(
     diff_delete_files(&mut writes, base, state, new_snapshot);
     diff_partitions(&mut writes, base, state, new_snapshot);
     diff_sorts(&mut writes, base, state, new_snapshot);
+    diff_macros(&mut writes, base, state, new_snapshot);
+    diff_mappings(&mut writes, base, state);
     diff_table_stats(&mut writes, base, state);
     diff_table_column_stats(&mut writes, base, state);
     diff_file_column_stats(&mut writes, base, state);

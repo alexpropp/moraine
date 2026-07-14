@@ -685,6 +685,269 @@ mod tests {
         assert_eq!(rows, vec![vec!["0".to_string()]]);
     }
 
+    /// Column/name mapping end to end: a Parquet file written by plain
+    /// DuckDB `COPY` (no DuckLake field ids), one column short and sitting
+    /// under a hive path, registers through `ducklake_add_data_files` with
+    /// `hive_partitioning`. DuckLake writes the `ducklake_column_mapping` /
+    /// `ducklake_name_mapping` rows (folded into one mapping record) and
+    /// the file row carries its `mapping_id`; reads resolve the body
+    /// column by name and the partition column from the path, time travel
+    /// included; the standalone attach serves the row-faithful
+    /// projections.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn ducklake_add_data_files_maps_foreign_parquet() {
+        let dir = TempDir::new("mapping-store");
+        let data_dir = TempDir::new("mapping-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        let foreign_dir = data_path.join("foreign").join("region=east");
+        std::fs::create_dir_all(&foreign_dir).expect("test setup: create hive dir");
+        let foreign_file = foreign_dir.join("part.parquet");
+
+        // Create, write the foreign file, register it.
+        run_ducklake_sql(
+            store,
+            data_path,
+            &format!(
+                "CREATE TABLE lake.main.t (id BIGINT, region VARCHAR);\
+                 COPY (SELECT range AS id FROM range(3)) TO '{f}' (FORMAT parquet);\
+                 CALL ducklake_add_data_files('lake', 't', '{f}', hive_partitioning => true);",
+                f = foreign_file.display(),
+            ),
+        );
+
+        // A fresh attach re-reads the mapping from the store: the body
+        // column resolves by name, the partition column from the path.
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT id, region FROM lake.main.t ORDER BY id;",
+        );
+        assert_eq!(
+            csv_rows(&out),
+            vec![
+                vec!["0".to_string(), "east".to_string()],
+                vec!["1".to_string(), "east".to_string()],
+                vec!["2".to_string(), "east".to_string()],
+            ]
+        );
+
+        // A later write advances the head; the registered snapshot stays
+        // readable through the mapping.
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            "USE lake;\
+             SELECT CAST(max(snapshot_id) AS VARCHAR) FROM snapshots();",
+        );
+        let registered_snapshot = csv_rows(&out)[0][0].clone();
+        run_ducklake_sql(
+            store,
+            data_path,
+            "INSERT INTO lake.main.t VALUES (9, 'west');",
+        );
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            &format!(
+                "SELECT count(*), max(id) FROM lake.main.t AT (VERSION => {registered_snapshot});"
+            ),
+        );
+        assert_eq!(csv_rows(&out), vec![vec!["3".to_string(), "2".to_string()]]);
+
+        // Row-faithful projections through the standalone attach: one
+        // mapping, map_by_name.
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT mapping_id, table_id, type FROM m.ducklake_column_mapping;",
+        ));
+        assert_eq!(rows.len(), 1);
+        let mapping_id = rows[0][0].clone();
+        assert_eq!(rows[0][2], "map_by_name");
+
+        // The name rows: `id` resolved from the file body, `region` a
+        // hive-path virtual column; roots carry no parent.
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT column_id, source_name, \
+                    CAST(parent_column IS NULL AS VARCHAR), \
+                    CAST(is_partition AS VARCHAR) \
+             FROM m.ducklake_name_mapping ORDER BY column_id;",
+        ));
+        let sources: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r[1].as_str(), r[3].as_str()))
+            .collect();
+        assert!(sources.contains(&("id", "false")), "{rows:?}");
+        assert!(sources.contains(&("region", "true")), "{rows:?}");
+        assert!(rows.iter().all(|r| r[2] == "true"), "roots only: {rows:?}");
+
+        // The registered file row carries the mapping id; nothing else
+        // does (the inlined INSERT wrote no file).
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT CAST(mapping_id AS VARCHAR) FROM m.ducklake_data_file \
+             WHERE mapping_id IS NOT NULL;",
+        ));
+        assert_eq!(rows, vec![vec![mapping_id]]);
+    }
+
+    /// Scalar and table macros end to end, driven entirely through
+    /// DuckLake's own SQL: `CREATE MACRO` (arity overloads, a defaulted
+    /// parameter, a table macro) folds its `ducklake_macro_impl` /
+    /// `ducklake_macro_parameters` inserts into one macro record;
+    /// `CREATE OR REPLACE` re-binds under a fresh `macro_id`;
+    /// `DROP MACRO` ends the row; a `SNAPSHOT_VERSION` attach still calls
+    /// the dropped definition; and the standalone attach serves the
+    /// row-faithful `ducklake_macro*` projections.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    #[allow(clippy::too_many_lines)]
+    fn ducklake_macros_round_trip_through_staged_writes() {
+        let dir = TempDir::new("macro-store");
+        let data_dir = TempDir::new("macro-data");
+        let store = dir.path();
+        let data_path = data_dir.path();
+
+        // Create all three macros, then call every shape in one SELECT.
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            "USE lake;\
+             CREATE MACRO add_num(a) AS a + 1, (a, b) AS a + b;\
+             CREATE MACRO defaulted(a, b := 5) AS a + b;\
+             CREATE MACRO pick(x) AS TABLE SELECT x AS v;\
+             SELECT add_num(1), add_num(1, 2), defaulted(1), (SELECT v FROM pick(7));",
+        );
+        assert_eq!(
+            csv_rows(&out),
+            vec![vec![
+                "2".to_string(),
+                "3".to_string(),
+                "6".to_string(),
+                "7".to_string()
+            ]]
+        );
+
+        // A fresh session re-reads the macros from the store and captures
+        // the pre-replace snapshot for the time-travel attach below.
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            "USE lake;\
+             SELECT CAST(max(snapshot_id) AS VARCHAR) || ':' || \
+                    CAST(add_num(1, 2) AS VARCHAR) FROM snapshots();",
+        );
+        let combined = csv_rows(&out);
+        let (pre_replace_snapshot, add_result) = combined[0][0]
+            .trim_matches('"')
+            .split_once(':')
+            .expect("snapshot:result pair");
+        assert_eq!(add_result, "3");
+        let pre_replace_snapshot = pre_replace_snapshot.to_owned();
+
+        // Replace re-binds under a fresh macro_id; drop removes the
+        // defaulted macro from the live catalog set.
+        let out = run_ducklake_sql(
+            store,
+            data_path,
+            "USE lake;\
+             CREATE OR REPLACE MACRO add_num(a) AS a + 10;\
+             DROP MACRO defaulted;\
+             SELECT add_num(1), \
+                    (SELECT count(*) FROM duckdb_functions() \
+                     WHERE database_name = 'lake' AND function_name = 'defaulted');",
+        );
+        assert_eq!(
+            csv_rows(&out),
+            vec![vec!["11".to_string(), "0".to_string()]]
+        );
+
+        // Time travel: at the pre-replace snapshot the old overloads and
+        // the since-dropped macro both still bind and compute.
+        let out = run_ducklake_sql_with_options(
+            store,
+            data_path,
+            &format!(", SNAPSHOT_VERSION {pre_replace_snapshot}"),
+            "USE lake; SELECT add_num(1), add_num(1, 2), defaulted(1);",
+        );
+        assert_eq!(
+            csv_rows(&out),
+            vec![vec!["2".to_string(), "3".to_string(), "6".to_string()]]
+        );
+
+        // Row-faithful projections through the standalone attach. Four
+        // macro rows: the replaced and dropped ones ended, the replacement
+        // and the table macro live.
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT macro_name, CAST(end_snapshot IS NULL AS VARCHAR) \
+             FROM m.ducklake_macro ORDER BY macro_id;",
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                vec!["add_num".to_string(), "false".to_string()],
+                vec!["defaulted".to_string(), "false".to_string()],
+                vec!["pick".to_string(), "true".to_string()],
+                vec!["add_num".to_string(), "true".to_string()],
+            ]
+        );
+
+        // Impl rows keep serving for ended macros (time travel reads
+        // them); ordinals and types are verbatim.
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT i.macro_id = m.macro_id, i.impl_id, i.type \
+             FROM m.ducklake_macro_impl i \
+             JOIN m.ducklake_macro m USING (macro_id) \
+             WHERE m.macro_name = 'add_num' AND m.end_snapshot IS NOT NULL \
+             ORDER BY i.impl_id;",
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                vec!["true".to_string(), "0".to_string(), "scalar".to_string()],
+                vec!["true".to_string(), "1".to_string(), "scalar".to_string()],
+            ]
+        );
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT i.type FROM m.ducklake_macro_impl i \
+             JOIN m.ducklake_macro m USING (macro_id) \
+             WHERE m.macro_name = 'pick';",
+        ));
+        assert_eq!(rows, vec![vec!["table".to_string()]]);
+
+        // The defaulted parameter row carries the default verbatim.
+        let rows = csv_rows(&run_standalone_sql(
+            store,
+            "SELECT p.column_id, p.parameter_name, p.default_value, p.default_value_type \
+             FROM m.ducklake_macro_parameters p \
+             JOIN m.ducklake_macro m USING (macro_id) \
+             WHERE m.macro_name = 'defaulted' ORDER BY p.column_id;",
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    "0".to_string(),
+                    "a".to_string(),
+                    "NULL".to_string(),
+                    "unknown".to_string()
+                ],
+                vec![
+                    "1".to_string(),
+                    "b".to_string(),
+                    "5".to_string(),
+                    "int32".to_string()
+                ],
+            ]
+        );
+    }
+
     /// Data inlining end to end, driven entirely through DuckLake's own
     /// SQL: small `INSERT`s land in the `inline/*` keyspace (never
     /// materialized as a real table) and read back through DuckLake's own

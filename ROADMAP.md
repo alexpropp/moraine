@@ -66,10 +66,29 @@ on that path.
   (`ducklake_load.rs`'s `ducklake_scalar_type_matrix_round_trip_through_flush`);
   nested types by `ducklake_inline_nested_types_round_trip_through_flush`.
   `VARIANT` awaits the extension surface (RFC 0005 non-goal until proven)
-- [ ] Column and name mapping for externally written Parquet
-  (`column_mapping`, `name_mapping`) (RFC 0018)
-- [ ] Macros: scalar/table macros with parameters (`macro`, `macro_impl`,
-  `macro_parameters`) (RFC 0019)
+- [x] Column and name mapping for externally written Parquet
+  (`column_mapping`, `name_mapping`) (RFC 0018). One unversioned,
+  immutable `mapping` record per `(table_id, mapping_id)` embeds its
+  `ducklake_name_mapping` rows (folded from the staged child-table
+  inserts; `mapping_id` lives in DuckLake's file-id counter space, and
+  the file row carries it verbatim). No verb surface — mappings exist
+  only as a side effect of `ducklake_add_data_files`. Verified live end
+  to end (`ducklake_load.rs`'s
+  `ducklake_add_data_files_maps_foreign_parquet` — a hive-partitioned
+  foreign file with no field ids registers, reads by name with the
+  partition column from the path, and stays readable through time
+  travel), fold constraints pinned by the core suite
+- [x] Macros: scalar/table macros with parameters (`macro`, `macro_impl`,
+  `macro_parameters`) (RFC 0019). One versioned `macro` record embeds its
+  impl and parameter rows (folded from the staged child-table inserts,
+  served back in ordinal order — DuckLake's `LIST()` reconstruction has no
+  `ORDER BY`); `DROP` is the generic end-snapshot update, `CREATE OR
+  REPLACE` upstream's own drop + fresh id. Verified live end to end
+  (`ducklake_load.rs`'s `ducklake_macros_round_trip_through_staged_writes`
+  — overloads, a defaulted parameter, a table macro, replace, drop, and a
+  `SNAPSHOT_VERSION` attach that still calls the dropped definition), with
+  the verb surface (`create_macro`/`drop_macro`) and `changes_made` tokens
+  pinned by the core suite
 
 ## Data, deletes & layout
 - [x] Parquet data files on object storage (`data_file`)

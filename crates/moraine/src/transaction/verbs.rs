@@ -10,12 +10,14 @@ use uuid::Uuid;
 use crate::{
     catalog::{
         CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnStats, DataFile, DataFileId,
-        DeleteFile, DeleteFileId, OptionScope, SchemaId, TableId, ViewId,
+        DeleteFile, DeleteFileId, MacroId, MacroImplementationDef, OptionScope, SchemaId, TableId,
+        ViewId,
     },
     error::{Error, Result},
     store::proto::{
-        ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, SchemaValue,
-        TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+        ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, MacroImplementation,
+        MacroParameter, MacroValue, SchemaValue, TableColumnStatsValue, TableStatsValue,
+        TableValue, ViewValue,
     },
     transaction::operations::Operation,
 };
@@ -143,6 +145,16 @@ impl Transaction {
         {
             return Err(Error::Constraint(format!(
                 "schema {schema} still contains views"
+            )));
+        }
+        if self
+            .state
+            .macros
+            .values()
+            .any(|m| m.schema_id == schema.get())
+        {
+            return Err(Error::Constraint(format!(
+                "schema {schema} still contains macros"
             )));
         }
         self.state.delete_schema(schema.get());
@@ -800,6 +812,119 @@ impl Transaction {
         self.state.delete_view(view.get());
         self.ops.push(Operation::DropView {
             view_id: view.get(),
+        });
+        Ok(())
+    }
+
+    /// Creates a macro with its implementations.
+    ///
+    /// Macro names are namespaced per `macro_type`: scalar and table
+    /// macros are distinct catalog sets, so the name must be free only
+    /// among the schema's live macros of the same type. Every
+    /// implementation must carry the same `macro_type`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the schema does not exist.
+    /// Returns [`Error::Constraint`] if `implementations` is empty or
+    /// mixes `macro_type`s.
+    /// Returns [`Error::AlreadyExists`] if a live macro with that name
+    /// and type already exists in the schema.
+    pub fn create_macro(
+        &mut self,
+        schema: SchemaId,
+        name: &str,
+        implementations: &[MacroImplementationDef],
+    ) -> Result<MacroId> {
+        let Some(schema_rec) = self.state.schemas.get(&schema.get()) else {
+            return Err(Error::NotFound(format!("schema {schema}")));
+        };
+        let schema_name = schema_rec.schema_name.clone();
+        let Some(first) = implementations.first() else {
+            return Err(Error::Constraint(format!(
+                "macro {name} needs at least one implementation"
+            )));
+        };
+        if implementations
+            .iter()
+            .any(|i| i.macro_type != first.macro_type)
+        {
+            return Err(Error::Constraint(format!(
+                "macro {name}: all implementations must share one macro_type"
+            )));
+        }
+        let name_taken = self.state.macros.values().any(|m| {
+            m.schema_id == schema.get()
+                && m.macro_name == name
+                && m.implementations
+                    .first()
+                    .is_some_and(|i| i.macro_type == first.macro_type)
+        });
+        if name_taken {
+            return Err(Error::AlreadyExists(format!("macro {name}")));
+        }
+        let macro_id = self.alloc_catalog_id();
+
+        self.state.put_macro(MacroValue {
+            macro_id,
+            begin_snapshot: self.new_snapshot_id,
+            end_snapshot: None,
+            schema_id: schema.get(),
+            macro_name: name.to_owned(),
+            implementations: implementations
+                .iter()
+                .enumerate()
+                .map(|(impl_id, def)| MacroImplementation {
+                    impl_id: impl_id as u64,
+                    dialect: def.dialect.clone(),
+                    sql: def.sql.clone(),
+                    macro_type: def.macro_type.clone(),
+                    parameters: def
+                        .parameters
+                        .iter()
+                        .enumerate()
+                        .map(|(column_id, p)| MacroParameter {
+                            column_id: column_id as u64,
+                            parameter_name: p.name.clone(),
+                            parameter_type: p.parameter_type.clone(),
+                            default_value: p.default_value.clone(),
+                            default_value_type: p.default_value_type.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        });
+        self.ops.push(Operation::CreateMacro {
+            schema_id: schema.get(),
+            macro_id,
+            schema_name,
+            macro_name: name.to_owned(),
+            macro_type: first.macro_type.clone(),
+        });
+
+        Ok(MacroId::new(macro_id))
+    }
+
+    /// Drops a macro, ending its live version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the macro does not exist.
+    pub fn drop_macro(&mut self, macro_id: MacroId) -> Result<()> {
+        let Some(record) = self.state.macros.get(&macro_id.get()) else {
+            return Err(Error::NotFound(format!("macro {macro_id}")));
+        };
+        // Implementations are never empty: creation requires at least
+        // one, on the verb path above and the staged path alike.
+        let macro_type = record
+            .implementations
+            .first()
+            .map(|i| i.macro_type.clone())
+            .unwrap_or_default();
+        self.state.delete_macro(macro_id.get());
+        self.ops.push(Operation::DropMacro {
+            macro_id: macro_id.get(),
+            macro_type,
         });
         Ok(())
     }

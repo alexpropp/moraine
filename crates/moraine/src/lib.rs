@@ -74,7 +74,8 @@ mod transaction;
 pub use catalog::{
     Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
     ColumnStats, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
-    FileColumnStats, OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
+    FileColumnStats, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId,
+    MappingInfo, NameMappingDef, OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
     SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
