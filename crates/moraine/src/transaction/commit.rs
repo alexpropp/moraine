@@ -499,6 +499,28 @@ fn diff_gc_files(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &
     }
 }
 
+fn diff_macros(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    let macro_ids = base.macros.keys().chain(state.macros.keys());
+    for &macro_id in macro_ids.collect::<std::collections::BTreeSet<_>>() {
+        stage_transition(
+            writes,
+            EntityKey::Macro { macro_id },
+            base.macros.get(&macro_id),
+            state.macros.get(&macro_id),
+            new_snapshot,
+            |prior| proto::MacroValue {
+                end_snapshot: Some(new_snapshot),
+                ..prior.clone()
+            },
+        );
+    }
+}
+
 fn diff_columns(
     writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
@@ -738,6 +760,7 @@ pub(crate) fn diff_writes(
     diff_delete_files(&mut writes, base, state, new_snapshot);
     diff_partitions(&mut writes, base, state, new_snapshot);
     diff_sorts(&mut writes, base, state, new_snapshot);
+    diff_macros(&mut writes, base, state, new_snapshot);
     diff_table_stats(&mut writes, base, state);
     diff_table_column_stats(&mut writes, base, state);
     diff_file_column_stats(&mut writes, base, state);

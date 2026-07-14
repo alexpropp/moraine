@@ -19,8 +19,8 @@ use crate::{
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
-            TableStatsValue, TableValue, ViewValue,
+            MacroValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
+            TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
         read::{EntityRecord, scan_current_entities, scan_history_entities, scan_snapshots},
     },
@@ -72,6 +72,17 @@ pub async fn dump_tables(catalog: &Catalog) -> Result<Vec<TableValue>> {
 pub async fn dump_views(catalog: &Catalog) -> Result<Vec<ViewValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::View(v) => Some(v),
+        _ => None,
+    })
+    .await
+}
+
+/// Every `ducklake_macro` row, current and history, implementations and
+/// their parameters embedded in `impl_id`/`column_id` order.
+#[doc(hidden)]
+pub async fn dump_macros(catalog: &Catalog) -> Result<Vec<MacroValue>> {
+    dump_entities(catalog, |r| match r {
+        EntityRecord::Macro(m) => Some(m),
         _ => None,
     })
     .await
@@ -331,6 +342,7 @@ mod tests {
     use super::*;
     use crate::catalog::{
         CatalogOptions, ColumnDef, ColumnStats, DataFile, DeleteFile, FileColumnStats,
+        MacroImplementationDef, MacroParameterDef,
     };
 
     /// Seeds a store whose second commit renames a table — the fixture
@@ -477,6 +489,81 @@ mod tests {
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].sql, "select * from orders");
         assert!(views[0].end_snapshot.is_none());
+    }
+
+    /// An ended macro keeps serving its implementation and parameter
+    /// rows: the whole record — children included — mirrors to history,
+    /// where time travel still reads it.
+    #[tokio::test]
+    async fn dump_macros_serves_children_current_and_history() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        catalog
+            .commit(|tx| {
+                let schema = tx.create_schema("s")?;
+                tx.create_macro(
+                    schema,
+                    "add",
+                    &[
+                        MacroImplementationDef {
+                            dialect: "duckdb".into(),
+                            sql: "(a + 1)".into(),
+                            macro_type: "scalar".into(),
+                            parameters: vec![MacroParameterDef {
+                                name: "a".into(),
+                                parameter_type: "unknown".into(),
+                                default_value: None,
+                                default_value_type: "unknown".into(),
+                            }],
+                        },
+                        MacroImplementationDef {
+                            dialect: "duckdb".into(),
+                            sql: "(a + b)".into(),
+                            macro_type: "scalar".into(),
+                            parameters: vec![
+                                MacroParameterDef {
+                                    name: "a".into(),
+                                    parameter_type: "unknown".into(),
+                                    default_value: None,
+                                    default_value_type: "unknown".into(),
+                                },
+                                MacroParameterDef {
+                                    name: "b".into(),
+                                    parameter_type: "unknown".into(),
+                                    default_value: Some("5".into()),
+                                    default_value_type: "int32".into(),
+                                },
+                            ],
+                        },
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let head = catalog.snapshot().await.unwrap();
+        let schema = head.schema_by_name("s").unwrap();
+        let created = head.macro_by_name(schema.id, "add").unwrap();
+        catalog
+            .commit(move |tx| tx.drop_macro(created.id))
+            .await
+            .unwrap();
+
+        let macros = dump_macros(&catalog).await.unwrap();
+        assert_eq!(macros.len(), 1);
+        let ended = &macros[0];
+        assert!(ended.end_snapshot.is_some());
+        assert_eq!(ended.implementations.len(), 2);
+        assert_eq!(ended.implementations[0].impl_id, 0);
+        assert_eq!(ended.implementations[1].parameters[1].parameter_name, "b");
+        assert_eq!(
+            ended.implementations[1].parameters[1]
+                .default_value
+                .as_deref(),
+            Some("5")
+        );
     }
 
     #[tokio::test]

@@ -12,7 +12,8 @@ pub use handle::{Catalog, CatalogOptions};
 pub use snapshot::CatalogSnapshot;
 pub use types::{
     ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnStats, DataFile, DataFileId,
-    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, OptionScope,
-    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
-    TableStats, TagEntry, ViewId, ViewInfo,
+    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, MacroId,
+    MacroImplementationDef, MacroInfo, MacroParameterDef, OptionScope, ScheduledDeletion, SchemaId,
+    SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId,
+    ViewInfo,
 };

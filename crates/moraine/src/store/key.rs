@@ -161,6 +161,11 @@ pub(crate) enum EntityKey {
         /// Sort spec id.
         sort_id: u64,
     },
+    /// `ducklake_macro` (+ impls and parameters embedded).
+    Macro {
+        /// Global catalog id.
+        macro_id: u64,
+    },
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
@@ -499,6 +504,14 @@ mod tests {
     }
 
     #[test]
+    fn golden_current_macro_key() {
+        let mut expect = vec![0x04, 0x02, 0x0f];
+        expect.extend(be(3));
+        let key = Key::current(EntityKey::Macro { macro_id: 3 });
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
     fn golden_history_file_key_appends_end_snapshot() {
         let mut expect = vec![0x05, 0x07];
         expect.extend(be(1));
@@ -511,6 +524,15 @@ mod tests {
             },
             9,
         );
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
+    fn golden_history_macro_key_appends_end_snapshot() {
+        let mut expect = vec![0x05, 0x0f];
+        expect.extend(be(3));
+        expect.extend(be(9));
+        let key = Key::history(EntityKey::Macro { macro_id: 3 }, 9);
         assert_eq!(key.encode(), expect);
     }
 
@@ -769,6 +791,7 @@ mod tests {
                 scope_kind,
                 scope_id
             }),
+            any::<u64>().prop_map(|macro_id| EntityKey::Macro { macro_id }),
         ]
     }
 

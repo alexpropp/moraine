@@ -60,6 +60,10 @@ id_type!(
     /// Identifies a view.
     ViewId
 );
+id_type!(
+    /// Identifies a macro.
+    MacroId
+);
 
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
@@ -239,6 +243,49 @@ pub struct ViewInfo {
     pub dialect: String,
     /// The view's defining SQL.
     pub sql: String,
+}
+
+/// One parameter of a macro implementation. An absent default stores
+/// `default_value: None` with `default_value_type` `"unknown"`, matching
+/// the row DuckLake writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroParameterDef {
+    /// Parameter name.
+    pub name: String,
+    /// DuckLake type string; `"unknown"` for an untyped parameter.
+    pub parameter_type: String,
+    /// Default value rendered as a string, if the parameter has one.
+    pub default_value: Option<String>,
+    /// DuckLake type string of the default; `"unknown"` when absent.
+    pub default_value_type: String,
+}
+
+/// One implementation (arity overload) of a macro.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroImplementationDef {
+    /// SQL dialect of the body (DuckLake writes `"duckdb"`).
+    pub dialect: String,
+    /// The macro body: an expression (scalar) or a SELECT (table).
+    pub sql: String,
+    /// `"scalar"` or `"table"`; every implementation of one macro must
+    /// carry the same value.
+    pub macro_type: String,
+    /// Parameters in positional order.
+    pub parameters: Vec<MacroParameterDef>,
+}
+
+/// A macro with its implementations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroInfo {
+    /// The macro's id.
+    pub id: MacroId,
+    /// The schema the macro belongs to.
+    pub schema_id: SchemaId,
+    /// The macro's name, unique among the schema's live macros (macros
+    /// have their own namespace, separate from tables and views).
+    pub name: String,
+    /// Implementations in `impl_id` order.
+    pub implementations: Vec<MacroImplementationDef>,
 }
 
 /// A column definition: the input to table creation and column addition.

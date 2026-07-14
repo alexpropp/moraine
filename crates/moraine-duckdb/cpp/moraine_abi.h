@@ -191,6 +191,36 @@ typedef struct MoraineViewRow {
 	char *column_aliases;
 } MoraineViewRow;
 
+// Mirrors `moraine_duckdb::dumps::MoraineMacroRow`.
+typedef struct MoraineMacroRow {
+	uint64_t schema_id;
+	uint64_t macro_id;
+	char *macro_name;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+} MoraineMacroRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineMacroImplRow`.
+typedef struct MoraineMacroImplRow {
+	uint64_t macro_id;
+	uint64_t impl_id;
+	char *dialect;
+	char *sql;
+	char *macro_type;
+} MoraineMacroImplRow;
+
+// Mirrors `moraine_duckdb::dumps::MoraineMacroParameterRow`.
+typedef struct MoraineMacroParameterRow {
+	uint64_t macro_id;
+	uint64_t impl_id;
+	uint64_t column_id;
+	char *parameter_name;
+	char *parameter_type;
+	char *default_value;
+	char *default_value_type;
+} MoraineMacroParameterRow;
+
 // Mirrors `moraine_duckdb::dumps::MoraineColumnRow`.
 typedef struct MoraineColumnRow {
 	uint64_t column_id;
@@ -315,6 +345,21 @@ int32_t moraine_dump_views(MoraineCatalogHandle *handle, MoraineViewRow **out_it
                             MoraineInterruptProbe probe, void *probe_ctx,
                 MoraineError *err);
 void moraine_dump_views_free(MoraineViewRow *items, size_t len);
+
+int32_t moraine_dump_macros(MoraineCatalogHandle *handle, MoraineMacroRow **out_items, size_t *out_len,
+                             MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_macros_free(MoraineMacroRow *items, size_t len);
+
+int32_t moraine_dump_macro_impls(MoraineCatalogHandle *handle, MoraineMacroImplRow **out_items, size_t *out_len,
+                                  MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_macro_impls_free(MoraineMacroImplRow *items, size_t len);
+
+int32_t moraine_dump_macro_parameters(MoraineCatalogHandle *handle, MoraineMacroParameterRow **out_items,
+                                       size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                MoraineError *err);
+void moraine_dump_macro_parameters_free(MoraineMacroParameterRow *items, size_t len);
 
 int32_t moraine_dump_data_files(MoraineCatalogHandle *handle, MoraineDataFileRow **out_items, size_t *out_len,
                                  MoraineInterruptProbe probe, void *probe_ctx,

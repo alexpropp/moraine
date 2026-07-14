@@ -91,6 +91,26 @@ pub(crate) enum Operation {
         /// The dropped view's id.
         view_id: u64,
     },
+    /// A macro was created.
+    CreateMacro {
+        /// The schema the macro was created in.
+        schema_id: u64,
+        /// The new macro's id.
+        macro_id: u64,
+        /// The owning schema's name, serialized as `"schema"."macro"`.
+        schema_name: String,
+        /// The new macro's name.
+        macro_name: String,
+        /// `"scalar"` or `"table"` — selects the change-set entry kind.
+        macro_type: String,
+    },
+    /// A macro was dropped.
+    DropMacro {
+        /// The dropped macro's id.
+        macro_id: u64,
+        /// `"scalar"` or `"table"` — selects the change-set entry kind.
+        macro_type: String,
+    },
 }
 
 impl Operation {
@@ -105,7 +125,9 @@ impl Operation {
             | Operation::DropTable { .. }
             | Operation::CreateView { .. }
             | Operation::AlterView { .. }
-            | Operation::DropView { .. } => true,
+            | Operation::DropView { .. }
+            | Operation::CreateMacro { .. }
+            | Operation::DropMacro { .. } => true,
             Operation::RegisterDataFile { .. }
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
@@ -125,10 +147,14 @@ impl Operation {
             Operation::CreateView { view_id, .. } | Operation::AlterView { view_id } => {
                 Some(*view_id)
             }
+            // Macros carry no per-table schema version: DuckLake writes no
+            // `ducklake_schema_versions` row for macro DDL.
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
             | Operation::DropTable { .. }
             | Operation::DropView { .. }
+            | Operation::CreateMacro { .. }
+            | Operation::DropMacro { .. }
             | Operation::RegisterDataFile { .. }
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
@@ -244,6 +270,16 @@ pub(crate) struct ChangeSet {
     pub(crate) created_view_schema_ids: BTreeSet<u64>,
     pub(crate) altered_views: BTreeSet<u64>,
     pub(crate) dropped_views: BTreeSet<u64>,
+    /// `(schema name, macro name)` pairs, unquoted — one set per macro
+    /// type because the wire grammar distinguishes them.
+    pub(crate) created_scalar_macros: BTreeSet<(String, String)>,
+    /// The table-macro twin of [`Self::created_scalar_macros`].
+    pub(crate) created_table_macros: BTreeSet<(String, String)>,
+    /// Schema ids a macro was created in — the macro twin of
+    /// [`Self::created_table_schema_ids`].
+    pub(crate) created_macro_schema_ids: BTreeSet<u64>,
+    pub(crate) dropped_scalar_macros: BTreeSet<u64>,
+    pub(crate) dropped_table_macros: BTreeSet<u64>,
     /// Tables data was appended to.
     pub(crate) inserted_tables: BTreeSet<u64>,
     /// Tables delete markers were appended to.
@@ -319,6 +355,31 @@ impl ChangeSet {
                 Operation::DropView { view_id } => {
                     set.dropped_views.insert(*view_id);
                 }
+                Operation::CreateMacro {
+                    schema_id,
+                    schema_name,
+                    macro_name,
+                    macro_type,
+                    ..
+                } => {
+                    let pair = (schema_name.clone(), macro_name.clone());
+                    if macro_type == "table" {
+                        set.created_table_macros.insert(pair);
+                    } else {
+                        set.created_scalar_macros.insert(pair);
+                    }
+                    set.created_macro_schema_ids.insert(*schema_id);
+                }
+                Operation::DropMacro {
+                    macro_id,
+                    macro_type,
+                } => {
+                    if macro_type == "table" {
+                        set.dropped_table_macros.insert(*macro_id);
+                    } else {
+                        set.dropped_scalar_macros.insert(*macro_id);
+                    }
+                }
             }
         }
         set
@@ -326,7 +387,8 @@ impl ChangeSet {
 
     /// Emits entries in DuckLake's writer order (the subset moraine
     /// emits): dropped schemas, dropped tables, dropped views, created
-    /// schemas, created tables, created views, `inserted_into_table`,
+    /// schemas, created tables, created views, created scalar/table
+    /// macros, dropped scalar/table macros, `inserted_into_table`,
     /// `deleted_from_table`, altered tables, altered views,
     /// `merge_adjacent`, `rewrite_delete`.
     pub(crate) fn to_changes_made(&self) -> String {
@@ -360,6 +422,26 @@ impl ChangeSet {
             self.created_views
                 .iter()
                 .map(|(s, v)| format!("created_view:{}.{}", quote_ident(s), quote_ident(v))),
+        );
+        entries.extend(
+            self.created_scalar_macros.iter().map(|(s, m)| {
+                format!("created_scalar_macro:{}.{}", quote_ident(s), quote_ident(m))
+            }),
+        );
+        entries.extend(
+            self.created_table_macros
+                .iter()
+                .map(|(s, m)| format!("created_table_macro:{}.{}", quote_ident(s), quote_ident(m))),
+        );
+        entries.extend(
+            self.dropped_scalar_macros
+                .iter()
+                .map(|id| format!("dropped_scalar_macro:{id}")),
+        );
+        entries.extend(
+            self.dropped_table_macros
+                .iter()
+                .map(|id| format!("dropped_table_macro:{id}")),
         );
         entries.extend(
             self.inserted_tables
@@ -440,6 +522,24 @@ impl ChangeSet {
                     .parse()
                     .map(|id| set.dropped_views.insert(id))
                     .is_ok()
+            } else if kind.eq_ignore_ascii_case("created_scalar_macro") {
+                parse_created_table_payload(payload)
+                    .map(|pair| set.created_scalar_macros.insert(pair))
+                    .is_some()
+            } else if kind.eq_ignore_ascii_case("created_table_macro") {
+                parse_created_table_payload(payload)
+                    .map(|pair| set.created_table_macros.insert(pair))
+                    .is_some()
+            } else if kind.eq_ignore_ascii_case("dropped_scalar_macro") {
+                payload
+                    .parse()
+                    .map(|id| set.dropped_scalar_macros.insert(id))
+                    .is_ok()
+            } else if kind.eq_ignore_ascii_case("dropped_table_macro") {
+                payload
+                    .parse()
+                    .map(|id| set.dropped_table_macros.insert(id))
+                    .is_ok()
             } else if kind.eq_ignore_ascii_case("inserted_into_table") {
                 payload
                     .parse()
@@ -489,6 +589,7 @@ impl ChangeSet {
     fn creates_table_in(&self, schema_id: u64) -> bool {
         self.created_table_schema_ids.contains(&schema_id)
             || self.created_view_schema_ids.contains(&schema_id)
+            || self.created_macro_schema_ids.contains(&schema_id)
     }
 
     fn table_kinds(&self) -> BTreeMap<u64, TableKinds> {
@@ -848,6 +949,68 @@ mod tests {
             e
         });
         assert!(ops.iter().all(Operation::is_schema_changing));
+    }
+
+    #[test]
+    fn macro_ops_serialize_and_round_trip() {
+        let ops = [
+            Operation::CreateMacro {
+                schema_id: 1,
+                macro_id: 4,
+                schema_name: "s".into(),
+                macro_name: "m".into(),
+                macro_type: "scalar".into(),
+            },
+            Operation::CreateMacro {
+                schema_id: 1,
+                macro_id: 5,
+                schema_name: "s".into(),
+                macro_name: "tm".into(),
+                macro_type: "table".into(),
+            },
+            Operation::DropMacro {
+                macro_id: 6,
+                macro_type: "scalar".into(),
+            },
+            Operation::DropMacro {
+                macro_id: 7,
+                macro_type: "table".into(),
+            },
+        ];
+        let set = ChangeSet::from_operations(&ops);
+        assert_eq!(
+            set.to_changes_made(),
+            r#"created_scalar_macro:"s"."m",created_table_macro:"s"."tm",dropped_scalar_macro:6,dropped_table_macro:7"#
+        );
+        assert_eq!(ChangeSet::parse(&set.to_changes_made()), {
+            let mut e = set.clone();
+            e.created_macro_schema_ids.clear();
+            e
+        });
+        assert!(ops.iter().all(Operation::is_schema_changing));
+    }
+
+    #[test]
+    fn macro_conflicts_classify_like_views() {
+        // Two drops of one macro classify benign: like tables and views,
+        // the loser's closure re-run sees the macro gone and surfaces
+        // NotFound — set comparison never has to catch it.
+        let drop = ChangeSet::from_operations(&[Operation::DropMacro {
+            macro_id: 9,
+            macro_type: "scalar".into(),
+        }]);
+        assert!(!conflicts(&drop, &drop));
+        // Creating a macro inside a schema another commit dropped conflicts.
+        let create = ChangeSet::from_operations(&[Operation::CreateMacro {
+            schema_id: 3,
+            macro_id: 7,
+            schema_name: "s".into(),
+            macro_name: "m".into(),
+            macro_type: "scalar".into(),
+        }]);
+        let drop_schema = ChangeSet::from_operations(&[Operation::DropSchema { schema_id: 3 }]);
+        assert!(conflicts(&create, &drop_schema));
+        assert!(conflicts(&drop_schema, &create));
     }
 
     #[test]

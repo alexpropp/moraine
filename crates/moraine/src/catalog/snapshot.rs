@@ -6,13 +6,14 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
-        OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId,
-        TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
+        MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, OptionScope,
+        ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo,
+        TableStats, TagEntry, ViewId, ViewInfo,
     },
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
+            MacroValue, OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
             TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         read::EntityRecord,
@@ -30,10 +31,12 @@ pub struct CatalogSnapshot {
     pub(crate) schemas: BTreeMap<u64, SchemaValue>,
     pub(crate) tables: BTreeMap<u64, TableValue>,
     pub(crate) views: BTreeMap<u64, ViewValue>,
+    pub(crate) macros: BTreeMap<u64, MacroValue>,
     pub(crate) columns: BTreeMap<u64, BTreeMap<u64, ColumnValue>>,
     pub(crate) schema_names: HashMap<String, u64>,
     pub(crate) table_names: HashMap<(u64, String), u64>,
     pub(crate) view_names: HashMap<(u64, String), u64>,
+    pub(crate) macro_names: HashMap<(u64, String), u64>,
     pub(crate) data_files: BTreeMap<u64, BTreeMap<u64, DataFileValue>>,
     pub(crate) delete_files: BTreeMap<u64, BTreeMap<u64, DeleteFileValue>>,
     pub(crate) partitions: BTreeMap<u64, BTreeMap<u64, PartitionValue>>,
@@ -93,6 +96,9 @@ impl CatalogSnapshot {
                 EntityRecord::Sort(s) if included(s.begin_snapshot, s.end_snapshot) => {
                     view.put_sort(s);
                 }
+                EntityRecord::Macro(m) if included(m.begin_snapshot, m.end_snapshot) => {
+                    view.put_macro(m);
+                }
                 EntityRecord::FileColumnStats(fcs) => {
                     view.put_file_column_stats(fcs);
                 }
@@ -126,7 +132,8 @@ impl CatalogSnapshot {
                 | EntityRecord::DeleteFile(_)
                 | EntityRecord::View(_)
                 | EntityRecord::Partition(_)
-                | EntityRecord::Sort(_) => {
+                | EntityRecord::Sort(_)
+                | EntityRecord::Macro(_) => {
                     // Filtered out by version range
                 }
             }
@@ -236,6 +243,32 @@ impl CatalogSnapshot {
     #[must_use]
     pub fn view_by_id(&self, id: ViewId) -> Option<ViewInfo> {
         self.views.get(&id.get()).map(view_info)
+    }
+
+    /// The live macros of a schema.
+    #[must_use]
+    pub fn macros_in(&self, schema: SchemaId) -> Vec<MacroInfo> {
+        self.macros
+            .values()
+            .filter(|m| m.schema_id == schema.get())
+            .map(macro_info)
+            .collect()
+    }
+
+    /// One macro by name within a schema. Macros have their own name
+    /// namespace, separate from tables and views.
+    #[must_use]
+    pub fn macro_by_name(&self, schema: SchemaId, name: &str) -> Option<MacroInfo> {
+        self.macro_names
+            .get(&(schema.get(), name.to_owned()))
+            .and_then(|id| self.macros.get(id))
+            .map(macro_info)
+    }
+
+    /// One macro by id.
+    #[must_use]
+    pub fn macro_by_id(&self, id: MacroId) -> Option<MacroInfo> {
+        self.macros.get(&id.get()).map(macro_info)
     }
 
     /// A resolved option value: table falls back to its schema, then
@@ -363,6 +396,22 @@ impl CatalogSnapshot {
         if let Some(old) = self.views.remove(&view_id) {
             self.view_names
                 .remove(&(old.schema_id, old.view_name.clone()));
+        }
+    }
+
+    pub(crate) fn put_macro(&mut self, value: MacroValue) {
+        if let Some(old) = self.macros.get(&value.macro_id) {
+            self.macro_names
+                .remove(&(old.schema_id, old.macro_name.clone()));
+        }
+        self.macro_names
+            .insert((value.schema_id, value.macro_name.clone()), value.macro_id);
+        self.macros.insert(value.macro_id, value);
+    }
+    pub(crate) fn delete_macro(&mut self, macro_id: u64) {
+        if let Some(old) = self.macros.remove(&macro_id) {
+            self.macro_names
+                .remove(&(old.schema_id, old.macro_name.clone()));
         }
     }
 
@@ -526,6 +575,33 @@ fn view_info(value: &ViewValue) -> ViewInfo {
     }
 }
 
+fn macro_info(value: &MacroValue) -> MacroInfo {
+    MacroInfo {
+        id: MacroId::new(value.macro_id),
+        schema_id: SchemaId::new(value.schema_id),
+        name: value.macro_name.clone(),
+        implementations: value
+            .implementations
+            .iter()
+            .map(|implementation| MacroImplementationDef {
+                dialect: implementation.dialect.clone(),
+                sql: implementation.sql.clone(),
+                macro_type: implementation.macro_type.clone(),
+                parameters: implementation
+                    .parameters
+                    .iter()
+                    .map(|parameter| MacroParameterDef {
+                        name: parameter.parameter_name.clone(),
+                        parameter_type: parameter.parameter_type.clone(),
+                        default_value: parameter.default_value.clone(),
+                        default_value_type: parameter.default_value_type.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 fn data_file_info(value: &DataFileValue) -> DataFileInfo {
     DataFileInfo {
         id: DataFileId::new(value.data_file_id),
@@ -670,6 +746,23 @@ mod tests {
             dialect: "duckdb".into(),
             sql: format!("select * from {name}"),
             column_aliases: None,
+        }
+    }
+
+    fn macro_rec(id: u64, schema: u64, name: &str, begin: u64, end: Option<u64>) -> MacroValue {
+        MacroValue {
+            macro_id: id,
+            begin_snapshot: begin,
+            end_snapshot: end,
+            schema_id: schema,
+            macro_name: name.into(),
+            implementations: vec![crate::store::proto::MacroImplementation {
+                impl_id: 0,
+                dialect: "duckdb".into(),
+                sql: "1".into(),
+                macro_type: "scalar".into(),
+                parameters: vec![],
+            }],
         }
     }
 
@@ -874,6 +967,25 @@ mod tests {
         assert!(head.view_by_name(SchemaId::new(0), "v1").is_none());
         let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
         assert_eq!(past.view_by_id(ViewId::new(3)).unwrap().name, "v1");
+    }
+
+    #[test]
+    fn macros_are_versioned_and_indexed() {
+        let current = vec![EntityRecord::Macro(macro_rec(1, 5, "add", 10, None))];
+        let history = vec![EntityRecord::Macro(macro_rec(2, 5, "old", 1, Some(10)))];
+        let head = CatalogSnapshot::build(snap(12), current.clone(), vec![], None);
+        assert_eq!(
+            head.macro_by_name(SchemaId::new(5), "add").unwrap().id,
+            MacroId::new(1)
+        );
+        assert!(head.macro_by_name(SchemaId::new(5), "old").is_none());
+        assert_eq!(head.macros_in(SchemaId::new(5)).len(), 1);
+        let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
+        assert_eq!(past.macro_by_id(MacroId::new(2)).unwrap().name, "old");
+        assert_eq!(
+            past.macro_by_id(MacroId::new(2)).unwrap().implementations[0].macro_type,
+            "scalar"
+        );
     }
 
     #[test]

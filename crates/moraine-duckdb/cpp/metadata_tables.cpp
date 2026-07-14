@@ -248,6 +248,78 @@ std::vector<std::vector<duckdb::Value>> ProvideViews(MoraineCatalogHandle *handl
 	return result;
 }
 
+std::vector<std::vector<duckdb::Value>> ProvideMacros(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                            void *probe_ctx) {
+	OwnedArray<MoraineMacroRow> rows(moraine_dump_macros_free);
+	MoraineError err{};
+	auto code = moraine_dump_macros(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.schema_id),
+		    Bigint(r.macro_id),
+		    Varchar(r.macro_name),
+		    Bigint(r.begin_snapshot),
+		    OptBigint(r.has_end_snapshot, r.end_snapshot),
+		});
+	}
+	return result;
+}
+
+// Impl and parameter rows come back flattened from the embedded children
+// in `(macro_id, impl_id[, column_id])` order, and that order is served
+// as-is: DuckLake reconstructs macros with LIST() aggregations that carry
+// no ORDER BY, so served row order is the reconstruction order.
+std::vector<std::vector<duckdb::Value>> ProvideMacroImpls(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                            void *probe_ctx) {
+	OwnedArray<MoraineMacroImplRow> rows(moraine_dump_macro_impls_free);
+	MoraineError err{};
+	auto code = moraine_dump_macro_impls(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.macro_id),
+		    Bigint(r.impl_id),
+		    Varchar(r.dialect),
+		    Varchar(r.sql),
+		    Varchar(r.macro_type),
+		});
+	}
+	return result;
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideMacroParameters(MoraineCatalogHandle *handle,
+                                            MoraineInterruptProbe probe, void *probe_ctx) {
+	OwnedArray<MoraineMacroParameterRow> rows(moraine_dump_macro_parameters_free);
+	MoraineError err{};
+	auto code = moraine_dump_macro_parameters(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	std::vector<std::vector<duckdb::Value>> result;
+	result.reserve(rows.size());
+	for (auto &r : rows) {
+		result.push_back({
+		    Bigint(r.macro_id),
+		    Bigint(r.impl_id),
+		    Bigint(r.column_id),
+		    Varchar(r.parameter_name),
+		    Varchar(r.parameter_type),
+		    OptVarchar(r.default_value),
+		    Varchar(r.default_value_type),
+		});
+	}
+	return result;
+}
+
 std::vector<std::vector<duckdb::Value>> ProvideColumns(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                             void *probe_ctx) {
 	OwnedArray<MoraineColumnRow> rows(moraine_dump_columns_free);
@@ -438,7 +510,7 @@ std::vector<std::vector<duckdb::Value>> ProvideSchemaVersions(MoraineCatalogHand
 }
 
 // Always-empty stand-in for a `ducklake_*` table covering a feature the
-// store doesn't model (tags, data inlining, column mapping, macros). The
+// store doesn't model (column and name mapping). The
 // table must still exist as a SQL table: DuckLake's attach/snapshot-load
 // query joins every one of them unconditionally, so a missing table is a
 // bind-time Catalog Error even where the query would return zero rows
@@ -965,7 +1037,11 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"begin_snapshot", "BIGINT", false},
 	            {"end_snapshot", "BIGINT", false},
 	        },
-	        ProvideEmpty,
+	        ProvideMacros,
+	        20,
+	        /* end key: macro_id */ {1},
+	        /* end_snapshot col */ 4,
+	        /* delete key: macro_id, end_snapshot */ {1, 4},
 	    },
 	    {
 	        "ducklake_macro_impl",
@@ -976,7 +1052,11 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"sql", "VARCHAR", false},
 	            {"type", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideMacroImpls,
+	        21,
+	        {},
+	        0,
+	        /* delete key: macro_id */ {0},
 	    },
 	    {
 	        "ducklake_macro_parameters",
@@ -989,7 +1069,11 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"default_value", "VARCHAR", false},
 	            {"default_value_type", "VARCHAR", false},
 	        },
-	        ProvideEmpty,
+	        ProvideMacroParameters,
+	        22,
+	        {},
+	        0,
+	        /* delete key: macro_id */ {0},
 	    },
 	    {
 	        "ducklake_partition_info",

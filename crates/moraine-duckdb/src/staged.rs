@@ -82,6 +82,9 @@ fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
         17 => Ok(TableKind::Tag),
         18 => Ok(TableKind::ColumnTag),
         19 => Ok(TableKind::FilesScheduledForDeletion),
+        20 => Ok(TableKind::Macro),
+        21 => Ok(TableKind::MacroImpl),
+        22 => Ok(TableKind::MacroParameters),
         other => Err(AbiError::invalid_argument(format!(
             "moraine_tx_stage: unknown table_kind {other}"
         ))),
