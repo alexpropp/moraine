@@ -78,6 +78,7 @@ impl MoraineCatalogHandle {
             // SAFETY: caller contract — `probe` is callable with
             // `probe_ctx` for the duration of this call.
             if unsafe { probe(probe_ctx) } {
+                self.drain_interrupt();
                 return Err(AbiError::interrupted());
             }
         }
@@ -107,6 +108,17 @@ impl MoraineCatalogHandle {
                 result = future => result.map_err(AbiError::from),
             }
         })
+    }
+
+    /// Consumes a stored interrupt permit, if any. Every cancelled call
+    /// must leave the push channel empty — a permit surviving one call
+    /// would spuriously interrupt the next.
+    fn drain_interrupt(&self) {
+        let mut pending = std::pin::pin!(self.interrupt.notified());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        // Ready consumes the permit; Pending registered a waiter that
+        // deregisters when `pending` drops here.
+        let _ = std::future::Future::poll(pending.as_mut(), &mut context);
     }
 }
 

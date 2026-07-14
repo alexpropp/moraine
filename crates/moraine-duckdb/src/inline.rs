@@ -608,8 +608,6 @@ mod tests {
         id
     }
 
-    /// End-to-end over the ABI: stage an inline schema + insert, commit;
-    /// `moraine_inline_scan` (`Table`) returns the row with the right
     /// One representative inline read pins the pull channel for the
     /// family — every inline read routes through the same cancellable
     /// bridge.
@@ -669,6 +667,8 @@ mod tests {
         }
     }
 
+    /// End-to-end over the ABI: stage an inline schema + insert, commit;
+    /// `moraine_inline_scan` (`Table`) returns the row with the right
     /// `row_id`/`begin_snapshot`/body, and `moraine_inline_schemas`/
     /// `moraine_inline_registered_tables` see the schema. Staging an
     /// `inline/inline_delete` then makes the row disappear from a `Table` scan at

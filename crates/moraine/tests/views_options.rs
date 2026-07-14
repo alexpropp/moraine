@@ -170,7 +170,7 @@ async fn option_resolution_reads_through_the_catalog() {
     catalog.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_option_writes_are_last_write_wins() {
     let catalog = open_memory().await;
     let c1 = catalog.clone();

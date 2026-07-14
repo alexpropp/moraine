@@ -295,12 +295,15 @@ pub unsafe extern "C" fn moraine_tx_commit(
         if tx.is_null() {
             return Err(AbiError::invalid_argument("`tx` is null"));
         }
-        if out_snapshot_id.is_null() {
-            return Err(AbiError::invalid_argument("`out_snapshot_id` is null"));
-        }
         // SAFETY: caller contract above; `tx` consumed exactly once.
         let boxed = unsafe { Box::from_raw(tx) };
         let MoraineTxHandle { catalog, tx } = *boxed;
+        // Checked after `tx` is reclaimed: the contract frees it on every
+        // path, argument errors included.
+        if out_snapshot_id.is_null() {
+            tx.rollback();
+            return Err(AbiError::invalid_argument("`out_snapshot_id` is null"));
+        }
         // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
         let catalog_ref = unsafe { &*catalog };
         let id = catalog_ref

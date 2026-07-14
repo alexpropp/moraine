@@ -11,6 +11,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1"
+arrow = { version = "59.1.0", default-features = false }
 bytes = "1"
 cc = "1"
 moraine = { path = "crates/moraine", version = "0.1.0" }

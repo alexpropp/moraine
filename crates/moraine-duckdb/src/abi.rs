@@ -261,13 +261,15 @@ pub unsafe extern "C" fn moraine_attach(
             StoreKind::parse(s)?
         };
 
+        // Open the store first: it is synchronous and fallible, and a bad
+        // path must not cost a runtime spun up just to be torn down.
+        let object_store = store_kind.open(path_str)?;
         let runtime = new_runtime().map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
                 format!("failed to start tokio runtime: {e}"),
             )
         })?;
-        let object_store = store_kind.open(path_str)?;
         let mut options = moraine::CatalogOptions::default();
         options.encrypted = encrypted;
         let open = async {
@@ -1648,6 +1650,67 @@ mod tests {
         // SAFETY: a null `handle` is exactly the input this test
         // exercises, documented as a no-op.
         unsafe { moraine_interrupt(ptr::null_mut()) };
+    }
+
+    /// A probe cancellation must also consume a pending interrupt signal:
+    /// the pre-flight probe check returns before the signal race runs, and
+    /// a permit surviving it would spuriously interrupt the next read.
+    #[test]
+    fn probe_cancel_consumes_pending_interrupt() {
+        let dir = TempDir::new("interrupt-probe");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        unsafe { moraine_interrupt(handle) };
+
+        // Both channels pending: the probe pre-flight cancels this read.
+        let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; out/err slots are valid;
+        // `probe_always` accepts a null context.
+        let code = unsafe {
+            moraine_snapshot(
+                handle,
+                &raw mut snapshot,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert!(snapshot.is_null());
+        // SAFETY: `err.message` was just populated above and not yet freed.
+        unsafe { moraine_error_free(err.message) };
+
+        // The interrupt permit must not survive into this quiet read.
+        let mut snap2: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut err2 = MoraineError::default();
+        // SAFETY: `handle` is still attached; out/err slots are valid;
+        // `probe_never` accepts a null context.
+        let code2 = unsafe {
+            moraine_snapshot(
+                handle,
+                &raw mut snap2,
+                Some(probe_never),
+                ptr::null_mut(),
+                &raw mut err2,
+            )
+        };
+        // SAFETY: null on success, or just written by the failed call.
+        let err2_message = unsafe { err2.message.as_ref() };
+        assert_eq!(
+            code2,
+            codes::OK,
+            "stale interrupt leaked into the next read: {err2_message:?}"
+        );
+
+        // SAFETY: `snap2`/`handle` came from the calls above and are each
+        // freed exactly once.
+        unsafe {
+            moraine_snapshot_free(snap2);
+            moraine_detach(handle);
+        }
     }
 
     unsafe extern "C" fn probe_never(_probe_ctx: *mut c_void) -> bool {

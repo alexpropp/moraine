@@ -541,7 +541,6 @@ fn decode_partition_info(cells: &[Cell]) -> Result<proto::PartitionValue> {
         columns: Vec::new(),
     };
     c.finish()?;
-
     Ok(value)
 }
 
@@ -555,7 +554,6 @@ fn decode_partition_column(cells: &[Cell]) -> Result<(u64, proto::PartitionColum
         transform: c.string()?,
     };
     c.finish()?;
-
     Ok((partition_id, column))
 }
 
@@ -568,7 +566,6 @@ fn decode_file_partition_value(cells: &[Cell]) -> Result<((u64, u64), proto::Fil
         partition_value: c.string()?,
     };
     c.finish()?;
-
     Ok(((table_id, data_file_id), value))
 }
 
@@ -582,7 +579,6 @@ fn decode_sort_info(cells: &[Cell]) -> Result<proto::SortValue> {
         expressions: Vec::new(),
     };
     c.finish()?;
-
     Ok(value)
 }
 
@@ -598,7 +594,6 @@ fn decode_sort_expression(cells: &[Cell]) -> Result<(u64, proto::SortExpression)
         null_order: c.string()?,
     };
     c.finish()?;
-
     Ok((sort_id, expression))
 }
 
@@ -855,47 +850,60 @@ fn apply_update_set_end(
     // authors every row change explicitly (a rename ends the table row but
     // keeps its columns live); the verb-path `delete_*` helpers would
     // cascade and end those siblings.
-    match key {
-        EntityKey::Schema { schema_id } => {
-            state.schemas.remove(&schema_id);
-        }
-        EntityKey::Table { table_id } => {
-            state.tables.remove(&table_id);
-        }
-        EntityKey::View { view_id } => {
-            state.views.remove(&view_id);
-        }
+    let ended = match key {
+        EntityKey::Schema { schema_id } => state.schemas.remove(&schema_id).is_some(),
+        EntityKey::Table { table_id } => state.tables.remove(&table_id).is_some(),
+        EntityKey::View { view_id } => state.views.remove(&view_id).is_some(),
         EntityKey::Column {
             table_id,
             column_id,
-        } => {
-            if let Some(columns) = state.columns.get_mut(&table_id) {
-                columns.remove(&column_id);
-            }
-        }
+        } => state
+            .columns
+            .get_mut(&table_id)
+            .is_some_and(|columns| columns.remove(&column_id).is_some()),
         EntityKey::File {
             table_id,
             data_file_id,
-        } => {
-            if let Some(files) = state.data_files.get_mut(&table_id) {
-                files.remove(&data_file_id);
-            }
-        }
+        } => state
+            .data_files
+            .get_mut(&table_id)
+            .is_some_and(|files| files.remove(&data_file_id).is_some()),
         EntityKey::DeleteFile {
             table_id,
             delete_file_id,
-        } => {
-            if let Some(files) = state.delete_files.get_mut(&table_id) {
-                files.remove(&delete_file_id);
-            }
-        }
+        } => state
+            .delete_files
+            .get_mut(&table_id)
+            .is_some_and(|files| files.remove(&delete_file_id).is_some()),
         EntityKey::Partition {
             table_id,
             partition_id,
-        } => state.delete_partition(table_id, partition_id),
-        EntityKey::Sort { table_id, sort_id } => state.delete_sort(table_id, sort_id),
+        } => {
+            let live = state
+                .partitions
+                .get(&table_id)
+                .is_some_and(|specs| specs.contains_key(&partition_id));
+            state.delete_partition(table_id, partition_id);
+            live
+        }
+        EntityKey::Sort { table_id, sort_id } => {
+            let live = state
+                .sorts
+                .get(&table_id)
+                .is_some_and(|specs| specs.contains_key(&sort_id));
+            state.delete_sort(table_id, sort_id);
+            live
+        }
         // decode_end only ever returns the keys matched above.
         _ => return Err(corrupt_row(table, "unreachable entity key")),
+    };
+    // DuckLake's UPDATE only names rows it read; ending an absent row is
+    // drift and must fail loudly, never pass as a no-op.
+    if !ended {
+        return Err(corrupt_row(
+            table,
+            format!("no live row to end for {key:?}"),
+        ));
     }
 
     Ok(())
@@ -1169,6 +1177,20 @@ fn translate(
             TableKind::FilePartitionValue,
             "file_partition_value rows without a matching data_file insert in this commit",
         ));
+    }
+
+    // DuckLake authors column ids itself, so its inserts advance no
+    // counter; float each table's field-id counter above every live id so
+    // a later verb-path `add_column` can never re-allocate one.
+    for (table_id, columns) in &state.columns {
+        let Some(max_id) = columns.keys().max() else {
+            continue;
+        };
+        if let Some(table) = state.tables.get_mut(table_id)
+            && table.next_column_id <= *max_id
+        {
+            table.next_column_id = max_id + 1;
+        }
     }
 
     let writes = commit::diff_writes(base, &state, new_id);
@@ -1593,6 +1615,99 @@ mod tests {
         let cols = snapshot.columns_of(tables[0].id);
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].name, "a");
+    }
+
+    /// Staged column inserts advance the table's field-id counter: a later
+    /// verb `add_column` — even after the highest staged column is dropped
+    /// — must never re-allocate a DuckLake-authored field id.
+    #[tokio::test]
+    async fn staged_columns_advance_the_field_id_counter() {
+        use crate::catalog::{ColumnDef, ColumnId, SchemaId, TableId};
+
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 2, "a", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 5, "b", 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        // Drop the max-id column, then add: the freed id must not return.
+        let table = TableId::new(1);
+        catalog
+            .commit(|tx| tx.drop_column(table, ColumnId::new(5)))
+            .await
+            .unwrap();
+        let added = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                added.set(Some(tx.add_column(
+                    table,
+                    &ColumnDef {
+                        name: "c".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        default_value: None,
+                    },
+                )?));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            added.get(),
+            Some(ColumnId::new(6)),
+            "field id 5 must not be reused"
+        );
+
+        // The counter-only table update stayed in place: one live table
+        // row for snapshot 1's create, no counter-minted history version.
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.tables_in(SchemaId::new(0)).len(), 1);
+    }
+
+    /// DuckLake's UPDATE only names rows it read: an `UpdateSetEnd` for a
+    /// row that is not live is drift and must fail the commit loudly, not
+    /// pass as a silent no-op that drops the authored end.
+    #[tokio::test]
+    async fn ending_an_absent_row_is_rejected() {
+        let catalog = open().await;
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin(db_tx);
+
+        // No table 7 exists; end it at this commit's snapshot id (1).
+        tx.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Table,
+            cells: vec![Cell::U64(7), Cell::U64(1)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "dropped_table:7"),
+        });
+
+        let err = tx.commit().await.unwrap_err();
+        assert!(matches!(err, crate::error::Error::Corruption(_)), "{err}");
     }
 
     /// DuckLake-authored data-file and delete-file rows carry

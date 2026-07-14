@@ -296,26 +296,92 @@ fn stage_overwrite<M: prost::Message + PartialEq>(
     }
 }
 
+/// Stages the transition of every entity in one id-keyed map pair.
+fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
+    writes: &mut Vec<StagedWrite>,
+    base: &std::collections::BTreeMap<K, M>,
+    state: &std::collections::BTreeMap<K, M>,
+    make_key: impl Fn(K) -> EntityKey,
+    new_snapshot: u64,
+    set_end: impl Fn(&M) -> M,
+) {
+    for &id in base
+        .keys()
+        .chain(state.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        stage_transition(
+            writes,
+            make_key(id),
+            base.get(&id),
+            state.get(&id),
+            new_snapshot,
+            &set_end,
+        );
+    }
+}
+
+/// Stages the transition of every entity in one table-scoped nested map
+/// pair (`table_id` → `id` → record).
+fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
+    writes: &mut Vec<StagedWrite>,
+    base: &std::collections::BTreeMap<u64, std::collections::BTreeMap<K, M>>,
+    state: &std::collections::BTreeMap<u64, std::collections::BTreeMap<K, M>>,
+    make_key: impl Fn(u64, K) -> EntityKey,
+    new_snapshot: u64,
+    set_end: impl Fn(&M) -> M,
+) {
+    let empty = std::collections::BTreeMap::new();
+    for &table_id in base
+        .keys()
+        .chain(state.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        diff_versioned_map(
+            writes,
+            base.get(&table_id).unwrap_or(&empty),
+            state.get(&table_id).unwrap_or(&empty),
+            |id| make_key(table_id, id),
+            new_snapshot,
+            &set_end,
+        );
+    }
+}
+
+/// Stages the in-place overwrite of every record in one id-keyed map
+/// pair — unversioned kinds with no history mirror.
+fn diff_overwrite_map<K: Copy + Ord, M: prost::Message + PartialEq>(
+    writes: &mut Vec<StagedWrite>,
+    base: &std::collections::BTreeMap<K, M>,
+    state: &std::collections::BTreeMap<K, M>,
+    make_key: impl Fn(K) -> EntityKey,
+) {
+    for &id in base
+        .keys()
+        .chain(state.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        stage_overwrite(writes, make_key(id), base.get(&id), state.get(&id));
+    }
+}
+
 fn diff_schemas(
     writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    let schema_ids = base.schemas.keys().chain(state.schemas.keys());
-    for &schema_id in schema_ids.collect::<std::collections::BTreeSet<_>>() {
-        stage_transition(
-            writes,
-            EntityKey::Schema { schema_id },
-            base.schemas.get(&schema_id),
-            state.schemas.get(&schema_id),
-            new_snapshot,
-            |prior| proto::SchemaValue {
-                end_snapshot: Some(new_snapshot),
-                ..prior.clone()
-            },
-        );
-    }
+    diff_versioned_map(
+        writes,
+        &base.schemas,
+        &state.schemas,
+        |schema_id| EntityKey::Schema { schema_id },
+        new_snapshot,
+        |prior| proto::SchemaValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
 }
 
 fn diff_tables(
@@ -324,11 +390,36 @@ fn diff_tables(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
+    // The table row minus its field-id counter: the part whose change
+    // means a version transition.
+    fn sans_counter(value: &proto::TableValue) -> proto::TableValue {
+        proto::TableValue {
+            next_column_id: 0,
+            ..value.clone()
+        }
+    }
+
     let table_ids = base.tables.keys().chain(state.tables.keys());
     for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
+        let entity = EntityKey::Table { table_id };
+
+        // A counter-only change overwrites the record in place: the
+        // field-id counter is moraine-internal bookkeeping, so the table
+        // row did not transition and must not mint a history version.
+        if let (Some(prior), Some(next)) = (base.tables.get(&table_id), state.tables.get(&table_id))
+            && prior != next
+            && sans_counter(prior) == sans_counter(next)
+        {
+            writes.push((
+                Key::current(entity).encode(),
+                Some(value::encode_value(next)),
+            ));
+            continue;
+        }
+
         stage_transition(
             writes,
-            EntityKey::Table { table_id },
+            entity,
             base.tables.get(&table_id),
             state.tables.get(&table_id),
             new_snapshot,
@@ -346,35 +437,29 @@ fn diff_views(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    let view_ids = base.views.keys().chain(state.views.keys());
-    for &view_id in view_ids.collect::<std::collections::BTreeSet<_>>() {
-        stage_transition(
-            writes,
-            EntityKey::View { view_id },
-            base.views.get(&view_id),
-            state.views.get(&view_id),
-            new_snapshot,
-            |prior| proto::ViewValue {
-                end_snapshot: Some(new_snapshot),
-                ..prior.clone()
-            },
-        );
-    }
+    diff_versioned_map(
+        writes,
+        &base.views,
+        &state.views,
+        |view_id| EntityKey::View { view_id },
+        new_snapshot,
+        |prior| proto::ViewValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
 }
 
 fn diff_options(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
-    let scopes = base.options.keys().chain(state.options.keys());
-    for &(scope_kind, scope_id) in scopes.collect::<std::collections::BTreeSet<_>>() {
-        stage_overwrite(
-            writes,
-            EntityKey::Option {
-                scope_kind,
-                scope_id,
-            },
-            base.options.get(&(scope_kind, scope_id)),
-            state.options.get(&(scope_kind, scope_id)),
-        );
-    }
+    diff_overwrite_map(
+        writes,
+        &base.options,
+        &state.options,
+        |(scope_kind, scope_id)| EntityKey::Option {
+            scope_kind,
+            scope_id,
+        },
+    );
 }
 
 fn diff_columns(
@@ -418,33 +503,20 @@ fn diff_data_files(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    let file_tables = base.data_files.keys().chain(state.data_files.keys());
-    for &table_id in file_tables.collect::<std::collections::BTreeSet<_>>() {
-        static EMPTY: std::collections::BTreeMap<u64, proto::DataFileValue> =
-            std::collections::BTreeMap::new();
-        let base_files = base.data_files.get(&table_id).unwrap_or(&EMPTY);
-        let state_files = state.data_files.get(&table_id).unwrap_or(&EMPTY);
-        for &data_file_id in base_files
-            .keys()
-            .chain(state_files.keys())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            stage_transition(
-                writes,
-                EntityKey::File {
-                    table_id,
-                    data_file_id,
-                },
-                base_files.get(&data_file_id),
-                state_files.get(&data_file_id),
-                new_snapshot,
-                |prior| proto::DataFileValue {
-                    end_snapshot: Some(new_snapshot),
-                    ..prior.clone()
-                },
-            );
-        }
-    }
+    diff_nested_versioned(
+        writes,
+        &base.data_files,
+        &state.data_files,
+        |table_id, data_file_id| EntityKey::File {
+            table_id,
+            data_file_id,
+        },
+        new_snapshot,
+        |prior| proto::DataFileValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
 }
 
 fn diff_delete_files(
@@ -453,33 +525,20 @@ fn diff_delete_files(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    let delete_file_tables = base.delete_files.keys().chain(state.delete_files.keys());
-    for &table_id in delete_file_tables.collect::<std::collections::BTreeSet<_>>() {
-        static EMPTY: std::collections::BTreeMap<u64, proto::DeleteFileValue> =
-            std::collections::BTreeMap::new();
-        let base_files = base.delete_files.get(&table_id).unwrap_or(&EMPTY);
-        let state_files = state.delete_files.get(&table_id).unwrap_or(&EMPTY);
-        for &delete_file_id in base_files
-            .keys()
-            .chain(state_files.keys())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            stage_transition(
-                writes,
-                EntityKey::DeleteFile {
-                    table_id,
-                    delete_file_id,
-                },
-                base_files.get(&delete_file_id),
-                state_files.get(&delete_file_id),
-                new_snapshot,
-                |prior| proto::DeleteFileValue {
-                    end_snapshot: Some(new_snapshot),
-                    ..prior.clone()
-                },
-            );
-        }
-    }
+    diff_nested_versioned(
+        writes,
+        &base.delete_files,
+        &state.delete_files,
+        |table_id, delete_file_id| EntityKey::DeleteFile {
+            table_id,
+            delete_file_id,
+        },
+        new_snapshot,
+        |prior| proto::DeleteFileValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
 }
 
 fn diff_partitions(
@@ -488,38 +547,20 @@ fn diff_partitions(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    let partition_tables = base
-        .partitions
-        .keys()
-        .chain(state.partitions.keys())
-        .collect::<std::collections::BTreeSet<_>>();
-    for &table_id in partition_tables {
-        static EMPTY: std::collections::BTreeMap<u64, proto::PartitionValue> =
-            std::collections::BTreeMap::new();
-
-        let base_specs = base.partitions.get(&table_id).unwrap_or(&EMPTY);
-        let state_specs = state.partitions.get(&table_id).unwrap_or(&EMPTY);
-        for &partition_id in base_specs
-            .keys()
-            .chain(state_specs.keys())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            stage_transition(
-                writes,
-                EntityKey::Partition {
-                    table_id,
-                    partition_id,
-                },
-                base_specs.get(&partition_id),
-                state_specs.get(&partition_id),
-                new_snapshot,
-                |prior| proto::PartitionValue {
-                    end_snapshot: Some(new_snapshot),
-                    ..prior.clone()
-                },
-            );
-        }
-    }
+    diff_nested_versioned(
+        writes,
+        &base.partitions,
+        &state.partitions,
+        |table_id, partition_id| EntityKey::Partition {
+            table_id,
+            partition_id,
+        },
+        new_snapshot,
+        |prior| proto::PartitionValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
 }
 
 fn diff_sorts(
@@ -528,35 +569,17 @@ fn diff_sorts(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    let sort_tables = base
-        .sorts
-        .keys()
-        .chain(state.sorts.keys())
-        .collect::<std::collections::BTreeSet<_>>();
-    for &table_id in sort_tables {
-        static EMPTY: std::collections::BTreeMap<u64, proto::SortValue> =
-            std::collections::BTreeMap::new();
-
-        let base_specs = base.sorts.get(&table_id).unwrap_or(&EMPTY);
-        let state_specs = state.sorts.get(&table_id).unwrap_or(&EMPTY);
-        for &sort_id in base_specs
-            .keys()
-            .chain(state_specs.keys())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            stage_transition(
-                writes,
-                EntityKey::Sort { table_id, sort_id },
-                base_specs.get(&sort_id),
-                state_specs.get(&sort_id),
-                new_snapshot,
-                |prior| proto::SortValue {
-                    end_snapshot: Some(new_snapshot),
-                    ..prior.clone()
-                },
-            );
-        }
-    }
+    diff_nested_versioned(
+        writes,
+        &base.sorts,
+        &state.sorts,
+        |table_id, sort_id| EntityKey::Sort { table_id, sort_id },
+        new_snapshot,
+        |prior| proto::SortValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
 }
 
 fn diff_table_stats(
@@ -564,15 +587,9 @@ fn diff_table_stats(
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
 ) {
-    let table_ids = base.table_stats.keys().chain(state.table_stats.keys());
-    for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
-        stage_overwrite(
-            writes,
-            EntityKey::TableStats { table_id },
-            base.table_stats.get(&table_id),
-            state.table_stats.get(&table_id),
-        );
-    }
+    diff_overwrite_map(writes, &base.table_stats, &state.table_stats, |table_id| {
+        EntityKey::TableStats { table_id }
+    });
 }
 
 fn diff_table_column_stats(
@@ -580,30 +597,21 @@ fn diff_table_column_stats(
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
 ) {
+    let empty = std::collections::BTreeMap::new();
     let table_ids = base
         .table_column_stats
         .keys()
         .chain(state.table_column_stats.keys());
     for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
-        static EMPTY: std::collections::BTreeMap<u64, proto::TableColumnStatsValue> =
-            std::collections::BTreeMap::new();
-        let base_cols = base.table_column_stats.get(&table_id).unwrap_or(&EMPTY);
-        let state_cols = state.table_column_stats.get(&table_id).unwrap_or(&EMPTY);
-        for &column_id in base_cols
-            .keys()
-            .chain(state_cols.keys())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            stage_overwrite(
-                writes,
-                EntityKey::TableColumnStats {
-                    table_id,
-                    column_id,
-                },
-                base_cols.get(&column_id),
-                state_cols.get(&column_id),
-            );
-        }
+        diff_overwrite_map(
+            writes,
+            base.table_column_stats.get(&table_id).unwrap_or(&empty),
+            state.table_column_stats.get(&table_id).unwrap_or(&empty),
+            |column_id| EntityKey::TableColumnStats {
+                table_id,
+                column_id,
+            },
+        );
     }
 }
 
@@ -753,6 +761,14 @@ where
         if writes.is_empty() {
             return Ok(Prepared::Nothing { head });
         }
+        // Re-put the unchanged head as a conflict anchor: every
+        // snapshot-minting commit writes it, so a racing drop of this
+        // option's scope forces a re-run that re-validates the scope
+        // against the winner's state instead of committing blind.
+        writes.push((
+            Key::Sys(SysKey::Head).encode(),
+            Some(value::encode_value(&proto::HeadValue { snapshot_id: head })),
+        ));
         stage_writes(db_tx, writes)?;
         return Ok(Prepared::Staged {
             ours: Box::default(),
@@ -763,6 +779,12 @@ where
 
     let mut writes = diff_writes(&base, &state, new_id);
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
+    let schema_changed_table_ids: Vec<u64> = operations
+        .iter()
+        .filter_map(Operation::schema_changed_table_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let ours = ChangeSet::from_operations(&operations);
 
     let snapshot = proto::SnapshotValue {
@@ -776,7 +798,7 @@ where
         author: None,
         commit_message: None,
         commit_extra_info: None,
-        schema_changed_table_ids: Vec::new(),
+        schema_changed_table_ids,
     };
     writes.push((
         Key::Snapshot {
@@ -1059,6 +1081,77 @@ mod tests {
         let head: proto::HeadValue = value::decode_value(&head_bytes).unwrap();
         assert_eq!(head.snapshot_id, 1);
         reader.close().await.unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    /// Verb-path DDL records the shape-changed table ids on its snapshot,
+    /// one per changed table or view — the id set `ducklake_schema_versions`
+    /// rows are served from. Data-only commits record none.
+    #[tokio::test]
+    async fn verb_ddl_records_schema_changed_table_ids() {
+        use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile};
+
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+
+        // One commit creating a table and altering it twice: the id set
+        // dedups to that one table.
+        let created = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.create_schema("s")?;
+                let table = tx.create_table(
+                    schema,
+                    "t",
+                    &[ColumnDef {
+                        name: "a".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        default_value: None,
+                    }],
+                )?;
+                tx.rename_table(table, "t2")?;
+                created.set(Some(table));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let table = created.get().unwrap();
+
+        // A data-only commit changes no table's shape.
+        catalog
+            .commit(|tx| {
+                tx.register_data_file(
+                    table,
+                    DataFile {
+                        path: "f.parquet".into(),
+                        path_is_relative: true,
+                        file_format: "parquet".into(),
+                        record_count: 1,
+                        file_size_bytes: 10,
+                        footer_size: 4,
+                        encryption_key: None,
+                        column_stats: vec![],
+                    },
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let ddl = read::read_snapshot(ReadHandle::Tx(&tx), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ddl.schema_changed_table_ids, vec![table.get()]);
+        let data_only = read::read_snapshot(ReadHandle::Tx(&tx), 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data_only.schema_changed_table_ids, Vec::<u64>::new());
+        tx.rollback();
         catalog.close().await.unwrap();
     }
 }
