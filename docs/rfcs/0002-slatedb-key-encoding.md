@@ -94,7 +94,8 @@ bump that alters encoding) fails CI before it can reach a store.
   a table id.
 - **No strings in keys.** Entities are keyed by their DuckLake-allocated
   ids — schemas/tables/views/macros from the global `next_catalog_id`,
-  files from `next_file_id`, columns from a per-table counter (RFC 0012).
+  files and column mappings from `next_file_id` (RFC 0018), columns from a
+  per-table counter (RFC 0012).
   Names live in values; name→id resolution runs against the in-memory
   snapshot built by scanning `current` at attach (a persistent name index is
   complexity without payoff at catalog scale).
@@ -115,20 +116,25 @@ columns, so these records are overwritten in place, never transition to
 `history`, and a time-travel view serves the current stats (stats are
 advisory pruning data, not catalog history). An `fstat` record outlives
 its file's live version — historical snapshots still prune by it — and
-is removed only when RFC 0007 GC prunes the file's history. The `tag`
-kind is a third shape: an unversioned container record whose embedded
-entries are individually begin/end-versioned (see its row below):
+is removed only when RFC 0007 GC prunes the file's history. The `mapping`
+kind is a third shape, unversioned and **immutable create-only**: written
+once (by `ducklake_add_data_files`), never overwritten, never mirrored,
+removed only by RFC 0007 GC (RFC 0018). The `tag` kind is a fourth shape:
+an unversioned container record whose embedded entries are individually
+begin/end-versioned (see its row below):
 
 | Kind | Key components | DuckLake table(s) |
 |---|---|---|
 | `schema` | `schema_id` | `ducklake_schema` |
 | `table` | `table_id` | `ducklake_table` |
 | `view` | `view_id` | `ducklake_view` |
+| `macro` | `macro_id` | `ducklake_macro` (+ `ducklake_macro_impl`, `ducklake_macro_parameters` embedded — immutable child rows with no independent lifecycle, served back in `impl_id`/`column_id` order because DuckLake's `LIST()` reconstruction has no `ORDER BY`; RFC 0019) |
 | `column` | `table_id, column_id` | `ducklake_column` (+ `ducklake_column_tag` embedded). One record per row, **nested fields included** — struct members / list elements / map key-value are their own rows with per-table field ids; `parent_column` lives in the value (RFC 0012). |
 | `partition` | `table_id, partition_id` | `ducklake_partition_info` (+ `ducklake_partition_column` embedded) |
 | `sort` | `table_id, sort_id` | `ducklake_sort_info` (+ `ducklake_sort_expression` embedded) |
 | `file` | `table_id, data_file_id` | `ducklake_data_file` |
 | `delfile` | `table_id, delete_file_id` | `ducklake_delete_file` |
+| `mapping` | `table_id, mapping_id` | `ducklake_column_mapping` (+ `ducklake_name_mapping` embedded). Immutable create-only (see above); `mapping_id` is DuckLake-allocated from `next_file_id`, **not** `next_catalog_id` — the lazy mapping reader cursors on that id space (RFC 0018). |
 | `fstat` | `table_id, data_file_id, column_id` | `ducklake_file_column_stats` (+ variant stats) |
 | `tstat` | `table_id` | `ducklake_table_stats` |
 | `tcstat` | `table_id, column_id` | `ducklake_table_column_stats` |
@@ -151,9 +157,10 @@ their parent record, and **pure child tables with no independent lifecycle
 embed** in the parent's value (partition columns, sort expressions, column
 tags). A DuckLake
 table earns its own kind only when its rows have an independent begin/end
-lifecycle. The v1.0 spec has ~28 tables; the remainder (e.g. column/name
-mapping) follow the same key structure and are added here as implementation
-reaches them — this RFC is updated, not diverged from.
+lifecycle. With `macro` (RFC 0019) and `mapping` (RFC 0018) mapped, every
+table of the v1.0 spec's ~28 has a home above — as a kind, an embedded
+child, or a merged 1:1 side table; any future spec table follows the same
+conventions — this RFC is updated, not diverged from.
 
 Per-table collections (`column`, `file`, `fstat`, …) are keyed
 `table_id`-first so "everything about table T" — the unit DuckLake reads

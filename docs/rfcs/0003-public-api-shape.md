@@ -205,10 +205,11 @@ The public surface is hand-written domain types, decoupled from the
 `prost`-generated messages that `store` uses on disk:
 
 - **Newtype ids** (wrapping the DuckLake-allocated `u64`s of RFC 0002):
-  `SchemaId`, `TableId`, `ViewId`, `ColumnId`, `DataFileId`, `DeleteFileId`,
-  `SnapshotId`.
-- **Value structs:** `TableInfo`, `ViewInfo`, `ColumnDef`, `DataFile`,
-  `DeleteFile`, `PartitionSpec`, `ColumnStats`, `TableStats`, `OptionScope`.
+  `SchemaId`, `TableId`, `ViewId`, `MacroId`, `MappingId`, `ColumnId`,
+  `DataFileId`, `DeleteFileId`, `SnapshotId`.
+- **Value structs:** `TableInfo`, `ViewInfo`, `MacroInfo`, `MappingInfo`,
+  `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `ColumnStats`,
+  `TableStats`, `OptionScope`.
 
 Keeping these separate from the wire types is what lets RFC 0002's protobuf
 field evolution stay an internal change instead of a public breaking one.
@@ -225,6 +226,7 @@ semantics and the entities RFC 0002 maps:
 | **Schemas** | `create_schema`, `drop_schema` (no rename verb — DuckLake models no schema rename: `ducklake_schema` is one row per id under a primary key, and its alter path handles tables and views only) |
 | **Tables** | `create_table`, `rename_table`, `set_table_schema` (move to another schema), `drop_table` |
 | **Views** | `create_view`, `alter_view`, `drop_view` |
+| **Macros** (RFC 0019) | `create_macro`, `drop_macro` (no alter verb — DuckLake models macro replacement as drop + create under a fresh `macro_id`; macro names collide with live macros in the schema only, not with tables/views) |
 | **Columns** | `add_column`, `rename_column`, `alter_column` (type / default / nullability), `drop_column` |
 | **Partitioning** | `set_partitioning`, `clear_partitioning` |
 | **Data files** | `register_data_file` (carries its file column stats), `expire_data_file` |
@@ -245,6 +247,11 @@ Notes:
 - `alter_column` is one verb taking an optional change per attribute, rather
   than three verbs, because DuckLake models a column alteration as a single
   new column version regardless of which attributes changed.
+- Column/name mappings (RFC 0018) have **no verb**: DuckLake creates them
+  only as a side effect of `ducklake_add_data_files`, and the embedding API
+  has no consumer registering foreign Parquet today. `register_data_file`
+  leaves `mapping_id` unset on the verb path; the staged path carries it
+  verbatim. A verb is added if an embedding use case appears (additive).
 - Snapshot expiry / `history` GC has no verb (deferred, per non-goals).
 - This table covers the entities the core models today. As the DuckLake v1.0
   spec's remaining tables and the extension contract (RFC 0005 open question)

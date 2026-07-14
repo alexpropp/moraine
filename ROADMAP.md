@@ -56,13 +56,20 @@ on that path.
   reorder is not reachable through DuckLake SQL (no reorder `ALTER`); the
   version-transition machinery supports position changes, but nothing issues
   them, so it stays a latent core capability, not a shipped surface.
-- [ ] All DuckLake types: scalars and nested `LIST`/`STRUCT`/`MAP` create,
-  inline, and round-trip live (RFC 0005); `VARIANT` awaits the extension
-  surface (RFC 0005 non-goal until proven)
+- [x] All DuckLake types: scalars and nested `LIST`/`STRUCT`/`MAP` create,
+  inline, and round-trip live (RFC 0005). The full scalar matrix — every
+  signed/unsigned integer width, `FLOAT`/`DOUBLE`, `DECIMAL(w,s)`
+  (width/scale preserved through the type round trip), `VARCHAR`/`BLOB`/
+  `BOOLEAN`, `DATE`/`TIME`/`TIMESTAMP`/`TIMESTAMPTZ`/`INTERVAL`, and
+  `UUID` — is pinned live with values, `NULL`s, and stored DuckLake type
+  names, both pre-flush (inline Arrow IPC) and post-flush (Parquet)
+  (`ducklake_load.rs`'s `ducklake_scalar_type_matrix_round_trip_through_flush`);
+  nested types by `ducklake_inline_nested_types_round_trip_through_flush`.
+  `VARIANT` awaits the extension surface (RFC 0005 non-goal until proven)
 - [ ] Column and name mapping for externally written Parquet
-  (`column_mapping`, `name_mapping`)
+  (`column_mapping`, `name_mapping`) (RFC 0018)
 - [ ] Macros: scalar/table macros with parameters (`macro`, `macro_impl`,
-  `macro_parameters`)
+  `macro_parameters`) (RFC 0019)
 
 ## Data, deletes & layout
 - [x] Parquet data files on object storage (`data_file`)
@@ -127,18 +134,31 @@ on that path.
   snapshots and backdates flushed files, and DuckLake filters by version in
   its own SQL
 - [ ] Change data feed: changes between snapshots (`snapshot_changes`)
+  (RFC 0020)
 
 ## Maintenance & operations
 - [ ] Compaction / data-file rewriting (RFC 0008)
 - [ ] Snapshot expiry and orphaned-file cleanup / deletion scheduling
   (RFC 0007; `files_scheduled_for_deletion`)
-- [ ] Data-file encryption (RFC 0014)
+- [x] Data-file encryption (RFC 0014): moraine is a faithful conduit —
+  `ENCRYPTED` reaches a fresh store through DuckLake's `META_` passthrough,
+  is recorded once at bootstrap as the stored global `encrypted` option and
+  served back through `ducklake_metadata` (later attaches adopt it), and the
+  per-file keys DuckLake writes round-trip verbatim on
+  `ducklake_data_file`/`ducklake_delete_file`. Verified live end to end
+  (`ducklake_load.rs`'s
+  `ducklake_encrypted_writes_encrypted_files_and_reads_back`: encrypted
+  attach → non-plaintext Parquet at rest → plain re-attach decrypts →
+  catalog rows carry the keys). Catalog-at-rest stays delegated to bucket
+  SSE-KMS per the RFC; moraine holds no crypto
 - [ ] Table/column tags and catalog options (`tag`, `column_tag`,
-  `metadata`) (options done; tags pending a keyspace decision)
+  `metadata`) (options done; the tag keyspace is decided — RFC 0002's
+  `tag` kind — implementation pending)
 
 ## Hardening & release
 - [ ] Real object storage tests (MinIO/localstack)
-- [ ] `cargo-fuzz` targets for store codecs
+- [ ] Arbitrary-bytes decode proptests for store codecs (never panic on
+  garbage)
 - [ ] v0.1 crates.io release (switch `release.yml` trigger to `push`)
 - [ ] Extension distribution story: per-DuckDB-version build + signing
   (RFC 0006 pins one supported DuckDB release)
