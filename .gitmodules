@@ -2,7 +2,6 @@
 	path = duckdb
 	url = https://github.com/duckdb/duckdb.git
 	branch = v1.5.4
-	shallow = true
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools.git
