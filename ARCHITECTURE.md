@@ -5,11 +5,11 @@ decision is specified in full. It is a reading guide, not a specification —
 every claim here has an authoritative RFC in [`docs/rfcs/`](docs/rfcs/), linked
 inline. For *what* moraine is and *why*, start with the [README](README.md);
 for *where it's going*, the [ROADMAP](ROADMAP.md); for *how to work in it*,
-[AGENTS.md](AGENTS.md).
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-> **Status: pre-alpha.** The core is a skeleton and the design RFCs are mostly
-> `Draft`. This document describes the architecture those RFCs define; the code
-> is catching up to it.
+> **Status: pre-1.0, actively developed.** The architecture below is
+> implemented and exercised end-to-end through real DuckDB; a few features
+> remain (see the [ROADMAP](ROADMAP.md)).
 
 ## What moraine is
 
@@ -73,7 +73,7 @@ knows nothing about DuckLake semantics; `tx` bridges them.** This keeps
 catalog logic testable against an in-memory store and concentrates every
 key-encoding decision in one reviewable place.
 
-The public surface ([RFC 0005](docs/rfcs/0005-public-api-shape.md)) is three
+The public surface ([RFC 0003](docs/rfcs/0003-public-api-shape.md)) is three
 types over that error taxonomy — SlateDB never appears in a public signature:
 
 - **`Catalog`** — the handle. `Catalog::open(object_store, options)`; cheap to
@@ -110,7 +110,7 @@ most expensive-to-reverse decision in the project; it is
 - **Keyspace partitioned by a leading tag byte** into subspaces: `system` (format
   version, head pointer), `snapshot` (one immutable record per snapshot), `current`
   (live catalog entities), `history` (ended entity versions), `inline` (inlined
-  data, [RFC 0003](docs/rfcs/0003-data-inlining.md)).
+  data, [RFC 0005](docs/rfcs/0005-data-inlining.md)).
 - **The `current`/`history` split is the load-bearing decision.** DuckLake versions
   entities temporally (`begin_snapshot`/`end_snapshot`). Rather than store one
   history stream and filter it on every read, moraine keeps *live* versions in
@@ -177,7 +177,7 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
 
 The RFCs also specify the operations a catalog needs past open/read/commit:
 
-- **Data inlining** ([RFC 0003](docs/rfcs/0003-data-inlining.md)) — small
+- **Data inlining** ([RFC 0005](docs/rfcs/0005-data-inlining.md)) — small
   inserts land as rows in the catalog and flush to Parquet later, skipping the
   tiny-Parquet-file tax. A launch feature: the workload an LSM is built for, and
   where a KV catalog beats a SQL one rather than merely matching it.
@@ -213,24 +213,10 @@ post-recovery invariant it verifies, iterated mechanically by the suite.
 
 Process is **TDD** — test first, watch it fail, implement — and every bugfix
 lands with a regression test. The full local gate (fmt, clippy, test, doc, deny,
-e2e) is in [AGENTS.md](AGENTS.md#the-local-gate).
+e2e) is in [CONTRIBUTING.md](CONTRIBUTING.md#the-local-gate).
 
 ## Where decisions live
 
 RFCs are the source of truth for anything expensive to reverse — the KV key
-layout, the commit protocol, and the public API shape *require* one. The index
-is [`docs/rfcs/README.md`](docs/rfcs/README.md); the current set:
-
-| RFC | Topic |
-|---|---|
-| [0001](docs/rfcs/0001-repository-structure-and-conventions.md) | Repository structure and conventions |
-| [0002](docs/rfcs/0002-slatedb-key-encoding.md) | SlateDB key encoding for catalog state |
-| [0003](docs/rfcs/0003-data-inlining.md) | Data inlining on SlateDB |
-| [0004](docs/rfcs/0004-commit-protocol.md) | Commit and transaction protocol |
-| [0005](docs/rfcs/0005-public-api-shape.md) | Public API shape of the core |
-| [0006](docs/rfcs/0006-extension-surface.md) | Extension surface (DuckDB) |
-| [0007](docs/rfcs/0007-snapshot-expiry-and-gc.md) | Snapshot expiry and garbage collection |
-| [0008](docs/rfcs/0008-compaction.md) | Compaction and delete-file consolidation |
-| [0009](docs/rfcs/0009-reader-consistency-and-caching.md) | Reader consistency and snapshot caching |
-| [0010](docs/rfcs/0010-async-sync-bridge.md) | Async↔sync bridge |
-| [0011](docs/rfcs/0011-crash-injection-test-matrix.md) | Crash-injection test matrix |
+layout, the commit protocol, and the public API shape *require* one. The full
+index is [`docs/rfcs/README.md`](docs/rfcs/README.md).

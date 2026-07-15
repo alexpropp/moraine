@@ -7,33 +7,29 @@ core, sync↔async bridge), and DuckDB's own `src/include/` header tree
 — see "Where the headers come from" below). The shim carries no DuckLake
 domain logic — see the crate root docs and RFC 0006.
 
-**Status:** DuckLake's own metadata catalog, with a metadata-only standalone
-attach alongside it. The cdylib registers a `duckdb::StorageExtension`
-under attach type `moraine`, reachable two ways:
+The cdylib registers a `duckdb::StorageExtension` under attach type
+`moraine`, reachable two ways:
 
 - **Primary path — `ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH
   '<data-path>')`.** DuckLake nests `ATTACH 'moraine:<store>'` as its
   metadata connection (see "The `moraine:` prefix" below); every
   `ducklake_*` table the store models is synthesized in the catalog's
-  `main` schema (see "Serving as DuckLake's metadata catalog" below), and
-  the writable ones accept DuckLake's own `INSERT`/`UPDATE`/`DELETE` as
-  staged row mutations committed atomically (see "The staged-row write
-  path" below). Real user-table data is read through **DuckLake's own
-  reader**, not this crate's scan.
+  `main` schema, and the writable ones accept DuckLake's own
+  `INSERT`/`UPDATE`/`DELETE` as staged row mutations committed atomically.
+  User-table data is read through **DuckLake's own reader**, not this
+  crate's scan.
 - **Secondary path — `ATTACH '<path>' AS m (TYPE moraine)`, or the bare
   `moraine:<path>` prefix.** Schema/table/view listing and `DESCRIBE` work
   through the C ABI; every `ducklake_*` projection is queryable directly,
-  for independent verification of what DuckLake wrote. A `SELECT` against
-  a real user table binds normally but raises `InvalidInputException` at
-  execution time, redirecting to the `ducklake:moraine:` attach — see
-  "User-table data is served only through DuckLake" below.
+  for independent verification of what DuckLake wrote. A `SELECT` against a
+  real user table binds normally but raises `InvalidInputException` at
+  execution time, redirecting to the `ducklake:moraine:` attach — table
+  data is served only through DuckLake, never through the standalone
+  attach.
 
 DDL issued directly against a user schema/table (outside DuckLake's own
-`ducklake_*` writes), plus querying a view's definition, still raises
-`NotImplementedException` (later slices). This document records every
-build shape discovery and later tasks pinned, verified against the real
-DuckDB v1.5.4 source, the real pinned DuckLake source, and a real CLI
-`LOAD`/`ATTACH`/`SELECT` — not against memory or documentation.
+`ducklake_*` writes), plus querying a view's definition, raises
+`NotImplementedException`.
 
 ## Pin
 
@@ -50,7 +46,7 @@ this README and `compile_flags.txt`.
 | Library source | the `libduckdb-src.zip` amalgamation from the same release, compiled once per target by `build.rs` into a static archive cached at `target/duckdb-src/v1.5.4-lib/<target>/` (never committed) — see "Why DuckDB is statically linked" |
 | C++ standard | C++17 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
-| DuckLake extension (for the coming e2e) | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
+| DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
 
 ## Installing a released build
 
@@ -73,38 +69,25 @@ The same artifact tree is produced locally by `cargo xtask package`
 
 ## Where the headers come from
 
-**Build-model switch.** Earlier this crate vendored a single amalgamated
-`duckdb.hpp` (one 1.9 MiB file assembled by DuckDB's own release tooling
-from every header reachable through `duckdb.hpp`'s own top-level includes)
-plus 10 additional headers fetched by hand for classes the amalgamation
-left forward-declared only (`StorageExtension`, `TableCatalogEntry`,
-`ViewCatalogEntry`, …). That approach hit a hard wall: DuckDB's SQL parser
-types (`TableFunctionRef`, and anything built on it, e.g.
-`TableFunctionBindInput`) are never reachable from the amalgamation at
-all — the parser's own headers form a separate, non-amalgamated tree — so
-constructs that need them (calling a registered `TableFunction`'s `.bind`
-directly, the way DuckLake and the built-in RDBMS scanners do; binding a
-view's defining query) could not be made to compile no matter how many
-individual headers were hand-vendored around the gap.
+This crate compiles against DuckDB's **full `src/include/` source tree**,
+not the amalgamated `duckdb.hpp`. The amalgamation cannot express DuckDB's
+SQL parser types (`TableFunctionRef` and anything built on it, e.g.
+`TableFunctionBindInput`) — the parser's headers form a separate,
+non-amalgamated tree — so constructs that need them (calling a registered
+`TableFunction`'s `.bind` directly, the way DuckLake and the built-in RDBMS
+scanners do; binding a view's defining query) cannot compile against it. In
+the full tree every internal header exists as its own file at its own real
+path (`duckdb/parser/tableref/table_function_ref.hpp`,
+`duckdb/storage/storage_extension.hpp`, etc.), so nothing is
+forward-declared-only and no hand-vendoring is needed.
 
-The fix is DuckDB's **full `src/include/` source tree** instead of the
-amalgamation: every internal header exists there as its own file, at its
-own real path (`duckdb/parser/tableref/table_function_ref.hpp`,
-`duckdb/storage/storage_extension.hpp`, etc.), so nothing is forward-declared-only
-and no hand-vendoring is needed for anything the shim's `#include`s reach.
-
-**Acquisition: git sparse checkout, not the release tarball.** DuckDB's
-tagged source (`https://github.com/duckdb/duckdb/archive/refs/tags/v1.5.4.tar.gz`)
-is **101 MB** compressed — building all of DuckDB from it is the plan's
-explicit escalation trigger, and even just downloading it every time this
-crate builds cold would be wasteful, since `src/include/` alone is 8.8 MB
-across 1,555 files and **the shim needs nothing outside it**: every header
-reachable from `cpp/*.cpp`'s `#include`s, transitively, resolves inside
-`src/include/duckdb/...` — verified empirically (see "How the C++ shim
-compiles" below) by compiling the exact `cpp/*.cpp` set against `-I
-src/include` alone, with **no `third_party/` on the include path**, before
-wiring this into `build.rs`. So `build.rs` fetches only that subtree, via a
-blobless partial clone plus a sparse checkout of `src/include/`:
+**Acquisition: git sparse checkout, not the release tarball.** The tagged
+source (`https://github.com/duckdb/duckdb/archive/refs/tags/v1.5.4.tar.gz`)
+is 101 MB compressed; `src/include/` alone is 8.8 MB across 1,555 files and
+the shim needs nothing outside it (every header reachable from `cpp/*.cpp`'s
+includes resolves inside `src/include/duckdb/...`, with no `third_party/` on
+the include path). So `build.rs` fetches only that subtree, via a blobless
+partial clone plus a sparse checkout:
 
 ```
 git clone --filter=blob:none --no-checkout --depth 1 --branch v1.5.4 \
@@ -113,120 +96,48 @@ git -C target/duckdb-src/v1.5.4 sparse-checkout set src/include
 git -C target/duckdb-src/v1.5.4 checkout v1.5.4
 ```
 
-Measured cost: ~3.8 MB of git objects (`.git/`) + 8.8 MB checked out,
-under 3 seconds total, versus the 101 MB/multi-minute full-tarball
-alternative. `build.rs`'s `ensure_duckdb_headers` runs this once and skips
-straight to the cached path on every later build, exactly like `xtask`'s
-own `target/duckdb-cli/` CLI cache. The cache sanity check is
+Cost: ~3.8 MB of git objects + 8.8 MB checked out, under 3 seconds.
+`build.rs`'s `ensure_duckdb_headers` runs this once and skips to the cached
+path on every later build. The cache sanity check is
 `duckdb/storage/storage_extension.hpp` existing under the checked-out
-`src/include/` — deliberately a file only the full tree has (the
-amalgamation asset also ships a file named `duckdb.hpp`, so checking for
-that name alone would accept an amalgamation-shaped cache here and then
-fail confusingly at compile time; an unrecognized cache shape is wiped
-and re-fetched instead). If `git` can't reach GitHub, the build fails
-with an offline-friendly message naming exactly what to pre-populate:
-the `src/include/` directory of a `duckdb/duckdb` checkout at tag
-`v1.5.4` — **not** `libduckdb-src.zip`, which is the single-file
-amalgamation, not this tree (that asset *is* used, separately, as the
-statically linked library source — see "Why DuckDB is statically
-linked"). Nothing under `target/` is committed —
-matches the project's rule that large, reproducible downloads live under
-`target/`, never in git.
+`src/include/` — a file only the full tree has (the amalgamation asset also
+ships a file named `duckdb.hpp`, so checking for that name alone would
+accept an amalgamation-shaped cache and fail confusingly at compile time; an
+unrecognized cache shape is wiped and re-fetched). If `git` can't reach
+GitHub, the build fails with an offline-friendly message naming what to
+pre-populate: the `src/include/` directory of a `duckdb/duckdb` checkout at
+tag `v1.5.4` — **not** `libduckdb-src.zip`, which is the single-file
+amalgamation used separately as the statically linked library source (see
+"Why DuckDB is statically linked"). Nothing under `target/` is committed.
 
 **CI network surface.** Because the header fetch happens in `build.rs`,
-*every* CI job that compiles `moraine-duckdb` — clippy, test, doc, e2e,
-not just e2e — needs `git` and network access to github.com whenever
-`target/duckdb-src/` is cold or was pruned from the job's cache. Noted as
-a comment on the affected jobs in `.github/workflows/ci.yml`; an explicit
-cache step for `target/duckdb-src/` is a future improvement.
+*every* CI job that compiles `moraine-duckdb` — clippy, test, doc, e2e —
+needs `git` and network access to github.com whenever `target/duckdb-src/`
+is cold or was pruned from the job's cache. Noted as a comment on the
+affected jobs in `.github/workflows/ci.yml`.
 
-**Why not vendor `src/include/` into the repo instead?** The plan allows
-either — vendor-with-provenance if the tree is "reasonably sized," or
-download-and-cache under `target/` if it's large — and directs recording
-the decision. 1,555 individual header files (versus the amalgamation's
-~10) is a large jump in files-tracked-by-git for comparatively little
-benefit: unlike the CLI binary (which genuinely can't be vendored as
-source), this tree is deterministically reproducible from a public tag in
-under 3 seconds, so there's nothing a git-committed copy buys over the
-`target/`-cached copy except permanently inflating clone size (repeated on
-every future DuckDB version bump, since old vendored trees would need
-either deletion-and-replacement per bump or accumulate). The CLI download
-already established the "large + reproducible → `target/`, gitignored"
-precedent in this crate; the header tree follows the same rule.
-
-**Amalgamation gaps that no longer need hand-vendoring.** The 10
-extra headers this crate used to fetch by hand and commit under
-`vendor/duckdb-v1.5.4/` (`storage_extension.hpp`, `database_size.hpp`,
-`create_schema_info.hpp`, `create_table_info.hpp`, `create_view_info.hpp`,
-`not_null_constraint.hpp`, `table_catalog_entry.hpp`, `thread.hpp`,
-`view_catalog_entry.hpp`, plus `duckdb.hpp` itself) are now just files at
-their real paths inside the fetched tree; `vendor/` has been deleted
-entirely and `cpp/catalog.hpp` / `cpp/transaction_manager.hpp` now
-`#include` them by their real `duckdb/...` subpaths (e.g.
-`#include "duckdb/storage/storage_extension.hpp"`) instead of the old bare
-filenames. This was the **only** source change required — every other line
-of `cpp/*.cpp` / `cpp/*.hpp` compiles unchanged against the full tree.
-
-Views still can't bind their defining query: `duckdb::Parser` (needed to
-turn a view's SQL text back into an AST) pulls in the tokenizer/grammar
-machinery, which is present in the full tree but was never exercised by
-this crate and stays out of scope this task (compiling it is possible now;
-using it is future work). `MoraineViewEntry::GetQuery`/`BindView` still
-override the base's `return *query;` (which would null-deref, since no
-parsed query is ever stored) to throw `NotImplementedException` — the
-same intentional boundary as before, not a regression from the header
-switch.
-
-## User-table data is served only through DuckLake (standalone scan retired)
-
-Table *data* is served only through DuckLake — never through this
-standalone attach. DuckLake owns delete-file merge-on-read, row lineage,
-and pushdown; a second independent reader here would silently return
-stale/deleted rows once merge-on-read exists. `MoraineTableEntry::GetScanFunction`
-(`cpp/catalog.cpp`) still binds unconditionally — populating only the
-qualified table name, the attach's store path, and the catalog entry
-itself (for `DESCRIBE`/`EXPLAIN`'s NOT NULL lookups) — so `DESCRIBE`,
-`EXPLAIN`, and any other bind-only plan consumer keep working. The bound
-`TableFunction`'s `init_global` (`MoraineScanInitGlobal`, `cpp/scan.cpp`),
-called once per query *execution* rather than once per bind, unconditionally
-throws `InvalidInputException` naming the table and the `ducklake:moraine:`
-attach form to use instead:
-
-```
-moraine: table "s"."t" data is served only through DuckLake, not the standalone attach —
-attach the lake with ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH '<data-path>')
-and query it as lake.s.t
-```
-
-`<store>` is the real attach path (`MoraineCatalog::GetDBPath()`); `<data-path>`
-stays a placeholder — this shim has no store-level source of truth for a
-lake-wide `DATA_PATH` to fill in (see "`ducklake_metadata` synthesis"
-below). The message deliberately avoids DuckLake's own retry substrings
-(`"conflict"`, `"unique"`, `"primary key"`, `"concurrent"` — see the C ABI
-error mapping section) since this is not a benign race to retry.
-
-The now-dead scan machinery this replaced — a nested `duckdb::Connection`
-streaming `read_parquet` over resolved data-file paths, the relative/
-absolute path-resolution rule, the per-chunk `DataChunk::Reference`
-handoff, and the column-count memory-safety guard it needed — is deleted,
-not archived; `crates/moraine-duckdb/tests/duckdb_load.rs`'s
-`attach_lists_and_scans_through_real_duckdb` asserts the redirect error
-instead of a real scan, and real data-scan assertions (read, `COUNT`
-pushdown, time travel) live in `tests/ducklake_load.rs`'s DuckLake
-round-trip test — see "Serving as DuckLake's metadata catalog" below.
+The only source change the full tree required over the old vendored
+amalgamation was that `cpp/catalog.hpp` / `cpp/transaction_manager.hpp`
+`#include` headers by their real `duckdb/...` subpaths (e.g.
+`#include "duckdb/storage/storage_extension.hpp"`). Views still can't bind
+their defining query: `duckdb::Parser` (needed to turn a view's SQL text
+back into an AST) is present in the full tree but unused here.
+`MoraineViewEntry::GetQuery`/`BindView` override the base's `return *query;`
+(which would null-deref, since no parsed query is stored) to throw
+`NotImplementedException` — an intentional boundary.
 
 ## Extension entry-point contract (v1.5.4, C++ ABI)
 
-Verified by reading `ExtensionHelper::LoadExternalExtensionInternal` and
-`ExtensionHelper::ParseExtensionMetaData` in the amalgamated `duckdb.cpp`
-(not trusted from memory):
+Derived from `ExtensionHelper::LoadExternalExtensionInternal` and
+`ExtensionHelper::ParseExtensionMetaData` in the amalgamated `duckdb.cpp`:
 
 - The loader `dlopen()`s the file (`RTLD_NOW | RTLD_LOCAL`) and calls
   `dlsym` for **`<filebase>_duckdb_cpp_init`**, where `filebase` is the
   artifact's filename with **every** `.`-suffix stripped (`FileSystem::
   ExtractBaseName` splits on `.` and takes the first component) — so the
-  artifact must be named with exactly one dot, e.g. `moraine_duckdb.duckdb_extension`
-  → entry symbol `moraine_duckdb_duckdb_cpp_init`.
+  artifact must be named with exactly one dot, e.g.
+  `moraine_duckdb.duckdb_extension` → entry symbol
+  `moraine_duckdb_duckdb_cpp_init`.
 - The symbol's signature is `void(duckdb::ExtensionLoader &)`
   (`typedef void (*ext_init_fun_t)(ExtensionLoader &);`). It must call
   nothing that throws past the loader without being an intentional init
@@ -241,9 +152,9 @@ Verified by reading `ExtensionHelper::LoadExternalExtensionInternal` and
   `#[no_mangle]`, exported by rustc on every platform) and forwards the
   `ExtensionLoader *` to the C++ shim's registration function
   (`moraine_duckdb_register` in `cpp/extension.cpp`), which stays
-  unexported. A C++-side export worked on macOS only because ld64's
-  `-exported_symbol` *adds* to the export list — that asymmetry kept the
-  local gate green while every Linux CI load failed at `dlsym`.
+  unexported. A C++-side export works on macOS only because ld64's
+  `-exported_symbol` *adds* to the export list — that asymmetry keeps the
+  local gate green while every Linux CI load fails at `dlsym`.
 - A file loaded via `LOAD '<path>'` (full path) **must** end in literally
   `.duckdb_extension` or the loader rejects it before even opening it.
 - **512-byte metadata footer**, appended to the end of the file
@@ -302,44 +213,36 @@ target and cached under `target/` thereafter.
 into a host process (the DuckDB CLI, or any embedding application), and
 the shim's ~185 undefined `duckdb::` symbols resolve only if that host
 *exports* its C++ internals. The macOS release CLI does (23k+ `duckdb::`
-symbols in its export table) — but the stock Linux release CLI is a
-statically linked executable built without `-rdynamic`: its `.dynsym`
-carries ~450 entries, none of them DuckDB's own classes, and no
-`libduckdb.so` ships in the release zip. An extension that defers DuckDB
-symbol resolution to `dlopen` time (the earlier `-undefined
-dynamic_lookup` approach) can therefore never load into the stock Linux
-CLI — it dies with `undefined symbol: _ZTVN6duckdb18SchemaCatalogEntryE`.
-Official DuckDB C++ extensions solve this by carrying their own copy of
-DuckDB's internals (`httpfs.duckdb_extension` for linux_amd64 v1.5.4 has
-**zero** undefined `duckdb::` symbols and ~11k defined ones in 21 MB), so
-this crate does the same: `build.rs` downloads the pinned release's
-`libduckdb-src.zip` (the single-file *library* amalgamation:
-`duckdb.cpp` + `duckdb.hpp`), compiles `duckdb.cpp` once per target triple
-with fixed flags (`-O1`, `NDEBUG` to match the release CLI, no debug
-info — profile-independent, so debug and release builds share it), and
-caches the archive at `target/duckdb-src/v1.5.4-lib/<target>/`. `-O1`
+symbols in its export table) — but the stock Linux release CLI is
+statically linked without `-rdynamic`: its `.dynsym` carries ~450 entries,
+none of them DuckDB's own classes, and no `libduckdb.so` ships in the
+release zip. An extension that defers DuckDB symbol resolution to `dlopen`
+time (the earlier `-undefined dynamic_lookup` approach) can therefore never
+load into the stock Linux CLI — it dies with `undefined symbol:
+_ZTVN6duckdb18SchemaCatalogEntryE`. Official DuckDB C++ extensions carry
+their own copy of DuckDB's internals (`httpfs.duckdb_extension` for
+linux_amd64 v1.5.4 has **zero** undefined `duckdb::` symbols and ~11k
+defined ones in 21 MB), so this crate does the same: `build.rs` downloads
+the pinned release's `libduckdb-src.zip` (the single-file *library*
+amalgamation: `duckdb.cpp` + `duckdb.hpp`), compiles `duckdb.cpp` once per
+target triple with fixed flags (`-O1`, `NDEBUG` to match the release CLI,
+no debug info — profile-independent, so debug and release builds share it),
+and caches the archive at `target/duckdb-src/v1.5.4-lib/<target>/`. `-O1`
 rather than `-O2` because gcc at `-O2` on this one giant translation unit
-peaks past a 16 GB CI runner's memory alongside parallel rustc jobs
-(observed as runner-agent deaths, exit 143, in every compiling CI job);
-optimization level does not affect the ABI, and the linked-in code serves
-only the shim's metadata-catalog calls, not the host's query execution. Note the
-split: the *headers* the shim compiles against still come from the full
+peaks past a 16 GB CI runner's memory alongside parallel rustc jobs (exit
+143 in every compiling CI job); optimization level does not affect the ABI.
+Note the split: the *headers* the shim compiles against come from the full
 `src/include/` tree (the amalgamation's single header cannot express the
 parser types the shim needs); the amalgamation supplies only the linked
 *definitions*. Same pinned version on both sides, so the symbols agree.
 
-Objects still cross the extension↔host boundary by pointer (DuckDB hands
-the shim an `ExtensionLoader &`, catalog entries, and so on): the host's
-objects carry host vtables, the extension's carry its own, and both are
-layouts of the same pinned version compiled for the same platform — the
-version pin is what makes the mix sound, exactly as it is for every
-official extension shaped this way.
+Objects cross the extension↔host boundary by pointer (DuckDB hands the shim
+an `ExtensionLoader &`, catalog entries, etc.): host objects carry host
+vtables, the extension's carry its own, and both are layouts of the same
+pinned version compiled for the same platform — the version pin is what
+makes the mix sound.
 
-**Link-time gotchas found empirically** (the first required capturing the
-real linker invocation via a `cc`-wrapper shim logging its own `argv`,
-since `cargo build`'s default output hides it; the second surfaced as
-duplicate-symbol errors from lld on Linux CI; the third as the Linux CI
-`dlsym` failure):
+**Link-time constraints:**
 
 1. Nothing in the Rust crate *calls* most of the C++ shim (only the entry
    point's forward target), so the linker would drop unreferenced archive
@@ -356,17 +259,13 @@ duplicate-symbol errors from lld on Linux CI; the third as the Linux CI
    mention while it is still force-loading the other, defining every
    cross-referenced symbol twice — a hard error. ld64 tolerates the double
    mention, so this only bit on Linux, and only once the shim grew beyond
-   one `.cpp` file (a single member has no cross-member references to
-   fetch). Fix: `cargo_metadata(false)` on the `cc::Build`, plus linking
-   the C++ standard library by hand (`-lc++`/`-lstdc++`), which that
-   metadata had been contributing.
-3. The extension entry point cannot be exported from C++ on ELF: rustc's
-   cdylib link emits a version script binding every non-Rust symbol
-   `local`, no additive linker flag overrides that wildcard, and a second
-   `--version-script` is a hard linker error. See "Extension entry-point
-   contract" above — the entry point lives in `src/entrypoint.rs` as
-   `#[no_mangle]` Rust, which rustc exports on every platform, so no
-   export-related linker flag exists anymore on either OS.
+   one `.cpp` file. Fix: `cargo_metadata(false)` on the `cc::Build`, plus
+   linking the C++ standard library by hand (`-lc++`/`-lstdc++`), which
+   that metadata had been contributing.
+3. The extension entry point cannot be exported from C++ on ELF (see
+   "Extension entry-point contract" above) — the entry point lives in
+   `src/entrypoint.rs` as `#[no_mangle]` Rust, which rustc exports on every
+   platform, so no export-related linker flag exists on either OS.
 
 `build.rs` branches on `CARGO_CFG_TARGET_OS` (the *target* platform —
 `cfg!(target_os)` in a build script would describe the host, which is
@@ -386,17 +285,15 @@ https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-arm64
 # (+ windows-amd64/arm64, and -musl variants for linux)
 ```
 
-Cached under `target/duckdb-cli/` (gitignored, never committed — matches the
-plan's "large downloads go under `target/`" constraint). The header source is
-fetched separately, from a git tag rather than a release asset — see "Where
-the headers come from" above.
+Cached under `target/duckdb-cli/` (gitignored, never committed). The header
+source is fetched separately, from a git tag rather than a release asset —
+see "Where the headers come from" above.
 
-## Obtaining the DuckLake extension (for the coming e2e)
+## Obtaining the DuckLake extension
 
-`INSTALL ducklake` against the pinned `v1.5.4` CLI, run once at any point
-in this discovery, deterministically resolves and installs DuckLake — no
-version pin of our own is needed beyond the DuckDB version, and none
-drifted from the RFC 0006 pin:
+`INSTALL ducklake` against the pinned `v1.5.4` CLI deterministically
+resolves and installs DuckLake — no version pin of our own is needed beyond
+the DuckDB version:
 
 ```
 $ target/duckdb-cli/cli/duckdb \
@@ -417,28 +314,12 @@ tree names `GIT_URL https://github.com/duckdb/ducklake` at
 `GIT_TAG d318a545571d7d46eb751fa2aa5f6f4389285d3c`) — `INSTALL ducklake`
 against this exact CLI build always resolves to this exact commit,
 deterministically, from DuckDB's `core` extension repository
-(`installed_from: core`, not the community repository). No separate
-"which DuckLake version" decision exists to make for this DuckDB pin.
-
-**Version-drift check against RFC 0006's `v1.5-variegata` pin.** RFC 0006
-records DuckLake at branch `v1.5-variegata` @ `c23aca43` (a later commit,
-observed at RFC-writing time). Confirmed via the DuckLake repository's own
-compare API that `d318a545` (what `INSTALL ducklake` actually fetches) is
-an ancestor of `v1.5-variegata`'s current tip — same branch line, an
-earlier point on it. This is expected, not a bug: DuckDB v1.5.4 was built
-against whatever `v1.5-variegata` commit existed when v1.5.4 was released
-(2026-06-11-ish), and DuckLake development continued on that branch
-afterward; `INSTALL ducklake` for a fixed DuckDB version always resolves
-to that frozen point, never the branch's current tip. Drift only matters
-if a *newer* DuckLake feature the branch tip has (but `d318a545` doesn't)
-turns out to be load-bearing for a later task — not something to guess at
-here; flagged for whoever hits it.
+(`installed_from: core`, not the community repository).
 
 **Caching under `target/`, not the CLI's default `~/.duckdb/extensions/`.**
 `INSTALL`'s default cache is the user's home directory, outside this
-repo's `target/` convention and outside CI's usual workspace-scoped cache
-boundaries. Redirect it with a `SET` run before `INSTALL`/`LOAD`, verified
-live:
+repo's `target/` convention. Redirect it with a `SET` run before
+`INSTALL`/`LOAD`:
 
 ```
 $ duckdb -c "SET extension_directory='target/duckdb-extensions';" \
@@ -451,145 +332,23 @@ $ duckdb -c "SET extension_directory='target/duckdb-extensions';" \
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-Wired into `xtask e2e` (the `moraine:`-prefix and `ducklake:moraine:`
-sections below): `SET extension_directory=...` + `INSTALL ducklake` +
-`LOAD ducklake` now run for real, every `e2e` invocation, against
+`xtask e2e` runs `SET extension_directory=...` + `INSTALL ducklake` +
+`LOAD ducklake` for real on every invocation, against
 `crates/moraine-duckdb/tests/ducklake_load.rs`.
 
-## `LOAD` proof
-
-Built via `cargo build -p moraine-duckdb --release`, then packaged into a
-`.duckdb_extension` file (rename + append the 512-byte footer described
-above — `xtask`'s `package_extension` does this in Rust, see
-`xtask/src/main.rs`):
-
-```
-$ target/duckdb-cli/cli/duckdb -unsigned \
-    -c "LOAD '/…/target/duckdb-cli/artifact/moraine_duckdb.duckdb_extension';" \
-    -c "SELECT 'moraine_duckdb loaded' AS status;"
-┌───────────────────────┐
-│        status         │
-│        varchar        │
-├───────────────────────┤
-│ moraine_duckdb loaded │
-└───────────────────────┘
-$ echo $?
-0
-```
-
-For contrast, the same command against a nonexistent file exits 1 with a
-loud `IO Error`, and against the real artifact *without* `-unsigned` exits 1
-with `"...signature is either missing or invalid and unsigned extensions are
-disabled..."` — confirming the clean run above is a genuine, non-silent
-success and that the unsigned-extension gate is real.
-
-## `ATTACH` proof
-
-Seeded a store through the `moraine` API directly (one schema `s`, tables
-`orders` (two columns, `BIGINT`/`DOUBLE`) and `empty` (no data files), one
-view `orders_v`), then, against the same packaged artifact as above:
-
-```
-$ target/duckdb-cli/cli/duckdb -unsigned \
-    -c "LOAD '/…/target/duckdb-cli/artifact/moraine_duckdb.duckdb_extension';" \
-    -c "ATTACH '/tmp/moraine-attach-smoke' AS m (TYPE moraine);" \
-    -c "SELECT database_name FROM duckdb_databases();"
-┌────────────────┐
-│ database_name  │
-│    varchar     │
-├────────────────┤
-│ m               │
-│ memory          │
-│ system          │
-│ temp            │
-└────────────────┘
-$ echo $?
-0
-
-$ target/duckdb-cli/cli/duckdb -unsigned \
-    -c "LOAD '/…/target/duckdb-cli/artifact/moraine_duckdb.duckdb_extension';" \
-    -c "ATTACH '/tmp/moraine-attach-smoke' AS m (TYPE moraine);" \
-    -c "SELECT table_name FROM duckdb_tables() WHERE database_name='m';"
-┌────────────┐
-│ table_name │
-│  varchar   │
-├────────────┤
-│ empty      │
-│ orders     │
-└────────────┘
-```
-
-Also verified beyond the required proof: `SELECT * FROM duckdb_views()`
-lists `orders_v` with its textually composed definition (`CREATE VIEW
-orders_v AS select * from orders;` — `MoraineViewEntry::ToSQL` assembles it
-from the listing ABI's strings, since the base class's implementation
-stringifies the parsed query, which is null here and would crash), and
-`duckdb_columns()` shows `orders`'s columns with their mapped DuckDB types
-(`id BIGINT`, `amount DOUBLE`) — confirming the listing ABI, schema
-enumeration, and scalar type mapping all work end to end without a scan.
-`DESCRIBE` on a table binds and works; `SELECT` on a table binds but
-redirects to the DuckLake attach at execution time (see "User-table data
-is served only through DuckLake" below); on a view
-(which DuckDB resolves through a TABLE_ENTRY-typed lookup — the schema
-entry's lookup falls back to the view map for table-typed lookups the way
-standard DuckDB catalogs do) both still fail with `moraine: querying a
-view's definition is not supported yet` — the documented, intentional
-view-binding boundary (no SQL parser vendored), not a bug. Neither path
-ever reports a bogus "does not exist" or crashes.
-
-## `SELECT` redirect proof (Task 6)
-
-Seeded a store through the `moraine` API directly (schema `s`, table `t`
-with a registered data file, table `empty` with none), then, against the
-same packaged artifact as above:
-
-```
-$ target/duckdb-cli/cli/duckdb -unsigned \
-    -c "LOAD '/…/moraine_duckdb.duckdb_extension';" \
-    -c "ATTACH '<store>' AS m (TYPE moraine);" \
-    -c "DESCRIBE m.s.t;"
-┌───────────────┐
-│       t       │
-│ id     bigint │
-│ amount double │
-└───────────────┘
-$ … -c "SELECT * FROM m.s.t;"
-Invalid Input Error: moraine: table "s.t" data is served only through DuckLake, not the standalone attach —
-attach the lake with ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH '<data-path>')
-and query it as lake.s.t
-$ echo $?
-1
-```
-
-(the error above is the literal text captured live, one line wrapped for
-this document; `<store>` is the real attach path, e.g.
-`/tmp/moraine-duckdb-load-attach-.../`).
-
-`DESCRIBE` (a bind-only consumer) still works — confirming `GetScanFunction`
-keeps binding unconditionally — while the actual scan's `init_global`
-raises before any row would be produced, on both a table with a registered
-data file and an empty one (`m.s.empty`). Encoded as
-`attach_lists_and_scans_through_real_duckdb` in
-`crates/moraine-duckdb/tests/duckdb_load.rs`, asserting the table name, the
-`ducklake:moraine:` attach form, the real store path, and the absence of
-DuckLake's own retry substrings all appear in the error text.
-
-## Serving as DuckLake's metadata catalog (ducklake-integration slice, Task 4)
+## Serving as DuckLake's metadata catalog
 
 DuckLake drives moraine as its own metadata catalog by nesting an
 `ATTACH 'moraine:<path>' ...` inside `ATTACH 'ducklake:moraine:<path>' AS
-lake (DATA_PATH ...)`. This section pins every fact that attach chain
-depends on, each verified against the pinned DuckLake source (commit
-`d318a545571d7d46eb751fa2aa5f6f4389285d3c`, checked out read-only under
-`target/ducklake-src/` for this research — not committed, not a build
-dependency) and a real live `ATTACH`/`SELECT`, not assumed.
+lake (DATA_PATH ...)`. The facts that attach chain depends on are pinned
+against the DuckLake source at commit
+`d318a545571d7d46eb751fa2aa5f6f4389285d3c`.
 
 ### The `moraine:` prefix
 
 No shim code parses it. DuckDB's own core does, unconditionally, for any
 top-level `ATTACH '<prefix>:<path>' AS <name>` where no explicit `TYPE` is
-given — read directly from the pinned DuckDB v1.5.4 source
-(`src/execution/operator/schema/physical_attach.cpp`):
+given (`src/execution/operator/schema/physical_attach.cpp`):
 
 ```cpp
 if (options.db_type.empty()) {
@@ -602,58 +361,37 @@ everything before the first `:` (rejecting `<2`-character prefixes, so
 Windows drive letters like `C:` are never misread, and rejecting a `://`
 suffix, so URLs are never misread), lowercases it, and hands the
 *stripped* remainder on as `info.path`. `AttachDatabase` then looks up a
-`StorageExtension` registered under that exact name — which is exactly
-`"moraine"`, the name `RegisterMoraineStorageExtension`
-(`cpp/storage_extension.cpp`) already registers for the `TYPE moraine`
-form. So `moraine:<path>` and `<path>` + `TYPE moraine` converge on the
-identical `MoraineCatalog::Attach` call with an identical, already-stripped
-`info.path` — verified live, no code change needed:
+`StorageExtension` registered under that exact name — which is `"moraine"`,
+the name `RegisterMoraineStorageExtension` (`cpp/storage_extension.cpp`)
+registers for the `TYPE moraine` form. So `moraine:<path>` and `<path>` +
+`TYPE moraine` converge on the identical `MoraineCatalog::Attach` call with
+an identical, already-stripped `info.path` — no code change needed.
 
-```
-$ duckdb -unsigned \
-    -c "LOAD '/…/moraine_duckdb.duckdb_extension';" \
-    -c "ATTACH 'moraine:<store>' AS m;" \
-    -c "SELECT database_name FROM duckdb_databases() WHERE database_name='m';"
-┌───────────────┐
-│ database_name │
-├───────────────┤
-│ m             │
-└───────────────┘
-```
-
-DuckLake's own `DuckLakeAttach` (`src/storage/ducklake_storage.cpp`) is
-what constructs the nested path: `options.metadata_path = info.path` (the
-literal string after `ducklake:` is stripped by the *same* mechanism one
-level up), and `options.metadata_database = "__ducklake_metadata_" +
-name`. `DuckLakeInitializer::Initialize` then issues `ATTACH OR REPLACE
+DuckLake's own `DuckLakeAttach` (`src/storage/ducklake_storage.cpp`)
+constructs the nested path: `options.metadata_path = info.path` (the literal
+string after `ducklake:` is stripped by the *same* mechanism one level up),
+and `options.metadata_database = "__ducklake_metadata_" + name`.
+`DuckLakeInitializer::Initialize` then issues `ATTACH OR REPLACE
 {METADATA_PATH} AS {METADATA_CATALOG_NAME_IDENTIFIER}` — i.e. literally
 `ATTACH OR REPLACE 'moraine:<path>' AS __ducklake_metadata_lake` — through
-the exact same top-level-statement machinery as any other `ATTACH`, so the
-prefix dispatch above fires again, unmodified.
+the same top-level-statement machinery, so the prefix dispatch fires again,
+unmodified.
 
-### Which schema DuckLake queries
-
-`main`. `DuckLakeInitializer::Initialize` falls back to
-`DuckLakeTransaction::GetDefaultSchemaName()` (`ducklake_transaction.cpp`)
-when no explicit `METADATA_SCHEMA` option is given, which reads
-`metadb->GetCatalog().GetDefaultSchema()` on the attached moraine catalog —
-`duckdb::Catalog`'s own base-class default, `"main"`, which `MoraineCatalog`
-never overrides. This is also the schema bootstrap mints from
-snapshot 0, so every moraine store is DuckLake-attachable from birth: the
-synthesized `ducklake_*` tables and any user-created tables/schemas share
-the *same* attached catalog and the *same* `main` schema namespace (a
-same-named real table would shadow a synthesized one — not exercised, not
-expected to occur in practice).
+The schema DuckLake queries is `main` — `duckdb::Catalog`'s base-class
+default, which `MoraineCatalog` never overrides, and the schema bootstrap
+mints from snapshot 0. So every moraine store is DuckLake-attachable from
+birth, with synthesized `ducklake_*` tables and any user tables sharing the
+same catalog and `main` schema namespace.
 
 ### Pinned `ducklake_*` table shapes
 
-Every column list below is transcribed verbatim from
+Every column list is transcribed verbatim from
 `DuckLakeMetadataManager::InitializeDuckLake`'s bootstrap SQL text in the
-pinned DuckLake source (`src/storage/ducklake_metadata_manager.cpp`), not
-from memory. `not null` marks only columns DuckLake itself declares
-`NOT NULL`/`PRIMARY KEY`. `moraine-duckdb`'s C++ source is the single
-source of truth (`cpp/metadata_tables.cpp`'s `MetadataTableSpecsImpl`);
-this table is a human-readable mirror of it.
+pinned DuckLake source (`src/storage/ducklake_metadata_manager.cpp`).
+`not null` marks only columns DuckLake itself declares `NOT NULL`/`PRIMARY
+KEY`. `moraine-duckdb`'s C++ source is the single source of truth
+(`cpp/metadata_tables.cpp`'s `MetadataTableSpecsImpl`); this table is a
+human-readable mirror of it.
 
 | Table | Fed from | Notes |
 |---|---|---|
@@ -679,47 +417,61 @@ this table is a human-readable mirror of it.
 | `ducklake_tag` | `moraine_dump_tags` | one row per embedded entry of the object's container record, ended entries included (each carries its own begin/end) |
 | `ducklake_column_tag` | `moraine_dump_column_tags` | flattened from each column's latest record — a column version transition carries entries forward, so only that record's set is emitted |
 | `ducklake_files_scheduled_for_deletion` | `moraine_dump_scheduled_deletions` | the physical-deletion schedule (`current/gcfile`, keyed by the scheduled file's id); written by expiry/compaction, drained by `ducklake_cleanup_old_files` |
-| `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_file_variant_stats`, `ducklake_column_mapping`, `ducklake_name_mapping` | always empty | store models none of these kinds this slice — see "Discovered: absence isn't tolerated" below. The last three were added once `ducklake_flush_inlined_data`'s generic cleanup batch (`DELETE FROM`/`INSERT INTO` unconditionally, not gated on variant-stats/mapping actually being in use) proved they must at least exist — see "Data inlining" below |
+| `ducklake_macro`, `ducklake_macro_impl`, `ducklake_macro_parameters`, `ducklake_file_variant_stats`, `ducklake_column_mapping`, `ducklake_name_mapping` | always empty | store models none of these kinds — a missing table is a bind-time error even for a query that would return zero rows (see below) |
 
 Every table DuckLake's own schema defines is served, either with real data
-or as an always-empty stand-in; none are left unbound.
+or as an always-empty stand-in; none are left unbound. This is required:
+`DuckLakeMetadataManager::BuildCatalogForSnapshot`, the query DuckLake's own
+attach/snapshot-load always runs, joins and correlated-subqueries
+`ducklake_tag`, `ducklake_column_tag`, `ducklake_inlined_data_tables`,
+`ducklake_macro(_impl/_parameters)`, and `ducklake_partition_info`/`_column`
+unconditionally while resolving basic table/view/schema info — a *missing*
+table is a bind-time `Catalog Error` even though the query would otherwise
+return zero rows for it. So absent store-modeled data means an empty table
+(`ProvideEmpty` in `cpp/metadata_tables.cpp`), never an absent SQL table.
+
+The exists-probe `SELECT NULL FROM ducklake_metadata LIMIT 1` references
+zero real columns; DuckDB's optimizer only takes that "virtual column" scan
+shape for a table function that advertises `projection_pushdown = true`
+(otherwise `Not implemented Error: Virtual columns require projection
+pushdown` fires before the scan callback runs). `MetadataScanTableFunction`
+(`cpp/metadata_tables.cpp`) sets the flag and carries
+`TableFunctionInitInput`'s `column_ids` through to the `.function` callback,
+which projects exactly those columns out of the already-materialized row
+set.
 
 ### `ducklake_column.column_type`: two type vocabularies, one stored string
 
-Moraine's own catalog stores column types as DuckDB SQL syntax
-(`"BIGINT"`, `"DOUBLE"`, ...) — what `ColumnDef::column_type` carries, and
-what `MapColumnType` (used for the standalone attach's own `DESCRIBE`)
-already parses. DuckLake's `ducklake_column.column_type`, read back through
-its own `DuckLakeTypes::FromString` (`src/common/ducklake_types.cpp`),
-accepts a *different*, lowercase vocabulary instead (`"int64"`,
-`"float64"`, `"timestamptz"`, ...). Serving the stored string verbatim
-throws live: `Invalid Input Error: Failed to parse DuckLake type -
-unsupported type 'BIGINT'`. Fixed with one translation point
-(`DuckLakeColumnType` in `cpp/metadata_tables.cpp`): reparse the stored SQL
-string through the already-trusted `MapColumnType`, then name the
+Moraine's catalog stores column types as DuckDB SQL syntax (`"BIGINT"`,
+`"DOUBLE"`, ...) — what `ColumnDef::column_type` carries, and what
+`MapColumnType` (used for the standalone attach's `DESCRIBE`) parses.
+DuckLake's `ducklake_column.column_type`, read back through its own
+`DuckLakeTypes::FromString` (`src/common/ducklake_types.cpp`), accepts a
+*different*, lowercase vocabulary instead (`"int64"`, `"float64"`,
+`"timestamptz"`, ...); serving the stored string verbatim throws `Invalid
+Input Error: Failed to parse DuckLake type - unsupported type 'BIGINT'`. One
+translation point (`DuckLakeColumnType` in `cpp/metadata_tables.cpp`)
+reparses the stored SQL string through `MapColumnType`, then names the
 resulting `LogicalTypeId` DuckLake's way — never two independently
-maintained type tables. Every type `MapColumnType` currently supports maps
-exactly, except `DECIMAL`'s width/scale suffix (DuckLake's own
-`ToStringBaseType` returns the bare `"decimal"` for the base type;
-precision/scale plumbing is unexercised this slice).
+maintained type tables. Every type `MapColumnType` supports maps exactly,
+except `DECIMAL`'s width/scale suffix (DuckLake's own `ToStringBaseType`
+returns the bare `"decimal"`; precision/scale plumbing is unexercised).
 
 ### `ducklake_metadata` synthesis
 
 Pinned from `DuckLakeInitializer::LoadExistingDuckLake`
-(`src/storage/ducklake_initializer.cpp`) — the exact keys it reads after
-the exists-probe (`SELECT NULL FROM ducklake_metadata LIMIT 1`, itself
-zero-real-column and thus dependent on the projection-pushdown fix below)
-succeeds:
+(`src/storage/ducklake_initializer.cpp`) — the keys it reads after the
+exists-probe (`SELECT NULL FROM ducklake_metadata LIMIT 1`) succeeds:
 
 | Key | Served value | Why |
 |---|---|---|
-| `version` | `"1.0"` | compared against `"1.0"` exactly; anything else triggers migration logic (`MigrateV01`/`V02`/...) this slice never needs and never wires up — the schema served is already 1.0-shaped |
-| `encrypted` | `"false"` | read unconditionally, sets `DuckLakeEncryption`; moraine has no encryption support this slice |
+| `version` | `"1.0"` | compared against `"1.0"` exactly; anything else triggers migration logic (`MigrateV01`/`V02`/...) never wired up — the schema served is already 1.0-shaped |
+| `encrypted` | `"false"` | read unconditionally, sets `DuckLakeEncryption`; moraine has no encryption support |
 | `created_by` | `"moraine"` | never read back by DuckLake's own init path; served anyway since DuckLake itself writes it at bootstrap and it costs nothing |
-| `data_path` | **not served** | `LoadExistingDuckLake` only acts on this key if the row exists (loads/validates `options.data_path` against it); moraine has no store-level source of truth for a lake-wide data path to serve faithfully, so the row is omitted — the ATTACH statement's own `DATA_PATH` option is left as the sole authority, exactly the value the live proof below supplies |
+| `data_path` | **not served** | `LoadExistingDuckLake` only acts on this key if the row exists; moraine has no store-level source of truth for a lake-wide data path to serve faithfully, so the row is omitted — the ATTACH statement's own `DATA_PATH` option is left as the sole authority |
 
 All rows are global (`scope`/`scope_id` `NULL`) — no schema/table-scoped
-DuckLake settings exist to serve this slice.
+DuckLake settings exist to serve.
 
 ### Data inlining
 
@@ -748,135 +500,12 @@ record-batch importer (`ArrowTableFunction::ArrowToDuckDB`). Because DuckDB
 owns both export and import, the encoding is exactly as type-faithful as
 DuckDB's Arrow support, nulls and nested types included.
 
-Two DuckDB-internal contracts the import path depends on (learned the hard
-way, both silent on violation): `ArrowToDuckDB` reads `output.size()` as
-the row count to convert, so the output `DataChunk`'s cardinality must be
-set *before* the call; and the per-column `ColumnArrowToDuckDB` does not
-apply a column's validity itself — its caller must run `SetValidityMask`
-first, or every null silently reads back as a default value. `inline/insert`
-carries the record-batch body only (no schema message), decoded against the
-version's `inline/schema` schema-only stream so the schema is not
-re-serialized per chunk; `inline/schema` also reconstructs a looked-up
-table's columns. See RFC 0005 for the encoding rationale and costs.
-
-`ducklake_flush_inlined_data` and DuckLake's compaction/rewrite cleanup
-also unconditionally touch five more fixed tables this shim did not
-previously serve (`ducklake_file_partition_value`,
-`ducklake_file_variant_stats`, `ducklake_files_scheduled_for_deletion`,
-`ducklake_column_mapping`, `ducklake_name_mapping`) even when none of the
-features they back (partitioning, variant stats, name/column mapping) are
-in use — discovered live the same way the always-empty list above was:
-a `CALL ducklake_flush_inlined_data('lake')` failing commit with `Table
-"...ducklake_file_partition_value" could not be found` until it, and then
-each of the other four in turn, was added as an always-empty stand-in.
-
-Live proof (`crates/moraine-duckdb/tests/ducklake_load.rs`'s
-`ducklake_inline_data_round_trip_through_flush`, run un-ignored by
-`cargo xtask e2e`): `CREATE TABLE` + two small `INSERT`s (mixed types,
-`NULL`s, two chunks) inline; `SELECT` returns every row correctly through
-DuckLake's own inlined-data reader (not this crate's scan); `DELETE` of
-one row stages an `inline/inline_delete` and a follow-up `SELECT` no longer sees
-it; `CALL ducklake_flush_inlined_data('lake')` moves the remaining rows
-to a real Parquet file (DuckLake registers a genuine delete file for the
-pre-flush `DELETE`, not a shrunk record count) and a post-flush `SELECT`
-is still correct; the standalone `moraine:` attach confirms the drained
-`ducklake_inlined_data_<t>_<v>` entry (`0` rows) and the newly-registered
-`ducklake_data_file`.
-
-### Discovered: zero-column scans need `projection_pushdown = true`
-
-The exists-probe itself, `SELECT NULL FROM ducklake_metadata LIMIT 1`,
-references zero real columns — DuckDB's optimizer only takes that
-"virtual column" scan shape for a table function that advertises
-`projection_pushdown = true`; without it, `Not implemented Error: Virtual
-columns require projection pushdown` fires before this shim's scan
-callback is ever reached — a hard blocker here, since DuckLake's probe is
-unconditional. Fixed in
-`cpp/metadata_tables.cpp`'s `MetadataScanTableFunction`: the flag is set,
-and `MetadataScanGlobalState` now carries `TableFunctionInitInput`'s
-`column_ids` through to the `.function` callback, which projects exactly
-those columns (real pushdown, not just tolerance of the zero-column case)
-straight out of the already-materialized row set.
-
-### Discovered: absence isn't tolerated, only absence of *rows*
-
-The plan's stated rule — "project only what the store models; absent
-kinds are absent tables" — turned out to need a correction, found live:
-`DuckLakeMetadataManager::BuildCatalogForSnapshot`, the query DuckLake's
-own attach/snapshot-load always runs (not a lazy, feature-conditional
-path), correlated-subqueries and joins `ducklake_tag`, `ducklake_column_tag`,
-`ducklake_inlined_data_tables`, `ducklake_macro(_impl/_parameters)`, and
-`ducklake_partition_info`/`_column` unconditionally while resolving basic
-table/view/schema info — a *missing* table is a bind-time `Catalog Error`
-even though the query would otherwise happily return zero rows for it. So
-"absent kinds are absent tables" means absent store-modeled row *data*,
-not an absent SQL table: every table in that always-run query exists here,
-always empty (`ProvideEmpty` in `cpp/metadata_tables.cpp`), documented at
-its definition.
-
-### Data-file path resolution is DuckLake's own, not this shim's
-
-The standalone attach's own scan never resolves data-file paths at all
-now — it always redirects before touching a path (see "User-table data is
-served only through DuckLake" above). This section is about DuckLake's own
-reader's resolution rule, exercised only through the `ducklake:moraine:`
-path: a relative data-file path resolves against `<DATA_PATH from
-ATTACH>/<schema.path>/<table.path>/` — read from `ducklake_schema.path`/
-`ducklake_table.path` (this shim's own projections, fed from the store's
-`SchemaValue`/`TableValue` `path` fields, unrelated to the attached
-catalog's own directory). `table.path` is fixed at `CREATE TABLE` time and
-is untouched by a later rename, matching real DuckLake semantics (renaming
-a catalog entry never moves files on disk) — confirmed live in the proof
-below, where the table is created as `t_old`, gets its data file, and is
-renamed to `t`, yet its data still resolves under `.../t_old/`.
-
-### Live proof
-
-Seeded a store through the `moraine` API directly: `main` from bootstrap, table `t_old` (columns `id BIGINT`/`amount DOUBLE`), a
-relative-path data file registered against it (real stats — see below),
-then `rename_table` to `t` (history depth: `ducklake_table` now carries both
-the `t_old` and `t` versions). The Parquet file's bytes come from the
-DuckDB CLI's own `COPY ... TO`, written under
-`<DATA_PATH>/main/t_old/data.parquet` per the path rule above — with its
-*real* `file_size_bytes`/`footer_size` registered (DuckLake's own reader
-seeks straight to the footer using the registered `footer_size`; a
-placeholder `0` throws `Invalid Input Error: Invalid footer length` the
-moment DuckLake reads the file — also discovered live).
-
-```
-$ duckdb -unsigned \
-    -c "SET extension_directory='target/duckdb-extensions';" \
-    -c "INSTALL ducklake;" -c "LOAD ducklake;" \
-    -c "LOAD '/…/moraine_duckdb.duckdb_extension';" \
-    -c "ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH '<data>');" \
-    -c "SELECT * FROM lake.main.t ORDER BY id;"
-   id | amount
-    0 |    0.0
-    1 |    1.5
-    2 |    3.0
-    3 |    4.5
-    4 |    6.0
-$ … -c "SELECT count(*) FROM lake.main.t;"          # DuckLake's own pushdown
-5
-$ … -c "SELECT count(*) FROM ducklake_snapshots('lake');"
-1
-$ … -c "SELECT count(*) FROM lake.main.t AT (VERSION => 1);"   # t exists at v1
-5
-$ … -c "SELECT count(*) FROM lake.main.t AT (VERSION => 0);"   # t doesn't exist yet at v0
-Catalog Error: Table with name t does not exist!
-$ echo $?
-0
-```
-
-Every row above is read through **DuckLake's own reader** (its own
-`read_parquet`/multi-file-list machinery, driven by the `ducklake_data_file`
-row this shim served) — the standalone attach's own scan, which always
-redirects (see "User-table data is served only through DuckLake" above),
-is never reached in this chain at all.
-
-Encoded as `crates/moraine-duckdb/tests/ducklake_load.rs`
-(`moraine_prefix_attach_without_type_clause`,
-`ducklake_attach_reads_through_moraine_metadata`), run un-ignored by
-`cargo xtask e2e` alongside `duckdb_load.rs` — the gate now proves the
-`moraine:` prefix and the full DuckLake read chain on every run, live,
-not just as a recorded manual proof.
+Two DuckDB-internal contracts the import path depends on, both silent on
+violation: `ArrowToDuckDB` reads `output.size()` as the row count to
+convert, so the output `DataChunk`'s cardinality must be set *before* the
+call; and the per-column `ColumnArrowToDuckDB` does not apply a column's
+validity itself — its caller must run `SetValidityMask` first, or every
+null silently reads back as a default value. `inline/insert` carries the
+record-batch body only (no schema message), decoded against the version's
+`inline/schema` schema-only stream so the schema is not re-serialized per
+chunk; `inline/schema` also reconstructs a looked-up table's columns.

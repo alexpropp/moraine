@@ -1,34 +1,13 @@
 # Benchmarking
 
-## Summary
+`cargo xtask bench` runs identical DuckLake workloads against three metadata
+catalogs — moraine's SlateDB store, a stock DuckDB-file catalog, and a stock
+Postgres catalog — through the same pinned DuckDB CLI, and reports per-phase
+wall-clock timings side by side. The data layer is Parquet under a local
+`DATA_PATH` in every configuration; only the catalog backend varies, so the
+numbers isolate metadata-path cost — the thing moraine replaces.
 
-`cargo xtask bench` runs identical DuckLake workloads against
-three metadata catalogs — moraine's SlateDB store, a stock DuckDB-file
-catalog, and a stock Postgres catalog — through the same pinned DuckDB CLI,
-and reports per-workload wall-clock timings side by side. The data layer is
-Parquet under a local `DATA_PATH` in every configuration; only the catalog
-backend varies, so differences isolate metadata-path cost — the thing moraine
-replaces.
-
-## Goals
-
-- One command produces a comparable table: workload × backend, median over
-  repeats, with min/max spread.
-- Every backend runs the byte-identical SQL statement stream through the same
-  DuckDB binary, so numbers differ only by catalog backend.
-- Workloads cover both catalog-dominated paths (many small commits, DDL,
-  attach, snapshot listing, maintenance) and data-dominated paths (bulk load,
-  scans) — the latter as a sanity check that the data plane is unaffected.
-- The Postgres backend self-provisions when Postgres binaries are on the
-  machine and degrades to a skip (with a notice) when they are not; the suite
-  never fails because a backend is unavailable.
-- Non-goals: concurrency/contention benchmarks, remote object stores,
-  cross-machine reproducibility, statistical rigor beyond median/min/max, and
-  CI execution (the suite is a local tool; CI keeps running `e2e`).
-
-## Design
-
-### Command surface
+## Running it
 
 ```text
 cargo xtask bench [--backends moraine,duckdb,postgres]
@@ -37,107 +16,48 @@ cargo xtask bench [--backends moraine,duckdb,postgres]
                   [--repeat N]
 ```
 
-Defaults: all backends (Postgres skipped with a notice if unavailable), all
-workloads, `--scale small`, `--repeat 3`. `bench` reuses `e2e`'s plumbing: it
-downloads/caches the pinned DuckDB CLI, builds and packages the
-`moraine_duckdb` extension, and caches `INSTALL ducklake` / `INSTALL postgres`
-artifacts under `target/duckdb-extensions/`.
+Defaults: all backends, all workloads, `--scale small`, `--repeat 3`. It
+reuses the `e2e` plumbing — downloads/caches the pinned DuckDB CLI, builds and
+packages the extension, caches the `ducklake`/`postgres` extensions.
 
-### Backends
+The Postgres backend self-provisions an ephemeral cluster (`initdb` +
+`pg_ctl` on a Unix socket, torn down on exit) from Postgres binaries on
+`$PATH` or under `/opt/homebrew/opt/postgresql@*`. Set
+`MORAINE_BENCH_POSTGRES=<libpq DSN>` to use an existing server instead. If no
+Postgres is found, that backend is skipped with a notice — the suite never
+fails because a backend is unavailable.
 
-Each backend is an `ATTACH` recipe over a fresh per-run directory; everything
-else in the session is shared.
+moraine's per-commit latency is bounded by its WAL flush cadence (100ms by
+default); the bench pins it low so `small_commits` measures catalog work
+rather than the flush wait. Tune it on any attach with
+`META_FLUSH_INTERVAL_MS <n>`, at the cost of more frequent object-store PUTs.
 
-- `moraine` — `ATTACH 'ducklake:moraine:<store_dir>' (DATA_PATH '<data_dir>')`
-  after `LOAD`ing the packaged extension. SlateDB over the local filesystem.
-  moraine's per-commit latency is bounded by its WAL flush cadence (100ms by
-  default); `META_FLUSH_INTERVAL_MS <n>` on the attach tunes it, at the cost
-  of more frequent object-store PUTs.
-- `duckdb` — `ATTACH 'ducklake:<dir>/meta.ducklake' (DATA_PATH '<data_dir>')`.
-  The stock, all-files DuckLake.
-- `postgres` — `ATTACH 'ducklake:postgres:dbname=<db> host=<socket_dir>
-  port=<port>' (DATA_PATH '<data_dir>')`. The harness provisions an ephemeral
-  cluster per bench run: `initdb` into a temp dir, `pg_ctl start` listening
-  only on a Unix socket (no TCP), one database per (workload, repeat), stock
-  configuration, `pg_ctl stop` on exit (including on failure, via a drop
-  guard). Binary discovery: `$PATH` first, then the newest
-  `/opt/homebrew/opt/postgresql@*/bin`. `MORAINE_BENCH_POSTGRES=<libpq DSN>`
-  overrides provisioning and points at an existing server (the harness then
-  creates and drops its scratch databases there). If neither is available the
-  backend reports `skipped`.
+## Workloads
 
-The moraine extension is `LOAD`ed in every session — including stock ones —
-so session preambles are identical across backends.
+`small` / `medium` / `large` scale (bulk rows, small commits, tables) as
+(100k, 20, 10) / (1M, 50, 25) / (10M, 200, 100).
 
-### Timing mechanics
+| workload | measures |
+|---|---|
+| `bulk_load` | `CREATE TABLE` + one large `INSERT` — data-plane dominated |
+| `small_commits` | K single-row `INSERT`s — the headline catalog-latency number |
+| `many_tables` | T × `CREATE TABLE` — the DDL commit path |
+| `scan` | full/filtered scans, time travel, snapshot listing over a seeded table |
+| `maintenance` | `merge_adjacent_files`, `expire_snapshots`, `cleanup_old_files` |
 
-One CLI process per (backend, workload, repeat), fed a script on stdin:
+Every backend runs the byte-identical SQL through the same DuckDB binary, one
+statement timed at a time via `.timer on`, so differences come only from the
+catalog backend. `ATTACH` is a timed phase, so catalog-open cost is measured
+too. Each (workload, repeat) runs in fresh directories, so repeats are
+independent.
 
-```text
-.timer on
-<statement 1>;
-<statement 2>;
-...
-```
+## Results
 
-With `.timer on`, the CLI prints `Run Time (s): real R user U sys S` after
-every SQL statement, in statement order; dot-commands print none. The harness
-builds each workload as an ordered list of statements, each tagged with a
-phase label or `setup`, then zips the `Run Time` lines with the SQL statements
-by index. A phase's time is the sum of its statements' `real` values; `setup`
-statements are executed but not reported. A count mismatch between statements
-and `Run Time` lines is a hard error, not a partial report.
+Stdout prints an aligned table — rows are `workload/phase`, columns are
+backends, cells are `median (min…max)`, plus a ratio column against moraine.
+The same data lands in `target/bench/report.json` for diffing across
+checkouts.
 
-Process start-up, extension loading, and fixture seeding are thus excluded;
-`ATTACH` itself is a timed statement so catalog-open cost is a first-class
-phase. The first statement in a session absorbs some one-time initialization,
-so every session opens with a throwaway `SELECT 1` tagged `setup`. Threads
-are left at DuckDB's default; both sides of every comparison share it.
-
-Workloads that measure reads against pre-existing state get two sessions: an
-untimed seeding session (same backend, same directories), then the measured
-session — so the measured `ATTACH` is a genuinely cold open over a populated
-catalog.
-
-### Workloads
-
-Scales: `small` / `medium` / `large` set (bulk rows N, small commits K,
-tables T) to (100k, 20, 10) / (1M, 50, 25) / (10M, 200, 100).
-
-- `bulk_load` — `CREATE TABLE` + one `INSERT … FROM range(N)`. Phases:
-  `attach`, `create_table`, `insert`. Data-plane dominated.
-- `small_commits` — K autocommitted single-row `INSERT`s into one table.
-  Phases: `attach`, `inserts` (sum of K). The headline catalog-latency
-  number; also reported per-commit in the table.
-- `many_tables` — T × `CREATE TABLE`. Phases: `attach`, `creates`. DDL
-  commit path.
-- `scan` — seeded with the `bulk_load` shape, then measured: `attach`,
-  `full_scan` (`SELECT sum(...)`), `filtered_scan` (`WHERE id = N/2`),
-  `time_travel` (`AT (VERSION => 1)` count), `snapshots`
-  (`SELECT count(*) FROM ducklake_snapshots('lake')`).
-- `maintenance` — seeded with K small commits, then measured: `attach`,
-  `merge` (`CALL ducklake_merge_adjacent_files('lake')`), `expire`
-  (`CALL ducklake_expire_snapshots('lake', older_than => now())`), `cleanup`
-  (`CALL ducklake_cleanup_old_files('lake', cleanup_all => true)`).
-
-Every (workload, repeat) runs in fresh directories (and, for Postgres, a
-fresh database) so repeats are independent; the report is the median across
-repeats with min/max.
-
-### Report
-
-Stdout gets one aligned table: rows are `workload/phase`, columns are
-backends, cells are `median (min…max)` in adaptive units (µs/ms/s), plus a
-`×` ratio column relative to `moraine` where both ran. The same data is
-written as JSON to `target/bench/report.json` (schema: run metadata —
-date-free machine facts like scale, repeat, backend versions — then
-`results[{workload, phase, backend, seconds: [per repeat]}]`), for diffing
-across checkouts.
-
-### Structure
-
-`xtask` splits into `main.rs` (dispatch), `e2e.rs`, `duckdb.rs` (shared CLI
-download/build/packaging helpers), and `bench.rs` with `bench/` submodules
-(`backends.rs`, `workloads.rs`, `timing.rs`, `report.rs`). Timer-line
-parsing, statement/phase zipping, statistics, and table formatting are pure
-functions with unit tests.
+Not covered: concurrency/contention, remote object stores, cross-machine
+reproducibility, or statistical rigor beyond median/min/max. It's a local
+tool; CI runs `e2e`, not this.
