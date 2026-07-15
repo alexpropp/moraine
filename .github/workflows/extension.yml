@@ -1,12 +1,17 @@
 name: Extension
 
-# Builds the loadable extension for every supported DuckDB platform through
-# DuckDB's own extension-ci-tools distribution workflow — the same toolchain
-# the community-extensions repository uses. Runs on release tags and on demand.
+# Build the extension for every platform and publish an UNSIGNED ext-v* release
+# from a dispatched tag. This is the decoupled path: a first extension release
+# for an already-published crate, or a rebuild (ext-v<version>-build.N) after a
+# build fix or DuckDB bump with no crate change. Full releases go through
+# release.yml. There is deliberately no tag-push trigger: the release-publishing
+# action creates the tag, which would otherwise double-fire this build.
 on:
   workflow_dispatch:
-  push:
-    tags: ["v*"]
+    inputs:
+      tag:
+        description: "Extension release tag, e.g. ext-v0.1.0 or ext-v0.1.0-build.2"
+        required: true
 
 jobs:
   build:
@@ -21,3 +26,19 @@ jobs:
       # WebAssembly, and Windows is unverified; the community build excludes
       # the same set.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - uses: ./.github/actions/publish-extension-release
+        with:
+          tag: ${{ inputs.tag }}
+          target: ${{ github.sha }}
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}

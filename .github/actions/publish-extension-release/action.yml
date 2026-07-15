@@ -1,0 +1,57 @@
+name: Publish extension release
+description: Attach built per-arch extensions to a draft ext-v* release, reveal it, and pin the descriptor ref.
+inputs:
+  tag:
+    description: The ext-v<version>[-build.N] release/tag name.
+    required: true
+  target:
+    description: Commit SHA the tag points at.
+    required: true
+  token:
+    description: Token with contents:write (release + push to main).
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Stage per-arch assets
+      shell: bash
+      run: |
+        mkdir -p dist
+        for d in artifacts/*-extension-*/; do
+          arch=${d##*-extension-}
+          arch=${arch%/}
+          cp "$d/moraine.duckdb_extension" "dist/moraine.${arch}.duckdb_extension"
+        done
+        ls -l dist
+    - name: Create draft release, attach binaries, reveal
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        gh release create "${{ inputs.tag }}" --target "${{ inputs.target }}" --draft \
+          --title "${{ inputs.tag }}" \
+          --notes "Unsigned moraine extension built against DuckDB v1.5.4. Signed install: INSTALL moraine FROM community; LOAD moraine;" \
+          || true
+        gh release upload "${{ inputs.tag }}" dist/*.duckdb_extension --clobber
+        gh release edit "${{ inputs.tag }}" --draft=false
+    - name: Pin descriptor ref to the released commit
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        python3 - "${{ inputs.target }}" <<'PY'
+        import re, sys, pathlib
+        sha = sys.argv[1]
+        p = pathlib.Path("description.yml")
+        p.write_text(re.sub(r'(?m)^(\s*ref:\s*).*$', r'\g<1>' + sha, p.read_text(), count=1))
+        PY
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        if ! git diff --quiet -- description.yml; then
+          git add description.yml
+          git commit -m "docs: pin community descriptor ref to ${{ inputs.tag }} [skip ci]"
+          git push origin HEAD:main
+        fi

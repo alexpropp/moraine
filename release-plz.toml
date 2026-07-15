@@ -4,7 +4,7 @@ semver_check = true
 
 [[package]]
 name = "moraine"
-# Pinned so the extension workflow's `v*` tag trigger always matches.
+# The extension release references the released commit; the crate tag is fixed.
 git_tag_name = "v{{ version }}"
 
 [[package]]

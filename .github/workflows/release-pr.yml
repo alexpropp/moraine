@@ -1,0 +1,38 @@
+name: Release PR
+
+# Maintains the release PR (version bump + changelog) on every push to main.
+# Publishing is handled separately by release.yml, which gates the crates.io
+# publish and tag on the extension building for every platform first.
+#
+# Uses RELEASE_PLZ_TOKEN (a PAT/App token with contents:write and
+# pull-requests:write) so the PR it opens triggers the other workflows;
+# GITHUB_TOKEN-authored events do not.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # release-plz refreshes the release PR in a fresh temp clone that fetches
+      # `main` over HTTPS. That clone inherits only global git config, not the
+      # checkout's persisted credentials, so give it the token globally.
+      - name: Authenticate git so release-plz can fetch main into the PR branch
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.RELEASE_PLZ_TOKEN }}@github.com/".insteadOf \
+            "https://github.com/"
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

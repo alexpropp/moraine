@@ -1,41 +1,88 @@
 name: Release
 
-# Every push to main runs release-plz: it maintains a release PR (version
-# bump + changelog); merging that PR publishes to crates.io, tags
-# `v<version>`, and creates the GitHub release the extension workflow
-# attaches artifacts to.
+# On push to main, when Cargo.toml's version isn't on crates.io yet: build the
+# extension for every platform, and only if that succeeds, publish the crate and
+# cut both the v<version> crate release and the ext-v<version> extension release
+# (binaries attached). The crate never publishes without a working extension.
+# An ordinary push (no version bump) no-ops at the should-release gate.
 #
-# Requires two repo secrets:
-#   CARGO_REGISTRY_TOKEN — crates.io publish token.
-#   RELEASE_PLZ_TOKEN    — a PAT (or GitHub App token) with contents:write
-#     and pull-requests:write. Used instead of the built-in GITHUB_TOKEN so
-#     the release PR and release-tag push trigger the other workflows (CI,
-#     PR-title check, extension build); GITHUB_TOKEN-authored events do not.
+# Secrets: RELEASE_PLZ_TOKEN (contents+PRs; authors the tag/release, pushes the
+# descriptor ref bump, triggers downstream workflows) and CARGO_REGISTRY_TOKEN.
 on:
   workflow_dispatch:
   push:
     branches: [main]
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  release-plz:
+  should-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        # The workspace version (inherited by the moraine crate) lives in the
+        # root Cargo.toml. Release when crates.io doesn't have it yet; a missing
+        # crate (404 from the index) also means "release".
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if curl -sf -H "User-Agent: moraine-release (alex@contour.app)" \
+               https://index.crates.io/mo/ra/moraine | grep -q "\"vers\":\"$version\""; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "moraine $version already on crates.io - nothing to release."
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "moraine $version not on crates.io - release pending."
+          fi
+
+  build-extension:
+    needs: should-release
+    if: needs.should-release.outputs.release == 'true'
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
+    with:
+      extension_name: moraine
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
+      enable_rust: true
+      # moraine's Rust core (tokio, object_store, SlateDB) does not target
+      # WebAssembly, and Windows is unverified; the community build excludes
+      # the same set.
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+
+  publish:
+    needs: [should-release, build-extension]
+    if: needs.should-release.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
+    env:
+      VERSION: ${{ needs.should-release.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
-      # release-plz refreshes the release PR in a fresh temp clone that fetches
-      # `main` over HTTPS. That clone inherits only global git config, not the
-      # checkout's persisted credentials, so give it the token globally.
-      - name: Authenticate git so release-plz can fetch main into the PR branch
+      - name: Authenticate git so release-plz can push the tag
         run: |
           git config --global \
             url."https://x-access-token:${{ secrets.RELEASE_PLZ_TOKEN }}@github.com/".insteadOf \
             "https://github.com/"
-      - uses: release-plz/action@v0.5
+      - name: Publish crate and create the v<version> release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish the ext-v<version> extension release
+        uses: ./.github/actions/publish-extension-release
+        with:
+          tag: ext-v${{ env.VERSION }}
+          target: ${{ github.sha }}
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}

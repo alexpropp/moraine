@@ -1,0 +1,28 @@
+extension:
+  name: moraine
+  description: A SlateDB-backed catalog for DuckLake
+  version: 0.1.0
+  language: Rust & C++
+  build: cmake
+  license: MIT OR Apache-2.0
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
+  requires_toolchains: "rust"
+  maintainers:
+    - alexpropp
+
+repo:
+  github: alexpropp/moraine
+  ref: TO_BE_SET
+
+docs:
+  hello_world: |
+    INSTALL moraine FROM community;
+    LOAD moraine;
+    INSTALL ducklake;
+    LOAD ducklake;
+    ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH '<data-path>');
+  extended_description: |
+    moraine backs a DuckLake catalog with SlateDB over object storage.
+    ATTACH 'ducklake:moraine:<store>' nests moraine as DuckLake's metadata
+    connection; every ducklake_* table is served from the store and DuckLake's
+    own INSERT/UPDATE/DELETE commit atomically.
