@@ -99,8 +99,10 @@ pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
 /// the metadata footer; this replaces the old cdylib-plus-hand-written-
 /// footer packaging. Requires `ninja` on PATH (the toolchain generator).
 pub fn build_and_package_extension() -> anyhow::Result<PathBuf> {
+    // Stamp the artifact with the pinned DuckDB version explicitly.
+    let override_describe = format!("OVERRIDE_GIT_DESCRIBE={}", duckdb_pin());
     run(Command::new("make")
-        .args(["release", "GEN=ninja"])
+        .args(["release", "GEN=ninja", &override_describe])
         .current_dir(workspace_root()))?;
     let artifact =
         workspace_root().join("build/release/extension/moraine/moraine.duckdb_extension");
