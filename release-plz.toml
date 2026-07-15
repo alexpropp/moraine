@@ -11,7 +11,9 @@ git_tag_name = "v{{ version }}"
 name = "moraine-duckdb"
 # Distributed as a prebuilt .duckdb_extension artifact, not a crate.
 release = false
+publish = false
 
 [[package]]
 name = "xtask"
 release = false
+publish = false

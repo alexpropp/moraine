@@ -27,6 +27,14 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # release-plz refreshes the release PR in a fresh temp clone that fetches
+      # `main` over HTTPS. That clone inherits only global git config, not the
+      # checkout's persisted credentials, so give it the token globally.
+      - name: Authenticate git so release-plz can fetch main into the PR branch
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.RELEASE_PLZ_TOKEN }}@github.com/".insteadOf \
+            "https://github.com/"
       - uses: release-plz/action@v0.5
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
