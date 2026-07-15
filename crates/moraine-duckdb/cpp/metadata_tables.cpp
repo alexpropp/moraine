@@ -130,9 +130,9 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 // ProvideSnapshotChanges, since the store models them as one merged record;
 // each emits its columns in the declared order of its `ducklake_*` table.
 std::vector<std::vector<duckdb::Value>> ProvideSnapshots(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                         void *probe_ctx) {
 	OwnedArray<MoraineSnapshotRow> rows(moraine_dump_snapshots_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_snapshots(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -151,10 +151,10 @@ std::vector<std::vector<duckdb::Value>> ProvideSnapshots(MoraineCatalogHandle *h
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideSnapshotChanges(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideSnapshotChanges(MoraineCatalogHandle *handle,
+                                                               MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineSnapshotRow> rows(moraine_dump_snapshots_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_snapshots(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -174,9 +174,9 @@ std::vector<std::vector<duckdb::Value>> ProvideSnapshotChanges(MoraineCatalogHan
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideSchemas(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                       void *probe_ctx) {
 	OwnedArray<MoraineSchemaRow> rows(moraine_dump_schemas_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_schemas(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -198,9 +198,9 @@ std::vector<std::vector<duckdb::Value>> ProvideSchemas(MoraineCatalogHandle *han
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideTables(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                      void *probe_ctx) {
 	OwnedArray<MoraineTableRow> rows(moraine_dump_tables_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_tables(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -223,9 +223,9 @@ std::vector<std::vector<duckdb::Value>> ProvideTables(MoraineCatalogHandle *hand
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideViews(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                     void *probe_ctx) {
 	OwnedArray<MoraineViewRow> rows(moraine_dump_views_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_views(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -249,9 +249,9 @@ std::vector<std::vector<duckdb::Value>> ProvideViews(MoraineCatalogHandle *handl
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideMacros(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                      void *probe_ctx) {
 	OwnedArray<MoraineMacroRow> rows(moraine_dump_macros_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_macros(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -275,9 +275,9 @@ std::vector<std::vector<duckdb::Value>> ProvideMacros(MoraineCatalogHandle *hand
 // as-is: DuckLake reconstructs macros with LIST() aggregations that carry
 // no ORDER BY, so served row order is the reconstruction order.
 std::vector<std::vector<duckdb::Value>> ProvideMacroImpls(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                          void *probe_ctx) {
 	OwnedArray<MoraineMacroImplRow> rows(moraine_dump_macro_impls_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_macro_impls(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -297,9 +297,9 @@ std::vector<std::vector<duckdb::Value>> ProvideMacroImpls(MoraineCatalogHandle *
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideMacroParameters(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+                                                               MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineMacroParameterRow> rows(moraine_dump_macro_parameters_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_macro_parameters(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -320,10 +320,10 @@ std::vector<std::vector<duckdb::Value>> ProvideMacroParameters(MoraineCatalogHan
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideColumnMappings(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideColumnMappings(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                              void *probe_ctx) {
 	OwnedArray<MoraineColumnMappingRow> rows(moraine_dump_column_mappings_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_column_mappings(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -340,10 +340,10 @@ std::vector<std::vector<duckdb::Value>> ProvideColumnMappings(MoraineCatalogHand
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideNameMappings(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideNameMappings(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                            void *probe_ctx) {
 	OwnedArray<MoraineNameMappingRow> rows(moraine_dump_name_mappings_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_name_mappings(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -364,9 +364,9 @@ std::vector<std::vector<duckdb::Value>> ProvideNameMappings(MoraineCatalogHandle
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideColumns(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                       void *probe_ctx) {
 	OwnedArray<MoraineColumnRow> rows(moraine_dump_columns_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_columns(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -394,9 +394,9 @@ std::vector<std::vector<duckdb::Value>> ProvideColumns(MoraineCatalogHandle *han
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                         void *probe_ctx) {
 	OwnedArray<MoraineDataFileRow> rows(moraine_dump_data_files_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_data_files(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -427,9 +427,9 @@ std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *h
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideDeleteFiles(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                           void *probe_ctx) {
 	OwnedArray<MoraineDeleteFileRow> rows(moraine_dump_delete_files_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_delete_files(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -457,9 +457,9 @@ std::vector<std::vector<duckdb::Value>> ProvideDeleteFiles(MoraineCatalogHandle 
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideTableStats(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                          void *probe_ctx) {
 	OwnedArray<MoraineTableStatsRow> rows(moraine_dump_table_stats_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_table_stats(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -477,10 +477,10 @@ std::vector<std::vector<duckdb::Value>> ProvideTableStats(MoraineCatalogHandle *
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideTableColumnStats(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideTableColumnStats(MoraineCatalogHandle *handle,
+                                                                MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineTableColumnStatsRow> rows(moraine_dump_table_column_stats_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_table_column_stats(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -501,10 +501,10 @@ std::vector<std::vector<duckdb::Value>> ProvideTableColumnStats(MoraineCatalogHa
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHandle *handle,
+                                                               MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineFileColumnStatsRow> rows(moraine_dump_file_column_stats_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_file_column_stats(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -533,9 +533,9 @@ std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHan
 // table-id set — begin_snapshot/schema_version are the snapshot's own
 // values, revalidated at commit).
 std::vector<std::vector<duckdb::Value>> ProvideSchemaVersions(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+                                                              void *probe_ctx) {
 	OwnedArray<MoraineSchemaVersionRow> rows(moraine_dump_schema_versions_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_schema_versions(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -561,10 +561,10 @@ std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *, Mor
 	return {};
 }
 
-std::vector<std::vector<duckdb::Value>> ProvidePartitionInfo(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvidePartitionInfo(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                             void *probe_ctx) {
 	OwnedArray<MorainePartitionInfoRow> rows(moraine_dump_partition_info_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_partition_info(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -583,9 +583,9 @@ std::vector<std::vector<duckdb::Value>> ProvidePartitionInfo(MoraineCatalogHandl
 }
 
 std::vector<std::vector<duckdb::Value>> ProvidePartitionColumns(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+                                                                MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MorainePartitionColumnRow> rows(moraine_dump_partition_columns_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_partition_columns(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -605,9 +605,9 @@ std::vector<std::vector<duckdb::Value>> ProvidePartitionColumns(MoraineCatalogHa
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideFilePartitionValues(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+                                                                   MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineFilePartitionValueRow> rows(moraine_dump_file_partition_values_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_file_partition_values(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -625,10 +625,10 @@ std::vector<std::vector<duckdb::Value>> ProvideFilePartitionValues(MoraineCatalo
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideSortInfo(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideSortInfo(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                        void *probe_ctx) {
 	OwnedArray<MoraineSortInfoRow> rows(moraine_dump_sort_info_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_sort_info(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -647,9 +647,9 @@ std::vector<std::vector<duckdb::Value>> ProvideSortInfo(MoraineCatalogHandle *ha
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideSortExpressions(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+                                                               MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineSortExpressionRow> rows(moraine_dump_sort_expressions_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_sort_expressions(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -670,10 +670,10 @@ std::vector<std::vector<duckdb::Value>> ProvideSortExpressions(MoraineCatalogHan
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideTags(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideTags(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                    void *probe_ctx) {
 	OwnedArray<MoraineTagRow> rows(moraine_dump_tags_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_tags(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -692,10 +692,10 @@ std::vector<std::vector<duckdb::Value>> ProvideTags(MoraineCatalogHandle *handle
 	return result;
 }
 
-std::vector<std::vector<duckdb::Value>> ProvideColumnTags(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideColumnTags(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                          void *probe_ctx) {
 	OwnedArray<MoraineColumnTagRow> rows(moraine_dump_column_tags_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_column_tags(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -716,9 +716,9 @@ std::vector<std::vector<duckdb::Value>> ProvideColumnTags(MoraineCatalogHandle *
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalogHandle *handle,
-                                            MoraineInterruptProbe probe, void *probe_ctx) {
+                                                                  MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineScheduledDeletionRow> rows(moraine_dump_scheduled_deletions_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_dump_scheduled_deletions(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -757,7 +757,7 @@ std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalog
 std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                         void *probe_ctx) {
 	bool encrypted = false;
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_catalog_encrypted(handle, &encrypted, probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -776,10 +776,10 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *ha
 // schema_version)` with a recorded `inline/schema`. The table_name column
 // carries `InlinedDataTableName` (inline_tables.cpp), matching DuckLake's
 // own inline-table naming.
-std::vector<std::vector<duckdb::Value>> ProvideInlinedDataTables(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                            void *probe_ctx) {
+std::vector<std::vector<duckdb::Value>> ProvideInlinedDataTables(MoraineCatalogHandle *handle,
+                                                                 MoraineInterruptProbe probe, void *probe_ctx) {
 	OwnedArray<MoraineInlineTableRow> rows(moraine_inline_registered_tables_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_inline_registered_tables(handle, rows.OutItems(), rows.OutLen(), probe, probe_ctx, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -1286,8 +1286,8 @@ struct MetadataScanGlobalState : public duckdb::GlobalTableFunctionState {
 	}
 };
 
-duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
-MetadataScanInitGlobal(duckdb::ClientContext &, duckdb::TableFunctionInitInput &input) {
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duckdb::ClientContext &,
+                                                                            duckdb::TableFunctionInitInput &input) {
 	auto state = duckdb::make_uniq<MetadataScanGlobalState>();
 	state->column_ids = input.column_ids;
 	return std::move(state);
@@ -1311,8 +1311,7 @@ void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInpu
 				// fixed committed head, so the staged-write Sink
 				// (staged_write.cpp) resolves this index back to the row by
 				// re-materializing the same provider.
-				output.SetValue(out_col, out_row,
-				                duckdb::Value::BIGINT(static_cast<int64_t>(state.offset + out_row)));
+				output.SetValue(out_col, out_row, duckdb::Value::BIGINT(static_cast<int64_t>(state.offset + out_row)));
 				continue;
 			}
 			if (duckdb::IsVirtualColumn(col_id) || col_id >= row.size()) {
@@ -1364,13 +1363,13 @@ const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs() {
 }
 
 MoraineMetadataTableEntry::MoraineMetadataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
-                                                       duckdb::CreateTableInfo &info, const MetadataTableSpec &spec,
-                                                       MoraineCatalogHandle *handle)
+                                                     duckdb::CreateTableInfo &info, const MetadataTableSpec &spec,
+                                                     MoraineCatalogHandle *handle)
     : duckdb::TableCatalogEntry(catalog, schema, info), spec_(spec), handle_(handle) {
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> MoraineMetadataTableEntry::GetStatistics(duckdb::ClientContext &,
-                                                                                     duckdb::column_t) {
+                                                                                    duckdb::column_t) {
 	throw duckdb::NotImplementedException("moraine: column statistics are not supported yet");
 }
 
@@ -1382,7 +1381,7 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineMetadataTableEntry::GetStatist
 // every scan outside a write transaction — serves committed state.
 static std::vector<std::vector<duckdb::Value>> TxAwareSnapshotRows(MoraineTxHandle *tx, bool changes_shape) {
 	OwnedArray<MoraineSnapshotRow> rows(moraine_dump_snapshots_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_tx_dump_snapshots(tx, rows.OutItems(), rows.OutLen(), &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -1411,9 +1410,8 @@ static std::vector<std::vector<duckdb::Value>> TxAwareSnapshotRows(MoraineTxHand
 	return result;
 }
 
-duckdb::TableFunction
-MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
-                                           duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
+duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
+                                                                 duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
 
 	// write_table_kind 0/1 are ducklake_snapshot / ducklake_snapshot_changes.
@@ -1438,7 +1436,7 @@ duckdb::TableStorageInfo MoraineMetadataTableEntry::GetStorageInfo(duckdb::Clien
 }
 
 void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
-                             duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::CatalogEntry>> &tables) {
+                            duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::CatalogEntry>> &tables) {
 	for (auto &spec : MoraineMetadataTableSpecs()) {
 		duckdb::CreateTableInfo info(schema, spec.name);
 		duckdb::idx_t column_index = 0;
@@ -1450,8 +1448,7 @@ void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry
 			}
 			column_index++;
 		}
-		tables.emplace(spec.name,
-		               duckdb::make_uniq<MoraineMetadataTableEntry>(catalog, schema, info, spec, handle));
+		tables.emplace(spec.name, duckdb::make_uniq<MoraineMetadataTableEntry>(catalog, schema, info, spec, handle));
 	}
 }
 

@@ -7,11 +7,6 @@
 //!   (see `bench.rs`).
 //! - `s3` runs the catalog's object storage suite against a pinned MinIO
 //!   server (see `s3.rs`).
-//! - `package` builds and packages the extension into a distributable
-//!   `dist/<duckdb_version>/<platform>/` tree (the directory shape DuckDB
-//!   extension repositories serve).
-
-use std::path::Path;
 
 use anyhow::bail;
 
@@ -27,11 +22,7 @@ fn main() -> anyhow::Result<()> {
         Some("e2e") => e2e::e2e(),
         Some("bench") => bench::bench(&arguments),
         Some("s3") => s3::s3(),
-        Some("package") => {
-            let out = arguments.first().map_or("dist", String::as_str);
-            duckdb::package(Path::new(out))
-        }
-        Some(other) => bail!("unknown task `{other}`; available: e2e, bench, s3, package"),
-        None => bail!("usage: cargo xtask <task>; available: e2e, bench, s3, package"),
+        Some(other) => bail!("unknown task `{other}`; available: e2e, bench, s3"),
+        None => bail!("usage: cargo xtask <task>; available: e2e, bench, s3"),
     }
 }

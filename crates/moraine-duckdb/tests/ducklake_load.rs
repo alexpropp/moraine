@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! MORAINE_DUCKDB_CLI=target/duckdb-cli/cli/duckdb \
-//! MORAINE_DUCKDB_EXT=target/duckdb-cli/artifact/moraine_duckdb.duckdb_extension \
+//! MORAINE_DUCKDB_EXT=build/release/extension/moraine/moraine.duckdb_extension \
 //! cargo test -p moraine-duckdb --release --test ducklake_load -- --ignored
 //! ```
 

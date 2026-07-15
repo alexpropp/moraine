@@ -22,7 +22,7 @@ namespace {
 // invalidate any already-taken pointer.
 MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType &type,
                           std::vector<std::string> &string_storage) {
-	MoraineCell cell{};
+	MoraineCell cell {};
 	if (value.IsNull()) {
 		cell.kind = 0;
 		return cell;
@@ -57,8 +57,7 @@ MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType 
 		// Every `ducklake_*` column declared (metadata_tables.cpp) uses one
 		// of the types above; any other type here is a spec/Sink mismatch.
 		throw duckdb::NotImplementedException(
-		    "moraine: staged write hit an unsupported column type (%s) — spec/Sink type mismatch",
-		    type.ToString());
+		    "moraine: staged write hit an unsupported column type (%s) — spec/Sink type mismatch", type.ToString());
 	}
 }
 
@@ -175,9 +174,8 @@ public:
 				auto type = MapColumnType(spec_.columns[col].ducklake_type);
 				cells.push_back(CellFromValue(value, type, string_storage));
 			}
-			MoraineError err{};
-			auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* insert */ 0, cells.data(), cells.size(),
-			                              &err);
+			MoraineError err {};
+			auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* insert */ 0, cells.data(), cells.size(), &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
 			}
@@ -210,9 +208,9 @@ public:
 class MoraineMetadataUpdate : public MoraineMetadataDml {
 public:
 	MoraineMetadataUpdate(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
-	                      const MetadataTableSpec &spec, duckdb::Catalog &catalog,
-	                      duckdb::idx_t estimated_cardinality, int32_t lifecycle_op,
-	                      std::vector<duckdb::idx_t> set_columns, std::vector<duckdb::idx_t> set_refs)
+	                      const MetadataTableSpec &spec, duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality,
+	                      int32_t lifecycle_op, std::vector<duckdb::idx_t> set_columns,
+	                      std::vector<duckdb::idx_t> set_refs)
 	    : MoraineMetadataDml(physical_plan, std::move(types), spec, catalog, estimated_cardinality),
 	      lifecycle_op_(lifecycle_op), set_columns_(std::move(set_columns)), set_refs_(std::move(set_refs)) {
 	}
@@ -253,9 +251,9 @@ public:
 				}
 				auto value_type = MapColumnType(spec_.columns[set_columns_[0]].ducklake_type);
 				cells.push_back(CellFromValue(chunk.GetValue(set_refs_[0], row), value_type, string_storage));
-				MoraineError err{};
-				auto code = moraine_tx_stage(tx, spec_.write_table_kind, lifecycle_op_, cells.data(),
-				                              cells.size(), &err);
+				MoraineError err {};
+				auto code =
+				    moraine_tx_stage(tx, spec_.write_table_kind, lifecycle_op_, cells.data(), cells.size(), &err);
 				if (code != MORAINE_OK) {
 					ThrowMoraineError(err);
 				}
@@ -271,9 +269,9 @@ public:
 					auto type = MapColumnType(spec_.columns[col].ducklake_type);
 					cells.push_back(CellFromValue(new_row[col], type, string_storage));
 				}
-				MoraineError err{};
+				MoraineError err {};
 				auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* insert (overwrite) */ 0, cells.data(),
-				                              cells.size(), &err);
+				                             cells.size(), &err);
 				if (code != MORAINE_OK) {
 					ThrowMoraineError(err);
 				}
@@ -289,8 +287,8 @@ public:
 class MoraineMetadataDelete : public MoraineMetadataDml {
 public:
 	MoraineMetadataDelete(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
-	                      const MetadataTableSpec &spec, duckdb::Catalog &catalog,
-	                      duckdb::idx_t estimated_cardinality, duckdb::idx_t row_id_chunk_index)
+	                      const MetadataTableSpec &spec, duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality,
+	                      duckdb::idx_t row_id_chunk_index)
 	    : MoraineMetadataDml(physical_plan, std::move(types), spec, catalog, estimated_cardinality),
 	      row_id_chunk_index_(row_id_chunk_index) {
 	}
@@ -314,9 +312,8 @@ public:
 				auto type = MapColumnType(spec_.columns[key_col].ducklake_type);
 				cells.push_back(CellFromValue(old_row[key_col], type, string_storage));
 			}
-			MoraineError err{};
-			auto code =
-			    moraine_tx_stage(tx, spec_.write_table_kind, /* delete */ 1, cells.data(), cells.size(), &err);
+			MoraineError err {};
+			auto code = moraine_tx_stage(tx, spec_.write_table_kind, /* delete */ 1, cells.data(), cells.size(), &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
 			}
@@ -376,7 +373,7 @@ public:
 			// Column order: table_id, table_name, schema_version.
 			auto table_id = old_row[0].GetValue<uint64_t>();
 			auto schema_version = old_row[2].GetValue<uint64_t>();
-			MoraineError err{};
+			MoraineError err {};
 			auto code = moraine_tx_stage_inline_schema_drop(tx, table_id, schema_version, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
@@ -431,7 +428,7 @@ std::vector<duckdb::idx_t> ExtractSetRefs(duckdb::LogicalUpdate &op) {
 } // namespace
 
 duckdb::PhysicalOperator &PlanMetadataInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
-                                              const MetadataTableSpec &spec) {
+                                             const MetadataTableSpec &spec) {
 	if (spec.write_table_kind == kVoidInsertable) {
 		return planner.Make<MoraineMetadataVoidInsert>(op.types, spec, op.table.catalog, op.estimated_cardinality);
 	}
@@ -439,7 +436,7 @@ duckdb::PhysicalOperator &PlanMetadataInsert(duckdb::PhysicalPlanGenerator &plan
 }
 
 duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalUpdate &op,
-                                              const MetadataTableSpec &spec) {
+                                             const MetadataTableSpec &spec) {
 	if (op.return_chunk) {
 		throw duckdb::NotImplementedException("moraine: UPDATE ... RETURNING is not supported on \"%s\"",
 		                                      op.table.name);
@@ -461,8 +458,7 @@ duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &plan
 			                                           /* update_set_end */ 2, std::move(set_columns),
 			                                           std::move(set_refs));
 		}
-		if (set_columns.size() == 1 &&
-		    std::string(spec.columns[set_columns[0]].name) == "begin_snapshot") {
+		if (set_columns.size() == 1 && std::string(spec.columns[set_columns[0]].name) == "begin_snapshot") {
 			return planner.Make<MoraineMetadataUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality,
 			                                           /* update_set_begin */ 3, std::move(set_columns),
 			                                           std::move(set_refs));
@@ -482,15 +478,14 @@ duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &plan
 	// end_snapshot` against unmodeled tables (see MoraineMetadataVoidUpdate),
 	// translatable as a no-op since such a table can never have a live row.
 	// Anything else against an unwritable table stays rejected.
-	if (set_columns.size() == 1 &&
-	    std::string(spec.columns[set_columns[0]].name) == "end_snapshot") {
+	if (set_columns.size() == 1 && std::string(spec.columns[set_columns[0]].name) == "end_snapshot") {
 		return planner.Make<MoraineMetadataVoidUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality);
 	}
 	throw duckdb::NotImplementedException("moraine: UPDATE is not supported on \"%s\"", spec.name);
 }
 
 duckdb::PhysicalOperator &PlanMetadataDelete(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalDelete &op,
-                                              const MetadataTableSpec &spec) {
+                                             const MetadataTableSpec &spec) {
 	if (op.return_chunk) {
 		throw duckdb::NotImplementedException("moraine: DELETE ... RETURNING is not supported on \"%s\"",
 		                                      op.table.name);
@@ -500,12 +495,12 @@ duckdb::PhysicalOperator &PlanMetadataDelete(duckdb::PhysicalPlanGenerator &plan
 			// `ducklake_inlined_data_tables`: the one registry-backed
 			// table, deleted for real by the expiry cascade.
 			if (op.expressions.size() != 1) {
-				throw duckdb::InternalException(
-				    "moraine: expected exactly one row-id expression for DELETE on \"%s\"", spec.name);
+				throw duckdb::InternalException("moraine: expected exactly one row-id expression for DELETE on \"%s\"",
+				                                spec.name);
 			}
 			auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
-			return planner.Make<MoraineInlineRegistryDelete>(op.types, spec, op.table.catalog,
-			                                                 op.estimated_cardinality, bound_ref.index);
+			return planner.Make<MoraineInlineRegistryDelete>(op.types, spec, op.table.catalog, op.estimated_cardinality,
+			                                                 bound_ref.index);
 		}
 		return planner.Make<MoraineMetadataVoidDelete>(op.types, spec, op.table.catalog, op.estimated_cardinality);
 	}

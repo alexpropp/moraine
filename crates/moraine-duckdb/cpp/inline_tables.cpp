@@ -105,7 +105,7 @@ std::optional<InlinedDataTableId> ParseInlinedDataTableName(const std::string &n
 	if (!table_id || !schema_version) {
 		return std::nullopt;
 	}
-	return InlinedDataTableId{*table_id, *schema_version};
+	return InlinedDataTableId {*table_id, *schema_version};
 }
 
 std::optional<uint64_t> ParseInlinedDeleteTableName(const std::string &name) {
@@ -131,8 +131,8 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 	ArrowSchema c_schema;
 	duckdb::ArrowConverter::ToArrowSchema(&c_schema, types, names, options);
 
-	MoraineArrowBytes bytes{};
-	MoraineArrowError err{};
+	MoraineArrowBytes bytes {};
+	MoraineArrowError err {};
 	// Consumes `c_schema` (releases DuckDB's buffers); do not release it here.
 	if (moraine_arrow_encode_schema(&c_schema, &bytes, &err) != 0) {
 		ThrowArrowError(err, "encoding inline schema");
@@ -145,7 +145,7 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &context, const uint8_t *data, size_t len) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
-	MoraineArrowError err{};
+	MoraineArrowError err {};
 	if (moraine_arrow_decode_stream(data, len, &c_schema, &c_array, &err) != 0) {
 		ThrowArrowError(err, "decoding inline schema");
 	}
@@ -160,7 +160,7 @@ std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &conte
 		ArrowSchema &child = *c_schema.children[i];
 		std::string name = child.name ? child.name : "";
 		auto arrow_type = duckdb::ArrowType::GetTypeFromSchema(context, child);
-		result.push_back(DecodedInlineColumn{std::move(name), arrow_type->GetDuckType()});
+		result.push_back(DecodedInlineColumn {std::move(name), arrow_type->GetDuckType()});
 	}
 	if (c_schema.release) {
 		c_schema.release(&c_schema);
@@ -197,8 +197,8 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	ArrowArray c_array;
 	duckdb::ArrowConverter::ToArrowArray(user_chunk, &c_array, options, {});
 
-	MoraineArrowBytes bytes{};
-	MoraineArrowError err{};
+	MoraineArrowBytes bytes {};
+	MoraineArrowError err {};
 	// Consumes both `c_schema` and `c_array`; do not release them here.
 	if (moraine_arrow_encode_chunk(&c_schema, &c_array, &bytes, &err) != 0) {
 		ThrowArrowError(err, "encoding inline chunk");
@@ -208,13 +208,12 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	return out;
 }
 
-std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context,
-                                                               const uint8_t *schema_ipc, size_t schema_ipc_len,
-                                                               const uint8_t *data, size_t len,
-                                                               const std::vector<duckdb::LogicalType> &user_types) {
+std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context, const uint8_t *schema_ipc,
+                                                              size_t schema_ipc_len, const uint8_t *data, size_t len,
+                                                              const std::vector<duckdb::LogicalType> &user_types) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
-	MoraineArrowError err{};
+	MoraineArrowError err {};
 	if (moraine_arrow_decode_body(schema_ipc, schema_ipc_len, data, len, &c_schema, &c_array, &err) != 0) {
 		ThrowArrowError(err, "decoding inline chunk");
 	}
@@ -230,9 +229,9 @@ std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientCont
 		if (c_array.release) {
 			c_array.release(&c_array);
 		}
-		throw duckdb::InternalException(
-		    "moraine: inline chunk has %llu columns, expected %llu — schema/body mismatch",
-		    static_cast<unsigned long long>(columns.size()), static_cast<unsigned long long>(user_types.size()));
+		throw duckdb::InternalException("moraine: inline chunk has %llu columns, expected %llu — schema/body mismatch",
+		                                static_cast<unsigned long long>(columns.size()),
+		                                static_cast<unsigned long long>(user_types.size()));
 	}
 
 	// Drive DuckDB's own record-batch importer (the arrow-scan path), which
@@ -304,15 +303,15 @@ duckdb::CreateTableInfo BuildInlineDataTableInfo(duckdb::SchemaCatalogEntry &sch
 // still holding unflushed inlined data under the old version would misdecode
 // here.
 std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientContext &context,
-                                                               MoraineCatalogHandle *handle, uint64_t table_id,
-                                                               uint64_t schema_version,
-                                                               const std::vector<duckdb::LogicalType> &user_types) {
+                                                              MoraineCatalogHandle *handle, uint64_t table_id,
+                                                              uint64_t schema_version,
+                                                              const std::vector<duckdb::LogicalType> &user_types) {
 	// This entry serves one `(table_id, schema_version)`; body-only chunks of
 	// that version decode against its schema-only stream (`inline/schema`).
 	// The scan below spans every version of the table, so chunks of other
 	// versions — a schema-evolved table holds several — are filtered out.
 	OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
-	MoraineError schema_err{};
+	MoraineError schema_err {};
 	if (moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(), moraine_shim_is_interrupted,
 	                           &context, &schema_err) != MORAINE_OK) {
 		ThrowMoraineError(schema_err);
@@ -327,13 +326,13 @@ std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientCont
 		}
 	}
 	if (!schema_ipc) {
-		throw duckdb::InternalException(
-		    "moraine: no inline schema recorded for table %llu schema version %llu",
-		    static_cast<unsigned long long>(table_id), static_cast<unsigned long long>(schema_version));
+		throw duckdb::InternalException("moraine: no inline schema recorded for table %llu schema version %llu",
+		                                static_cast<unsigned long long>(table_id),
+		                                static_cast<unsigned long long>(schema_version));
 	}
 
 	OwnedArray<MoraineInlineRow> rows(moraine_inline_scan_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_inline_scan(handle, table_id, /* SCAN_FOR_FLUSH */ 3, std::numeric_limits<uint64_t>::max(), 0,
 	                                rows.OutItems(), rows.OutLen(), moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
@@ -348,8 +347,8 @@ std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientCont
 		if (r.schema_version != schema_version) {
 			continue;
 		}
-		auto decoded = DecodeInlineChunkRows(context, schema_ipc, schema_ipc_len, r.chunk_body, r.chunk_body_len,
-		                                     user_types);
+		auto decoded =
+		    DecodeInlineChunkRows(context, schema_ipc, schema_ipc_len, r.chunk_body, r.chunk_body_len, user_types);
 		if (r.offset_in_chunk >= decoded.size()) {
 			throw duckdb::InternalException("moraine: inline scan row offset out of range");
 		}
@@ -370,14 +369,14 @@ std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientCont
 } // namespace
 
 MoraineInlineDataTableEntry::MoraineInlineDataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
-                                                          duckdb::CreateTableInfo &info, MoraineCatalogHandle *handle,
-                                                          uint64_t table_id, uint64_t schema_version)
+                                                         duckdb::CreateTableInfo &info, MoraineCatalogHandle *handle,
+                                                         uint64_t table_id, uint64_t schema_version)
     : duckdb::TableCatalogEntry(catalog, schema, info), handle_(handle), table_id_(table_id),
       schema_version_(schema_version) {
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> MoraineInlineDataTableEntry::GetStatistics(duckdb::ClientContext &,
-                                                                                       duckdb::column_t) {
+                                                                                      duckdb::column_t) {
 	throw duckdb::NotImplementedException("moraine: column statistics are not supported yet");
 }
 
@@ -393,8 +392,9 @@ std::vector<duckdb::LogicalType> MoraineInlineDataTableEntry::UserColumnTypes() 
 	return types;
 }
 
-duckdb::TableFunction MoraineInlineDataTableEntry::GetScanFunction(duckdb::ClientContext &context,
-                                                                    duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
+duckdb::TableFunction
+MoraineInlineDataTableEntry::GetScanFunction(duckdb::ClientContext &context,
+                                             duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
 	scan_bind_data->rows = ProvideInlineDataRows(context, handle_, table_id_, schema_version_, UserColumnTypes());
 	scan_bind_data->table_entry = this;
@@ -407,14 +407,14 @@ duckdb::TableStorageInfo MoraineInlineDataTableEntry::GetStorageInfo(duckdb::Cli
 }
 
 MoraineInlineDeleteTableEntry::MoraineInlineDeleteTableEntry(duckdb::Catalog &catalog,
-                                                              duckdb::SchemaCatalogEntry &schema,
-                                                              duckdb::CreateTableInfo &info,
-                                                              MoraineCatalogHandle *handle, uint64_t table_id)
+                                                             duckdb::SchemaCatalogEntry &schema,
+                                                             duckdb::CreateTableInfo &info,
+                                                             MoraineCatalogHandle *handle, uint64_t table_id)
     : duckdb::TableCatalogEntry(catalog, schema, info), handle_(handle), table_id_(table_id) {
 }
 
 duckdb::unique_ptr<duckdb::BaseStatistics> MoraineInlineDeleteTableEntry::GetStatistics(duckdb::ClientContext &,
-                                                                                         duckdb::column_t) {
+                                                                                        duckdb::column_t) {
 	throw duckdb::NotImplementedException("moraine: column statistics are not supported yet");
 }
 
@@ -422,7 +422,7 @@ duckdb::TableFunction
 MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	OwnedArray<MoraineInlineFileDeleteRow> file_deletes(moraine_inline_file_deletes_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_inline_file_deletes(handle_, table_id_, file_deletes.OutItems(), file_deletes.OutLen(),
 	                                        moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
@@ -464,13 +464,12 @@ duckdb::unique_ptr<MoraineInlineDeleteTableEntry> MakeInlineDeleteTableEntry(duc
 }
 
 duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientContext &context,
-                                                                 duckdb::Catalog &catalog,
-                                                                 duckdb::SchemaCatalogEntry &schema,
-                                                                 MoraineCatalogHandle *handle,
-                                                                 const std::string &name) {
+                                                                duckdb::Catalog &catalog,
+                                                                duckdb::SchemaCatalogEntry &schema,
+                                                                MoraineCatalogHandle *handle, const std::string &name) {
 	if (auto parsed = ParseInlinedDataTableName(name)) {
 		OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
-		MoraineError err{};
+		MoraineError err {};
 		auto code = moraine_inline_schemas(handle, parsed->table_id, schemas.OutItems(), schemas.OutLen(),
 		                                   moraine_shim_is_interrupted, &context, &err);
 		if (code != MORAINE_OK) {
@@ -488,7 +487,7 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
 	}
 	if (auto table_id = ParseInlinedDeleteTableName(name)) {
 		bool exists = false;
-		MoraineError err{};
+		MoraineError err {};
 		auto code = moraine_inline_file_delete_table_exists(handle, *table_id, &exists, moraine_shim_is_interrupted,
 		                                                    &context, &err);
 		if (code != MORAINE_OK) {
@@ -503,12 +502,12 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
 }
 
 duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                                duckdb::SchemaCatalogEntry &schema,
-                                                                MoraineCatalogHandle *handle, MoraineTxHandle *tx,
-                                                                duckdb::BoundCreateTableInfo &info, uint64_t table_id,
-                                                                uint64_t schema_version) {
+                                                               duckdb::SchemaCatalogEntry &schema,
+                                                               MoraineCatalogHandle *handle, MoraineTxHandle *tx,
+                                                               duckdb::BoundCreateTableInfo &info, uint64_t table_id,
+                                                               uint64_t schema_version) {
 	OwnedArray<MoraineInlineSchemaRow> schemas(moraine_inline_schemas_free);
-	MoraineError lookup_err{};
+	MoraineError lookup_err {};
 	auto lookup_code = moraine_inline_schemas(handle, table_id, schemas.OutItems(), schemas.OutLen(),
 	                                          moraine_shim_is_interrupted, &context, &lookup_err);
 	if (lookup_code != MORAINE_OK) {
@@ -528,14 +527,14 @@ duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientCon
 	duckdb::idx_t index = 0;
 	for (auto &col : info.Base().columns.Logical()) {
 		if (index >= 3) {
-			user_columns.push_back(DecodedInlineColumn{col.Name(), col.Type()});
+			user_columns.push_back(DecodedInlineColumn {col.Name(), col.Type()});
 		}
 		index++;
 	}
 	auto schema_bytes = EncodeInlineSchema(context, user_columns);
-	MoraineError stage_err{};
+	MoraineError stage_err {};
 	auto stage_code = moraine_tx_stage_inline_schema(tx, table_id, schema_version, schema_bytes.data(),
-	                                                  schema_bytes.size(), &stage_err);
+	                                                 schema_bytes.size(), &stage_err);
 	if (stage_code != MORAINE_OK) {
 		ThrowMoraineError(stage_err);
 	}
@@ -649,9 +648,9 @@ public:
 		auto row_id_start = CellAsU64(chunk.GetValue(0, 0));
 		auto begin_snapshot = CellAsU64(chunk.GetValue(1, 0));
 		auto body = EncodeInlineChunkRows(context.client, chunk, /* user_col_start */ 3);
-		MoraineError err{};
+		MoraineError err {};
 		auto code = moraine_tx_stage_inline_insert(tx, table_id_, schema_version_, begin_snapshot, row_id_start,
-		                                            chunk.size(), body.data(), body.size(), &err);
+		                                           chunk.size(), body.data(), body.size(), &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
@@ -663,9 +662,9 @@ public:
 class MoraineInlineDataUpdateOp : public MoraineInlineDml {
 public:
 	MoraineInlineDataUpdateOp(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
-	                          duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality, MoraineCatalogHandle *handle,
-	                          uint64_t table_id, uint64_t schema_version, std::vector<duckdb::LogicalType> user_types,
-	                          duckdb::idx_t set_ref)
+	                          duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality,
+	                          MoraineCatalogHandle *handle, uint64_t table_id, uint64_t schema_version,
+	                          std::vector<duckdb::LogicalType> user_types, duckdb::idx_t set_ref)
 	    : MoraineInlineDml(physical_plan, std::move(types), catalog, estimated_cardinality), handle_(handle),
 	      table_id_(table_id), schema_version_(schema_version), user_types_(std::move(user_types)), set_ref_(set_ref) {
 	}
@@ -687,7 +686,7 @@ public:
 			                           chunk.GetValue(row_id_col, row));
 			auto real_row_id = CellAsU64(old_row[0]);
 			auto end_snapshot = CellAsU64(chunk.GetValue(set_ref_, row));
-			MoraineError err{};
+			MoraineError err {};
 			auto code = moraine_tx_stage_inline_inline_delete(tx, table_id_, real_row_id, end_snapshot, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
@@ -701,9 +700,9 @@ public:
 class MoraineInlineDataDeleteOp : public MoraineInlineDml {
 public:
 	MoraineInlineDataDeleteOp(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
-	                          duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality, MoraineCatalogHandle *handle,
-	                          uint64_t table_id, uint64_t schema_version, std::vector<duckdb::LogicalType> user_types,
-	                          duckdb::idx_t row_id_chunk_index)
+	                          duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality,
+	                          MoraineCatalogHandle *handle, uint64_t table_id, uint64_t schema_version,
+	                          std::vector<duckdb::LogicalType> user_types, duckdb::idx_t row_id_chunk_index)
 	    : MoraineInlineDml(physical_plan, std::move(types), catalog, estimated_cardinality), handle_(handle),
 	      table_id_(table_id), schema_version_(schema_version), user_types_(std::move(user_types)),
 	      row_id_chunk_index_(row_id_chunk_index) {
@@ -735,9 +734,9 @@ public:
 		auto &state = sink_state->Cast<InlineDmlState>();
 		if (!state.emitted && state.max_begin_snapshot.has_value()) {
 			auto *tx = StagedTx(context.client);
-			MoraineError err{};
-			auto code = moraine_tx_stage_inline_flush_delete(tx, table_id_, schema_version_,
-			                                                  *state.max_begin_snapshot, &err);
+			MoraineError err {};
+			auto code =
+			    moraine_tx_stage_inline_flush_delete(tx, table_id_, schema_version_, *state.max_begin_snapshot, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
 			}
@@ -763,7 +762,7 @@ public:
 			auto file_id = CellAsU64(chunk.GetValue(0, row));
 			auto row_id = CellAsU64(chunk.GetValue(1, row));
 			auto begin_snapshot = CellAsU64(chunk.GetValue(2, row));
-			MoraineError err{};
+			MoraineError err {};
 			auto code = moraine_tx_stage_inline_file_delete(tx, table_id_, file_id, row_id, begin_snapshot, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
@@ -816,10 +815,9 @@ duckdb::PhysicalOperator &PlanInlineDataDelete(duckdb::PhysicalPlanGenerator &pl
 		                                op.table.name);
 	}
 	auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
-	return planner.Make<MoraineInlineDataDeleteOp>(op.types, op.table.catalog, op.estimated_cardinality,
-	                                               table_entry.Handle(), table_entry.TableId(),
-	                                               table_entry.SchemaVersion(), table_entry.UserColumnTypes(),
-	                                               bound_ref.index);
+	return planner.Make<MoraineInlineDataDeleteOp>(
+	    op.types, op.table.catalog, op.estimated_cardinality, table_entry.Handle(), table_entry.TableId(),
+	    table_entry.SchemaVersion(), table_entry.UserColumnTypes(), bound_ref.index);
 }
 
 duckdb::PhysicalOperator &PlanInlineDeleteInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,

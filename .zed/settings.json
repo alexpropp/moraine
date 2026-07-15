@@ -1,6 +1,22 @@
 {
   "ensure_final_newline_on_save": true,
   "remove_trailing_whitespace_on_save": true,
+  // Keep the build-toolchain submodules out of the project scan (search,
+  // indexing, clangd). Re-lists Zed's defaults since this key replaces them
+  // rather than merging. Segment-exact, so crates/moraine-duckdb is unaffected.
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/.svn",
+    "**/.hg",
+    "**/.jj",
+    "**/CVS",
+    "**/.DS_Store",
+    "**/Thumbs.db",
+    "**/.classpath",
+    "**/.settings",
+    "**/duckdb",
+    "**/extension-ci-tools"
+  ],
   "languages": {
     "Rust": {
       "format_on_save": "on",
@@ -12,6 +28,12 @@
       },
       "tab_size": 4,
       "preferred_line_length": 100
+    },
+    "C++": {
+      "format_on_save": "on"
+    },
+    "C": {
+      "format_on_save": "on"
     }
   },
   "lsp": {

@@ -92,13 +92,13 @@ const std::vector<MetadataTableSpec> &MoraineMetadataTableSpecs();
 class MoraineMetadataTableEntry : public duckdb::TableCatalogEntry {
 public:
 	MoraineMetadataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
-	                           duckdb::CreateTableInfo &info, const MetadataTableSpec &spec,
-	                           MoraineCatalogHandle *handle);
+	                          duckdb::CreateTableInfo &info, const MetadataTableSpec &spec,
+	                          MoraineCatalogHandle *handle);
 
 	duckdb::unique_ptr<duckdb::BaseStatistics> GetStatistics(duckdb::ClientContext &context,
-	                                                          duckdb::column_t column_id) override;
+	                                                         duckdb::column_t column_id) override;
 	duckdb::TableFunction GetScanFunction(duckdb::ClientContext &context,
-	                                       duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
+	                                      duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
 	duckdb::TableStorageInfo GetStorageInfo(duckdb::ClientContext &context) override;
 
 	// Exposed for the staged-write path (staged_write.cpp): the column
@@ -121,7 +121,7 @@ private:
 // `MoraineMetadataTableSpecs()` and adds it to `tables` (keyed by name, via
 // `emplace` — a same-named entry already present wins, never overwritten).
 void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
-                             duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::CatalogEntry>> &tables);
+                            duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::CatalogEntry>> &tables);
 
 // Bind data for a metadata-shaped scan: every row is materialized up front
 // (these tables are metadata/inline-registry sized, not data-sized). Shared

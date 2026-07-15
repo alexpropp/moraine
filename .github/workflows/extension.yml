@@ -1,60 +1,23 @@
 name: Extension
 
-# Per-platform extension artifacts: built on every release tag and
-# buildable on demand for verification.
+# Builds the loadable extension for every supported DuckDB platform through
+# DuckDB's own extension-ci-tools distribution workflow — the same toolchain
+# the community-extensions repository uses. Runs on release tags and on demand.
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            platform: linux_amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux_arm64
-          - runner: macos-14
-            platform: osx_arm64
-          - runner: macos-15-intel
-            platform: osx_amd64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
-        with:
-          path: target/duckdb-src
-          key: duckdb-src-${{ matrix.platform }}-${{ hashFiles('DUCKDB_VERSION') }}
-      - run: cargo xtask package
-      # The file inside the archive must stay exactly
-      # `moraine_duckdb.duckdb_extension`: DuckDB derives the entry symbol
-      # from the filename before the first dot, so release assets are
-      # zips, never renamed raw files.
-      - run: |
-          duckdb_pin="$(cat DUCKDB_VERSION)"
-          zip -j "moraine_duckdb-${duckdb_pin}-${{ matrix.platform }}.zip" \
-            "dist/${duckdb_pin}/${{ matrix.platform }}/moraine_duckdb.duckdb_extension"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: extension-${{ matrix.platform }}
-          path: "*.zip"
-
-  attach:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: extension-*
-          merge-multiple: true
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" *.zip --clobber --repo "$GITHUB_REPOSITORY"
+    name: Build (extension-ci-tools)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
+    with:
+      extension_name: moraine
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
+      enable_rust: true
+      # moraine's Rust core (tokio, object_store, SlateDB) does not target
+      # WebAssembly, and Windows is unverified; the community build excludes
+      # the same set.
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"

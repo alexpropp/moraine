@@ -4,6 +4,10 @@
 **/*.rs.bk
 *.pdb
 
+# DuckDB extension toolchain build output
+/build
+/.cache
+
 # macOS
 .DS_Store
 

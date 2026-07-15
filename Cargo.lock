@@ -1840,9 +1840,7 @@ dependencies = [
 name = "moraine-duckdb"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow",
- "cc",
  "moraine",
  "object_store",
  "tokio",

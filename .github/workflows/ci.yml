@@ -22,26 +22,14 @@ jobs:
       - run: rustup toolchain install nightly --profile minimal --component rustfmt
       - run: cargo +nightly fmt --check
 
-  # clippy/test/doc/e2e all compile moraine-duckdb, whose build.rs fetches
-  # DuckDB's src/include/ header tree from GitHub on a cold cache (a ~9 MB
-  # git sparse checkout into target/duckdb-src/ — see that crate's README,
-  # "Where the headers come from") and compiles the DuckDB amalgamation
-  # into a static archive there (minutes of compile — see "Why DuckDB is
-  # statically linked"). target/duckdb-src/ is cached with its own
-  # actions/cache step, not rust-cache's cache-directories: rust-cache's
-  # post-step cleanup deletes directories under target/ it doesn't
-  # recognize, so the extra step must be declared *after* rust-cache —
-  # post steps run in reverse order, making its save fire before that
-  # cleanup. Keyed on DUCKDB_VERSION, the single source of the DuckDB pin.
+  # moraine-duckdb is a pure Rust static library (the C++ shim and DuckDB
+  # link are owned by the extension toolchain, exercised only by the e2e
+  # job), so clippy/test/doc need no DuckDB checkout or build.
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
-        with:
-          path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -49,10 +37,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
-        with:
-          path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       - run: cargo test --workspace --locked
 
   doc:
@@ -62,10 +46,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
-        with:
-          path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
       - run: cargo doc --workspace --no-deps
 
   deny:
@@ -74,22 +54,31 @@ jobs:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # e2e builds the loadable extension through the DuckDB toolchain (`make
+  # release`), which compiles DuckDB from the `duckdb` submodule and links
+  # moraine's Rust core — so it needs the submodules, a ninja generator,
+  # and a cache of the toolchain build tree.
   e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # The DuckDB toolchain build tree (keyed on the submodule refs and the
+      # C++ shim), declared after rust-cache so its save fires before
+      # rust-cache's post-step cleanup of unrecognized target/ dirs.
       - uses: actions/cache@v4
         with:
-          path: target/duckdb-src
-          key: duckdb-src-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
-      # The pinned DuckDB CLI xtask downloads (~20 MB, re-fetched every run
-      # otherwise, for the same rust-cache cleanup reason). Keyed on
-      # DUCKDB_VERSION, the single source of the DuckDB pin.
+          path: build
+          key: duckdb-build-${{ runner.os }}-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'extension_config.cmake', 'crates/moraine-duckdb/cpp/**') }}
+      # The pinned DuckDB CLI xtask downloads, keyed on xtask/src/duckdb.rs,
+      # which owns the pin.
       - uses: actions/cache@v4
         with:
           path: target/duckdb-cli/cli
-          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('DUCKDB_VERSION') }}
+          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('xtask/src/duckdb.rs') }}
       - run: cargo xtask e2e
 
   s3:
@@ -99,7 +88,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The pinned MinIO binaries xtask downloads, keyed on
       # xtask/src/s3.rs, which owns those pins (same rust-cache cleanup
-      # caveat as the DuckDB CLI cache above).
+      # caveat as the DuckDB build cache above).
       - uses: actions/cache@v4
         with:
           path: target/minio/bin

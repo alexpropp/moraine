@@ -48,12 +48,12 @@ extern "C" bool moraine_shim_is_interrupted(void *client_context);
 class MoraineTableEntry : public duckdb::TableCatalogEntry {
 public:
 	MoraineTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, duckdb::CreateTableInfo &info,
-	                   MoraineSnapshotHandle *snapshot, uint64_t table_id);
+	                  MoraineSnapshotHandle *snapshot, uint64_t table_id);
 
 	duckdb::unique_ptr<duckdb::BaseStatistics> GetStatistics(duckdb::ClientContext &context,
-	                                                          duckdb::column_t column_id) override;
+	                                                         duckdb::column_t column_id) override;
 	duckdb::TableFunction GetScanFunction(duckdb::ClientContext &context,
-	                                       duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
+	                                      duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
 	duckdb::TableStorageInfo GetStorageInfo(duckdb::ClientContext &context) override;
 
 private:
@@ -81,36 +81,36 @@ public:
 class MoraineSchemaEntry : public duckdb::SchemaCatalogEntry {
 public:
 	MoraineSchemaEntry(duckdb::Catalog &catalog, duckdb::CreateSchemaInfo &info, MoraineSnapshotHandle *snapshot,
-	                    uint64_t schema_id);
+	                   uint64_t schema_id);
 
 	void Scan(duckdb::ClientContext &context, duckdb::CatalogType type,
 	          const std::function<void(duckdb::CatalogEntry &)> &callback) override;
 	void Scan(duckdb::CatalogType type, const std::function<void(duckdb::CatalogEntry &)> &callback) override;
 
 	duckdb::optional_ptr<duckdb::CatalogEntry> LookupEntry(duckdb::CatalogTransaction transaction,
-	                                                        const duckdb::EntryLookupInfo &lookup_info) override;
+	                                                       const duckdb::EntryLookupInfo &lookup_info) override;
 
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateIndex(duckdb::CatalogTransaction transaction,
-	                                                        duckdb::CreateIndexInfo &info,
-	                                                        duckdb::TableCatalogEntry &table) override;
+	                                                       duckdb::CreateIndexInfo &info,
+	                                                       duckdb::TableCatalogEntry &table) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateFunction(duckdb::CatalogTransaction transaction,
-	                                                           duckdb::CreateFunctionInfo &info) override;
+	                                                          duckdb::CreateFunctionInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateTable(duckdb::CatalogTransaction transaction,
-	                                                        duckdb::BoundCreateTableInfo &info) override;
+	                                                       duckdb::BoundCreateTableInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateView(duckdb::CatalogTransaction transaction,
-	                                                       duckdb::CreateViewInfo &info) override;
+	                                                      duckdb::CreateViewInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateSequence(duckdb::CatalogTransaction transaction,
-	                                                           duckdb::CreateSequenceInfo &info) override;
+	                                                          duckdb::CreateSequenceInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateTableFunction(duckdb::CatalogTransaction transaction,
-	                                                                duckdb::CreateTableFunctionInfo &info) override;
+	                                                               duckdb::CreateTableFunctionInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateCopyFunction(duckdb::CatalogTransaction transaction,
-	                                                               duckdb::CreateCopyFunctionInfo &info) override;
+	                                                              duckdb::CreateCopyFunctionInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreatePragmaFunction(duckdb::CatalogTransaction transaction,
-	                                                                 duckdb::CreatePragmaFunctionInfo &info) override;
+	                                                                duckdb::CreatePragmaFunctionInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateCollation(duckdb::CatalogTransaction transaction,
-	                                                            duckdb::CreateCollationInfo &info) override;
+	                                                           duckdb::CreateCollationInfo &info) override;
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateType(duckdb::CatalogTransaction transaction,
-	                                                       duckdb::CreateTypeInfo &info) override;
+	                                                      duckdb::CreateTypeInfo &info) override;
 	void DropEntry(duckdb::ClientContext &context, duckdb::DropInfo &info) override;
 	void Alter(duckdb::CatalogTransaction transaction, duckdb::AlterInfo &info) override;
 
@@ -140,31 +140,31 @@ public:
 
 	// The attach_function_t the storage extension registers.
 	static duckdb::unique_ptr<duckdb::Catalog> Attach(duckdb::optional_ptr<duckdb::StorageExtensionInfo> storage_info,
-	                                                   duckdb::ClientContext &context, duckdb::AttachedDatabase &db,
-	                                                   const std::string &name, duckdb::AttachInfo &info,
-	                                                   duckdb::AttachOptions &options);
+	                                                  duckdb::ClientContext &context, duckdb::AttachedDatabase &db,
+	                                                  const std::string &name, duckdb::AttachInfo &info,
+	                                                  duckdb::AttachOptions &options);
 
 	void Initialize(bool load_builtin) override;
 	std::string GetCatalogType() override;
 
 	duckdb::optional_ptr<duckdb::CatalogEntry> CreateSchema(duckdb::CatalogTransaction transaction,
-	                                                         duckdb::CreateSchemaInfo &info) override;
+	                                                        duckdb::CreateSchemaInfo &info) override;
 	duckdb::optional_ptr<duckdb::SchemaCatalogEntry> LookupSchema(duckdb::CatalogTransaction transaction,
-	                                                               const duckdb::EntryLookupInfo &schema_lookup,
-	                                                               duckdb::OnEntryNotFound if_not_found) override;
+	                                                              const duckdb::EntryLookupInfo &schema_lookup,
+	                                                              duckdb::OnEntryNotFound if_not_found) override;
 	void ScanSchemas(duckdb::ClientContext &context,
-	                  std::function<void(duckdb::SchemaCatalogEntry &)> callback) override;
+	                 std::function<void(duckdb::SchemaCatalogEntry &)> callback) override;
 
 	duckdb::PhysicalOperator &PlanCreateTableAs(duckdb::ClientContext &context, duckdb::PhysicalPlanGenerator &planner,
-	                                             duckdb::LogicalCreateTable &op,
-	                                             duckdb::PhysicalOperator &plan) override;
+	                                            duckdb::LogicalCreateTable &op,
+	                                            duckdb::PhysicalOperator &plan) override;
 	duckdb::PhysicalOperator &PlanInsert(duckdb::ClientContext &context, duckdb::PhysicalPlanGenerator &planner,
-	                                      duckdb::LogicalInsert &op,
-	                                      duckdb::optional_ptr<duckdb::PhysicalOperator> plan) override;
+	                                     duckdb::LogicalInsert &op,
+	                                     duckdb::optional_ptr<duckdb::PhysicalOperator> plan) override;
 	duckdb::PhysicalOperator &PlanDelete(duckdb::ClientContext &context, duckdb::PhysicalPlanGenerator &planner,
-	                                      duckdb::LogicalDelete &op, duckdb::PhysicalOperator &plan) override;
+	                                     duckdb::LogicalDelete &op, duckdb::PhysicalOperator &plan) override;
 	duckdb::PhysicalOperator &PlanUpdate(duckdb::ClientContext &context, duckdb::PhysicalPlanGenerator &planner,
-	                                      duckdb::LogicalUpdate &op, duckdb::PhysicalOperator &plan) override;
+	                                     duckdb::LogicalUpdate &op, duckdb::PhysicalOperator &plan) override;
 
 	duckdb::DatabaseSize GetDatabaseSize(duckdb::ClientContext &context) override;
 	bool InMemory() override;
@@ -187,7 +187,7 @@ private:
 	// Ensures the active transaction's schema cache is populated from the
 	// listing ABI, then returns it.
 	static duckdb::vector<duckdb::reference<duckdb::SchemaCatalogEntry>> LoadedSchemas(duckdb::Catalog &catalog,
-	                                                                                    duckdb::Transaction &tx);
+	                                                                                   duckdb::Transaction &tx);
 };
 
 } // namespace moraine_duckdb

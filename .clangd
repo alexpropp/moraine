@@ -1,18 +1,24 @@
-# Workspace-root clangd config (editor-only; the cargo build ignores it).
+# Workspace-root clangd config (editor-only; the cargo/CMake builds ignore it).
 #
-# moraine-duckdb's build.rs fetches DuckDB's C++ headers into
-# target/duckdb-src/<pin>/. clangd background-indexes that tree and parses
-# each header standalone with no include path (DuckDB's own vendored .clangd
-# there points CompilationDatabase at a .cache/clangd dir absent in this
-# layout), producing hundreds of spurious errors for third-party code no one
-# edits. This fragment applies only to files under target/ and silences them:
-# Suppress hides every diagnostic, and -ferror-limit=0 stops clang emitting
+# clangd background-indexes and standalone-parses C++ under these paths, none
+# of it first-party source we edit and none with a compile database clangd can
+# use — so it emits hundreds of spurious diagnostics:
+#   - duckdb/, extension-ci-tools/  : the build-toolchain submodules
+#   - build/                        : the toolchain's DuckDB + extension build tree
+#   - target/                       : cargo output and cached third-party checkouts
+# This fragment suppresses every diagnostic under them; -ferror-limit=0 stops
 # the one "too many errors" banner that Suppress cannot reach.
 #
 # PathMatch is a regex against the path relative to this file's directory, so
-# it has no leading slash — `(.*/)?target/.*`, not `.*/target/.*`.
+# it has no leading slash — `(.*/)?duckdb/.*`, not `.*/duckdb/.*`. The
+# segment-boundary form keeps crates/moraine-duckdb (whose diagnostics we
+# want) from matching.
 If:
-  PathMatch: (.*/)?target/.*
+  PathMatch:
+    - (.*/)?duckdb/.*
+    - (.*/)?extension-ci-tools/.*
+    - (.*/)?build/.*
+    - (.*/)?target/.*
 CompileFlags:
   Add: [-ferror-limit=0]
 Diagnostics:

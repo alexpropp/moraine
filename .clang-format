@@ -1,0 +1,31 @@
+# Matches DuckDB's own C++ style (duckdb/.clang-format) so the shim formats
+# identically to upstream. clang-format/clangd only search upward, so this
+# lives at the repo root to cover crates/moraine-duckdb/cpp/.
+BasedOnStyle: LLVM
+Language: Cpp
+SortIncludes: false
+TabWidth: 4
+IndentWidth: 4
+UseTab: ForIndentation
+ColumnLimit: 120
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Inline
+AllowShortLoopsOnASingleLine: false
+DerivePointerAlignment: false
+PointerAlignment: Right
+AlignConsecutiveMacros: true
+AlignTrailingComments: true
+AlignAfterOpenBracket: Align
+AllowAllArgumentsOnNextLine: true
+AllowAllConstructorInitializersOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+SpaceBeforeCpp11BracedList: true
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpacesInAngles: false
+SpacesInCStyleCastParentheses: false
+SpacesInConditionalStatement: false
+AlwaysBreakTemplateDeclarations: Yes
+IncludeBlocks: Regroup
+KeepEmptyLinesAtTheStartOfBlocks: false

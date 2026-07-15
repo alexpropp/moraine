@@ -1,13 +1,11 @@
 # moraine-duckdb
 
-The DuckDB extension surface for [moraine](../moraine). Three layers:
-`cpp/` (a C++ shim linking DuckDB's internal C++ API), `src/` (the Rust C-ABI
-core, sync↔async bridge), and DuckDB's own `src/include/` header tree
-(fetched and cached by `build.rs` under `target/duckdb-src/`, not committed
-— see "Where the headers come from" below). The shim carries no DuckLake
-domain logic — see the crate root docs and RFC 0006.
+The DuckDB extension surface for [moraine](../moraine). Two layers:
+`cpp/` (a C++ shim linking DuckDB's internal C++ API) and `src/` (the Rust
+C-ABI core, sync↔async bridge). The shim carries no DuckLake domain logic —
+see the crate root docs and RFC 0006.
 
-The cdylib registers a `duckdb::StorageExtension` under attach type
+The extension registers a `duckdb::StorageExtension` under attach type
 `moraine`, reachable two ways:
 
 - **Primary path — `ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH
@@ -31,247 +29,73 @@ DDL issued directly against a user schema/table (outside DuckLake's own
 `ducklake_*` writes), plus querying a view's definition, raises
 `NotImplementedException`.
 
-## Pin
+## How it is built
 
-The pin's single source is the repo-root `DUCKDB_VERSION` file, read by
-both `build.rs` (headers + amalgamation) and xtask (CLI download +
-artifact footer); CI cache keys hash it. Bumping the pin means editing
-that file — plus the hand-maintained references to the version string in
-this README and `compile_flags.txt`.
+moraine-duckdb builds through DuckDB's own extension toolchain
+(`extension-ci-tools`) — the same one the community-extensions repository
+uses. The Rust crate is compiled as a **static library** (`crate-type =
+["staticlib"]`) exporting the C ABI declared in `cpp/moraine_abi.h`; CMake
+compiles the C++ shim, links that static library into it, and statically
+links DuckDB — producing the loadable `moraine.duckdb_extension`. The
+toolchain also writes the extension's metadata footer and, in the community
+pipeline, signs the result. None of the extension↔DuckDB linking lives in
+this crate; there is no `build.rs`.
+
+Two git submodules pin the build:
+
+- `duckdb/` — DuckDB source at tag **v1.5.4**: the shim compiles against its
+  full `src/include/` tree and links its static library.
+- `extension-ci-tools/` — the toolchain (Make + CMake helpers) at the
+  matching **v1.5.4**.
+
+The moraine Rust static library is bridged into CMake with
+[corrosion](https://github.com/corrosion-rs/corrosion) (see the repo-root
+`CMakeLists.txt` and `extension_config.cmake`). Build locally with:
+
+```sh
+make release GEN=ninja   # needs ninja + a Rust toolchain
+```
+
+The loadable lands at `build/release/extension/moraine/moraine.duckdb_extension`
+(gitignored). `cargo xtask e2e` builds it that way and drives it through a
+real DuckDB CLI plus a real `INSTALL ducklake`.
+
+The DuckDB pin has one source per side: the `duckdb` submodule ref (the
+build) and the `duckdb_pin()` constant in `xtask/src/duckdb.rs` (the CLI
+download). Bumping the pin means moving both submodules to the new tag and
+updating that constant.
 
 | What | Pinned at |
 |---|---|
 | DuckDB | **v1.5.4** (git hash `08e34c447b`, codename Variegata) |
-| Header source | `src/include/` from the `duckdb/duckdb` git tag `v1.5.4`, sparse-checked-out by `build.rs` and cached at `target/duckdb-src/v1.5.4/src/include/` (never committed) |
-| Library source | the `libduckdb-src.zip` amalgamation from the same release, compiled once per target by `build.rs` into a static archive cached at `target/duckdb-src/v1.5.4-lib/<target>/` (never committed) — see "Why DuckDB is statically linked" |
+| Toolchain | `duckdb/extension-ci-tools` tag **v1.5.4** |
 | C++ standard | C++17 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
 | DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
 
-## Installing a released build
+## Installing
 
-Release assets are unsigned: DuckDB verifies extension signatures only
-against its own core/community keys, so a self-distributed build must be
-loaded with signature checks off.
+Once moraine is published to the DuckDB community-extensions repository,
+installing verifies DuckDB's own signature — no flags needed:
 
-1. Download the asset for your platform and the pinned DuckDB release
-   from the GitHub release, e.g. `moraine_duckdb-v1.5.4-osx_arm64.zip`.
-2. Unzip. The archive holds `moraine_duckdb.duckdb_extension`; the
-   filename is load-bearing (DuckDB derives the entry symbol from it).
-3. Load with signature checks off:
-
-   ```sh
-   duckdb -unsigned -c "LOAD './moraine_duckdb.duckdb_extension';"
-   ```
-
-The same artifact tree is produced locally by `cargo xtask package`
-(`dist/<duckdb_version>/<platform>/`).
-
-## Where the headers come from
-
-This crate compiles against DuckDB's **full `src/include/` source tree**,
-not the amalgamated `duckdb.hpp`. The amalgamation cannot express DuckDB's
-SQL parser types (`TableFunctionRef` and anything built on it, e.g.
-`TableFunctionBindInput`) — the parser's headers form a separate,
-non-amalgamated tree — so constructs that need them (calling a registered
-`TableFunction`'s `.bind` directly, the way DuckLake and the built-in RDBMS
-scanners do; binding a view's defining query) cannot compile against it. In
-the full tree every internal header exists as its own file at its own real
-path (`duckdb/parser/tableref/table_function_ref.hpp`,
-`duckdb/storage/storage_extension.hpp`, etc.), so nothing is
-forward-declared-only and no hand-vendoring is needed.
-
-**Acquisition: git sparse checkout, not the release tarball.** The tagged
-source (`https://github.com/duckdb/duckdb/archive/refs/tags/v1.5.4.tar.gz`)
-is 101 MB compressed; `src/include/` alone is 8.8 MB across 1,555 files and
-the shim needs nothing outside it (every header reachable from `cpp/*.cpp`'s
-includes resolves inside `src/include/duckdb/...`, with no `third_party/` on
-the include path). So `build.rs` fetches only that subtree, via a blobless
-partial clone plus a sparse checkout:
-
-```
-git clone --filter=blob:none --no-checkout --depth 1 --branch v1.5.4 \
-    https://github.com/duckdb/duckdb.git target/duckdb-src/v1.5.4
-git -C target/duckdb-src/v1.5.4 sparse-checkout set src/include
-git -C target/duckdb-src/v1.5.4 checkout v1.5.4
+```sql
+INSTALL moraine FROM community;
+LOAD moraine;
 ```
 
-Cost: ~3.8 MB of git objects + 8.8 MB checked out, under 3 seconds.
-`build.rs`'s `ensure_duckdb_headers` runs this once and skips to the cached
-path on every later build. The cache sanity check is
-`duckdb/storage/storage_extension.hpp` existing under the checked-out
-`src/include/` — a file only the full tree has (the amalgamation asset also
-ships a file named `duckdb.hpp`, so checking for that name alone would
-accept an amalgamation-shaped cache and fail confusingly at compile time; an
-unrecognized cache shape is wiped and re-fetched). If `git` can't reach
-GitHub, the build fails with an offline-friendly message naming what to
-pre-populate: the `src/include/` directory of a `duckdb/duckdb` checkout at
-tag `v1.5.4` — **not** `libduckdb-src.zip`, which is the single-file
-amalgamation used separately as the statically linked library source (see
-"Why DuckDB is statically linked"). Nothing under `target/` is committed.
+Until then — or to load a locally built artifact — load the unsigned
+loadable directly with signature checks off. The CLI must be *started* with
+`-unsigned`; the setting cannot be changed on a running database:
 
-**CI network surface.** Because the header fetch happens in `build.rs`,
-*every* CI job that compiles `moraine-duckdb` — clippy, test, doc, e2e —
-needs `git` and network access to github.com whenever `target/duckdb-src/`
-is cold or was pruned from the job's cache. Noted as a comment on the
-affected jobs in `.github/workflows/ci.yml`.
+```sh
+duckdb -unsigned -c "LOAD './build/release/extension/moraine/moraine.duckdb_extension';"
+```
 
-The only source change the full tree required over the old vendored
-amalgamation was that `cpp/catalog.hpp` / `cpp/transaction_manager.hpp`
-`#include` headers by their real `duckdb/...` subpaths (e.g.
-`#include "duckdb/storage/storage_extension.hpp"`). Views still can't bind
-their defining query: `duckdb::Parser` (needed to turn a view's SQL text
-back into an AST) is present in the full tree but unused here.
-`MoraineViewEntry::GetQuery`/`BindView` override the base's `return *query;`
-(which would null-deref, since no parsed query is stored) to throw
-`NotImplementedException` — an intentional boundary.
-
-## Extension entry-point contract (v1.5.4, C++ ABI)
-
-Derived from `ExtensionHelper::LoadExternalExtensionInternal` and
-`ExtensionHelper::ParseExtensionMetaData` in the amalgamated `duckdb.cpp`:
-
-- The loader `dlopen()`s the file (`RTLD_NOW | RTLD_LOCAL`) and calls
-  `dlsym` for **`<filebase>_duckdb_cpp_init`**, where `filebase` is the
-  artifact's filename with **every** `.`-suffix stripped (`FileSystem::
-  ExtractBaseName` splits on `.` and takes the first component) — so the
-  artifact must be named with exactly one dot, e.g.
-  `moraine_duckdb.duckdb_extension` → entry symbol
-  `moraine_duckdb_duckdb_cpp_init`.
-- The symbol's signature is `void(duckdb::ExtensionLoader &)`
-  (`typedef void (*ext_init_fun_t)(ExtensionLoader &);`). It must call
-  nothing that throws past the loader without being an intentional init
-  failure; `loader.FinalizeLoad()` runs automatically after the function
-  returns.
-- The symbol must sit in the shared object's **dynamic** symbol table, and
-  on ELF rustc's cdylib link emits a version script binding every symbol it
-  doesn't own to `local` — no additive linker flag
-  (`--export-dynamic-symbol`, `--dynamic-list`, `--undefined`) overrides
-  that wildcard, and a second `--version-script` is rejected outright. So
-  the entry point is defined in **Rust** (`src/entrypoint.rs`,
-  `#[no_mangle]`, exported by rustc on every platform) and forwards the
-  `ExtensionLoader *` to the C++ shim's registration function
-  (`moraine_duckdb_register` in `cpp/extension.cpp`), which stays
-  unexported. A C++-side export works on macOS only because ld64's
-  `-exported_symbol` *adds* to the export list — that asymmetry keeps the
-  local gate green while every Linux CI load fails at `dlsym`.
-- A file loaded via `LOAD '<path>'` (full path) **must** end in literally
-  `.duckdb_extension` or the loader rejects it before even opening it.
-- **512-byte metadata footer**, appended to the end of the file
-  (`ParsedExtensionMetaData::FOOTER_SIZE = 512`,
-  `SIGNATURE_SIZE = 256`). Byte layout, ascending offset from
-  `file_size - 512` (source-derived from `ParseExtensionMetaData`'s reversed
-  8×32-byte field read, cross-checked against DuckDB's own
-  `scripts/append_metadata.cmake`):
-
-  | Offset (within footer) | Size | Content |
-  |---|---|---|
-  | `[0, 96)` | 96 B | reserved, zero |
-  | `[96, 128)` | 32 B | ABI type: `"CPP"` |
-  | `[128, 160)` | 32 B | extension's own version string (free-form) |
-  | `[160, 192)` | 32 B | DuckDB version this was built for: `"v1.5.4"` (must equal `DUCKDB_VERSION` exactly for the CPP ABI — checked byte-for-byte) |
-  | `[192, 224)` | 32 B | target platform, e.g. `"osx_arm64"` (from `DuckDB::Platform()`, empirically confirmed via `PRAGMA platform;`) |
-  | `[224, 256)` | 32 B | magic value `"4"` (zero-padded; `ParsedExtensionMetaData::EXPECTED_MAGIC_VALUE`) |
-  | `[256, 512)` | 256 B | signature (crypto). All-zero is fine when unsigned extensions are allowed — this region is only read when `allow_unsigned_extensions = false`. |
-
-  Each 32-byte field is UTF-8, NUL-padded on the right. The WASM-only custom
-  section header that DuckDB's build tooling additionally prepends
-  (`append_metadata.cmake`'s `duckdb_signature` LEB128-length wrapper) is
-  irrelevant for native loading — `ParseExtensionMetaData(FileHandle&)` reads
-  only the trailing 512 bytes regardless of what precedes them, so it's
-  omitted here.
-
-- **`allow_unsigned_extensions`**: the metadata-footer version/platform
-  fields and the crypto signature are only enforced when this setting is
-  `false` (the default). It can only be set at process startup, **not** at
-  runtime (`SET allow_unsigned_extensions=true` after the database is
-  running fails with `Cannot change allow_unsigned_extensions setting while
-  database is running`) — the CLI must be started with `duckdb -unsigned`.
-  Even with unsigned extensions allowed, a version/platform mismatch still
-  throws *unless* `allow_extensions_metadata_mismatch` is also set — we
-  don't rely on that escape valve since our footer values are exact.
-
-## How the C++ shim compiles (`build.rs`)
-
-`build.rs`'s `ensure_duckdb_headers` runs first (fetching/caching
-`target/duckdb-src/v1.5.4/src/include/` per "Where the headers come from"
-above), then `ensure_duckdb_static_archive` (below), then compiles with
-the `cc` crate (`cc::Build`), `cpp(true)`, `-std=c++17`, two include paths
-(the fetched `src/include/`, and `cpp`), every `.cpp` source file under
-`cpp/` (`extension.cpp`, `storage_extension.cpp`, `catalog.cpp`,
-`metadata_tables.cpp`, `scan.cpp`, `staged_write.cpp`,
-`transaction_manager.cpp`), producing one static archive linked into this
-crate's `cdylib` alongside the DuckDB archive. The C ABI functions the
-shim calls (`moraine_attach`, `moraine_snapshot`, …) are ordinary
-same-binary Rust symbols resolved by the normal link step.
-
-The shim's own compile stays a few seconds; the one-time DuckDB
-amalgamation compile below is the slow step, paid once per machine per
-target and cached under `target/` thereafter.
-
-**Why DuckDB is statically linked.** A loadable extension is `dlopen`'d
-into a host process (the DuckDB CLI, or any embedding application), and
-the shim's ~185 undefined `duckdb::` symbols resolve only if that host
-*exports* its C++ internals. The macOS release CLI does (23k+ `duckdb::`
-symbols in its export table) — but the stock Linux release CLI is
-statically linked without `-rdynamic`: its `.dynsym` carries ~450 entries,
-none of them DuckDB's own classes, and no `libduckdb.so` ships in the
-release zip. An extension that defers DuckDB symbol resolution to `dlopen`
-time (the earlier `-undefined dynamic_lookup` approach) can therefore never
-load into the stock Linux CLI — it dies with `undefined symbol:
-_ZTVN6duckdb18SchemaCatalogEntryE`. Official DuckDB C++ extensions carry
-their own copy of DuckDB's internals (`httpfs.duckdb_extension` for
-linux_amd64 v1.5.4 has **zero** undefined `duckdb::` symbols and ~11k
-defined ones in 21 MB), so this crate does the same: `build.rs` downloads
-the pinned release's `libduckdb-src.zip` (the single-file *library*
-amalgamation: `duckdb.cpp` + `duckdb.hpp`), compiles `duckdb.cpp` once per
-target triple with fixed flags (`-O1`, `NDEBUG` to match the release CLI,
-no debug info — profile-independent, so debug and release builds share it),
-and caches the archive at `target/duckdb-src/v1.5.4-lib/<target>/`. `-O1`
-rather than `-O2` because gcc at `-O2` on this one giant translation unit
-peaks past a 16 GB CI runner's memory alongside parallel rustc jobs (exit
-143 in every compiling CI job); optimization level does not affect the ABI.
-Note the split: the *headers* the shim compiles against come from the full
-`src/include/` tree (the amalgamation's single header cannot express the
-parser types the shim needs); the amalgamation supplies only the linked
-*definitions*. Same pinned version on both sides, so the symbols agree.
-
-Objects cross the extension↔host boundary by pointer (DuckDB hands the shim
-an `ExtensionLoader &`, catalog entries, etc.): host objects carry host
-vtables, the extension's carry its own, and both are layouts of the same
-pinned version compiled for the same platform — the version pin is what
-makes the mix sound.
-
-**Link-time constraints:**
-
-1. Nothing in the Rust crate *calls* most of the C++ shim (only the entry
-   point's forward target), so the linker would drop unreferenced archive
-   members. Fix: `-Wl,-force_load,<shim-archive>` (ld64) /
-   `-Wl,--whole-archive,<shim-archive>,--no-whole-archive` (GNU ld)
-   forces the whole shim archive in. The DuckDB archive is deliberately
-   *not* force-loaded — it is one giant member that the shim's references
-   pull in lazily.
-2. Each archive must appear on the link line exactly once. `cc`'s
-   `compile()` normally emits `cargo:rustc-link-lib=static=…`, adding a
-   second, *lazy* mention of the same archive ahead of the force-load one.
-   lld resolves cross-member references (e.g. `catalog.o` calling
-   `MoraineScanFunction` in `scan.o`) by fetching members from the lazy
-   mention while it is still force-loading the other, defining every
-   cross-referenced symbol twice — a hard error. ld64 tolerates the double
-   mention, so this only bit on Linux, and only once the shim grew beyond
-   one `.cpp` file. Fix: `cargo_metadata(false)` on the `cc::Build`, plus
-   linking the C++ standard library by hand (`-lc++`/`-lstdc++`), which
-   that metadata had been contributing.
-3. The extension entry point cannot be exported from C++ on ELF (see
-   "Extension entry-point contract" above) — the entry point lives in
-   `src/entrypoint.rs` as `#[no_mangle]` Rust, which rustc exports on every
-   platform, so no export-related linker flag exists on either OS.
-
-`build.rs` branches on `CARGO_CFG_TARGET_OS` (the *target* platform —
-`cfg!(target_os)` in a build script would describe the host, which is
-wrong under cross-compilation); the macOS and Linux branches are both
-exercised by the e2e suite. Any other target OS gets a `cargo:warning` at
-build time stating extension linkage is unverified there.
+The loadable's base filename (`moraine`) is load-bearing: DuckDB derives the
+entry symbol (`moraine_duckdb_cpp_init`, defined in
+`cpp/moraine_extension.cpp`) from the filename before the first `.`. A
+version/platform mismatch against the running DuckDB is rejected even when
+unsigned.
 
 ## Obtaining a DuckDB v1.5.4 CLI for testing
 
@@ -285,9 +109,9 @@ https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-arm64
 # (+ windows-amd64/arm64, and -musl variants for linux)
 ```
 
-Cached under `target/duckdb-cli/` (gitignored, never committed). The header
-source is fetched separately, from a git tag rather than a release asset —
-see "Where the headers come from" above.
+Cached under `target/duckdb-cli/` (gitignored, never committed). The CLI is
+downloaded from a release asset; the DuckDB *source* the extension builds
+against comes from the `duckdb` submodule, not this download.
 
 ## Obtaining the DuckLake extension
 

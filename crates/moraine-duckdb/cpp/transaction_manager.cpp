@@ -31,12 +31,12 @@ MoraineTransaction::~MoraineTransaction() {
 MoraineTxHandle *MoraineTransaction::StagedTx() {
 	if (staged_tx_ == nullptr) {
 		MoraineTxHandle *tx = nullptr;
-		MoraineError err{};
+		MoraineError err {};
 		// The owning client context, when still alive, makes the head read
 		// cancellable; a gone context degrades to a non-cancellable call.
 		auto client = context.lock();
-		auto code = moraine_tx_begin(catalog_handle_, &tx,
-		                              client ? moraine_shim_is_interrupted : nullptr, client.get(), &err);
+		auto code =
+		    moraine_tx_begin(catalog_handle_, &tx, client ? moraine_shim_is_interrupted : nullptr, client.get(), &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
 		}
@@ -88,7 +88,7 @@ MoraineTransactionManager::Create(duckdb::optional_ptr<duckdb::StorageExtensionI
 
 duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientContext &context) {
 	MoraineSnapshotHandle *snapshot = nullptr;
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_snapshot(catalog_.Handle(), &snapshot, moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -101,7 +101,8 @@ duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientC
 	return transaction_ref;
 }
 
-duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientContext &, duckdb::Transaction &transaction) {
+duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientContext &,
+                                                               duckdb::Transaction &transaction) {
 	// A staged tx (opened lazily by the first write this DuckDB
 	// transaction made) is taken out from under the lock and committed
 	// after releasing it — moraine_tx_commit blocks on store I/O, which
@@ -127,7 +128,7 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 		return duckdb::ErrorData();
 	}
 	uint64_t new_snapshot_id = 0;
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_tx_commit(staged, &new_snapshot_id, &err);
 	if (code != MORAINE_OK) {
 		try {

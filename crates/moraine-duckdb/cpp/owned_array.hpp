@@ -7,7 +7,8 @@
 
 namespace moraine_duckdb {
 
-template <typename T> class OwnedArray {
+template <typename T>
+class OwnedArray {
 public:
 	explicit OwnedArray(void (*free_fn)(T *, size_t)) : items_(nullptr), len_(0), free_fn_(free_fn) {
 	}

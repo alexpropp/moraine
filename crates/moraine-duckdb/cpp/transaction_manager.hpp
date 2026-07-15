@@ -24,7 +24,7 @@ class MoraineCatalog;
 class MoraineTransaction : public duckdb::Transaction {
 public:
 	MoraineTransaction(duckdb::TransactionManager &manager, duckdb::ClientContext &context,
-	                    MoraineSnapshotHandle *snapshot, MoraineCatalogHandle *catalog_handle);
+	                   MoraineSnapshotHandle *snapshot, MoraineCatalogHandle *catalog_handle);
 	~MoraineTransaction() override;
 
 	MoraineSnapshotHandle *Snapshot() const {

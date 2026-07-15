@@ -10,17 +10,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+# A static library the DuckDB extension toolchain links into the loadable
+# `.duckdb_extension` (the toolchain, not cargo, owns the final link).
+crate-type = ["staticlib"]
 
 [dependencies]
 arrow = { workspace = true, features = ["ffi", "ipc"] }
 moraine = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
-
-[build-dependencies]
-anyhow = { workspace = true }
-cc = { workspace = true }
 
 [lints]
 workspace = true

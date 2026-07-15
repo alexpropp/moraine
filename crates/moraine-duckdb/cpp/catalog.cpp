@@ -29,7 +29,7 @@ duckdb::LogicalType BuildColumnType(const MoraineColumnDesc &column,
                                     const std::unordered_map<uint64_t, const MoraineColumnDesc *> &by_id,
                                     const std::unordered_map<uint64_t, std::vector<uint64_t>> &children_of) {
 	auto child_ids = children_of.find(column.id);
-	auto children = child_ids == children_of.end() ? std::vector<uint64_t>{} : child_ids->second;
+	auto children = child_ids == children_of.end() ? std::vector<uint64_t> {} : child_ids->second;
 
 	if (duckdb::StringUtil::CIEquals(column.sql_type, "list")) {
 		if (children.size() != 1) {
@@ -175,8 +175,7 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 }
 
 MoraineTableEntry::MoraineTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
-                                     duckdb::CreateTableInfo &info, MoraineSnapshotHandle *snapshot,
-                                     uint64_t table_id)
+                                     duckdb::CreateTableInfo &info, MoraineSnapshotHandle *snapshot, uint64_t table_id)
     : duckdb::TableCatalogEntry(catalog, schema, info), snapshot_(snapshot), table_id_(table_id) {
 }
 
@@ -186,7 +185,7 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineTableEntry::GetStatistics(duck
 }
 
 duckdb::TableFunction MoraineTableEntry::GetScanFunction(duckdb::ClientContext &context,
-                                                          duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
+                                                         duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	// Binds unconditionally (so DESCRIBE/EXPLAIN work); the scan itself
 	// always redirects to DuckLake at execution time — see scan.hpp.
 	auto scan_bind_data = duckdb::make_uniq<MoraineScanBindData>();
@@ -238,18 +237,17 @@ void MoraineSchemaEntry::EnsureTablesLoaded() {
 	}
 
 	OwnedArray<MoraineTableDesc> table_descs(moraine_snapshot_tables_in_free);
-	MoraineError err{};
-	auto code =
-	    moraine_snapshot_tables_in(snapshot_, schema_id_, table_descs.OutItems(), table_descs.OutLen(), &err);
+	MoraineError err {};
+	auto code = moraine_snapshot_tables_in(snapshot_, schema_id_, table_descs.OutItems(), table_descs.OutLen(), &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
 
 	for (auto &table_desc : table_descs) {
 		OwnedArray<MoraineColumnDesc> column_descs(moraine_snapshot_columns_of_free);
-		MoraineError column_err{};
+		MoraineError column_err {};
 		auto column_code = moraine_snapshot_columns_of(snapshot_, table_desc.id, column_descs.OutItems(),
-		                                                column_descs.OutLen(), &column_err);
+		                                               column_descs.OutLen(), &column_err);
 		if (column_code != MORAINE_OK) {
 			ThrowMoraineError(column_err);
 		}
@@ -303,7 +301,7 @@ void MoraineSchemaEntry::EnsureViewsLoaded() {
 	}
 
 	OwnedArray<MoraineViewDesc> view_descs(moraine_snapshot_views_in_free);
-	MoraineError err{};
+	MoraineError err {};
 	auto code = moraine_snapshot_views_in(snapshot_, schema_id_, view_descs.OutItems(), view_descs.OutLen(), &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -341,8 +339,8 @@ void MoraineSchemaEntry::Scan(duckdb::CatalogType type, const std::function<void
 	// Every other CatalogType has nothing to enumerate.
 }
 
-duckdb::optional_ptr<duckdb::CatalogEntry>
-MoraineSchemaEntry::LookupEntry(duckdb::CatalogTransaction transaction, const duckdb::EntryLookupInfo &lookup_info) {
+duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::LookupEntry(duckdb::CatalogTransaction transaction,
+                                                                           const duckdb::EntryLookupInfo &lookup_info) {
 	auto type = lookup_info.GetCatalogType();
 	auto &name = lookup_info.GetEntryName();
 	if (type == duckdb::CatalogType::TABLE_ENTRY) {
@@ -384,8 +382,8 @@ MoraineSchemaEntry::LookupEntry(duckdb::CatalogTransaction transaction, const du
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateIndex(duckdb::CatalogTransaction transaction,
-                                                                          duckdb::CreateIndexInfo &info,
-                                                                          duckdb::TableCatalogEntry &table) {
+                                                                           duckdb::CreateIndexInfo &info,
+                                                                           duckdb::TableCatalogEntry &table) {
 	throw duckdb::NotImplementedException("moraine: creating an index is not supported (read-only catalog)");
 }
 
@@ -395,7 +393,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateFunction(du
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckdb::CatalogTransaction transaction,
-                                                                          duckdb::BoundCreateTableInfo &info) {
+                                                                           duckdb::BoundCreateTableInfo &info) {
 	auto &table_name = info.Base().table;
 	auto &moraine_catalog = ParentCatalog().Cast<MoraineCatalog>();
 
@@ -441,18 +439,17 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateView(duckdb::CatalogTransaction transaction,
-                                                                         duckdb::CreateViewInfo &info) {
+                                                                          duckdb::CreateViewInfo &info) {
 	throw duckdb::NotImplementedException("moraine: creating a view is not supported (read-only catalog)");
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateSequence(duckdb::CatalogTransaction transaction,
-                                                                             duckdb::CreateSequenceInfo &info) {
+                                                                              duckdb::CreateSequenceInfo &info) {
 	throw duckdb::NotImplementedException("moraine: creating a sequence is not supported (read-only catalog)");
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry>
-MoraineSchemaEntry::CreateTableFunction(duckdb::CatalogTransaction transaction,
-                                        duckdb::CreateTableFunctionInfo &info) {
+MoraineSchemaEntry::CreateTableFunction(duckdb::CatalogTransaction transaction, duckdb::CreateTableFunctionInfo &info) {
 	throw duckdb::NotImplementedException("moraine: creating a table function is not supported (read-only catalog)");
 }
 
@@ -467,13 +464,13 @@ MoraineSchemaEntry::CreatePragmaFunction(duckdb::CatalogTransaction transaction,
 	throw duckdb::NotImplementedException("moraine: creating a pragma function is not supported (read-only catalog)");
 }
 
-duckdb::optional_ptr<duckdb::CatalogEntry>
-MoraineSchemaEntry::CreateCollation(duckdb::CatalogTransaction transaction, duckdb::CreateCollationInfo &info) {
+duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateCollation(duckdb::CatalogTransaction transaction,
+                                                                               duckdb::CreateCollationInfo &info) {
 	throw duckdb::NotImplementedException("moraine: creating a collation is not supported (read-only catalog)");
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateType(duckdb::CatalogTransaction transaction,
-                                                                         duckdb::CreateTypeInfo &info) {
+                                                                          duckdb::CreateTypeInfo &info) {
 	throw duckdb::NotImplementedException("moraine: creating a type is not supported (read-only catalog)");
 }
 
@@ -487,9 +484,9 @@ void MoraineSchemaEntry::DropEntry(duckdb::ClientContext &context, duckdb::DropI
 		if (auto parsed = ParseInlinedDataTableName(info.name)) {
 			auto catalog_transaction = catalog.GetCatalogTransaction(context);
 			auto &moraine_tx = catalog_transaction.transaction->Cast<MoraineTransaction>();
-			MoraineError err{};
+			MoraineError err {};
 			auto code = moraine_tx_stage_inline_schema_drop(moraine_tx.StagedTx(), parsed->table_id,
-			                                                 parsed->schema_version, &err);
+			                                                parsed->schema_version, &err);
 			if (code != MORAINE_OK) {
 				ThrowMoraineError(err);
 			}
@@ -520,7 +517,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
                                                            const std::string &, duckdb::AttachInfo &info,
                                                            duckdb::AttachOptions &options) {
 	MoraineCatalogHandle *handle = nullptr;
-	MoraineError err{};
+	MoraineError err {};
 	// DuckDB resolves the attach's `READ_ONLY` flag into this access mode
 	// (including through DuckLake's nested metadata attach); a read-only
 	// catalog opens a `DbReader` and never fences the writer.
@@ -560,7 +557,7 @@ std::string MoraineCatalog::GetCatalogType() {
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> MoraineCatalog::CreateSchema(duckdb::CatalogTransaction transaction,
-                                                                       duckdb::CreateSchemaInfo &info) {
+                                                                        duckdb::CreateSchemaInfo &info) {
 	throw duckdb::NotImplementedException("moraine: creating a schema is not supported (read-only catalog)");
 }
 
@@ -574,7 +571,7 @@ MoraineCatalog::LookupSchema(duckdb::CatalogTransaction transaction, const duckd
 
 	if (!tx.SchemasLoaded()) {
 		OwnedArray<MoraineSchemaDesc> schema_descs(moraine_snapshot_schemas_free);
-		MoraineError err{};
+		MoraineError err {};
 		auto code = moraine_snapshot_schemas(tx.Snapshot(), schema_descs.OutItems(), schema_descs.OutLen(), &err);
 		if (code != MORAINE_OK) {
 			ThrowMoraineError(err);
@@ -583,7 +580,7 @@ MoraineCatalog::LookupSchema(duckdb::CatalogTransaction transaction, const duckd
 			duckdb::CreateSchemaInfo info;
 			info.schema = schema_desc.name;
 			tx.PutSchema(schema_desc.id,
-			              duckdb::make_uniq<MoraineSchemaEntry>(*this, info, tx.Snapshot(), schema_desc.id));
+			             duckdb::make_uniq<MoraineSchemaEntry>(*this, info, tx.Snapshot(), schema_desc.id));
 		}
 		tx.SetSchemasLoaded();
 	}

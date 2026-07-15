@@ -52,7 +52,7 @@ struct MetadataTableSpec;
 // execution time — the operator itself is stateless, per DuckDB's Sink
 // convention.
 duckdb::PhysicalOperator &PlanMetadataInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
-                                              const MetadataTableSpec &spec);
+                                             const MetadataTableSpec &spec);
 
 // The UPDATE operator, same Sink+Source shape. Exactly two UPDATE forms
 // are translatable — the only two DuckLake issues against its metadata
@@ -66,7 +66,7 @@ duckdb::PhysicalOperator &PlanMetadataInsert(duckdb::PhysicalPlanGenerator &plan
 //   applies as the in-place overwrite unversioned kinds define.
 // Anything else throws NotImplementedException at plan time.
 duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalUpdate &op,
-                                              const MetadataTableSpec &spec);
+                                             const MetadataTableSpec &spec);
 
 // The DELETE operator, same Sink+Source shape. Translatable only for the
 // three unversioned statistics kinds (`spec.delete_key_columns`
@@ -74,6 +74,6 @@ duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &plan
 // DELETE against a versioned kind (snapshot-expiry cleanup, deferred this
 // slice) throws NotImplementedException at plan time.
 duckdb::PhysicalOperator &PlanMetadataDelete(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalDelete &op,
-                                              const MetadataTableSpec &spec);
+                                             const MetadataTableSpec &spec);
 
 } // namespace moraine_duckdb

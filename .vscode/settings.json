@@ -1,11 +1,37 @@
 {
   "files.insertFinalNewline": true,
   "files.trimTrailingWhitespace": true,
+  // Keep the build-toolchain submodules out of the explorer, search, file
+  // watcher, and any C/C++ browse index. Segment-exact, so crates/moraine-duckdb
+  // is unaffected. clangd diagnostics for them are silenced by the repo-root
+  // .clangd; these merge with (don't replace) VS Code's built-in excludes.
+  "files.exclude": {
+    "**/duckdb": true,
+    "**/extension-ci-tools": true
+  },
+  "search.exclude": {
+    "**/duckdb": true,
+    "**/extension-ci-tools": true
+  },
+  "files.watcherExclude": {
+    "**/duckdb/**": true,
+    "**/extension-ci-tools/**": true
+  },
   "[rust]": {
     "editor.defaultFormatter": "rust-lang.rust-analyzer",
     "editor.formatOnSave": true,
     "editor.tabSize": 4,
     "editor.rulers": [100]
+  },
+  // Format C/C++ on save via clangd (uses the repo-root .clang-format).
+  // Requires the clangd extension (recommended in extensions.json).
+  "[cpp]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true
+  },
+  "[c]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true
   },
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.cargo.features": "all",

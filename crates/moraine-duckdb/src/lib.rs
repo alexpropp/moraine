@@ -2,8 +2,9 @@
 //! catalog. Three layers, thin by policy — no DuckLake domain logic lives
 //! outside the core crate:
 //!
-//! 1. a **C++ shim** (`cpp/*.cpp`, compiled by `build.rs`) links DuckDB's
-//!    internal C++ API and registers a `StorageExtension`;
+//! 1. a **C++ shim** (`cpp/*.cpp`, compiled by the DuckDB extension
+//!    toolchain) links DuckDB's internal C++ API and registers a
+//!    `StorageExtension`;
 //! 2. a **C ABI** (the [`abi`] module, mirrored by hand in
 //!    `cpp/moraine_abi.h`) marshals calls across the language boundary and
 //!    owns the sync↔async bridge — one tokio runtime per attached catalog,
@@ -47,7 +48,6 @@
 pub mod abi;
 pub mod arrow_ipc;
 pub mod dumps;
-pub mod entrypoint;
 pub mod error;
 pub mod inline;
 pub mod runtime;

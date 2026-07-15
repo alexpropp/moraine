@@ -88,23 +88,22 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 // (`inline/schema`), against which the body-only chunk decodes. Throws
 // InternalException on malformed bytes or a column count mismatch against
 // `user_types`.
-std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context,
-                                                                const uint8_t *schema_ipc, size_t schema_ipc_len,
-                                                                const uint8_t *data, size_t len,
-                                                                const std::vector<duckdb::LogicalType> &user_types);
+std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context, const uint8_t *schema_ipc,
+                                                              size_t schema_ipc_len, const uint8_t *data, size_t len,
+                                                              const std::vector<duckdb::LogicalType> &user_types);
 
 // A synthesized `ducklake_inlined_data_<t>_<v>` entry: columns are
 // `(row_id, begin_snapshot, end_snapshot, <user columns>)`.
 class MoraineInlineDataTableEntry : public duckdb::TableCatalogEntry {
 public:
 	MoraineInlineDataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
-	                             duckdb::CreateTableInfo &info, MoraineCatalogHandle *handle, uint64_t table_id,
-	                             uint64_t schema_version);
+	                            duckdb::CreateTableInfo &info, MoraineCatalogHandle *handle, uint64_t table_id,
+	                            uint64_t schema_version);
 
 	duckdb::unique_ptr<duckdb::BaseStatistics> GetStatistics(duckdb::ClientContext &context,
-	                                                          duckdb::column_t column_id) override;
+	                                                         duckdb::column_t column_id) override;
 	duckdb::TableFunction GetScanFunction(duckdb::ClientContext &context,
-	                                       duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
+	                                      duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
 	duckdb::TableStorageInfo GetStorageInfo(duckdb::ClientContext &context) override;
 
 	uint64_t TableId() const {
@@ -131,12 +130,12 @@ private:
 class MoraineInlineDeleteTableEntry : public duckdb::TableCatalogEntry {
 public:
 	MoraineInlineDeleteTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
-	                               duckdb::CreateTableInfo &info, MoraineCatalogHandle *handle, uint64_t table_id);
+	                              duckdb::CreateTableInfo &info, MoraineCatalogHandle *handle, uint64_t table_id);
 
 	duckdb::unique_ptr<duckdb::BaseStatistics> GetStatistics(duckdb::ClientContext &context,
-	                                                          duckdb::column_t column_id) override;
+	                                                         duckdb::column_t column_id) override;
 	duckdb::TableFunction GetScanFunction(duckdb::ClientContext &context,
-	                                       duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
+	                                      duckdb::unique_ptr<duckdb::FunctionData> &bind_data) override;
 	duckdb::TableStorageInfo GetStorageInfo(duckdb::ClientContext &context) override;
 
 	uint64_t TableId() const {
@@ -155,13 +154,13 @@ private:
 // `user_columns`).
 duckdb::unique_ptr<MoraineInlineDataTableEntry>
 MakeInlineDataTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema, MoraineCatalogHandle *handle,
-                          uint64_t table_id, uint64_t schema_version,
-                          const std::vector<DecodedInlineColumn> &user_columns);
+                         uint64_t table_id, uint64_t schema_version,
+                         const std::vector<DecodedInlineColumn> &user_columns);
 
 duckdb::unique_ptr<MoraineInlineDeleteTableEntry> MakeInlineDeleteTableEntry(duckdb::Catalog &catalog,
-                                                                              duckdb::SchemaCatalogEntry &schema,
-                                                                              MoraineCatalogHandle *handle,
-                                                                              uint64_t table_id);
+                                                                             duckdb::SchemaCatalogEntry &schema,
+                                                                             MoraineCatalogHandle *handle,
+                                                                             uint64_t table_id);
 
 // Recognizes `name` against the store's persisted state and synthesizes
 // the matching entry (see the module doc for each family's existence
@@ -169,9 +168,9 @@ duckdb::unique_ptr<MoraineInlineDeleteTableEntry> MakeInlineDeleteTableEntry(duc
 // pattern but nothing has been staged for it yet — the CREATE path, or an
 // existence-probe DuckLake expects to fail.
 duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientContext &context,
-                                                                 duckdb::Catalog &catalog,
-                                                                 duckdb::SchemaCatalogEntry &schema,
-                                                                 MoraineCatalogHandle *handle, const std::string &name);
+                                                                duckdb::Catalog &catalog,
+                                                                duckdb::SchemaCatalogEntry &schema,
+                                                                MoraineCatalogHandle *handle, const std::string &name);
 
 // Handles `CREATE TABLE [IF NOT EXISTS] ducklake_inlined_data_<t>_<v>(...)`:
 // stages `inline/schema` from `info`'s bound columns (skipping the three
@@ -179,33 +178,33 @@ duckdb::unique_ptr<duckdb::CatalogEntry> LookupInlineTableEntry(duckdb::ClientCo
 // already recorded for `(t, v)` and `on_conflict == IGNORE_ON_CONFLICT`;
 // throws CatalogException if already recorded and `ERROR_ON_CONFLICT`.
 duckdb::unique_ptr<duckdb::CatalogEntry> CreateInlineDataTable(duckdb::ClientContext &context, duckdb::Catalog &catalog,
-                                                                duckdb::SchemaCatalogEntry &schema,
-                                                                MoraineCatalogHandle *handle, MoraineTxHandle *tx,
-                                                                duckdb::BoundCreateTableInfo &info, uint64_t table_id,
-                                                                uint64_t schema_version);
+                                                               duckdb::SchemaCatalogEntry &schema,
+                                                               MoraineCatalogHandle *handle, MoraineTxHandle *tx,
+                                                               duckdb::BoundCreateTableInfo &info, uint64_t table_id,
+                                                               uint64_t schema_version);
 
 // Physical operator builders: a translate-only Sink feeding the inline
 // staged-write ABI, dual-rooted as a Source emitting the one-row `Count`
 // result.
 duckdb::PhysicalOperator &PlanInlineDataInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
-                                                MoraineInlineDataTableEntry &table_entry);
+                                               MoraineInlineDataTableEntry &table_entry);
 
 // The only translatable UPDATE shape: `SET end_snapshot = <v> WHERE
 // row_id = r`. Throws NotImplementedException at plan time for any other
 // SET target.
 duckdb::PhysicalOperator &PlanInlineDataUpdate(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalUpdate &op,
-                                                MoraineInlineDataTableEntry &table_entry);
+                                               MoraineInlineDataTableEntry &table_entry);
 
 // `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <=
 // {flush_snap}` — the flush's chunk-removal step. One
 // `stage_inline_flush_delete` call at the maximum `begin_snapshot` among the
 // deleted rows.
 duckdb::PhysicalOperator &PlanInlineDataDelete(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalDelete &op,
-                                                MoraineInlineDataTableEntry &table_entry);
+                                               MoraineInlineDataTableEntry &table_entry);
 
 // `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id,
 // {snap}), ...` — one `stage_inline_fdel` call per row.
 duckdb::PhysicalOperator &PlanInlineDeleteInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
-                                                  MoraineInlineDeleteTableEntry &table_entry);
+                                                 MoraineInlineDeleteTableEntry &table_entry);
 
 } // namespace moraine_duckdb

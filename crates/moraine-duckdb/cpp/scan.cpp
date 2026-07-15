@@ -49,8 +49,8 @@ bool MoraineScanBindData::Equals(const duckdb::FunctionData &other_p) const {
 duckdb::TableFunction MoraineScanFunction() {
 	// No `bind`/`bind_replace` callback: the sole caller
 	// (MoraineTableEntry::GetScanFunction) already produces complete bind data.
-	auto function = duckdb::TableFunction("moraine_scan", {}, MoraineScanFunctionImpl, nullptr,
-	                                      MoraineScanInitGlobal, nullptr);
+	auto function =
+	    duckdb::TableFunction("moraine_scan", {}, MoraineScanFunctionImpl, nullptr, MoraineScanInitGlobal, nullptr);
 	// Lets `LogicalGet::GetTable()` find the catalog entry behind this scan,
 	// so DESCRIBE/SHOW can read its NOT NULL constraints (otherwise every
 	// column looks nullable).
