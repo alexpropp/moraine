@@ -99,7 +99,22 @@ typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
 // whose stored flag (moraine_catalog_encrypted) is authoritative.
 // `flush_interval_ms` sets the store's WAL flush cadence (bounds
 // per-commit latency); 0 means "not given" and keeps the default.
-int32_t moraine_attach(const char *path, const char *object_store_uri, bool read_only, bool encrypted,
+//
+// `s3` carries S3 credentials for an `s3://` path, sourced from a DuckDB
+// secret. Any field may be NULL/unset, in which case the AWS_* environment
+// supplies it. `use_ssl`: -1 unset, 0 false, 1 true. Pass NULL to use the
+// environment alone; ignored for non-`s3://` paths.
+typedef struct {
+	const char *key_id;
+	const char *secret;
+	const char *region;
+	const char *session_token;
+	const char *endpoint;
+	const char *url_style;
+	int32_t use_ssl;
+} MoraineS3Config;
+
+int32_t moraine_attach(const char *path, const MoraineS3Config *s3, bool read_only, bool encrypted,
                        uint64_t flush_interval_ms, MoraineCatalogHandle **out, MoraineError *err);
 void moraine_detach(MoraineCatalogHandle *handle);
 

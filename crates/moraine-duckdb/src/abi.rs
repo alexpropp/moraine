@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
 };
 
-use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
+use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
@@ -127,29 +127,101 @@ pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: imp
     drop(unsafe { Box::from_raw(raw_slice) });
 }
 
-/// The object store an attach path resolves to: a local filesystem
-/// directory or an in-memory store. Credentialed remote stores are
-/// deferred.
+/// Mirrors the C `MoraineS3Config`: S3 credentials for an `s3://` store,
+/// sourced from a DuckDB secret. Null/empty fields fall back to the AWS_*
+/// environment; `use_ssl` is -1 unset, 0 false, 1 true.
+#[repr(C)]
+pub struct MoraineS3Config {
+    /// AWS access key id.
+    pub key_id: *const c_char,
+    /// AWS secret access key.
+    pub secret: *const c_char,
+    /// AWS region.
+    pub region: *const c_char,
+    /// AWS session token, for temporary credentials.
+    pub session_token: *const c_char,
+    /// Endpoint URL for S3-compatible stores (e.g. MinIO).
+    pub endpoint: *const c_char,
+    /// Addressing style: `"path"` or `"vhost"`.
+    pub url_style: *const c_char,
+    /// TLS toggle: -1 unset, 0 plain HTTP, 1 HTTPS.
+    pub use_ssl: i32,
+}
+
+/// S3 credentials borrowed from a [`MoraineS3Config`]. Every field is
+/// optional; an absent field defers to the AWS_* environment.
+struct S3Creds<'a> {
+    key_id: Option<&'a str>,
+    secret: Option<&'a str>,
+    region: Option<&'a str>,
+    session_token: Option<&'a str>,
+    endpoint: Option<&'a str>,
+    url_style: Option<&'a str>,
+    use_ssl: Option<bool>,
+}
+
+/// Borrows a nullable C string as `Some(&str)`, mapping null, empty, and
+/// non-UTF-8 to `None` — a missing or malformed field defers to the
+/// environment rather than failing the attach.
+///
+/// # Safety
+///
+/// `ptr`, if non-null, must point to a NUL-terminated C string valid for
+/// reads for the duration of this call.
+unsafe fn opt_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract; non-null checked above.
+    let s = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?;
+    (!s.is_empty()).then_some(s)
+}
+
+/// The object store an attach path resolves to.
 enum StoreKind {
-    /// `path` is a directory on the local filesystem, created if absent.
+    /// A directory on the local filesystem, created if absent.
     LocalFile,
-    /// `path` is ignored; a fresh, empty in-memory store.
+    /// A fresh, empty in-memory store.
     Memory,
+    /// An S3 (or S3-compatible) bucket.
+    S3 { bucket: String },
 }
 
 impl StoreKind {
-    fn parse(s: &str) -> Result<Self, AbiError> {
-        match s {
-            "" | "file" => Ok(Self::LocalFile),
-            "memory" => Ok(Self::Memory),
-            other => Err(AbiError::invalid_argument(format!(
-                "moraine_attach: unsupported object_store_uri `{other}` \
-                 (expected `file` or `memory`)"
-            ))),
+    /// Classifies an attach path by scheme, returning the store kind and the
+    /// bucket-relative key prefix (empty for local and in-memory stores).
+    fn from_path(path: &str) -> Result<(Self, String), AbiError> {
+        if let Some(rest) = path.strip_prefix("s3://") {
+            let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+            if bucket.is_empty() {
+                return Err(AbiError::invalid_argument(
+                    "moraine_attach: s3:// URL is missing a bucket",
+                ));
+            }
+            return Ok((
+                Self::S3 {
+                    bucket: bucket.to_string(),
+                },
+                prefix.to_string(),
+            ));
         }
+        for scheme in [
+            "gs://", "gcs://", "azure://", "az://", "http://", "https://",
+        ] {
+            if path.starts_with(scheme) {
+                return Err(AbiError::invalid_argument(format!(
+                    "moraine_attach: unsupported store scheme in `{path}` \
+                     (supported: a local path, `memory://`, or `s3://`)"
+                )));
+            }
+        }
+        if path == "memory://" || path == "memory:" {
+            return Ok((Self::Memory, String::new()));
+        }
+        Ok((Self::LocalFile, String::new()))
     }
 
-    fn open(&self, path: &str) -> Result<Arc<dyn ObjectStore>, AbiError> {
+    fn open(&self, path: &str, s3: Option<&S3Creds>) -> Result<Arc<dyn ObjectStore>, AbiError> {
         match self {
             Self::LocalFile => {
                 std::fs::create_dir_all(path).map_err(|e| {
@@ -165,6 +237,56 @@ impl StoreKind {
                 Ok(Arc::new(fs))
             }
             Self::Memory => Ok(Arc::new(InMemory::new())),
+            Self::S3 { bucket } => {
+                // With a secret, build from ONLY the secret's values so no
+                // ambient AWS environment (endpoint/profile/session token/region
+                // from `~/.aws`, an IMDS provider, …) can leak into the store.
+                // Without a secret, fall back to the environment credential chain.
+                let base = if s3.is_some() {
+                    AmazonS3Builder::new()
+                } else {
+                    AmazonS3Builder::from_env()
+                };
+                let mut builder = base.with_bucket_name(bucket);
+                if let Some(c) = s3 {
+                    if let Some(v) = c.key_id {
+                        builder = builder.with_access_key_id(v);
+                    }
+                    if let Some(v) = c.secret {
+                        builder = builder.with_secret_access_key(v);
+                    }
+                    if let Some(v) = c.region {
+                        builder = builder.with_region(v);
+                    }
+                    if let Some(v) = c.session_token {
+                        builder = builder.with_token(v);
+                    }
+                    // DuckDB's S3 secret defaults `endpoint` to the
+                    // region-less AWS host (`s3.amazonaws.com`) even when the
+                    // user set none. Forwarding that to object_store overrides
+                    // its region-derived endpoint and misroutes every request.
+                    // Only apply a genuinely custom (non-AWS) endpoint; for AWS,
+                    // let object_store derive the endpoint from the region.
+                    if let Some(v) = c.endpoint {
+                        if !v.is_empty() && !v.contains("amazonaws.com") {
+                            builder = builder.with_endpoint(v);
+                        }
+                    }
+                    if c.url_style == Some("path") {
+                        builder = builder.with_virtual_hosted_style_request(false);
+                    }
+                    if c.use_ssl == Some(false) {
+                        builder = builder.with_allow_http(true);
+                    }
+                }
+                let store = builder.build().map_err(|e| {
+                    AbiError::invalid_argument(format!(
+                        "moraine_attach: cannot open s3 bucket `{bucket}`: {e} \
+                         (check the s3 secret or the AWS_* environment)"
+                    ))
+                })?;
+                Ok(Arc::new(store))
+            }
         }
     }
 }
@@ -217,9 +339,11 @@ pub(crate) unsafe fn borrow_bytes<'a>(
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.
 ///
-/// `path` is a local filesystem directory (created if absent) unless
-/// `object_store_uri` selects otherwise. `object_store_uri` may be null
-/// (defaults to `"file"`), `"file"`, or `"memory"`.
+/// `path`'s scheme selects the store: a local filesystem directory
+/// (created if absent) by default, `memory://` for an in-memory store, or
+/// `s3://<bucket>[/<prefix>]` for S3. For an `s3://` path, `s3` supplies
+/// credentials (any field unset falls back to the AWS_* environment); it
+/// may be null to use the environment alone and is ignored otherwise.
 ///
 /// `encrypted` requests DuckLake data-file encryption. Creation-time
 /// only: it is recorded when a fresh store bootstraps and ignored on an
@@ -232,15 +356,15 @@ pub(crate) unsafe fn borrow_bytes<'a>(
 ///
 /// # Safety
 ///
-/// `path` must be a valid NUL-terminated C string. `object_store_uri`
-/// must be null or a valid NUL-terminated C string. `out` must be a
-/// valid, writable `*mut *mut MoraineCatalogHandle`. `err`, if non-null,
-/// must be a valid, writable [`MoraineError`]. All for the duration of
-/// this call.
+/// `path` must be a valid NUL-terminated C string. `s3`, if non-null,
+/// must point to a valid [`MoraineS3Config`] whose non-null fields are
+/// valid NUL-terminated C strings. `out` must be a valid, writable
+/// `*mut *mut MoraineCatalogHandle`. `err`, if non-null, must be a valid,
+/// writable [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_attach(
     path: *const c_char,
-    object_store_uri: *const c_char,
+    s3: *const MoraineS3Config,
     read_only: bool,
     encrypted: bool,
     flush_interval_ms: u64,
@@ -254,17 +378,34 @@ pub unsafe extern "C" fn moraine_attach(
         // SAFETY: `path` validity is this function's own safety contract.
         let path_str = unsafe { borrow_str(path, "path") }?;
 
-        let store_kind = if object_store_uri.is_null() {
-            StoreKind::LocalFile
-        } else {
-            // SAFETY: caller contract; checked non-null above.
-            let s = unsafe { borrow_str(object_store_uri, "object_store_uri") }?;
-            StoreKind::parse(s)?
-        };
+        let (store_kind, prefix) = StoreKind::from_path(path_str)?;
+
+        // SAFETY: `s3` validity is this function's own safety contract; null
+        // means "no secret — the environment supplies credentials".
+        let s3_config = unsafe { s3.as_ref() };
+        let s3_creds = s3_config.map(|c| {
+            // SAFETY: each string field of `*c` is null or a NUL-terminated C
+            // string valid for this call (the shim keeps them alive across it).
+            unsafe {
+                S3Creds {
+                    key_id: opt_str(c.key_id),
+                    secret: opt_str(c.secret),
+                    region: opt_str(c.region),
+                    session_token: opt_str(c.session_token),
+                    endpoint: opt_str(c.endpoint),
+                    url_style: opt_str(c.url_style),
+                    use_ssl: match c.use_ssl {
+                        0 => Some(false),
+                        1 => Some(true),
+                        _ => None,
+                    },
+                }
+            }
+        });
 
         // Open the store first: it is synchronous and fallible, and a bad
         // path must not cost a runtime spun up just to be torn down.
-        let object_store = store_kind.open(path_str)?;
+        let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
         let runtime = new_runtime().map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
@@ -278,14 +419,19 @@ pub unsafe extern "C" fn moraine_attach(
         if flush_interval_ms > 0 {
             options.flush_interval = std::time::Duration::from_millis(flush_interval_ms);
         }
-        let open = async {
-            if read_only {
-                moraine::Catalog::open_read_only(object_store, options).await
-            } else {
-                moraine::Catalog::open(object_store, options).await
-            }
+        options.path = prefix;
+        let catalog = if read_only {
+            // A read-only attach never bootstraps; on a fresh store the open
+            // fails, so surface the reason (DuckDB defaults remote attaches to
+            // read-only) and the fix (add READ_WRITE).
+            runtime
+                .block_on(moraine::Catalog::open_read_only(object_store, options))
+                .map_err(|e| AbiError::from(e).with_read_only_attach_hint())?
+        } else {
+            runtime
+                .block_on(moraine::Catalog::open(object_store, options))
+                .map_err(AbiError::from)?
         };
-        let catalog = runtime.block_on(open).map_err(AbiError::from)?;
 
         Ok(Box::new(MoraineCatalogHandle::new(runtime, catalog)))
     };
@@ -1118,6 +1264,47 @@ mod tests {
         encrypted
     }
 
+    /// A read-only attach of an uninitialized store fails with guidance to
+    /// add `READ_WRITE`: a read-only attach cannot bootstrap, which is how a
+    /// fresh remote (DuckDB-defaulted-read-only) lake presents.
+    #[test]
+    fn read_only_attach_of_fresh_store_hints_read_write() {
+        let dir = TempDir::new("ro-fresh");
+        let c_path =
+            CString::new(dir.path().to_str().expect("test path is UTF-8")).expect("no NUL in path");
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                true,
+                false,
+                0,
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_ne!(
+            code,
+            codes::OK,
+            "read-only attach of a fresh store should fail"
+        );
+        assert!(handle.is_null());
+        // SAFETY: on failure `err.message` is a valid, just-written C string.
+        let message = unsafe { CStr::from_ptr(err.message) }
+            .to_str()
+            .expect("message is UTF-8")
+            .to_owned();
+        // SAFETY: frees the message allocated by the failed attach, exactly once.
+        unsafe { moraine_error_free(err.message) };
+        assert!(
+            message.contains("READ_WRITE"),
+            "read-only attach error should point at READ_WRITE: {message}"
+        );
+    }
+
     /// The `encrypted` flag is fixed by the attach that bootstraps the
     /// store; later attaches requesting a different value do not flip it,
     /// and the getter always reports the stored flag.
@@ -1491,17 +1678,17 @@ mod tests {
 
     #[test]
     fn attach_rejects_unknown_store_scheme() {
-        let dir = TempDir::new("bad-scheme");
-        let c_path = dir.c_path();
-        let scheme = CString::new("s3").expect("no NUL");
+        // A remote scheme moraine doesn't back is rejected from the path
+        // itself, before any store is opened.
+        let c_path = CString::new("gs://some-bucket").expect("no NUL");
         let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
         let mut err = MoraineError::default();
-        // SAFETY: `c_path`/`scheme` are valid NUL-terminated C strings;
-        // `handle`/`err` are valid, writable local slots.
+        // SAFETY: `c_path` is a valid NUL-terminated C string; `s3` is null
+        // (env-only); `handle`/`err` are valid, writable local slots.
         let code = unsafe {
             moraine_attach(
                 c_path.as_ptr(),
-                scheme.as_ptr(),
+                ptr::null(),
                 false,
                 false,
                 0,
@@ -1514,9 +1701,34 @@ mod tests {
         assert!(handle.is_null());
         // SAFETY: just populated above.
         let msg = unsafe { CStr::from_ptr(err.message) }.to_str().unwrap();
-        assert!(msg.contains("s3"), "message: {msg}");
+        assert!(msg.contains("unsupported store scheme"), "message: {msg}");
         // SAFETY: `err.message` was just populated above and not yet freed.
         unsafe { moraine_error_free(err.message) };
+    }
+
+    #[test]
+    fn store_kind_parses_s3_bucket_and_prefix() {
+        let (kind, prefix) =
+            StoreKind::from_path("s3://my-bucket/catalogs/lake").expect("s3 with prefix parses");
+        assert!(matches!(kind, StoreKind::S3 { ref bucket } if bucket == "my-bucket"));
+        assert_eq!(prefix, "catalogs/lake");
+
+        let (kind, prefix) = StoreKind::from_path("s3://my-bucket").expect("bare bucket parses");
+        assert!(matches!(kind, StoreKind::S3 { ref bucket } if bucket == "my-bucket"));
+        assert_eq!(prefix, "");
+
+        let (kind, prefix) = StoreKind::from_path("/tmp/lake").expect("local path parses");
+        assert!(matches!(kind, StoreKind::LocalFile));
+        assert_eq!(prefix, "");
+
+        assert!(
+            StoreKind::from_path("s3://").is_err(),
+            "empty bucket is rejected"
+        );
+        assert!(
+            StoreKind::from_path("gs://b").is_err(),
+            "unknown scheme is rejected"
+        );
     }
 
     #[test]

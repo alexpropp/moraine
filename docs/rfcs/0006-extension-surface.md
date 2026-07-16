@@ -87,6 +87,26 @@ accepts the `moraine:` path-prefix form alongside `TYPE moraine`. Absent
 from DuckLake's dialect map, moraine is spoken to in the **default
 dialect**: plain DuckDB SQL, native types, no wrapper calls.
 
+### Store URIs and credentials
+
+The `<slatedb-uri>` selects moraine's object-store backend:
+
+- **Local filesystem** — a path (`/var/lib/lake`): the catalog is a directory,
+  created if absent.
+- **In-memory** — `memory://`: an ephemeral store, for tests and scratch work.
+- **S3 / S3-compatible** — `s3://<bucket>[/<prefix>]`: the catalog lives in
+  `<bucket>` under the optional key `<prefix>` (empty places it at the bucket
+  root). The bucket must already exist; moraine writes keys into it and never
+  creates the bucket.
+
+For an `s3://` store, credentials resolve through DuckDB's secret manager:
+moraine looks up the `s3`-type secret whose scope matches the `s3://` path —
+one created with `CREATE SECRET (TYPE s3, KEY_ID …, SECRET …, REGION …[,
+ENDPOINT …, URL_STYLE 'path', USE_SSL false])`, the same secret DuckLake and
+httpfs consult for `DATA_PATH`. Fields the secret leaves unset fall back to the
+`AWS_*` process environment. No credentials appear in SQL text or ATTACH
+options.
+
 **The standalone attach is a metadata-only surface.** Table *data* is
 served through DuckLake, which owns delete-file merging, row lineage, and
 pushdown; a standalone data scan re-implementing that read path would
@@ -131,6 +151,25 @@ The truly-zero-write alternative — attaching against a pre-created
 checkpoint id — is exposed as an attach option for deployments with
 strictly read-only credentials, at the cost of reading a fixed checkpoint
 rather than following head.
+
+**Creating an S3 lake needs `READ_WRITE`.** DuckDB bumps any attach whose
+path begins with a remote prefix (`s3://`, `gcs://`, `azure://`, `http(s)://`,
+…) from `AUTOMATIC` to `READ_ONLY` before the storage extension is reached
+(`DatabaseManager::AttachDatabase`, on the premise that remote DB *files* are
+not writable). moraine honors that flag, so an `s3://` attach with no explicit
+mode opens read-only — and a read-only open never bootstraps, so *creating* a
+new S3 lake fails with the SlateDB "no manifest" error. The premise is wrong
+for moraine (SlateDB is object-store-native and writes S3 happily), but the
+heuristic is a blanket path-prefix rule with no per-extension opt-out. The user
+contract is therefore: **creating or writing an S3-backed lake requires
+`READ_WRITE` on the ATTACH** — `ATTACH 'ducklake:moraine:s3://bucket/prefix' AS
+lake (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE)` — the same opt-in any
+writable remote DuckDB database needs. Local and `memory://` stores default to
+read-write and need no flag. When a read-only attach targets an uninitialized
+store the shim rewrites the terse store error to name this fix (add
+`READ_WRITE`). Other DuckLake metadata backends sidestep this because their
+paths are not remote-file URIs — a Postgres/MySQL connection string never
+matches the prefix rule, and local DuckDB/SQLite files default read-write.
 
 ### Interception level: catalog-entry, row-faithful (B1)
 

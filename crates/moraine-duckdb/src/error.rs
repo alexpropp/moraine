@@ -82,6 +82,24 @@ impl AbiError {
         Self::new(codes::INVALID_ARGUMENT, message)
     }
 
+    /// Appends read-only-attach guidance when the code signals a missing or
+    /// unreadable catalog ([`STORE`](codes::STORE) or
+    /// [`CORRUPTION`](codes::CORRUPTION)) — the shape a read-only open of an
+    /// uninitialized store takes. A read-only attach cannot bootstrap, and
+    /// DuckDB opens remote (e.g. `s3://`) paths read-only by default, so the
+    /// usual fix for a fresh remote lake is to add `READ_WRITE` to the
+    /// ATTACH. Other codes pass through unchanged.
+    pub(crate) fn with_read_only_attach_hint(mut self) -> Self {
+        if self.code == codes::STORE || self.code == codes::CORRUPTION {
+            self.message.push_str(
+                "; a read-only attach cannot create a catalog — DuckDB opens remote \
+                 paths (e.g. s3://) read-only by default, so to create or write a new \
+                 lake add READ_WRITE to the ATTACH",
+            );
+        }
+        self
+    }
+
     /// The fixed error a cancellable read reports when
     /// [`moraine_interrupt`](crate::abi::moraine_interrupt) or the call's
     /// interrupt probe cancelled it.
@@ -131,8 +149,24 @@ impl From<moraine::Error> for AbiError {
             // Covers `Store` and any future `#[non_exhaustive]` variant.
             _ => codes::STORE,
         };
-        Self::new(code, err.to_string())
+        Self::new(code, error_chain(&err))
     }
+}
+
+/// Formats an error with its full `source()` chain. A terse top-level
+/// message — `moraine::Error::Store` renders only "store error" — would
+/// otherwise drop the underlying object-store cause (`AccessDenied`, a
+/// region redirect, a missing bucket), which is exactly what a caller
+/// needs to fix a misconfigured attach.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 /// The `(code, message)` pair carried across the FFI boundary.
@@ -158,5 +192,35 @@ impl Default for MoraineError {
             code: codes::OK,
             message: std::ptr::null_mut(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_hint_added_for_missing_catalog_codes() {
+        for code in [codes::STORE, codes::CORRUPTION] {
+            let err = AbiError::new(code, "failed to find latest manifest version")
+                .with_read_only_attach_hint();
+            assert!(
+                err.message.contains("READ_WRITE"),
+                "code {code} message missing READ_WRITE hint: {}",
+                err.message
+            );
+            // The original cause is preserved, not replaced.
+            assert!(
+                err.message
+                    .contains("failed to find latest manifest version")
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_hint_left_off_unrelated_codes() {
+        let err =
+            AbiError::new(codes::INVALID_ARGUMENT, "bad argument").with_read_only_attach_hint();
+        assert!(!err.message.contains("READ_WRITE"), "{}", err.message);
     }
 }

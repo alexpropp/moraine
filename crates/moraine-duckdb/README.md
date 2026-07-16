@@ -29,6 +29,21 @@ DDL issued directly against a user schema/table (outside DuckLake's own
 `ducklake_*` writes), plus querying a view's definition, raises
 `NotImplementedException`.
 
+**Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
+attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
+…) read-only by default, and a read-only attach cannot create a catalog. To
+create or write a lake whose moraine catalog lives on S3, add `READ_WRITE`:
+
+```sql
+CREATE SECRET s (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-west-2');
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+```
+
+Local and `memory://` stores default to read-write and need no flag. A
+read-only attach of an uninitialized store fails with an error that names this
+fix.
+
 ## How it is built
 
 moraine-duckdb builds through DuckDB's own extension toolchain

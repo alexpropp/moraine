@@ -11,6 +11,11 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
+
 #include <cctype>
 #include <cstdlib>
 #include <unordered_map>
@@ -513,9 +518,9 @@ MoraineCatalog::~MoraineCatalog() {
 }
 
 duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<duckdb::StorageExtensionInfo>,
-                                                           duckdb::ClientContext &, duckdb::AttachedDatabase &db,
-                                                           const std::string &, duckdb::AttachInfo &info,
-                                                           duckdb::AttachOptions &options) {
+                                                           duckdb::ClientContext &context,
+                                                           duckdb::AttachedDatabase &db, const std::string &,
+                                                           duckdb::AttachInfo &info, duckdb::AttachOptions &options) {
 	MoraineCatalogHandle *handle = nullptr;
 	MoraineError err {};
 	// DuckDB resolves the attach's `READ_ONLY` flag into this access mode
@@ -541,7 +546,41 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			}
 		}
 	}
-	auto code = moraine_attach(info.path.c_str(), nullptr, read_only, encrypted, flush_interval_ms, &handle, &err);
+	// For an s3:// store, resolve credentials from the matching DuckDB secret
+	// (the same secret DuckLake/httpfs use for DATA_PATH); fields the secret
+	// omits fall back to the AWS_* environment in the core. The backing strings
+	// must outlive the moraine_attach call, so they live in this scope.
+	MoraineS3Config s3 {};
+	s3.use_ssl = -1;
+	std::string key_id, secret, region, session_token, endpoint, url_style;
+	bool is_s3 = duckdb::StringUtil::StartsWith(info.path, "s3://");
+	if (is_s3) {
+		auto &secret_manager = duckdb::SecretManager::Get(context);
+		auto transaction = duckdb::CatalogTransaction::GetSystemCatalogTransaction(context);
+		auto match = secret_manager.LookupSecret(transaction, info.path, "s3");
+		if (match.HasMatch()) {
+			auto &kv = dynamic_cast<const duckdb::KeyValueSecret &>(match.GetSecret());
+			auto take = [&](const char *key, std::string &into, const char *&field) {
+				duckdb::Value value;
+				if (kv.TryGetValue(key, value) && !value.IsNull()) {
+					into = value.ToString();
+					field = into.c_str();
+				}
+			};
+			take("key_id", key_id, s3.key_id);
+			take("secret", secret, s3.secret);
+			take("region", region, s3.region);
+			take("session_token", session_token, s3.session_token);
+			take("endpoint", endpoint, s3.endpoint);
+			take("url_style", url_style, s3.url_style);
+			duckdb::Value ssl;
+			if (kv.TryGetValue("use_ssl", ssl) && !ssl.IsNull()) {
+				s3.use_ssl = ssl.GetValue<bool>() ? 1 : 0;
+			}
+		}
+	}
+	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
+	                           &handle, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
