@@ -100,6 +100,10 @@ typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
 // `flush_interval_ms` sets the store's WAL flush cadence (bounds
 // per-commit latency); 0 means "not given" and keeps the default.
 //
+// `cache_dir` is a local directory backing SlateDB's on-disk block cache;
+// NULL or empty disables it. Worthwhile for remote (`s3://`) stores, whose
+// warm reads then avoid repeat object-store GETs and survive restarts.
+//
 // `s3` carries S3 credentials for an `s3://` path, sourced from a DuckDB
 // secret. Any field may be NULL/unset, in which case the AWS_* environment
 // supplies it. `use_ssl`: -1 unset, 0 false, 1 true. Pass NULL to use the
@@ -115,7 +119,8 @@ typedef struct {
 } MoraineS3Config;
 
 int32_t moraine_attach(const char *path, const MoraineS3Config *s3, bool read_only, bool encrypted,
-                       uint64_t flush_interval_ms, MoraineCatalogHandle **out, MoraineError *err);
+                       uint64_t flush_interval_ms, const char *cache_dir, MoraineCatalogHandle **out,
+                       MoraineError *err);
 void moraine_detach(MoraineCatalogHandle *handle);
 
 // The stored `encrypted` flag, fixed when the store was created; stores

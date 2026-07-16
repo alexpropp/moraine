@@ -9,7 +9,7 @@ use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
-    store::handle::ReadSession,
+    store::{handle::ReadSession, open::StoreBuilder},
     transaction::{Transaction, commit},
 };
 
@@ -48,6 +48,12 @@ pub struct CatalogOptions {
     /// per-commit latency; smaller values mean more frequent (on S3,
     /// costlier) object-store PUTs. Must be nonzero; defaults to 100ms.
     pub flush_interval: Duration,
+    /// Local directory backing SlateDB's on-disk block cache. When set,
+    /// reads are served from a disk-backed cache that survives process
+    /// restarts, so warm queries skip repeat object-store GETs — worthwhile
+    /// for remote (`s3://`) stores, redundant for local ones. `None` (the
+    /// default) uses only SlateDB's in-memory cache.
+    pub cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for CatalogOptions {
@@ -56,6 +62,7 @@ impl Default for CatalogOptions {
             path: String::new(),
             encrypted: false,
             flush_interval: Duration::from_millis(100),
+            cache_dir: None,
         }
     }
 }
@@ -104,13 +111,10 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
-        let db = commit::open_initialized(
-            &options.path,
-            object_store,
-            options.encrypted,
-            options.flush_interval,
-        )
-        .await?;
+        let store = StoreBuilder::new(&options.path, object_store)
+            .flush_interval(options.flush_interval)
+            .cache_dir(options.cache_dir.clone());
+        let db = commit::open_initialized(store, options.encrypted).await?;
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
@@ -134,7 +138,9 @@ impl Catalog {
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<Self> {
-        let reader = commit::open_reader_initialized(&options.path, object_store).await?;
+        let store =
+            StoreBuilder::new(&options.path, object_store).cache_dir(options.cache_dir.clone());
+        let reader = commit::open_reader_initialized(store).await?;
         Ok(Self {
             store: Arc::new(Store::Reader(Arc::new(reader))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
