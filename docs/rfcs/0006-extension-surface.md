@@ -171,6 +171,19 @@ store the shim rewrites the terse store error to name this fix (add
 paths are not remote-file URIs — a Postgres/MySQL connection string never
 matches the prefix rule, and local DuckDB/SQLite files default read-write.
 
+**`CACHE_DIR` — an on-disk block cache for S3 stores.** Every query rebinds the
+catalog by reading its metadata (snapshot → tables → columns → files → stats)
+from the store; on an `s3://`-backed catalog those SlateDB block reads are S3
+round-trips, and the default in-memory cache is lost on each new process. The
+`CACHE_DIR` attach option — `ATTACH 'ducklake:moraine:s3://…' AS lake (DATA_PATH
+'…', READ_WRITE, META_CACHE_DIR '/var/cache/moraine')`, or `CACHE_DIR` directly
+on a standalone `moraine:` attach — points SlateDB's `object_store_cache_options`
+at a local directory, so warm blocks survive restarts and repeat queries skip
+the GETs. It threads through the shim (`moraine_attach`'s `cache_dir`) into
+`CatalogOptions::cache_dir` and `StoreBuilder`, applying to both the writer and
+the reader; unset (the default), only the in-memory cache applies. Redundant for
+local/`memory://` stores.
+
 ### Interception level: catalog-entry, row-faithful (B1)
 
 moraine intercepts at DuckDB's **Catalog / table-scan / DML layer** — the

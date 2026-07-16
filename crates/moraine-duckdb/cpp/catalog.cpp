@@ -550,13 +550,16 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// catalog opens a `DbReader` and never fences the writer.
 	bool read_only = options.access_mode == duckdb::AccessMode::READ_ONLY;
 	// Options reach this attach through DuckLake's `META_` passthrough
-	// (`META_ENCRYPTED true`, `META_FLUSH_INTERVAL_MS 5`), or directly on
-	// a standalone `moraine:` attach. `ENCRYPTED` is creation-time only:
-	// the ABI records it when a fresh store bootstraps and ignores it
-	// afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on the
-	// ABI means "not given", so an explicit zero is refused here.
+	// (`META_ENCRYPTED true`, `META_FLUSH_INTERVAL_MS 5`, `META_CACHE_DIR '…'`),
+	// or directly on a standalone `moraine:` attach. `ENCRYPTED` is
+	// creation-time only: the ABI records it when a fresh store bootstraps and
+	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
+	// the ABI means "not given", so an explicit zero is refused here.
+	// `CACHE_DIR` is a local directory for SlateDB's on-disk block cache; it
+	// must outlive the moraine_attach call, so it lives in this scope.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
+	std::string cache_dir;
 	for (auto &option : info.options) {
 		auto name = duckdb::StringUtil::Lower(option.first);
 		if (name == "encrypted") {
@@ -566,6 +569,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			if (flush_interval_ms == 0) {
 				throw duckdb::BinderException("FLUSH_INTERVAL_MS must be a positive number of milliseconds");
 			}
+		} else if (name == "cache_dir") {
+			cache_dir = option.second.GetValue<std::string>();
 		}
 	}
 	// For an s3:// store, resolve credentials from the matching DuckDB secret
@@ -602,7 +607,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		}
 	}
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           &handle, &err);
+	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), &handle, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

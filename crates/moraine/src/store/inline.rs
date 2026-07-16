@@ -195,7 +195,7 @@ mod tests {
     use slatedb::{IsolationLevel, config::WriteOptions};
 
     use super::*;
-    use crate::store::open::open_store;
+    use crate::store::open::StoreBuilder;
 
     /// Seeds inline records for two tables and one that overlaps chunk
     /// sequence numbers across two schema versions, then asserts every
@@ -204,13 +204,10 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn scans_return_inline_records_in_key_order() {
-        let db = open_store(
-            "t",
-            Arc::new(InMemory::new()),
-            std::time::Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
 
         let schema_v0 = InlineSchemaValue {
             arrow_schema: b"schema-v0".to_vec(),
@@ -426,13 +423,10 @@ mod tests {
     /// table-scoped `scan_inline_schemas`.
     #[tokio::test]
     async fn scan_all_inline_schemas_covers_every_table() {
-        let db = open_store(
-            "t",
-            Arc::new(InMemory::new()),
-            std::time::Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
 
         let table_one_v0 = InlineSchemaValue {
             arrow_schema: b"a-0".to_vec(),

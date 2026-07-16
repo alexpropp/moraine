@@ -21,6 +21,7 @@ use std::{
     sync::Arc,
 };
 
+use moraine::CatalogOptions;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 
 use crate::{
@@ -368,6 +369,7 @@ pub unsafe extern "C" fn moraine_attach(
     read_only: bool,
     encrypted: bool,
     flush_interval_ms: u64,
+    cache_dir: *const c_char,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -377,6 +379,9 @@ pub unsafe extern "C" fn moraine_attach(
         }
         // SAFETY: `path` validity is this function's own safety contract.
         let path_str = unsafe { borrow_str(path, "path") }?;
+        // SAFETY: `cache_dir` validity is this function's own safety contract;
+        // null (or empty) means "no on-disk cache".
+        let cache_dir = unsafe { opt_str(cache_dir) }.filter(|s| !s.is_empty());
 
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
@@ -412,14 +417,18 @@ pub unsafe extern "C" fn moraine_attach(
                 format!("failed to start tokio runtime: {e}"),
             )
         })?;
-        let mut options = moraine::CatalogOptions::default();
+
+        // `CatalogOptions` is `#[non_exhaustive]`, so it is built through
+        // `default()` and field assignment rather than a struct literal.
+        let mut options = CatalogOptions::default();
+        options.path = prefix;
         options.encrypted = encrypted;
-        // 0 means "not given": the default cadence stands. An explicit
-        // zero never reaches this ABI — the shim refuses it at bind time.
+        // 0 means "not given": the default cadence stands. An explicit zero
+        // never reaches this ABI — the shim refuses it at bind time.
         if flush_interval_ms > 0 {
             options.flush_interval = std::time::Duration::from_millis(flush_interval_ms);
         }
-        options.path = prefix;
+        options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         let catalog = if read_only {
             // A read-only attach never bootstraps; on a fresh store the open
             // fails, so surface the reason (DuckDB defaults remote attaches to
@@ -1230,6 +1239,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1282,6 +1292,7 @@ mod tests {
                 true,
                 false,
                 0,
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1323,6 +1334,7 @@ mod tests {
                 false,
                 true,
                 0,
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1659,6 +1671,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1692,6 +1705,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1744,6 +1758,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )

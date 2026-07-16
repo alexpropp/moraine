@@ -44,6 +44,20 @@ Local and `memory://` stores default to read-write and need no flag. A
 read-only attach of an uninitialized store fails with an error that names this
 fix.
 
+**`CACHE_DIR` — on-disk block cache for S3 catalogs.** Each query reads the
+catalog metadata from the store; on S3 that is network latency every time, and
+the default in-memory cache is lost on each new process. Point SlateDB's disk
+cache at a local directory so warm blocks survive restarts and repeat queries
+skip the GETs — `META_CACHE_DIR` through the DuckLake attach (or `CACHE_DIR`
+directly on a standalone `moraine:` attach):
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE, META_CACHE_DIR '/var/cache/moraine');
+```
+
+Unset, only the in-memory cache applies; redundant for local/`memory://` stores.
+
 ## How it is built
 
 moraine-duckdb builds through DuckDB's own extension toolchain

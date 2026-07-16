@@ -1,12 +1,8 @@
 //! Opening, bootstrap, and snapshot materialization. The commit cycle
 //! itself builds on these.
 
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use object_store::ObjectStore;
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
 use uuid::Uuid;
 
@@ -19,7 +15,7 @@ use crate::{
     store::{
         handle::ReadHandle,
         key::{CurrentKey, EntityKey, Key, SysKey},
-        open::{open_reader, open_store},
+        open::StoreBuilder,
         proto, read, value,
     },
     transaction::{
@@ -139,13 +135,8 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
 /// Opens the store, bootstrapping an empty one in one atomic batch under
 /// conflict detection — a lost bootstrap race re-validates instead of
 /// double-initializing. Every exit that does not commit rolls back.
-pub(crate) async fn open_initialized(
-    path: &str,
-    object_store: Arc<dyn ObjectStore>,
-    encrypted: bool,
-    flush_interval: std::time::Duration,
-) -> Result<Db> {
-    let db = open_store(path, object_store, flush_interval).await?;
+pub(crate) async fn open_initialized(store: StoreBuilder<'_>, encrypted: bool) -> Result<Db> {
+    let db = store.open_writer().await?;
     let tx = db
         .begin(IsolationLevel::Snapshot)
         .await
@@ -194,11 +185,8 @@ pub(crate) async fn open_initialized(
 /// finds. Never opens a `Db`, so it never fences a live writer, and never
 /// bootstraps — a read-only attach against an uninitialized store is refused
 /// (there is nothing committed to read).
-pub(crate) async fn open_reader_initialized(
-    path: &str,
-    object_store: Arc<dyn ObjectStore>,
-) -> Result<DbReader> {
-    let reader = open_reader(path, object_store).await?;
+pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<DbReader> {
+    let reader = store.open_reader().await?;
     match validate_format(ReadHandle::Reader(&reader)).await? {
         Some(_) => Ok(reader),
         None => Err(Error::Corruption(
@@ -1052,6 +1040,8 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use object_store::memory::InMemory;
 
     use super::*;
@@ -1061,13 +1051,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_format_is_refused() {
         let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-        let db = open_store(
-            "",
-            object_store.clone(),
-            std::time::Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+        let db = StoreBuilder::new("", object_store.clone())
+            .open_writer()
+            .await
+            .unwrap();
         db.put(
             &Key::Sys(SysKey::Format).encode(),
             &value::encode_value(&proto::FormatValue {
@@ -1081,15 +1068,10 @@ mod tests {
 
         // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
         // `Debug` impl; `err().unwrap()` only needs it on the error side.
-        let err = open_initialized(
-            "",
-            object_store,
-            false,
-            std::time::Duration::from_millis(100),
-        )
-        .await
-        .err()
-        .unwrap();
+        let err = open_initialized(StoreBuilder::new("", object_store), false)
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, Error::Corruption(_)));
     }
 
@@ -1097,13 +1079,10 @@ mod tests {
     #[tokio::test]
     async fn migration_marker_is_refused() {
         let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-        let db = open_store(
-            "",
-            object_store.clone(),
-            std::time::Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+        let db = StoreBuilder::new("", object_store.clone())
+            .open_writer()
+            .await
+            .unwrap();
         db.put(
             &Key::Sys(SysKey::Migration).encode(),
             &value::encode_value(&proto::MigrationValue {
@@ -1116,15 +1095,10 @@ mod tests {
         .unwrap();
         db.close().await.unwrap();
 
-        let err = open_initialized(
-            "",
-            object_store,
-            false,
-            std::time::Duration::from_millis(100),
-        )
-        .await
-        .err()
-        .unwrap();
+        let err = open_initialized(StoreBuilder::new("", object_store), false)
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, Error::Corruption(_)));
     }
 

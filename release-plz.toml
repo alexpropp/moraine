@@ -6,14 +6,32 @@ semver_check = true
 name = "moraine"
 # The extension release references the released commit; the crate tag is fixed.
 git_tag_name = "v{{ version }}"
+# Single workspace changelog: moraine owns the one CHANGELOG.md at the repo root
+# (changelog_path is relative to the root Cargo.toml) and folds moraine-duckdb's
+# commits into it. The root file is not part of any crate's package tarball;
+# crates.io renders the README, not the changelog, so nothing is lost there.
+changelog_path = "CHANGELOG.md"
+changelog_include = ["moraine-duckdb"]
 
 [[package]]
 name = "moraine-duckdb"
-# Distributed as a prebuilt .duckdb_extension artifact, not a crate.
-release = false
+# Not published to crates.io (it ships as a prebuilt .duckdb_extension), but
+# release-plz still tracks its changes so extension-only work bumps the shared
+# workspace version and opens a release PR. It keeps its own `moraine-duckdb-v*`
+# tag (release-plz uses it to detect the last released version, since there's no
+# crates.io version to compare against), but creates no GitHub release: the
+# crate's `v<version>` release and the separately built `ext-v<version>` release
+# already cover it.
+release = true
 publish = false
+git_release_enable = false
+# Its changes are folded into moraine's root changelog (changelog_include above),
+# so it writes no changelog of its own.
+changelog_update = false
 
 [[package]]
 name = "xtask"
 release = false
 publish = false
+# Internal tooling: excluded from the published changelog entirely.
+changelog_update = false
