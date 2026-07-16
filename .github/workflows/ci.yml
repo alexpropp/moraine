@@ -69,13 +69,13 @@ jobs:
       # The DuckDB toolchain build tree (keyed on the submodule refs and the
       # C++ shim), declared after rust-cache so its save fires before
       # rust-cache's post-step cleanup of unrecognized target/ dirs.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: build
           key: duckdb-build-${{ runner.os }}-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'extension_config.cmake', 'crates/moraine-duckdb/cpp/**') }}
       # The pinned DuckDB CLI xtask downloads, keyed on xtask/src/duckdb.rs,
       # which owns the pin.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target/duckdb-cli/cli
           key: duckdb-cli-${{ runner.os }}-${{ hashFiles('xtask/src/duckdb.rs') }}
@@ -89,7 +89,7 @@ jobs:
       # The pinned MinIO binaries xtask downloads, keyed on
       # xtask/src/s3.rs, which owns those pins (same rust-cache cleanup
       # caveat as the DuckDB build cache above).
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: target/minio/bin
           key: minio-${{ runner.os }}-${{ hashFiles('xtask/src/s3.rs') }}
