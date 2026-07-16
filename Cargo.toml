@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexpropp/moraine"
@@ -14,7 +14,7 @@ anyhow = "1"
 arrow = { version = "59.1.0", default-features = false }
 bytes = "1"
 cc = "1"
-moraine = { path = "crates/moraine", version = "0.1.0" }
+moraine = { path = "crates/moraine", version = "0.1.1" }
 # object_store must stay on the same minor as slatedb's
 object_store = "0.14"
 prost = "0.14"
