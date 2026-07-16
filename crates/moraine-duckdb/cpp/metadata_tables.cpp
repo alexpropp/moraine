@@ -74,6 +74,12 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 		return duckdb::Value(duckdb::StringUtil::Lower(sql_type));
 	}
 	auto type = MapColumnType(sql_type);
+	// `JSON` is a VARCHAR carrying a `JSON` alias, so it must be named before
+	// the id switch would collapse it to "varchar" (matches DuckLake's own
+	// `DuckLakeTypes::ToString`, which checks the alias first).
+	if (type.IsJSONType()) {
+		return duckdb::Value("json");
+	}
 	switch (type.id()) {
 	case duckdb::LogicalTypeId::BOOLEAN:
 		return duckdb::Value("boolean");
@@ -87,6 +93,8 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 		return duckdb::Value("int64");
 	case duckdb::LogicalTypeId::HUGEINT:
 		return duckdb::Value("int128");
+	case duckdb::LogicalTypeId::UHUGEINT:
+		return duckdb::Value("uint128");
 	case duckdb::LogicalTypeId::UTINYINT:
 		return duckdb::Value("uint8");
 	case duckdb::LogicalTypeId::USMALLINT:
@@ -106,10 +114,20 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 		return duckdb::Value("interval");
 	case duckdb::LogicalTypeId::TIME:
 		return duckdb::Value("time");
+	case duckdb::LogicalTypeId::TIME_NS:
+		return duckdb::Value("time_ns");
+	case duckdb::LogicalTypeId::TIME_TZ:
+		return duckdb::Value("timetz");
 	case duckdb::LogicalTypeId::DATE:
 		return duckdb::Value("date");
 	case duckdb::LogicalTypeId::TIMESTAMP:
 		return duckdb::Value("timestamp");
+	case duckdb::LogicalTypeId::TIMESTAMP_SEC:
+		return duckdb::Value("timestamp_s");
+	case duckdb::LogicalTypeId::TIMESTAMP_MS:
+		return duckdb::Value("timestamp_ms");
+	case duckdb::LogicalTypeId::TIMESTAMP_NS:
+		return duckdb::Value("timestamp_ns");
 	case duckdb::LogicalTypeId::TIMESTAMP_TZ:
 		return duckdb::Value("timestamptz");
 	case duckdb::LogicalTypeId::VARCHAR:
@@ -118,6 +136,8 @@ duckdb::Value DuckLakeColumnType(const char *sql_type) {
 		return duckdb::Value("blob");
 	case duckdb::LogicalTypeId::UUID:
 		return duckdb::Value("uuid");
+	case duckdb::LogicalTypeId::GEOMETRY:
+		return duckdb::Value("geometry");
 	default:
 		// `MapColumnType` only ever returns one of the ids above (it
 		// throws NotImplementedException for anything else), so this is

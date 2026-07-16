@@ -156,22 +156,44 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 		return duckdb::LogicalType::VARCHAR;
 	} else if (upper == "TEXT") {
 		return duckdb::LogicalType::VARCHAR;
+	} else if (upper == "JSON") {
+		// DuckLake's `json`: VARCHAR carrying a `JSON` alias, matched on the
+		// alias (not the id) by `DuckLakeColumnType`'s inverse.
+		return duckdb::LogicalType::JSON();
+	} else if (upper == "GEOMETRY") {
+		// Requires the `spatial` extension at runtime for geometry values; the
+		// type itself, and its Arrow inline encoding, resolve without it.
+		return duckdb::LogicalType::GEOMETRY();
 	} else if (upper == "BOOLEAN") {
 		return duckdb::LogicalType::BOOLEAN;
 	} else if (upper == "DATE") {
 		return duckdb::LogicalType::DATE;
-	} else if (upper == "TIMESTAMP") {
+	} else if (upper == "TIMESTAMP" || upper == "TIMESTAMP_US") {
+		// DuckLake's `timestamp_us` is the microsecond default, spelled
+		// `timestamp`; the sub-second widths below are distinct ids.
 		return duckdb::LogicalType::TIMESTAMP;
+	} else if (upper == "TIMESTAMP_MS") {
+		return duckdb::LogicalType::TIMESTAMP_MS;
+	} else if (upper == "TIMESTAMP_NS") {
+		return duckdb::LogicalType::TIMESTAMP_NS;
+	} else if (upper == "TIMESTAMP_S") {
+		return duckdb::LogicalType::TIMESTAMP_S;
 	} else if (upper == "TIMESTAMPTZ" || upper == "TIMESTAMP WITH TIME ZONE") {
 		return duckdb::LogicalType::TIMESTAMP_TZ;
 	} else if (upper == "TIME") {
 		return duckdb::LogicalType::TIME;
+	} else if (upper == "TIME_NS") {
+		return duckdb::LogicalType::TIME_NS;
+	} else if (upper == "TIMETZ" || upper == "TIME WITH TIME ZONE") {
+		return duckdb::LogicalType::TIME_TZ;
 	} else if (upper == "BLOB") {
 		return duckdb::LogicalType::BLOB;
 	} else if (upper == "UUID") {
 		return duckdb::LogicalType::UUID;
 	} else if (upper == "HUGEINT" || upper == "INT128") {
 		return duckdb::LogicalType::HUGEINT;
+	} else if (upper == "UHUGEINT" || upper == "UINT128") {
+		return duckdb::LogicalType::UHUGEINT;
 	} else if (upper == "INTERVAL") {
 		return duckdb::LogicalType::INTERVAL;
 	}

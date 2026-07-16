@@ -293,8 +293,22 @@ translation point (`DuckLakeColumnType` in `cpp/metadata_tables.cpp`)
 reparses the stored SQL string through `MapColumnType`, then names the
 resulting `LogicalTypeId` DuckLake's way — never two independently
 maintained type tables. Every type `MapColumnType` supports maps exactly,
-except `DECIMAL`'s width/scale suffix (DuckLake's own `ToStringBaseType`
-returns the bare `"decimal"`; precision/scale plumbing is unexercised).
+except `DECIMAL`'s width/scale suffix and `JSON`. `JSON` is a `VARCHAR`
+carrying a `"JSON"` alias, so it is matched on the alias in both directions
+(`MapColumnType` maps `"json"` to `LogicalType::JSON()`; `DuckLakeColumnType`
+names an aliased-JSON type `"json"` before its `LogicalTypeId` would collapse
+to `"varchar"`) — mirroring DuckLake's own `DuckLakeTypes` handling.
+
+The supported scalars track DuckLake's full vocabulary: every signed/unsigned
+integer width including `int128`/`uint128`, `float32`/`float64`, `decimal`,
+`varchar`/`blob`/`boolean`/`uuid`, the temporal types
+(`date`, `time`, `time_ns`, `timetz`, `timestamp`, `timestamp_s`/`_ms`/`_ns`,
+`timestamptz`, `interval`), `json`, and `geometry` (a distinct `LogicalTypeId`
+needing the `spatial` extension at runtime for values, not for the type or its
+Arrow encoding). `variant` is **not** supported: moraine serializes inline data
+through Arrow, and DuckDB's Arrow format has no VARIANT representation, so a
+`VARIANT` column is rejected at creation with an actionable error (unlike
+GEOMETRY, whose Arrow support `spatial` registers).
 
 ### `ducklake_metadata` synthesis
 
