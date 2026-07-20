@@ -3279,4 +3279,42 @@ mod tests {
             "expected the lossy-double reason, got: {stderr}"
         );
     }
+
+    /// With no data-path store resolvable (a lake attached with neither a
+    /// recorded nor a supplied data path), an index can still be created on
+    /// an empty table — but a later bulk INSERT is refused rather than
+    /// silently leaving the index under-covered.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn moraine_index_bulk_insert_without_a_data_store_is_refused() {
+        let store = TempDir::new("index-nostore-store");
+        let data = TempDir::new("index-nostore-data");
+        // DATA_PATH only (no META_DATA_PATH) on a fresh lake: moraine records
+        // and resolves no data store.
+        let run = |sql: &str| run_ducklake_sql(store.path(), data.path(), sql);
+
+        run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+        // An index on the still-empty table needs no scoped read, so it is
+        // created fine.
+        run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+        // A bulk INSERT registers a Parquet file that would need scoped-reading
+        // to maintain the index; with no store, the commit is refused.
+        let out = run_ducklake_sql_output(
+            store.path(),
+            data.path(),
+            "",
+            "INSERT INTO lake.main.t SELECT i, 'x' FROM range(20) t(i);",
+        );
+        assert!(
+            !out.status.success(),
+            "a bulk insert with no data store must be refused; stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        assert!(
+            stderr.contains("no data-path store"),
+            "expected the missing-store reason, got: {stderr}"
+        );
+    }
 }

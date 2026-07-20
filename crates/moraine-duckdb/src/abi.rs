@@ -1684,12 +1684,15 @@ unsafe fn coerce_lookup_value(
         "SMALLINT" | "INT16" => signed(signed_input()?, IntWidth::I16),
         "INTEGER" | "INT32" => signed(signed_input()?, IntWidth::I32),
         "BIGINT" | "INT64" => signed(signed_input()?, IntWidth::I64),
-        "HUGEINT" | "INT128" => signed(signed_input()?, IntWidth::I128),
         "UTINYINT" | "UINT8" => unsigned(unsigned_input()?, IntWidth::I8),
         "USMALLINT" | "UINT16" => unsigned(unsigned_input()?, IntWidth::I16),
         "UINTEGER" | "UINT32" => unsigned(unsigned_input()?, IntWidth::I32),
         "UBIGINT" | "UINT64" => unsigned(unsigned_input()?, IntWidth::I64),
-        "UHUGEINT" | "UINT128" => unsigned(unsigned_input()?, IntWidth::I128),
+        // 128-bit integers are intentionally absent: they are not indexable
+        // (DuckDB stores `HUGEINT` as a lossy double in Parquet), so no index
+        // covers such a column and this coercion is never reached for one —
+        // it falls through to the unsupported-type error, matching the
+        // refusal at index creation.
         // Temporal types index by their underlying integer, as the scoped
         // read derives them: `DATE` as an `i32` day count, the rest as `i64`.
         "DATE" => signed(signed_input()?, IntWidth::I32),

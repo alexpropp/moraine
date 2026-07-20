@@ -740,8 +740,9 @@ impl Transaction {
     /// table.
     /// Returns [`Error::Constraint`] if the table has live indexes and a
     /// non-empty file supplies no `index_entries` (a silently under-covered
-    /// index is a lie), or a supplied indexed value exceeds the size cap, or
-    /// the entries duplicate a unique value.
+    /// index is a lie), an entry's `ordinal` is outside the file's rows, a
+    /// supplied indexed value exceeds the size cap, or the entries duplicate
+    /// a unique value.
     /// Returns [`Error::Corruption`] if the table has no statistics
     /// record (impossible for a table created by [`Self::create_table`],
     /// which always mints one).
@@ -764,6 +765,18 @@ impl Transaction {
             return Err(Error::Constraint(format!(
                 "register_data_file on indexed table {table} must supply index entries"
             )));
+        }
+        // An entry's row is `row_id_start + ordinal`; an ordinal past the
+        // file's rows would index a row id outside the file's range and break
+        // lookup→holder resolution.
+        for entry in index_entries {
+            if entry.ordinal >= file.record_count {
+                return Err(Error::Constraint(format!(
+                    "register_data_file: index entry ordinal {} is outside file record count {} \
+                     on table {table}",
+                    entry.ordinal, file.record_count
+                )));
+            }
         }
         let data_file_id = self.alloc_file_id();
         let tstat = self.live_table_stats(table)?;
@@ -1689,6 +1702,42 @@ mod tests {
         assert!(matches!(
             transaction.register_data_file(t, datafile(1, bad_stats), &[]),
             Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn register_rejects_an_out_of_range_index_ordinal() {
+        use crate::store::index_encoding::{IndexKeyValue, IntWidth};
+
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let col_a = transaction.state.columns_of(t)[0].id;
+        let index = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![col_a],
+                    unique: true,
+                },
+                &[],
+            )
+            .unwrap();
+
+        // The file has three rows (ordinals 0..=2); an entry at ordinal 3
+        // would index a row id outside the file's range.
+        let entry = FileIndexEntry {
+            index,
+            ordinal: 3,
+            values: vec![Some(IndexKeyValue::Int {
+                value: 7,
+                width: IntWidth::I64,
+            })],
+        };
+        assert!(matches!(
+            transaction.register_data_file(t, datafile(3, vec![]), &[entry]),
+            Err(Error::Constraint(_))
         ));
     }
 

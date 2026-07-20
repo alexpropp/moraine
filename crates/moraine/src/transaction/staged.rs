@@ -1979,21 +1979,21 @@ impl StagedTransaction {
                 // Maintain equality-index entries for any data file this
                 // commit registered on an indexed table, by scoped-reading it
                 // from `DATA_PATH`. Gated: a no-op unless a live index covers
-                // the file's table, so non-indexed writes are untouched.
-                if let Some(store) = data_store.as_deref() {
-                    if let Err(err) = stage_index_maintenance(
-                        &db_tx,
-                        &base,
-                        &ops,
-                        store,
-                        &data_prefix,
-                        &mut writes,
-                    )
-                    .await
-                    {
-                        db_tx.rollback();
-                        return Err(err);
-                    }
+                // the file's table, so non-indexed writes are untouched. A
+                // Parquet file on an indexed table with no store to read it
+                // aborts the commit rather than under-covering the index.
+                if let Err(err) = stage_index_maintenance(
+                    &db_tx,
+                    &base,
+                    &ops,
+                    data_store.as_deref(),
+                    &data_prefix,
+                    &mut writes,
+                )
+                .await
+                {
+                    db_tx.rollback();
+                    return Err(err);
                 }
                 if let Err(err) = commit::stage_writes(&db_tx, &writes) {
                     db_tx.rollback();
@@ -2022,17 +2022,57 @@ impl StagedTransaction {
     }
 }
 
-/// Derives and stages equality-index entries for the rows this commit adds to
-/// a table that has a live index — bulk rows by scoped-reading the registered
-/// Parquet from the `DATA_PATH` store, small rows by decoding the inline Arrow
-/// chunk. Uniqueness is enforced against the committed entry set as the puts
-/// are staged. A data file carrying per-row ids (a rewrite output) is refused
-/// — maintaining those is a follow-up.
+/// Derives and appends the equality-index entries for one registered data
+/// file (a `RowOperation::Insert` into `TableKind::DataFile`), by scoped-
+/// reading the file. A no-op if the file's table has no live index. Refuses
+/// (rather than silently under-covering) when the file must be read but no
+/// store is available.
+async fn stage_data_file_index_entries(
+    base: &CatalogSnapshot,
+    cells: &[Cell],
+    data_store: Option<&dyn ObjectStore>,
+    data_prefix: &str,
+    entries: &mut Vec<StagedIndexEntry>,
+) -> Result<()> {
+    let file = decode_data_file(cells)?;
+    let table = TableId::new(file.table_id);
+    let indexes = base.indexes_of(table);
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    // The file must be read to maintain the index; no store to read it means
+    // the index would silently miss these rows.
+    let data_store = data_store.ok_or_else(|| {
+        Error::Constraint(format!(
+            "data file {} on indexed table {} cannot be read to maintain its equality index: no \
+             data-path store is available",
+            file.data_file_id, file.table_id
+        ))
+    })?;
+    let row_id_start = file.row_id_start.ok_or_else(|| {
+        Error::Constraint(format!(
+            "data file {} on indexed table {} carries per-row ids; index maintenance of rewrite \
+             files is a follow-up",
+            file.data_file_id, file.table_id
+        ))
+    })?;
+    let path = data_file_object_path(base, &file, data_prefix)?;
+    let live_columns = base.columns_of(table);
+    for index in &indexes {
+        let positions = index_positions(&live_columns, index, table)?;
+        let scoped =
+            scoped_read::scoped_read_entries(data_store, &path, &positions, None, row_id_start)
+                .await?;
+        push_index_entries(entries, index, scoped)?;
+    }
+    Ok(())
+}
+
 async fn stage_index_maintenance(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
-    data_store: &dyn ObjectStore,
+    data_store: Option<&dyn ObjectStore>,
     data_prefix: &str,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
@@ -2057,33 +2097,8 @@ async fn stage_index_maintenance(
                 table: TableKind::DataFile,
                 cells,
             } => {
-                let file = decode_data_file(cells)?;
-                let table = TableId::new(file.table_id);
-                let indexes = base.indexes_of(table);
-                if indexes.is_empty() {
-                    continue;
-                }
-                let row_id_start = file.row_id_start.ok_or_else(|| {
-                    Error::Constraint(format!(
-                        "data file {} on indexed table {} carries per-row ids; index maintenance \
-                         of rewrite files is a follow-up",
-                        file.data_file_id, file.table_id
-                    ))
-                })?;
-                let path = data_file_object_path(base, &file, data_prefix)?;
-                let live_columns = base.columns_of(table);
-                for index in &indexes {
-                    let positions = index_positions(&live_columns, index, table)?;
-                    let scoped = scoped_read::scoped_read_entries(
-                        data_store,
-                        &path,
-                        &positions,
-                        None,
-                        row_id_start,
-                    )
+                stage_data_file_index_entries(base, cells, data_store, data_prefix, &mut entries)
                     .await?;
-                    push_index_entries(&mut entries, index, scoped)?;
-                }
             }
             RowOperation::InlineInsert {
                 table_id,

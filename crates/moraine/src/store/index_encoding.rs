@@ -33,7 +33,9 @@ pub enum IntWidth {
     /// Eight bytes (`BIGINT`, `UBIGINT`, and temporal types by their
     /// underlying representation).
     I64,
-    /// Sixteen bytes (`HUGEINT`, `UHUGEINT`).
+    /// Sixteen bytes. Reserved: no column type currently derives this width
+    /// — `HUGEINT`/`UHUGEINT` are not indexable, since DuckDB writes them to
+    /// Parquet as a lossy double. Kept encodable for if that changes.
     I128,
 }
 
