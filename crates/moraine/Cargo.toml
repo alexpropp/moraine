@@ -11,8 +11,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arrow = { workspace = true, features = ["ipc"] }
 bytes = { workspace = true }
 object_store = { workspace = true }
+parquet = { workspace = true }
 prost = { workspace = true }
 slatedb = { workspace = true }
 storekey = { workspace = true }

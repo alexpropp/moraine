@@ -138,7 +138,13 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 		names.push_back(col.name);
 	}
 
+	// Lossless: encode UUID (and other extension types) type-faithfully — a
+	// UUID as a 16-byte blob, byte-identical to how DuckDB writes it to
+	// Parquet — so an equality index derives the same value whether a row is
+	// inlined or written to a data file. The lossy default would render a
+	// UUID as a string, diverging from the Parquet path.
 	auto options = context.GetClientProperties();
+	options.arrow_lossless_conversion = true;
 	ArrowSchema c_schema;
 	duckdb::ArrowConverter::ToArrowSchema(&c_schema, types, names, options);
 
@@ -202,7 +208,11 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	}
 	user_chunk.SetCardinality(chunk.size());
 
+	// Lossless, matching the inline schema registration: a UUID encodes as a
+	// 16-byte blob (as in Parquet), not a string, so index maintenance sees
+	// the same value across the inline and data-file paths.
 	auto options = context.GetClientProperties();
+	options.arrow_lossless_conversion = true;
 	ArrowSchema c_schema;
 	duckdb::ArrowConverter::ToArrowSchema(&c_schema, types, names, options);
 	ArrowArray c_array;

@@ -336,6 +336,59 @@ pub(crate) unsafe fn borrow_bytes<'a>(
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
+/// Resolves the `DATA_PATH` object store a catalog maintains equality
+/// indexes against, and its bucket-relative key prefix.
+///
+/// A lake's data root is fixed once recorded: the recorded value is
+/// authoritative, so a re-attach need not repeat it, and one that supplies a
+/// differing `data_path_arg` is refused. A lake with none recorded yet
+/// (freshly bootstrapped without one, or predating the option) adopts the
+/// given value — recording it, unless read-only, so it is served and enforced
+/// from then on. `None`/`None` yields no store.
+fn resolve_data_store(
+    runtime: &tokio::runtime::Runtime,
+    catalog: &moraine::Catalog,
+    data_path_arg: Option<String>,
+    read_only: bool,
+    s3_creds: Option<&S3Creds>,
+) -> Result<(Option<Arc<dyn ObjectStore>>, String), AbiError> {
+    let recorded = runtime
+        .block_on(catalog.snapshot())
+        .map_err(AbiError::from)?
+        .data_path();
+    let data_root = match (data_path_arg, recorded) {
+        (Some(given), Some(recorded)) => {
+            if given.trim_end_matches('/') != recorded.trim_end_matches('/') {
+                return Err(AbiError::invalid_argument(format!(
+                    "META_DATA_PATH `{given}` does not match the data path recorded for this \
+                     lake (`{recorded}`); a lake's data path is fixed when it is created"
+                )));
+            }
+            Some(recorded)
+        }
+        (Some(given), None) => {
+            if !read_only {
+                let to_record = given.clone();
+                runtime
+                    .block_on(catalog.commit(move |tx| {
+                        tx.set_option(moraine::OptionScope::Global, "data_path", &to_record)?;
+                        Ok(())
+                    }))
+                    .map_err(AbiError::from)?;
+            }
+            Some(given)
+        }
+        (None, recorded) => recorded,
+    };
+    match data_root {
+        Some(path) => {
+            let (kind, prefix) = StoreKind::from_path(&path)?;
+            Ok((Some(kind.open(&path, s3_creds)?), prefix))
+        }
+        None => Ok((None, String::new())),
+    }
+}
+
 /// Attaches a moraine catalog: creates the runtime this handle owns for
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.
@@ -370,6 +423,7 @@ pub unsafe extern "C" fn moraine_attach(
     encrypted: bool,
     flush_interval_ms: u64,
     cache_dir: *const c_char,
+    data_path: *const c_char,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -418,6 +472,13 @@ pub unsafe extern "C" fn moraine_attach(
             )
         })?;
 
+        // The DATA_PATH given at this attach (via `META_DATA_PATH`), if any.
+        // SAFETY: `data_path` validity is this function's own safety contract;
+        // null or empty means none was given.
+        let data_path_arg = unsafe { opt_str(data_path) }
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned);
+
         // `CatalogOptions` is `#[non_exhaustive]`, so it is built through
         // `default()` and field assignment rather than a struct literal.
         let mut options = CatalogOptions::default();
@@ -429,6 +490,9 @@ pub unsafe extern "C" fn moraine_attach(
             options.flush_interval = std::time::Duration::from_millis(flush_interval_ms);
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        // Persist the data root at bootstrap so a later attach reads it back
+        // without being told it again.
+        options.data_path.clone_from(&data_path_arg);
         let catalog = if read_only {
             // A read-only attach never bootstraps; on a fresh store the open
             // fails, so surface the reason (DuckDB defaults remote attaches to
@@ -442,7 +506,21 @@ pub unsafe extern "C" fn moraine_attach(
                 .map_err(AbiError::from)?
         };
 
-        Ok(Box::new(MoraineCatalogHandle::new(runtime, catalog)))
+        // Resolve the DATA_PATH object store index maintenance and backfill
+        // scoped-read against. Reuse the catalog store's S3 secret; DuckLake
+        // uses one for both.
+        let (data_store, data_prefix) = resolve_data_store(
+            &runtime,
+            &catalog,
+            data_path_arg,
+            read_only,
+            s3_creds.as_ref(),
+        )?;
+
+        let mut handle = MoraineCatalogHandle::new(runtime, catalog);
+        handle.data_store = data_store;
+        handle.data_prefix = data_prefix;
+        Ok(Box::new(handle))
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
@@ -456,6 +534,71 @@ pub unsafe extern "C" fn moraine_attach(
         }
         Err(code) => code,
     }
+}
+
+/// Writes the lake's recorded data root — the stored global `data_path`
+/// option, set when the store was created — to `*out` as an owned C string,
+/// or null when none was recorded. Free a non-null result exactly once with
+/// [`moraine_string_free`]. The shim serves this back as DuckLake's
+/// `ducklake_metadata` `data_path` row, so a re-attach need not repeat it.
+///
+/// Cancellable via `probe`/`probe_ctx` or a pending `moraine_interrupt`
+/// signal, exactly as [`moraine_snapshot`].
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`]. `out` must be a
+/// valid, writable `*mut *mut c_char`. `probe`/`probe_ctx` follow the ABI
+/// cancellation contract. `err`, if non-null, must be writable. All for the
+/// duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_data_path(
+    handle: *mut MoraineCatalogHandle,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    out: *mut *mut c_char,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out.is_null() {
+            return Err(AbiError::invalid_argument("`out` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+        let path_ptr = match snapshot.data_path() {
+            Some(path) => to_c_string(&path)?.into_raw(),
+            None => ptr::null_mut(),
+        };
+        // SAFETY: `out` is non-null and writable per the caller contract.
+        unsafe { *out = path_ptr };
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Frees a string previously written through [`moraine_data_path`]'s `out`.
+/// A null pointer is ignored.
+///
+/// # Safety
+///
+/// `ptr` must be a value written by [`moraine_data_path`] and not yet
+/// freed, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_string_free(ptr: *mut c_char) {
+    // SAFETY: caller contract — a `moraine_data_path` string or null.
+    unsafe { free_c_string(ptr) };
 }
 
 /// Whether the catalog encrypts its data files: the stored global
@@ -1121,6 +1264,601 @@ pub unsafe extern "C" fn moraine_snapshot_data_files_of_free(
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// One index, as returned by [`moraine_indexes`].
+#[repr(C)]
+pub struct MoraineIndexDesc {
+    /// The index's id.
+    pub index_id: u64,
+    /// Whether the index enforces uniqueness.
+    pub unique: bool,
+    /// Whether a staged build is still in progress.
+    pub building: bool,
+    /// The index name, owned — free via [`moraine_indexes_free`].
+    pub name: *mut c_char,
+}
+
+fn resolve_table(
+    snapshot: &moraine::CatalogSnapshot,
+    schema: &str,
+    table: &str,
+) -> Result<moraine::TableId, AbiError> {
+    let schema = snapshot
+        .schema_by_name(schema)
+        .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("schema {schema}"))))?;
+    let table = snapshot
+        .table_by_name(schema.id, table)
+        .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("table {table}"))))?;
+    Ok(table.id)
+}
+
+/// Borrows an inbound array of C strings.
+///
+/// # Safety
+///
+/// `names`/`count` must describe a valid array of `count` non-null,
+/// NUL-terminated C strings, valid for the duration of the borrow.
+unsafe fn borrow_str_array<'a>(
+    names: *const *const c_char,
+    count: usize,
+    arg: &str,
+) -> Result<Vec<&'a str>, AbiError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if names.is_null() {
+        return Err(AbiError::invalid_argument(format!("`{arg}` is null")));
+    }
+    // SAFETY: caller contract that `names`/`count` describe a valid array.
+    let slice = unsafe { std::slice::from_raw_parts(names, count) };
+    slice
+        .iter()
+        // SAFETY: each element is a valid C string per the caller contract.
+        .map(|&ptr| unsafe { borrow_str(ptr, arg) })
+        .collect()
+}
+
+/// Creates an equality index, committing autonomously. Refuses a table that
+/// already holds data (SQL-path backfill is a follow-up).
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null,
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_create(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    index_name: *const c_char,
+    column_names: *const *const c_char,
+    column_count: usize,
+    unique: bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        // SAFETY: caller contract.
+        let name = unsafe { borrow_str(index_name, "index_name") }?;
+        // SAFETY: caller contract for the column-name array.
+        let columns = unsafe { borrow_str_array(column_names, column_count, "column_names") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let live_columns = snapshot.columns_of(table_id);
+        let mut column_ids = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let found = live_columns
+                .iter()
+                .find(|c| c.name == *column)
+                .ok_or_else(|| {
+                    AbiError::from(moraine::Error::NotFound(format!("column {column}")))
+                })?;
+            // DuckDB writes a HUGEINT to Parquet as a lossy `double`, so a
+            // 128-bit column cannot be indexed faithfully: distinct values
+            // could collide and its data-file and inline forms disagree.
+            // Refuse rather than build a silently wrong index.
+            let base_type = found
+                .column_type
+                .split('(')
+                .next()
+                .unwrap_or(&found.column_type)
+                .trim()
+                .to_ascii_uppercase();
+            if matches!(
+                base_type.as_str(),
+                "HUGEINT" | "UHUGEINT" | "INT128" | "UINT128"
+            ) {
+                return Err(AbiError::from(moraine::Error::Constraint(format!(
+                    "column {column} is {}; a 128-bit integer is not indexable because DuckDB \
+                     stores it as a lossy double in Parquet",
+                    found.column_type
+                ))));
+            }
+            column_ids.push(found.id);
+        }
+
+        // A table that already holds data must be backfilled by scoped-reading
+        // its files from the DATA_PATH store (resolved at attach from
+        // `META_DATA_PATH`); without it, refuse rather than under-cover.
+        let backfill = if snapshot.data_files_of(table_id).is_empty() {
+            Vec::new()
+        } else {
+            let store = handle_ref.data_store.as_deref().ok_or_else(|| {
+                AbiError::from(moraine::Error::Constraint(
+                    "the table already holds data; attach with META_DATA_PATH so its files can be \
+                     scoped-read"
+                        .to_owned(),
+                ))
+            })?;
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.scoped_backfill_entries(
+                        store,
+                        &handle_ref.data_prefix,
+                        table_id,
+                        &column_ids,
+                    ),
+                )
+            }?
+        };
+
+        let def = moraine::IndexDef {
+            name: name.to_owned(),
+            columns: column_ids,
+            unique,
+        };
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.commit(|tx| {
+                    tx.create_index(table_id, &def, &backfill)?;
+                    Ok(())
+                }),
+            )
+        }?;
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Drops an equality index by name, committing autonomously.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null,
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_drop(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    index_name: *const c_char,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        // SAFETY: caller contract.
+        let name = unsafe { borrow_str(index_name, "index_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let index = snapshot
+            .index_by_name(table_id, name)
+            .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
+        let index_id = index.id;
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.commit(move |tx| tx.drop_index(index_id)),
+            )
+        }?;
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Lists a table's live equality indexes.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null,
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_indexes(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    out_items: *mut *mut MoraineIndexDesc,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineIndexDesc>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        // Owned-first: no raw pointers until every string converts.
+        let owned: Vec<(u64, bool, bool, CString)> = snapshot
+            .indexes_of(table_id)
+            .into_iter()
+            .map(|index| {
+                Ok((
+                    index.id.get(),
+                    index.unique,
+                    index.state != moraine::IndexState::Ready,
+                    to_c_string(&index.name)?,
+                ))
+            })
+            .collect::<Result<_, AbiError>>()?;
+        Ok(owned
+            .into_iter()
+            .map(|(index_id, unique, building, name)| MoraineIndexDesc {
+                index_id,
+                unique,
+                building,
+                name: name.into_raw(),
+            })
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees the array a [`moraine_indexes`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_indexes`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_indexes_free(items: *mut MoraineIndexDesc, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |d| free_c_string(d.name));
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// One row an index lookup resolved, as returned by [`moraine_index_lookup`].
+#[repr(C)]
+pub struct MoraineRowLocation {
+    /// The row id the entry points at.
+    pub row_id: u64,
+    /// The data file holding the row (valid when `is_inline` is false).
+    pub data_file_id: u64,
+    /// Whether the row is inlined (or not resolvable to a dense-range file).
+    pub is_inline: bool,
+}
+
+/// A value passed to [`moraine_index_lookup`], tagged by kind. The shim
+/// fills the field matching `kind`; the ABI coerces it to the indexed
+/// column's canonical form.
+#[repr(C)]
+pub struct MoraineLookupValue {
+    /// `1`=i64, `2`=u64, `3`=f64, `4`=bool, `5`=string, `6`=bytes.
+    pub kind: i32,
+    /// Valid iff `kind == 1`.
+    pub i64_value: i64,
+    /// Valid iff `kind == 2`.
+    pub u64_value: u64,
+    /// Valid iff `kind == 3`.
+    pub f64_value: f64,
+    /// Valid iff `kind == 4`.
+    pub bool_value: bool,
+    /// Valid iff `kind == 5`: a borrowed, NUL-terminated UTF-8 string.
+    pub str_value: *const c_char,
+    /// Valid iff `kind == 6`: a borrowed byte buffer of `bytes_len` bytes.
+    pub bytes_value: *const u8,
+    /// Length of `bytes_value` when `kind == 6`.
+    pub bytes_len: usize,
+}
+
+/// Coerces a lookup value to the canonical [`IndexKeyValue`] for a column of
+/// DuckLake type `ducklake_type`, matching how index maintenance derives the
+/// stored key from that column's Parquet/Arrow values. Errors on a column
+/// type equality indexes do not cover, or a value kind that cannot represent
+/// it.
+///
+/// # Safety
+///
+/// If `raw.kind` is `5` (string) or `6` (bytes), its pointer fields must be
+/// valid per the ABI contract for the duration of this call.
+// Distinct type names with a coincidentally identical body (e.g. `INTEGER`
+// and `DATE` both index as an `i32`) are kept as separate arms for clarity.
+// The `f64 as f32` narrowing for a `FLOAT` column is intended: the value came
+// from a single-precision column.
+#[allow(clippy::match_same_arms, clippy::cast_possible_truncation)]
+unsafe fn coerce_lookup_value(
+    raw: &MoraineLookupValue,
+    ducklake_type: &str,
+) -> Result<moraine::IndexKeyValue, AbiError> {
+    use moraine::{IndexKeyValue, IntWidth};
+
+    let want = |kind: i32, what: &str| -> Result<(), AbiError> {
+        if raw.kind == kind {
+            Ok(())
+        } else {
+            Err(AbiError::invalid_argument(format!(
+                "index lookup: expected a {what} value for a `{ducklake_type}` column"
+            )))
+        }
+    };
+    // A signed/unsigned integer value from either integer kind.
+    let signed_input = || -> Result<i128, AbiError> {
+        match raw.kind {
+            1 => Ok(i128::from(raw.i64_value)),
+            2 => Ok(i128::from(raw.u64_value)),
+            _ => want(1, "an integer").map(|()| 0),
+        }
+    };
+    let unsigned_input = || -> Result<u128, AbiError> {
+        match raw.kind {
+            2 => Ok(u128::from(raw.u64_value)),
+            1 if raw.i64_value >= 0 => Ok(raw.i64_value.unsigned_abs().into()),
+            _ => want(2, "an unsigned integer").map(|()| 0),
+        }
+    };
+    let signed = |value, width| IndexKeyValue::Int { value, width };
+    let unsigned = |value, width| IndexKeyValue::UInt { value, width };
+
+    // The base name, e.g. `DECIMAL` from `DECIMAL(18,3)`.
+    let base = ducklake_type
+        .split('(')
+        .next()
+        .unwrap_or(ducklake_type)
+        .trim()
+        .to_ascii_uppercase();
+    // Names as DuckLake records them (see the shim's `MapColumnType`): the
+    // bit-width spellings (`INT64`) alongside the SQL names (`BIGINT`).
+    let value = match base.as_str() {
+        "TINYINT" | "INT8" => signed(signed_input()?, IntWidth::I8),
+        "SMALLINT" | "INT16" => signed(signed_input()?, IntWidth::I16),
+        "INTEGER" | "INT32" => signed(signed_input()?, IntWidth::I32),
+        "BIGINT" | "INT64" => signed(signed_input()?, IntWidth::I64),
+        "UTINYINT" | "UINT8" => unsigned(unsigned_input()?, IntWidth::I8),
+        "USMALLINT" | "UINT16" => unsigned(unsigned_input()?, IntWidth::I16),
+        "UINTEGER" | "UINT32" => unsigned(unsigned_input()?, IntWidth::I32),
+        "UBIGINT" | "UINT64" => unsigned(unsigned_input()?, IntWidth::I64),
+        // 128-bit integers are intentionally absent: they are not indexable
+        // (DuckDB stores `HUGEINT` as a lossy double in Parquet), so no index
+        // covers such a column and this coercion is never reached for one —
+        // it falls through to the unsupported-type error, matching the
+        // refusal at index creation.
+        // Temporal types index by their underlying integer, as the scoped
+        // read derives them: `DATE` as an `i32` day count, the rest as `i64`.
+        "DATE" => signed(signed_input()?, IntWidth::I32),
+        "TIME"
+        | "TIME_NS"
+        | "TIMETZ"
+        | "TIME WITH TIME ZONE"
+        | "TIMESTAMP"
+        | "TIMESTAMP_S"
+        | "TIMESTAMP_MS"
+        | "TIMESTAMP_NS"
+        | "TIMESTAMP_US"
+        | "TIMESTAMPTZ"
+        | "TIMESTAMP WITH TIME ZONE" => signed(signed_input()?, IntWidth::I64),
+        "BOOLEAN" => {
+            want(4, "a boolean")?;
+            IndexKeyValue::Bool(raw.bool_value)
+        }
+        "FLOAT" | "FLOAT32" | "REAL" => {
+            want(3, "a float")?;
+            IndexKeyValue::F32(raw.f64_value as f32)
+        }
+        "DOUBLE" | "FLOAT64" => {
+            want(3, "a float")?;
+            IndexKeyValue::F64(raw.f64_value)
+        }
+        "VARCHAR" | "TEXT" | "JSON" => {
+            want(5, "a string")?;
+            // SAFETY: caller contract — a `kind == 5` value's string pointer
+            // is a valid NUL-terminated C string for this call.
+            let text = unsafe { borrow_str(raw.str_value, "lookup value") }?;
+            IndexKeyValue::Str(text.to_owned())
+        }
+        "UUID" | "BLOB" => {
+            want(6, "a UUID or blob")?;
+            // SAFETY: caller contract — a `kind == 6` value's byte pointer is
+            // valid for `bytes_len` bytes for this call.
+            let bytes = unsafe { borrow_bytes(raw.bytes_value, raw.bytes_len, "lookup value") }?;
+            IndexKeyValue::Bytes(bytes.to_vec())
+        }
+        other => {
+            return Err(AbiError::invalid_argument(format!(
+                "index lookup: column type `{other}` is not supported"
+            )));
+        }
+    };
+    Ok(value)
+}
+
+/// Resolves an equality lookup on a single-column index to the rows
+/// currently holding `lookup_value` — a [`MoraineLookupValue`] the ABI
+/// coerces to the indexed column's type. v1 resolves a single value.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null,
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_lookup(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    index_name: *const c_char,
+    lookup_value: *const MoraineLookupValue,
+    out_items: *mut *mut MoraineRowLocation,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineRowLocation>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        if lookup_value.is_null() {
+            return Err(AbiError::invalid_argument("`lookup_value` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        // SAFETY: caller contract.
+        let name = unsafe { borrow_str(index_name, "index_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let index = snapshot
+            .index_by_name(table_id, name)
+            .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
+        // v1 resolves a single value, so only a single-column index.
+        let [column_id] = index.columns[..] else {
+            return Err(AbiError::invalid_argument(
+                "index lookup: a single value resolves only a single-column index",
+            ));
+        };
+        let columns = snapshot.columns_of(table_id);
+        let column = columns.iter().find(|c| c.id == column_id).ok_or_else(|| {
+            AbiError::from(moraine::Error::Corruption(format!(
+                "index {name} covers column {column_id} absent from table {table_id}"
+            )))
+        })?;
+        // SAFETY: caller contract — `lookup_value` is a valid pointer whose
+        // string/bytes fields (if its kind uses them) are valid for this call.
+        let value = unsafe { coerce_lookup_value(&*lookup_value, &column.column_type) }?;
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let locations = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .index_lookup(table_id, index.id, &[value]),
+            )
+        }?;
+        Ok(locations
+            .into_iter()
+            .map(|location| {
+                let (data_file_id, is_inline) = match location.holder {
+                    moraine::RowHolder::DataFile(id) => (id.get(), false),
+                    moraine::RowHolder::Inline => (0, true),
+                };
+                MoraineRowLocation {
+                    row_id: location.row_id,
+                    data_file_id,
+                    is_inline,
+                }
+            })
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees the array a [`moraine_index_lookup`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_index_lookup`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineRowLocation, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above. The descriptor owns no heap.
+        unsafe {
+            free_array(items, len, |_| {});
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1216,6 +1954,7 @@ mod tests {
                             encryption_key: None,
                             column_stats: vec![],
                         },
+                        &[],
                     )?;
                     tx.create_view(schema, "orders_v", "duckdb", "select * from orders")?;
                     Ok(())
@@ -1239,6 +1978,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 &raw mut handle,
                 &raw mut err,
@@ -1274,6 +2014,169 @@ mod tests {
         encrypted
     }
 
+    /// Bootstraps a fresh store at `dir` recording `data_path`, the way an
+    /// attach with `META_DATA_PATH` does.
+    fn seed_with_data_path(dir: &Path, data_path: &str) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test setup: build tokio runtime");
+        rt.block_on(async {
+            let store = Arc::new(
+                LocalFileSystem::new_with_prefix(dir).expect("test setup: open local store"),
+            );
+            let mut options = moraine::CatalogOptions::default();
+            options.data_path = Some(data_path.to_owned());
+            let catalog = moraine::Catalog::open(store, options)
+                .await
+                .expect("test setup: open catalog");
+            catalog.close().await.expect("test setup: close catalog");
+        });
+    }
+
+    /// A lake's data path is fixed at creation: re-attaching with a
+    /// conflicting `META_DATA_PATH` is refused, while the recorded value
+    /// (trailing separator and all) attaches cleanly.
+    #[test]
+    fn attach_refuses_a_conflicting_data_path() {
+        let dir = TempDir::new("data-path-fixed");
+        let data = TempDir::new("data-path-fixed-root");
+        let recorded = data.path().to_str().expect("utf-8").to_owned();
+        seed_with_data_path(dir.path(), &recorded);
+        let c_path = dir.c_path();
+
+        // A different data path is refused with a clear message.
+        let c_bad = CString::new("/lake/other").expect("no NUL");
+        let mut bad_handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut bad_err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let bad_code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                c_bad.as_ptr(),
+                &raw mut bad_handle,
+                &raw mut bad_err,
+            )
+        };
+        assert_ne!(
+            bad_code,
+            codes::OK,
+            "a conflicting data path must be refused"
+        );
+        // SAFETY: on failure `guard` wrote a non-null message.
+        let message = unsafe { CStr::from_ptr(bad_err.message) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains("does not match"), "got: {message}");
+        // SAFETY: `bad_err.message` was minted by the failed call, freed once.
+        unsafe { moraine_error_free(bad_err.message) };
+
+        // The recorded path, with a trailing separator, still attaches.
+        let c_good = CString::new(format!("{recorded}/")).expect("no NUL");
+        let mut good_handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut good_err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let good_code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                c_good.as_ptr(),
+                &raw mut good_handle,
+                &raw mut good_err,
+            )
+        };
+        // SAFETY: `good_err.message` is null or just written; `as_ref` allows null.
+        let good_message = unsafe { good_err.message.as_ref() };
+        assert_eq!(
+            good_code,
+            codes::OK,
+            "matching path failed: {good_message:?}"
+        );
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(good_handle) };
+    }
+
+    /// A lake with no data path recorded yet (created before the option
+    /// existed) adopts the one given at its next attach, and enforces it
+    /// thereafter.
+    #[test]
+    fn attach_records_a_missing_data_path_then_fixes_it() {
+        let dir = TempDir::new("legacy-data-path");
+        seed(dir.path()); // a store with no data_path recorded
+        let data = TempDir::new("legacy-data-path-root");
+        let recorded = data.path().to_str().expect("utf-8").to_owned();
+        let c_path = dir.c_path();
+
+        // The first attach records the data path.
+        let c_first = CString::new(recorded.clone()).expect("no NUL");
+        let mut first_handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut first_err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let first_code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                c_first.as_ptr(),
+                &raw mut first_handle,
+                &raw mut first_err,
+            )
+        };
+        // SAFETY: `first_err.message` is null or just written; `as_ref` allows null.
+        let first_message = unsafe { first_err.message.as_ref() };
+        assert_eq!(
+            first_code,
+            codes::OK,
+            "recording attach failed: {first_message:?}"
+        );
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(first_handle) };
+
+        // A later attach with a different data path is now refused.
+        let c_other = CString::new("/lake/elsewhere").expect("no NUL");
+        let mut other_handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut other_err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let other_code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                c_other.as_ptr(),
+                &raw mut other_handle,
+                &raw mut other_err,
+            )
+        };
+        assert_ne!(other_code, codes::OK, "the recorded path is now enforced");
+        // SAFETY: on failure `guard` wrote a non-null message.
+        let other_message = unsafe { CStr::from_ptr(other_err.message) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            other_message.contains("does not match"),
+            "got: {other_message}"
+        );
+        // SAFETY: minted by the failed call, freed once.
+        unsafe { moraine_error_free(other_err.message) };
+    }
+
     /// A read-only attach of an uninitialized store fails with guidance to
     /// add `READ_WRITE`: a read-only attach cannot bootstrap, which is how a
     /// fresh remote (DuckDB-defaulted-read-only) lake presents.
@@ -1292,6 +2195,7 @@ mod tests {
                 true,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 &raw mut handle,
                 &raw mut err,
@@ -1334,6 +2238,7 @@ mod tests {
                 false,
                 true,
                 0,
+                ptr::null(),
                 ptr::null(),
                 &raw mut handle,
                 &raw mut err,
@@ -1672,6 +2577,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -1705,6 +2611,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 &raw mut handle,
                 &raw mut err,
@@ -1758,6 +2665,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 &raw mut handle,
                 &raw mut err,
@@ -2121,6 +3029,82 @@ mod tests {
         unsafe { moraine_detach(handle) };
     }
 
+    /// A lookup value coerces to the same canonical `IndexKeyValue` the
+    /// scoped read derives for the column's type — width and all — so a
+    /// lookup matches a stored key.
+    #[test]
+    fn coerce_lookup_value_matches_column_types() {
+        use moraine::{IndexKeyValue, IntWidth};
+
+        let blank = MoraineLookupValue {
+            kind: 0,
+            i64_value: 0,
+            u64_value: 0,
+            f64_value: 0.0,
+            bool_value: false,
+            str_value: ptr::null(),
+            bytes_value: ptr::null(),
+            bytes_len: 0,
+        };
+
+        let int_value = MoraineLookupValue {
+            kind: 1,
+            i64_value: 42,
+            ..blank
+        };
+        // The same integer takes the column's width, not the literal's — and
+        // DuckLake's bit-width spelling (`INT64`) resolves like the SQL name.
+        // SAFETY: an integer-kind value dereferences no pointer fields.
+        let as_bigint = unsafe { coerce_lookup_value(&int_value, "INT64") }.unwrap();
+        assert_eq!(
+            as_bigint,
+            IndexKeyValue::Int {
+                value: 42,
+                width: IntWidth::I64
+            }
+        );
+        // SAFETY: as above.
+        let as_integer = unsafe { coerce_lookup_value(&int_value, "INT32") }.unwrap();
+        assert_eq!(
+            as_integer,
+            IndexKeyValue::Int {
+                value: 42,
+                width: IntWidth::I32
+            }
+        );
+
+        // A UUID arrives as 16 bytes.
+        let uuid = [0x5Au8; 16];
+        let bytes_value = MoraineLookupValue {
+            kind: 6,
+            bytes_value: uuid.as_ptr(),
+            bytes_len: uuid.len(),
+            ..blank
+        };
+        // SAFETY: `uuid` outlives the call.
+        let as_uuid = unsafe { coerce_lookup_value(&bytes_value, "UUID") }.unwrap();
+        assert_eq!(as_uuid, IndexKeyValue::Bytes(uuid.to_vec()));
+
+        let text = CString::new("hello").expect("no NUL");
+        let str_value = MoraineLookupValue {
+            kind: 5,
+            str_value: text.as_ptr(),
+            ..blank
+        };
+        // SAFETY: `text` outlives the call.
+        let as_varchar = unsafe { coerce_lookup_value(&str_value, "VARCHAR") }.unwrap();
+        assert_eq!(as_varchar, IndexKeyValue::Str("hello".to_owned()));
+
+        // A kind that cannot represent the column, and an unsupported type,
+        // are both refused rather than silently mis-encoded.
+        // SAFETY: integer-kind value, no pointer fields.
+        let wrong_kind = unsafe { coerce_lookup_value(&int_value, "UUID") };
+        assert!(wrong_kind.is_err());
+        // SAFETY: as above.
+        let unsupported = unsafe { coerce_lookup_value(&int_value, "DECIMAL(18,3)") };
+        assert!(unsupported.is_err());
+    }
+
     /// `cpp/moraine_abi.h` is a hand-written C mirror of this module's
     /// `extern "C"` surface, kept in lockstep by hand (no `cbindgen`
     /// step). Checks textual presence of each symbol/struct name only —
@@ -2131,6 +3115,8 @@ mod tests {
 
         let functions = [
             "moraine_attach",
+            "moraine_data_path",
+            "moraine_string_free",
             "moraine_catalog_encrypted",
             "moraine_detach",
             "moraine_snapshot",
@@ -2153,6 +3139,12 @@ mod tests {
             "moraine_arrow_decode_body",
             "moraine_arrow_bytes_free",
             "moraine_arrow_error_free",
+            "moraine_index_create",
+            "moraine_index_drop",
+            "moraine_indexes",
+            "moraine_indexes_free",
+            "moraine_index_lookup",
+            "moraine_index_lookup_free",
         ];
         let structs = [
             "MoraineCatalogHandle",
@@ -2166,6 +3158,9 @@ mod tests {
             "MoraineDataFileDesc",
             "MoraineArrowBytes",
             "MoraineArrowError",
+            "MoraineIndexDesc",
+            "MoraineRowLocation",
+            "MoraineLookupValue",
         ];
         let error_codes = [
             "MORAINE_OK",

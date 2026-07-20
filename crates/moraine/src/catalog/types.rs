@@ -69,6 +69,11 @@ id_type!(
     /// counter as data-file ids).
     MappingId
 );
+id_type!(
+    /// Identifies an equality index within its table (allocated from the
+    /// global catalog-id counter).
+    IndexId
+);
 
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
@@ -324,6 +329,94 @@ pub struct MappingInfo {
     pub map_type: String,
     /// The mapping's rows in `column_id` order.
     pub name_mappings: Vec<NameMappingDef>,
+}
+
+/// One writer-supplied index entry for a row of a registered data file.
+/// The ordinal is the row's 0-based position in the file; the commit maps
+/// it to a row id (`row_id_start + ordinal`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileIndexEntry {
+    /// The index this entry belongs to.
+    pub index: IndexId,
+    /// The row's 0-based position within the file.
+    pub ordinal: u64,
+    /// The indexed column values, positionally matching the index's
+    /// columns; a `None` is SQL NULL and yields no entry.
+    pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
+}
+
+/// The build lifecycle of an equality index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexState {
+    /// Fully built: serving lookups and enforcing uniqueness.
+    Ready,
+    /// A staged backfill is in progress; lookups fail typed and a unique
+    /// violation poisons the build rather than failing the writer.
+    Building,
+    /// A duplicate was discovered during a staged build; the definition is
+    /// terminally poisoned and will be dropped by its driver.
+    Poisoned,
+}
+
+/// A live equality index, as read from a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexInfo {
+    /// The index's id.
+    pub id: IndexId,
+    /// The table the index covers.
+    pub table_id: TableId,
+    /// The index name, unique among the table's live indexes.
+    pub name: String,
+    /// Indexed columns by field id, in declared order.
+    pub columns: Vec<ColumnId>,
+    /// Whether the index enforces uniqueness.
+    pub unique: bool,
+    /// The build lifecycle state.
+    pub state: IndexState,
+}
+
+/// The definition of an equality index to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexDef {
+    /// The index name, unique among the table's live indexes.
+    pub name: String,
+    /// Indexed columns by field id, in declared order.
+    pub columns: Vec<ColumnId>,
+    /// Whether the index enforces uniqueness.
+    pub unique: bool,
+}
+
+/// One writer-supplied index entry: a row and its indexed column values,
+/// in the index's column order. A `None` in any position is SQL NULL, and
+/// a row with any NULL indexed value gets no entry — the caller passes the
+/// row through and the maintenance layer skips it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexEntry {
+    /// The row this entry points at.
+    pub row_id: u64,
+    /// The indexed column values, positionally matching the index's
+    /// columns.
+    pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
+}
+
+/// Where a row a lookup found currently lives. moraine returns candidates;
+/// the consumer applies delete files, as any DuckLake scan does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowHolder {
+    /// A data file whose live row-id range contains the row.
+    DataFile(DataFileId),
+    /// The row is inlined (or its holder is not a dense-range data file),
+    /// so it is not resolvable from data-file ranges alone.
+    Inline,
+}
+
+/// A row an index lookup resolved: its stable id and current holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowLocation {
+    /// The stable row id the entry points at.
+    pub row_id: u64,
+    /// The row's current holder in this snapshot.
+    pub holder: RowHolder,
 }
 
 /// A column definition: the input to table creation and column addition.

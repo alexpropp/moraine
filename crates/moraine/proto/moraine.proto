@@ -141,6 +141,32 @@ message SortValue {
   repeated SortExpression expressions = 5;
 }
 
+// idx index definition: a moraine-native equality index. Table-scoped and
+// temporally versioned like any entity; it has no DuckLake analog and is
+// invisible to every catalog scan. A value without a build_state is a
+// single-commit `ready` index, so the common case is byte-unchanged.
+message IndexValue {
+  uint64 index_id = 1;
+  uint64 table_id = 2;
+  uint64 begin_snapshot = 3;
+  optional uint64 end_snapshot = 4;
+  string index_name = 5;
+  // Indexed columns by field id, in declared order.
+  repeated uint64 column_ids = 6;
+  bool unique = 7;
+  // Staged-build lifecycle. Absent => a single-commit `ready` index.
+  optional string build_state = 8;
+  // Backfill watermark: the last covered file and row id.
+  optional uint64 build_cursor_file = 9;
+  optional uint64 build_cursor_row_id = 10;
+  // Last snapshot the delete-exclusion scan has caught up to.
+  optional uint64 build_deletes_scanned = 11;
+  // Terminal poison flag: a duplicate discovered during the build.
+  optional bool poisoned = 12;
+  // Reserved for a future DuckLake-native index mapped onto this idx range.
+  optional uint64 ducklake_index_id = 13;
+}
+
 // ducklake_file_partition_value — embedded in DataFileValue.
 message FilePartitionValue {
   uint64 partition_key_index = 1;

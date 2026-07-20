@@ -764,9 +764,10 @@ std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalog
 //     compares it against the attach's requested encryption and, when
 //     "true", encrypts new data files and records their keys in
 //     `ducklake_data_file`/`ducklake_delete_file` rows.
-//   - "data_path" is deliberately omitted: DuckLake acts on it only when the
-//     row is present, and there is no store-level lake-wide data path to
-//     serve; omitting it leaves the ATTACH DATA_PATH option as sole authority.
+//   - "data_path" is served only when the store recorded one at creation
+//     (from the DATA_PATH given then). DuckLake reads it back on attach and
+//     uses it when no DATA_PATH is supplied, so a re-attach need not repeat
+//     it; a store with none served leaves the ATTACH DATA_PATH as authority.
 //   - "created_by": never read back; served because it costs nothing.
 //   - "data_inlining_row_limit": "10" (DuckLake's compiled default). Load-
 //     bearing: a non-zero value is what makes DuckLake's write path emit
@@ -784,12 +785,33 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *ha
 	}
 	auto null_varchar = duckdb::Value(duckdb::LogicalType::VARCHAR);
 	auto null_bigint = duckdb::Value(duckdb::LogicalType::BIGINT);
-	return {
+	std::vector<std::vector<duckdb::Value>> rows = {
 	    {Varchar("version"), Varchar("1.0"), null_varchar, null_bigint},
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
 	    {Varchar("encrypted"), Varchar(encrypted ? "true" : "false"), null_varchar, null_bigint},
 	    {Varchar("data_inlining_row_limit"), Varchar("10"), null_varchar, null_bigint},
 	};
+	// The recorded data root, when the store has one, so DuckLake reads it
+	// back on attach instead of requiring DATA_PATH again.
+	char *data_path = nullptr;
+	MoraineError dp_err {};
+	if (moraine_data_path(handle, probe, probe_ctx, &data_path, &dp_err) != MORAINE_OK) {
+		ThrowMoraineError(dp_err);
+	}
+	if (data_path != nullptr) {
+		// DuckLake normalizes a data path to a single trailing separator and
+		// compares that to this served value (or adopts it verbatim when no
+		// DATA_PATH is given), so serve the same normalized form. moraine's
+		// supported stores (local, s3://) all use `/`.
+		std::string served(data_path);
+		moraine_string_free(data_path);
+		while (!served.empty() && served.back() == '/') {
+			served.pop_back();
+		}
+		served += '/';
+		rows.push_back({Varchar("data_path"), Varchar(served.c_str()), null_varchar, null_bigint});
+	}
+	return rows;
 }
 
 // Feeds `ducklake_inlined_data_tables`: one row per `(table_id,

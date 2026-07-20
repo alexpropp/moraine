@@ -58,7 +58,7 @@ async fn registration_is_data_only_and_visible() {
     let before = catalog.snapshot().await.unwrap().current_snapshot();
 
     catalog
-        .commit(move |tx| tx.register_data_file(t, datafile(100)).map(|_| ()))
+        .commit(move |tx| tx.register_data_file(t, datafile(100), &[]).map(|_| ()))
         .await
         .unwrap();
 
@@ -82,7 +82,7 @@ async fn registration_is_data_only_and_visible() {
 async fn expiry_time_travels_and_row_ids_stay_dense() {
     let (catalog, t) = seeded().await;
     catalog
-        .commit(move |tx| tx.register_data_file(t, datafile(100)).map(|_| ()))
+        .commit(move |tx| tx.register_data_file(t, datafile(100), &[]).map(|_| ()))
         .await
         .unwrap();
     let registered = catalog.snapshot().await.unwrap().current_snapshot().id;
@@ -101,7 +101,7 @@ async fn expiry_time_travels_and_row_ids_stay_dense() {
 
     // A later registration allocates above the expired rows.
     catalog
-        .commit(move |tx| tx.register_data_file(t, datafile(10)).map(|_| ()))
+        .commit(move |tx| tx.register_data_file(t, datafile(10), &[]).map(|_| ()))
         .await
         .unwrap();
     let head = catalog.snapshot().await.unwrap();
@@ -121,6 +121,7 @@ async fn encryption_keys_round_trip_verbatim() {
                     encryption_key: Some("ZGF0YS1rZXk=".into()),
                     ..datafile(10)
                 },
+                &[],
             )?;
             tx.register_delete_file(
                 t,
@@ -157,7 +158,7 @@ async fn delete_files_cascade_with_their_data_file() {
     let (catalog, t) = seeded().await;
     catalog
         .commit(move |tx| {
-            let f = tx.register_data_file(t, datafile(100))?;
+            let f = tx.register_data_file(t, datafile(100), &[])?;
             tx.register_delete_file(
                 t,
                 DeleteFile {
@@ -230,6 +231,7 @@ async fn column_stats_round_trip_verbatim() {
                     }],
                     ..datafile(100)
                 },
+                &[],
             )?;
             tx.update_column_stats(
                 t,

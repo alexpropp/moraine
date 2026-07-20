@@ -192,7 +192,15 @@ pub unsafe extern "C" fn moraine_tx_begin(
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let tx = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, staged_begin(&handle_ref.catalog))
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                staged_begin(
+                    &handle_ref.catalog,
+                    handle_ref.data_store.clone(),
+                    handle_ref.data_prefix.clone(),
+                ),
+            )
         }?;
         Ok(Box::new(MoraineTxHandle {
             catalog: handle,
@@ -743,6 +751,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 &raw mut handle,
                 &raw mut err,

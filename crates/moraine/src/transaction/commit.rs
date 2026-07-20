@@ -19,13 +19,27 @@ use crate::{
         proto, read, value,
     },
     transaction::{
+        index_maintenance,
         operations::{ChangeSet, Operation},
         verbs::Transaction,
     },
 };
 
-/// Structural layout version this binary reads and writes.
+/// Structural layout version a fresh store bootstraps at — format 1 plus
+/// nothing. Index-free stores stay here, byte-identical to pre-index
+/// stores and readable by older binaries.
 pub(crate) const FORMAT_VERSION: u64 = 1;
+/// Format stamped lazily the first time an equality index exists: format 1
+/// plus the `idx` subspace and `index` kind. Older binaries, which
+/// maintain no entries, refuse it.
+pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
+/// Format stamped the first time a staged (multi-commit) index build
+/// exists. A format-2 binary would read a `building` definition as a ready
+/// index and serve from an under-covered entry set, so it must refuse this.
+pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
+/// The highest format this binary understands. It opens any store in
+/// `FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
@@ -55,9 +69,11 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
         ));
     }
     match read::read_format(tx).await? {
-        Some(format) if format.format_version == FORMAT_VERSION => Ok(Some(format)),
+        Some(format) if (FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&format.format_version) => {
+            Ok(Some(format))
+        }
         Some(format) => Err(Error::Corruption(format!(
-            "store format {} is not the supported format {FORMAT_VERSION}",
+            "store format {} is outside the supported range {FORMAT_VERSION}..={MAX_FORMAT_VERSION}",
             format.format_version
         ))),
         None => Ok(None),
@@ -74,7 +90,7 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
 /// here: whether data files are encrypted is fixed when the catalog is
 /// created, exactly as DuckLake fixes it when initializing a metadata
 /// store.
-fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
+fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>) -> Result<()> {
     let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     stage(
         Key::Sys(SysKey::Format),
@@ -114,17 +130,22 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
             path_is_relative: true,
         }),
     )?;
+    // The global option record carries `encrypted` and, when the lake was
+    // given a data root, `data_path` — so a later open reads the root back
+    // without being told it again.
+    let mut options = std::collections::HashMap::from([(
+        "encrypted".to_string(),
+        if encrypted { "true" } else { "false" }.to_string(),
+    )]);
+    if let Some(path) = data_path {
+        options.insert("data_path".to_string(), path.to_string());
+    }
     stage(
         Key::current(EntityKey::Option {
             scope_kind: 0,
             scope_id: 0,
         }),
-        value::encode_value(&proto::OptionScopeValue {
-            options: std::collections::HashMap::from([(
-                "encrypted".to_string(),
-                if encrypted { "true" } else { "false" }.to_string(),
-            )]),
-        }),
+        value::encode_value(&proto::OptionScopeValue { options }),
     )?;
     stage(
         Key::Sys(SysKey::Head),
@@ -135,7 +156,11 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool) -> Result<()> {
 /// Opens the store, bootstrapping an empty one in one atomic batch under
 /// conflict detection — a lost bootstrap race re-validates instead of
 /// double-initializing. Every exit that does not commit rolls back.
-pub(crate) async fn open_initialized(store: StoreBuilder<'_>, encrypted: bool) -> Result<Db> {
+pub(crate) async fn open_initialized(
+    store: StoreBuilder<'_>,
+    encrypted: bool,
+    data_path: Option<&str>,
+) -> Result<Db> {
     let db = store.open_writer().await?;
     let tx = db
         .begin(IsolationLevel::Snapshot)
@@ -154,7 +179,7 @@ pub(crate) async fn open_initialized(store: StoreBuilder<'_>, encrypted: bool) -
         }
     }
 
-    if let Err(err) = stage_bootstrap(&tx, encrypted) {
+    if let Err(err) = stage_bootstrap(&tx, encrypted, data_path) {
         tx.rollback();
         return Err(err);
     }
@@ -683,6 +708,25 @@ fn diff_sorts(
     );
 }
 
+fn diff_indexes(
+    writes: &mut Vec<StagedWrite>,
+    base: &CatalogSnapshot,
+    state: &CatalogSnapshot,
+    new_snapshot: u64,
+) {
+    diff_nested_versioned(
+        writes,
+        &base.indexes,
+        &state.indexes,
+        |table_id, index_id| EntityKey::Index { table_id, index_id },
+        new_snapshot,
+        |prior| proto::IndexValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
+}
+
 fn diff_table_stats(
     writes: &mut Vec<StagedWrite>,
     base: &CatalogSnapshot,
@@ -776,6 +820,7 @@ pub(crate) fn diff_writes(
     diff_delete_files(&mut writes, base, state, new_snapshot);
     diff_partitions(&mut writes, base, state, new_snapshot);
     diff_sorts(&mut writes, base, state, new_snapshot);
+    diff_indexes(&mut writes, base, state, new_snapshot);
     diff_macros(&mut writes, base, state, new_snapshot);
     diff_mappings(&mut writes, base, state);
     diff_table_stats(&mut writes, base, state);
@@ -866,7 +911,7 @@ where
 
     let mut tx = Transaction::new(base.clone(), new_id);
     f(&mut tx)?;
-    let (operations, state, next_catalog_id, next_file_id) = tx.into_parts();
+    let (operations, index_entries, state, next_catalog_id, next_file_id) = tx.into_parts();
 
     if operations.is_empty() {
         let mut writes = Vec::new();
@@ -892,6 +937,43 @@ where
     }
 
     let mut writes = diff_writes(&base, &state, new_id);
+
+    // A staged (`building`) index implies format 3; any other index implies
+    // format 2. Stamp lazily, in the same batch, and only ever upward — a
+    // completed or dropped build never downgrades the stamp.
+    let target_format = if state
+        .indexes
+        .values()
+        .flat_map(std::collections::BTreeMap::values)
+        .any(|index| index.build_state.is_some())
+    {
+        FORMAT_WITH_STAGED_INDEX
+    } else if state
+        .indexes
+        .values()
+        .any(|per_table| !per_table.is_empty())
+    {
+        FORMAT_WITH_INDEX
+    } else {
+        FORMAT_VERSION
+    };
+    if target_format > FORMAT_VERSION {
+        let current = read::read_format(ReadHandle::Tx(db_tx))
+            .await?
+            .map_or(FORMAT_VERSION, |format| format.format_version);
+        if current < target_format {
+            writes.push((
+                Key::Sys(SysKey::Format).encode(),
+                Some(value::encode_value(&proto::FormatValue {
+                    format_version: target_format,
+                    writer_version: env!("CARGO_PKG_VERSION").to_string(),
+                })),
+            ));
+        }
+    }
+    index_maintenance::stage_index_entries(ReadHandle::Tx(db_tx), &index_entries, &mut writes)
+        .await?;
+
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
         .iter()
@@ -1058,7 +1140,7 @@ mod tests {
         db.put(
             &Key::Sys(SysKey::Format).encode(),
             &value::encode_value(&proto::FormatValue {
-                format_version: FORMAT_VERSION + 1,
+                format_version: MAX_FORMAT_VERSION + 1,
                 writer_version: "future".into(),
             }),
         )
@@ -1068,7 +1150,7 @@ mod tests {
 
         // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
         // `Debug` impl; `err().unwrap()` only needs it on the error side.
-        let err = open_initialized(StoreBuilder::new("", object_store), false)
+        let err = open_initialized(StoreBuilder::new("", object_store), false, None)
             .await
             .err()
             .unwrap();
@@ -1095,7 +1177,7 @@ mod tests {
         .unwrap();
         db.close().await.unwrap();
 
-        let err = open_initialized(StoreBuilder::new("", object_store), false)
+        let err = open_initialized(StoreBuilder::new("", object_store), false, None)
             .await
             .err()
             .unwrap();
@@ -1140,7 +1222,7 @@ mod tests {
             )
             .unwrap();
         let column = setup.columns_of(table)[0].id;
-        let (_, base, _, _) = setup.into_parts();
+        let (_, _, base, _, _) = setup.into_parts();
 
         // Register a file with column stats, then expire it — all inside
         // this one commit's transaction.
@@ -1167,10 +1249,11 @@ mod tests {
                         extra_stats: None,
                     }],
                 },
+                &[],
             )
             .unwrap();
         tx.expire_data_file(table, file).unwrap();
-        let (_, state, _, _) = tx.into_parts();
+        let (_, _, state, _, _) = tx.into_parts();
 
         let writes = diff_writes(&base, &state, 2);
         for (key_bytes, _) in &writes {
@@ -1274,6 +1357,7 @@ mod tests {
                         encryption_key: None,
                         column_stats: vec![],
                     },
+                    &[],
                 )
                 .map(|_| ())
             })
@@ -1292,6 +1376,889 @@ mod tests {
             .unwrap();
         assert_eq!(data_only.schema_changed_table_ids, Vec::<u64>::new());
         tx.rollback();
+        catalog.close().await.unwrap();
+    }
+
+    async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::catalog::TableId) {
+        use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let table = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.create_schema("s")?;
+                let column = |name: &str| ColumnDef {
+                    name: name.into(),
+                    column_type: "BIGINT".into(),
+                    nulls_allowed: true,
+                    default_value: None,
+                };
+                let created = tx.create_table(schema, "t", &[column("a"), column("b")])?;
+                table.set(Some(created));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (catalog, table.get().unwrap())
+    }
+
+    fn entry(row_id: u64, value: i128) -> crate::catalog::IndexEntry {
+        crate::catalog::IndexEntry {
+            row_id,
+            values: vec![Some(crate::store::index_encoding::IndexKeyValue::Int {
+                value,
+                width: crate::store::index_encoding::IntWidth::I64,
+            })],
+        }
+    }
+
+    async fn read_format_version(catalog: &crate::catalog::Catalog) -> u64 {
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let format = read::read_format(ReadHandle::Tx(&tx)).await.unwrap();
+        tx.rollback();
+        format.map_or(FORMAT_VERSION, |f| f.format_version)
+    }
+
+    #[tokio::test]
+    async fn create_index_persists_definition_stamps_format_and_lands_entries() {
+        use crate::{
+            catalog::{ColumnId, IndexDef, IndexState},
+            store::key::{IdxKind, idx_index_prefix},
+        };
+        let (catalog, table) = catalog_with_two_column_table().await;
+        assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[entry(0, 10), entry(1, 20)],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index_id = index.get().unwrap();
+
+        let snapshot = catalog.snapshot().await.unwrap();
+        let infos = snapshot.indexes_of(table);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, index_id);
+        assert_eq!(infos[0].columns, vec![ColumnId::new(1)]);
+        assert!(infos[0].unique);
+        assert_eq!(infos[0].state, IndexState::Ready);
+        assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
+
+        // Both backfill rows produced a stored entry.
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let mut iter = ReadHandle::Tx(&tx)
+            .scan_prefix(idx_index_prefix(IdxKind::Unique, index_id.get()), ..)
+            .await
+            .unwrap();
+        let mut count = 0;
+        while iter.next().await.unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+        tx.rollback();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_unique_value_in_backfill_aborts_create() {
+        use crate::catalog::{ColumnId, IndexDef};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let err = catalog
+            .commit(|tx| {
+                tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[entry(0, 10), entry(1, 10)],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+
+        // The aborted commit left no index and did not stamp the format.
+        assert!(
+            catalog
+                .snapshot()
+                .await
+                .unwrap()
+                .indexes_of(table)
+                .is_empty()
+        );
+        assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_unique_index_accepts_duplicate_values() {
+        use crate::catalog::{ColumnId, IndexDef};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        catalog
+            .commit(|tx| {
+                tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: false,
+                    },
+                    &[entry(0, 10), entry(1, 10)],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        assert_eq!(catalog.snapshot().await.unwrap().indexes_of(table).len(), 1);
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn null_indexed_value_gets_no_entry_so_unique_admits_many() {
+        use crate::catalog::{ColumnId, IndexDef, IndexEntry};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let null_entry = |row_id| IndexEntry {
+            row_id,
+            values: vec![None],
+        };
+        // Two NULL rows under a unique index: NULLs get no entry, so no
+        // collision.
+        catalog
+            .commit(|tx| {
+                tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[null_entry(0), null_entry(1)],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        assert_eq!(catalog.snapshot().await.unwrap().indexes_of(table).len(), 1);
+        catalog.close().await.unwrap();
+    }
+
+    async fn register_three_row_file(
+        catalog: &crate::catalog::Catalog,
+        table: crate::catalog::TableId,
+    ) -> crate::catalog::DataFileId {
+        use crate::catalog::DataFile;
+        let file = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.register_data_file(
+                    table,
+                    DataFile {
+                        path: "f.parquet".into(),
+                        path_is_relative: true,
+                        file_format: "parquet".into(),
+                        record_count: 3,
+                        file_size_bytes: 30,
+                        footer_size: 4,
+                        encryption_key: None,
+                        column_stats: vec![],
+                    },
+                    &[],
+                )?;
+                file.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        file.get().unwrap()
+    }
+
+    #[tokio::test]
+    async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
+        use crate::catalog::{ColumnId, IndexDef, RowHolder};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        // Rows 0,1,2 land in this file (row_id_start = 0).
+        let file = register_three_row_file(&catalog, table).await;
+
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[entry(0, 10), entry(1, 20), entry(2, 30)],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index = index.get().unwrap();
+
+        let value = |v: i128| crate::store::index_encoding::IndexKeyValue::Int {
+            value: v,
+            width: crate::store::index_encoding::IntWidth::I64,
+        };
+        let hits = catalog
+            .index_lookup(table, index, &[value(20)])
+            .await
+            .unwrap();
+        assert_eq!(
+            hits,
+            vec![crate::catalog::RowLocation {
+                row_id: 1,
+                holder: RowHolder::DataFile(file),
+            }]
+        );
+        // A value no row holds resolves to nothing.
+        assert!(
+            catalog
+                .index_lookup(table, index, &[value(99)])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_lookup_returns_all_rows_for_a_non_unique_value() {
+        use crate::catalog::{ColumnId, IndexDef};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        register_three_row_file(&catalog, table).await;
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                // Rows 0 and 2 share value 10; row 1 is 20.
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: false,
+                    },
+                    &[entry(0, 10), entry(1, 20), entry(2, 10)],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let value = crate::store::index_encoding::IndexKeyValue::Int {
+            value: 10,
+            width: crate::store::index_encoding::IntWidth::I64,
+        };
+        let mut rows: Vec<u64> = catalog
+            .index_lookup(table, index.get().unwrap(), &[value])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|location| location.row_id)
+            .collect();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![0, 2]);
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_lookup_on_missing_index_is_not_found() {
+        use crate::catalog::IndexId;
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let value = crate::store::index_encoding::IndexKeyValue::Int {
+            value: 1,
+            width: crate::store::index_encoding::IntWidth::I64,
+        };
+        let err = catalog
+            .index_lookup(table, IndexId::new(999), &[value])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err}");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
+        use crate::{
+            catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef},
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index = index.get().unwrap();
+
+        let file = || DataFile {
+            path: "f.parquet".into(),
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: 2,
+            file_size_bytes: 20,
+            footer_size: 4,
+            encryption_key: None,
+            column_stats: vec![],
+        };
+        let int = |value: i128| IndexKeyValue::Int {
+            value,
+            width: IntWidth::I64,
+        };
+
+        // A non-empty file on an indexed table with no entries is refused.
+        let refused = catalog
+            .commit(|tx| tx.register_data_file(table, file(), &[]).map(|_| ()))
+            .await;
+        assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
+
+        // With entries it lands; ordinals map to row ids 0 and 1.
+        catalog
+            .commit(|tx| {
+                tx.register_data_file(
+                    table,
+                    file(),
+                    &[
+                        FileIndexEntry {
+                            index,
+                            ordinal: 0,
+                            values: vec![Some(int(10))],
+                        },
+                        FileIndexEntry {
+                            index,
+                            ordinal: 1,
+                            values: vec![Some(int(20))],
+                        },
+                    ],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        let hits = catalog
+            .index_lookup(table, index, &[int(20)])
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].row_id, 1);
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unique_index_rejects_a_duplicate_value_across_commits() {
+        use crate::{
+            catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef},
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index = index.get().unwrap();
+
+        let one_row_with = |value: i128| {
+            let file = DataFile {
+                path: "f.parquet".into(),
+                path_is_relative: true,
+                file_format: "parquet".into(),
+                record_count: 1,
+                file_size_bytes: 10,
+                footer_size: 4,
+                encryption_key: None,
+                column_stats: vec![],
+            };
+            (
+                file,
+                FileIndexEntry {
+                    index,
+                    ordinal: 0,
+                    values: vec![Some(IndexKeyValue::Int {
+                        value,
+                        width: IntWidth::I64,
+                    })],
+                },
+            )
+        };
+
+        // First value 10 lands.
+        catalog
+            .commit(|tx| {
+                let (file, entry) = one_row_with(10);
+                tx.register_data_file(table, file, &[entry]).map(|_| ())
+            })
+            .await
+            .unwrap();
+        // A later commit inserting the same value 10 (different row) is
+        // rejected by the point-get against the winner's entry.
+        let dup = catalog
+            .commit(|tx| {
+                let (file, entry) = one_row_with(10);
+                tx.register_data_file(table, file, &[entry]).map(|_| ())
+            })
+            .await;
+        assert!(matches!(dup, Err(Error::Constraint(_))), "{dup:?}");
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_read_covers_a_registration_end_to_end() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{Int64Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+        use parquet::arrow::ArrowWriter;
+
+        use crate::{
+            catalog::{ColumnId, DataFile, IndexDef},
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index = index.get().unwrap();
+
+        // A DATA_PATH object store holds a Parquet file with the indexed
+        // column "a" at physical position 0.
+        let data = InMemory::new();
+        let path = Path::from("t/data-1.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![10, 20, 30]))])
+                .unwrap();
+        let mut buffer = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        data.put(&path, buffer.into()).await.unwrap();
+
+        // moraine derives coverage entries by the scoped read (column "a"
+        // at position 0), then registration lands them — DuckLake supplied
+        // none, and the read stands in for the refusal.
+        let entries = catalog
+            .scoped_file_index_entries(&data, &path, index, &[0])
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 3);
+        catalog
+            .commit(|tx| {
+                tx.register_data_file(
+                    table,
+                    DataFile {
+                        path: "t/data-1.parquet".into(),
+                        path_is_relative: true,
+                        file_format: "parquet".into(),
+                        record_count: 3,
+                        file_size_bytes: 30,
+                        footer_size: 4,
+                        encryption_key: None,
+                        column_stats: vec![],
+                    },
+                    &entries,
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        let value = IndexKeyValue::Int {
+            value: 20,
+            width: IntWidth::I64,
+        };
+        let hits = catalog.index_lookup(table, index, &[value]).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].row_id, 1);
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ddl_on_an_indexed_column_is_guarded() {
+        use crate::catalog::{ColumnAlteration, ColumnId, IndexDef};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        catalog
+            .commit(|tx| {
+                tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[entry(0, 10)],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        // Dropping or retyping the indexed column is refused.
+        let dropped = catalog
+            .commit(|tx| tx.drop_column(table, ColumnId::new(1)))
+            .await;
+        assert!(matches!(dropped, Err(Error::Constraint(_))), "{dropped:?}");
+        let retyped = catalog
+            .commit(|tx| {
+                tx.alter_column(
+                    table,
+                    ColumnId::new(1),
+                    ColumnAlteration {
+                        column_type: Some("INTEGER".into()),
+                        ..ColumnAlteration::default()
+                    },
+                )
+            })
+            .await;
+        assert!(matches!(retyped, Err(Error::Constraint(_))), "{retyped:?}");
+
+        // Renaming the indexed column, and retyping a non-indexed column,
+        // are unaffected.
+        catalog
+            .commit(|tx| tx.rename_column(table, ColumnId::new(1), "a2"))
+            .await
+            .unwrap();
+        catalog
+            .commit(|tx| {
+                tx.alter_column(
+                    table,
+                    ColumnId::new(2),
+                    ColumnAlteration {
+                        column_type: Some("INTEGER".into()),
+                        ..ColumnAlteration::default()
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    async fn scan_idx_entries(
+        catalog: &crate::catalog::Catalog,
+        index: crate::catalog::IndexId,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        use crate::store::key::{IdxKind, idx_index_prefix};
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let mut entries = Vec::new();
+        for kind in [IdxKind::Unique, IdxKind::Multi] {
+            let mut iter = ReadHandle::Tx(&tx)
+                .scan_prefix(idx_index_prefix(kind, index.get()), ..)
+                .await
+                .unwrap();
+            while let Some(entry) = iter.next().await.unwrap() {
+                entries.push((entry.key.to_vec(), entry.value.to_vec()));
+            }
+        }
+        tx.rollback();
+        entries.sort();
+        entries
+    }
+
+    #[tokio::test]
+    async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
+        use crate::{
+            catalog::{ColumnId, IndexDef, IndexState},
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let def = || IndexDef {
+            name: "by_a".into(),
+            columns: vec![ColumnId::new(1)],
+            unique: true,
+        };
+        let value = |v: i128| IndexKeyValue::Int {
+            value: v,
+            width: IntWidth::I64,
+        };
+
+        // Reference: a single-commit build over rows 0,1,2.
+        let (single, table_single) = catalog_with_two_column_table().await;
+        register_three_row_file(&single, table_single).await;
+        let single_index = std::cell::Cell::new(None);
+        single
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table_single,
+                    &def(),
+                    &[entry(0, 10), entry(1, 20), entry(2, 30)],
+                )?;
+                single_index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let single_index = single_index.get().unwrap();
+
+        // Staged: same table shape, same rows, built in two batches.
+        let (staged, table_staged) = catalog_with_two_column_table().await;
+        register_three_row_file(&staged, table_staged).await;
+        let staged_index = std::cell::Cell::new(None);
+        staged
+            .commit(|tx| {
+                let id = tx.create_index_staged(table_staged, &def())?;
+                staged_index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let staged_index = staged_index.get().unwrap();
+        // Identical allocation sequence → identical index id, so the idx
+        // keys can be compared directly.
+        assert_eq!(single_index, staged_index);
+
+        // While building: format 3, lookups fail typed.
+        assert_eq!(read_format_version(&staged).await, FORMAT_WITH_STAGED_INDEX);
+        assert!(matches!(
+            staged
+                .index_lookup(table_staged, staged_index, &[value(20)])
+                .await,
+            Err(Error::IndexBuilding(_))
+        ));
+
+        // Two batches, the second final.
+        staged
+            .commit(|tx| {
+                tx.build_index_step(staged_index, &[entry(0, 10), entry(1, 20)], false)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let final_state = std::cell::Cell::new(None);
+        staged
+            .commit(|tx| {
+                let state = tx.build_index_step(staged_index, &[entry(2, 30)], true)?;
+                final_state.set(Some(state));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(final_state.get().unwrap(), IndexState::Ready);
+
+        // After the flip: lookups serve, and the idx range is byte-identical
+        // to the single-commit build over the same rows.
+        let hits = staged
+            .index_lookup(table_staged, staged_index, &[value(20)])
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].row_id, 1);
+        assert_eq!(
+            scan_idx_entries(&single, single_index).await,
+            scan_idx_entries(&staged, staged_index).await
+        );
+
+        single.close().await.unwrap();
+        staged.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
+        use crate::catalog::{ColumnId, IndexDef};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        register_three_row_file(&catalog, table).await;
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index_staged(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index = index.get().unwrap();
+
+        // A duplicate value within a batch fails the step.
+        let dup = catalog
+            .commit(|tx| {
+                tx.build_index_step(index, &[entry(0, 10), entry(1, 10)], false)
+                    .map(|_| ())
+            })
+            .await;
+        assert!(matches!(dup, Err(Error::Constraint(_))), "{dup:?}");
+
+        // Complete the build, then a further step on the ready index is
+        // refused.
+        catalog
+            .commit(|tx| {
+                tx.build_index_step(index, &[entry(0, 10)], true)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let after_ready = catalog
+            .commit(|tx| {
+                tx.build_index_step(index, &[entry(1, 20)], false)
+                    .map(|_| ())
+            })
+            .await;
+        assert!(
+            matches!(after_ready, Err(Error::Constraint(_))),
+            "{after_ready:?}"
+        );
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
+        use crate::{
+            catalog::{ColumnId, IndexDef},
+            store::key::{IdxKind, idx_index_prefix},
+        };
+        let (catalog, table) = catalog_with_two_column_table().await;
+        register_three_row_file(&catalog, table).await;
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[entry(0, 10), entry(1, 20), entry(2, 30)],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index = index.get().unwrap();
+
+        // Reclaiming a live index is refused.
+        assert!(matches!(
+            catalog.reclaim_index_entries(index, 100).await,
+            Err(Error::Constraint(_))
+        ));
+
+        catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+
+        // A bounded sweep deletes the three orphaned entries, then reports
+        // nothing left.
+        let first = catalog.reclaim_index_entries(index, 2).await.unwrap();
+        assert_eq!(first, 2);
+        let second = catalog.reclaim_index_entries(index, 100).await.unwrap();
+        assert_eq!(second, 1);
+        assert_eq!(catalog.reclaim_index_entries(index, 100).await.unwrap(), 0);
+
+        // The idx range is empty afterward.
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let mut iter = ReadHandle::Tx(&tx)
+            .scan_prefix(idx_index_prefix(IdxKind::Unique, index.get()), ..)
+            .await
+            .unwrap();
+        assert!(iter.next().await.unwrap().is_none());
+        tx.rollback();
+        catalog.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_index_ends_definition_and_keeps_format() {
+        use crate::catalog::{ColumnId, IndexDef};
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[entry(0, 10)],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        catalog
+            .commit(|tx| tx.drop_index(index.get().unwrap()))
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .snapshot()
+                .await
+                .unwrap()
+                .indexes_of(table)
+                .is_empty()
+        );
+        // Dropping the last index does not downgrade the stamp.
+        assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
         catalog.close().await.unwrap();
     }
 }

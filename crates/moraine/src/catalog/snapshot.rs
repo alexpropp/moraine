@@ -6,15 +6,17 @@ use std::collections::{BTreeMap, HashMap};
 use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
-        MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId, MappingInfo,
-        NameMappingDef, OptionScope, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
-        SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
+        IndexId, IndexInfo, IndexState, MacroId, MacroImplementationDef, MacroInfo,
+        MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, ScheduledDeletion,
+        SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry,
+        ViewId, ViewInfo,
     },
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            MacroValue, MappingValue, OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue,
-            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
+            IndexValue, MacroValue, MappingValue, OptionScopeValue, PartitionValue, SchemaValue,
+            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
+            ViewValue,
         },
         read::EntityRecord,
     },
@@ -42,6 +44,8 @@ pub struct CatalogSnapshot {
     pub(crate) partitions: BTreeMap<u64, BTreeMap<u64, PartitionValue>>,
     pub(crate) sorts: BTreeMap<u64, BTreeMap<u64, SortValue>>,
     pub(crate) mappings: BTreeMap<u64, BTreeMap<u64, MappingValue>>,
+    pub(crate) indexes: BTreeMap<u64, BTreeMap<u64, IndexValue>>,
+    pub(crate) index_names: HashMap<(u64, String), u64>,
     pub(crate) table_stats: BTreeMap<u64, TableStatsValue>,
     pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
     pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
@@ -100,6 +104,9 @@ impl CatalogSnapshot {
                 EntityRecord::Macro(m) if included(m.begin_snapshot, m.end_snapshot) => {
                     view.put_macro(m);
                 }
+                EntityRecord::Index(i) if included(i.begin_snapshot, i.end_snapshot) => {
+                    view.put_index(i);
+                }
                 // Mappings are unversioned and immutable: included at any
                 // time-travel target, since a historical file read still
                 // resolves through its mapping.
@@ -140,7 +147,8 @@ impl CatalogSnapshot {
                 | EntityRecord::View(_)
                 | EntityRecord::Partition(_)
                 | EntityRecord::Sort(_)
-                | EntityRecord::Macro(_) => {
+                | EntityRecord::Macro(_)
+                | EntityRecord::Index(_) => {
                     // Filtered out by version range
                 }
             }
@@ -288,6 +296,50 @@ impl CatalogSnapshot {
             .unwrap_or_default()
     }
 
+    /// A table's live equality indexes, ordered by id.
+    #[must_use]
+    pub fn indexes_of(&self, table: TableId) -> Vec<IndexInfo> {
+        self.indexes
+            .get(&table.get())
+            .map(|per_table| per_table.values().map(index_info).collect())
+            .unwrap_or_default()
+    }
+
+    /// One equality index by name within a table.
+    #[must_use]
+    pub fn index_by_name(&self, table: TableId, name: &str) -> Option<IndexInfo> {
+        self.index_names
+            .get(&(table.get(), name.to_owned()))
+            .and_then(|id| self.indexes.get(&table.get()).and_then(|m| m.get(id)))
+            .map(index_info)
+    }
+
+    pub(crate) fn put_index(&mut self, value: IndexValue) {
+        if let Some(old) = self
+            .indexes
+            .get(&value.table_id)
+            .and_then(|m| m.get(&value.index_id))
+        {
+            self.index_names
+                .remove(&(old.table_id, old.index_name.clone()));
+        }
+        self.index_names
+            .insert((value.table_id, value.index_name.clone()), value.index_id);
+        self.indexes
+            .entry(value.table_id)
+            .or_default()
+            .insert(value.index_id, value);
+    }
+
+    pub(crate) fn delete_index(&mut self, table_id: u64, index_id: u64) {
+        if let Some(per_table) = self.indexes.get_mut(&table_id) {
+            if let Some(old) = per_table.remove(&index_id) {
+                self.index_names
+                    .remove(&(old.table_id, old.index_name.clone()));
+            }
+        }
+    }
+
     /// A resolved option value: table falls back to its schema, then
     /// global; schema falls back to global. Options are unversioned: a
     /// time-traveled snapshot resolves current values.
@@ -310,6 +362,15 @@ impl CatalogSnapshot {
                 .get(&c)
                 .and_then(|v| v.options.get(key).cloned())
         })
+    }
+
+    /// The lake's data root, as recorded in the global `data_path` metadata
+    /// option when the store was created. `None` when no data path was given
+    /// at bootstrap. DuckLake's `DATA_PATH`; index maintenance resolves data
+    /// files against it.
+    #[must_use]
+    pub fn data_path(&self) -> Option<String> {
+        self.option(OptionScope::Global, "data_path")
     }
 
     /// Every tag row on `object_id` (a schema/table/view id), ended
@@ -392,6 +453,12 @@ impl CatalogSnapshot {
         self.delete_files.remove(&table_id);
         self.partitions.remove(&table_id);
         self.sorts.remove(&table_id);
+        if let Some(per_table) = self.indexes.remove(&table_id) {
+            for value in per_table.values() {
+                self.index_names
+                    .remove(&(value.table_id, value.index_name.clone()));
+            }
+        }
         self.table_stats.remove(&table_id);
         self.table_column_stats.remove(&table_id);
         self.remove_option_record(OptionScope::Table(TableId::new(table_id)).key_components());
@@ -615,6 +682,29 @@ fn mapping_info(value: &MappingValue) -> MappingInfo {
                 is_partition: row.is_partition,
             })
             .collect(),
+    }
+}
+
+fn index_info(value: &IndexValue) -> IndexInfo {
+    let state = if value.poisoned == Some(true) {
+        IndexState::Poisoned
+    } else if value.build_state.is_some() {
+        IndexState::Building
+    } else {
+        IndexState::Ready
+    };
+    IndexInfo {
+        id: IndexId::new(value.index_id),
+        table_id: TableId::new(value.table_id),
+        name: value.index_name.clone(),
+        columns: value
+            .column_ids
+            .iter()
+            .copied()
+            .map(ColumnId::new)
+            .collect(),
+        unique: value.unique,
+        state,
     }
 }
 
@@ -1058,6 +1148,109 @@ mod tests {
             past.macro_by_id(MacroId::new(2)).unwrap().implementations[0].macro_type,
             "scalar"
         );
+    }
+
+    fn index_rec(
+        id: u64,
+        table: u64,
+        name: &str,
+        columns: Vec<u64>,
+        unique: bool,
+        begin: u64,
+        end: Option<u64>,
+    ) -> crate::store::proto::IndexValue {
+        crate::store::proto::IndexValue {
+            index_id: id,
+            table_id: table,
+            begin_snapshot: begin,
+            end_snapshot: end,
+            index_name: name.into(),
+            column_ids: columns,
+            unique,
+            build_state: None,
+            build_cursor_file: None,
+            build_cursor_row_id: None,
+            build_deletes_scanned: None,
+            poisoned: None,
+            ducklake_index_id: None,
+        }
+    }
+
+    #[test]
+    fn indexes_are_versioned_and_table_scoped() {
+        use crate::catalog::types::{IndexId, IndexState};
+        let current = vec![EntityRecord::Index(index_rec(
+            7,
+            1,
+            "by_id",
+            vec![0, 1],
+            true,
+            4,
+            None,
+        ))];
+        let history = vec![EntityRecord::Index(index_rec(
+            8,
+            1,
+            "old",
+            vec![0],
+            false,
+            1,
+            Some(4),
+        ))];
+
+        let head = CatalogSnapshot::build(snap(5), current.clone(), vec![], None);
+        let infos = head.indexes_of(TableId::new(1));
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, IndexId::new(7));
+        assert_eq!(infos[0].columns, vec![ColumnId::new(0), ColumnId::new(1)]);
+        assert!(infos[0].unique);
+        assert_eq!(infos[0].state, IndexState::Ready);
+        assert_eq!(
+            head.index_by_name(TableId::new(1), "by_id").unwrap().id,
+            IndexId::new(7)
+        );
+        assert!(head.index_by_name(TableId::new(1), "old").is_none());
+        assert!(head.indexes_of(TableId::new(2)).is_empty());
+
+        // Time travel to snapshot 2: the ended index was live, the new one
+        // not yet.
+        let past = CatalogSnapshot::build(snap(2), current, history, Some(2));
+        assert_eq!(past.indexes_of(TableId::new(1))[0].id, IndexId::new(8));
+    }
+
+    #[test]
+    fn dropping_a_table_clears_its_indexes() {
+        let mut view = CatalogSnapshot::build(snap(1), vec![], vec![], None);
+        view.put_table(table_rec(1, 0, "t", 1));
+        view.put_index(index_rec(7, 1, "by_id", vec![0], true, 1, None));
+        assert!(view.index_by_name(TableId::new(1), "by_id").is_some());
+
+        view.delete_table(1);
+        assert!(view.indexes_of(TableId::new(1)).is_empty());
+        assert!(view.index_by_name(TableId::new(1), "by_id").is_none());
+    }
+
+    #[test]
+    fn building_and_poisoned_states_are_projected() {
+        use crate::catalog::types::IndexState;
+        let building = crate::store::proto::IndexValue {
+            build_state: Some("building".into()),
+            ..index_rec(7, 1, "b", vec![0], true, 1, None)
+        };
+        let poisoned = crate::store::proto::IndexValue {
+            build_state: Some("building".into()),
+            poisoned: Some(true),
+            ..index_rec(8, 1, "p", vec![0], true, 1, None)
+        };
+        let view = CatalogSnapshot::build(
+            snap(1),
+            vec![EntityRecord::Index(building), EntityRecord::Index(poisoned)],
+            vec![],
+            None,
+        );
+        let by_name = |n: &str| view.index_by_name(TableId::new(1), n).unwrap().state;
+        assert_eq!(by_name("b"), IndexState::Building);
+        assert_eq!(by_name("p"), IndexState::Poisoned);
     }
 
     #[test]

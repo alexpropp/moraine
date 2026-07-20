@@ -3061,6 +3061,7 @@ mod tests {
                                 extra_stats: None,
                             }],
                         },
+                        &[],
                     )?;
                     tx.register_delete_file(
                         table,
@@ -3142,7 +3143,7 @@ mod tests {
 
             // Schema `sales` took global id 1, table `orders` id 2; its
             // first column has per-table field id 1.
-            let mut tx = staged_begin(&catalog)
+            let mut tx = staged_begin(&catalog, None, String::new())
                 .await
                 .expect("test setup: begin staged tx");
             tx.stage(RowOperation::Insert {
@@ -3205,6 +3206,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 &raw mut handle,
                 &raw mut err,

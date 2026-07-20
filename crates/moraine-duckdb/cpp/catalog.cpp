@@ -560,10 +560,17 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
+	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
+	// it is the DATA_PATH the index scoped read and maintenance resolve data
+	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
+	// data layer and does not forward it to this metadata attach.)
+	std::string data_path;
 	for (auto &option : info.options) {
 		auto name = duckdb::StringUtil::Lower(option.first);
 		if (name == "encrypted") {
 			encrypted = option.second.GetValue<bool>();
+		} else if (name == "data_path") {
+			data_path = option.second.GetValue<std::string>();
 		} else if (name == "flush_interval_ms") {
 			flush_interval_ms = option.second.GetValue<uint64_t>();
 			if (flush_interval_ms == 0) {
@@ -607,7 +614,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		}
 	}
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), &handle, &err);
+	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
+	                           data_path.empty() ? nullptr : data_path.c_str(), &handle, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

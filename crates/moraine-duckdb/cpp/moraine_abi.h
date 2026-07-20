@@ -119,9 +119,17 @@ typedef struct {
 } MoraineS3Config;
 
 int32_t moraine_attach(const char *path, const MoraineS3Config *s3, bool read_only, bool encrypted,
-                       uint64_t flush_interval_ms, const char *cache_dir, MoraineCatalogHandle **out,
-                       MoraineError *err);
+                       uint64_t flush_interval_ms, const char *cache_dir, const char *data_path,
+                       MoraineCatalogHandle **out, MoraineError *err);
 void moraine_detach(MoraineCatalogHandle *handle);
+
+// The lake's recorded data root (stored global `data_path` option), written
+// to `*out` as an owned C string or null when none was recorded. Free a
+// non-null result with `moraine_string_free`. Served back as the
+// `ducklake_metadata` `data_path` row so a re-attach need not repeat it.
+int32_t moraine_data_path(MoraineCatalogHandle *handle, MoraineInterruptProbe probe, void *probe_ctx, char **out,
+                          MoraineError *err);
+void moraine_string_free(char *str);
 
 // The stored `encrypted` flag, fixed when the store was created; stores
 // predating the flag read as false.
@@ -778,6 +786,65 @@ void moraine_arrow_bytes_free(MoraineArrowBytes bytes);
 
 // Frees a message set by a failed Arrow bridge call.
 void moraine_arrow_error_free(char *message);
+
+// Equality-index SQL surface (`src/abi.rs`). The DDL calls commit
+// autonomously (their own moraine commit, outside any enclosing DuckDB
+// transaction).
+
+// Mirrors `moraine_duckdb::abi::MoraineIndexDesc`.
+typedef struct MoraineIndexDesc {
+	uint64_t index_id;
+	bool unique;
+	bool building;
+	char *name;
+} MoraineIndexDesc;
+
+// Creates an equality index over `schema_name.table_name`, committing
+// autonomously. When the table already holds data, its files are scoped-read
+// from the handle's DATA_PATH store (resolved at attach from META_DATA_PATH)
+// to backfill the index.
+int32_t moraine_index_create(MoraineCatalogHandle *handle, const char *schema_name, const char *table_name,
+                             const char *index_name, const char *const *column_names, size_t column_count, bool unique,
+                             MoraineInterruptProbe probe, void *probe_ctx, MoraineError *err);
+
+// Drops an equality index by name, committing autonomously.
+int32_t moraine_index_drop(MoraineCatalogHandle *handle, const char *schema_name, const char *table_name,
+                           const char *index_name, MoraineInterruptProbe probe, void *probe_ctx, MoraineError *err);
+
+// Lists a table's live equality indexes.
+int32_t moraine_indexes(MoraineCatalogHandle *handle, const char *schema_name, const char *table_name,
+                        MoraineIndexDesc **out_items, size_t *out_len, MoraineInterruptProbe probe, void *probe_ctx,
+                        MoraineError *err);
+void moraine_indexes_free(MoraineIndexDesc *items, size_t len);
+
+// Mirrors `moraine_duckdb::abi::MoraineRowLocation`.
+typedef struct MoraineRowLocation {
+	uint64_t row_id;
+	uint64_t data_file_id;
+	bool is_inline;
+} MoraineRowLocation;
+
+// Mirrors `moraine_duckdb::abi::MoraineLookupValue`: a lookup value tagged by
+// kind (1=i64, 2=u64, 3=f64, 4=bool, 5=string, 6=bytes). The shim fills the
+// field matching `kind`; the ABI coerces it to the indexed column's type.
+typedef struct MoraineLookupValue {
+	int32_t kind;
+	int64_t i64_value;
+	uint64_t u64_value;
+	double f64_value;
+	bool bool_value;
+	const char *str_value;
+	const uint8_t *bytes_value;
+	size_t bytes_len;
+} MoraineLookupValue;
+
+// Resolves an equality lookup on a single-column index to the rows holding
+// `lookup_value`, coerced to the indexed column's type.
+int32_t moraine_index_lookup(MoraineCatalogHandle *handle, const char *schema_name, const char *table_name,
+                             const char *index_name, const MoraineLookupValue *lookup_value,
+                             MoraineRowLocation **out_items, size_t *out_len, MoraineInterruptProbe probe,
+                             void *probe_ctx, MoraineError *err);
+void moraine_index_lookup_free(MoraineRowLocation *items, size_t len);
 
 #ifdef __cplusplus
 } // extern "C"
