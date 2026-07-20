@@ -140,6 +140,7 @@ mod tests {
                             encryption_key: None,
                             column_stats: vec![],
                         },
+                        &[],
                     )?;
 
                     tx.create_view(schema, "t_v", "duckdb", "select * from t")?;

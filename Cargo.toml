@@ -13,6 +13,7 @@ rust-version = "1.85"
 anyhow = "1"
 arrow = { version = "59.1.0", default-features = false }
 bytes = "1"
+parquet = { version = "59.1.0", default-features = false, features = ["arrow", "snap", "zstd"] }
 cc = "1"
 moraine = { path = "crates/moraine", version = "0.1.2" }
 # object_store must stay on the same minor as slatedb's

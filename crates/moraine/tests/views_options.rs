@@ -23,6 +23,40 @@ async fn open_memory() -> Catalog {
         .unwrap()
 }
 
+/// A fresh store records the `data_path` passed at open into the global
+/// metadata, so a later attach can read the lake's data root back without
+/// being told it again. Absent when no data path is given.
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn data_path_persisted_at_bootstrap() {
+    let store = Arc::new(InMemory::new());
+
+    let mut options = CatalogOptions::default();
+    options.data_path = Some("s3://bucket/data".to_string());
+    let catalog = Catalog::open(store.clone(), options).await.unwrap();
+    assert_eq!(
+        catalog.snapshot().await.unwrap().data_path().as_deref(),
+        Some("s3://bucket/data"),
+    );
+
+    // It is bootstrap-time state: reopening the same store reads it back,
+    // even though the reopen supplies no data path.
+    drop(catalog);
+    let reopened = Catalog::open(store, CatalogOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.snapshot().await.unwrap().data_path().as_deref(),
+        Some("s3://bucket/data"),
+    );
+
+    // A store opened without a data path has none.
+    let bare = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(bare.snapshot().await.unwrap().data_path(), None);
+}
+
 #[tokio::test]
 async fn views_commit_version_and_time_travel() {
     let catalog = open_memory().await;

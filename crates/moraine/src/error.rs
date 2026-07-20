@@ -28,6 +28,11 @@ pub enum Error {
     #[error("constraint violation: {0}")]
     Constraint(String),
 
+    /// A lookup targeted an index whose staged backfill has not completed;
+    /// it serves no reads until it flips ready.
+    #[error("index building: {0}")]
+    IndexBuilding(String),
+
     /// An environment or option value could not be parsed or is out of
     /// range.
     #[error("configuration: {0}")]

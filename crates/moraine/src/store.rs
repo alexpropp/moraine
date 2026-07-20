@@ -4,6 +4,7 @@
 
 pub(crate) mod frame;
 pub(crate) mod handle;
+pub(crate) mod index_encoding;
 pub(crate) mod inline;
 pub(crate) mod key;
 pub(crate) mod open;

@@ -2,6 +2,7 @@
 //! write, with conflict classification and bounded benign-race retry.
 
 pub(crate) mod commit;
+pub(crate) mod index_maintenance;
 pub(crate) mod operations;
 pub(crate) mod staged;
 mod verbs;

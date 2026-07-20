@@ -8,9 +8,9 @@ use crate::{
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
-            GcFileValue, HeadValue, MacroValue, MappingValue, MigrationValue, OptionScopeValue,
-            PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
-            TableStatsValue, TableValue, TagValue, ViewValue,
+            GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
+            OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
+            TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         value,
     },
@@ -40,6 +40,8 @@ pub(crate) enum EntityRecord {
     Macro(MacroValue),
     /// A column-mapping record.
     Mapping(MappingValue),
+    /// An equality-index definition record.
+    Index(IndexValue),
     /// File-level column statistics record.
     FileColumnStats(FileColumnStatsValue),
     /// Table-level statistics record.
@@ -130,6 +132,7 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
         EntityKey::Sort { .. } => Ok(EntityRecord::Sort(value::decode_value(bytes)?)),
         EntityKey::Macro { .. } => Ok(EntityRecord::Macro(value::decode_value(bytes)?)),
         EntityKey::Mapping { .. } => Ok(EntityRecord::Mapping(value::decode_value(bytes)?)),
+        EntityKey::Index { .. } => Ok(EntityRecord::Index(value::decode_value(bytes)?)),
         EntityKey::FileColumnStats { .. } => {
             Ok(EntityRecord::FileColumnStats(value::decode_value(bytes)?))
         }

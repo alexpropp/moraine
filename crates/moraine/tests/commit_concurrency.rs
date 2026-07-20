@@ -193,11 +193,11 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |tx| tx.register_data_file(a, datafile(100)).map(|_| ()))
+        c1.commit(move |tx| tx.register_data_file(a, datafile(100), &[]).map(|_| ()))
             .await
     });
     let t2 = tokio::spawn(async move {
-        c2.commit(move |tx| tx.register_data_file(a, datafile(50)).map(|_| ()))
+        c2.commit(move |tx| tx.register_data_file(a, datafile(50), &[]).map(|_| ()))
             .await
     });
     t1.await.unwrap().unwrap();
@@ -230,7 +230,7 @@ async fn append_vs_drop_is_a_real_error() {
     let c1 = catalog.clone();
     let c2 = catalog.clone();
     let t1 = tokio::spawn(async move {
-        c1.commit(move |tx| tx.register_data_file(a, datafile(10)).map(|_| ()))
+        c1.commit(move |tx| tx.register_data_file(a, datafile(10), &[]).map(|_| ()))
             .await
     });
     let t2 = tokio::spawn(async move { c2.commit(move |tx| tx.drop_table(a)).await });
