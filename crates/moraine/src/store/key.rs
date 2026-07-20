@@ -8,17 +8,20 @@
 
 use storekey::{Decode, Encode};
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    store::index_encoding::CanonicalKey,
+};
 
 /// Length in bytes of the encoded subspace prefix — one discriminant
 /// byte. The segment extractor and the prefix builders must agree on
 /// this.
 pub(crate) const TAG_PREFIX_LEN: usize = 1;
 
-/// A fully addressed store key. The five variants are the five
-/// subspaces; each is also a SlateDB segment (the store is created with a
-/// one-byte segment extractor over the leading discriminant).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+/// A fully addressed store key. The six variants are the six subspaces;
+/// each is also a SlateDB segment (the store is created with a one-byte
+/// segment extractor over the leading discriminant).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum Key {
     /// Store-level singletons: format version, head pointer, migration
     /// marker. Overwritten in place.
@@ -35,6 +38,34 @@ pub(crate) enum Key {
     History(HistoryKey),
     /// Inlined data and its archive forms.
     Inline(InlineKey),
+    /// Equality-index entries. Live-only; keyed by index and canonical
+    /// value.
+    Idx(IdxKey),
+}
+
+/// An equality-index entry key. The unique kind keys on the value alone —
+/// the store key *is* the uniqueness claim, so two commits inserting the
+/// same value collide in the store's write-write detection. The non-unique
+/// kind appends the row id, so rows sharing a value occupy distinct keys
+/// and concurrent appends stay benign.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub(crate) enum IdxKey {
+    /// A unique-index entry; value is the holding row id.
+    Unique {
+        /// The index this entry belongs to.
+        index_id: u64,
+        /// The canonical indexed value.
+        key: CanonicalKey,
+    },
+    /// A non-unique-index entry; value is empty.
+    Multi {
+        /// The index this entry belongs to.
+        index_id: u64,
+        /// The canonical indexed value.
+        key: CanonicalKey,
+        /// The holding row id, disambiguating rows that share a value.
+        row_id: u64,
+    },
 }
 
 /// Store-level singleton keys.
@@ -175,6 +206,13 @@ pub(crate) enum EntityKey {
         /// Mapping id, allocated by DuckLake from the file-id counter.
         mapping_id: u64,
     },
+    /// A moraine-native equality-index definition. No DuckLake analog.
+    Index {
+        /// Owning table.
+        table_id: u64,
+        /// Index id, allocated from the global catalog-id counter.
+        index_id: u64,
+    },
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
@@ -279,6 +317,11 @@ pub(crate) enum Subspace {
     // Data inlining is not implemented yet.
     #[allow(dead_code)]
     Inline,
+    /// Equality-index entries.
+    // Entries are read by exact key or per-index prefix, not by a
+    // whole-subspace scan yet.
+    #[allow(dead_code)]
+    Idx,
 }
 
 impl Subspace {
@@ -292,6 +335,10 @@ impl Subspace {
             Self::Inline => Key::Inline(InlineKey::Schema {
                 table_id: 0,
                 schema_version: 0,
+            }),
+            Self::Idx => Key::Idx(IdxKey::Unique {
+                index_id: 0,
+                key: CanonicalKey::empty(),
             }),
         }
     }
@@ -322,6 +369,8 @@ pub(crate) enum TableScopedKind {
     Sort,
     /// `ducklake_column_mapping`.
     Mapping,
+    /// Equality-index definition.
+    Index,
 }
 
 impl TableScopedKind {
@@ -363,6 +412,10 @@ impl TableScopedKind {
             Self::Mapping => EntityKey::Mapping {
                 table_id,
                 mapping_id: 0,
+            },
+            Self::Index => EntityKey::Index {
+                table_id,
+                index_id: 0,
             },
         }
     }
@@ -446,6 +499,58 @@ pub(crate) fn inline_schema_prefix() -> Vec<u8> {
     })
     .encode();
     bytes.truncate(INLINE_SCHEMA_PREFIX_LEN);
+    bytes
+}
+
+/// Discriminant bytes preceding an index entry's components: the `idx`
+/// subspace byte and the [`IdxKey`] kind byte.
+const IDX_KIND_PREFIX_LEN: usize = 2;
+
+/// The two entry kinds inside the `idx` subspace. An index is exclusively
+/// one kind, so its entries form one contiguous `(kind, index_id)` range.
+// The prefix builders below have no caller until index lookups and
+// reclamation land; the ranges are pinned by tests.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdxKind {
+    /// `idx/unique`.
+    Unique,
+    /// `idx/multi`.
+    Multi,
+}
+
+/// Byte prefix of every entry of one index — the range reclamation sweeps
+/// after a drop.
+#[allow(dead_code)]
+pub(crate) fn idx_index_prefix(kind: IdxKind, index_id: u64) -> Vec<u8> {
+    let key = match kind {
+        IdxKind::Unique => Key::Idx(IdxKey::Unique {
+            index_id,
+            key: CanonicalKey::empty(),
+        }),
+        IdxKind::Multi => Key::Idx(IdxKey::Multi {
+            index_id,
+            key: CanonicalKey::empty(),
+            row_id: 0,
+        }),
+    };
+    let mut bytes = key.encode();
+    bytes.truncate(IDX_KIND_PREFIX_LEN + size_of::<u64>());
+    bytes
+}
+
+/// Byte prefix of every non-unique entry sharing one `(index_id, value)` —
+/// the ascending scan a non-unique lookup runs. The row id is the fixed
+/// eight-byte final component, so dropping it yields the value prefix.
+#[allow(dead_code)]
+pub(crate) fn idx_multi_value_prefix(index_id: u64, value: &CanonicalKey) -> Vec<u8> {
+    let mut bytes = Key::Idx(IdxKey::Multi {
+        index_id,
+        key: value.clone(),
+        row_id: 0,
+    })
+    .encode();
+    bytes.truncate(bytes.len() - size_of::<u64>());
     bytes
 }
 
@@ -552,6 +657,18 @@ mod tests {
     }
 
     #[test]
+    fn golden_current_index_key() {
+        let mut expect = vec![0x04, 0x02, 0x11];
+        expect.extend(be(4));
+        expect.extend(be(7));
+        let key = Key::current(EntityKey::Index {
+            table_id: 4,
+            index_id: 7,
+        });
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
     fn golden_current_mapping_key() {
         let mut expect = vec![0x04, 0x02, 0x10];
         expect.extend(be(4));
@@ -619,6 +736,158 @@ mod tests {
     }
 
     // Decode: exact inverse, loud failure.
+
+    fn canon(values: &[crate::store::index_encoding::IndexKeyValue]) -> CanonicalKey {
+        crate::store::index_encoding::encode_key(values).unwrap()
+    }
+
+    #[test]
+    fn golden_idx_unique_key_leads_with_subspace_and_index() {
+        use crate::store::index_encoding::{IndexKeyValue, IntWidth};
+        let key = Key::Idx(IdxKey::Unique {
+            index_id: 1,
+            key: canon(&[IndexKeyValue::Int {
+                value: 7,
+                width: IntWidth::I64,
+            }]),
+        });
+        let bytes = key.encode();
+        // Subspace byte, then the `Unique` discriminant, then the index id.
+        let mut prefix = vec![0x07, 0x02];
+        prefix.extend(be(1));
+        assert!(bytes.starts_with(&prefix), "{bytes:?}");
+    }
+
+    #[test]
+    fn golden_idx_multi_key_leads_with_subspace_and_index() {
+        use crate::store::index_encoding::{IndexKeyValue, IntWidth};
+        let key = Key::Idx(IdxKey::Multi {
+            index_id: 1,
+            key: canon(&[IndexKeyValue::Int {
+                value: 7,
+                width: IntWidth::I64,
+            }]),
+            row_id: 3,
+        });
+        let bytes = key.encode();
+        let mut prefix = vec![0x07, 0x03];
+        prefix.extend(be(1));
+        assert!(bytes.starts_with(&prefix), "{bytes:?}");
+        // The row id is the final component, appended after the value.
+        let mut tail = bytes.clone();
+        tail.reverse();
+        assert!(tail.starts_with(&{
+            let mut r = be(3);
+            r.reverse();
+            r
+        }));
+    }
+
+    #[test]
+    fn idx_composite_framing_distinct_at_key_level() {
+        use crate::store::index_encoding::IndexKeyValue;
+        let ab_c = Key::Idx(IdxKey::Unique {
+            index_id: 1,
+            key: canon(&[
+                IndexKeyValue::Str("ab".into()),
+                IndexKeyValue::Str("c".into()),
+            ]),
+        });
+        let a_bc = Key::Idx(IdxKey::Unique {
+            index_id: 1,
+            key: canon(&[
+                IndexKeyValue::Str("a".into()),
+                IndexKeyValue::Str("bc".into()),
+            ]),
+        });
+        assert_ne!(ab_c.encode(), a_bc.encode());
+    }
+
+    #[test]
+    fn idx_index_prefix_covers_one_index_and_kind() {
+        use crate::store::index_encoding::IndexKeyValue;
+        let value = canon(&[IndexKeyValue::Str("v".into())]);
+
+        let unique = Key::Idx(IdxKey::Unique {
+            index_id: 4,
+            key: value.clone(),
+        })
+        .encode();
+        assert!(unique.starts_with(&idx_index_prefix(IdxKind::Unique, 4)));
+        // A different index id, and the other kind, do not match.
+        assert!(!unique.starts_with(&idx_index_prefix(IdxKind::Unique, 5)));
+        assert!(!unique.starts_with(&idx_index_prefix(IdxKind::Multi, 4)));
+
+        let multi = Key::Idx(IdxKey::Multi {
+            index_id: 4,
+            key: value,
+            row_id: 1,
+        })
+        .encode();
+        assert!(multi.starts_with(&idx_index_prefix(IdxKind::Multi, 4)));
+        assert!(!multi.starts_with(&idx_index_prefix(IdxKind::Unique, 4)));
+    }
+
+    #[test]
+    fn idx_multi_value_prefix_covers_all_row_ids_of_one_value() {
+        use crate::store::index_encoding::IndexKeyValue;
+        let value = canon(&[IndexKeyValue::Str("shared".into())]);
+        let prefix = idx_multi_value_prefix(9, &value);
+        for row_id in [0, 1, u64::MAX] {
+            let key = Key::Idx(IdxKey::Multi {
+                index_id: 9,
+                key: value.clone(),
+                row_id,
+            });
+            assert!(key.encode().starts_with(&prefix), "row_id {row_id}");
+        }
+        // A different value, and a different index, do not match.
+        let other_value = canon(&[IndexKeyValue::Str("different".into())]);
+        assert!(
+            !Key::Idx(IdxKey::Multi {
+                index_id: 9,
+                key: other_value,
+                row_id: 0,
+            })
+            .encode()
+            .starts_with(&prefix)
+        );
+        assert!(
+            !Key::Idx(IdxKey::Multi {
+                index_id: 10,
+                key: value,
+                row_id: 0,
+            })
+            .encode()
+            .starts_with(&prefix)
+        );
+    }
+
+    #[test]
+    fn idx_keys_roundtrip() {
+        use crate::store::index_encoding::{IndexKeyValue, IntWidth};
+        let keys = [
+            Key::Idx(IdxKey::Unique {
+                index_id: 5,
+                key: canon(&[IndexKeyValue::Str("hello".into())]),
+            }),
+            Key::Idx(IdxKey::Multi {
+                index_id: 9,
+                key: canon(&[
+                    IndexKeyValue::Int {
+                        value: -3,
+                        width: IntWidth::I32,
+                    },
+                    IndexKeyValue::Bool(true),
+                ]),
+                row_id: 42,
+            }),
+        ];
+        for key in keys {
+            let decoded = Key::decode(&key.encode()).unwrap();
+            assert_eq!(decoded, key);
+        }
+    }
 
     #[test]
     fn decode_roundtrips_representative_keys() {
@@ -823,6 +1092,8 @@ mod tests {
                 table_id,
                 mapping_id
             }),
+            any::<(u64, u64)>()
+                .prop_map(|(table_id, index_id)| EntityKey::Index { table_id, index_id }),
         ]
     }
 
@@ -848,6 +1119,36 @@ mod tests {
         ]
     }
 
+    fn arb_canonical_key() -> impl Strategy<Value = CanonicalKey> {
+        // Arbitrary component byte strings, kept well under the size cap so
+        // `encode_key` never rejects.
+        proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..8), 0..4).prop_map(
+            |components| {
+                let values = components
+                    .into_iter()
+                    .map(crate::store::index_encoding::IndexKeyValue::Bytes)
+                    .collect::<Vec<_>>();
+                crate::store::index_encoding::encode_key(&values).unwrap()
+            },
+        )
+    }
+
+    fn arb_idx() -> impl Strategy<Value = IdxKey> {
+        prop_oneof![
+            (any::<u64>(), arb_canonical_key())
+                .prop_map(|(index_id, key)| IdxKey::Unique { index_id, key }),
+            (any::<u64>(), arb_canonical_key(), any::<u64>()).prop_map(
+                |(index_id, key, row_id)| {
+                    IdxKey::Multi {
+                        index_id,
+                        key,
+                        row_id,
+                    }
+                }
+            ),
+        ]
+    }
+
     fn arb_key() -> impl Strategy<Value = Key> {
         prop_oneof![
             Just(Key::Sys(SysKey::Format)),
@@ -865,6 +1166,7 @@ mod tests {
             }),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
+            arb_idx().prop_map(Key::Idx),
         ]
     }
 
@@ -902,7 +1204,7 @@ mod tests {
         // sees the garbage too.
         #[test]
         fn decode_garbage_in_valid_subspace_never_panics(
-            subspace in 0x02u8..=0x06,
+            subspace in 0x02u8..=0x07,
             bytes in proptest::collection::vec(any::<u8>(), 0..64),
         ) {
             let mut encoded = vec![subspace];

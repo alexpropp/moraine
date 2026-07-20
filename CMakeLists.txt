@@ -24,6 +24,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/moraine_extension.cpp
     ${CPP_DIR}/storage_extension.cpp
     ${CPP_DIR}/catalog.cpp
+    ${CPP_DIR}/index_functions.cpp
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/metadata_tables.cpp
     ${CPP_DIR}/scan.cpp

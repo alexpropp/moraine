@@ -517,6 +517,7 @@ mod tests {
                             extra_stats: None,
                         }],
                     },
+                    &[],
                 )?;
                 tx.register_delete_file(
                     table,

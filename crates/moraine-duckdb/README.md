@@ -335,7 +335,7 @@ exists-probe (`SELECT NULL FROM ducklake_metadata LIMIT 1`) succeeds:
 | `version` | `"1.0"` | compared against `"1.0"` exactly; anything else triggers migration logic (`MigrateV01`/`V02`/...) never wired up — the schema served is already 1.0-shaped |
 | `encrypted` | `"false"` | read unconditionally, sets `DuckLakeEncryption`; moraine has no encryption support |
 | `created_by` | `"moraine"` | never read back by DuckLake's own init path; served anyway since DuckLake itself writes it at bootstrap and it costs nothing |
-| `data_path` | **not served** | `LoadExistingDuckLake` only acts on this key if the row exists; moraine has no store-level source of truth for a lake-wide data path to serve faithfully, so the row is omitted — the ATTACH statement's own `DATA_PATH` option is left as the sole authority |
+| `data_path` | the recorded root, or **not served** | Recorded once from `META_DATA_PATH` (at bootstrap, or on the first attach of a lake that predates it) and served back normalized with a trailing separator, so `LoadExistingDuckLake` reads it and a re-attach need not repeat `DATA_PATH`; a lake with none recorded omits the row, leaving the ATTACH `DATA_PATH` as the authority. The recorded value is fixed — a conflicting `META_DATA_PATH` is refused |
 
 All rows are global (`scope`/`scope_id` `NULL`) — no schema/table-scoped
 DuckLake settings exist to serve.

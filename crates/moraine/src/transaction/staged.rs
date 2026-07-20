@@ -20,22 +20,28 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use object_store::ObjectStore;
 use slatedb::DbTransaction;
 
 use crate::{
     catalog::{
-        CatalogSnapshot, SnapshotId,
+        CatalogSnapshot, ColumnInfo, IndexInfo, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
         projection::{ProjectionCache, fold_committed_batch},
+        scoped_read::{self, ScopedReadEntry},
     },
     error::{Error, Result},
     store::{
         handle::ReadHandle,
+        index_encoding::encode_key,
         inline as store_inline,
         key::{EntityKey, InlineKey, InlineOperation, Key, SysKey},
         proto, read, value,
     },
-    transaction::commit,
+    transaction::{
+        commit,
+        index_maintenance::{StagedIndexEntry, stage_index_entries},
+    },
 };
 
 /// Which `ducklake_*` table a staged row targets. `Snapshot`,
@@ -1809,6 +1815,11 @@ pub struct StagedTransaction {
     db_tx: DbTransaction,
     ops: Vec<RowOperation>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    /// The `DATA_PATH` object store and its bucket-relative prefix, present
+    /// when the attach supplied `META_DATA_PATH`. Index maintenance
+    /// scoped-reads registered data files through it; absent it is skipped.
+    data_store: Option<Arc<dyn ObjectStore>>,
+    data_prefix: String,
 }
 
 impl StagedTransaction {
@@ -1819,22 +1830,28 @@ impl StagedTransaction {
     pub(crate) fn begin(
         db_tx: DbTransaction,
         projections: Arc<std::sync::RwLock<ProjectionCache>>,
+        data_store: Option<Arc<dyn ObjectStore>>,
+        data_prefix: String,
     ) -> Self {
         Self {
             db_tx,
             ops: Vec::new(),
             projections,
+            data_store,
+            data_prefix,
         }
     }
 
     /// As [`begin`](Self::begin), but with a throwaway, never-served
-    /// projection state — for tests that drive a `StagedTransaction`
-    /// directly without a `Catalog`.
+    /// projection state and no `DATA_PATH` store — for tests that drive a
+    /// `StagedTransaction` directly without a `Catalog`.
     #[cfg(test)]
     pub(crate) fn begin_detached(db_tx: DbTransaction) -> Self {
         Self::begin(
             db_tx,
             Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+            None,
+            String::new(),
         )
     }
 
@@ -1902,6 +1919,8 @@ impl StagedTransaction {
             db_tx,
             ops,
             projections,
+            data_store,
+            data_prefix,
         } = self;
 
         let base = match commit::materialize(ReadHandle::Tx(&db_tx), None).await {
@@ -1957,6 +1976,25 @@ impl StagedTransaction {
         match translated {
             Ok((result_id, mut writes)) => {
                 writes.extend(inline_writes);
+                // Maintain equality-index entries for any data file this
+                // commit registered on an indexed table, by scoped-reading it
+                // from `DATA_PATH`. Gated: a no-op unless a live index covers
+                // the file's table, so non-indexed writes are untouched.
+                if let Some(store) = data_store.as_deref() {
+                    if let Err(err) = stage_index_maintenance(
+                        &db_tx,
+                        &base,
+                        &ops,
+                        store,
+                        &data_prefix,
+                        &mut writes,
+                    )
+                    .await
+                    {
+                        db_tx.rollback();
+                        return Err(err);
+                    }
+                }
                 if let Err(err) = commit::stage_writes(&db_tx, &writes) {
                     db_tx.rollback();
                     return Err(err);
@@ -1982,6 +2020,195 @@ impl StagedTransaction {
             }
         }
     }
+}
+
+/// Derives and stages equality-index entries for the rows this commit adds to
+/// a table that has a live index — bulk rows by scoped-reading the registered
+/// Parquet from the `DATA_PATH` store, small rows by decoding the inline Arrow
+/// chunk. Uniqueness is enforced against the committed entry set as the puts
+/// are staged. A data file carrying per-row ids (a rewrite output) is refused
+/// — maintaining those is a follow-up.
+async fn stage_index_maintenance(
+    db_tx: &DbTransaction,
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+    data_store: &dyn ObjectStore,
+    data_prefix: &str,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    // Schemas registered in this same commit, for an inline chunk whose
+    // `inline/schema` record is not yet committed (the first insert).
+    let mut pending_schemas: HashMap<(u64, u64), &[u8]> = HashMap::new();
+    for op in ops {
+        if let RowOperation::InlineSchema {
+            table_id,
+            schema_version,
+            arrow_schema,
+        } = op
+        {
+            pending_schemas.insert((*table_id, *schema_version), arrow_schema.as_slice());
+        }
+    }
+
+    let mut entries: Vec<StagedIndexEntry> = Vec::new();
+    for op in ops {
+        match op {
+            RowOperation::Insert {
+                table: TableKind::DataFile,
+                cells,
+            } => {
+                let file = decode_data_file(cells)?;
+                let table = TableId::new(file.table_id);
+                let indexes = base.indexes_of(table);
+                if indexes.is_empty() {
+                    continue;
+                }
+                let row_id_start = file.row_id_start.ok_or_else(|| {
+                    Error::Constraint(format!(
+                        "data file {} on indexed table {} carries per-row ids; index maintenance \
+                         of rewrite files is a follow-up",
+                        file.data_file_id, file.table_id
+                    ))
+                })?;
+                let path = data_file_object_path(base, &file, data_prefix)?;
+                let live_columns = base.columns_of(table);
+                for index in &indexes {
+                    let positions = index_positions(&live_columns, index, table)?;
+                    let scoped = scoped_read::scoped_read_entries(
+                        data_store,
+                        &path,
+                        &positions,
+                        None,
+                        row_id_start,
+                    )
+                    .await?;
+                    push_index_entries(&mut entries, index, scoped)?;
+                }
+            }
+            RowOperation::InlineInsert {
+                table_id,
+                schema_version,
+                row_id_start,
+                arrow_body,
+                ..
+            } => {
+                let table = TableId::new(*table_id);
+                let indexes = base.indexes_of(table);
+                if indexes.is_empty() {
+                    continue;
+                }
+                // Use this commit's `InlineSchema` op if the insert registered
+                // it, else the committed inline schema.
+                let stored;
+                let schema_ipc: &[u8] =
+                    if let Some(bytes) = pending_schemas.get(&(*table_id, *schema_version)) {
+                        bytes
+                    } else {
+                        stored = store_inline::read_inline_schema(
+                            ReadHandle::Tx(db_tx),
+                            *table_id,
+                            *schema_version,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "no inline schema for table {table_id} version {schema_version}"
+                            ))
+                        })?
+                        .arrow_schema;
+                        &stored
+                    };
+                let live_columns = base.columns_of(table);
+                for index in &indexes {
+                    let positions = index_positions(&live_columns, index, table)?;
+                    let scoped = scoped_read::inline_batch_entries(
+                        schema_ipc,
+                        arrow_body,
+                        &positions,
+                        *row_id_start,
+                    )?;
+                    push_index_entries(&mut entries, index, scoped)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+    stage_index_entries(ReadHandle::Tx(db_tx), &entries, writes).await
+}
+
+/// The object path of a registered data file: its stored path relative to the
+/// table's data directory (`<schema path><table path>`) under `DATA_PATH`,
+/// whose bucket-relative prefix leads for an `s3://` store.
+fn data_file_object_path(
+    base: &CatalogSnapshot,
+    file: &proto::DataFileValue,
+    data_prefix: &str,
+) -> Result<object_store::path::Path> {
+    let table_value = base.tables.get(&file.table_id).ok_or_else(|| {
+        Error::Corruption(format!(
+            "registered file names unknown table {}",
+            file.table_id
+        ))
+    })?;
+    let schema_value = base.schemas.get(&table_value.schema_id).ok_or_else(|| {
+        Error::Corruption(format!(
+            "table {} references a missing schema",
+            file.table_id
+        ))
+    })?;
+    let table_prefix = format!("{}{}", schema_value.path, table_value.path);
+    let relative = match (file.path_is_relative, data_prefix.is_empty()) {
+        (false, _) => file.path.clone(),
+        (true, true) => format!("{table_prefix}{}", file.path),
+        (true, false) => format!("{data_prefix}/{table_prefix}{}", file.path),
+    };
+    Ok(object_store::path::Path::from(relative.as_str()))
+}
+
+/// The physical positions of an index's columns in a file or chunk written
+/// under the current schema: each column's 0-based rank among the table's
+/// columns (the order `columns_of` returns).
+fn index_positions(
+    live_columns: &[ColumnInfo],
+    index: &IndexInfo,
+    table: TableId,
+) -> Result<Vec<usize>> {
+    index
+        .columns
+        .iter()
+        .map(|column| {
+            live_columns
+                .iter()
+                .position(|c| c.id == *column)
+                .ok_or_else(|| Error::NotFound(format!("indexed column {column} of table {table}")))
+        })
+        .collect()
+}
+
+/// Turns scoped-read entries into staged index entries, skipping any row with
+/// a NULL indexed value (which gets no entry).
+fn push_index_entries(
+    entries: &mut Vec<StagedIndexEntry>,
+    index: &IndexInfo,
+    scoped: Vec<ScopedReadEntry>,
+) -> Result<()> {
+    for entry in scoped {
+        if entry.values.iter().any(Option::is_none) {
+            continue;
+        }
+        let values: Vec<_> = entry.values.into_iter().flatten().collect();
+        entries.push(StagedIndexEntry {
+            index_id: index.id.get(),
+            unique: index.unique,
+            key: encode_key(&values)?,
+            row_id: entry.row_id,
+            delete: false,
+        });
+    }
+    Ok(())
 }
 
 /// Applies every op onto a clone of `base`, then diffs the two exactly as

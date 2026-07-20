@@ -7,3 +7,4 @@
 cc a79c351ab48e6e55c14f24e36a578d05997b9459b73335f8ae2b1c5569f80390 # shrinks to a = SysFormat, b = Cur(Partition { table_id: 0, partition_id: 51251431603436 })
 cc 459d69707f667747250c5a418ce0c967d10bc232e58ba2df787846cec5e1ac8d # shrinks to a = InlineIns { table_id: 0, schema_version: 0, begin_snapshot: 0, chunk_seq: 0 }, b = InlineIns { table_id: 0, schema_version: 0, begin_snapshot: 0, chunk_seq: 1 }
 cc 34b2ccff3209bfadedcaf67a83d1e09abe17a32f2474c2c7ca561b91b571b990 # shrinks to key = InlineSchema { table_id: 0, schema_version: 627831326881744978 }
+cc 91809416d3101b9a356e80410a62956b225ea929fb227bf70406fb151638009f # shrinks to key = Idx(Unique { index_id: 0, key: CanonicalKey([[]]) })

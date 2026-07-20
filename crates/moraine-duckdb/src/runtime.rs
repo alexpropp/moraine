@@ -1,9 +1,10 @@
 //! Opaque handles owned across the FFI boundary, and the sync↔async
 //! bridge: one tokio multi-threaded runtime per attached catalog.
 
-use std::{ffi::c_void, future::Future, time::Duration};
+use std::{ffi::c_void, future::Future, sync::Arc, time::Duration};
 
 use moraine::{Catalog, CatalogSnapshot};
+use object_store::ObjectStore;
 
 use crate::error::AbiError;
 
@@ -30,6 +31,13 @@ const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub struct MoraineCatalogHandle {
     pub(crate) runtime: tokio::runtime::Runtime,
     pub(crate) catalog: Catalog,
+    /// The `DATA_PATH` object store, resolved at attach from `META_DATA_PATH`.
+    /// Present only when that option was given; index maintenance and
+    /// scoped-read backfill need it, and are skipped when it is absent.
+    pub(crate) data_store: Option<Arc<dyn ObjectStore>>,
+    /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
+    /// bare-bucket store), prepended to a data file's stored path.
+    pub(crate) data_prefix: String,
     /// The cancellation seam's push channel:
     /// [`moraine_interrupt`](crate::abi::moraine_interrupt) signals it and
     /// [`block_on_cancellable`](Self::block_on_cancellable) `select!`s
@@ -47,6 +55,8 @@ impl MoraineCatalogHandle {
         Self {
             runtime,
             catalog,
+            data_store: None,
+            data_prefix: String::new(),
             interrupt: tokio::sync::Notify::new(),
         }
     }

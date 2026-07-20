@@ -3,14 +3,22 @@
 
 use std::{sync::Arc, time::Duration};
 
-use object_store::ObjectStore;
+use object_store::{ObjectStore, path::Path};
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 
 use crate::{
-    catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
+    catalog::{
+        CatalogSnapshot, ColumnId, FileIndexEntry, IndexEntry, IndexId, IndexState, RowHolder,
+        RowLocation, SnapshotId, TableId, projection::ProjectionCache, scoped_read,
+    },
     error::{Error, Result},
-    store::{handle::ReadSession, open::StoreBuilder},
-    transaction::{Transaction, commit},
+    store::{
+        handle::{ReadHandle, ReadSession},
+        index_encoding::IndexKeyValue,
+        key::{IdxKind, idx_index_prefix},
+        open::StoreBuilder,
+    },
+    transaction::{Transaction, commit, index_maintenance},
 };
 
 /// The open store behind a catalog: the read-write `Db` writer, or a
@@ -54,6 +62,12 @@ pub struct CatalogOptions {
     /// for remote (`s3://`) stores, redundant for local ones. `None` (the
     /// default) uses only SlateDB's in-memory cache.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
+    /// recorded as the stored global `data_path` option when a fresh store
+    /// bootstraps, so a later open can read it back
+    /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
+    /// `None` records nothing.
+    pub data_path: Option<String>,
 }
 
 impl Default for CatalogOptions {
@@ -63,6 +77,7 @@ impl Default for CatalogOptions {
             encrypted: false,
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
+            data_path: None,
         }
     }
 }
@@ -114,7 +129,8 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone());
-        let db = commit::open_initialized(store, options.encrypted).await?;
+        let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
+            .await?;
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
@@ -197,6 +213,66 @@ impl Catalog {
         view
     }
 
+    /// Resolves an equality lookup to the rows currently holding `values`.
+    ///
+    /// Head-only: the lookup materializes the current head and scans the
+    /// `idx` subspace under one read session, so the entries and the catalog
+    /// they resolve against are one consistent cut. Entries are live-only,
+    /// so there is no time-travel variant. Returns candidate
+    /// [`RowLocation`]s; the caller applies delete files as any DuckLake
+    /// scan does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the index does not exist,
+    /// [`Error::IndexBuilding`] if its staged backfill has not completed,
+    /// [`Error::Constraint`] if a value exceeds the size cap, or a store
+    /// error if the scan fails.
+    pub async fn index_lookup(
+        &self,
+        table: TableId,
+        index: IndexId,
+        values: &[IndexKeyValue],
+    ) -> Result<Vec<RowLocation>> {
+        let session = self.begin_read().await?;
+        let handle = session.handle();
+
+        let outcome = async {
+            let view = commit::materialize(handle, None).await?;
+            let info = view
+                .indexes_of(table)
+                .into_iter()
+                .find(|info| info.id == index)
+                .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+
+            match info.state {
+                IndexState::Ready => {}
+                IndexState::Building => {
+                    return Err(Error::IndexBuilding(format!(
+                        "index {index} is still building"
+                    )));
+                }
+                IndexState::Poisoned => {
+                    return Err(Error::NotFound(format!("index {index} was poisoned")));
+                }
+            }
+            let key = crate::store::index_encoding::encode_key(values)?;
+            let row_ids =
+                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await?;
+            Ok(row_ids
+                .into_iter()
+                .map(|row_id| RowLocation {
+                    row_id,
+                    holder: resolve_row_holder(&view, table, row_id),
+                })
+                .collect())
+        }
+        .await;
+        session.finish();
+
+        outcome
+    }
+
     /// Opens a read session at the current head — a read-write transaction or
     /// the read-only reader — the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
@@ -220,6 +296,177 @@ impl Catalog {
             .begin(IsolationLevel::Snapshot)
             .await
             .map_err(Error::from)
+    }
+
+    /// Derives the index entries for a file the extension path registers, by
+    /// scoped-reading it — DuckLake supplies none, so moraine reads them.
+    /// The caller resolves each of the index's columns to its physical
+    /// position in the file (through the column-mapping rules) and passes
+    /// them in the index's column order. The returned entries feed
+    /// [`Transaction::register_data_file`] so registration stays covered.
+    ///
+    /// v1 covers new dense-range files (`row_id_start + ordinal`); reading a
+    /// rewrite file's embedded row-id column is a follow-up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if the file cannot be read or a column
+    /// type does not match its Parquet type, or [`Error::Constraint`] for a
+    /// non-indexable column type.
+    pub async fn scoped_file_index_entries(
+        &self,
+        object_store: &dyn ObjectStore,
+        path: &Path,
+        index: IndexId,
+        indexed_positions: &[usize],
+    ) -> Result<Vec<FileIndexEntry>> {
+        let entries =
+            scoped_read::scoped_read_entries(object_store, path, indexed_positions, None, 0)
+                .await?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| FileIndexEntry {
+                index,
+                // No row-id column and `row_id_start = 0`, so the derived
+                // row id is the ordinal the registration re-maps.
+                ordinal: entry.row_id,
+                values: entry.values,
+            })
+            .collect())
+    }
+
+    /// Backfills an index over a table's live data by scoped-reading every
+    /// live file from `object_store` (the `DATA_PATH` store) and deriving one
+    /// entry per row — the extension-path build for a table that already
+    /// holds data. The returned entries feed `create_index`'s backfill.
+    /// Indexed columns are located by resolving each field id to its physical
+    /// position (the file's columns follow the table's column order).
+    ///
+    /// v1 covers dense-range files (`row_id_start + ordinal`); a file that
+    /// carries explicit per-row ids (compaction output) is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table or a column is not live,
+    /// [`Error::Constraint`] for a per-row-id file or a non-indexable type,
+    /// or [`Error::Corruption`] if a file cannot be read.
+    pub async fn scoped_backfill_entries(
+        &self,
+        object_store: &dyn ObjectStore,
+        data_prefix: &str,
+        table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<Vec<IndexEntry>> {
+        let snapshot = self.snapshot().await?;
+        // `columns_of` is ordered by the column's ordinal, so a column's
+        // 0-based index here is its physical position in a file written under
+        // this schema — the mapping the scoped read needs. (Ordinals are
+        // 1-based in the stored value, so the stored order can't be used
+        // directly.)
+        let live_columns = snapshot.columns_of(table);
+        let positions = columns
+            .iter()
+            .map(|column| {
+                live_columns
+                    .iter()
+                    .position(|c| c.id == *column)
+                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // A relative data-file path is relative to the table's data directory
+        // (`<schema path><table path>`), itself relative to DATA_PATH.
+        let table_value = snapshot
+            .tables
+            .get(&table.get())
+            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
+        let schema_value = snapshot
+            .schemas
+            .get(&table_value.schema_id)
+            .ok_or_else(|| {
+                Error::Corruption(format!("table {table} references a missing schema"))
+            })?;
+        let table_prefix = format!("{}{}", schema_value.path, table_value.path);
+
+        let mut entries = Vec::new();
+        for file in snapshot.data_files_of(table) {
+            let row_id_start = file.row_id_start.ok_or_else(|| {
+                Error::Constraint(format!(
+                    "data file {} carries per-row ids; scoped backfill of rewrite files is a follow-up",
+                    file.id
+                ))
+            })?;
+            let relative = match (file.path_is_relative, data_prefix.is_empty()) {
+                (false, _) => file.path.clone(),
+                (true, true) => format!("{table_prefix}{}", file.path),
+                (true, false) => format!("{data_prefix}/{table_prefix}{}", file.path),
+            };
+            let path = object_store::path::Path::from(relative.as_str());
+            let scoped = scoped_read::scoped_read_entries(
+                object_store,
+                &path,
+                &positions,
+                None,
+                row_id_start,
+            )
+            .await?;
+            entries.extend(scoped.into_iter().map(|entry| IndexEntry {
+                row_id: entry.row_id,
+                values: entry.values,
+            }));
+        }
+        Ok(entries)
+    }
+
+    /// Deletes up to `limit` orphaned entries of a dropped index, in one
+    /// bounded batch outside the commit protocol (entries are not catalog
+    /// entities, and the dropping commit's batch must stay bounded). Returns
+    /// the number deleted; a host loops until it returns 0. Index ids are
+    /// never reused, so a concurrent create cannot collide with a sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the index is still live (reclaiming
+    /// a live index's entries would corrupt it), or a store error.
+    pub async fn reclaim_index_entries(&self, index: IndexId, limit: usize) -> Result<usize> {
+        let head = self.snapshot().await?;
+        if head
+            .indexes
+            .values()
+            .any(|per_table| per_table.contains_key(&index.get()))
+        {
+            return Err(Error::Constraint(format!(
+                "index {index} is still live; drop it before reclaiming its entries"
+            )));
+        }
+
+        let tx = self.begin_write_tx().await?;
+        let mut deleted = 0;
+        // An index is exclusively one kind, so only one prefix holds entries;
+        // scanning both is harmless.
+        for kind in [IdxKind::Unique, IdxKind::Multi] {
+            if deleted >= limit {
+                break;
+            }
+            let mut iter = ReadHandle::Tx(&tx)
+                .scan_prefix(idx_index_prefix(kind, index.get()), ..)
+                .await
+                .map_err(Error::from)?;
+            while deleted < limit {
+                match iter.next().await.map_err(Error::from)? {
+                    Some(entry) => {
+                        tx.delete(entry.key).map_err(Error::from)?;
+                        deleted += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        tx.commit_with_options(&commit::durable())
+            .await
+            .map_err(Error::from)?;
+
+        Ok(deleted)
     }
 
     /// Closes the catalog, flushing background work.
@@ -291,4 +538,21 @@ impl Catalog {
     {
         commit::commit_cycle(self.writer()?, &f, &self.projections).await
     }
+}
+
+/// Resolves a row id to its current holder against a materialized view: the
+/// data file whose live dense row-id range contains it, else `Inline`
+/// (an inlined row, or a file that carries explicit per-row ids rather than
+/// a dense range).
+fn resolve_row_holder(view: &CatalogSnapshot, table: TableId, row_id: u64) -> RowHolder {
+    for file in view.data_files_of(table) {
+        if let Some(start) = file.row_id_start
+            && row_id >= start
+            && row_id < start.saturating_add(file.record_count)
+        {
+            return RowHolder::DataFile(file.id);
+        }
+    }
+
+    RowHolder::Inline
 }

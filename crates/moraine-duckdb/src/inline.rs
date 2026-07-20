@@ -563,6 +563,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
