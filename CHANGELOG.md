@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/alexpropp/moraine/compare/v0.1.1...v0.1.2) - 2026-07-20
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.1](https://github.com/alexpropp/moraine/compare/v0.1.0...v0.1.1) - 2026-07-16
 
 ### Added
