@@ -3075,6 +3075,7 @@ mod tests {
                             footer_size: 32,
                             encryption_key: Some("a2V5LWRlbA==".into()),
                         },
+                        &[],
                     )?;
                     tx.update_column_stats(
                         table,

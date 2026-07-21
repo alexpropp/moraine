@@ -18,7 +18,10 @@
 //! sets it to this commit's own new snapshot id — the value `diff_writes`
 //! stamps on its own — so a mismatch is drift caught loudly.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use object_store::ObjectStore;
 use slatedb::DbTransaction;
@@ -1855,6 +1858,21 @@ impl StagedTransaction {
         )
     }
 
+    /// As [`begin_detached`](Self::begin_detached), but reading registered
+    /// files from `data_store` — for tests that exercise the file paths.
+    #[cfg(test)]
+    pub(crate) fn begin_detached_with_store(
+        db_tx: DbTransaction,
+        data_store: Arc<dyn ObjectStore>,
+    ) -> Self {
+        Self::begin(
+            db_tx,
+            Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+            Some(data_store),
+            String::new(),
+        )
+    }
+
     /// Accumulates one row mutation. Nothing touches the store until
     /// [`commit`](Self::commit).
     pub fn stage(&mut self, op: RowOperation) {
@@ -2049,13 +2067,7 @@ async fn stage_data_file_index_entries(
             file.data_file_id, file.table_id
         ))
     })?;
-    let row_id_start = file.row_id_start.ok_or_else(|| {
-        Error::Constraint(format!(
-            "data file {} on indexed table {} carries per-row ids; index maintenance of rewrite \
-             files is a follow-up",
-            file.data_file_id, file.table_id
-        ))
-    })?;
+    let row_id_start = data_file_row_id_start(&file)?;
     let path = data_file_object_path(base, &file, data_prefix)?;
     let live_columns = base.columns_of(table);
     for index in &indexes {
@@ -2063,7 +2075,7 @@ async fn stage_data_file_index_entries(
         let scoped =
             scoped_read::scoped_read_entries(data_store, &path, &positions, None, row_id_start)
                 .await?;
-        push_index_entries(entries, index, scoped)?;
+        push_index_entries(entries, index, scoped, false)?;
     }
     Ok(())
 }
@@ -2076,21 +2088,14 @@ async fn stage_index_maintenance(
     data_prefix: &str,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    // Schemas registered in this same commit, for an inline chunk whose
-    // `inline/schema` record is not yet committed (the first insert).
-    let mut pending_schemas: HashMap<(u64, u64), &[u8]> = HashMap::new();
-    for op in ops {
-        if let RowOperation::InlineSchema {
-            table_id,
-            schema_version,
-            arrow_schema,
-        } = op
-        {
-            pending_schemas.insert((*table_id, *schema_version), arrow_schema.as_slice());
-        }
-    }
+    let pending_schemas = pending_inline_schemas(ops);
 
     let mut entries: Vec<StagedIndexEntry> = Vec::new();
+    // Rows this commit kills, grouped by where their values must be read
+    // from: an inline chunk, or a position range of one data file.
+    let mut inline_deletes: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut file_deletes: HashMap<(u64, u64), Vec<u64>> = HashMap::new();
+
     for op in ops {
         match op {
             RowOperation::Insert {
@@ -2100,58 +2105,374 @@ async fn stage_index_maintenance(
                 stage_data_file_index_entries(base, cells, data_store, data_prefix, &mut entries)
                     .await?;
             }
+            RowOperation::Insert {
+                table: TableKind::DeleteFile,
+                cells,
+            } => {
+                collect_delete_file_rows(base, cells, data_store, data_prefix, &mut file_deletes)
+                    .await?;
+            }
             RowOperation::InlineInsert {
                 table_id,
                 schema_version,
                 row_id_start,
+                row_count,
                 arrow_body,
                 ..
             } => {
-                let table = TableId::new(*table_id);
-                let indexes = base.indexes_of(table);
-                if indexes.is_empty() {
-                    continue;
-                }
-                // Use this commit's `InlineSchema` op if the insert registered
-                // it, else the committed inline schema.
-                let stored;
-                let schema_ipc: &[u8] =
-                    if let Some(bytes) = pending_schemas.get(&(*table_id, *schema_version)) {
-                        bytes
-                    } else {
-                        stored = store_inline::read_inline_schema(
-                            ReadHandle::Tx(db_tx),
-                            *table_id,
-                            *schema_version,
-                        )
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Corruption(format!(
-                                "no inline schema for table {table_id} version {schema_version}"
-                            ))
-                        })?
-                        .arrow_schema;
-                        &stored
-                    };
-                let live_columns = base.columns_of(table);
-                for index in &indexes {
-                    let positions = index_positions(&live_columns, index, table)?;
-                    let scoped = scoped_read::inline_batch_entries(
-                        schema_ipc,
-                        arrow_body,
-                        &positions,
-                        *row_id_start,
-                    )?;
-                    push_index_entries(&mut entries, index, scoped)?;
-                }
+                stage_inline_chunk_entries(
+                    db_tx,
+                    base,
+                    &pending_schemas,
+                    *table_id,
+                    &InlineChunk {
+                        schema_version: *schema_version,
+                        row_id_start: *row_id_start,
+                        row_count: *row_count,
+                        body: arrow_body,
+                    },
+                    None,
+                    &mut entries,
+                )
+                .await?;
+            }
+            RowOperation::InlineInlineDelete {
+                table_id, row_id, ..
+            } => {
+                inline_deletes.entry(*table_id).or_default().push(*row_id);
+            }
+            RowOperation::InlineFileDelete {
+                table_id,
+                data_file_id,
+                row_id,
+                ..
+            } => {
+                file_deletes
+                    .entry((*table_id, *data_file_id))
+                    .or_default()
+                    .push(*row_id);
             }
             _ => {}
         }
     }
+
+    for (table_id, row_ids) in &inline_deletes {
+        stage_inline_delete_entries(
+            db_tx,
+            base,
+            ops,
+            &pending_schemas,
+            *table_id,
+            row_ids,
+            &mut entries,
+        )
+        .await?;
+    }
+    for ((table_id, data_file_id), row_ids) in &file_deletes {
+        stage_file_delete_entries(
+            base,
+            *table_id,
+            *data_file_id,
+            row_ids,
+            data_store,
+            data_prefix,
+            &mut entries,
+        )
+        .await?;
+    }
+
     if entries.is_empty() {
         return Ok(());
     }
     stage_index_entries(ReadHandle::Tx(db_tx), &entries, writes).await
+}
+
+/// The inline schemas this commit registers, for a chunk whose
+/// `inline/schema` record is not committed yet (the first insert).
+fn pending_inline_schemas(ops: &[RowOperation]) -> HashMap<(u64, u64), &[u8]> {
+    ops.iter()
+        .filter_map(|op| match op {
+            RowOperation::InlineSchema {
+                table_id,
+                schema_version,
+                arrow_schema,
+            } => Some(((*table_id, *schema_version), arrow_schema.as_slice())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One chunk version's Arrow IPC schema: this commit's staged record if it
+/// registered one, else the committed one.
+async fn inline_schema_for<'a>(
+    db_tx: &DbTransaction,
+    pending_schemas: &HashMap<(u64, u64), &'a [u8]>,
+    table_id: u64,
+    schema_version: u64,
+) -> Result<std::borrow::Cow<'a, [u8]>> {
+    if let Some(bytes) = pending_schemas.get(&(table_id, schema_version)) {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    let stored = store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
+        .await?
+        .ok_or_else(|| {
+            Error::Corruption(format!(
+                "no inline schema for table {table_id} version {schema_version}"
+            ))
+        })?;
+    Ok(std::borrow::Cow::Owned(stored.arrow_schema))
+}
+
+/// Appends the index entries for one inline chunk's rows: every row when
+/// `held` is `None` (the chunk is being inserted), or just those rows when
+/// it is `Some` (they are being deleted, so their entries are removals).
+async fn stage_inline_chunk_entries(
+    db_tx: &DbTransaction,
+    base: &CatalogSnapshot,
+    pending_schemas: &HashMap<(u64, u64), &[u8]>,
+    table_id: u64,
+    chunk: &InlineChunk<'_>,
+    held: Option<&HashSet<u64>>,
+    entries: &mut Vec<StagedIndexEntry>,
+) -> Result<()> {
+    let table = TableId::new(table_id);
+    let indexes = base.indexes_of(table);
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let schema_ipc =
+        inline_schema_for(db_tx, pending_schemas, table_id, chunk.schema_version).await?;
+    let live_columns = base.columns_of(table);
+    for index in &indexes {
+        let positions = index_positions(&live_columns, index, table)?;
+        let scoped = scoped_read::inline_batch_entries(
+            &schema_ipc,
+            chunk.body,
+            &positions,
+            chunk.row_id_start,
+        )?
+        .into_iter()
+        .filter(|entry| held.is_none_or(|rows| rows.contains(&entry.row_id)))
+        .collect();
+        push_index_entries(entries, index, scoped, held.is_some())?;
+    }
+    Ok(())
+}
+
+/// One inline chunk this commit can read: already committed, or staged by
+/// the commit itself.
+struct InlineChunk<'a> {
+    schema_version: u64,
+    row_id_start: u64,
+    row_count: u64,
+    body: &'a [u8],
+}
+
+impl InlineChunk<'_> {
+    fn holds(&self, row_id: u64) -> bool {
+        row_id >= self.row_id_start && row_id < self.row_id_start.saturating_add(self.row_count)
+    }
+}
+
+/// Derives the entry removals for rows tombstoned out of inline chunks. A
+/// tombstoned row's indexed values come from the chunk holding it, so the
+/// removal rides the same batch that kills the row.
+async fn stage_inline_delete_entries(
+    db_tx: &DbTransaction,
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+    pending_schemas: &HashMap<(u64, u64), &[u8]>,
+    table_id: u64,
+    row_ids: &[u64],
+    entries: &mut Vec<StagedIndexEntry>,
+) -> Result<()> {
+    let table = TableId::new(table_id);
+    let indexes = base.indexes_of(table);
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let committed = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
+    let mut chunks: Vec<InlineChunk<'_>> = committed
+        .iter()
+        .filter_map(|(op, value)| match op {
+            InlineOperation::Insert {
+                schema_version: version,
+                ..
+            } => Some(InlineChunk {
+                schema_version: *version,
+                row_id_start: value.row_id_start,
+                row_count: value.row_count,
+                body: &value.body,
+            }),
+            _ => None,
+        })
+        .collect();
+    // A row inserted and deleted inside one commit lives in a chunk that is
+    // still only staged.
+    chunks.extend(ops.iter().filter_map(|op| match op {
+        RowOperation::InlineInsert {
+            table_id: owner,
+            schema_version,
+            row_id_start,
+            row_count,
+            arrow_body,
+            ..
+        } if *owner == table_id => Some(InlineChunk {
+            schema_version: *schema_version,
+            row_id_start: *row_id_start,
+            row_count: *row_count,
+            body: arrow_body,
+        }),
+        _ => None,
+    }));
+
+    let mut covered: HashSet<u64> = HashSet::new();
+    for chunk in &chunks {
+        let held: HashSet<u64> = row_ids
+            .iter()
+            .copied()
+            .filter(|&row_id| chunk.holds(row_id))
+            .collect();
+        if held.is_empty() {
+            continue;
+        }
+        stage_inline_chunk_entries(
+            db_tx,
+            base,
+            pending_schemas,
+            table_id,
+            chunk,
+            Some(&held),
+            entries,
+        )
+        .await?;
+        covered.extend(held);
+    }
+
+    // A tombstone naming no live chunk would leave its entries behind, which
+    // is the leak this derivation exists to prevent.
+    if let Some(missing) = row_ids.iter().find(|row_id| !covered.contains(row_id)) {
+        return Err(Error::Corruption(format!(
+            "inline delete of row {missing} on indexed table {table_id} names no inline chunk, so \
+             its index entries cannot be derived"
+        )));
+    }
+    Ok(())
+}
+
+/// Records the rows a staged `register_delete_file` kills, by reading the
+/// positions out of the delete file and resolving them against its target's
+/// row-id range.
+async fn collect_delete_file_rows(
+    base: &CatalogSnapshot,
+    cells: &[Cell],
+    data_store: Option<&dyn ObjectStore>,
+    data_prefix: &str,
+    file_deletes: &mut HashMap<(u64, u64), Vec<u64>>,
+) -> Result<()> {
+    let delete_file = decode_delete_file(cells)?;
+    let table = TableId::new(delete_file.table_id);
+    if base.indexes_of(table).is_empty() {
+        return Ok(());
+    }
+
+    let data_file = live_data_file(base, delete_file.table_id, delete_file.data_file_id)?;
+    let row_id_start = data_file_row_id_start(&data_file)?;
+    let data_store = data_store.ok_or_else(|| {
+        Error::Constraint(format!(
+            "delete file {} on indexed table {} cannot be read to maintain its equality index: no \
+             data-path store is available",
+            delete_file.delete_file_id, delete_file.table_id
+        ))
+    })?;
+
+    let path = delete_file_object_path(base, &delete_file, data_prefix)?;
+    let positions = scoped_read::delete_file_positions(data_store, &path).await?;
+    let killed = file_deletes
+        .entry((delete_file.table_id, delete_file.data_file_id))
+        .or_default();
+
+    for position in positions {
+        let row_id = row_id_start.checked_add(position).ok_or_else(|| {
+            Error::Corruption(format!(
+                "delete file {} names position {position}, which overflows the row-id range of \
+                 data file {} on table {}",
+                delete_file.delete_file_id, delete_file.data_file_id, delete_file.table_id
+            ))
+        })?;
+        killed.push(row_id);
+    }
+    Ok(())
+}
+
+/// Derives the entry removals for rows killed inside one data file, by
+/// scoped-reading the file and keeping the rows this commit marks dead.
+async fn stage_file_delete_entries(
+    base: &CatalogSnapshot,
+    table_id: u64,
+    data_file_id: u64,
+    row_ids: &[u64],
+    data_store: Option<&dyn ObjectStore>,
+    data_prefix: &str,
+    entries: &mut Vec<StagedIndexEntry>,
+) -> Result<()> {
+    let table = TableId::new(table_id);
+    let indexes = base.indexes_of(table);
+    if indexes.is_empty() {
+        return Ok(());
+    }
+
+    let file = live_data_file(base, table_id, data_file_id)?;
+    let row_id_start = data_file_row_id_start(&file)?;
+    let data_store = data_store.ok_or_else(|| {
+        Error::Constraint(format!(
+            "data file {data_file_id} on indexed table {table_id} cannot be read to maintain its \
+             equality index: no data-path store is available"
+        ))
+    })?;
+
+    let path = data_file_object_path(base, &file, data_prefix)?;
+    let live_columns = base.columns_of(table);
+    let killed: HashSet<u64> = row_ids.iter().copied().collect();
+    for index in &indexes {
+        let positions = index_positions(&live_columns, index, table)?;
+        let scoped =
+            scoped_read::scoped_read_entries(data_store, &path, &positions, None, row_id_start)
+                .await?
+                .into_iter()
+                .filter(|entry| killed.contains(&entry.row_id))
+                .collect();
+        push_index_entries(entries, index, scoped, true)?;
+    }
+    Ok(())
+}
+
+/// One live data file of a table.
+fn live_data_file(
+    base: &CatalogSnapshot,
+    table_id: u64,
+    data_file_id: u64,
+) -> Result<proto::DataFileValue> {
+    base.data_files
+        .get(&table_id)
+        .and_then(|files| files.get(&data_file_id))
+        .cloned()
+        .ok_or_else(|| Error::NotFound(format!("data file {data_file_id} of table {table_id}")))
+}
+
+/// A data file's first row id. Files carrying per-row ids (rewrites from
+/// UPDATE and compaction) are not maintained yet, on either the register or
+/// the delete side.
+fn data_file_row_id_start(file: &proto::DataFileValue) -> Result<u64> {
+    file.row_id_start.ok_or_else(|| {
+        Error::Constraint(format!(
+            "data file {} on indexed table {} carries per-row ids; index maintenance of rewrite \
+             files is a follow-up",
+            file.data_file_id, file.table_id
+        ))
+    })
 }
 
 /// The object path of a registered data file: its stored path relative to the
@@ -2162,23 +2483,49 @@ fn data_file_object_path(
     file: &proto::DataFileValue,
     data_prefix: &str,
 ) -> Result<object_store::path::Path> {
-    let table_value = base.tables.get(&file.table_id).ok_or_else(|| {
-        Error::Corruption(format!(
-            "registered file names unknown table {}",
-            file.table_id
-        ))
+    table_object_path(
+        base,
+        file.table_id,
+        &file.path,
+        file.path_is_relative,
+        data_prefix,
+    )
+}
+
+/// The object path of a registered delete file, resolved exactly as its
+/// target data file's is.
+fn delete_file_object_path(
+    base: &CatalogSnapshot,
+    file: &proto::DeleteFileValue,
+    data_prefix: &str,
+) -> Result<object_store::path::Path> {
+    table_object_path(
+        base,
+        file.table_id,
+        &file.path,
+        file.path_is_relative,
+        data_prefix,
+    )
+}
+
+fn table_object_path(
+    base: &CatalogSnapshot,
+    table_id: u64,
+    path: &str,
+    path_is_relative: bool,
+    data_prefix: &str,
+) -> Result<object_store::path::Path> {
+    let table_value = base.tables.get(&table_id).ok_or_else(|| {
+        Error::Corruption(format!("registered file names unknown table {table_id}"))
     })?;
     let schema_value = base.schemas.get(&table_value.schema_id).ok_or_else(|| {
-        Error::Corruption(format!(
-            "table {} references a missing schema",
-            file.table_id
-        ))
+        Error::Corruption(format!("table {table_id} references a missing schema"))
     })?;
     let table_prefix = format!("{}{}", schema_value.path, table_value.path);
-    let relative = match (file.path_is_relative, data_prefix.is_empty()) {
-        (false, _) => file.path.clone(),
-        (true, true) => format!("{table_prefix}{}", file.path),
-        (true, false) => format!("{data_prefix}/{table_prefix}{}", file.path),
+    let relative = match (path_is_relative, data_prefix.is_empty()) {
+        (false, _) => path.to_owned(),
+        (true, true) => format!("{table_prefix}{path}"),
+        (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
     };
     Ok(object_store::path::Path::from(relative.as_str()))
 }
@@ -2203,12 +2550,14 @@ fn index_positions(
         .collect()
 }
 
-/// Turns scoped-read entries into staged index entries, skipping any row with
-/// a NULL indexed value (which gets no entry).
+/// Turns scoped-read entries into staged index entries — puts when `delete`
+/// is false, removals when it is true — skipping any row with a NULL indexed
+/// value (which gets no entry, so has none to remove either).
 fn push_index_entries(
     entries: &mut Vec<StagedIndexEntry>,
     index: &IndexInfo,
     scoped: Vec<ScopedReadEntry>,
+    delete: bool,
 ) -> Result<()> {
     for entry in scoped {
         if entry.values.iter().any(Option::is_none) {
@@ -2220,7 +2569,7 @@ fn push_index_entries(
             unique: index.unique,
             key: encode_key(&values)?,
             row_id: entry.row_id,
-            delete: false,
+            delete,
         });
     }
     Ok(())
@@ -3295,6 +3644,454 @@ mod tests {
                 .map(|r| r.row_id)
                 .collect::<Vec<_>>(),
             vec![1]
+        );
+    }
+
+    /// The schema-only Arrow IPC stream stored once per inline schema
+    /// version, matching what the extension's encoder produces.
+    fn inline_schema_ipc(schema: &arrow::datatypes::Schema) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut buffer, schema).unwrap();
+            writer.finish().unwrap();
+        }
+        buffer
+    }
+
+    /// One inline chunk body: a little-endian `u32` message length, the
+    /// record-batch message, then the arrow data buffers.
+    fn inline_body(batch: &arrow::array::RecordBatch) -> Vec<u8> {
+        use arrow::ipc::writer::{
+            DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
+        };
+
+        let generator = IpcDataGenerator::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let options = IpcWriteOptions::default();
+        let mut context = IpcWriteContext::default();
+        let (dictionaries, encoded) = generator
+            .encode(batch, &mut tracker, &options, &mut context)
+            .unwrap();
+        assert!(dictionaries.is_empty(), "test bodies carry no dictionaries");
+
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(
+            &u32::try_from(encoded.ipc_message.len())
+                .unwrap()
+                .to_le_bytes(),
+        );
+        buffer.extend_from_slice(&encoded.ipc_message);
+        buffer.extend_from_slice(&encoded.arrow_data);
+        buffer
+    }
+
+    /// A one-column `BIGINT` batch, the shape the inline index tests insert.
+    fn bigint_batch(values: &[i64]) -> (arrow::datatypes::Schema, arrow::array::RecordBatch) {
+        use arrow::{
+            array::{Int64Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(values.to_vec()))],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    /// Creates table 1 with one `BIGINT` column and an equality index over
+    /// it, returning the catalog and the index id.
+    async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {
+        use crate::catalog::{IndexDef, TableId};
+
+        let catalog = open().await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut setup = StagedTransaction::begin_detached(db_tx);
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "a", 0),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        setup.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, "created_table:1"),
+        });
+        setup.commit().await.unwrap();
+
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    TableId::new(1),
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![crate::catalog::ColumnId::new(1)],
+                        unique,
+                    },
+                    &[],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        (catalog, index.get().unwrap().get())
+    }
+
+    /// The stored entry count for one index.
+    async fn index_entry_count(catalog: &Catalog, unique: bool, index_id: u64) -> usize {
+        use crate::store::key::{IdxKind, idx_index_prefix};
+
+        let kind = if unique {
+            IdxKind::Unique
+        } else {
+            IdxKind::Multi
+        };
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let mut iter = ReadHandle::Tx(&tx)
+            .scan_prefix(idx_index_prefix(kind, index_id), ..)
+            .await
+            .unwrap();
+        let mut count = 0;
+        while iter.next().await.unwrap().is_some() {
+            count += 1;
+        }
+        tx.rollback();
+        count
+    }
+
+    /// Stages one inline chunk of `values` starting at `row_id_start`,
+    /// registering the schema on the first call.
+    async fn inline_insert(
+        catalog: &Catalog,
+        snapshot_id: u64,
+        row_id_start: u64,
+        values: &[i64],
+        with_schema: bool,
+    ) {
+        let (schema, batch) = bigint_batch(values);
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+        if with_schema {
+            tx.stage(RowOperation::InlineSchema {
+                table_id: 1,
+                schema_version: 0,
+                arrow_schema: inline_schema_ipc(&schema),
+            });
+        }
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: snapshot_id,
+            row_id_start,
+            row_count: u64::try_from(values.len()).unwrap(),
+            arrow_body: inline_body(&batch),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(snapshot_id, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(snapshot_id, "inlined_insert:1"),
+        });
+        tx.commit().await.unwrap();
+    }
+
+    /// Tombstones one inlined row in its own commit.
+    async fn inline_row_delete(catalog: &Catalog, snapshot_id: u64, row_id: u64) -> Result<()> {
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+        tx.stage(RowOperation::InlineInlineDelete {
+            table_id: 1,
+            row_id,
+            end_snapshot: snapshot_id,
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(snapshot_id, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(snapshot_id, "inlined_delete:1"),
+        });
+        tx.commit().await.map(|_| ())
+    }
+
+    /// Deleting an inlined row removes its unique index entry, so the value
+    /// is free to be inserted again — entries are live-only.
+    #[tokio::test]
+    async fn inline_row_delete_removes_its_unique_index_entry() {
+        let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+        inline_insert(&catalog, 3, 0, &[7], true).await;
+        assert_eq!(
+            index_entry_count(&catalog, true, index_id).await,
+            1,
+            "the insert lands one entry"
+        );
+
+        inline_row_delete(&catalog, 4, 0).await.unwrap();
+        assert_eq!(
+            index_entry_count(&catalog, true, index_id).await,
+            0,
+            "the delete removes the entry it killed"
+        );
+    }
+
+    /// The replace pattern a writer depends on: delete a row, then insert
+    /// the same unique value again in a later commit.
+    #[tokio::test]
+    async fn inline_delete_then_reinsert_admits_the_same_unique_value() {
+        let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+        inline_insert(&catalog, 3, 0, &[7], true).await;
+        inline_row_delete(&catalog, 4, 0).await.unwrap();
+        inline_insert(&catalog, 5, 1, &[7], false).await;
+
+        assert_eq!(
+            index_entry_count(&catalog, true, index_id).await,
+            1,
+            "the value is indexed again, held by the new row"
+        );
+    }
+
+    /// Delete and reinsert of one unique value inside a single commit: the
+    /// removal is staged before the put, so the value reads as absent.
+    #[tokio::test]
+    async fn inline_delete_and_reinsert_in_one_commit_admits_the_same_unique_value() {
+        let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+        inline_insert(&catalog, 3, 0, &[7], true).await;
+
+        let (_, batch) = bigint_batch(&[7]);
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+        tx.stage(RowOperation::InlineInlineDelete {
+            table_id: 1,
+            row_id: 0,
+            end_snapshot: 4,
+        });
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 4,
+            row_id_start: 1,
+            row_count: 1,
+            arrow_body: inline_body(&batch),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(4, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(4, "inlined_insert:1"),
+        });
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            index_entry_count(&catalog, true, index_id).await,
+            1,
+            "the reinserted value holds exactly one entry"
+        );
+    }
+
+    /// A non-unique index leaks differently: a stale entry does not block
+    /// writes, it makes a lookup resolve a row id that no longer exists.
+    #[tokio::test]
+    async fn inline_row_delete_removes_its_non_unique_index_entry() {
+        let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+
+        inline_insert(&catalog, 3, 0, &[7, 7], true).await;
+        assert_eq!(
+            index_entry_count(&catalog, false, index_id).await,
+            2,
+            "both rows share the value under a non-unique index"
+        );
+
+        inline_row_delete(&catalog, 4, 0).await.unwrap();
+        assert_eq!(
+            index_entry_count(&catalog, false, index_id).await,
+            1,
+            "only the surviving row is still indexed"
+        );
+    }
+
+    /// Writes `batch` to `path` on `store` as Parquet.
+    async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::RecordBatch) {
+        use object_store::ObjectStoreExt;
+
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
+            writer.write(batch).unwrap();
+            writer.close().unwrap();
+        }
+        store
+            .put(&object_store::path::Path::from(path), buffer.into())
+            .await
+            .unwrap();
+    }
+
+    /// A `ducklake_data_file` row for a file of `record_count` rows.
+    fn indexed_data_file_row(record_count: u64) -> Vec<Cell> {
+        vec![
+            Cell::U64(1),
+            Cell::U64(1),
+            Cell::U64(3),
+            Cell::Null,
+            Cell::Null,
+            Cell::Str("data.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(record_count),
+            Cell::U64(1024),
+            Cell::U64(64),
+            Cell::U64(0), // row_id_start
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+            Cell::Null,
+        ]
+    }
+
+    /// Registers a Parquet data file of `values` on the indexed table,
+    /// returning the store it lives on.
+    async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<InMemory> {
+        let store = Arc::new(InMemory::new());
+        let (_, batch) = bigint_batch(values);
+        // `s/` and `t/` are the bootstrap schema and table path prefixes.
+        write_parquet(&store, "main/t/data.parquet", &batch).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: indexed_data_file_row(u64::try_from(values.len()).unwrap()),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(3, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(3, "inserted_into_table:1"),
+        });
+        tx.commit().await.unwrap();
+        store
+    }
+
+    /// An inlined delete against a Parquet-file row removes that row's
+    /// entry, read back out of the target file.
+    #[tokio::test]
+    async fn inlined_file_delete_removes_the_killed_rows_index_entry() {
+        let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+        let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+        assert_eq!(
+            index_entry_count(&catalog, true, index_id).await,
+            3,
+            "the registered file lands one entry per row"
+        );
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+        tx.stage(RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 1,
+            row_id: 1,
+            begin_snapshot: 4,
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(4, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(4, "inlined_delete:1"),
+        });
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            index_entry_count(&catalog, true, index_id).await,
+            2,
+            "the deleted row's entry is gone, the other two remain"
+        );
+    }
+
+    /// A registered delete file names positions in its target; the commit
+    /// reads those positions' values and removes exactly their entries.
+    #[tokio::test]
+    async fn registered_delete_file_removes_the_killed_rows_index_entries() {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+
+        let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+        let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+        // A DuckLake delete file: `file_path` plus the killed positions.
+        let deletes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("file_path", DataType::Utf8, false),
+                Field::new("pos", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["data.parquet", "data.parquet"])),
+                Arc::new(Int64Array::from(vec![0, 2])),
+            ],
+        )
+        .unwrap();
+        write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DeleteFile,
+            cells: vec![
+                Cell::U64(2),
+                Cell::U64(1),
+                Cell::U64(4),
+                Cell::Null,
+                Cell::U64(1), // data_file_id
+                Cell::Str("deletes.parquet".into()),
+                Cell::Bool(true),
+                Cell::Str("parquet".into()),
+                Cell::U64(2), // delete_count
+                Cell::U64(512),
+                Cell::U64(64),
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(4, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(4, "deleted_from_table:1"),
+        });
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            index_entry_count(&catalog, true, index_id).await,
+            1,
+            "positions 0 and 2 are unindexed; only row 1 survives"
         );
     }
 

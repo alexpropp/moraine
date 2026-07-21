@@ -1776,6 +1776,210 @@ mod tests {
         catalog.close().await.unwrap();
     }
 
+    /// Sets up an indexed table holding one two-row data file (values 10 and
+    /// 20 at row ids 0 and 1), returning the catalog, table, index and file.
+    async fn catalog_with_indexed_data_file() -> (
+        crate::catalog::Catalog,
+        crate::catalog::TableId,
+        crate::catalog::IndexId,
+        crate::catalog::DataFileId,
+    ) {
+        use crate::{
+            catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef},
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let (catalog, table) = catalog_with_two_column_table().await;
+        let index = std::cell::Cell::new(None);
+        let file = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: true,
+                    },
+                    &[],
+                )?;
+                index.set(Some(id));
+                let int = |value: i128| IndexKeyValue::Int {
+                    value,
+                    width: IntWidth::I64,
+                };
+                let registered = tx.register_data_file(
+                    table,
+                    DataFile {
+                        path: "f.parquet".into(),
+                        path_is_relative: true,
+                        file_format: "parquet".into(),
+                        record_count: 2,
+                        file_size_bytes: 20,
+                        footer_size: 4,
+                        encryption_key: None,
+                        column_stats: vec![],
+                    },
+                    &[
+                        FileIndexEntry {
+                            index: id,
+                            ordinal: 0,
+                            values: vec![Some(int(10))],
+                        },
+                        FileIndexEntry {
+                            index: id,
+                            ordinal: 1,
+                            values: vec![Some(int(20))],
+                        },
+                    ],
+                )?;
+                file.set(Some(registered));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (catalog, table, index.get().unwrap(), file.get().unwrap())
+    }
+
+    fn delete_file(data_file: crate::catalog::DataFileId) -> crate::catalog::DeleteFile {
+        crate::catalog::DeleteFile {
+            data_file_id: data_file,
+            path: "d.parquet".into(),
+            path_is_relative: true,
+            format: "parquet".into(),
+            delete_count: 1,
+            file_size_bytes: 10,
+            footer_size: 4,
+            encryption_key: None,
+        }
+    }
+
+    /// A delete file names the rows it kills, so their entries go with them
+    /// and the value is free to be indexed again.
+    #[tokio::test]
+    async fn register_delete_file_removes_the_entries_it_names() {
+        use crate::{
+            catalog::FileIndexEntry,
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
+        let int = |value: i128| IndexKeyValue::Int {
+            value,
+            width: IntWidth::I64,
+        };
+
+        catalog
+            .commit(|tx| {
+                tx.register_delete_file(
+                    table,
+                    delete_file(file),
+                    &[FileIndexEntry {
+                        index,
+                        ordinal: 1,
+                        values: vec![Some(int(20))],
+                    }],
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            catalog
+                .index_lookup(table, index, &[int(20)])
+                .await
+                .unwrap()
+                .is_empty(),
+            "the killed row's entry is gone"
+        );
+        assert_eq!(
+            catalog
+                .index_lookup(table, index, &[int(10)])
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the surviving row is still indexed"
+        );
+        catalog.close().await.unwrap();
+    }
+
+    /// Supplying no entries on an indexed table is refused, exactly as it is
+    /// on the register side — a silently under-covered index is a lie.
+    #[tokio::test]
+    async fn register_delete_file_must_supply_index_entries() {
+        let (catalog, table, _, file) = catalog_with_indexed_data_file().await;
+        let refused = catalog
+            .commit(|tx| {
+                tx.register_delete_file(table, delete_file(file), &[])
+                    .map(|_| ())
+            })
+            .await;
+        assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
+        catalog.close().await.unwrap();
+    }
+
+    /// Entries without deletes would strip the index of rows the catalog
+    /// still counts as live.
+    #[tokio::test]
+    async fn register_delete_file_rejects_index_entries_without_deletes() {
+        use crate::{
+            catalog::FileIndexEntry,
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
+        let refused = catalog
+            .commit(|tx| {
+                tx.register_delete_file(
+                    table,
+                    crate::catalog::DeleteFile {
+                        delete_count: 0,
+                        ..delete_file(file)
+                    },
+                    &[FileIndexEntry {
+                        index,
+                        ordinal: 1,
+                        values: vec![Some(IndexKeyValue::Int {
+                            value: 20,
+                            width: IntWidth::I64,
+                        })],
+                    }],
+                )
+                .map(|_| ())
+            })
+            .await;
+        assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
+        catalog.close().await.unwrap();
+    }
+
+    /// An ordinal past the target file's rows would name a row id outside it.
+    #[tokio::test]
+    async fn register_delete_file_rejects_an_out_of_range_index_ordinal() {
+        use crate::{
+            catalog::FileIndexEntry,
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
+        let refused = catalog
+            .commit(|tx| {
+                tx.register_delete_file(
+                    table,
+                    delete_file(file),
+                    &[FileIndexEntry {
+                        index,
+                        ordinal: 2,
+                        values: vec![Some(IndexKeyValue::Int {
+                            value: 30,
+                            width: IntWidth::I64,
+                        })],
+                    }],
+                )
+                .map(|_| ())
+            })
+            .await;
+        assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
+        catalog.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn unique_index_rejects_a_duplicate_value_across_commits() {
         use crate::{

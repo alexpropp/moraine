@@ -3028,6 +3028,75 @@ mod tests {
         reject("INSERT INTO lake.main.t VALUES (500, 'dup');");
     }
 
+    /// Delete-path coverage: entries are live-only, so a DELETE frees the
+    /// value it killed and the same key can be written again. Covers both
+    /// residences — an inlined row and a row in a flushed Parquet file —
+    /// and the replace-in-one-transaction shape a writer depends on.
+    #[test]
+    #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+    fn moraine_index_entries_are_removed_by_delete() {
+        let store = TempDir::new("index-delete-store");
+        let data = TempDir::new("index-delete-data");
+        let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+        let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+        let count = |sql: &str| csv_rows(&run(sql));
+
+        run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+        run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+        run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+        // A row in the flushed Parquet file: deleting it frees its value.
+        run("DELETE FROM lake.main.t WHERE a = 42;");
+        assert_eq!(
+            count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+            vec![vec!["0".to_string()]],
+            "the deleted row's entry is gone"
+        );
+        run("INSERT INTO lake.main.t VALUES (42, 'again');");
+        assert_eq!(
+            count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+            vec![vec!["1".to_string()]],
+            "the freed value is insertable again"
+        );
+
+        // A small INSERT stays inline; deleting it frees its value too.
+        run("INSERT INTO lake.main.t VALUES (500, 'z');");
+        run("DELETE FROM lake.main.t WHERE a = 500;");
+        assert_eq!(
+            count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);"),
+            vec![vec!["0".to_string()]],
+            "the inlined row's entry is gone"
+        );
+        run("INSERT INTO lake.main.t VALUES (500, 'again');");
+        assert_eq!(
+            count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 500);"),
+            vec![vec!["1".to_string()]],
+            "the freed inlined value is insertable again"
+        );
+
+        // The replace shape: delete and reinsert one key in one transaction.
+        run("BEGIN; DELETE FROM lake.main.t WHERE a = 7; \
+             INSERT INTO lake.main.t VALUES (7, 'replaced'); COMMIT;");
+        assert_eq!(
+            count("SELECT b FROM lake.main.t WHERE a = 7;"),
+            vec![vec!["replaced".to_string()]],
+            "the replacement row is the live one"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 7);"),
+            vec![vec!["1".to_string()]],
+            "the replaced key resolves to exactly one row"
+        );
+
+        // Every lookup still resolves to a row that exists: no entry outlives
+        // its row, which is what a non-unique leak would show as.
+        assert_eq!(
+            count("SELECT count(*) FROM lake.main.t;"),
+            vec![vec!["101".to_string()]],
+            "100 original rows, plus the extra key 500; every delete was reinserted"
+        );
+    }
+
     /// Runs `sql` against a fresh CLI attaching the moraine lake with **no**
     /// data-path option at all — DuckLake must read the data root from the
     /// `data_path` metadata moraine serves. Returns the raw output.
