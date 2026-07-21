@@ -24,7 +24,7 @@ use std::ffi::{CString, c_char};
 /// | [`STORE`](codes::STORE) | the underlying object store / SlateDB failed | `IOException` |
 /// | [`INVALID_ARGUMENT`](codes::INVALID_ARGUMENT) | a null pointer, non-UTF-8 string, or unsupported ABI input | `InvalidInputException` |
 /// | [`INTERNAL`](codes::INTERNAL) | a panic was caught at the FFI boundary | `InternalException` |
-/// | [`INTERRUPTED`](codes::INTERRUPTED) | cancellation — [`moraine_interrupt`](crate::abi::moraine_interrupt) or the call's interrupt probe — cancelled the read in flight (or about to start) on this handle | `InterruptException` |
+/// | [`INTERRUPTED`](codes::INTERRUPTED) | cancellation — the call's interrupt probe cancelled the read in flight (or about to start) on this handle | `InterruptException` |
 pub mod codes {
     /// Success; no error occurred.
     pub const OK: i32 = 0;
@@ -49,10 +49,9 @@ pub mod codes {
     /// A panic was caught at the FFI boundary and converted to an error
     /// instead of unwinding into C++.
     pub const INTERNAL: i32 = 8;
-    /// Cancellation — [`moraine_interrupt`](crate::abi::moraine_interrupt)
-    /// or the call's interrupt probe — cancelled the read in flight (or
-    /// about to start) on this handle. Never produced by the `moraine`
-    /// core — an ABI-layer cancellation signal.
+    /// Cancellation — the call's interrupt probe cancelled the read in
+    /// flight (or about to start) on this handle. Never produced by the
+    /// `moraine` core — an ABI-layer cancellation signal.
     pub const INTERRUPTED: i32 = 9;
 }
 
@@ -100,8 +99,7 @@ impl AbiError {
         self
     }
 
-    /// The fixed error a cancellable read reports when
-    /// [`moraine_interrupt`](crate::abi::moraine_interrupt) or the call's
+    /// The fixed error a cancellable read reports when the call's
     /// interrupt probe cancelled it.
     pub(crate) fn interrupted() -> Self {
         Self::new(

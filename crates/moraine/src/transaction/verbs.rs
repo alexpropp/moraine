@@ -1025,13 +1025,8 @@ impl Transaction {
             return Ok(());
         }
 
-        let row_id_start = data_file.row_id_start.ok_or_else(|| {
-            Error::Constraint(format!(
-                "data file {} of table {table} carries per-row ids; index maintenance of rewrite \
-                 files is a follow-up",
-                data_file.data_file_id
-            ))
-        })?;
+        let row_id_start =
+            crate::transaction::index_maintenance::data_file_row_id_start(data_file)?;
 
         for file_entry in index_entries {
             self.stage_file_index_entry(table, row_id_start, file_entry, true)?;

@@ -13,7 +13,7 @@ use crate::{
     store::{
         handle::ReadHandle,
         index_encoding::{CanonicalKey, IndexKeyValue, encode_key},
-        key::{IdxKey, Key, idx_multi_value_prefix},
+        key::{IdxKey, IdxKind, Key, idx_index_prefix, idx_multi_value_prefix},
     },
     transaction::commit::StagedWrite,
 };
@@ -119,6 +119,50 @@ fn unique_violation(index_id: u64) -> Error {
     Error::Constraint(format!(
         "duplicate value violates equality index {index_id}"
     ))
+}
+
+/// The dense row-id start of a data file under index maintenance, or the
+/// shared refusal for rewrite files (per-row ids, no dense range) — a
+/// documented follow-up, one constructor so the refusal sites cannot
+/// drift apart.
+pub(crate) fn data_file_row_id_start(file: &crate::store::proto::DataFileValue) -> Result<u64> {
+    file.row_id_start.ok_or_else(|| {
+        Error::Constraint(format!(
+            "data file {} on indexed table {} carries per-row ids; index maintenance of rewrite \
+             files is a follow-up",
+            file.data_file_id, file.table_id
+        ))
+    })
+}
+
+/// Deletes up to `limit` orphaned entries of one dropped index inside an
+/// open transaction, returning how many deletes were staged. An index is
+/// exclusively one kind, so only one prefix holds entries; scanning both
+/// is harmless.
+pub(crate) async fn reclaim_entries(
+    tx: &slatedb::DbTransaction,
+    index_id: u64,
+    limit: usize,
+) -> Result<usize> {
+    let mut deleted = 0;
+    for kind in [IdxKind::Unique, IdxKind::Multi] {
+        if deleted >= limit {
+            break;
+        }
+        let mut iter = ReadHandle::Tx(tx)
+            .scan_prefix(idx_index_prefix(kind, index_id), ..)
+            .await?;
+        while deleted < limit {
+            match iter.next().await? {
+                Some(entry) => {
+                    tx.delete(entry.key)?;
+                    deleted += 1;
+                }
+                None => break,
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 /// The row ids holding one indexed value: a point-get for a unique index,

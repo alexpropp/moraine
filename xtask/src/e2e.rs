@@ -6,15 +6,12 @@
 
 use std::process::Command;
 
-use anyhow::{Context, ensure};
-
 use crate::duckdb;
 
 /// The single `#[ignore]`d integration test `e2e` un-ignores and runs by
-/// exact name (including its `tests::` module path, required for
-/// `--exact` to match). Deleting or renaming it fails `e2e` instead of
-/// silently matching zero tests.
-const DUCKDB_LOAD_TEST_NAME: &str = "tests::attach_lists_and_scans_through_real_duckdb";
+/// exact name. Deleting or renaming it fails `e2e` instead of silently
+/// matching zero tests.
+const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb";
 
 /// Every `#[ignore]`d test in `ducklake_load.rs`, run together (not
 /// `--exact`, since there are many). Needs network access to `INSTALL
@@ -34,69 +31,29 @@ pub fn e2e() -> anyhow::Result<()> {
 
     duckdb::run(Command::new("cargo").args(["test", "-p", "moraine-duckdb", "--release"]))?;
 
-    let output = Command::new("cargo")
-        .args([
-            "test",
-            "-p",
-            "moraine-duckdb",
-            "--release",
-            "--test",
-            "duckdb_load",
-            "--",
-            "--ignored",
-            "--exact",
-            DUCKDB_LOAD_TEST_NAME,
-        ])
-        .env("MORAINE_DUCKDB_CLI", &cli)
-        .env("MORAINE_DUCKDB_EXT", &extension)
-        .output()
-        .context("spawning the duckdb_load integration test")?;
-    // Stdio isn't inherited here (unlike `run`), so output can be checked
-    // below; echo both streams so failures stay visible on the console.
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    ensure!(
-        output.status.success(),
-        "duckdb_load integration test failed"
-    );
-    // An exact-name filter matching nothing still exits 0 ("0 passed; 0
-    // filtered out"), which would let a deleted/renamed #[test] pass
-    // vacuously.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    ensure!(
-        stdout.contains("1 passed"),
-        "expected `{DUCKDB_LOAD_TEST_NAME}` to report `1 passed`; the test may have been \
-         deleted, renamed, or its #[ignore] removed/changed. Got:\n{stdout}"
-    );
+    let envs: &[(&str, &std::ffi::OsStr)] = &[
+        ("MORAINE_DUCKDB_CLI", cli.as_os_str()),
+        ("MORAINE_DUCKDB_EXT", extension.as_os_str()),
+    ];
+
+    duckdb::run_ignored_suite(
+        "moraine-duckdb",
+        "duckdb_load",
+        true,
+        &["--exact", DUCKDB_LOAD_TEST_NAME],
+        envs,
+        "1 passed",
+    )?;
     println!("ok: real DuckDB loaded moraine_duckdb and drove attach/listing/scan");
 
-    let ducklake_output = Command::new("cargo")
-        .args([
-            "test",
-            "-p",
-            "moraine-duckdb",
-            "--release",
-            "--test",
-            "ducklake_load",
-            "--",
-            "--ignored",
-        ])
-        .env("MORAINE_DUCKDB_CLI", &cli)
-        .env("MORAINE_DUCKDB_EXT", &extension)
-        .output()
-        .context("spawning the ducklake_load integration test")?;
-    print!("{}", String::from_utf8_lossy(&ducklake_output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&ducklake_output.stderr));
-    ensure!(
-        ducklake_output.status.success(),
-        "ducklake_load integration test failed"
-    );
-    let ducklake_stdout = String::from_utf8_lossy(&ducklake_output.stdout);
-    ensure!(
-        ducklake_stdout.contains(DUCKLAKE_LOAD_TEST_COUNT),
-        "expected ducklake_load.rs to report `{DUCKLAKE_LOAD_TEST_COUNT}`; a test may have been \
-         deleted or its #[ignore] removed/changed. Got:\n{ducklake_stdout}"
-    );
+    duckdb::run_ignored_suite(
+        "moraine-duckdb",
+        "ducklake_load",
+        true,
+        &[],
+        envs,
+        DUCKLAKE_LOAD_TEST_COUNT,
+    )?;
     println!(
         "ok: real DuckDB + ducklake attached through moraine:'s metadata catalog and read the lake"
     );

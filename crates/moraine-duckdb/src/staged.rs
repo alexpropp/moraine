@@ -60,37 +60,12 @@ pub struct MoraineTxHandle {
     tx: StagedTransaction,
 }
 
+/// Decodes the ABI's `table_kind` through the core's own wire table
+/// (`TableKind::ALL`), so the mapping can never drift from the enum.
 fn decode_table_kind(v: i32) -> Result<TableKind, AbiError> {
-    match v {
-        0 => Ok(TableKind::Snapshot),
-        1 => Ok(TableKind::SnapshotChanges),
-        2 => Ok(TableKind::Schema),
-        3 => Ok(TableKind::Table),
-        4 => Ok(TableKind::View),
-        5 => Ok(TableKind::Column),
-        6 => Ok(TableKind::DataFile),
-        7 => Ok(TableKind::DeleteFile),
-        8 => Ok(TableKind::TableStats),
-        9 => Ok(TableKind::TableColumnStats),
-        10 => Ok(TableKind::FileColumnStats),
-        11 => Ok(TableKind::SchemaVersions),
-        12 => Ok(TableKind::PartitionInfo),
-        13 => Ok(TableKind::PartitionColumn),
-        14 => Ok(TableKind::FilePartitionValue),
-        15 => Ok(TableKind::SortInfo),
-        16 => Ok(TableKind::SortExpression),
-        17 => Ok(TableKind::Tag),
-        18 => Ok(TableKind::ColumnTag),
-        19 => Ok(TableKind::FilesScheduledForDeletion),
-        20 => Ok(TableKind::Macro),
-        21 => Ok(TableKind::MacroImpl),
-        22 => Ok(TableKind::MacroParameters),
-        23 => Ok(TableKind::ColumnMapping),
-        24 => Ok(TableKind::NameMapping),
-        other => Err(AbiError::invalid_argument(format!(
-            "moraine_tx_stage: unknown table_kind {other}"
-        ))),
-    }
+    TableKind::try_from(v).map_err(|other| {
+        AbiError::invalid_argument(format!("moraine_tx_stage: unknown table_kind {other}"))
+    })
 }
 
 /// The four [`RowOperation`] shapes, decoded from `operation_kind`.
@@ -155,12 +130,10 @@ unsafe fn decode_cells(cells: *const MoraineCell, len: usize) -> Result<Vec<Cell
 /// Opens a staged-row transaction at the current head and writes the
 /// resulting handle to `*out`.
 ///
-/// Cancellable: races the head read against
-/// [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal and
-/// against `probe` (polled immediately, then ~100 ms; a null `probe`
-/// disables polling). If a cancellation wins, returns
-/// [`codes::INTERRUPTED`], `*out` is left unwritten, and nothing is
-/// staged.
+/// Cancellable: races the head read against `probe` (polled
+/// immediately, then ~100 ms; a null `probe` disables polling). If a
+/// cancellation wins, returns [`codes::INTERRUPTED`], `*out` is left
+/// unwritten, and nothing is staged.
 ///
 /// # Safety
 ///
@@ -328,23 +301,7 @@ pub unsafe extern "C" fn moraine_tx_dump_snapshots(
             .runtime
             .block_on(tx_ref.tx.visible_snapshots())
             .map_err(AbiError::from)?;
-        snapshot_rows(
-            rows.into_iter()
-                .map(|v| {
-                    (
-                        v.snapshot_id,
-                        v.snapshot_time_micros,
-                        v.schema_version,
-                        v.next_catalog_id,
-                        v.next_file_id,
-                        v.changes_made,
-                        v.author,
-                        v.commit_message,
-                        v.commit_extra_info,
-                    )
-                })
-                .collect(),
-        )
+        snapshot_rows(rows)
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
@@ -707,162 +664,15 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_schema_drop(
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, ptr};
+    use std::ptr;
 
     use super::*;
-    use crate::abi::{moraine_attach, moraine_detach};
-
-    /// A directory under the OS temp dir, unique per call, removed on
-    /// drop.
-    struct TempDir(std::path::PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "moraine-duckdb-staged-{tag}-{}-{n}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).expect("test setup: create temp dir");
-            Self(dir)
-        }
-
-        fn c_path(&self) -> CString {
-            CString::new(self.0.to_str().expect("test path is UTF-8")).expect("no NUL in path")
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn attach_ok(dir: &TempDir) -> *mut MoraineCatalogHandle {
-        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
-        let mut err = MoraineError::default();
-        let c_path = dir.c_path();
-        // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
-        let code = unsafe {
-            moraine_attach(
-                c_path.as_ptr(),
-                ptr::null(),
-                false,
-                false,
-                0,
-                ptr::null(),
-                ptr::null(),
-                &raw mut handle,
-                &raw mut err,
-            )
-        };
-        assert_eq!(code, codes::OK);
-        assert!(!handle.is_null());
-        handle
-    }
-
-    fn u64_cell(v: u64) -> MoraineCell {
-        MoraineCell {
-            kind: 1,
-            u64_value: v,
-            i64_value: 0,
-            bool_value: false,
-            str_value: ptr::null(),
-        }
-    }
-
-    fn i64_cell(v: i64) -> MoraineCell {
-        MoraineCell {
-            kind: 2,
-            u64_value: 0,
-            i64_value: v,
-            bool_value: false,
-            str_value: ptr::null(),
-        }
-    }
-
-    fn bool_cell(v: bool) -> MoraineCell {
-        MoraineCell {
-            kind: 3,
-            u64_value: 0,
-            i64_value: 0,
-            bool_value: v,
-            str_value: ptr::null(),
-        }
-    }
-
-    fn null_cell() -> MoraineCell {
-        MoraineCell {
-            kind: 0,
-            u64_value: 0,
-            i64_value: 0,
-            bool_value: false,
-            str_value: ptr::null(),
-        }
-    }
-
-    /// Owns the `CString`s a `str_cell` borrows from, so the cells stay
-    /// valid for the `moraine_tx_stage` call that reads them.
-    struct StrArena(Vec<CString>);
-
-    impl StrArena {
-        fn new() -> Self {
-            Self(Vec::new())
-        }
-
-        fn cell(&mut self, s: &str) -> MoraineCell {
-            let c = CString::new(s).expect("test string has no NUL");
-            let ptr = c.as_ptr();
-            self.0.push(c);
-            MoraineCell {
-                kind: 4,
-                u64_value: 0,
-                i64_value: 0,
-                bool_value: false,
-                str_value: ptr,
-            }
-        }
-    }
-
-    fn stage(
-        tx: *mut MoraineTxHandle,
-        table_kind: i32,
-        operation_kind: i32,
-        cells: &[MoraineCell],
-    ) {
-        let mut err = MoraineError::default();
-        // SAFETY: `tx` is a live handle from `moraine_tx_begin`; `cells`
-        // is a valid slice for the duration of this call.
-        let code = unsafe {
-            moraine_tx_stage(
-                tx,
-                table_kind,
-                operation_kind,
-                cells.as_ptr(),
-                cells.len(),
-                &raw mut err,
-            )
-        };
-        // SAFETY: `err.message` is null or was just written by `moraine_tx_stage`.
-        assert_eq!(code, codes::OK, "stage failed: {:?}", unsafe {
-            err.message.as_ref()
-        });
-    }
-
-    fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxHandle {
-        let mut tx: *mut MoraineTxHandle = ptr::null_mut();
-        let mut err = MoraineError::default();
-        // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code =
-            unsafe { moraine_tx_begin(handle, &raw mut tx, None, ptr::null_mut(), &raw mut err) };
-        // SAFETY: `err.message` is null or was just written by `moraine_tx_begin`.
-        assert_eq!(code, codes::OK, "begin failed: {:?}", unsafe {
-            err.message.as_ref()
-        });
-        assert!(!tx.is_null());
-        tx
-    }
+    use crate::{
+        abi::moraine_detach,
+        test_support::{
+            StrArena, TempDir, attach_ok, begin, bool_cell, i64_cell, null_cell, stage, u64_cell,
+        },
+    };
 
     /// Stages a full `ducklake_table` row (`table_kind` 3, `operation_kind` 0):
     /// id, a synthetic uuid, begin/end snapshot (`lifecycle`), schema id,
@@ -940,7 +750,7 @@ mod tests {
     #[test]
     fn stages_table_create_and_snapshot_bump_over_the_abi() {
         let dir = TempDir::new("create");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
         let tx = begin(handle);
 
         let mut arena = StrArena::new();
@@ -1050,7 +860,7 @@ mod tests {
     #[test]
     fn update_set_end_and_stats_delete_over_the_abi() {
         let dir = TempDir::new("end-delete");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
 
         // Snapshot 1: table `t` (id 1, in bootstrap's `main`) plus its
         // stats row.
@@ -1151,7 +961,7 @@ mod tests {
     #[test]
     fn lost_race_at_commit_is_not_retried_and_carries_conflict_text() {
         let dir = TempDir::new("race");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
 
         let tx_a = begin(handle);
         let tx_b = begin(handle);
@@ -1234,7 +1044,7 @@ mod tests {
     #[test]
     fn rollback_discards_staged_rows() {
         let dir = TempDir::new("rollback");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
         let tx = begin(handle);
 
         let mut arena = StrArena::new();
@@ -1287,7 +1097,7 @@ mod tests {
     #[test]
     fn malformed_row_reports_corruption_not_a_panic() {
         let dir = TempDir::new("malformed");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
         let tx = begin(handle);
 
         // Far too few cells for `ducklake_schema`.
@@ -1345,7 +1155,7 @@ mod tests {
         }
 
         let dir = TempDir::new("probe-tx-begin");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
 
         let mut tx: *mut MoraineTxHandle = ptr::null_mut();
         let mut err = MoraineError::default();
@@ -1419,7 +1229,7 @@ mod tests {
     #[test]
     fn stage_rejects_unknown_table_kind() {
         let dir = TempDir::new("bad-kind");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
         let tx = begin(handle);
 
         let mut err = MoraineError::default();
@@ -1440,7 +1250,7 @@ mod tests {
     #[test]
     fn tx_dump_snapshots_observes_staged_deletes() {
         let dir = TempDir::new("rywr");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
 
         // Seed snapshot 1 so the store holds {0, 1}.
         let tx = begin(handle);
@@ -1493,37 +1303,6 @@ mod tests {
             crate::dumps::moraine_dump_snapshots_free(committed, committed_len);
             moraine_tx_rollback(tx);
             moraine_detach(handle);
-        }
-    }
-
-    /// `cpp/moraine_abi.h` is a hand-written C mirror, kept in lockstep by
-    /// hand (see `crate::abi`'s identical test). Checks textual presence
-    /// of each symbol/struct name only.
-    #[test]
-    fn header_declares_every_staged_tx_symbol() {
-        let header = include_str!("../cpp/moraine_abi.h");
-        let names = [
-            "moraine_tx_begin",
-            "moraine_tx_dump_snapshots",
-            "moraine_tx_stage",
-            "moraine_tx_commit",
-            "moraine_tx_rollback",
-            "MoraineTxHandle",
-            "MoraineCell",
-            "moraine_tx_stage_inline_schema",
-            "moraine_tx_stage_inline_insert",
-            "moraine_tx_stage_inline_inline_delete",
-            "moraine_tx_stage_inline_file_delete",
-            "moraine_tx_stage_inline_flush_delete",
-            "moraine_tx_stage_inline_drop",
-            "moraine_tx_stage_inline_schema_drop",
-        ];
-        for name in names {
-            assert!(
-                header.contains(name),
-                "cpp/moraine_abi.h is missing `{name}`, declared in src/staged.rs — \
-                 the two must be kept in lockstep by hand"
-            );
         }
     }
 }

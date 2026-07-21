@@ -7,5 +7,6 @@ mod fixtures;
 mod catalog;
 mod commit_concurrency;
 mod data_files;
+mod index_backfill;
 mod macros;
 mod views_options;

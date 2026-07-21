@@ -228,3 +228,48 @@ async fn column_stats_round_trip_verbatim() {
     assert_eq!(after.id.get(), before.get() + 1);
     catalog.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn expired_delete_files_vanish_at_head_but_time_travel_sees_them() {
+    let (catalog, t) = seeded().await;
+
+    catalog
+        .commit(move |tx| {
+            let file = tx.register_data_file(t, datafile(10), &[])?;
+            tx.register_delete_file(
+                t,
+                DeleteFile {
+                    data_file_id: file,
+                    path: "d.parquet".into(),
+                    path_is_relative: true,
+                    format: "parquet".into(),
+                    delete_count: 1,
+                    file_size_bytes: 50,
+                    footer_size: 4,
+                    encryption_key: None,
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let registered = catalog.snapshot().await.unwrap().current_snapshot().id;
+
+    catalog
+        .commit(move |tx| {
+            let delete_file = tx.delete_files_of(t)[0].id;
+            tx.expire_delete_file(t, delete_file)
+        })
+        .await
+        .unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    assert!(head.delete_files_of(t).is_empty());
+    assert_eq!(head.data_files_of(t).len(), 1, "the data file survives");
+
+    // The expiry is versioned: time travel still serves the delete file.
+    let past = catalog.snapshot_at(registered).await.unwrap();
+    assert_eq!(past.delete_files_of(t).len(), 1);
+    catalog.close().await.unwrap();
+}

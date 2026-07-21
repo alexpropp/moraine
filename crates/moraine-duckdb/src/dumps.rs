@@ -26,7 +26,8 @@ mod statistics;
 mod tags;
 
 use std::{
-    ffi::{CString, c_char},
+    ffi::{CString, c_char, c_void},
+    future::Future,
     ptr,
 };
 
@@ -39,7 +40,11 @@ pub use snapshots::*;
 pub use statistics::*;
 pub use tags::*;
 
-use crate::{abi::to_c_string, error::AbiError};
+use crate::{
+    abi::{free_array, guard, to_c_string, write_array},
+    error::{AbiError, MoraineError, codes},
+    runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
+};
 
 /// Splits an optional `u64` into the `(has, value)` pair the dump row
 /// structs carry.
@@ -63,56 +68,97 @@ pub(crate) fn opt_into_raw(s: Option<CString>) -> *mut c_char {
     s.map_or(ptr::null_mut(), CString::into_raw)
 }
 
+/// The shared shell of every dump entry point: null checks, the
+/// cancellable bridge into the core `fetch`, `convert` to C rows, and
+/// `write_array`, all under [`guard`](crate::abi). Every `moraine_dump_*`
+/// export is a thin wrapper over this, so each concrete signature stays
+/// visible to cbindgen (which generates `cpp/moraine_abi.h`).
+///
+/// Cancellable via `probe`/`probe_ctx` (polled immediately, then ~100 ms;
+/// a null `probe` disables polling): a cancellation returns
+/// [`codes::INTERRUPTED`] and the out-params are left unwritten.
+///
+/// # Safety
+///
+/// `handle` must be a pointer previously returned by
+/// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
+/// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
+/// non-null, must be safe to call with `probe_ctx` from any thread.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
+/// for the duration of the call.
+// Six of the eight parameters mirror the fixed C signature every dump
+// entry point exposes; grouping them would only obscure the mirror.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn dump_rows<Row, Rows>(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut Row,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+    fetch: impl for<'c> FnOnce(
+        &'c moraine::Catalog,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Rows, moraine::Error>> + 'c>,
+    >,
+    convert: impl FnOnce(Rows) -> Result<Vec<Row>, AbiError>,
+) -> i32 {
+    let attempt = || -> Result<Vec<Row>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is the caller's contract.
+        let rows = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, fetch(&handle_ref.catalog))
+        }?;
+        convert(rows)
+    };
+
+    // SAFETY: `err` validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// The shared shell of every dump `_free`: `release` each element's owned
+/// strings and reclaim the array, under `catch_unwind` so a teardown can
+/// never unwind into C++. Null `items` is a no-op.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by the
+/// matching dump call, not yet freed.
+pub(crate) unsafe fn free_rows<Row>(items: *mut Row, len: usize, release: impl FnMut(&mut Row)) {
+    let attempt = std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            free_array(items, len, release);
+        }
+    });
+    let _ = std::panic::catch_unwind(attempt);
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Shared fixtures for the dump tests, reused by the per-family
     //! submodule tests.
 
-    use std::{
-        ffi::CString,
-        path::{Path, PathBuf},
-        ptr,
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
-    };
+    use std::{path::Path, sync::Arc};
 
     use moraine::{ColumnDef, ColumnStats, DataFile, DeleteFile, FileColumnStats};
     use object_store::local::LocalFileSystem;
 
-    use crate::{
-        abi::moraine_attach,
-        error::{MoraineError, codes},
-        runtime::MoraineCatalogHandle,
-    };
-
-    /// A directory under the OS temp dir, unique per call, removed on
-    /// drop.
-    pub(crate) struct TempDir(PathBuf);
-
-    impl TempDir {
-        pub(crate) fn new(tag: &str) -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "moraine-duckdb-dumps-{tag}-{}-{n}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).expect("test setup: create temp dir");
-            Self(dir)
-        }
-
-        pub(crate) fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    pub(crate) use crate::test_support::{TempDir, attach_ok};
 
     /// Seeds a catalog whose second commit renames the table `orders`,
     /// so `ducklake_table` carries one history row (the old name, ended)
@@ -306,32 +352,6 @@ pub(crate) mod test_support {
 
             catalog.close().await.expect("test setup: close catalog");
         });
-    }
-
-    pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
-        let c_path =
-            CString::new(dir.to_str().expect("test path is UTF-8")).expect("test path has no NUL");
-        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
-        let mut err = MoraineError::default();
-        // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
-        let code = unsafe {
-            moraine_attach(
-                c_path.as_ptr(),
-                ptr::null(),
-                false,
-                false,
-                0,
-                ptr::null(),
-                ptr::null(),
-                &raw mut handle,
-                &raw mut err,
-            )
-        };
-        // SAFETY: `err.message` is null or was just written by the call above.
-        let err_message = unsafe { err.message.as_ref() };
-        assert_eq!(code, codes::OK, "attach failed: {err_message:?}");
-        assert!(!handle.is_null());
-        handle
     }
 }
 
@@ -657,130 +677,11 @@ mod tests {
         unsafe { free_c_string(err.message) };
     }
 
+    /// Every `_free` routes through [`free_rows`], whose null-items input
+    /// is a no-op — pinned here through one representative symbol.
     #[test]
     fn dump_frees_tolerate_null() {
-        // Every teardown function must be a safe no-op on null.
-        //
-        // SAFETY: every argument below is null, which each function's own
-        // contract documents as a no-op.
-        unsafe {
-            moraine_dump_schemas_free(ptr::null_mut(), 0);
-            moraine_dump_tables_free(ptr::null_mut(), 0);
-            moraine_dump_views_free(ptr::null_mut(), 0);
-            moraine_dump_columns_free(ptr::null_mut(), 0);
-            moraine_dump_data_files_free(ptr::null_mut(), 0);
-            moraine_dump_delete_files_free(ptr::null_mut(), 0);
-            moraine_dump_table_stats_free(ptr::null_mut(), 0);
-            moraine_dump_table_column_stats_free(ptr::null_mut(), 0);
-            moraine_dump_file_column_stats_free(ptr::null_mut(), 0);
-            moraine_dump_snapshots_free(ptr::null_mut(), 0);
-            moraine_dump_schema_versions_free(ptr::null_mut(), 0);
-            moraine_dump_partition_info_free(ptr::null_mut(), 0);
-            moraine_dump_partition_columns_free(ptr::null_mut(), 0);
-            moraine_dump_file_partition_values_free(ptr::null_mut(), 0);
-            moraine_dump_sort_info_free(ptr::null_mut(), 0);
-            moraine_dump_sort_expressions_free(ptr::null_mut(), 0);
-            moraine_dump_macros_free(ptr::null_mut(), 0);
-            moraine_dump_macro_impls_free(ptr::null_mut(), 0);
-            moraine_dump_macro_parameters_free(ptr::null_mut(), 0);
-            moraine_dump_column_mappings_free(ptr::null_mut(), 0);
-            moraine_dump_name_mappings_free(ptr::null_mut(), 0);
-            moraine_dump_tags_free(ptr::null_mut(), 0);
-            moraine_dump_column_tags_free(ptr::null_mut(), 0);
-            moraine_dump_scheduled_deletions_free(ptr::null_mut(), 0);
-        }
-    }
-
-    /// `cpp/moraine_abi.h` is a hand-written C mirror of this module's
-    /// `extern "C"` surface, kept in lockstep by hand — parallel to
-    /// `abi.rs`'s own `header_declares_every_abi_symbol` test.
-    #[test]
-    fn header_declares_every_dump_symbol() {
-        let header = include_str!("../cpp/moraine_abi.h");
-
-        let functions = [
-            "moraine_dump_snapshots",
-            "moraine_dump_snapshots_free",
-            "moraine_dump_schemas",
-            "moraine_dump_schemas_free",
-            "moraine_dump_tables",
-            "moraine_dump_tables_free",
-            "moraine_dump_columns",
-            "moraine_dump_columns_free",
-            "moraine_dump_views",
-            "moraine_dump_views_free",
-            "moraine_dump_macros",
-            "moraine_dump_macros_free",
-            "moraine_dump_macro_impls",
-            "moraine_dump_macro_impls_free",
-            "moraine_dump_macro_parameters",
-            "moraine_dump_macro_parameters_free",
-            "moraine_dump_column_mappings",
-            "moraine_dump_column_mappings_free",
-            "moraine_dump_name_mappings",
-            "moraine_dump_name_mappings_free",
-            "moraine_dump_data_files",
-            "moraine_dump_data_files_free",
-            "moraine_dump_delete_files",
-            "moraine_dump_delete_files_free",
-            "moraine_dump_table_stats",
-            "moraine_dump_table_stats_free",
-            "moraine_dump_table_column_stats",
-            "moraine_dump_table_column_stats_free",
-            "moraine_dump_file_column_stats",
-            "moraine_dump_file_column_stats_free",
-            "moraine_dump_schema_versions",
-            "moraine_dump_schema_versions_free",
-            "moraine_dump_partition_info",
-            "moraine_dump_partition_info_free",
-            "moraine_dump_partition_columns",
-            "moraine_dump_partition_columns_free",
-            "moraine_dump_file_partition_values",
-            "moraine_dump_file_partition_values_free",
-            "moraine_dump_sort_info",
-            "moraine_dump_sort_info_free",
-            "moraine_dump_sort_expressions",
-            "moraine_dump_sort_expressions_free",
-            "moraine_dump_tags",
-            "moraine_dump_tags_free",
-            "moraine_dump_column_tags",
-            "moraine_dump_column_tags_free",
-            "moraine_dump_scheduled_deletions",
-            "moraine_dump_scheduled_deletions_free",
-        ];
-        let structs = [
-            "MoraineSnapshotRow",
-            "MoraineSchemaRow",
-            "MoraineTableRow",
-            "MoraineColumnRow",
-            "MoraineViewRow",
-            "MoraineMacroRow",
-            "MoraineMacroImplRow",
-            "MoraineMacroParameterRow",
-            "MoraineColumnMappingRow",
-            "MoraineNameMappingRow",
-            "MoraineDataFileRow",
-            "MoraineDeleteFileRow",
-            "MoraineTableStatsRow",
-            "MoraineTableColumnStatsRow",
-            "MoraineFileColumnStatsRow",
-            "MoraineSchemaVersionRow",
-            "MorainePartitionInfoRow",
-            "MorainePartitionColumnRow",
-            "MoraineFilePartitionValueRow",
-            "MoraineSortInfoRow",
-            "MoraineSortExpressionRow",
-            "MoraineTagRow",
-            "MoraineColumnTagRow",
-            "MoraineScheduledDeletionRow",
-        ];
-
-        for name in functions.iter().chain(&structs) {
-            assert!(
-                header.contains(name),
-                "cpp/moraine_abi.h is missing `{name}`, declared in src/dumps.rs — \
-                 the two must be kept in lockstep by hand"
-            );
-        }
+        // SAFETY: a null pointer with any length is documented as a no-op.
+        unsafe { moraine_dump_schemas_free(ptr::null_mut(), 0) };
     }
 }

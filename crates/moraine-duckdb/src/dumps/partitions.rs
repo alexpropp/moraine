@@ -2,15 +2,12 @@
 //! `ducklake_partition_column`, `ducklake_sort_info`, and
 //! `ducklake_sort_expression`.
 
-use std::{
-    ffi::{c_char, c_void},
-    panic::{AssertUnwindSafe, catch_unwind},
-};
+use std::ffi::{c_char, c_void};
 
-use super::opt_u64;
+use super::{dump_rows, free_rows, opt_u64};
 use crate::{
-    abi::{free_array, free_c_string, guard, to_c_string, write_array},
-    error::{AbiError, MoraineError, codes},
+    abi::{free_c_string, to_c_string},
+    error::{AbiError, MoraineError},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -37,7 +34,7 @@ pub struct MorainePartitionInfoRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`](crate::dumps::moraine_dump_schemas).
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_partition_info(
     handle: *mut MoraineCatalogHandle,
@@ -47,70 +44,50 @@ pub unsafe extern "C" fn moraine_dump_partition_info(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MorainePartitionInfoRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let rows = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_partition_info(&handle_ref.catalog),
-            )
-        }?;
-
-        Ok(rows
-            .into_iter()
-            .map(|v| {
-                let (has_end, end) = opt_u64(v.end_snapshot);
-                MorainePartitionInfoRow {
-                    partition_id: v.partition_id,
-                    table_id: v.table_id,
-                    begin_snapshot: v.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                }
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_partition_info(catalog)),
+            |rows| {
+                Ok(rows
+                    .into_iter()
+                    .map(|v| {
+                        let (has_end, end) = opt_u64(v.end_snapshot);
+                        MorainePartitionInfoRow {
+                            partition_id: v.partition_id,
+                            table_id: v.table_id,
+                            begin_snapshot: v.begin_snapshot,
+                            has_end_snapshot: has_end,
+                            end_snapshot: end,
+                        }
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_partition_info`]. No owned
-/// strings inside — releases only the backing allocation.
+/// Frees the array returned by [`moraine_dump_partition_info`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_partition_info`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_partition_info`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_partition_info_free(
     items: *mut MorainePartitionInfoRow,
     len: usize,
 ) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |_| {});
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |_row| {});
+    }
 }
 
 /// One `ducklake_partition_column` row, as returned by
@@ -136,7 +113,7 @@ pub struct MorainePartitionColumnRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`](crate::dumps::moraine_dump_schemas).
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_partition_columns(
     handle: *mut MoraineCatalogHandle,
@@ -146,84 +123,59 @@ pub unsafe extern "C" fn moraine_dump_partition_columns(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MorainePartitionColumnRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let specs = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_partition_info(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = specs
-            .into_iter()
-            .flat_map(|spec| {
-                spec.columns
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_partition_column_rows(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
                     .into_iter()
-                    .map(move |column| (spec.partition_id, spec.table_id, column))
-            })
-            .map(|(partition_id, table_id, column)| {
-                let transform = to_c_string(&column.transform)?;
-                Ok((partition_id, table_id, column, transform))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
+                    .map(|row| {
+                        let transform = to_c_string(&row.transform)?;
+                        Ok((row, transform))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
 
-        Ok(owned
-            .into_iter()
-            .map(
-                |(partition_id, table_id, column, transform)| MorainePartitionColumnRow {
-                    partition_id,
-                    table_id,
-                    partition_key_index: column.partition_key_index,
-                    column_id: column.column_id,
-                    transform: transform.into_raw(),
-                },
-            )
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                Ok(owned
+                    .into_iter()
+                    .map(|(row, transform)| MorainePartitionColumnRow {
+                        partition_id: row.partition_id,
+                        table_id: row.table_id,
+                        partition_key_index: row.partition_key_index,
+                        column_id: row.column_id,
+                        transform: transform.into_raw(),
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_partition_columns`].
+/// Frees the array returned by [`moraine_dump_partition_columns`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_partition_columns`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_partition_columns`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_partition_columns_free(
     items: *mut MorainePartitionColumnRow,
     len: usize,
 ) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |c| {
-                free_c_string(c.transform);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |c| {
+            free_c_string(c.transform);
+        });
+    }
 }
 
 /// One `ducklake_sort_info` row, as returned by
@@ -249,7 +201,7 @@ pub struct MoraineSortInfoRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`](crate::dumps::moraine_dump_schemas).
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_sort_info(
     handle: *mut MoraineCatalogHandle,
@@ -259,67 +211,47 @@ pub unsafe extern "C" fn moraine_dump_sort_info(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineSortInfoRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let rows = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_sort_info(&handle_ref.catalog),
-            )
-        }?;
-
-        Ok(rows
-            .into_iter()
-            .map(|v| {
-                let (has_end, end) = opt_u64(v.end_snapshot);
-                MoraineSortInfoRow {
-                    sort_id: v.sort_id,
-                    table_id: v.table_id,
-                    begin_snapshot: v.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                }
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_sort_info(catalog)),
+            |rows| {
+                Ok(rows
+                    .into_iter()
+                    .map(|v| {
+                        let (has_end, end) = opt_u64(v.end_snapshot);
+                        MoraineSortInfoRow {
+                            sort_id: v.sort_id,
+                            table_id: v.table_id,
+                            begin_snapshot: v.begin_snapshot,
+                            has_end_snapshot: has_end,
+                            end_snapshot: end,
+                        }
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_sort_info`]. No owned
-/// strings inside — releases only the backing allocation.
+/// Frees the array returned by [`moraine_dump_sort_info`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_sort_info`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_info`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_sort_info_free(items: *mut MoraineSortInfoRow, len: usize) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |_| {});
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |_row| {});
+    }
 }
 
 /// One `ducklake_sort_expression` row, as returned by
@@ -349,7 +281,7 @@ pub struct MoraineSortExpressionRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`](crate::dumps::moraine_dump_schemas).
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_sort_expressions(
     handle: *mut MoraineCatalogHandle,
@@ -359,108 +291,67 @@ pub unsafe extern "C" fn moraine_dump_sort_expressions(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineSortExpressionRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let specs = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_sort_info(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = specs
-            .into_iter()
-            .flat_map(|spec| {
-                spec.expressions
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_sort_expression_rows(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
                     .into_iter()
-                    .map(move |expression| (spec.sort_id, spec.table_id, expression))
-            })
-            .map(|(sort_id, table_id, e)| {
-                let expression = to_c_string(&e.expression)?;
-                let dialect = to_c_string(&e.dialect)?;
-                let sort_direction = to_c_string(&e.sort_direction)?;
-                let null_order = to_c_string(&e.null_order)?;
-                Ok((
-                    sort_id,
-                    table_id,
-                    e.sort_key_index,
-                    expression,
-                    dialect,
-                    sort_direction,
-                    null_order,
-                ))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
+                    .map(|row| {
+                        let expression = to_c_string(&row.expression)?;
+                        let dialect = to_c_string(&row.dialect)?;
+                        let sort_direction = to_c_string(&row.sort_direction)?;
+                        let null_order = to_c_string(&row.null_order)?;
+                        Ok((row, expression, dialect, sort_direction, null_order))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
 
-        Ok(owned
-            .into_iter()
-            .map(
-                |(
-                    sort_id,
-                    table_id,
-                    sort_key_index,
-                    expression,
-                    dialect,
-                    sort_direction,
-                    null_order,
-                )| {
-                    MoraineSortExpressionRow {
-                        sort_id,
-                        table_id,
-                        sort_key_index,
-                        expression: expression.into_raw(),
-                        dialect: dialect.into_raw(),
-                        sort_direction: sort_direction.into_raw(),
-                        null_order: null_order.into_raw(),
-                    }
-                },
-            )
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                Ok(owned
+                    .into_iter()
+                    .map(|(row, expression, dialect, sort_direction, null_order)| {
+                        MoraineSortExpressionRow {
+                            sort_id: row.sort_id,
+                            table_id: row.table_id,
+                            sort_key_index: row.sort_key_index,
+                            expression: expression.into_raw(),
+                            dialect: dialect.into_raw(),
+                            sort_direction: sort_direction.into_raw(),
+                            null_order: null_order.into_raw(),
+                        }
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_sort_expressions`].
+/// Frees the array returned by [`moraine_dump_sort_expressions`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_sort_expressions`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_expressions`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_sort_expressions_free(
     items: *mut MoraineSortExpressionRow,
     len: usize,
 ) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |e| {
-                free_c_string(e.expression);
-                free_c_string(e.dialect);
-                free_c_string(e.sort_direction);
-                free_c_string(e.null_order);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |e| {
+            free_c_string(e.expression);
+            free_c_string(e.dialect);
+            free_c_string(e.sort_direction);
+            free_c_string(e.null_order);
+        });
+    }
 }

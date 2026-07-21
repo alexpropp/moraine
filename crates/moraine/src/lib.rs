@@ -59,8 +59,8 @@
 //! - `catalog` — the DuckLake domain model. Never touches SlateDB directly.
 //! - `store` — the SlateDB layer: key layout and value codecs. Knows nothing
 //!   about DuckLake semantics.
-//! - `tx` — the commit protocol turning a catalog transaction into an atomic
-//!   store write.
+//! - `transaction` — the commit protocol turning a catalog transaction into
+//!   an atomic store write.
 
 #![forbid(unsafe_code)]
 

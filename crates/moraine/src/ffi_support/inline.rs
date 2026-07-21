@@ -15,9 +15,11 @@ use crate::{
     store::{inline as store_inline, key::InlineOperation},
 };
 
-/// One inlined row selected by [`scan_inline`]: the materialized row plus
-/// an owned copy of its chunk's full Arrow IPC body, so each row is
-/// self-contained (one independently-freed element per row across the ABI).
+/// One inlined row selected by [`scan_inline`], referencing its chunk's
+/// body by index into the scan's deduplicated
+/// [`chunk_bodies`](InlineScanRecord::chunk_bodies) — a chunk's body
+/// crosses the ABI once however many rows it holds, and the reader
+/// decodes it once.
 #[doc(hidden)]
 pub struct InlineRowRecord {
     /// The row's dense id.
@@ -29,10 +31,20 @@ pub struct InlineRowRecord {
     pub begin_snapshot: u64,
     /// The commit snapshot that tombstoned this row, if any.
     pub end_snapshot: Option<u64>,
-    /// The owning chunk's full Arrow IPC record-batch body.
-    pub chunk_body: Vec<u8>,
+    /// The owning chunk: an index into the scan's `chunk_bodies`.
+    pub chunk_index: u64,
     /// The row's index within its chunk (`0..row_count`).
     pub offset_in_chunk: u64,
+}
+
+/// A selected scan: the rows plus the chunk bodies they reference.
+#[doc(hidden)]
+pub struct InlineScanRecord {
+    /// The selected rows, in the scan variant's order.
+    pub rows: Vec<InlineRowRecord>,
+    /// The referenced chunks' full Arrow IPC record-batch bodies, each
+    /// appearing once, indexed by [`InlineRowRecord::chunk_index`].
+    pub chunk_bodies: Vec<Vec<u8>>,
 }
 
 /// Materializes `table_id`'s inlined rows and selects `kind`'s variant at
@@ -50,7 +62,7 @@ pub async fn scan_inline(
     kind: InlineScanKind,
     snapshot: u64,
     start: u64,
-) -> Result<Vec<InlineRowRecord>> {
+) -> Result<InlineScanRecord> {
     let session = catalog.begin_read().await?;
     let chunks = store_inline::scan_inline_chunks(session.handle(), table_id).await;
     let inline_deletes = store_inline::scan_inline_inline_deletes(session.handle(), table_id).await;
@@ -59,7 +71,12 @@ pub async fn scan_inline(
     let inline_deletes = inline_deletes?;
 
     let rows: Vec<InlineRow> = materialize_inline_rows(&chunks, &inline_deletes);
-    kind.select(&rows, snapshot, start)
+
+    // Referenced chunk bodies dense-index in first-reference order.
+    let mut chunk_indexes: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    let mut chunk_bodies: Vec<Vec<u8>> = Vec::new();
+    let selected = kind
+        .select(&rows, snapshot, start)
         .into_iter()
         .map(|row| {
             let (operation, chunk) = &chunks[row.chunk];
@@ -71,17 +88,26 @@ pub async fn scan_inline(
                     row.row_id
                 )));
             };
+            let chunk_index = *chunk_indexes.entry(row.chunk).or_insert_with(|| {
+                chunk_bodies.push(chunk.body.clone());
+                chunk_bodies.len() as u64 - 1
+            });
 
             Ok(InlineRowRecord {
                 row_id: row.row_id,
                 schema_version: *schema_version,
                 begin_snapshot: row.begin_snapshot,
                 end_snapshot: row.end_snapshot,
-                chunk_body: chunk.body.clone(),
+                chunk_index,
                 offset_in_chunk: row.offset_in_chunk,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(InlineScanRecord {
+        rows: selected,
+        chunk_bodies,
+    })
 }
 
 /// Every `(schema_version, arrow_schema)` recorded for `table_id`, in
@@ -256,18 +282,27 @@ mod tests {
         });
         inline_delete.commit().await.unwrap();
 
-        let rows = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0)
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 2, 0)
             .await
             .unwrap();
-        let mut by_id: Vec<(u64, Vec<u8>, u64)> = rows
+        let mut by_id: Vec<(u64, Vec<u8>, u64)> = record
+            .rows
             .iter()
-            .map(|r| (r.row_id, r.chunk_body.clone(), r.offset_in_chunk))
+            .map(|r| {
+                (
+                    r.row_id,
+                    record.chunk_bodies[usize::try_from(r.chunk_index).unwrap()].clone(),
+                    r.offset_in_chunk,
+                )
+            })
             .collect();
         by_id.sort_by_key(|(id, ..)| *id);
         assert_eq!(
             by_id,
             vec![(0, b"chunk-a".to_vec(), 0), (2, b"chunk-b".to_vec(), 0)]
         );
+        // Each referenced chunk's body crosses once.
+        assert_eq!(record.chunk_bodies.len(), 2);
 
         let schemas = inline_schemas(&catalog, 1).await.unwrap();
         assert_eq!(schemas, vec![(0, b"schema".to_vec())]);

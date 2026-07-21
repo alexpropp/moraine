@@ -208,9 +208,11 @@ pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<
     .await
 }
 
-/// Every ended entity-version record. Unversioned kinds are overwritten
-/// in place and never mirrored to history; finding one there is store
-/// damage, refused rather than replayed over the live record.
+/// Every ended entity-version record. Unversioned kinds
+/// ([`EntityKey::is_versioned`]) are overwritten in place and never
+/// mirrored to history; finding one there is store damage, refused here —
+/// before any consumer, snapshot build or raw dump, could replay it over
+/// the live record.
 pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     scan_decode(
         handle,

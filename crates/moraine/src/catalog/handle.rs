@@ -12,12 +12,7 @@ use crate::{
         RowHolder, RowLocation, SnapshotId, TableId, projection::ProjectionCache, scoped_read,
     },
     error::{Error, Result},
-    store::{
-        handle::{ReadHandle, ReadSession},
-        index_encoding::IndexKeyValue,
-        key::{IdxKind, idx_index_prefix},
-        open::StoreBuilder,
-    },
+    store::{handle::ReadSession, index_encoding::IndexKeyValue, open::StoreBuilder},
     transaction::{Transaction, commit, index_maintenance},
 };
 
@@ -372,19 +367,7 @@ impl Catalog {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // A relative data-file path is relative to the table's data directory
-        // (`<schema path><table path>`), itself relative to DATA_PATH.
-        let table_value = snapshot
-            .tables
-            .get(&table.get())
-            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
-        let schema_value = snapshot
-            .schemas
-            .get(&table_value.schema_id)
-            .ok_or_else(|| {
-                Error::Corruption(format!("table {table} references a missing schema"))
-            })?;
-        let table_prefix = format!("{}{}", schema_value.path, table_value.path);
+        let table_prefix = snapshot.table_data_prefix(table)?;
 
         let mut entries = Vec::new();
         for file in snapshot.data_files_of(table) {
@@ -440,27 +423,7 @@ impl Catalog {
         }
 
         let tx = self.begin_write_tx().await?;
-        let mut deleted = 0;
-        // An index is exclusively one kind, so only one prefix holds entries;
-        // scanning both is harmless.
-        for kind in [IdxKind::Unique, IdxKind::Multi] {
-            if deleted >= limit {
-                break;
-            }
-            let mut iter = ReadHandle::Tx(&tx)
-                .scan_prefix(idx_index_prefix(kind, index.get()), ..)
-                .await
-                .map_err(Error::from)?;
-            while deleted < limit {
-                match iter.next().await.map_err(Error::from)? {
-                    Some(entry) => {
-                        tx.delete(entry.key).map_err(Error::from)?;
-                        deleted += 1;
-                    }
-                    None => break,
-                }
-            }
-        }
+        let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
         tx.commit_with_options(&commit::durable())
             .await
             .map_err(Error::from)?;

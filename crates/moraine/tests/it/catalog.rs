@@ -367,3 +367,38 @@ async fn read_only_refuses_an_uninitialized_store() {
         .unwrap_err();
     assert!(matches!(err, Error::Store(_)), "got {err:?}");
 }
+
+#[tokio::test]
+async fn set_table_schema_moves_a_table_between_schemas() {
+    let catalog = open_memory().await;
+    let ids = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let source = tx.create_schema("source")?;
+            let target = tx.create_schema("target")?;
+            let table = tx.create_table(source, "orders", &[col("id")])?;
+            ids.set(Some((source, target, table)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (source, target, table) = ids.get().unwrap();
+    let created = catalog.snapshot().await.unwrap().current_snapshot().id;
+
+    catalog
+        .commit(move |tx| tx.set_table_schema(table, target))
+        .await
+        .unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    assert!(head.tables_in(source).is_empty());
+    assert_eq!(head.tables_in(target)[0].id, table);
+    assert_eq!(head.table_by_name(target, "orders").unwrap().id, table);
+    assert!(head.table_by_name(source, "orders").is_none());
+
+    // The move is versioned: time travel sees the table in its old schema.
+    let past = catalog.snapshot_at(created).await.unwrap();
+    assert_eq!(past.tables_in(source)[0].id, table);
+    assert!(past.tables_in(target).is_empty());
+    catalog.close().await.unwrap();
+}

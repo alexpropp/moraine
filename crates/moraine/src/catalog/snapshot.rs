@@ -11,6 +11,7 @@ use crate::{
         SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry,
         ViewId, ViewInfo,
     },
+    error::{Error, Result},
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
@@ -27,6 +28,10 @@ use crate::{
 /// Reads issue no store I/O after the view is built — a `CatalogSnapshot`
 /// is a value, not a cursor. The default value is an empty view at
 /// snapshot 0.
+///
+/// Partition and sort specs carry no read accessors by design: hosts read
+/// them through the ffi dumps, and the transaction layer diffs and
+/// mutates the whole per-table maps directly.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
     pub(crate) snapshot: SnapshotValue,
@@ -341,6 +346,20 @@ impl CatalogSnapshot {
         scoped_name(&self.index_names, table.get(), name)
             .and_then(|id| self.indexes.get(&table.get()).and_then(|m| m.get(&id)))
             .map(index_info)
+    }
+
+    /// The table's data directory (`<schema path><table path>`), itself
+    /// relative to `DATA_PATH` — the prefix a relative data-file path
+    /// resolves under.
+    pub(crate) fn table_data_prefix(&self, table: TableId) -> Result<String> {
+        let table_value = self
+            .tables
+            .get(&table.get())
+            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
+        let schema_value = self.schemas.get(&table_value.schema_id).ok_or_else(|| {
+            Error::Corruption(format!("table {table} references a missing schema"))
+        })?;
+        Ok(format!("{}{}", schema_value.path, table_value.path))
     }
 
     /// One equality index by id within a table.

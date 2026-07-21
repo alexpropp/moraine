@@ -69,7 +69,7 @@ transaction.rs      # commit protocol: catalog transaction → one atomic SlateD
 ```
 
 The load-bearing rule: **`catalog` never touches SlateDB directly; `store`
-knows nothing about DuckLake semantics; `tx` bridges them.** This keeps
+knows nothing about DuckLake semantics; `transaction` bridges them.** This keeps
 catalog logic testable against an in-memory store and concentrates every
 key-encoding decision in one reviewable place.
 

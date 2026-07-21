@@ -1,15 +1,12 @@
 //! Dumps for the catalog entity tables: `ducklake_schema`,
 //! `ducklake_table`, `ducklake_view`, and `ducklake_column`.
 
-use std::{
-    ffi::{c_char, c_void},
-    panic::{AssertUnwindSafe, catch_unwind},
-};
+use std::ffi::{c_char, c_void};
 
-use super::{opt_c_string, opt_into_raw, opt_u64};
+use super::{dump_rows, free_rows, opt_c_string, opt_into_raw, opt_u64};
 use crate::{
-    abi::{free_array, free_c_string, guard, to_c_string, write_array},
-    error::{AbiError, MoraineError, codes},
+    abi::{free_c_string, to_c_string},
+    error::{AbiError, MoraineError},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -37,20 +34,9 @@ pub struct MoraineSchemaRow {
 /// Dumps every `ducklake_schema` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
-/// Cancellable, like every dump in this module: races the core read
-/// against [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal
-/// and against `probe` (polled immediately, then ~100 ms; a null `probe`
-/// disables polling). If a cancellation wins, returns
-/// [`codes::INTERRUPTED`] and the out-params are left unwritten.
-///
 /// # Safety
 ///
-/// `handle` must be a pointer previously returned by
-/// [`moraine_attach`](crate::abi::moraine_attach) and not yet detached.
-/// `out_items`/`out_len` must be valid, writable pointers. `probe`, if
-/// non-null, must be safe to call with `probe_ctx` from any thread.
-/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All
-/// for the duration of this call.
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_schemas(
     handle: *mut MoraineCatalogHandle,
@@ -60,84 +46,66 @@ pub unsafe extern "C" fn moraine_dump_schemas(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineSchemaRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let rows = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_schemas(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first: every string in the whole batch converts before any
-        // raw pointer is minted, so a partial failure leaks nothing.
-        let owned = rows
-            .into_iter()
-            .map(|v| {
-                let schema_uuid = to_c_string(&v.schema_uuid)?;
-                let schema_name = to_c_string(&v.schema_name)?;
-                let path = to_c_string(&v.path)?;
-                Ok((v, schema_uuid, schema_name, path))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_schemas(catalog)),
+            |rows| {
+                // Owned-first: every string in the whole batch converts before any
+                // raw pointer is minted, so a partial failure leaks nothing.
+                let owned = rows
+                    .into_iter()
+                    .map(|v| {
+                        let schema_uuid = to_c_string(&v.schema_uuid)?;
+                        let schema_name = to_c_string(&v.schema_name)?;
+                        let path = to_c_string(&v.path)?;
+                        Ok((v, schema_uuid, schema_name, path))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
 
-        Ok(owned
-            .into_iter()
-            .map(|(v, schema_uuid, schema_name, path)| {
-                let (has_end, end) = opt_u64(v.end_snapshot);
-                MoraineSchemaRow {
-                    schema_id: v.schema_id,
-                    schema_uuid: schema_uuid.into_raw(),
-                    begin_snapshot: v.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                    schema_name: schema_name.into_raw(),
-                    path: path.into_raw(),
-                    path_is_relative: v.path_is_relative,
-                }
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                Ok(owned
+                    .into_iter()
+                    .map(|(v, schema_uuid, schema_name, path)| {
+                        let (has_end, end) = opt_u64(v.end_snapshot);
+                        MoraineSchemaRow {
+                            schema_id: v.schema_id,
+                            schema_uuid: schema_uuid.into_raw(),
+                            begin_snapshot: v.begin_snapshot,
+                            has_end_snapshot: has_end,
+                            end_snapshot: end,
+                            schema_name: schema_name.into_raw(),
+                            path: path.into_raw(),
+                            path_is_relative: v.path_is_relative,
+                        }
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_schemas`].
+/// Frees the array returned by [`moraine_dump_schemas`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_schemas`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_schemas`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_schemas_free(items: *mut MoraineSchemaRow, len: usize) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| {
-                free_c_string(d.schema_uuid);
-                free_c_string(d.schema_name);
-                free_c_string(d.path);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.schema_uuid);
+            free_c_string(d.schema_name);
+            free_c_string(d.path);
+        });
+    }
 }
 
 /// One `ducklake_table` row, as returned by [`moraine_dump_tables`].
@@ -170,7 +138,7 @@ pub struct MoraineTableRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`].
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_tables(
     handle: *mut MoraineCatalogHandle,
@@ -180,84 +148,66 @@ pub unsafe extern "C" fn moraine_dump_tables(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineTableRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let rows = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_tables(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = rows
-            .into_iter()
-            .map(|v| {
-                let table_uuid = to_c_string(&v.table_uuid)?;
-                let table_name = to_c_string(&v.table_name)?;
-                let path = to_c_string(&v.path)?;
-                Ok((v, table_uuid, table_name, path))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|(v, table_uuid, table_name, path)| {
-                let (has_end, end) = opt_u64(v.end_snapshot);
-                MoraineTableRow {
-                    table_id: v.table_id,
-                    table_uuid: table_uuid.into_raw(),
-                    begin_snapshot: v.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                    schema_id: v.schema_id,
-                    table_name: table_name.into_raw(),
-                    path: path.into_raw(),
-                    path_is_relative: v.path_is_relative,
-                }
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_tables(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
+                    .into_iter()
+                    .map(|v| {
+                        let table_uuid = to_c_string(&v.table_uuid)?;
+                        let table_name = to_c_string(&v.table_name)?;
+                        let path = to_c_string(&v.path)?;
+                        Ok((v, table_uuid, table_name, path))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
+                Ok(owned
+                    .into_iter()
+                    .map(|(v, table_uuid, table_name, path)| {
+                        let (has_end, end) = opt_u64(v.end_snapshot);
+                        MoraineTableRow {
+                            table_id: v.table_id,
+                            table_uuid: table_uuid.into_raw(),
+                            begin_snapshot: v.begin_snapshot,
+                            has_end_snapshot: has_end,
+                            end_snapshot: end,
+                            schema_id: v.schema_id,
+                            table_name: table_name.into_raw(),
+                            path: path.into_raw(),
+                            path_is_relative: v.path_is_relative,
+                        }
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_tables`].
+/// Frees the array returned by [`moraine_dump_tables`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_tables`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_tables`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_tables_free(items: *mut MoraineTableRow, len: usize) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| {
-                free_c_string(d.table_uuid);
-                free_c_string(d.table_name);
-                free_c_string(d.path);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.table_uuid);
+            free_c_string(d.table_name);
+            free_c_string(d.path);
+        });
+    }
 }
 
 /// One `ducklake_view` row, as returned by [`moraine_dump_views`].
@@ -290,7 +240,7 @@ pub struct MoraineViewRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`].
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_views(
     handle: *mut MoraineCatalogHandle,
@@ -300,90 +250,72 @@ pub unsafe extern "C" fn moraine_dump_views(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineViewRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let rows = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_views(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = rows
-            .into_iter()
-            .map(|v| {
-                let view_uuid = to_c_string(&v.view_uuid)?;
-                let view_name = to_c_string(&v.view_name)?;
-                let dialect = to_c_string(&v.dialect)?;
-                let sql = to_c_string(&v.sql)?;
-                let column_aliases = opt_c_string(v.column_aliases.as_deref())?;
-                Ok((v, view_uuid, view_name, dialect, sql, column_aliases))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_views(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
+                    .into_iter()
+                    .map(|v| {
+                        let view_uuid = to_c_string(&v.view_uuid)?;
+                        let view_name = to_c_string(&v.view_name)?;
+                        let dialect = to_c_string(&v.dialect)?;
+                        let sql = to_c_string(&v.sql)?;
+                        let column_aliases = opt_c_string(v.column_aliases.as_deref())?;
+                        Ok((v, view_uuid, view_name, dialect, sql, column_aliases))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
 
-        Ok(owned
-            .into_iter()
-            .map(|(v, view_uuid, view_name, dialect, sql, column_aliases)| {
-                let (has_end, end) = opt_u64(v.end_snapshot);
-                MoraineViewRow {
-                    view_id: v.view_id,
-                    view_uuid: view_uuid.into_raw(),
-                    begin_snapshot: v.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                    schema_id: v.schema_id,
-                    view_name: view_name.into_raw(),
-                    dialect: dialect.into_raw(),
-                    sql: sql.into_raw(),
-                    column_aliases: opt_into_raw(column_aliases),
-                }
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                Ok(owned
+                    .into_iter()
+                    .map(|(v, view_uuid, view_name, dialect, sql, column_aliases)| {
+                        let (has_end, end) = opt_u64(v.end_snapshot);
+                        MoraineViewRow {
+                            view_id: v.view_id,
+                            view_uuid: view_uuid.into_raw(),
+                            begin_snapshot: v.begin_snapshot,
+                            has_end_snapshot: has_end,
+                            end_snapshot: end,
+                            schema_id: v.schema_id,
+                            view_name: view_name.into_raw(),
+                            dialect: dialect.into_raw(),
+                            sql: sql.into_raw(),
+                            column_aliases: opt_into_raw(column_aliases),
+                        }
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_views`].
+/// Frees the array returned by [`moraine_dump_views`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_views`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_views`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_views_free(items: *mut MoraineViewRow, len: usize) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| {
-                free_c_string(d.view_uuid);
-                free_c_string(d.view_name);
-                free_c_string(d.dialect);
-                free_c_string(d.sql);
-                free_c_string(d.column_aliases);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.view_uuid);
+            free_c_string(d.view_name);
+            free_c_string(d.dialect);
+            free_c_string(d.sql);
+            free_c_string(d.column_aliases);
+        });
+    }
 }
 
 /// One `ducklake_column` row, as returned by [`moraine_dump_columns`].
@@ -428,7 +360,7 @@ pub struct MoraineColumnRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`].
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_columns(
     handle: *mut MoraineCatalogHandle,
@@ -438,116 +370,99 @@ pub unsafe extern "C" fn moraine_dump_columns(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineColumnRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let rows = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_columns(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = rows
-            .into_iter()
-            .map(|v| {
-                let column_name = to_c_string(&v.column_name)?;
-                let column_type = to_c_string(&v.column_type)?;
-                let initial_default = opt_c_string(v.initial_default.as_deref())?;
-                let default_value = opt_c_string(v.default_value.as_deref())?;
-                let default_value_type = opt_c_string(v.default_value_type.as_deref())?;
-                let default_value_dialect = opt_c_string(v.default_value_dialect.as_deref())?;
-                Ok((
-                    v,
-                    column_name,
-                    column_type,
-                    initial_default,
-                    default_value,
-                    default_value_type,
-                    default_value_dialect,
-                ))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(
-                |(
-                    v,
-                    column_name,
-                    column_type,
-                    initial_default,
-                    default_value,
-                    default_value_type,
-                    default_value_dialect,
-                )| {
-                    let (has_end, end) = opt_u64(v.end_snapshot);
-                    let (has_parent, parent) = opt_u64(v.parent_column);
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_columns(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
+                    .into_iter()
+                    .map(|v| {
+                        let column_name = to_c_string(&v.column_name)?;
+                        let column_type = to_c_string(&v.column_type)?;
+                        let initial_default = opt_c_string(v.initial_default.as_deref())?;
+                        let default_value = opt_c_string(v.default_value.as_deref())?;
+                        let default_value_type = opt_c_string(v.default_value_type.as_deref())?;
+                        let default_value_dialect =
+                            opt_c_string(v.default_value_dialect.as_deref())?;
+                        Ok((
+                            v,
+                            column_name,
+                            column_type,
+                            initial_default,
+                            default_value,
+                            default_value_type,
+                            default_value_dialect,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
+                Ok(owned
+                    .into_iter()
+                    .map(
+                        |(
+                            v,
+                            column_name,
+                            column_type,
+                            initial_default,
+                            default_value,
+                            default_value_type,
+                            default_value_dialect,
+                        )| {
+                            let (has_end, end) = opt_u64(v.end_snapshot);
+                            let (has_parent, parent) = opt_u64(v.parent_column);
 
-                    MoraineColumnRow {
-                        column_id: v.column_id,
-                        begin_snapshot: v.begin_snapshot,
-                        has_end_snapshot: has_end,
-                        end_snapshot: end,
-                        table_id: v.table_id,
-                        column_order: v.column_order,
-                        column_name: column_name.into_raw(),
-                        column_type: column_type.into_raw(),
-                        initial_default: opt_into_raw(initial_default),
-                        default_value: opt_into_raw(default_value),
-                        nulls_allowed: v.nulls_allowed,
-                        has_parent_column: has_parent,
-                        parent_column: parent,
-                        default_value_type: opt_into_raw(default_value_type),
-                        default_value_dialect: opt_into_raw(default_value_dialect),
-                    }
-                },
-            )
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                            MoraineColumnRow {
+                                column_id: v.column_id,
+                                begin_snapshot: v.begin_snapshot,
+                                has_end_snapshot: has_end,
+                                end_snapshot: end,
+                                table_id: v.table_id,
+                                column_order: v.column_order,
+                                column_name: column_name.into_raw(),
+                                column_type: column_type.into_raw(),
+                                initial_default: opt_into_raw(initial_default),
+                                default_value: opt_into_raw(default_value),
+                                nulls_allowed: v.nulls_allowed,
+                                has_parent_column: has_parent,
+                                parent_column: parent,
+                                default_value_type: opt_into_raw(default_value_type),
+                                default_value_dialect: opt_into_raw(default_value_dialect),
+                            }
+                        },
+                    )
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_columns`].
+/// Frees the array returned by [`moraine_dump_columns`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_columns`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_columns`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_columns_free(items: *mut MoraineColumnRow, len: usize) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| {
-                free_c_string(d.column_name);
-                free_c_string(d.column_type);
-                free_c_string(d.initial_default);
-                free_c_string(d.default_value);
-                free_c_string(d.default_value_type);
-                free_c_string(d.default_value_dialect);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.column_name);
+            free_c_string(d.column_type);
+            free_c_string(d.initial_default);
+            free_c_string(d.default_value);
+            free_c_string(d.default_value_type);
+            free_c_string(d.default_value_dialect);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -560,6 +475,7 @@ mod tests {
     use crate::{
         abi::{moraine_detach, moraine_error_free},
         dumps::test_support::{TempDir, attach_ok, seed},
+        error::codes,
     };
 
     #[test]

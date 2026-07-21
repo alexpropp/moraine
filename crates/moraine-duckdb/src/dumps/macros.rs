@@ -1,15 +1,12 @@
 //! Dumps for the macro tables: `ducklake_macro`, `ducklake_macro_impl`,
 //! and `ducklake_macro_parameters`.
 
-use std::{
-    ffi::{c_char, c_void},
-    panic::{AssertUnwindSafe, catch_unwind},
-};
+use std::ffi::{c_char, c_void};
 
-use super::{opt_c_string, opt_into_raw, opt_u64};
+use super::{dump_rows, free_rows, opt_c_string, opt_into_raw, opt_u64};
 use crate::{
-    abi::{free_array, free_c_string, guard, to_c_string, write_array},
-    error::{AbiError, MoraineError, codes},
+    abi::{free_c_string, to_c_string},
+    error::{AbiError, MoraineError},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
 
@@ -35,7 +32,7 @@ pub struct MoraineMacroRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`](crate::dumps::moraine_dump_schemas).
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macros(
     handle: *mut MoraineCatalogHandle,
@@ -45,78 +42,60 @@ pub unsafe extern "C" fn moraine_dump_macros(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineMacroRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let rows = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_macros(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = rows
-            .into_iter()
-            .map(|m| {
-                let macro_name = to_c_string(&m.macro_name)?;
-                Ok((m, macro_name))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_macros(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
+                    .into_iter()
+                    .map(|m| {
+                        let macro_name = to_c_string(&m.macro_name)?;
+                        Ok((m, macro_name))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
 
-        Ok(owned
-            .into_iter()
-            .map(|(m, macro_name)| {
-                let (has_end, end) = opt_u64(m.end_snapshot);
-                MoraineMacroRow {
-                    schema_id: m.schema_id,
-                    macro_id: m.macro_id,
-                    macro_name: macro_name.into_raw(),
-                    begin_snapshot: m.begin_snapshot,
-                    has_end_snapshot: has_end,
-                    end_snapshot: end,
-                }
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                Ok(owned
+                    .into_iter()
+                    .map(|(m, macro_name)| {
+                        let (has_end, end) = opt_u64(m.end_snapshot);
+                        MoraineMacroRow {
+                            schema_id: m.schema_id,
+                            macro_id: m.macro_id,
+                            macro_name: macro_name.into_raw(),
+                            begin_snapshot: m.begin_snapshot,
+                            has_end_snapshot: has_end,
+                            end_snapshot: end,
+                        }
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_macros`].
+/// Frees the array returned by [`moraine_dump_macros`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_macros`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_macros`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macros_free(items: *mut MoraineMacroRow, len: usize) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| {
-                free_c_string(d.macro_name);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.macro_name);
+        });
+    }
 }
 
 /// One `ducklake_macro_impl` row, as returned by
@@ -142,7 +121,7 @@ pub struct MoraineMacroImplRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`](crate::dumps::moraine_dump_schemas).
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macro_impls(
     handle: *mut MoraineCatalogHandle,
@@ -152,84 +131,63 @@ pub unsafe extern "C" fn moraine_dump_macro_impls(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineMacroImplRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let macros = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_macros(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = macros
-            .iter()
-            .flat_map(|m| m.implementations.iter().map(move |i| (m.macro_id, i)))
-            .map(|(macro_id, i)| {
-                let dialect = to_c_string(&i.dialect)?;
-                let sql = to_c_string(&i.sql)?;
-                let macro_type = to_c_string(&i.macro_type)?;
-                Ok((macro_id, i.impl_id, dialect, sql, macro_type))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_macro_impl_rows(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
+                    .into_iter()
+                    .map(|row| {
+                        let dialect = to_c_string(&row.dialect)?;
+                        let sql = to_c_string(&row.sql)?;
+                        let macro_type = to_c_string(&row.macro_type)?;
+                        Ok((row, dialect, sql, macro_type))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
 
-        Ok(owned
-            .into_iter()
-            .map(
-                |(macro_id, impl_id, dialect, sql, macro_type)| MoraineMacroImplRow {
-                    macro_id,
-                    impl_id,
-                    dialect: dialect.into_raw(),
-                    sql: sql.into_raw(),
-                    macro_type: macro_type.into_raw(),
-                },
-            )
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                Ok(owned
+                    .into_iter()
+                    .map(|(row, dialect, sql, macro_type)| MoraineMacroImplRow {
+                        macro_id: row.macro_id,
+                        impl_id: row.impl_id,
+                        dialect: dialect.into_raw(),
+                        sql: sql.into_raw(),
+                        macro_type: macro_type.into_raw(),
+                    })
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_macro_impls`].
+/// Frees the array returned by [`moraine_dump_macro_impls`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_macro_impls`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_macro_impls`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macro_impls_free(
     items: *mut MoraineMacroImplRow,
     len: usize,
 ) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| {
-                free_c_string(d.dialect);
-                free_c_string(d.sql);
-                free_c_string(d.macro_type);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.dialect);
+            free_c_string(d.sql);
+            free_c_string(d.macro_type);
+        });
+    }
 }
 
 /// One `ducklake_macro_parameters` row, as returned by
@@ -259,7 +217,7 @@ pub struct MoraineMacroParameterRow {
 ///
 /// # Safety
 ///
-/// Same pointer contract as [`moraine_dump_schemas`](crate::dumps::moraine_dump_schemas).
+/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macro_parameters(
     handle: *mut MoraineCatalogHandle,
@@ -269,106 +227,81 @@ pub unsafe extern "C" fn moraine_dump_macro_parameters(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineMacroParameterRow>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
-        // SAFETY: `probe`/`probe_ctx` validity is this function's own
-        // safety contract.
-        let macros = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                moraine::ffi_support::dump_macros(&handle_ref.catalog),
-            )
-        }?;
-        // Owned-first (see `moraine_dump_schemas`): every string in the
-        // whole batch converts before any raw pointer is minted.
-        let owned = macros
-            .iter()
-            .flat_map(|m| {
-                m.implementations
-                    .iter()
-                    .flat_map(move |i| i.parameters.iter().map(move |p| (m.macro_id, i.impl_id, p)))
-            })
-            .map(|(macro_id, impl_id, p)| {
-                let parameter_name = to_c_string(&p.parameter_name)?;
-                let parameter_type = to_c_string(&p.parameter_type)?;
-                let default_value = opt_c_string(p.default_value.as_deref())?;
-                let default_value_type = to_c_string(&p.default_value_type)?;
-                Ok((
-                    macro_id,
-                    impl_id,
-                    p.column_id,
-                    parameter_name,
-                    parameter_type,
-                    default_value,
-                    default_value_type,
-                ))
-            })
-            .collect::<Result<Vec<_>, AbiError>>()?;
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        dump_rows(
+            handle,
+            out_items,
+            out_len,
+            probe,
+            probe_ctx,
+            err,
+            |catalog| Box::pin(moraine::ffi_support::dump_macro_parameter_rows(catalog)),
+            |rows| {
+                // Owned-first (see `moraine_dump_schemas`): every string in the
+                // whole batch converts before any raw pointer is minted.
+                let owned = rows
+                    .into_iter()
+                    .map(|row| {
+                        let parameter_name = to_c_string(&row.parameter_name)?;
+                        let parameter_type = to_c_string(&row.parameter_type)?;
+                        let default_value = opt_c_string(row.default_value.as_deref())?;
+                        let default_value_type = to_c_string(&row.default_value_type)?;
+                        Ok((
+                            row,
+                            parameter_name,
+                            parameter_type,
+                            default_value,
+                            default_value_type,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, AbiError>>()?;
 
-        Ok(owned
-            .into_iter()
-            .map(
-                |(
-                    macro_id,
-                    impl_id,
-                    column_id,
-                    parameter_name,
-                    parameter_type,
-                    default_value,
-                    default_value_type,
-                )| MoraineMacroParameterRow {
-                    macro_id,
-                    impl_id,
-                    column_id,
-                    parameter_name: parameter_name.into_raw(),
-                    parameter_type: parameter_type.into_raw(),
-                    default_value: opt_into_raw(default_value),
-                    default_value_type: default_value_type.into_raw(),
-                },
-            )
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+                Ok(owned
+                    .into_iter()
+                    .map(
+                        |(
+                            row,
+                            parameter_name,
+                            parameter_type,
+                            default_value,
+                            default_value_type,
+                        )| {
+                            MoraineMacroParameterRow {
+                                macro_id: row.macro_id,
+                                impl_id: row.impl_id,
+                                column_id: row.column_id,
+                                parameter_name: parameter_name.into_raw(),
+                                parameter_type: parameter_type.into_raw(),
+                                default_value: opt_into_raw(default_value),
+                                default_value_type: default_value_type.into_raw(),
+                            }
+                        },
+                    )
+                    .collect())
+            },
+        )
     }
 }
 
-/// Frees an array returned by [`moraine_dump_macro_parameters`].
+/// Frees the array returned by [`moraine_dump_macro_parameters`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_dump_macro_parameters`] call, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_macro_parameters`] call
+/// wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macro_parameters_free(
     items: *mut MoraineMacroParameterRow,
     len: usize,
 ) {
-    let attempt = || {
-        // SAFETY: caller contract above.
-        unsafe {
-            free_array(items, len, |d| {
-                free_c_string(d.parameter_name);
-                free_c_string(d.parameter_type);
-                free_c_string(d.default_value);
-                free_c_string(d.default_value_type);
-            });
-        }
-    };
-    let _ = catch_unwind(AssertUnwindSafe(attempt));
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        free_rows(items, len, |d| {
+            free_c_string(d.parameter_name);
+            free_c_string(d.parameter_type);
+            free_c_string(d.default_value);
+            free_c_string(d.default_value_type);
+        });
+    }
 }
