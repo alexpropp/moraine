@@ -83,8 +83,9 @@ pub(super) async fn per_index_scoped_entries(
         Arc::clone(data_store),
         path,
         &all_positions,
-        None,
-        row_id_start,
+        scoped_read::RowIdSource::Resolve {
+            row_id_start: Some(row_id_start),
+        },
         Some(file.file_size_bytes),
     )
     .await?;

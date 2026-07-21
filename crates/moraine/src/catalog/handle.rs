@@ -298,14 +298,16 @@ impl Catalog {
     /// them in the index's column order. The returned entries feed
     /// [`Transaction::register_data_file`] so registration stays covered.
     ///
-    /// v1 covers new dense-range files (`row_id_start + ordinal`); reading a
-    /// rewrite file's embedded row-id column is a follow-up.
+    /// The file must not carry an embedded row-id column — its rows already
+    /// have ids, and re-registering them under a fresh dense range would
+    /// fork their identity — so such a file is refused.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Corruption`] if the file cannot be read or a column
     /// type does not match its Parquet type, or [`Error::Constraint`] for a
-    /// non-indexable column type.
+    /// non-indexable column type or a file carrying an embedded row-id
+    /// column.
     pub async fn scoped_file_index_entries(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -313,15 +315,20 @@ impl Catalog {
         index: IndexId,
         indexed_positions: &[usize],
     ) -> Result<Vec<FileIndexEntry>> {
-        let entries =
-            scoped_read::scoped_read_entries(object_store, path, indexed_positions, None, 0, None)
-                .await?;
+        let entries = scoped_read::scoped_read_entries(
+            object_store,
+            path,
+            indexed_positions,
+            scoped_read::RowIdSource::Ordinal,
+            None,
+        )
+        .await?;
         Ok(entries
             .into_iter()
             .map(|entry| FileIndexEntry {
                 index,
-                // No row-id column and `row_id_start = 0`, so the derived
-                // row id is the ordinal the registration re-maps.
+                // Ordinal-sourced ids are positions the registration
+                // re-maps onto its freshly allocated dense range.
                 ordinal: entry.row_id,
                 values: entry.values,
             })
@@ -387,8 +394,9 @@ impl Catalog {
                 Arc::clone(&object_store),
                 &path,
                 &positions,
-                None,
-                row_id_start,
+                scoped_read::RowIdSource::Resolve {
+                    row_id_start: Some(row_id_start),
+                },
                 Some(file.file_size_bytes),
             )
             .await?;
