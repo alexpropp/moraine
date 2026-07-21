@@ -4,6 +4,8 @@
 //! bounded, merge-free projection, not the scan path the no-Parquet-read
 //! rule guards.
 
+use std::sync::Arc;
+
 use arrow::{
     array::{
         Array, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryArray,
@@ -20,8 +22,20 @@ use arrow::{
     },
 };
 use bytes::Bytes;
+use futures::{
+    StreamExt,
+    future::{BoxFuture, FutureExt},
+};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
-use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+use parquet::{
+    arrow::{
+        ProjectionMask,
+        arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+        async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder},
+    },
+    errors::{ParquetError, Result as ParquetResult},
+    file::metadata::{ParquetMetaData, ParquetMetaDataReader},
+};
 
 use crate::{
     error::{Error, Result},
@@ -153,13 +167,143 @@ fn row_id_value(array: &dyn Array, row: usize) -> Result<u64> {
     }
 }
 
+/// An [`AsyncFileReader`] over moraine's own object store: the Parquet
+/// footer and the projected column chunks arrive as byte-range reads, so a
+/// scoped read never downloads the whole data file. Deliberately not
+/// `parquet`'s built-in `object_store` integration, which pins a different
+/// `object_store` major than the workspace.
+struct ObjectStoreReader {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    /// The object's total length, required to locate the footer.
+    file_size: u64,
+}
+
+impl AsyncFileReader for ObjectStoreReader {
+    fn get_bytes(&mut self, range: std::ops::Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let store = Arc::clone(&self.store);
+        let path = self.path.clone();
+        async move {
+            store
+                .get_range(&path, range)
+                .await
+                .map_err(|err| ParquetError::External(Box::new(err)))
+        }
+        .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        let store = Arc::clone(&self.store);
+        let path = self.path.clone();
+        // One `get_ranges` call, so the store can coalesce adjacent chunks.
+        async move {
+            store
+                .get_ranges(&path, &ranges)
+                .await
+                .map_err(|err| ParquetError::External(Box::new(err)))
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        let file_size = self.file_size;
+        async move {
+            ParquetMetaDataReader::new()
+                .load_and_finish(&mut *self, file_size)
+                .await
+                .map(Arc::new)
+        }
+        .boxed()
+    }
+}
+
 /// Derives one [`ScopedReadEntry`] per row of the Parquet file at `path`,
-/// reading only `indexed_positions` (the indexed columns, in the index's
-/// column order) and `row_id_position` when present. Row ids come from the
+/// fetching only the footer and the columns at `indexed_positions` (the
+/// indexed columns, in the index's column order) plus `row_id_position` when
+/// present — byte-range reads, never the whole object. Row ids come from the
 /// embedded row-id column if `row_id_position` is set — rewrite files from
 /// UPDATE and compaction preserve old ids there — else `row_id_start +
-/// ordinal`.
+/// ordinal`. `file_size` is the object's length when the caller knows it
+/// (DuckLake records it per data file); `None` costs one `head` request.
 pub(crate) async fn scoped_read_entries(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    indexed_positions: &[usize],
+    row_id_position: Option<usize>,
+    row_id_start: u64,
+    file_size: Option<u64>,
+) -> Result<Vec<ScopedReadEntry>> {
+    let file_size = match file_size {
+        Some(size) => size,
+        None => {
+            object_store
+                .head(path)
+                .await
+                .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?
+                .size
+        }
+    };
+    if file_size < WHOLE_OBJECT_THRESHOLD {
+        return whole_object_entries(
+            object_store.as_ref(),
+            path,
+            indexed_positions,
+            row_id_position,
+            row_id_start,
+        )
+        .await;
+    }
+
+    let reader = ObjectStoreReader {
+        store: object_store,
+        path: path.clone(),
+        file_size,
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+    let (mask, indexed_output, row_id_output) =
+        projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
+    let mut stream = builder
+        .with_projection(mask)
+        .build()
+        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+
+    let mut entries = Vec::new();
+    let mut ordinal_base = 0u64;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+        entries.extend(record_batch_entries(
+            &batch,
+            &indexed_output,
+            row_id_output,
+            row_id_start,
+            ordinal_base,
+        )?);
+        ordinal_base =
+            ordinal_base.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+    }
+
+    Ok(entries)
+}
+
+/// Below this object size the whole file is fetched in one request and
+/// decoded from memory: on a remote store the range reader's footer and
+/// chunk round trips cost more than the bytes they save (measured crossover
+/// ≈ 6 MiB at 30 ms per request and 100 MB/s, and DuckLake's small
+/// per-insert files sit far below it).
+const WHOLE_OBJECT_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// The pre-threshold read path: one whole-object fetch, then decode only
+/// the projected columns. The batches decode from memory, so this stays
+/// bounded by the threshold above.
+async fn whole_object_entries(
     object_store: &dyn ObjectStore,
     path: &Path,
     indexed_positions: &[usize],
@@ -173,49 +317,21 @@ pub(crate) async fn scoped_read_entries(
         .bytes()
         .await
         .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
-
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
-
-    // Project only the columns we need, so no non-indexed column is read.
-    let mut projected: Vec<usize> = indexed_positions.to_vec();
-    if let Some(position) = row_id_position {
-        projected.push(position);
-    }
-    projected.sort_unstable();
-    projected.dedup();
-    let mask = ProjectionMask::roots(builder.parquet_schema(), projected.iter().copied());
-    // Output-batch column index for an original file position.
-    let output_index = |position: usize| {
-        projected
-            .iter()
-            .position(|&candidate| candidate == position)
-            .ok_or_else(|| Error::Corruption("scoped read: projected column vanished".to_owned()))
-    };
-
+    let (mask, indexed_output, row_id_output) =
+        projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
     let reader = builder
         .with_projection(mask)
         .build()
         .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
 
-    let batches = reader
-        .into_iter()
-        .map(|batch| batch.map_err(|err| Error::Corruption(format!("scoped read: {err}"))))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Map the indexed and row-id columns to their positions in the projected
-    // output batch.
-    let indexed_output = indexed_positions
-        .iter()
-        .map(|&position| output_index(position))
-        .collect::<Result<Vec<_>>>()?;
-    let row_id_output = row_id_position.map(&output_index).transpose()?;
-
     let mut entries = Vec::new();
     let mut ordinal_base = 0u64;
-    for batch in &batches {
+    for batch in reader {
+        let batch = batch.map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
         entries.extend(record_batch_entries(
-            batch,
+            &batch,
             &indexed_output,
             row_id_output,
             row_id_start,
@@ -225,6 +341,36 @@ pub(crate) async fn scoped_read_entries(
             ordinal_base.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
     }
     Ok(entries)
+}
+
+/// The projection over `schema` covering only the indexed and row-id
+/// columns, with each requested position mapped to its index in the
+/// projected output batch.
+fn projection(
+    schema: &parquet::schema::types::SchemaDescriptor,
+    indexed_positions: &[usize],
+    row_id_position: Option<usize>,
+) -> Result<(ProjectionMask, Vec<usize>, Option<usize>)> {
+    let mut projected: Vec<usize> = indexed_positions.to_vec();
+    if let Some(position) = row_id_position {
+        projected.push(position);
+    }
+    projected.sort_unstable();
+    projected.dedup();
+    let mask = ProjectionMask::roots(schema, projected.iter().copied());
+    // Output-batch column index for an original file position.
+    let output_index = |position: usize| {
+        projected
+            .iter()
+            .position(|&candidate| candidate == position)
+            .ok_or_else(|| Error::Corruption("scoped read: projected column vanished".to_owned()))
+    };
+    let indexed_output = indexed_positions
+        .iter()
+        .map(|&position| output_index(position))
+        .collect::<Result<Vec<_>>>()?;
+    let row_id_output = row_id_position.map(output_index).transpose()?;
+    Ok((mask, indexed_output, row_id_output))
 }
 
 /// Derives one entry per row of `batch`: the values of the columns at
@@ -355,16 +501,445 @@ pub(crate) fn inline_batch_entries(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use object_store::{ObjectStoreExt, memory::InMemory};
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    };
     use parquet::arrow::ArrowWriter;
 
     use super::*;
+
+    /// Wraps an [`InMemory`] store, counting the payload bytes and requests
+    /// served by object/range reads — so a test can assert how much of a
+    /// file the scoped read actually fetched. `head` probes are not counted:
+    /// they carry no payload.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        fetched_bytes: AtomicU64,
+        fetch_requests: AtomicU64,
+    }
+
+    impl CountingStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                fetched_bytes: AtomicU64::new(0),
+                fetch_requests: AtomicU64::new(0),
+            }
+        }
+
+        fn fetched_bytes(&self) -> u64 {
+            self.fetched_bytes.load(Ordering::Relaxed)
+        }
+
+        fn fetch_requests(&self) -> u64 {
+            self.fetch_requests.load(Ordering::Relaxed)
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let head = options.head;
+            let result = self.inner.get_opts(location, options).await?;
+            if !head {
+                self.fetch_requests.fetch_add(1, Ordering::Relaxed);
+                self.fetched_bytes
+                    .fetch_add(result.range.end - result.range.start, Ordering::Relaxed);
+            }
+            Ok(result)
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            let results = self.inner.get_ranges(location, ranges).await?;
+            self.fetch_requests.fetch_add(1, Ordering::Relaxed);
+            let total: u64 = results.iter().map(|bytes| bytes.len() as u64).sum();
+            self.fetched_bytes.fetch_add(total, Ordering::Relaxed);
+            Ok(results)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A file wide enough that its indexed column is a small fraction of its
+    /// bytes: one `Int64` id plus seven fat `Utf8` payload columns, `rows`
+    /// rows. Returns the written object's size.
+    async fn write_wide_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -> u64 {
+        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        for i in 0..7 {
+            fields.push(Field::new(format!("payload{i}"), DataType::Utf8, false));
+        }
+        let schema = Arc::new(Schema::new(fields));
+
+        let ids: Vec<i64> = (0..i64::try_from(rows).unwrap()).collect();
+        let mut columns: Vec<Arc<dyn Array>> = vec![Arc::new(Int64Array::from(ids))];
+        for i in 0..7 {
+            // Row-unique text so the payload columns stay large on disk.
+            let values: Vec<String> = (0..rows)
+                .map(|row| format!("payload-{i}-row-{row:08}-abcdefghijklmnopqrstuvwxyz"))
+                .collect();
+            columns.push(Arc::new(StringArray::from(values)));
+        }
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+
+        let mut buffer = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let object_len = buffer.len() as u64;
+        store.put(path, buffer.into()).await.unwrap();
+        object_len
+    }
+
+    /// Above the whole-object threshold the read must fetch only the footer
+    /// and the projected columns' chunks, not the whole object — and values
+    /// must follow the requested position order on this path too.
+    #[tokio::test]
+    async fn scoped_read_fetches_only_projected_columns() {
+        let store = Arc::new(CountingStore::new());
+        let path = Path::from("wide.parquet");
+        // 20k rows ≈ 7.9 MB: above `WHOLE_OBJECT_THRESHOLD`, so the range
+        // reader (not the small-file whole-object fallback) serves this.
+        let object_len = write_wide_fixture(store.as_ref(), &path, 20_000).await;
+        assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
+
+        let entries = scoped_read_entries(store.clone(), &path, &[1, 0], None, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 20_000);
+        assert_eq!(
+            entries[19_999].values,
+            vec![
+                Some(IndexKeyValue::Str(
+                    "payload-0-row-00019999-abcdefghijklmnopqrstuvwxyz".to_owned()
+                )),
+                Some(IndexKeyValue::Int {
+                    value: 19_999,
+                    width: IntWidth::I64,
+                }),
+            ],
+        );
+
+        let fetched = store.fetched_bytes();
+        assert!(
+            fetched < object_len * 2 / 5,
+            "fetched {fetched} of {object_len} bytes ({} requests) — the scoped read should \
+             range-read only the footer and the projected columns",
+            store.fetch_requests(),
+        );
+    }
+
+    /// A narrow file shaped like DuckLake's small per-insert output: an
+    /// `Int64` id and one short `Utf8` column, `rows` rows. Returns the
+    /// written object's size.
+    async fn write_narrow_fixture(store: &dyn ObjectStore, path: &Path, rows: usize) -> u64 {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ids: Vec<i64> = (0..i64::try_from(rows).unwrap()).collect();
+        let names: Vec<String> = (0..rows).map(|row| format!("name-{row}")).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+
+        let mut buffer = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let object_len = u64::try_from(buffer.len()).unwrap();
+        store.put(path, buffer.into()).await.unwrap();
+        object_len
+    }
+
+    /// Prints the exact bytes and requests the range reader issues per
+    /// fixture shape. Run with:
+    /// `cargo test -p moraine --lib -- --ignored --nocapture prints_fetch_profile`
+    #[tokio::test]
+    #[ignore = "fetch-profile probe; run manually with --nocapture"]
+    async fn prints_fetch_profile() {
+        // (label, wide fixture?, rows, indexed positions)
+        let shapes: [(&str, bool, usize, &[usize]); 4] = [
+            ("wide 8-col x 20k rows, 1 indexed col ", true, 20_000, &[0]),
+            (
+                "wide 8-col x 20k rows, 2 indexed cols",
+                true,
+                20_000,
+                &[0, 1],
+            ),
+            ("narrow 2-col x 100 rows, 1 indexed   ", false, 100, &[0]),
+            ("narrow 2-col x 10 rows, 1 indexed    ", false, 10, &[0]),
+        ];
+        for (label, wide, rows, positions) in shapes {
+            let store = Arc::new(CountingStore::new());
+            let path = Path::from("probe.parquet");
+            let object_len = if wide {
+                write_wide_fixture(store.as_ref(), &path, rows).await
+            } else {
+                write_narrow_fixture(store.as_ref(), &path, rows).await
+            };
+            let entries = scoped_read_entries(store.clone(), &path, positions, None, 0, None)
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), rows);
+            println!(
+                "{label}: object {object_len:>8} B, fetched {:>7} B ({:>2}%), {} requests",
+                store.fetched_bytes(),
+                store.fetched_bytes() * 100 / object_len,
+                store.fetch_requests(),
+            );
+        }
+    }
+
+    /// Per-request latency a [`LatencyStore`] charges, modelling a remote
+    /// store round trip.
+    const REQUEST_LATENCY: std::time::Duration = std::time::Duration::from_millis(30);
+
+    /// Wraps an [`InMemory`] store, modelling a remote one: every read
+    /// request pays [`REQUEST_LATENCY`] plus transfer at ~100 MB/s (10 ns
+    /// per byte).
+    #[derive(Debug)]
+    struct LatencyStore {
+        inner: InMemory,
+    }
+
+    impl LatencyStore {
+        async fn charge(bytes: u64) {
+            tokio::time::sleep(REQUEST_LATENCY + std::time::Duration::from_nanos(bytes * 10)).await;
+        }
+    }
+
+    impl std::fmt::Display for LatencyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LatencyStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for LatencyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let head = options.head;
+            let result = self.inner.get_opts(location, options).await?;
+            let bytes = if head {
+                0
+            } else {
+                result.range.end - result.range.start
+            };
+            Self::charge(bytes).await;
+            Ok(result)
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            let results = self.inner.get_ranges(location, ranges).await?;
+            Self::charge(results.iter().map(|bytes| bytes.len() as u64).sum()).await;
+            Ok(results)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The pre-range-reader read, reproduced for comparison: fetch the whole
+    /// object, then decode only the projected columns.
+    async fn whole_file_entries(
+        store: &dyn ObjectStore,
+        path: &Path,
+        indexed_positions: &[usize],
+    ) -> Vec<ScopedReadEntry> {
+        let bytes: Bytes = store.get(path).await.unwrap().bytes().await.unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let mask =
+            ProjectionMask::roots(builder.parquet_schema(), indexed_positions.iter().copied());
+        let reader = builder.with_projection(mask).build().unwrap();
+
+        let output_positions: Vec<usize> = (0..indexed_positions.len()).collect();
+        let mut entries = Vec::new();
+        let mut ordinal_base = 0u64;
+        for batch in reader {
+            let batch = batch.unwrap();
+            entries.extend(
+                record_batch_entries(&batch, &output_positions, None, 0, ordinal_base).unwrap(),
+            );
+            ordinal_base += u64::try_from(batch.num_rows()).unwrap();
+        }
+        entries
+    }
+
+    /// Wall-clock comparison of the whole-object read against the range
+    /// reader on a simulated remote store (30 ms per request, ~100 MB/s).
+    /// Run with:
+    /// `cargo test -p moraine --lib -- --ignored --nocapture simulated_remote`
+    #[tokio::test]
+    #[ignore = "timing probe; run manually with --nocapture"]
+    async fn simulated_remote_store_bench() {
+        // (label, wide fixture?, rows) — narrow-small is DuckLake's typical
+        // per-insert file; wide-large is the backfill/bulk-maintenance case.
+        let shapes = [
+            ("narrow 2-col x 100 rows ", false, 100),
+            ("wide 8-col x 50k rows   ", true, 50_000),
+        ];
+        for (label, wide, rows) in shapes {
+            let store = Arc::new(LatencyStore {
+                inner: InMemory::new(),
+            });
+            let path = Path::from("bench.parquet");
+            let object_len = if wide {
+                write_wide_fixture(store.as_ref(), &path, rows).await
+            } else {
+                write_narrow_fixture(store.as_ref(), &path, rows).await
+            };
+
+            let started = std::time::Instant::now();
+            let old_entries = whole_file_entries(store.as_ref(), &path, &[0]).await;
+            let whole_file = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let new_entries = scoped_read_entries(store.clone(), &path, &[0], None, 0, None)
+                .await
+                .unwrap();
+            let range_read = started.elapsed();
+
+            assert_eq!(
+                old_entries, new_entries,
+                "both paths derive the same entries"
+            );
+            println!(
+                "{label} ({object_len:>8} B): whole-file {whole_file:>9.2?}, range-read \
+                 {range_read:>9.2?}"
+            );
+        }
+    }
 
     async fn write_fixture(object_store: &InMemory, path: &Path, batch: &RecordBatch) {
         let mut buffer = Vec::new();
@@ -433,12 +1008,12 @@ mod tests {
 
     #[tokio::test]
     async fn reads_indexed_columns_and_embedded_row_ids() {
-        let store = InMemory::new();
+        let store = Arc::new(InMemory::new());
         let path = Path::from("data.parquet");
         write_fixture(&store, &path, &fixture_batch()).await;
 
         // Index over (id, name); the file carries a row-id column at 2.
-        let entries = scoped_read_entries(&store, &path, &[0, 1], Some(2), 0)
+        let entries = scoped_read_entries(store.clone(), &path, &[0, 1], Some(2), 0, None)
             .await
             .unwrap();
         assert_eq!(entries.len(), 3);
@@ -461,14 +1036,42 @@ mod tests {
         assert_eq!(entries[2].row_id, 102);
     }
 
+    /// Values come back ordered as the requested positions — duplicates and
+    /// all. The merged multi-index read (one fetch per file, split back per
+    /// index) relies on exactly this.
+    #[tokio::test]
+    async fn values_follow_requested_position_order() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("data.parquet");
+        write_fixture(&store, &path, &fixture_batch()).await;
+
+        let entries = scoped_read_entries(store.clone(), &path, &[1, 0, 0], None, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries[0].values,
+            vec![
+                Some(IndexKeyValue::Str("a".to_owned())),
+                Some(IndexKeyValue::Int {
+                    value: 10,
+                    width: IntWidth::I64,
+                }),
+                Some(IndexKeyValue::Int {
+                    value: 10,
+                    width: IntWidth::I64,
+                }),
+            ],
+        );
+    }
+
     #[tokio::test]
     async fn derives_row_ids_from_start_plus_ordinal_when_absent() {
-        let store = InMemory::new();
+        let store = Arc::new(InMemory::new());
         let path = Path::from("data.parquet");
         write_fixture(&store, &path, &fixture_batch()).await;
 
         // No row-id column: ids are row_id_start (500) + ordinal.
-        let entries = scoped_read_entries(&store, &path, &[0], None, 500)
+        let entries = scoped_read_entries(store.clone(), &path, &[0], None, 500, None)
             .await
             .unwrap();
         assert_eq!(

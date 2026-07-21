@@ -315,13 +315,13 @@ impl Catalog {
     /// non-indexable column type.
     pub async fn scoped_file_index_entries(
         &self,
-        object_store: &dyn ObjectStore,
+        object_store: Arc<dyn ObjectStore>,
         path: &Path,
         index: IndexId,
         indexed_positions: &[usize],
     ) -> Result<Vec<FileIndexEntry>> {
         let entries =
-            scoped_read::scoped_read_entries(object_store, path, indexed_positions, None, 0)
+            scoped_read::scoped_read_entries(object_store, path, indexed_positions, None, 0, None)
                 .await?;
         Ok(entries
             .into_iter()
@@ -352,7 +352,7 @@ impl Catalog {
     /// or [`Error::Corruption`] if a file cannot be read.
     pub async fn scoped_backfill_entries(
         &self,
-        object_store: &dyn ObjectStore,
+        object_store: Arc<dyn ObjectStore>,
         data_prefix: &str,
         table: TableId,
         columns: &[ColumnId],
@@ -403,11 +403,12 @@ impl Catalog {
             };
             let path = object_store::path::Path::from(relative.as_str());
             let scoped = scoped_read::scoped_read_entries(
-                object_store,
+                Arc::clone(&object_store),
                 &path,
                 &positions,
                 None,
                 row_id_start,
+                Some(file.file_size_bytes),
             )
             .await?;
             entries.extend(scoped.into_iter().map(|entry| IndexEntry {

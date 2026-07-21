@@ -1822,7 +1822,9 @@ name = "moraine"
 version = "0.2.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
+ "futures",
  "object_store",
  "parquet",
  "proptest",
@@ -2071,6 +2073,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "futures",
  "half",
  "hashbrown 0.17.1",
  "num-bigint",
@@ -2079,6 +2082,7 @@ dependencies = [
  "paste",
  "seq-macro",
  "snap",
+ "tokio",
  "twox-hash",
  "zstd",
 ]
