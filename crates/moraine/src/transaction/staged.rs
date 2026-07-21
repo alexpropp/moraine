@@ -2232,7 +2232,7 @@ async fn stage_inline_chunk_entries(
     pending_schemas: &HashMap<(u64, u64), &[u8]>,
     table_id: u64,
     chunk: &InlineChunk<'_>,
-    held: Option<&[u64]>,
+    held: Option<&HashSet<u64>>,
     entries: &mut Vec<StagedIndexEntry>,
 ) -> Result<()> {
     let table = TableId::new(table_id);
@@ -2330,7 +2330,7 @@ async fn stage_inline_delete_entries(
 
     let mut covered: HashSet<u64> = HashSet::new();
     for chunk in &chunks {
-        let held: Vec<u64> = row_ids
+        let held: HashSet<u64> = row_ids
             .iter()
             .copied()
             .filter(|&row_id| chunk.holds(row_id))
@@ -2390,14 +2390,20 @@ async fn collect_delete_file_rows(
 
     let path = delete_file_object_path(base, &delete_file, data_prefix)?;
     let positions = scoped_read::delete_file_positions(data_store, &path).await?;
-    file_deletes
+    let killed = file_deletes
         .entry((delete_file.table_id, delete_file.data_file_id))
-        .or_default()
-        .extend(
-            positions
-                .into_iter()
-                .map(|position| row_id_start.saturating_add(position)),
-        );
+        .or_default();
+
+    for position in positions {
+        let row_id = row_id_start.checked_add(position).ok_or_else(|| {
+            Error::Corruption(format!(
+                "delete file {} names position {position}, which overflows the row-id range of \
+                 data file {} on table {}",
+                delete_file.delete_file_id, delete_file.data_file_id, delete_file.table_id
+            ))
+        })?;
+        killed.push(row_id);
+    }
     Ok(())
 }
 
@@ -2429,13 +2435,14 @@ async fn stage_file_delete_entries(
 
     let path = data_file_object_path(base, &file, data_prefix)?;
     let live_columns = base.columns_of(table);
+    let killed: HashSet<u64> = row_ids.iter().copied().collect();
     for index in &indexes {
         let positions = index_positions(&live_columns, index, table)?;
         let scoped =
             scoped_read::scoped_read_entries(data_store, &path, &positions, None, row_id_start)
                 .await?
                 .into_iter()
-                .filter(|entry| row_ids.contains(&entry.row_id))
+                .filter(|entry| killed.contains(&entry.row_id))
                 .collect();
         push_index_entries(entries, index, scoped, true)?;
     }

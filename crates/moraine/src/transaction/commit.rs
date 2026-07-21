@@ -1918,6 +1918,39 @@ mod tests {
         catalog.close().await.unwrap();
     }
 
+    /// Entries without deletes would strip the index of rows the catalog
+    /// still counts as live.
+    #[tokio::test]
+    async fn register_delete_file_rejects_index_entries_without_deletes() {
+        use crate::{
+            catalog::FileIndexEntry,
+            store::index_encoding::{IndexKeyValue, IntWidth},
+        };
+        let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
+        let refused = catalog
+            .commit(|tx| {
+                tx.register_delete_file(
+                    table,
+                    crate::catalog::DeleteFile {
+                        delete_count: 0,
+                        ..delete_file(file)
+                    },
+                    &[FileIndexEntry {
+                        index,
+                        ordinal: 1,
+                        values: vec![Some(IndexKeyValue::Int {
+                            value: 20,
+                            width: IntWidth::I64,
+                        })],
+                    }],
+                )
+                .map(|_| ())
+            })
+            .await;
+        assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
+        catalog.close().await.unwrap();
+    }
+
     /// An ordinal past the target file's rows would name a row id outside it.
     #[tokio::test]
     async fn register_delete_file_rejects_an_out_of_range_index_ordinal() {

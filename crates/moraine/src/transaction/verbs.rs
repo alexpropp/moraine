@@ -962,6 +962,14 @@ impl Transaction {
                 "register_delete_file on indexed table {table} must supply index entries"
             )));
         }
+        // Entries without deletes would strip index entries for rows the
+        // catalog still counts as live.
+        if file.delete_count == 0 && !index_entries.is_empty() {
+            return Err(Error::Constraint(format!(
+                "register_delete_file on table {table} supplies index entries but deletes no rows"
+            )));
+        }
+
         // An entry's row is the target's `row_id_start + ordinal`, so an
         // ordinal past that file's rows would name a row it does not hold.
         for entry in index_entries {
@@ -992,45 +1000,67 @@ impl Transaction {
             partial_max: None,
         });
 
-        if !index_entries.is_empty() {
-            let row_id_start = data_file.row_id_start.ok_or_else(|| {
-                Error::Constraint(format!(
-                    "data file {} of table {table} carries per-row ids; index maintenance of \
-                     rewrite files is a follow-up",
-                    file.data_file_id
-                ))
-            })?;
-            for file_entry in index_entries {
-                let (unique, column_count) = {
-                    let index = self
-                        .state
-                        .indexes
-                        .get(&table.get())
-                        .and_then(|per_table| per_table.get(&file_entry.index.get()))
-                        .ok_or_else(|| {
-                            Error::NotFound(format!("index {} on table {table}", file_entry.index))
-                        })?;
-                    (index.unique, index.column_ids.len())
-                };
-                let row_id = row_id_start.saturating_add(file_entry.ordinal);
-                self.stage_index_entry(
-                    file_entry.index.get(),
-                    unique,
-                    column_count,
-                    &IndexEntry {
-                        row_id,
-                        values: file_entry.values.clone(),
-                    },
-                    true,
-                )?;
-            }
-        }
+        self.stage_delete_file_index_entries(table, &data_file, index_entries)?;
 
         self.ops.push(Operation::RegisterDeleteFile {
             table_id: table.get(),
         });
 
         Ok(DeleteFileId::new(delete_file_id))
+    }
+
+    /// Stages the entry removals a delete file's index entries name, resolving
+    /// each ordinal against the target file's row-id range.
+    fn stage_delete_file_index_entries(
+        &mut self,
+        table: TableId,
+        data_file: &DataFileValue,
+        index_entries: &[FileIndexEntry],
+    ) -> Result<()> {
+        if index_entries.is_empty() {
+            return Ok(());
+        }
+
+        let row_id_start = data_file.row_id_start.ok_or_else(|| {
+            Error::Constraint(format!(
+                "data file {} of table {table} carries per-row ids; index maintenance of rewrite \
+                 files is a follow-up",
+                data_file.data_file_id
+            ))
+        })?;
+
+        for file_entry in index_entries {
+            let (unique, column_count) = {
+                let index = self
+                    .state
+                    .indexes
+                    .get(&table.get())
+                    .and_then(|per_table| per_table.get(&file_entry.index.get()))
+                    .ok_or_else(|| {
+                        Error::NotFound(format!("index {} on table {table}", file_entry.index))
+                    })?;
+                (index.unique, index.column_ids.len())
+            };
+            let row_id = row_id_start.checked_add(file_entry.ordinal).ok_or_else(|| {
+                Error::Constraint(format!(
+                    "register_delete_file: index entry ordinal {} overflows the row-id range of \
+                     data file {} on table {table}",
+                    file_entry.ordinal, data_file.data_file_id
+                ))
+            })?;
+
+            self.stage_index_entry(
+                file_entry.index.get(),
+                unique,
+                column_count,
+                &IndexEntry {
+                    row_id,
+                    values: file_entry.values.clone(),
+                },
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     /// Expires a delete file, removing it.
