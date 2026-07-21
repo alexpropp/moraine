@@ -99,11 +99,10 @@ pub struct MoraineInlineChunk {
 /// `start` for the incremental variants (ignored by `SCAN_TABLE`/
 /// `SCAN_FOR_FLUSH`).
 ///
-/// Cancellable: races the core read
-/// against [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal
-/// and against `probe` (polled immediately, then ~100 ms; a null `probe`
-/// disables polling). If a cancellation wins, returns
-/// [`codes::INTERRUPTED`] and the out-params are left unwritten.
+/// Cancellable: races the core read against `probe` (polled immediately,
+/// then ~100 ms; a null `probe` disables polling). If a cancellation
+/// wins, returns [`codes::INTERRUPTED`] and the out-params are left
+/// unwritten.
 ///
 /// # Safety
 ///

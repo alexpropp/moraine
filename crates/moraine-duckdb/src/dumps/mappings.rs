@@ -28,7 +28,11 @@ pub struct MoraineColumnMappingRow {
 ///
 /// # Safety
 ///
-/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+/// The shared dump-entry contract (`dump_rows`): a live `handle` from
+/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+/// thread, and a null-or-writable `err`, all for the duration of the
+/// call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_column_mappings(
     handle: *mut MoraineCatalogHandle,
@@ -117,7 +121,11 @@ pub struct MoraineNameMappingRow {
 ///
 /// # Safety
 ///
-/// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+/// The shared dump-entry contract (`dump_rows`): a live `handle` from
+/// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+/// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+/// thread, and a null-or-writable `err`, all for the duration of the
+/// call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_name_mappings(
     handle: *mut MoraineCatalogHandle,

@@ -1225,7 +1225,11 @@ int32_t moraine_arrow_decode_stream(const uint8_t *body,
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_schemas(struct MoraineCatalogHandle *handle,
                              struct MoraineSchemaRow **out_items,
                              size_t *out_len,
@@ -1246,7 +1250,11 @@ void moraine_dump_schemas_free(struct MoraineSchemaRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_tables(struct MoraineCatalogHandle *handle,
                             struct MoraineTableRow **out_items,
                             size_t *out_len,
@@ -1267,7 +1275,11 @@ void moraine_dump_tables_free(struct MoraineTableRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_views(struct MoraineCatalogHandle *handle,
                            struct MoraineViewRow **out_items,
                            size_t *out_len,
@@ -1288,7 +1300,11 @@ void moraine_dump_views_free(struct MoraineViewRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_columns(struct MoraineCatalogHandle *handle,
                              struct MoraineColumnRow **out_items,
                              size_t *out_len,
@@ -1309,7 +1325,11 @@ void moraine_dump_columns_free(struct MoraineColumnRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_data_files(struct MoraineCatalogHandle *handle,
                                 struct MoraineDataFileRow **out_items,
                                 size_t *out_len,
@@ -1330,7 +1350,11 @@ void moraine_dump_data_files_free(struct MoraineDataFileRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_delete_files(struct MoraineCatalogHandle *handle,
                                   struct MoraineDeleteFileRow **out_items,
                                   size_t *out_len,
@@ -1352,7 +1376,11 @@ void moraine_dump_delete_files_free(struct MoraineDeleteFileRow *items, size_t l
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_file_partition_values(struct MoraineCatalogHandle *handle,
                                            struct MoraineFilePartitionValueRow **out_items,
                                            size_t *out_len,
@@ -1374,7 +1402,11 @@ void moraine_dump_file_partition_values_free(struct MoraineFilePartitionValueRow
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_scheduled_deletions(struct MoraineCatalogHandle *handle,
                                          struct MoraineScheduledDeletionRow **out_items,
                                          size_t *out_len,
@@ -1395,7 +1427,11 @@ void moraine_dump_scheduled_deletions_free(struct MoraineScheduledDeletionRow *i
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_macros(struct MoraineCatalogHandle *handle,
                             struct MoraineMacroRow **out_items,
                             size_t *out_len,
@@ -1418,7 +1454,11 @@ void moraine_dump_macros_free(struct MoraineMacroRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_macro_impls(struct MoraineCatalogHandle *handle,
                                  struct MoraineMacroImplRow **out_items,
                                  size_t *out_len,
@@ -1441,7 +1481,11 @@ void moraine_dump_macro_impls_free(struct MoraineMacroImplRow *items, size_t len
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_macro_parameters(struct MoraineCatalogHandle *handle,
                                       struct MoraineMacroParameterRow **out_items,
                                       size_t *out_len,
@@ -1463,7 +1507,11 @@ void moraine_dump_macro_parameters_free(struct MoraineMacroParameterRow *items, 
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_column_mappings(struct MoraineCatalogHandle *handle,
                                      struct MoraineColumnMappingRow **out_items,
                                      size_t *out_len,
@@ -1485,7 +1533,11 @@ void moraine_dump_column_mappings_free(struct MoraineColumnMappingRow *items, si
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_name_mappings(struct MoraineCatalogHandle *handle,
                                    struct MoraineNameMappingRow **out_items,
                                    size_t *out_len,
@@ -1506,7 +1558,11 @@ void moraine_dump_name_mappings_free(struct MoraineNameMappingRow *items, size_t
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_partition_info(struct MoraineCatalogHandle *handle,
                                     struct MorainePartitionInfoRow **out_items,
                                     size_t *out_len,
@@ -1528,7 +1584,11 @@ void moraine_dump_partition_info_free(struct MorainePartitionInfoRow *items, siz
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_partition_columns(struct MoraineCatalogHandle *handle,
                                        struct MorainePartitionColumnRow **out_items,
                                        size_t *out_len,
@@ -1549,7 +1609,11 @@ void moraine_dump_partition_columns_free(struct MorainePartitionColumnRow *items
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_sort_info(struct MoraineCatalogHandle *handle,
                                struct MoraineSortInfoRow **out_items,
                                size_t *out_len,
@@ -1571,7 +1635,11 @@ void moraine_dump_sort_info_free(struct MoraineSortInfoRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_sort_expressions(struct MoraineCatalogHandle *handle,
                                       struct MoraineSortExpressionRow **out_items,
                                       size_t *out_len,
@@ -1593,7 +1661,11 @@ void moraine_dump_sort_expressions_free(struct MoraineSortExpressionRow *items, 
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_snapshots(struct MoraineCatalogHandle *handle,
                                struct MoraineSnapshotRow **out_items,
                                size_t *out_len,
@@ -1614,7 +1686,11 @@ void moraine_dump_snapshots_free(struct MoraineSnapshotRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_schema_versions(struct MoraineCatalogHandle *handle,
                                      struct MoraineSchemaVersionRow **out_items,
                                      size_t *out_len,
@@ -1635,7 +1711,11 @@ void moraine_dump_schema_versions_free(struct MoraineSchemaVersionRow *items, si
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_table_stats(struct MoraineCatalogHandle *handle,
                                  struct MoraineTableStatsRow **out_items,
                                  size_t *out_len,
@@ -1656,7 +1736,11 @@ void moraine_dump_table_stats_free(struct MoraineTableStatsRow *items, size_t le
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_table_column_stats(struct MoraineCatalogHandle *handle,
                                         struct MoraineTableColumnStatsRow **out_items,
                                         size_t *out_len,
@@ -1677,7 +1761,11 @@ void moraine_dump_table_column_stats_free(struct MoraineTableColumnStatsRow *ite
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_file_column_stats(struct MoraineCatalogHandle *handle,
                                        struct MoraineFileColumnStatsRow **out_items,
                                        size_t *out_len,
@@ -1697,7 +1785,11 @@ void moraine_dump_file_column_stats_free(struct MoraineFileColumnStatsRow *items
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_tags(struct MoraineCatalogHandle *handle,
                           struct MoraineTagRow **out_items,
                           size_t *out_len,
@@ -1717,7 +1809,11 @@ void moraine_dump_tags_free(struct MoraineTagRow *items, size_t len);
 //
 // # Safety
 //
-// [`dump_rows`](crate::dumps::dump_rows)'s pointer contract.
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
 int32_t moraine_dump_column_tags(struct MoraineCatalogHandle *handle,
                                  struct MoraineColumnTagRow **out_items,
                                  size_t *out_len,
@@ -1739,11 +1835,10 @@ void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len
 // `start` for the incremental variants (ignored by `SCAN_TABLE`/
 // `SCAN_FOR_FLUSH`).
 //
-// Cancellable: races the core read
-// against [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal
-// and against `probe` (polled immediately, then ~100 ms; a null `probe`
-// disables polling). If a cancellation wins, returns
-// [`codes::INTERRUPTED`] and the out-params are left unwritten.
+// Cancellable: races the core read against `probe` (polled immediately,
+// then ~100 ms; a null `probe` disables polling). If a cancellation
+// wins, returns [`codes::INTERRUPTED`] and the out-params are left
+// unwritten.
 //
 // # Safety
 //
