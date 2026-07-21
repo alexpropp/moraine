@@ -15,6 +15,8 @@ allow = [
     "CDLA-Permissive-2.0",
     # arrow's transitive graph (tiny-keccak) — public-domain dedication:
     "CC0-1.0",
+    # cbindgen (build-dependency generating cpp/moraine_abi.h):
+    "MPL-2.0",
 ]
 
 [bans]

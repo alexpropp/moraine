@@ -38,16 +38,6 @@ pub struct MoraineCatalogHandle {
     /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
     /// bare-bucket store), prepended to a data file's stored path.
     pub(crate) data_prefix: String,
-    /// The cancellation seam's push channel:
-    /// [`moraine_interrupt`](crate::abi::moraine_interrupt) signals it and
-    /// [`block_on_cancellable`](Self::block_on_cancellable) `select!`s
-    /// against it, alongside the pull channel (the per-call interrupt
-    /// probe).
-    ///
-    /// One-shot [`tokio::sync::Notify`] permit: the signal is consumed by
-    /// the read that observes it and never carries over. Assumes at most
-    /// one read in flight per handle at a time.
-    pub(crate) interrupt: tokio::sync::Notify,
 }
 
 impl MoraineCatalogHandle {
@@ -57,15 +47,13 @@ impl MoraineCatalogHandle {
             catalog,
             data_store: None,
             data_prefix: String::new(),
-            interrupt: tokio::sync::Notify::new(),
         }
     }
 
-    /// Runs `future` on the handle's runtime unless cancelled first — by a
-    /// pending or arriving [`moraine_interrupt`](crate::abi::moraine_interrupt)
-    /// signal, or by `probe` returning `true` (polled immediately, then
-    /// every [`INTERRUPT_POLL_INTERVAL`]). Cancellation drops the future
-    /// and returns the interrupted error.
+    /// Runs `future` on the handle's runtime unless cancelled first by
+    /// `probe` returning `true` (polled immediately, then every
+    /// [`INTERRUPT_POLL_INTERVAL`]). Cancellation drops the future and
+    /// returns the interrupted error.
     ///
     /// # Safety
     ///
@@ -88,7 +76,6 @@ impl MoraineCatalogHandle {
             // SAFETY: caller contract — `probe` is callable with
             // `probe_ctx` for the duration of this call.
             if unsafe { probe(probe_ctx) } {
-                self.drain_interrupt();
                 return Err(AbiError::interrupted());
             }
         }
@@ -113,22 +100,10 @@ impl MoraineCatalogHandle {
             // the core future is also immediately ready.
             tokio::select! {
                 biased;
-                () = self.interrupt.notified() => Err(AbiError::interrupted()),
                 () = probe_fired => Err(AbiError::interrupted()),
                 result = future => result.map_err(AbiError::from),
             }
         })
-    }
-
-    /// Consumes a stored interrupt permit, if any. Every cancelled call
-    /// must leave the push channel empty — a permit surviving one call
-    /// would spuriously interrupt the next.
-    fn drain_interrupt(&self) {
-        let mut pending = std::pin::pin!(self.interrupt.notified());
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        // Ready consumes the permit; Pending registered a waiter that
-        // deregisters when `pending` drops here.
-        let _ = std::future::Future::poll(pending.as_mut(), &mut context);
     }
 }
 

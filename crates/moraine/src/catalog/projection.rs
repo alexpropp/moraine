@@ -4,12 +4,13 @@
 //! caller observed; a mismatch (or an undecodable fold) degrades to a
 //! fresh scan, never to wrong rows.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     store::{
         key::{CurrentKey, EntityKey, Key},
         proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
+        read::EntityRecord,
         value,
     },
     transaction::commit::StagedWrite,
@@ -98,6 +99,12 @@ pub(crate) struct ProjectionCache {
     snapshots: Maintained<u64, SnapshotValue>,
     table_stats: Maintained<u64, TableStatsValue>,
     table_column_stats: Maintained<(u64, u64), TableColumnStatsValue>,
+    /// The full current+history entity scan at one head: populating
+    /// DuckLake's metadata tables issues ~two dozen per-kind dumps, and
+    /// this serves them all from one scan pair. Not folded forward —
+    /// entity writes are too varied — so any committed batch drops it
+    /// and the next dump re-installs it at the new head.
+    entities: Option<(u64, Arc<Vec<EntityRecord>>)>,
 }
 
 impl ProjectionCache {
@@ -106,7 +113,19 @@ impl ProjectionCache {
             snapshots: Maintained::empty(),
             table_stats: Maintained::empty(),
             table_column_stats: Maintained::empty(),
+            entities: None,
         }
+    }
+
+    pub(crate) fn install_entities(&mut self, head: u64, records: Vec<EntityRecord>) {
+        self.entities = Some((head, Arc::new(records)));
+    }
+
+    /// Serves the entity scan if it is exactly at `expected_head`.
+    pub(crate) fn entities_at(&self, expected_head: u64) -> Option<Arc<Vec<EntityRecord>>> {
+        self.entities
+            .as_ref()
+            .and_then(|(head, records)| (*head == expected_head).then(|| Arc::clone(records)))
     }
 
     pub(crate) fn install_snapshots(&mut self, head: u64, rows: Vec<SnapshotValue>) {
@@ -153,6 +172,7 @@ impl ProjectionCache {
     /// head). An undecodable key clears everything: the batch cannot be
     /// attributed, so no projection may claim the new head.
     pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
+        self.entities = None;
         for (encoded_key, write) in writes {
             let bytes = write.as_deref();
             match Key::decode(encoded_key) {

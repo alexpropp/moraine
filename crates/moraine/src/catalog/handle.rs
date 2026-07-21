@@ -8,16 +8,11 @@ use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnId, FileIndexEntry, IndexEntry, IndexId, IndexState, RowHolder,
-        RowLocation, SnapshotId, TableId, projection::ProjectionCache, scoped_read,
+        CatalogSnapshot, ColumnId, DataFileInfo, FileIndexEntry, IndexEntry, IndexId, IndexState,
+        RowHolder, RowLocation, SnapshotId, TableId, projection::ProjectionCache, scoped_read,
     },
     error::{Error, Result},
-    store::{
-        handle::{ReadHandle, ReadSession},
-        index_encoding::IndexKeyValue,
-        key::{IdxKind, idx_index_prefix},
-        open::StoreBuilder,
-    },
+    store::{handle::ReadSession, index_encoding::IndexKeyValue, open::StoreBuilder},
     transaction::{Transaction, commit, index_maintenance},
 };
 
@@ -240,9 +235,7 @@ impl Catalog {
         let outcome = async {
             let view = commit::materialize(handle, None).await?;
             let info = view
-                .indexes_of(table)
-                .into_iter()
-                .find(|info| info.id == index)
+                .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
 
             match info.state {
@@ -256,14 +249,14 @@ impl Catalog {
                     return Err(Error::NotFound(format!("index {index} was poisoned")));
                 }
             }
-            let key = crate::store::index_encoding::encode_key(values)?;
             let row_ids =
-                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await?;
+                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, values).await?;
+            let files = view.data_files_of(table);
             Ok(row_ids
                 .into_iter()
                 .map(|row_id| RowLocation {
                     row_id,
-                    holder: resolve_row_holder(&view, table, row_id),
+                    holder: resolve_row_holder(&files, row_id),
                 })
                 .collect())
         }
@@ -374,19 +367,7 @@ impl Catalog {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // A relative data-file path is relative to the table's data directory
-        // (`<schema path><table path>`), itself relative to DATA_PATH.
-        let table_value = snapshot
-            .tables
-            .get(&table.get())
-            .ok_or_else(|| Error::NotFound(format!("table {table}")))?;
-        let schema_value = snapshot
-            .schemas
-            .get(&table_value.schema_id)
-            .ok_or_else(|| {
-                Error::Corruption(format!("table {table} references a missing schema"))
-            })?;
-        let table_prefix = format!("{}{}", schema_value.path, table_value.path);
+        let table_prefix = snapshot.table_data_prefix(table)?;
 
         let mut entries = Vec::new();
         for file in snapshot.data_files_of(table) {
@@ -442,27 +423,7 @@ impl Catalog {
         }
 
         let tx = self.begin_write_tx().await?;
-        let mut deleted = 0;
-        // An index is exclusively one kind, so only one prefix holds entries;
-        // scanning both is harmless.
-        for kind in [IdxKind::Unique, IdxKind::Multi] {
-            if deleted >= limit {
-                break;
-            }
-            let mut iter = ReadHandle::Tx(&tx)
-                .scan_prefix(idx_index_prefix(kind, index.get()), ..)
-                .await
-                .map_err(Error::from)?;
-            while deleted < limit {
-                match iter.next().await.map_err(Error::from)? {
-                    Some(entry) => {
-                        tx.delete(entry.key).map_err(Error::from)?;
-                        deleted += 1;
-                    }
-                    None => break,
-                }
-            }
-        }
+        let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
         tx.commit_with_options(&commit::durable())
             .await
             .map_err(Error::from)?;
@@ -541,12 +502,12 @@ impl Catalog {
     }
 }
 
-/// Resolves a row id to its current holder against a materialized view: the
-/// data file whose live dense row-id range contains it, else `Inline`
+/// Resolves a row id to its current holder among a table's data files: the
+/// file whose live dense row-id range contains it, else `Inline`
 /// (an inlined row, or a file that carries explicit per-row ids rather than
 /// a dense range).
-fn resolve_row_holder(view: &CatalogSnapshot, table: TableId, row_id: u64) -> RowHolder {
-    for file in view.data_files_of(table) {
+fn resolve_row_holder(files: &[DataFileInfo], row_id: u64) -> RowHolder {
+    for file in files {
         if let Some(start) = file.row_id_start
             && row_id >= start
             && row_id < start.saturating_add(file.record_count)

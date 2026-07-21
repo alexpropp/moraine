@@ -28,6 +28,49 @@ pub fn run(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs one package's `#[ignore]`d test target with `envs` set, echoing
+/// both output streams, and fails unless the run succeeds **and** reports
+/// `expected_count` — a filter matching nothing still exits 0 ("0
+/// passed"), which would let a deleted or renamed test pass vacuously.
+pub fn run_ignored_suite(
+    package: &str,
+    test_target: &str,
+    release: bool,
+    extra_args: &[&str],
+    envs: &[(&str, &std::ffi::OsStr)],
+    expected_count: &str,
+) -> anyhow::Result<()> {
+    let mut command = Command::new("cargo");
+    command.args(["test", "-p", package]);
+    if release {
+        command.arg("--release");
+    }
+    command.args(["--test", test_target, "--", "--ignored"]);
+    command.args(extra_args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("spawning the {test_target} integration test"))?;
+    // Stdio isn't inherited (unlike `run`), so the count can be checked
+    // below; echo both streams so failures stay visible on the console.
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    ensure!(
+        output.status.success(),
+        "{test_target} integration test failed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    ensure!(
+        stdout.contains(expected_count),
+        "expected {test_target} to report `{expected_count}`; a test may have been deleted, \
+         renamed, or its #[ignore] removed/changed. Got:\n{stdout}"
+    );
+    Ok(())
+}
+
 pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }

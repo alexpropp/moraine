@@ -9,7 +9,7 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, bail};
 
 use crate::duckdb::{download, make_executable, workspace_root};
 
@@ -79,29 +79,18 @@ pub fn s3() -> anyhow::Result<()> {
         .with_context(|| format!("server log: {}", log_path.display()))?;
     println!("ok: minio serving bucket `{S3_BUCKET}` on {S3_ADDRESS}");
 
-    let output = Command::new("cargo")
-        .args([
-            "test",
-            "-p",
-            "moraine",
-            "--test",
-            "object_storage",
-            "--",
-            "--ignored",
-        ])
-        .env("MORAINE_S3_ENDPOINT", format!("http://{S3_ADDRESS}"))
-        .env("MORAINE_S3_BUCKET", S3_BUCKET)
-        .output()
-        .context("spawning the object_storage integration test")?;
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    ensure!(output.status.success(), "object_storage suite failed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    ensure!(
-        stdout.contains(OBJECT_STORAGE_TEST_COUNT),
-        "expected object_storage.rs to report `{OBJECT_STORAGE_TEST_COUNT}`; a test may have \
-         been deleted or its #[ignore] removed/changed. Got:\n{stdout}"
-    );
+    let endpoint = format!("http://{S3_ADDRESS}");
+    crate::duckdb::run_ignored_suite(
+        "moraine",
+        "object_storage",
+        false,
+        &[],
+        &[
+            ("MORAINE_S3_ENDPOINT", endpoint.as_ref()),
+            ("MORAINE_S3_BUCKET", S3_BUCKET.as_ref()),
+        ],
+        OBJECT_STORAGE_TEST_COUNT,
+    )?;
     println!("ok: the catalog round-tripped through a real S3 endpoint");
 
     Ok(())

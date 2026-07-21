@@ -17,5 +17,8 @@ mod generated {
 }
 
 // unused_imports: consumers arrive with `catalog`/`transaction`
+// `pub` so `ffi_support` can re-export it as the ABI crate's snapshot row
+// type; reachable only through that `#[doc(hidden)]` seam.
+pub use generated::SnapshotValue;
 #[allow(unused_imports)]
 pub(crate) use generated::*;

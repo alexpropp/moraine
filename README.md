@@ -2,10 +2,8 @@
 
 [![CI](https://github.com/alexpropp/moraine/actions/workflows/ci.yml/badge.svg)](https://github.com/alexpropp/moraine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-<!-- Enable after first release:
 [![crates.io](https://img.shields.io/crates/v/moraine.svg)](https://crates.io/crates/moraine)
 [![docs.rs](https://docs.rs/moraine/badge.svg)](https://docs.rs/moraine)
--->
 
 Moraine brings a [SlateDB](https://slatedb.io) backend to
 [DuckLake](https://ducklake.select): a DuckLake catalog implemented on a
@@ -16,7 +14,7 @@ catalog database.
 > extension work end-to-end: DuckLake SQL — `CREATE`/`INSERT`/`UPDATE`/
 > `DELETE`, time travel, maintenance — runs against moraine as its catalog,
 > validated against real DuckDB in CI. Most of the v0.1 feature set (below)
-> is in. No crates.io release yet; APIs may still change.
+> is in. Released on crates.io; APIs may still change before 1.0.
 
 ## Why
 

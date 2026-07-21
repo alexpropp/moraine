@@ -16,7 +16,6 @@ async-trait = "0.1"
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
-cc = "1"
 moraine = { path = "crates/moraine", version = "0.2.0" }
 # object_store must stay on the same minor as slatedb's
 object_store = "0.14"
@@ -31,6 +30,7 @@ thiserror = "2"
 tokio = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+cbindgen = { version = "0.29", default-features = false }
 
 [workspace.lints.rust]
 missing_docs = "warn"

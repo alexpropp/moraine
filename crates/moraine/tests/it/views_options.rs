@@ -4,24 +4,10 @@
 
 use std::sync::Arc;
 
-use moraine::{Catalog, CatalogOptions, ColumnDef, Error, OptionScope, SnapshotId};
+use moraine::{Catalog, CatalogOptions, Error, OptionScope, SnapshotId};
 use object_store::memory::InMemory;
 
-fn col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-    }
-}
-
-#[allow(clippy::unwrap_used)]
-async fn open_memory() -> Catalog {
-    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap()
-}
+use crate::fixtures::{col, open_memory};
 
 /// A fresh store records the `data_path` passed at open into the global
 /// metadata, so a later attach can read the lake's data root back without

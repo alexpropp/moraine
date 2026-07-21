@@ -31,6 +31,26 @@ use arrow::{
     },
 };
 
+use crate::{
+    abi::guard,
+    error::{AbiError, MoraineError, codes},
+};
+
+/// An encode failure: the input came from DuckDB in-process, so a failure
+/// is an internal fault, not bad stored data.
+fn encode_error(message: impl std::fmt::Display) -> AbiError {
+    AbiError::new(codes::INTERNAL, format!("moraine-duckdb: arrow {message}"))
+}
+
+/// A decode failure: the bytes came from the store, so a failure means
+/// they are corrupt or written by an incompatible encoder.
+fn decode_error(message: impl std::fmt::Display) -> AbiError {
+    AbiError::new(
+        codes::CORRUPTION,
+        format!("moraine-duckdb: arrow {message}"),
+    )
+}
+
 /// A byte buffer owned by Rust and freed via [`moraine_arrow_bytes_free`].
 #[repr(C)]
 pub struct MoraineArrowBytes {
@@ -63,53 +83,6 @@ impl MoraineArrowBytes {
     }
 }
 
-/// A short status/message pair mirroring the shim's error convention.
-#[repr(C)]
-pub struct MoraineArrowError {
-    /// Non-zero on failure.
-    pub failed: i32,
-    /// Heap `CString` message (owned by this struct), or null.
-    pub message: *mut std::os::raw::c_char,
-}
-
-fn set_error(err: *mut MoraineArrowError, message: &str) -> i32 {
-    if !err.is_null() {
-        let c = std::ffi::CString::new(message.replace('\0', " "))
-            .unwrap_or_else(|_| std::ffi::CString::new("arrow ipc error").unwrap_or_default());
-        // SAFETY: `err` is a valid, writable pointer the caller supplies for
-        // every fallible entry point.
-        unsafe {
-            (*err).failed = 1;
-            (*err).message = c.into_raw();
-        }
-    }
-    1
-}
-
-fn clear_error(err: *mut MoraineArrowError) -> i32 {
-    if !err.is_null() {
-        // SAFETY: as above; on success we leave the message null.
-        unsafe {
-            (*err).failed = 0;
-            (*err).message = ptr::null_mut();
-        }
-    }
-    0
-}
-
-/// Frees a message allocated by a failed call.
-///
-/// # Safety
-/// `message` must be null or a pointer returned in [`MoraineArrowError`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_arrow_error_free(message: *mut std::os::raw::c_char) {
-    if !message.is_null() {
-        // SAFETY: caller guarantees `message` came from a `CString::into_raw`
-        // in this module and is freed once.
-        drop(unsafe { std::ffi::CString::from_raw(message) });
-    }
-}
-
 /// Frees a buffer returned by an encode call.
 ///
 /// # Safety
@@ -124,40 +97,58 @@ pub unsafe extern "C" fn moraine_arrow_bytes_free(bytes: MoraineArrowBytes) {
     }
 }
 
-fn write_ffi_result(
+/// Runs `attempt` under [`guard`] and writes the produced C Data
+/// Interface pair into the out slots.
+///
+/// # Safety
+///
+/// `out_schema`/`out_array` are valid writable slots and `err` is null or
+/// a valid, writable [`MoraineError`], all for the duration of this call.
+unsafe fn write_ffi_result(
     out_schema: *mut FFI_ArrowSchema,
     out_array: *mut FFI_ArrowArray,
-    err: *mut MoraineArrowError,
-    result: Result<(FFI_ArrowArray, FFI_ArrowSchema), String>,
+    err: *mut MoraineError,
+    attempt: impl FnOnce() -> Result<(FFI_ArrowArray, FFI_ArrowSchema), AbiError>,
 ) -> i32 {
-    match result {
+    // SAFETY: `err` forwarded unchanged under this function's contract.
+    match unsafe { guard(err, attempt) } {
         Ok((ffi_array, ffi_schema)) => {
-            // SAFETY: `out_*` are valid writable slots per the caller contract.
+            // SAFETY: `out_*` are valid writable slots per this function's
+            // contract.
             unsafe {
                 ptr::write(out_array, ffi_array);
                 ptr::write(out_schema, ffi_schema);
             }
-            clear_error(err)
+            codes::OK
         }
-        Err(e) => set_error(err, &e),
+        Err(code) => code,
     }
 }
 
-fn write_bytes_result(
+/// Runs `attempt` under [`guard`] and writes the produced buffer (or the
+/// empty buffer on failure) into `out`.
+///
+/// # Safety
+///
+/// `out` is a valid writable slot and `err` is null or a valid, writable
+/// [`MoraineError`], both for the duration of this call.
+unsafe fn write_bytes_result(
     out: *mut MoraineArrowBytes,
-    err: *mut MoraineArrowError,
-    result: Result<Vec<u8>, String>,
+    err: *mut MoraineError,
+    attempt: impl FnOnce() -> Result<Vec<u8>, AbiError>,
 ) -> i32 {
-    match result {
+    // SAFETY: `err` forwarded unchanged under this function's contract.
+    match unsafe { guard(err, attempt) } {
         Ok(buf) => {
-            // SAFETY: `out` is a valid writable slot per the caller contract.
+            // SAFETY: `out` is a valid writable slot per this function's
+            // contract.
             unsafe { ptr::write(out, MoraineArrowBytes::from_vec(buf)) };
-            clear_error(err)
+            codes::OK
         }
-        Err(e) => {
+        Err(code) => {
             // SAFETY: as above.
             unsafe { ptr::write(out, MoraineArrowBytes::empty()) };
-            set_error(err, &e)
+            code
         }
     }
 }
@@ -173,21 +164,23 @@ fn write_bytes_result(
 pub unsafe extern "C" fn moraine_arrow_encode_schema(
     schema: *mut FFI_ArrowSchema,
     out: *mut MoraineArrowBytes,
-    err: *mut MoraineArrowError,
+    err: *mut MoraineError,
 ) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let attempt = || -> Result<Vec<u8>, AbiError> {
         // SAFETY: caller cedes ownership of the exported schema.
         let schema = unsafe { consume_schema(schema) }?;
         let mut buf = Vec::new();
         {
-            let mut writer =
-                StreamWriter::try_new(&mut buf, &schema).map_err(|e| format!("writer: {e}"))?;
-            writer.finish().map_err(|e| format!("finish: {e}"))?;
+            let mut writer = StreamWriter::try_new(&mut buf, &schema)
+                .map_err(|e| encode_error(format!("writer: {e}")))?;
+            writer
+                .finish()
+                .map_err(|e| encode_error(format!("finish: {e}")))?;
         }
-        Ok::<Vec<u8>, String>(buf)
-    }))
-    .unwrap_or_else(|_| Err("panic encoding arrow schema".to_string()));
-    write_bytes_result(out, err, result)
+        Ok(buf)
+    };
+    // SAFETY: out/err validity is this function's own safety contract.
+    unsafe { write_bytes_result(out, err, attempt) }
 }
 
 /// Serializes one inlined chunk to a record-batch **body** only — the IPC
@@ -209,17 +202,17 @@ pub unsafe extern "C" fn moraine_arrow_encode_chunk(
     schema: *mut FFI_ArrowSchema,
     array: *mut FFI_ArrowArray,
     out: *mut MoraineArrowBytes,
-    err: *mut MoraineArrowError,
+    err: *mut MoraineError,
 ) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let attempt = || -> Result<Vec<u8>, AbiError> {
         if schema.is_null() || array.is_null() {
-            return Err("null schema or array".to_string());
+            return Err(AbiError::invalid_argument("null schema or array"));
         }
         // SAFETY: caller cedes ownership of both exported structs.
         let (owned_schema, owned_array) = unsafe { (ptr::read(schema), ptr::read(array)) };
         // SAFETY: `owned_array` is a valid exported array matching `owned_schema`.
         let data = unsafe { from_ffi(owned_array, &owned_schema) }
-            .map_err(|e| format!("array import: {e}"))?;
+            .map_err(|e| encode_error(format!("array import: {e}")))?;
         drop(owned_schema);
         let batch = RecordBatch::from(StructArray::from(data));
 
@@ -229,21 +222,23 @@ pub unsafe extern "C" fn moraine_arrow_encode_chunk(
         let mut context = IpcWriteContext::default();
         let (dictionaries, encoded) = generator
             .encode(&batch, &mut tracker, &options, &mut context)
-            .map_err(|e| format!("encode batch: {e}"))?;
+            .map_err(|e| encode_error(format!("encode batch: {e}")))?;
         if !dictionaries.is_empty() {
-            return Err("dictionary-encoded inline columns are not supported".to_string());
+            return Err(AbiError::invalid_argument(
+                "dictionary-encoded inline columns are not supported",
+            ));
         }
 
         let mut buf = Vec::with_capacity(4 + encoded.ipc_message.len() + encoded.arrow_data.len());
         let message_len = u32::try_from(encoded.ipc_message.len())
-            .map_err(|_| "inline chunk message too large".to_string())?;
+            .map_err(|_| encode_error("inline chunk message too large"))?;
         buf.extend_from_slice(&message_len.to_le_bytes());
         buf.extend_from_slice(&encoded.ipc_message);
         buf.extend_from_slice(&encoded.arrow_data);
-        Ok::<Vec<u8>, String>(buf)
-    }))
-    .unwrap_or_else(|_| Err("panic encoding arrow chunk".to_string()));
-    write_bytes_result(out, err, result)
+        Ok(buf)
+    };
+    // SAFETY: out/err validity is this function's own safety contract.
+    unsafe { write_bytes_result(out, err, attempt) }
 }
 
 /// Decodes a chunk body from [`moraine_arrow_encode_chunk`] against the
@@ -264,38 +259,37 @@ pub unsafe extern "C" fn moraine_arrow_decode_body(
     body_len: usize,
     out_schema: *mut FFI_ArrowSchema,
     out_array: *mut FFI_ArrowArray,
-    err: *mut MoraineArrowError,
+    err: *mut MoraineError,
 ) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let attempt = || -> Result<(FFI_ArrowArray, FFI_ArrowSchema), AbiError> {
         if schema_ipc.is_null() || body.is_null() {
-            return Err("null schema or body".to_string());
+            return Err(AbiError::invalid_argument("null schema or body"));
         }
         // SAFETY: caller guarantees `schema_ipc_len` bytes are readable at `schema_ipc`.
-        let schema_bytes =
-            unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) }.to_vec();
+        let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) };
         // SAFETY: caller guarantees `body_len` bytes are readable at `body`.
         let body_bytes = unsafe { std::slice::from_raw_parts(body, body_len) };
 
         let schema = StreamReader::try_new(Cursor::new(schema_bytes), None)
-            .map_err(|e| format!("schema reader: {e}"))?
+            .map_err(|e| decode_error(format!("schema reader: {e}")))?
             .schema();
 
         if body_bytes.len() < 4 {
-            return Err("inline chunk body truncated".to_string());
+            return Err(decode_error("inline chunk body truncated"));
         }
         let len_bytes: [u8; 4] = body_bytes[0..4]
             .try_into()
-            .map_err(|_| "inline chunk length prefix".to_string())?;
+            .map_err(|_| decode_error("inline chunk length prefix"))?;
         let message_len = u32::from_le_bytes(len_bytes) as usize;
         let message_end = 4 + message_len;
         if message_end > body_bytes.len() {
-            return Err("inline chunk body truncated".to_string());
+            return Err(decode_error("inline chunk body truncated"));
         }
         let message = root_as_message(&body_bytes[4..message_end])
-            .map_err(|e| format!("message parse: {e}"))?;
+            .map_err(|e| decode_error(format!("message parse: {e}")))?;
         let record_batch = message
             .header_as_record_batch()
-            .ok_or_else(|| "inline chunk body is not a record batch".to_string())?;
+            .ok_or_else(|| decode_error("inline chunk body is not a record batch"))?;
         let version: MetadataVersion = message.version();
         let buffer = Buffer::from_vec(body_bytes[message_end..].to_vec());
 
@@ -307,11 +301,12 @@ pub unsafe extern "C" fn moraine_arrow_decode_body(
             None,
             &version,
         )
-        .map_err(|e| format!("read batch: {e}"))?;
-        to_ffi(&StructArray::from(batch).to_data()).map_err(|e| format!("array export: {e}"))
-    }))
-    .unwrap_or_else(|_| Err("panic decoding inline chunk body".to_string()));
-    write_ffi_result(out_schema, out_array, err, result)
+        .map_err(|e| decode_error(format!("read batch: {e}")))?;
+        to_ffi(&StructArray::from(batch).to_data())
+            .map_err(|e| decode_error(format!("array export: {e}")))
+    };
+    // SAFETY: out/err validity is this function's own safety contract.
+    unsafe { write_ffi_result(out_schema, out_array, err, attempt) }
 }
 
 /// Decodes a self-contained IPC stream (from [`moraine_arrow_encode_chunk`],
@@ -328,25 +323,26 @@ pub unsafe extern "C" fn moraine_arrow_decode_stream(
     body_len: usize,
     out_schema: *mut FFI_ArrowSchema,
     out_array: *mut FFI_ArrowArray,
-    err: *mut MoraineArrowError,
+    err: *mut MoraineError,
 ) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let attempt = || -> Result<(FFI_ArrowArray, FFI_ArrowSchema), AbiError> {
         if body.is_null() {
-            return Err("null body".to_string());
+            return Err(AbiError::invalid_argument("null body"));
         }
         // SAFETY: caller guarantees `body_len` readable bytes at `body`.
-        let bytes = unsafe { std::slice::from_raw_parts(body, body_len) }.to_vec();
-        let mut reader =
-            StreamReader::try_new(Cursor::new(bytes), None).map_err(|e| format!("reader: {e}"))?;
+        let bytes = unsafe { std::slice::from_raw_parts(body, body_len) };
+        let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
+            .map_err(|e| decode_error(format!("reader: {e}")))?;
         let schema = reader.schema();
         let batch = match reader.next() {
-            Some(b) => b.map_err(|e| format!("read batch: {e}"))?,
+            Some(b) => b.map_err(|e| decode_error(format!("read batch: {e}")))?,
             None => RecordBatch::new_empty(schema),
         };
-        to_ffi(&StructArray::from(batch).to_data()).map_err(|e| format!("array export: {e}"))
-    }))
-    .unwrap_or_else(|_| Err("panic decoding arrow stream".to_string()));
-    write_ffi_result(out_schema, out_array, err, result)
+        to_ffi(&StructArray::from(batch).to_data())
+            .map_err(|e| decode_error(format!("array export: {e}")))
+    };
+    // SAFETY: out/err validity is this function's own safety contract.
+    unsafe { write_ffi_result(out_schema, out_array, err, attempt) }
 }
 
 /// Reads and takes ownership of an exported schema struct.
@@ -354,13 +350,13 @@ pub unsafe extern "C" fn moraine_arrow_decode_stream(
 /// # Safety
 /// `schema` points to a valid exported `ArrowSchema` whose ownership the
 /// caller cedes to this call.
-unsafe fn consume_schema(schema: *mut FFI_ArrowSchema) -> Result<SchemaRef, String> {
+unsafe fn consume_schema(schema: *mut FFI_ArrowSchema) -> Result<SchemaRef, AbiError> {
     if schema.is_null() {
-        return Err("null schema".to_string());
+        return Err(AbiError::invalid_argument("null schema"));
     }
     // SAFETY: caller cedes ownership of the exported struct.
     let owned = unsafe { ptr::read(schema) };
-    let schema = Schema::try_from(&owned).map_err(|e| format!("schema import: {e}"));
+    let schema = Schema::try_from(&owned).map_err(|e| encode_error(format!("schema import: {e}")));
     drop(owned);
     Ok(SchemaRef::new(schema?))
 }
@@ -382,10 +378,7 @@ mod tests {
     /// drives (schema once per version, body per chunk). The returned structs
     /// are Rust-owned and release on drop.
     fn encode_then_decode(source: &StructArray) -> (FFI_ArrowArray, FFI_ArrowSchema) {
-        let mut err = MoraineArrowError {
-            failed: 0,
-            message: ptr::null_mut(),
-        };
+        let mut err = MoraineError::default();
 
         // Schema-only stream (stored once per version as `inline/schema`).
         let batch = RecordBatch::from(source.clone());

@@ -52,3 +52,5 @@ pub mod error;
 pub mod inline;
 pub mod runtime;
 pub mod staged;
+#[cfg(test)]
+mod test_support;

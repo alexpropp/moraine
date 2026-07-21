@@ -64,60 +64,98 @@ pub(crate) enum EntityRecord {
     GcFile(GcFileValue),
 }
 
-async fn read_singleton<M: prost::Message + Default>(
-    tx: ReadHandle<'_>,
+impl EntityRecord {
+    /// The record's begin/end lifecycle; `None` for unversioned kinds,
+    /// which are live at any time-travel target.
+    pub(crate) fn lifecycle(&self) -> Option<(u64, Option<u64>)> {
+        match self {
+            Self::Schema(s) => Some((s.begin_snapshot, s.end_snapshot)),
+            Self::Table(t) => Some((t.begin_snapshot, t.end_snapshot)),
+            Self::View(v) => Some((v.begin_snapshot, v.end_snapshot)),
+            Self::Column(c) => Some((c.begin_snapshot, c.end_snapshot)),
+            Self::File(f) => Some((f.begin_snapshot, f.end_snapshot)),
+            Self::DeleteFile(d) => Some((d.begin_snapshot, d.end_snapshot)),
+            Self::Partition(p) => Some((p.begin_snapshot, p.end_snapshot)),
+            Self::Sort(s) => Some((s.begin_snapshot, s.end_snapshot)),
+            Self::Macro(m) => Some((m.begin_snapshot, m.end_snapshot)),
+            Self::Index(i) => Some((i.begin_snapshot, i.end_snapshot)),
+            Self::Mapping(_)
+            | Self::FileColumnStats(_)
+            | Self::TableStats(_)
+            | Self::TableColumnStats(_)
+            | Self::Option { .. }
+            | Self::Tag(_)
+            | Self::GcFile(_) => None,
+        }
+    }
+}
+
+/// Point read of one key, decoded, `None` when absent.
+pub(crate) async fn read_singleton<M: prost::Message + Default>(
+    handle: ReadHandle<'_>,
     key: Key,
 ) -> Result<Option<M>> {
-    tx.get(key.encode())
-        .await
-        .map_err(Error::from)?
+    handle
+        .get(key.encode())
+        .await?
         .map(|bytes| value::decode_value(&bytes))
         .transpose()
 }
 
+/// Scans every key under `prefix`, decoding each entry with `extract`;
+/// `extract` rejects keys of the wrong kind with its scan's corruption
+/// error.
+pub(crate) async fn scan_decode<T>(
+    handle: ReadHandle<'_>,
+    prefix: Vec<u8>,
+    mut extract: impl FnMut(Key, &[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut iter = handle.scan_prefix(prefix, ..).await?;
+    let mut records = Vec::new();
+    while let Some(entry) = iter.next().await? {
+        records.push(extract(Key::decode(&entry.key)?, &entry.value)?);
+    }
+
+    Ok(records)
+}
+
 /// The layout-format stamp, if the store has been initialized.
-pub(crate) async fn read_format(tx: ReadHandle<'_>) -> Result<Option<FormatValue>> {
-    read_singleton(tx, Key::Sys(SysKey::Format)).await
+pub(crate) async fn read_format(handle: ReadHandle<'_>) -> Result<Option<FormatValue>> {
+    read_singleton(handle, Key::Sys(SysKey::Format)).await
 }
 
 /// The structural-migration marker, present only mid-migration.
-pub(crate) async fn read_migration(tx: ReadHandle<'_>) -> Result<Option<MigrationValue>> {
-    read_singleton(tx, Key::Sys(SysKey::Migration)).await
+pub(crate) async fn read_migration(handle: ReadHandle<'_>) -> Result<Option<MigrationValue>> {
+    read_singleton(handle, Key::Sys(SysKey::Migration)).await
 }
 
 /// The head pointer: the latest committed snapshot id.
-pub(crate) async fn read_head(tx: ReadHandle<'_>) -> Result<Option<HeadValue>> {
-    read_singleton(tx, Key::Sys(SysKey::Head)).await
+pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue>> {
+    read_singleton(handle, Key::Sys(SysKey::Head)).await
 }
 
 /// One snapshot record.
 pub(crate) async fn read_snapshot(
-    tx: ReadHandle<'_>,
+    handle: ReadHandle<'_>,
     snapshot_id: u64,
 ) -> Result<Option<SnapshotValue>> {
-    read_singleton(tx, Key::Snapshot { snapshot_id }).await
+    read_singleton(handle, Key::Snapshot { snapshot_id }).await
 }
 
 /// Every committed snapshot record (`ducklake_snapshot` +
 /// `ducklake_snapshot_changes`, merged), in key order.
-pub(crate) async fn scan_snapshots(tx: ReadHandle<'_>) -> Result<Vec<SnapshotValue>> {
-    let mut iter = tx
-        .scan_prefix(subspace_prefix(Subspace::Snapshot), ..)
-        .await
-        .map_err(Error::from)?;
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::Snapshot { .. } => records.push(value::decode_value(&entry.value)?),
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-snapshot key in snapshot scan: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(records)
+pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<SnapshotValue>> {
+    scan_decode(
+        handle,
+        subspace_prefix(Subspace::Snapshot),
+        |key, bytes| match key {
+            Key::Snapshot { .. } => value::decode_value(bytes),
+            other => Err(Error::Corruption(format!(
+                "non-snapshot key in snapshot scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
@@ -153,67 +191,43 @@ fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
 }
 
 /// Every live entity record.
-pub(crate) async fn scan_current_entities(tx: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    let mut iter = tx
-        .scan_prefix(subspace_prefix(Subspace::Current), ..)
-        .await
-        .map_err(Error::from)?;
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::Current(CurrentKey::Entity(entity)) => {
-                records.push(decode_entity(entity, &entry.value)?);
-            }
+pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
+    scan_decode(
+        handle,
+        subspace_prefix(Subspace::Current),
+        |key, bytes| match key {
+            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
             Key::Current(CurrentKey::GcFile { .. }) => {
-                records.push(EntityRecord::GcFile(value::decode_value(&entry.value)?));
+                Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
             }
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-current key in current scan: {other:?}"
-                )));
-            }
-        }
-    }
-    Ok(records)
+            other => Err(Error::Corruption(format!(
+                "non-current key in current scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
-/// Every ended entity-version record. Unversioned kinds (statistics,
-/// options, tags) are overwritten in place and never mirrored to history;
-/// finding one there is store damage, refused rather than replayed over
+/// Every ended entity-version record. Unversioned kinds
+/// ([`EntityKey::is_versioned`]) are overwritten in place and never
+/// mirrored to history; finding one there is store damage, refused here —
+/// before any consumer, snapshot build or raw dump, could replay it over
 /// the live record.
-pub(crate) async fn scan_history_entities(tx: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    let mut iter = tx
-        .scan_prefix(subspace_prefix(Subspace::History), ..)
-        .await
-        .map_err(Error::from)?;
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::History(history) => {
-                if matches!(
-                    history.entity,
-                    EntityKey::FileColumnStats { .. }
-                        | EntityKey::TableStats { .. }
-                        | EntityKey::TableColumnStats { .. }
-                        | EntityKey::Option { .. }
-                        | EntityKey::Tag { .. }
-                ) {
-                    return Err(Error::Corruption(format!(
-                        "unversioned key in history scan: {:?}",
-                        history.entity
-                    )));
-                }
-                records.push(decode_entity(history.entity, &entry.value)?);
-            }
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-history key in history scan: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(records)
+pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
+    scan_decode(
+        handle,
+        subspace_prefix(Subspace::History),
+        |key, bytes| match key {
+            Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(
+                format!("unversioned key in history scan: {:?}", history.entity),
+            )),
+            Key::History(history) => decode_entity(history.entity, bytes),
+            other => Err(Error::Corruption(format!(
+                "non-history key in history scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -383,6 +397,50 @@ mod tests {
         tx.put(
             Key::history(EntityKey::TableStats { table_id: 7 }, 2).encode(),
             value::encode_value(&stats),
+        )
+        .unwrap();
+        tx.commit_with_options(&WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let err = scan_history_entities(ReadHandle::Tx(&tx))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "{err}");
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// Mappings are write-once and never mirrored to history; one found
+    /// there is refused like every other unversioned kind.
+    #[tokio::test]
+    async fn mapping_in_history_is_refused() {
+        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let mapping = MappingValue {
+            mapping_id: 21,
+            table_id: 4,
+            map_type: "map_by_name".into(),
+            name_mappings: vec![],
+        };
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(
+            Key::history(
+                EntityKey::Mapping {
+                    table_id: 4,
+                    mapping_id: 21,
+                },
+                2,
+            )
+            .encode(),
+            value::encode_value(&mapping),
         )
         .unwrap();
         tx.commit_with_options(&WriteOptions {

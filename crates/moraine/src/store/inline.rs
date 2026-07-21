@@ -13,6 +13,7 @@ use crate::{
         proto::{
             InlineChunkValue, InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaValue,
         },
+        read::{read_singleton, scan_decode},
         value,
     },
 };
@@ -21,170 +22,120 @@ use crate::{
 /// in key order (schema version, then commit snapshot, then chunk
 /// sequence).
 pub(crate) async fn scan_inline_chunks(
-    tx: ReadHandle<'_>,
+    handle: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(InlineOperation, InlineChunkValue)>> {
-    let mut iter = tx
-        .scan_prefix(
-            inline_live_table_prefix(InlineOperationKind::Insert, table_id),
-            ..,
-        )
-        .await
-        .map_err(Error::from)?;
-
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
+    scan_decode(
+        handle,
+        inline_live_table_prefix(InlineOperationKind::Insert, table_id),
+        |key, bytes| match key {
             Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
-                records.push((op, value::decode_value(&entry.value)?));
+                Ok((op, value::decode_value(bytes)?))
             }
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-insert key in inline chunk scan: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(records)
+            other => Err(Error::Corruption(format!(
+                "non-insert key in inline chunk scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 /// Every inlined-insert-row tombstone for `table_id`, keyed by row id.
 pub(crate) async fn scan_inline_inline_deletes(
-    tx: ReadHandle<'_>,
+    handle: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineInlineDeleteValue)>> {
-    let mut iter = tx
-        .scan_prefix(
-            inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
-            ..,
-        )
-        .await
-        .map_err(Error::from)?;
-
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
+    scan_decode(
+        handle,
+        inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
+        |key, bytes| match key {
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete { row_id, .. })) => {
-                records.push((row_id, value::decode_value(&entry.value)?));
+                Ok((row_id, value::decode_value(bytes)?))
             }
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-inline_delete key in inline inline_delete scan: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(records)
+            other => Err(Error::Corruption(format!(
+                "non-inline_delete key in inline inline_delete scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 /// Every inlined Parquet-row delete for `table_id`, keyed by
 /// `(data_file_id, row_id)`.
 pub(crate) async fn scan_inline_file_deletes(
-    tx: ReadHandle<'_>,
+    handle: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, u64, InlineFileDeleteValue)>> {
-    let mut iter = tx
-        .scan_prefix(
-            inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
-            ..,
-        )
-        .await
-        .map_err(Error::from)?;
-
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
+    scan_decode(
+        handle,
+        inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
+        |key, bytes| match key {
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 data_file_id,
                 row_id,
                 ..
-            })) => {
-                records.push((data_file_id, row_id, value::decode_value(&entry.value)?));
-            }
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-file_delete key in inline file delete scan: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(records)
+            })) => Ok((data_file_id, row_id, value::decode_value(bytes)?)),
+            other => Err(Error::Corruption(format!(
+                "non-file_delete key in inline file delete scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 /// One table's Arrow IPC schema at `schema_version`, if recorded.
 // No production caller yet; see `scan_inline_chunks`.
 #[allow(dead_code)]
 pub(crate) async fn read_inline_schema(
-    tx: ReadHandle<'_>,
+    handle: ReadHandle<'_>,
     table_id: u64,
     schema_version: u64,
 ) -> Result<Option<InlineSchemaValue>> {
-    let key = Key::Inline(InlineKey::Schema {
-        table_id,
-        schema_version,
-    })
-    .encode();
-
-    match tx.get(key).await.map_err(Error::from)? {
-        Some(bytes) => Ok(Some(value::decode_value(&bytes)?)),
-        None => Ok(None),
-    }
+    read_singleton(
+        handle,
+        Key::Inline(InlineKey::Schema {
+            table_id,
+            schema_version,
+        }),
+    )
+    .await
 }
 
 /// Every schema version recorded for `table_id`, in key order.
 pub(crate) async fn scan_inline_schemas(
-    tx: ReadHandle<'_>,
+    handle: ReadHandle<'_>,
     table_id: u64,
 ) -> Result<Vec<(u64, InlineSchemaValue)>> {
-    let mut iter = tx
-        .scan_prefix(inline_schema_table_prefix(table_id), ..)
-        .await
-        .map_err(Error::from)?;
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
+    scan_decode(
+        handle,
+        inline_schema_table_prefix(table_id),
+        |key, bytes| match key {
             Key::Inline(InlineKey::Schema { schema_version, .. }) => {
-                records.push((schema_version, value::decode_value(&entry.value)?));
+                Ok((schema_version, value::decode_value(bytes)?))
             }
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-schema key in inline schema scan: {other:?}"
-                )));
-            }
-        }
-    }
-    Ok(records)
+            other => Err(Error::Corruption(format!(
+                "non-schema key in inline schema scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 /// Every `inline/schema` record across every table, in key order
 /// (`table_id`, then `schema_version`).
 pub(crate) async fn scan_all_inline_schemas(
-    tx: ReadHandle<'_>,
+    handle: ReadHandle<'_>,
 ) -> Result<Vec<(u64, u64, InlineSchemaValue)>> {
-    let mut iter = tx
-        .scan_prefix(inline_schema_prefix(), ..)
-        .await
-        .map_err(Error::from)?;
-    let mut records = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::Inline(InlineKey::Schema {
-                table_id,
-                schema_version,
-            }) => {
-                records.push((table_id, schema_version, value::decode_value(&entry.value)?));
-            }
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-schema key in inline schema scan: {other:?}"
-                )));
-            }
-        }
-    }
-    Ok(records)
+    scan_decode(handle, inline_schema_prefix(), |key, bytes| match key {
+        Key::Inline(InlineKey::Schema {
+            table_id,
+            schema_version,
+        }) => Ok((table_id, schema_version, value::decode_value(bytes)?)),
+        other => Err(Error::Corruption(format!(
+            "non-schema key in all-table inline schema scan: {other:?}"
+        ))),
+    })
+    .await
 }
 
 #[cfg(test)]

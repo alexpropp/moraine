@@ -14,7 +14,7 @@
 //! each call reads at whatever the current head is when it runs.
 
 use crate::{
-    catalog::Catalog,
+    catalog::{Catalog, projection::ProjectionCache},
     error::Result,
     store::{
         proto::{
@@ -36,9 +36,7 @@ async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Opt
 
 /// Locks the shared projection state for reading, recovering a poisoned
 /// lock (folds never panic mid-flight, so the state is whole).
-fn projections_read(
-    catalog: &Catalog,
-) -> std::sync::RwLockReadGuard<'_, crate::catalog::projection::ProjectionCache> {
+fn projections_read(catalog: &Catalog) -> std::sync::RwLockReadGuard<'_, ProjectionCache> {
     catalog
         .projections()
         .read()
@@ -46,9 +44,7 @@ fn projections_read(
 }
 
 /// As [`projections_read`], for writing (installs).
-fn projections_write(
-    catalog: &Catalog,
-) -> std::sync::RwLockWriteGuard<'_, crate::catalog::projection::ProjectionCache> {
+fn projections_write(catalog: &Catalog) -> std::sync::RwLockWriteGuard<'_, ProjectionCache> {
     catalog
         .projections()
         .write()
@@ -56,34 +52,76 @@ fn projections_write(
 }
 
 #[doc(hidden)]
+pub mod index;
+#[doc(hidden)]
 pub mod inline;
 #[doc(hidden)]
 pub mod staged;
 
-/// Scans `current` then `history` in one transaction, keeping only the records
-/// `extract` maps to `Some` — the shared engine every *versioned*
-/// entity-kind `dump_*` function below is a thin, concretely typed
-/// wrapper over.
-async fn dump_entities<T>(
-    catalog: &Catalog,
-    extract: impl Fn(EntityRecord) -> Option<T>,
-) -> Result<Vec<T>> {
+// Re-exported so the ABI crate can name the row type its snapshot dumps
+// convert from, instead of mirroring it as an anonymous tuple.
+#[doc(hidden)]
+pub use crate::store::proto::SnapshotValue as SnapshotRecord;
+
+/// The full current+history record set at the session head, served from
+/// the maintained entity projection when its head matches; a fresh scan
+/// pair installs it otherwise. Populating DuckLake's metadata tables
+/// issues ~two dozen `dump_*` calls, and this collapses their store cost
+/// to one scan pair per head.
+async fn all_entities(catalog: &Catalog) -> Result<std::sync::Arc<Vec<EntityRecord>>> {
     let session = catalog.begin_read().await?;
+    let head = session_head(&session).await?;
+
+    let cache_at = match (catalog.maintains_projections(), head) {
+        (true, Some(head)) => {
+            if let Some(records) = projections_read(catalog).entities_at(head) {
+                session.finish();
+                return Ok(records);
+            }
+            Some(head)
+        }
+        _ => None,
+    };
+
     let current = scan_current_entities(session.handle()).await;
     let history = scan_history_entities(session.handle()).await;
     session.finish();
     let mut records = current?;
     records.extend(history?);
-    Ok(records.into_iter().filter_map(extract).collect())
+    let records = std::sync::Arc::new(records);
+    if let Some(head) = cache_at {
+        projections_write(catalog).install_entities(head, records.as_ref().clone());
+    }
+    Ok(records)
 }
 
-/// As [`dump_entities`], but `current` only — for the unversioned kinds
-/// (statistics, tags, scheduled deletions) that are overwritten in place
-/// and never mirrored to `history`, where that scan is pure waste.
+/// Scans `current` then `history` (through the entity projection),
+/// keeping only the records `extract` maps to `Some` — the shared engine
+/// every *versioned* entity-kind `dump_*` function below is a thin,
+/// concretely typed wrapper over.
+async fn dump_entities<T>(
+    catalog: &Catalog,
+    extract: impl Fn(EntityRecord) -> Option<T>,
+) -> Result<Vec<T>> {
+    let records = all_entities(catalog).await?;
+    Ok(records.iter().cloned().filter_map(extract).collect())
+}
+
+/// As [`dump_entities`], for the unversioned kinds (statistics, tags,
+/// mappings, scheduled deletions). They are overwritten in place and
+/// never mirrored to `history` — a history record of one is refused as
+/// corruption at scan — so the merged record set holds exactly their
+/// live rows and the shared entity projection serves them too. A
+/// read-only catalog (no projections) scans `current` only, where the
+/// history scan would be pure waste.
 async fn dump_current_entities<T>(
     catalog: &Catalog,
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
+    if catalog.maintains_projections() {
+        return dump_entities(catalog, extract).await;
+    }
+
     let session = catalog.begin_read().await?;
     let current = scan_current_entities(session.handle()).await;
     session.finish();
@@ -137,7 +175,7 @@ pub async fn dump_macros(catalog: &Catalog) -> Result<Vec<MacroValue>> {
 /// rows.
 #[doc(hidden)]
 pub async fn dump_mappings(catalog: &Catalog) -> Result<Vec<MappingValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_current_entities(catalog, |r| match r {
         EntityRecord::Mapping(m) => Some(m),
         _ => None,
     })
@@ -196,40 +234,54 @@ pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
     .await
 }
 
+/// Scans `current` for one unversioned kind, serving and maintaining the
+/// projection cache: rows come from the projection when its head matches,
+/// and a scan on a miss installs them for the next call.
+async fn dump_projected_current<T: Clone>(
+    catalog: &Catalog,
+    read: impl Fn(&ProjectionCache, u64) -> Option<Vec<T>>,
+    install: impl Fn(&mut ProjectionCache, u64, Vec<T>),
+    extract: impl Fn(EntityRecord) -> Option<T>,
+) -> Result<Vec<T>> {
+    let session = catalog.begin_read().await?;
+    let head = session_head(&session).await?;
+
+    let cache_at = match (catalog.maintains_projections(), head) {
+        (true, Some(head)) => {
+            if let Some(rows) = read(&projections_read(catalog), head) {
+                session.finish();
+                return Ok(rows);
+            }
+            Some(head)
+        }
+        _ => None,
+    };
+
+    let current = scan_current_entities(session.handle()).await;
+    session.finish();
+    let rows: Vec<T> = current?.into_iter().filter_map(extract).collect();
+    if let Some(head) = cache_at {
+        install(&mut projections_write(catalog), head, rows.clone());
+    }
+    Ok(rows)
+}
+
 /// Every `ducklake_table_stats` row. Unversioned (overwritten in place,
 /// never mirrored to history), so this is always exactly the live rows.
 /// Served from the maintained projection when its head matches; a fresh
 /// scan installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>> {
-    let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
-    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).table_stats_at(head) {
-            session.finish();
-            return Ok(rows);
-        }
-        let current = scan_current_entities(session.handle()).await;
-        session.finish();
-        let rows: Vec<TableStatsValue> = current?
-            .into_iter()
-            .filter_map(|r| match r {
-                EntityRecord::TableStats(v) => Some(v),
-                _ => None,
-            })
-            .collect();
-        projections_write(catalog).install_table_stats(head, rows.clone());
-        return Ok(rows);
-    }
-    let current = scan_current_entities(session.handle()).await;
-    session.finish();
-    Ok(current?
-        .into_iter()
-        .filter_map(|r| match r {
+    dump_projected_current(
+        catalog,
+        ProjectionCache::table_stats_at,
+        ProjectionCache::install_table_stats,
+        |r| match r {
             EntityRecord::TableStats(v) => Some(v),
             _ => None,
-        })
-        .collect())
+        },
+    )
+    .await
 }
 
 /// Every `ducklake_table_column_stats` row. Unversioned, as
@@ -237,34 +289,16 @@ pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>>
 /// same way.
 #[doc(hidden)]
 pub async fn dump_table_column_stats(catalog: &Catalog) -> Result<Vec<TableColumnStatsValue>> {
-    let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
-    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).table_column_stats_at(head) {
-            session.finish();
-            return Ok(rows);
-        }
-        let current = scan_current_entities(session.handle()).await;
-        session.finish();
-        let rows: Vec<TableColumnStatsValue> = current?
-            .into_iter()
-            .filter_map(|r| match r {
-                EntityRecord::TableColumnStats(v) => Some(v),
-                _ => None,
-            })
-            .collect();
-        projections_write(catalog).install_table_column_stats(head, rows.clone());
-        return Ok(rows);
-    }
-    let current = scan_current_entities(session.handle()).await;
-    session.finish();
-    Ok(current?
-        .into_iter()
-        .filter_map(|r| match r {
+    dump_projected_current(
+        catalog,
+        ProjectionCache::table_column_stats_at,
+        ProjectionCache::install_table_column_stats,
+        |r| match r {
             EntityRecord::TableColumnStats(v) => Some(v),
             _ => None,
-        })
-        .collect())
+        },
+    )
+    .await
 }
 
 /// Every `ducklake_file_column_stats` row. Unversioned, as
@@ -448,6 +482,247 @@ pub async fn dump_column_tags(catalog: &Catalog) -> Result<Vec<ColumnTagRow>> {
                 key: t.key.clone(),
                 value: t.value.clone(),
             })
+        })
+        .collect())
+}
+
+/// One `ducklake_macro_impl` row, flattened from its macro's record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroImplRow {
+    /// The owning macro.
+    pub macro_id: u64,
+    /// Implementation id within the macro.
+    pub impl_id: u64,
+    /// SQL dialect the implementation targets.
+    pub dialect: String,
+    /// Implementation body.
+    pub sql: String,
+    /// `"scalar"` or `"table"`.
+    pub macro_type: String,
+}
+
+/// Every `ducklake_macro_impl` row, current and history.
+#[doc(hidden)]
+pub async fn dump_macro_impl_rows(catalog: &Catalog) -> Result<Vec<MacroImplRow>> {
+    Ok(dump_macros(catalog)
+        .await?
+        .into_iter()
+        .flat_map(|value| {
+            let macro_id = value.macro_id;
+            value
+                .implementations
+                .into_iter()
+                .map(move |implementation| MacroImplRow {
+                    macro_id,
+                    impl_id: implementation.impl_id,
+                    dialect: implementation.dialect,
+                    sql: implementation.sql,
+                    macro_type: implementation.macro_type,
+                })
+        })
+        .collect())
+}
+
+/// One `ducklake_macro_parameters` row, flattened from its macro's
+/// record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroParameterRow {
+    /// The owning macro.
+    pub macro_id: u64,
+    /// The owning implementation.
+    pub impl_id: u64,
+    /// Parameter position.
+    pub column_id: u64,
+    /// Parameter name.
+    pub parameter_name: String,
+    /// Parameter type.
+    pub parameter_type: String,
+    /// Default value, if declared.
+    pub default_value: Option<String>,
+    /// Type of the default value.
+    pub default_value_type: String,
+}
+
+/// Every `ducklake_macro_parameters` row, current and history.
+#[doc(hidden)]
+pub async fn dump_macro_parameter_rows(catalog: &Catalog) -> Result<Vec<MacroParameterRow>> {
+    Ok(dump_macros(catalog)
+        .await?
+        .into_iter()
+        .flat_map(|value| {
+            let macro_id = value.macro_id;
+            value.implementations.into_iter().flat_map(move |i| {
+                let impl_id = i.impl_id;
+                i.parameters.into_iter().map(move |p| MacroParameterRow {
+                    macro_id,
+                    impl_id,
+                    column_id: p.column_id,
+                    parameter_name: p.parameter_name,
+                    parameter_type: p.parameter_type,
+                    default_value: p.default_value,
+                    default_value_type: p.default_value_type,
+                })
+            })
+        })
+        .collect())
+}
+
+/// One `ducklake_name_mapping` row, flattened from its mapping's record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameMappingRow {
+    /// The owning column mapping.
+    pub mapping_id: u64,
+    /// The mapped column.
+    pub column_id: u64,
+    /// Source name in the file.
+    pub source_name: String,
+    /// Target field id.
+    pub target_field_id: u64,
+    /// Parent column for nested fields, if any.
+    pub parent_column: Option<u64>,
+    /// Whether the source column is a partition column.
+    pub is_partition: bool,
+}
+
+/// Every `ducklake_name_mapping` row (mappings are unversioned).
+#[doc(hidden)]
+pub async fn dump_name_mapping_rows(catalog: &Catalog) -> Result<Vec<NameMappingRow>> {
+    Ok(dump_mappings(catalog)
+        .await?
+        .into_iter()
+        .flat_map(|value| {
+            let mapping_id = value.mapping_id;
+            value
+                .name_mappings
+                .into_iter()
+                .map(move |row| NameMappingRow {
+                    mapping_id,
+                    column_id: row.column_id,
+                    source_name: row.source_name,
+                    target_field_id: row.target_field_id,
+                    parent_column: row.parent_column,
+                    is_partition: row.is_partition,
+                })
+        })
+        .collect())
+}
+
+/// One `ducklake_partition_column` row, flattened from its spec's record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionColumnRow {
+    /// The owning partition spec.
+    pub partition_id: u64,
+    /// The spec's table.
+    pub table_id: u64,
+    /// Position within the partition key.
+    pub partition_key_index: u64,
+    /// The partitioning column.
+    pub column_id: u64,
+    /// Partition transform.
+    pub transform: String,
+}
+
+/// Every `ducklake_partition_column` row, current and history.
+#[doc(hidden)]
+pub async fn dump_partition_column_rows(catalog: &Catalog) -> Result<Vec<PartitionColumnRow>> {
+    Ok(dump_partition_info(catalog)
+        .await?
+        .into_iter()
+        .flat_map(|spec| {
+            let (partition_id, table_id) = (spec.partition_id, spec.table_id);
+            spec.columns
+                .into_iter()
+                .map(move |column| PartitionColumnRow {
+                    partition_id,
+                    table_id,
+                    partition_key_index: column.partition_key_index,
+                    column_id: column.column_id,
+                    transform: column.transform,
+                })
+        })
+        .collect())
+}
+
+/// One `ducklake_file_partition_value` row, flattened from its file's
+/// record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePartitionValueRow {
+    /// The owning data file.
+    pub data_file_id: u64,
+    /// The file's table.
+    pub table_id: u64,
+    /// Position within the partition key.
+    pub partition_key_index: u64,
+    /// The value, rendered as text.
+    pub partition_value: String,
+}
+
+/// Every `ducklake_file_partition_value` row, current and history.
+#[doc(hidden)]
+pub async fn dump_file_partition_value_rows(
+    catalog: &Catalog,
+) -> Result<Vec<FilePartitionValueRow>> {
+    Ok(dump_data_files(catalog)
+        .await?
+        .into_iter()
+        .flat_map(|file| {
+            let (data_file_id, table_id) = (file.data_file_id, file.table_id);
+            file.partition_values
+                .into_iter()
+                .map(move |value| FilePartitionValueRow {
+                    data_file_id,
+                    table_id,
+                    partition_key_index: value.partition_key_index,
+                    partition_value: value.partition_value,
+                })
+        })
+        .collect())
+}
+
+/// One `ducklake_sort_expression` row, flattened from its spec's record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortExpressionRow {
+    /// The owning sort spec.
+    pub sort_id: u64,
+    /// The spec's table.
+    pub table_id: u64,
+    /// Position within the sort key.
+    pub sort_key_index: u64,
+    /// The sort expression.
+    pub expression: String,
+    /// SQL dialect of the expression.
+    pub dialect: String,
+    /// `ASC`/`DESC`.
+    pub sort_direction: String,
+    /// Null ordering.
+    pub null_order: String,
+}
+
+/// Every `ducklake_sort_expression` row, current and history.
+#[doc(hidden)]
+pub async fn dump_sort_expression_rows(catalog: &Catalog) -> Result<Vec<SortExpressionRow>> {
+    Ok(dump_sort_info(catalog)
+        .await?
+        .into_iter()
+        .flat_map(|spec| {
+            let (sort_id, table_id) = (spec.sort_id, spec.table_id);
+            spec.expressions
+                .into_iter()
+                .map(move |expression| SortExpressionRow {
+                    sort_id,
+                    table_id,
+                    sort_key_index: expression.sort_key_index,
+                    expression: expression.expression,
+                    dialect: expression.dialect,
+                    sort_direction: expression.sort_direction,
+                    null_order: expression.null_order,
+                })
         })
         .collect())
 }

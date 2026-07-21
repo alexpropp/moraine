@@ -1,58 +1,9 @@
 //! Concurrent-commit behavior through the public API: benign races
 //! retry internally; true conflicts surface typed.
 
-use std::sync::Arc;
+use moraine::Error;
 
-use moraine::{Catalog, CatalogOptions, ColumnDef, DataFile, Error, SchemaId, TableId};
-use object_store::memory::InMemory;
-
-fn col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-    }
-}
-
-fn datafile(rows: u64) -> DataFile {
-    DataFile {
-        path: format!("data-{rows}.parquet"),
-        path_is_relative: true,
-        file_format: "parquet".into(),
-        record_count: rows,
-        file_size_bytes: rows * 10,
-        footer_size: 4,
-        encryption_key: None,
-        column_stats: vec![],
-    }
-}
-
-/// Opens a catalog pre-seeded with two tables in one schema.
-///
-/// Test-only helper: `unwrap_used` is a library-code lint, not exempted
-/// automatically for a plain (non-`#[test]`) function even in an
-/// integration-test crate.
-#[allow(clippy::unwrap_used)]
-async fn seeded() -> (Catalog, SchemaId, TableId, TableId) {
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap();
-    catalog
-        .commit(|tx| {
-            let s = tx.create_schema("s")?;
-            tx.create_table(s, "a", &[col("x")])?;
-            tx.create_table(s, "b", &[col("x")])?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let snapshot = catalog.snapshot().await.unwrap();
-    let s = snapshot.schema_by_name("s").unwrap().id;
-    let a = snapshot.table_by_name(s, "a").unwrap().id;
-    let b = snapshot.table_by_name(s, "b").unwrap().id;
-    (catalog, s, a, b)
-}
+use crate::fixtures::{col, datafile, seeded};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn disjoint_table_ddl_both_succeed() {

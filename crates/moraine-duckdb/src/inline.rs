@@ -20,6 +20,7 @@ use moraine::ffi_support::inline::InlineScanKind;
 
 use crate::{
     abi::{free_array, guard, write_array},
+    dumps::opt_u64,
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
@@ -58,9 +59,10 @@ unsafe fn free_owned_bytes(ptr: *mut u8, len: usize) {
     drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
 }
 
-/// One inlined row, as returned by [`moraine_inline_scan`]. `chunk_body`
-/// is the owning chunk's full Arrow IPC record-batch body; the shim decodes
-/// it and reads the row at `offset_in_chunk`.
+/// One inlined row, as returned by [`moraine_inline_scan`]: `chunk_index`
+/// names the owning chunk in the scan's parallel [`MoraineInlineChunk`]
+/// array, so the shim decodes each chunk once and reads the row at
+/// `offset_in_chunk`.
 #[repr(C)]
 pub struct MoraineInlineRow {
     /// The row's dense id.
@@ -75,12 +77,20 @@ pub struct MoraineInlineRow {
     pub has_end_snapshot: bool,
     /// `end_snapshot`, valid iff `has_end_snapshot`.
     pub end_snapshot: u64,
-    /// The owning chunk's full Arrow IPC record-batch body, owned.
-    pub chunk_body: *mut u8,
-    /// `chunk_body`'s length in bytes.
-    pub chunk_body_len: usize,
-    /// The row's offset within `chunk_body`.
+    /// The owning chunk: an index into the scan's chunk array.
+    pub chunk_index: usize,
+    /// The row's offset within its chunk.
     pub offset_in_chunk: u64,
+}
+
+/// One referenced chunk's full Arrow IPC record-batch body, owned —
+/// returned once per chunk however many rows reference it.
+#[repr(C)]
+pub struct MoraineInlineChunk {
+    /// The chunk's Arrow IPC record-batch body, owned.
+    pub body: *mut u8,
+    /// `body`'s length in bytes.
+    pub body_len: usize,
 }
 
 /// Materializes `table_id`'s inlined rows and selects the `scan_kind`
@@ -89,11 +99,10 @@ pub struct MoraineInlineRow {
 /// `start` for the incremental variants (ignored by `SCAN_TABLE`/
 /// `SCAN_FOR_FLUSH`).
 ///
-/// Cancellable: races the core read
-/// against [`moraine_interrupt`](crate::abi::moraine_interrupt)'s signal
-/// and against `probe` (polled immediately, then ~100 ms; a null `probe`
-/// disables polling). If a cancellation wins, returns
-/// [`codes::INTERRUPTED`] and the out-params are left unwritten.
+/// Cancellable: races the core read against `probe` (polled immediately,
+/// then ~100 ms; a null `probe` disables polling). If a cancellation
+/// wins, returns [`codes::INTERRUPTED`] and the out-params are left
+/// unwritten.
 ///
 /// # Safety
 ///
@@ -112,15 +121,21 @@ pub unsafe extern "C" fn moraine_inline_scan(
     start: u64,
     out_items: *mut *mut MoraineInlineRow,
     out_len: *mut usize,
+    out_chunks: *mut *mut MoraineInlineChunk,
+    out_chunks_len: *mut usize,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineInlineRow>, AbiError> {
+    let attempt = || -> Result<(Vec<MoraineInlineRow>, Vec<MoraineInlineChunk>), AbiError> {
         if handle.is_null() {
             return Err(AbiError::invalid_argument("`handle` is null"));
         }
-        if out_items.is_null() || out_len.is_null() {
+        if out_items.is_null()
+            || out_len.is_null()
+            || out_chunks.is_null()
+            || out_chunks_len.is_null()
+        {
             return Err(AbiError::invalid_argument("output pointer is null"));
         }
         let kind = decode_scan_kind(scan_kind)?;
@@ -128,7 +143,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
         let handle_ref = unsafe { &*handle };
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
-        let rows = unsafe {
+        let record = unsafe {
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
@@ -141,50 +156,70 @@ pub unsafe extern "C" fn moraine_inline_scan(
                 ),
             )
         }?;
-        Ok(rows
+        let rows = record
+            .rows
             .into_iter()
             .map(|row| {
-                let (has_end_snapshot, end_snapshot) =
-                    row.end_snapshot.map_or((false, 0), |v| (true, v));
-                let (chunk_body, chunk_body_len) = into_owned_bytes(row.chunk_body);
-                MoraineInlineRow {
+                let (has_end_snapshot, end_snapshot) = opt_u64(row.end_snapshot);
+                let chunk_index = usize::try_from(row.chunk_index).map_err(|_| {
+                    AbiError::invalid_argument("inline scan chunk index exceeds usize")
+                })?;
+                Ok(MoraineInlineRow {
                     row_id: row.row_id,
                     schema_version: row.schema_version,
                     begin_snapshot: row.begin_snapshot,
                     has_end_snapshot,
                     end_snapshot,
-                    chunk_body,
-                    chunk_body_len,
+                    chunk_index,
                     offset_in_chunk: row.offset_in_chunk,
-                }
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>, AbiError>>()?;
+        let chunks = record
+            .chunk_bodies
+            .into_iter()
+            .map(|body| {
+                let (body, body_len) = into_owned_bytes(body);
+                MoraineInlineChunk { body, body_len }
+            })
+            .collect();
+        Ok((rows, chunks))
     };
 
     // SAFETY: `err` validity is this function's own safety contract.
     match unsafe { guard(err, attempt) } {
-        Ok(items) => {
+        Ok((items, chunks)) => {
             // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
+            unsafe {
+                write_array(items, out_items, out_len);
+                write_array(chunks, out_chunks, out_chunks_len);
+            }
             codes::OK
         }
         Err(code) => code,
     }
 }
 
-/// Frees an array returned by [`moraine_inline_scan`].
+/// Frees the row and chunk arrays returned by [`moraine_inline_scan`].
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pointer and length written by a
-/// matching [`moraine_inline_scan`] call, not yet freed.
+/// `items`/`len` and `chunks`/`chunks_len` must be exactly the pointers
+/// and lengths written by one matching [`moraine_inline_scan`] call, not
+/// yet freed.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moraine_inline_scan_free(items: *mut MoraineInlineRow, len: usize) {
+pub unsafe extern "C" fn moraine_inline_scan_free(
+    items: *mut MoraineInlineRow,
+    len: usize,
+    chunks: *mut MoraineInlineChunk,
+    chunks_len: usize,
+) {
     let attempt = || {
         // SAFETY: caller contract above.
         unsafe {
-            free_array(items, len, |d| {
-                free_owned_bytes(d.chunk_body, d.chunk_body_len);
+            free_array(items, len, |_row| {});
+            free_array(chunks, chunks_len, |c| {
+                free_owned_bytes(c.body, c.body_len);
             });
         }
     };
@@ -513,153 +548,20 @@ pub unsafe extern "C" fn moraine_inline_file_deletes_free(
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, ptr};
+    use std::ptr;
 
     use super::*;
     use crate::{
-        abi::{moraine_attach, moraine_detach},
+        abi::moraine_detach,
         staged::{
-            MoraineCell, MoraineTxHandle, moraine_tx_begin, moraine_tx_commit, moraine_tx_stage,
-            moraine_tx_stage_inline_flush_delete, moraine_tx_stage_inline_inline_delete,
-            moraine_tx_stage_inline_insert, moraine_tx_stage_inline_schema,
+            MoraineTxHandle, moraine_tx_stage_inline_flush_delete,
+            moraine_tx_stage_inline_inline_delete, moraine_tx_stage_inline_insert,
+            moraine_tx_stage_inline_schema,
+        },
+        test_support::{
+            StrArena, TempDir, attach_ok, begin, commit, i64_cell, null_cell, stage, u64_cell,
         },
     };
-
-    struct TempDir(std::path::PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "moraine-duckdb-inline-{tag}-{}-{n}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).expect("test setup: create temp dir");
-            Self(dir)
-        }
-
-        fn c_path(&self) -> CString {
-            CString::new(self.0.to_str().expect("test path is UTF-8")).expect("no NUL in path")
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn attach_ok(dir: &TempDir) -> *mut MoraineCatalogHandle {
-        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
-        let mut err = MoraineError::default();
-        let c_path = dir.c_path();
-        // SAFETY: `c_path` is a valid C string; outputs are valid local slots.
-        let code = unsafe {
-            moraine_attach(
-                c_path.as_ptr(),
-                ptr::null(),
-                false,
-                false,
-                0,
-                ptr::null(),
-                ptr::null(),
-                &raw mut handle,
-                &raw mut err,
-            )
-        };
-        assert_eq!(code, codes::OK);
-        handle
-    }
-
-    fn begin(handle: *mut MoraineCatalogHandle) -> *mut MoraineTxHandle {
-        let mut tx: *mut MoraineTxHandle = ptr::null_mut();
-        let mut err = MoraineError::default();
-        // SAFETY: `handle` is attached; outputs are valid local slots.
-        let code =
-            unsafe { moraine_tx_begin(handle, &raw mut tx, None, ptr::null_mut(), &raw mut err) };
-        // SAFETY: `err.message` is null or was just written by `moraine_tx_begin`.
-        assert_eq!(code, codes::OK, "begin failed: {:?}", unsafe {
-            err.message.as_ref()
-        });
-        tx
-    }
-
-    fn u64_cell(v: u64) -> MoraineCell {
-        MoraineCell {
-            kind: 1,
-            u64_value: v,
-            i64_value: 0,
-            bool_value: false,
-            str_value: ptr::null(),
-        }
-    }
-
-    fn i64_cell(v: i64) -> MoraineCell {
-        MoraineCell {
-            kind: 2,
-            u64_value: 0,
-            i64_value: v,
-            bool_value: false,
-            str_value: ptr::null(),
-        }
-    }
-
-    fn null_cell() -> MoraineCell {
-        MoraineCell {
-            kind: 0,
-            u64_value: 0,
-            i64_value: 0,
-            bool_value: false,
-            str_value: ptr::null(),
-        }
-    }
-
-    struct StrArena(Vec<CString>);
-
-    impl StrArena {
-        fn new() -> Self {
-            Self(Vec::new())
-        }
-
-        fn cell(&mut self, s: &str) -> MoraineCell {
-            let c = CString::new(s).expect("test string has no NUL");
-            let ptr = c.as_ptr();
-            self.0.push(c);
-            MoraineCell {
-                kind: 4,
-                u64_value: 0,
-                i64_value: 0,
-                bool_value: false,
-                str_value: ptr,
-            }
-        }
-    }
-
-    fn stage(
-        tx: *mut MoraineTxHandle,
-        table_kind: i32,
-        operation_kind: i32,
-        cells: &[MoraineCell],
-    ) {
-        let mut err = MoraineError::default();
-        // SAFETY: `tx` is a live handle; `cells` is a valid slice for the
-        // duration of this call.
-        let code = unsafe {
-            moraine_tx_stage(
-                tx,
-                table_kind,
-                operation_kind,
-                cells.as_ptr(),
-                cells.len(),
-                &raw mut err,
-            )
-        };
-        // SAFETY: `err.message` is null or was just written by `moraine_tx_stage`.
-        assert_eq!(code, codes::OK, "stage failed: {:?}", unsafe {
-            err.message.as_ref()
-        });
-    }
 
     /// Stages the `ducklake_snapshot` + `ducklake_snapshot_changes` pair
     /// every commit needs, regardless of what else is staged alongside it.
@@ -690,18 +592,6 @@ mod tests {
         );
     }
 
-    fn commit(tx: *mut MoraineTxHandle) -> u64 {
-        let mut id: u64 = 0;
-        let mut err = MoraineError::default();
-        // SAFETY: `tx` is live; outputs are valid local slots.
-        let code = unsafe { moraine_tx_commit(tx, &raw mut id, &raw mut err) };
-        // SAFETY: `err.message` is null or was just written by `moraine_tx_commit`.
-        assert_eq!(code, codes::OK, "commit failed: {:?}", unsafe {
-            err.message.as_ref()
-        });
-        id
-    }
-
     /// One representative inline read pins the pull channel for the
     /// family — every inline read routes through the same cancellable
     /// bridge.
@@ -715,7 +605,7 @@ mod tests {
         }
 
         let dir = TempDir::new("probe-inline");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
 
         let mut items: *mut MoraineInlineTableRow = ptr::null_mut();
         let mut len: usize = 0;
@@ -772,7 +662,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn stage_scan_inline_delete_and_flush_delete_over_the_abi() {
         let dir = TempDir::new("scan");
-        let handle = attach_ok(&dir);
+        let handle = attach_ok(dir.path());
 
         let tx = begin(handle);
         let mut arena = StrArena::new();
@@ -814,6 +704,8 @@ mod tests {
 
         let mut rows: *mut MoraineInlineRow = ptr::null_mut();
         let mut len: usize = 0;
+        let mut chunks: *mut MoraineInlineChunk = ptr::null_mut();
+        let mut chunks_len: usize = 0;
         let mut scan_err = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
@@ -825,6 +717,8 @@ mod tests {
                 0,
                 &raw mut rows,
                 &raw mut len,
+                &raw mut chunks,
+                &raw mut chunks_len,
                 None,
                 ptr::null_mut(),
                 &raw mut scan_err,
@@ -838,14 +732,18 @@ mod tests {
         assert_eq!(slice[0].begin_snapshot, 1);
         assert!(!slice[0].has_end_snapshot);
         assert_eq!(slice[0].offset_in_chunk, 0);
-        // SAFETY: just populated above.
-        let body_bytes =
-            unsafe { std::slice::from_raw_parts(slice[0].chunk_body, slice[0].chunk_body_len) };
+        // Both rows reference the one chunk, whose body crossed once.
+        assert_eq!(chunks_len, 1);
+        assert_eq!(slice[0].chunk_index, 0);
+        // SAFETY: just populated above with `chunks_len` live elements.
+        let chunk = unsafe { &*chunks };
+        // SAFETY: `chunk` was just populated with `body_len` live bytes.
+        let body_bytes = unsafe { std::slice::from_raw_parts(chunk.body, chunk.body_len) };
         assert_eq!(body_bytes, body);
         assert_eq!(slice[1].row_id, 1);
         assert_eq!(slice[1].offset_in_chunk, 1);
         // SAFETY: matching allocator, not yet freed.
-        unsafe { moraine_inline_scan_free(rows, len) };
+        unsafe { moraine_inline_scan_free(rows, len, chunks, chunks_len) };
 
         let mut schema_rows: *mut MoraineInlineSchemaRow = ptr::null_mut();
         let mut schema_len: usize = 0;
@@ -921,6 +819,8 @@ mod tests {
 
         let mut rows2: *mut MoraineInlineRow = ptr::null_mut();
         let mut len2: usize = 0;
+        let mut chunks2: *mut MoraineInlineChunk = ptr::null_mut();
+        let mut chunks_len2: usize = 0;
         let mut scan_err2 = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
@@ -932,6 +832,8 @@ mod tests {
                 0,
                 &raw mut rows2,
                 &raw mut len2,
+                &raw mut chunks2,
+                &raw mut chunks_len2,
                 None,
                 ptr::null_mut(),
                 &raw mut scan_err2,
@@ -944,7 +846,7 @@ mod tests {
             assert_eq!((*rows2).row_id, 1);
         }
         // SAFETY: matching allocator, not yet freed.
-        unsafe { moraine_inline_scan_free(rows2, len2) };
+        unsafe { moraine_inline_scan_free(rows2, len2, chunks2, chunks_len2) };
 
         // Flush: every chunk begun at or before snapshot 2 is removed,
         // along with its consumed inline delete.
@@ -960,6 +862,8 @@ mod tests {
 
         let mut rows3: *mut MoraineInlineRow = ptr::null_mut();
         let mut len3: usize = 0;
+        let mut chunks3: *mut MoraineInlineChunk = ptr::null_mut();
+        let mut chunks_len3: usize = 0;
         let mut scan_err3 = MoraineError::default();
         // SAFETY: `handle` is attached; outputs are valid local slots.
         let code = unsafe {
@@ -971,6 +875,8 @@ mod tests {
                 0,
                 &raw mut rows3,
                 &raw mut len3,
+                &raw mut chunks3,
+                &raw mut chunks_len3,
                 None,
                 ptr::null_mut(),
                 &raw mut scan_err3,
@@ -980,7 +886,7 @@ mod tests {
         assert_eq!(len3, 0, "flushed chunk must be gone from the scan");
         // SAFETY: matching allocator (empty, but still owned per the
         // `write_array` contract), not yet freed.
-        unsafe { moraine_inline_scan_free(rows3, len3) };
+        unsafe { moraine_inline_scan_free(rows3, len3, chunks3, chunks_len3) };
 
         let mut table_rows2: *mut MoraineInlineTableRow = ptr::null_mut();
         let mut table_len2: usize = 0;
@@ -1007,34 +913,5 @@ mod tests {
         // SAFETY: `handle` came from `attach_ok` above and is detached
         // exactly once.
         unsafe { moraine_detach(handle) };
-    }
-
-    /// `cpp/moraine_abi.h` is a hand-written C mirror, kept in lockstep by
-    /// hand (see `crate::abi`'s identical test). Checks textual presence
-    /// of each symbol/struct name only.
-    #[test]
-    fn header_declares_every_inline_read_symbol() {
-        let header = include_str!("../cpp/moraine_abi.h");
-        let names = [
-            "moraine_inline_scan",
-            "moraine_inline_scan_free",
-            "moraine_inline_schemas",
-            "moraine_inline_schemas_free",
-            "moraine_inline_registered_tables",
-            "moraine_inline_registered_tables_free",
-            "moraine_inline_file_delete_table_exists",
-            "moraine_inline_file_deletes",
-            "moraine_inline_file_deletes_free",
-            "MoraineInlineRow",
-            "MoraineInlineSchemaRow",
-            "MoraineInlineTableRow",
-        ];
-        for name in names {
-            assert!(
-                header.contains(name),
-                "cpp/moraine_abi.h is missing `{name}`, declared in src/inline.rs — \
-                 the two must be kept in lockstep by hand"
-            );
-        }
     }
 }

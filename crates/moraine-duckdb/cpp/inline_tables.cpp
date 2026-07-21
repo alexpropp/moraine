@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <optional>
 
 namespace moraine_duckdb {
 
@@ -38,20 +39,6 @@ duckdb::Value OptBigint(bool has, uint64_t v) {
 
 uint64_t CellAsU64(const duckdb::Value &v) {
 	return static_cast<uint64_t>(v.GetValue<int64_t>());
-}
-
-// Raises a `MoraineArrowError` returned by the Rust IPC bridge as a DuckDB
-// exception, consuming and freeing its message. `context_msg` names the
-// operation for the surfaced text.
-[[noreturn]] void ThrowArrowError(MoraineArrowError &err, const char *context_msg) {
-	std::string message = context_msg;
-	if (err.message) {
-		message += ": ";
-		message += err.message;
-		moraine_arrow_error_free(err.message);
-		err.message = nullptr;
-	}
-	throw duckdb::InternalException(std::string("moraine: ") + message);
 }
 
 } // namespace
@@ -149,10 +136,10 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 	duckdb::ArrowConverter::ToArrowSchema(&c_schema, types, names, options);
 
 	MoraineArrowBytes bytes {};
-	MoraineArrowError err {};
+	MoraineError err {};
 	// Consumes `c_schema` (releases DuckDB's buffers); do not release it here.
 	if (moraine_arrow_encode_schema(&c_schema, &bytes, &err) != 0) {
-		ThrowArrowError(err, "encoding inline schema");
+		ThrowMoraineError(err);
 	}
 	std::vector<uint8_t> out(bytes.data, bytes.data + bytes.len);
 	moraine_arrow_bytes_free(bytes);
@@ -162,9 +149,9 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &context, const uint8_t *data, size_t len) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
-	MoraineArrowError err {};
+	MoraineError err {};
 	if (moraine_arrow_decode_stream(data, len, &c_schema, &c_array, &err) != 0) {
-		ThrowArrowError(err, "decoding inline schema");
+		ThrowMoraineError(err);
 	}
 	// A schema-only stream still yields a (zero-row) array; release it.
 	if (c_array.release) {
@@ -219,10 +206,10 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	duckdb::ArrowConverter::ToArrowArray(user_chunk, &c_array, options, {});
 
 	MoraineArrowBytes bytes {};
-	MoraineArrowError err {};
+	MoraineError err {};
 	// Consumes both `c_schema` and `c_array`; do not release them here.
 	if (moraine_arrow_encode_chunk(&c_schema, &c_array, &bytes, &err) != 0) {
-		ThrowArrowError(err, "encoding inline chunk");
+		ThrowMoraineError(err);
 	}
 	std::vector<uint8_t> out(bytes.data, bytes.data + bytes.len);
 	moraine_arrow_bytes_free(bytes);
@@ -234,9 +221,9 @@ std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientCont
                                                               const std::vector<duckdb::LogicalType> &user_types) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
-	MoraineArrowError err {};
+	MoraineError err {};
 	if (moraine_arrow_decode_body(schema_ipc, schema_ipc_len, data, len, &c_schema, &c_array, &err) != 0) {
-		ThrowArrowError(err, "decoding inline chunk");
+		ThrowMoraineError(err);
 	}
 
 	// Build a per-column `ArrowType` map from the stream's own embedded schema.
@@ -352,24 +339,47 @@ std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientCont
 		                                static_cast<unsigned long long>(schema_version));
 	}
 
-	OwnedArray<MoraineInlineRow> rows(moraine_inline_scan_free);
+	// The scan returns rows plus the deduplicated chunk bodies they
+	// reference; both arrays are owned together and freed by the one
+	// moraine_inline_scan_free call below, pass or throw.
+	struct ScanGuard {
+		MoraineInlineRow *rows = nullptr;
+		size_t rows_len = 0;
+		MoraineInlineChunk *chunks = nullptr;
+		size_t chunks_len = 0;
+		~ScanGuard() {
+			moraine_inline_scan_free(rows, rows_len, chunks, chunks_len);
+		}
+	} scan;
 	MoraineError err {};
 	auto code = moraine_inline_scan(handle, table_id, /* SCAN_FOR_FLUSH */ 3, std::numeric_limits<uint64_t>::max(), 0,
-	                                rows.OutItems(), rows.OutLen(), moraine_shim_is_interrupted, &context, &err);
+	                                &scan.rows, &scan.rows_len, &scan.chunks, &scan.chunks_len,
+	                                moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
 	std::vector<std::vector<duckdb::Value>> result;
-	result.reserve(rows.size());
-	for (auto &r : rows) {
+	result.reserve(scan.rows_len);
+	// Each referenced chunk decodes once, on first use, however many rows
+	// it holds.
+	std::vector<std::optional<std::vector<std::vector<duckdb::Value>>>> decoded_chunks(scan.chunks_len);
+	for (size_t i = 0; i < scan.rows_len; i++) {
+		auto &r = scan.rows[i];
 		// The scan spans every schema version of the table; this entry serves
 		// exactly its own version's `ducklake_inlined_data_<t>_<v>`, so a chunk
 		// from another version (its columns and schema differ) is not ours.
 		if (r.schema_version != schema_version) {
 			continue;
 		}
-		auto decoded =
-		    DecodeInlineChunkRows(context, schema_ipc, schema_ipc_len, r.chunk_body, r.chunk_body_len, user_types);
+		if (r.chunk_index >= scan.chunks_len) {
+			throw duckdb::InternalException("moraine: inline scan chunk index out of range");
+		}
+		auto &slot = decoded_chunks[r.chunk_index];
+		if (!slot.has_value()) {
+			auto &chunk = scan.chunks[r.chunk_index];
+			slot = DecodeInlineChunkRows(context, schema_ipc, schema_ipc_len, chunk.body, chunk.body_len, user_types);
+		}
+		auto &decoded = *slot;
 		if (r.offset_in_chunk >= decoded.size()) {
 			throw duckdb::InternalException("moraine: inline scan row offset out of range");
 		}

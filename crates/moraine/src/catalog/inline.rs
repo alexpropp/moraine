@@ -88,47 +88,25 @@ pub enum InlineScanKind {
 }
 
 impl InlineScanKind {
-    /// Filters `rows` per this scan's predicate at snapshot `S`, then
-    /// orders them: by `row_id` for every variant, with `begin_snapshot`
-    /// as a tiebreak for `ForFlush` (the only variant that can return
-    /// more than one row per `row_id`). `start` is only read by
-    /// `Insertions`/`Deletions`.
+    /// Filters `rows` per this scan's predicate at snapshot `S`, ordered
+    /// by `(row_id, begin_snapshot)` — only `ForFlush` can return more
+    /// than one row per `row_id`, so only it observes the tiebreak.
+    /// `start` is only read by `Insertions`/`Deletions`.
     #[must_use]
     pub fn select(self, rows: &[InlineRow], snapshot: u64, start: u64) -> Vec<InlineRow> {
-        let mut selected: Vec<InlineRow> = match self {
-            Self::Table => rows
-                .iter()
-                .copied()
-                .filter(|row| {
-                    row.begin_snapshot <= snapshot
-                        && row.end_snapshot.is_none_or(|end| snapshot < end)
-                })
-                .collect(),
-            Self::Insertions => rows
-                .iter()
-                .copied()
-                .filter(|row| row.begin_snapshot >= start && row.begin_snapshot <= snapshot)
-                .collect(),
-            Self::Deletions => rows
-                .iter()
-                .copied()
-                .filter(|row| {
-                    row.end_snapshot
-                        .is_some_and(|end| end >= start && end <= snapshot)
-                })
-                .collect(),
-            Self::ForFlush => rows
-                .iter()
-                .copied()
-                .filter(|row| row.begin_snapshot <= snapshot)
-                .collect(),
-        };
-        match self {
-            Self::ForFlush => selected.sort_by_key(|row| (row.row_id, row.begin_snapshot)),
-            Self::Table | Self::Insertions | Self::Deletions => {
-                selected.sort_by_key(|row| row.row_id);
+        let included = |row: &InlineRow| match self {
+            Self::Table => {
+                row.begin_snapshot <= snapshot && row.end_snapshot.is_none_or(|end| snapshot < end)
             }
-        }
+            Self::Insertions => row.begin_snapshot >= start && row.begin_snapshot <= snapshot,
+            Self::Deletions => row
+                .end_snapshot
+                .is_some_and(|end| end >= start && end <= snapshot),
+            Self::ForFlush => row.begin_snapshot <= snapshot,
+        };
+
+        let mut selected: Vec<InlineRow> = rows.iter().copied().filter(included).collect();
+        selected.sort_by_key(|row| (row.row_id, row.begin_snapshot));
         selected
     }
 }

@@ -392,87 +392,56 @@ impl ChangeSet {
     /// `deleted_from_table`, altered tables, altered views,
     /// `merge_adjacent`, `rewrite_delete`.
     pub(crate) fn to_changes_made(&self) -> String {
+        fn ids(entries: &mut Vec<String>, kind: &str, set: &BTreeSet<u64>) {
+            entries.extend(set.iter().map(|id| format!("{kind}:{id}")));
+        }
+        fn pairs(entries: &mut Vec<String>, kind: &str, set: &BTreeSet<(String, String)>) {
+            entries.extend(set.iter().map(|(scope, name)| {
+                format!("{kind}:{}.{}", quote_ident(scope), quote_ident(name))
+            }));
+        }
+
         let mut entries = Vec::new();
-        entries.extend(
-            self.dropped_schemas
-                .iter()
-                .map(|id| format!("dropped_schema:{id}")),
-        );
-        entries.extend(
-            self.dropped_tables
-                .iter()
-                .map(|id| format!("dropped_table:{id}")),
-        );
-        entries.extend(
-            self.dropped_views
-                .iter()
-                .map(|id| format!("dropped_view:{id}")),
-        );
+        ids(&mut entries, "dropped_schema", &self.dropped_schemas);
+        ids(&mut entries, "dropped_table", &self.dropped_tables);
+        ids(&mut entries, "dropped_view", &self.dropped_views);
         entries.extend(
             self.created_schemas
                 .iter()
                 .map(|name| format!("created_schema:{}", quote_ident(name))),
         );
-        entries.extend(
-            self.created_tables
-                .iter()
-                .map(|(s, t)| format!("created_table:{}.{}", quote_ident(s), quote_ident(t))),
+        pairs(&mut entries, "created_table", &self.created_tables);
+        pairs(&mut entries, "created_view", &self.created_views);
+        pairs(
+            &mut entries,
+            "created_scalar_macro",
+            &self.created_scalar_macros,
         );
-        entries.extend(
-            self.created_views
-                .iter()
-                .map(|(s, v)| format!("created_view:{}.{}", quote_ident(s), quote_ident(v))),
+        pairs(
+            &mut entries,
+            "created_table_macro",
+            &self.created_table_macros,
         );
-        entries.extend(
-            self.created_scalar_macros.iter().map(|(s, m)| {
-                format!("created_scalar_macro:{}.{}", quote_ident(s), quote_ident(m))
-            }),
+        ids(
+            &mut entries,
+            "dropped_scalar_macro",
+            &self.dropped_scalar_macros,
         );
-        entries.extend(
-            self.created_table_macros
-                .iter()
-                .map(|(s, m)| format!("created_table_macro:{}.{}", quote_ident(s), quote_ident(m))),
+        ids(
+            &mut entries,
+            "dropped_table_macro",
+            &self.dropped_table_macros,
         );
-        entries.extend(
-            self.dropped_scalar_macros
-                .iter()
-                .map(|id| format!("dropped_scalar_macro:{id}")),
+        ids(&mut entries, "inserted_into_table", &self.inserted_tables);
+        ids(
+            &mut entries,
+            "deleted_from_table",
+            &self.deleted_from_tables,
         );
-        entries.extend(
-            self.dropped_table_macros
-                .iter()
-                .map(|id| format!("dropped_table_macro:{id}")),
-        );
-        entries.extend(
-            self.inserted_tables
-                .iter()
-                .map(|id| format!("inserted_into_table:{id}")),
-        );
-        entries.extend(
-            self.deleted_from_tables
-                .iter()
-                .map(|id| format!("deleted_from_table:{id}")),
-        );
-        entries.extend(
-            self.altered_tables
-                .iter()
-                .map(|id| format!("altered_table:{id}")),
-        );
-        entries.extend(
-            self.altered_views
-                .iter()
-                .map(|id| format!("altered_view:{id}")),
-        );
-        entries.extend(
-            self.merge_adjacent_tables
-                .iter()
-                .map(|id| format!("merge_adjacent:{id}")),
-        );
-        entries.extend(
-            self.rewrite_delete_tables
-                .iter()
-                .map(|id| format!("rewrite_delete:{id}")),
-        );
+        ids(&mut entries, "altered_table", &self.altered_tables);
+        ids(&mut entries, "altered_view", &self.altered_views);
+        ids(&mut entries, "merge_adjacent", &self.merge_adjacent_tables);
+        ids(&mut entries, "rewrite_delete", &self.rewrite_delete_tables);
         entries.join(",")
     }
 
@@ -485,88 +454,33 @@ impl ChangeSet {
                 set.has_unknown = true;
                 continue;
             };
-            let known = if kind.eq_ignore_ascii_case("created_schema") {
-                parse_created_schema_payload(payload)
+            let id = |ids: &mut BTreeSet<u64>| payload.parse().map(|id| ids.insert(id)).is_ok();
+            let pair = |pairs: &mut BTreeSet<(String, String)>| {
+                parse_created_table_payload(payload)
+                    .map(|parsed| pairs.insert(parsed))
+                    .is_some()
+            };
+            let known = match kind.to_ascii_lowercase().as_str() {
+                "created_schema" => parse_created_schema_payload(payload)
                     .map(|name| set.created_schemas.insert(name))
-                    .is_some()
-            } else if kind.eq_ignore_ascii_case("dropped_schema") {
-                payload
-                    .parse()
-                    .map(|id| set.dropped_schemas.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("created_table") {
-                parse_created_table_payload(payload)
-                    .map(|pair| set.created_tables.insert(pair))
-                    .is_some()
-            } else if kind.eq_ignore_ascii_case("altered_table") {
-                payload
-                    .parse()
-                    .map(|id| set.altered_tables.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("dropped_table") {
-                payload
-                    .parse()
-                    .map(|id| set.dropped_tables.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("created_view") {
-                parse_created_table_payload(payload)
-                    .map(|pair| set.created_views.insert(pair))
-                    .is_some()
-            } else if kind.eq_ignore_ascii_case("altered_view") {
-                payload
-                    .parse()
-                    .map(|id| set.altered_views.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("dropped_view") {
-                payload
-                    .parse()
-                    .map(|id| set.dropped_views.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("created_scalar_macro") {
-                parse_created_table_payload(payload)
-                    .map(|pair| set.created_scalar_macros.insert(pair))
-                    .is_some()
-            } else if kind.eq_ignore_ascii_case("created_table_macro") {
-                parse_created_table_payload(payload)
-                    .map(|pair| set.created_table_macros.insert(pair))
-                    .is_some()
-            } else if kind.eq_ignore_ascii_case("dropped_scalar_macro") {
-                payload
-                    .parse()
-                    .map(|id| set.dropped_scalar_macros.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("dropped_table_macro") {
-                payload
-                    .parse()
-                    .map(|id| set.dropped_table_macros.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("inserted_into_table") {
-                payload
-                    .parse()
-                    .map(|id| set.inserted_tables.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("deleted_from_table") {
-                payload
-                    .parse()
-                    .map(|id| set.deleted_from_tables.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("merge_adjacent") {
-                payload
-                    .parse()
-                    .map(|id| set.merge_adjacent_tables.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("rewrite_delete") {
-                payload
-                    .parse()
-                    .map(|id| set.rewrite_delete_tables.insert(id))
-                    .is_ok()
-            } else if kind.eq_ignore_ascii_case("compacted_table") {
-                payload
-                    .parse()
-                    .map(|id| set.compacted_tables.insert(id))
-                    .is_ok()
-            } else {
-                false
+                    .is_some(),
+                "dropped_schema" => id(&mut set.dropped_schemas),
+                "created_table" => pair(&mut set.created_tables),
+                "altered_table" => id(&mut set.altered_tables),
+                "dropped_table" => id(&mut set.dropped_tables),
+                "created_view" => pair(&mut set.created_views),
+                "altered_view" => id(&mut set.altered_views),
+                "dropped_view" => id(&mut set.dropped_views),
+                "created_scalar_macro" => pair(&mut set.created_scalar_macros),
+                "created_table_macro" => pair(&mut set.created_table_macros),
+                "dropped_scalar_macro" => id(&mut set.dropped_scalar_macros),
+                "dropped_table_macro" => id(&mut set.dropped_table_macros),
+                "inserted_into_table" => id(&mut set.inserted_tables),
+                "deleted_from_table" => id(&mut set.deleted_from_tables),
+                "merge_adjacent" => id(&mut set.merge_adjacent_tables),
+                "rewrite_delete" => id(&mut set.rewrite_delete_tables),
+                "compacted_table" => id(&mut set.compacted_tables),
+                _ => false,
             };
 
             if !known {

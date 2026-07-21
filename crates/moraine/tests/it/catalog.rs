@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use moraine::{
-    Catalog, CatalogOptions, ColumnDef, ColumnId, Error, OptionScope, SchemaId, SnapshotId,
-};
+use moraine::{Catalog, CatalogOptions, ColumnId, Error, OptionScope, SchemaId, SnapshotId};
 use object_store::memory::InMemory;
+
+use crate::fixtures::{col, open_memory};
 
 #[tokio::test]
 async fn encrypted_flag_is_fixed_at_bootstrap() {
@@ -123,25 +123,6 @@ async fn committed_state_survives_reopen() {
     let s = head.schema_by_name("durable").unwrap();
     assert!(head.table_by_name(s.id, "t").is_some());
     catalog.close().await.unwrap();
-}
-
-fn col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-    }
-}
-
-// Test-only helper: `unwrap_used` is a library-code lint, not exempted
-// automatically for a plain (non-`#[test]`) function even in an
-// integration-test crate.
-#[allow(clippy::unwrap_used)]
-async fn open_memory() -> Catalog {
-    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap()
 }
 
 #[tokio::test]
@@ -385,4 +366,39 @@ async fn read_only_refuses_an_uninitialized_store() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Store(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn set_table_schema_moves_a_table_between_schemas() {
+    let catalog = open_memory().await;
+    let ids = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let source = tx.create_schema("source")?;
+            let target = tx.create_schema("target")?;
+            let table = tx.create_table(source, "orders", &[col("id")])?;
+            ids.set(Some((source, target, table)));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (source, target, table) = ids.get().unwrap();
+    let created = catalog.snapshot().await.unwrap().current_snapshot().id;
+
+    catalog
+        .commit(move |tx| tx.set_table_schema(table, target))
+        .await
+        .unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    assert!(head.tables_in(source).is_empty());
+    assert_eq!(head.tables_in(target)[0].id, table);
+    assert_eq!(head.table_by_name(target, "orders").unwrap().id, table);
+    assert!(head.table_by_name(source, "orders").is_none());
+
+    // The move is versioned: time travel sees the table in its old schema.
+    let past = catalog.snapshot_at(created).await.unwrap();
+    assert_eq!(past.tables_in(source)[0].id, table);
+    assert!(past.tables_in(target).is_empty());
+    catalog.close().await.unwrap();
 }

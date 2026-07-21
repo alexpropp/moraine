@@ -20,5 +20,8 @@ moraine = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
 
+[build-dependencies]
+cbindgen = { workspace = true }
+
 [lints]
 workspace = true

@@ -7,10 +7,6 @@
 //! order-compatible (byte order matches value order), so a future range
 //! contract is an upgrade, not a rewrite — but only equality is promised.
 
-// The codec is consumed by index maintenance and lookups in later slices;
-// until those land only tests exercise it.
-#![allow(dead_code)]
-
 use storekey::{Decode, Encode};
 
 use crate::error::{Error, Result};
@@ -49,6 +45,21 @@ impl IntWidth {
             Self::I64 => 8,
             Self::I128 => 16,
         }
+    }
+
+    /// Whether `value` is representable as a signed integer of this width.
+    const fn holds_signed(self, value: i128) -> bool {
+        if matches!(self, Self::I128) {
+            return true;
+        }
+        let bits = self.bytes() * 8;
+        value >= -(1_i128 << (bits - 1)) && value < (1_i128 << (bits - 1))
+    }
+
+    /// Whether `value` is representable as an unsigned integer of this
+    /// width.
+    const fn holds_unsigned(self, value: u128) -> bool {
+        matches!(self, Self::I128) || value < (1_u128 << (self.bytes() * 8))
     }
 }
 
@@ -183,10 +194,24 @@ impl CanonicalKey {
 
 /// Canonically encode an index's ordered column values into a
 /// [`CanonicalKey`]. Fails as [`Error::Constraint`] when the summed
-/// component size exceeds [`MAX_INDEX_KEY_BYTES`]. Every value must be
-/// non-null: a NULL in any indexed column yields no entry, so the caller
-/// skips such rows before encoding.
+/// component size exceeds [`MAX_INDEX_KEY_BYTES`] or an integer value
+/// does not fit its declared width (truncating would map distinct values
+/// to one key). Every value must be non-null: a NULL in any indexed
+/// column yields no entry, so the caller skips such rows before encoding.
 pub(crate) fn encode_key(values: &[IndexKeyValue]) -> Result<CanonicalKey> {
+    for value in values {
+        let fits = match value {
+            IndexKeyValue::Int { value, width } => width.holds_signed(*value),
+            IndexKeyValue::UInt { value, width } => width.holds_unsigned(*value),
+            _ => true,
+        };
+        if !fits {
+            return Err(Error::Constraint(format!(
+                "index key value {value:?} does not fit its declared integer width"
+            )));
+        }
+    }
+
     let components: Vec<Vec<u8>> = values.iter().map(IndexKeyValue::encode).collect();
     let total: usize = components.iter().map(Vec::len).sum();
     if total > MAX_INDEX_KEY_BYTES {
@@ -441,5 +466,119 @@ mod tests {
     fn key_at_the_cap_is_accepted() {
         let at_cap = IndexKeyValue::Bytes(vec![0; MAX_INDEX_KEY_BYTES]);
         assert!(encode_key(std::slice::from_ref(&at_cap)).is_ok());
+    }
+
+    #[test]
+    fn out_of_width_integers_are_refused() {
+        // Truncating 300 to one byte would collide with 44; refuse instead.
+        let narrow = |value| {
+            encode_key(&[IndexKeyValue::Int {
+                value,
+                width: IntWidth::I8,
+            }])
+        };
+        assert!(matches!(narrow(300).unwrap_err(), Error::Constraint(_)));
+        assert!(matches!(narrow(-129).unwrap_err(), Error::Constraint(_)));
+        assert!(narrow(i128::from(i8::MIN)).is_ok());
+        assert!(narrow(i128::from(i8::MAX)).is_ok());
+
+        let unsigned = |value| {
+            encode_key(&[IndexKeyValue::UInt {
+                value,
+                width: IntWidth::I8,
+            }])
+        };
+        assert!(matches!(unsigned(256).unwrap_err(), Error::Constraint(_)));
+        assert!(unsigned(u128::from(u8::MAX)).is_ok());
+
+        // Full width admits the extremes.
+        assert!(
+            encode_key(&[IndexKeyValue::Int {
+                value: i128::MIN,
+                width: IntWidth::I128,
+            }])
+            .is_ok()
+        );
+        assert!(
+            encode_key(&[IndexKeyValue::UInt {
+                value: u128::MAX,
+                width: IntWidth::I128,
+            }])
+            .is_ok()
+        );
+    }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            /// Determinism and injectivity: equal values share one byte
+            /// string, distinct values never collide.
+            #[test]
+            fn signed_encoding_is_injective(a: i64, b: i64) {
+                let one = signed(i128::from(a));
+                let two = signed(i128::from(b));
+                prop_assert_eq!(one.clone(), signed(i128::from(a)));
+                prop_assert_eq!(a == b, one == two);
+            }
+
+            /// Byte order matches numeric order at every width the codec
+            /// promises order-compatibility for.
+            #[test]
+            fn signed_encoding_preserves_order(a: i64, b: i64) {
+                let one = signed(i128::from(a));
+                let two = signed(i128::from(b));
+                prop_assert_eq!(a.cmp(&b), one.cmp(&two));
+            }
+
+            #[test]
+            fn unsigned_encoding_preserves_order(a: u64, b: u64) {
+                let encode = |value| {
+                    IndexKeyValue::UInt {
+                        value,
+                        width: IntWidth::I64,
+                    }
+                    .encode()
+                };
+                let one = encode(u128::from(a));
+                let two = encode(u128::from(b));
+                prop_assert_eq!(a.cmp(&b), one.cmp(&two));
+            }
+
+            /// In-range narrow values encode injectively — the property the
+            /// width validation in `encode_key` protects.
+            #[test]
+            fn narrow_signed_encoding_is_injective(a: i16, b: i16) {
+                let encode = |value: i16| {
+                    encode_key(&[IndexKeyValue::Int {
+                        value: i128::from(value),
+                        width: IntWidth::I16,
+                    }])
+                    .unwrap()
+                };
+                prop_assert_eq!(a == b, encode(a) == encode(b));
+            }
+
+            /// Composite framing keeps distinct component splits distinct
+            /// for arbitrary string pairs.
+            #[test]
+            fn composite_framing_is_injective(
+                a in prop::collection::vec(".{0,8}", 1..3),
+                b in prop::collection::vec(".{0,8}", 1..3),
+            ) {
+                let encode = |parts: &[String]| {
+                    encode_key(
+                        &parts
+                            .iter()
+                            .map(|part| IndexKeyValue::Str(part.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                };
+                prop_assert_eq!(a == b, encode(&a) == encode(&b));
+            }
+        }
     }
 }

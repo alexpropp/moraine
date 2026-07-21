@@ -39,6 +39,16 @@ pub struct Transaction {
     new_snapshot_id: u64,
 }
 
+/// A finished transaction's accumulated products, consumed by the commit
+/// protocol.
+pub(crate) struct TransactionParts {
+    pub(crate) operations: Vec<Operation>,
+    pub(crate) index_entries: Vec<StagedIndexEntry>,
+    pub(crate) state: CatalogSnapshot,
+    pub(crate) next_catalog_id: u64,
+    pub(crate) next_file_id: u64,
+}
+
 impl Deref for Transaction {
     type Target = CatalogSnapshot;
 
@@ -62,22 +72,14 @@ impl Transaction {
         }
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Vec<Operation>,
-        Vec<StagedIndexEntry>,
-        CatalogSnapshot,
-        u64,
-        u64,
-    ) {
-        (
-            self.ops,
-            self.index_entries,
-            self.state,
-            self.next_catalog_id,
-            self.next_file_id,
-        )
+    pub(crate) fn into_parts(self) -> TransactionParts {
+        TransactionParts {
+            operations: self.ops,
+            index_entries: self.index_entries,
+            state: self.state,
+            next_catalog_id: self.next_catalog_id,
+            next_file_id: self.next_file_id,
+        }
     }
 
     fn alloc_catalog_id(&mut self) -> u64 {
@@ -141,34 +143,32 @@ impl Transaction {
         if !self.state.schemas.contains_key(&schema.get()) {
             return Err(Error::NotFound(format!("schema {schema}")));
         }
-        if self
-            .state
-            .tables
-            .values()
-            .any(|t| t.schema_id == schema.get())
-        {
+        let occupied = [
+            (
+                "tables",
+                self.state
+                    .tables
+                    .values()
+                    .any(|t| t.schema_id == schema.get()),
+            ),
+            (
+                "views",
+                self.state
+                    .views
+                    .values()
+                    .any(|v| v.schema_id == schema.get()),
+            ),
+            (
+                "macros",
+                self.state
+                    .macros
+                    .values()
+                    .any(|m| m.schema_id == schema.get()),
+            ),
+        ];
+        if let Some((kind, _)) = occupied.iter().find(|(_, taken)| *taken) {
             return Err(Error::Constraint(format!(
-                "schema {schema} still contains tables"
-            )));
-        }
-        if self
-            .state
-            .views
-            .values()
-            .any(|v| v.schema_id == schema.get())
-        {
-            return Err(Error::Constraint(format!(
-                "schema {schema} still contains views"
-            )));
-        }
-        if self
-            .state
-            .macros
-            .values()
-            .any(|m| m.schema_id == schema.get())
-        {
-            return Err(Error::Constraint(format!(
-                "schema {schema} still contains macros"
+                "schema {schema} still contains {kind}"
             )));
         }
         self.state.delete_schema(schema.get());
@@ -262,10 +262,12 @@ impl Transaction {
 
     /// Tables and views share one name namespace per schema.
     fn relation_name_free(&self, schema_id: u64, name: &str) -> Result<()> {
-        let key = (schema_id, name.to_owned());
-        let taken =
-            self.state.table_names.contains_key(&key) || self.state.view_names.contains_key(&key);
-        if taken {
+        let taken = |names: &crate::catalog::ScopedNames| {
+            names
+                .get(&schema_id)
+                .is_some_and(|per_schema| per_schema.contains_key(name))
+        };
+        if taken(&self.state.table_names) || taken(&self.state.view_names) {
             return Err(Error::AlreadyExists(format!("relation {name}")));
         }
         Ok(())
@@ -531,13 +533,9 @@ impl Transaction {
                 entry.values.len()
             )));
         }
-        let mut values = Vec::with_capacity(column_count);
-        for value in &entry.values {
-            match value {
-                Some(value) => values.push(value.clone()),
-                None => return Ok(()),
-            }
-        }
+        let Some(values) = entry.values.iter().cloned().collect::<Option<Vec<_>>>() else {
+            return Ok(());
+        };
         let key = encode_key(&values)?;
         self.index_entries.push(StagedIndexEntry {
             index_id,
@@ -568,6 +566,23 @@ impl Transaction {
         def: &IndexDef,
         backfill: &[IndexEntry],
     ) -> Result<IndexId> {
+        let index_id = self.insert_index_definition(table, def, None)?;
+        for entry in backfill {
+            self.stage_index_entry(index_id, def.unique, def.columns.len(), entry, false)?;
+        }
+        self.mark_altered(table.get());
+        Ok(IndexId::new(index_id))
+    }
+
+    /// Validates an index definition against the live table and stages its
+    /// definition record. `build_state` is `None` for a single-commit build
+    /// and `Some("building")` for a staged one.
+    fn insert_index_definition(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        build_state: Option<String>,
+    ) -> Result<u64> {
         nonempty_name("index", &def.name)?;
         self.live_table(table)?;
         if def.columns.is_empty() {
@@ -590,18 +605,14 @@ impl Transaction {
             index_name: def.name.clone(),
             column_ids: def.columns.iter().map(|c| c.get()).collect(),
             unique: def.unique,
-            build_state: None,
+            build_state,
             build_cursor_file: None,
             build_cursor_row_id: None,
             build_deletes_scanned: None,
             poisoned: None,
             ducklake_index_id: None,
         });
-        for entry in backfill {
-            self.stage_index_entry(index_id, def.unique, def.columns.len(), entry, false)?;
-        }
-        self.mark_altered(table.get());
-        Ok(IndexId::new(index_id))
+        Ok(index_id)
     }
 
     /// Drops an equality index. The definition ends into history; its
@@ -611,16 +622,23 @@ impl Transaction {
     ///
     /// Returns [`Error::NotFound`] if the index does not exist.
     pub fn drop_index(&mut self, index: IndexId) -> Result<()> {
-        let table_id = self
-            .state
-            .indexes
-            .iter()
-            .find(|(_, per_table)| per_table.contains_key(&index.get()))
-            .map(|(&table_id, _)| table_id)
-            .ok_or_else(|| Error::NotFound(format!("index {index}")))?;
+        let (table_id, _) = self.live_index(index)?;
         self.state.delete_index(table_id, index.get());
         self.mark_altered(table_id);
         Ok(())
+    }
+
+    /// The owning table id and definition of a live index.
+    fn live_index(&self, index: IndexId) -> Result<(u64, IndexValue)> {
+        self.state
+            .indexes
+            .iter()
+            .find_map(|(&table_id, per_table)| {
+                per_table
+                    .get(&index.get())
+                    .map(|value| (table_id, value.clone()))
+            })
+            .ok_or_else(|| Error::NotFound(format!("index {index}")))
     }
 
     /// Begins a staged (multi-commit) index build. The definition lands in
@@ -636,35 +654,7 @@ impl Transaction {
     /// not live, [`Error::AlreadyExists`] if the name is taken, or
     /// [`Error::Constraint`] if the column list is empty.
     pub fn create_index_staged(&mut self, table: TableId, def: &IndexDef) -> Result<IndexId> {
-        nonempty_name("index", &def.name)?;
-        self.live_table(table)?;
-        if def.columns.is_empty() {
-            return Err(Error::Constraint(format!(
-                "index {} needs at least one column",
-                def.name
-            )));
-        }
-        for &column in &def.columns {
-            self.live_column(table, column)?;
-        }
-        self.index_name_free(table, &def.name)?;
-
-        let index_id = self.alloc_catalog_id();
-        self.state.put_index(IndexValue {
-            index_id,
-            table_id: table.get(),
-            begin_snapshot: self.new_snapshot_id,
-            end_snapshot: None,
-            index_name: def.name.clone(),
-            column_ids: def.columns.iter().map(|c| c.get()).collect(),
-            unique: def.unique,
-            build_state: Some("building".to_owned()),
-            build_cursor_file: None,
-            build_cursor_row_id: None,
-            build_deletes_scanned: None,
-            poisoned: None,
-            ducklake_index_id: None,
-        });
+        let index_id = self.insert_index_definition(table, def, Some("building".to_owned()))?;
         self.mark_altered(table.get());
         Ok(IndexId::new(index_id))
     }
@@ -687,14 +677,7 @@ impl Transaction {
         batch: &[IndexEntry],
         is_final: bool,
     ) -> Result<IndexState> {
-        let (table_id, mut value) = self
-            .state
-            .indexes
-            .iter()
-            .find_map(|(&table_id, per_table)| {
-                per_table.get(&index.get()).map(|v| (table_id, v.clone()))
-            })
-            .ok_or_else(|| Error::NotFound(format!("index {index}")))?;
+        let (table_id, mut value) = self.live_index(index)?;
         if value.build_state.as_deref() != Some("building") {
             return Err(Error::Constraint(format!("index {index} is not building")));
         }
@@ -822,33 +805,54 @@ impl Transaction {
             });
         }
         for file_entry in index_entries {
-            let (unique, column_count) = {
-                let index = self
-                    .state
-                    .indexes
-                    .get(&table.get())
-                    .and_then(|per_table| per_table.get(&file_entry.index.get()))
-                    .ok_or_else(|| {
-                        Error::NotFound(format!("index {} on table {table}", file_entry.index))
-                    })?;
-                (index.unique, index.column_ids.len())
-            };
-            let row_id = row_id_start.saturating_add(file_entry.ordinal);
-            self.stage_index_entry(
-                file_entry.index.get(),
-                unique,
-                column_count,
-                &IndexEntry {
-                    row_id,
-                    values: file_entry.values.clone(),
-                },
-                false,
-            )?;
+            self.stage_file_index_entry(table, row_id_start, file_entry, false)?;
         }
         self.ops.push(Operation::RegisterDataFile {
             table_id: table.get(),
         });
         Ok(DataFileId::new(data_file_id))
+    }
+
+    /// Stages one file-supplied index entry, adding (`delete: false`) or
+    /// removing (`delete: true`) the value of the row at
+    /// `row_id_start + ordinal`. Overflow is refused: a clamped row id
+    /// would alias another row's entry.
+    fn stage_file_index_entry(
+        &mut self,
+        table: TableId,
+        row_id_start: u64,
+        file_entry: &FileIndexEntry,
+        delete: bool,
+    ) -> Result<()> {
+        let (unique, column_count) = {
+            let index = self
+                .state
+                .indexes
+                .get(&table.get())
+                .and_then(|per_table| per_table.get(&file_entry.index.get()))
+                .ok_or_else(|| {
+                    Error::NotFound(format!("index {} on table {table}", file_entry.index))
+                })?;
+            (index.unique, index.column_ids.len())
+        };
+        let row_id = row_id_start
+            .checked_add(file_entry.ordinal)
+            .ok_or_else(|| {
+                Error::Constraint(format!(
+                    "index entry ordinal {} overflows the row-id range on table {table}",
+                    file_entry.ordinal
+                ))
+            })?;
+        self.stage_index_entry(
+            file_entry.index.get(),
+            unique,
+            column_count,
+            &IndexEntry {
+                row_id,
+                values: file_entry.values.clone(),
+            },
+            delete,
+        )
     }
 
     /// Expires a data file, removing it and subtracting its contribution
@@ -1021,44 +1025,11 @@ impl Transaction {
             return Ok(());
         }
 
-        let row_id_start = data_file.row_id_start.ok_or_else(|| {
-            Error::Constraint(format!(
-                "data file {} of table {table} carries per-row ids; index maintenance of rewrite \
-                 files is a follow-up",
-                data_file.data_file_id
-            ))
-        })?;
+        let row_id_start =
+            crate::transaction::index_maintenance::data_file_row_id_start(data_file)?;
 
         for file_entry in index_entries {
-            let (unique, column_count) = {
-                let index = self
-                    .state
-                    .indexes
-                    .get(&table.get())
-                    .and_then(|per_table| per_table.get(&file_entry.index.get()))
-                    .ok_or_else(|| {
-                        Error::NotFound(format!("index {} on table {table}", file_entry.index))
-                    })?;
-                (index.unique, index.column_ids.len())
-            };
-            let row_id = row_id_start.checked_add(file_entry.ordinal).ok_or_else(|| {
-                Error::Constraint(format!(
-                    "register_delete_file: index entry ordinal {} overflows the row-id range of \
-                     data file {} on table {table}",
-                    file_entry.ordinal, data_file.data_file_id
-                ))
-            })?;
-
-            self.stage_index_entry(
-                file_entry.index.get(),
-                unique,
-                column_count,
-                &IndexEntry {
-                    row_id,
-                    values: file_entry.values.clone(),
-                },
-                true,
-            )?;
+            self.stage_file_index_entry(table, row_id_start, file_entry, true)?;
         }
         Ok(())
     }
@@ -1525,8 +1496,9 @@ mod tests {
         // The counter is seeded past the ids just handed out.
         assert_eq!(transaction.state().tables[&11].next_column_id, 3);
 
-        let (ops, _, _, next_catalog_id, _) = transaction.into_parts();
-        assert_eq!(next_catalog_id, 12);
+        let parts = transaction.into_parts();
+        let ops = parts.operations;
+        assert_eq!(parts.next_catalog_id, 12);
         assert_eq!(
             ops,
             vec![
@@ -1657,7 +1629,7 @@ mod tests {
         transaction.set_table_schema(t1, s2).unwrap();
         assert_eq!(transaction.tables_in(s2).len(), 2);
         // Each mutation of an existing table classifies as an alter.
-        let (ops, _, _, _, _) = transaction.into_parts();
+        let ops = transaction.into_parts().operations;
         let alters = ops
             .iter()
             .filter(|op| matches!(op, Operation::AlterTable { table_id } if *table_id == t1.get()))
@@ -2077,7 +2049,7 @@ mod tests {
             Err(Error::NotFound(_))
         ));
         // Option mutations stage no ops; the two DDL ops remain.
-        let (ops, _, _, _, _) = transaction.into_parts();
+        let ops = transaction.into_parts().operations;
         assert_eq!(ops.len(), 2);
     }
 
