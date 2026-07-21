@@ -139,8 +139,32 @@ impl IndexKeyValue {
 /// result as a single byte string lets the enclosing entry key embed it —
 /// and append a trailing row id — with an unambiguous, self-delimiting
 /// storekey encoding.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CanonicalKey(Vec<u8>);
+
+// Coded as a storekey byte string rather than by the derive, which routes a
+// `Vec<u8>` through the generic sequence codec. Both emit the same bytes —
+// low bytes escaped behind `0x01`, a `0x00` terminator — but the sequence
+// decoder leaves "the next byte may be escaped" set after consuming that
+// terminator, so a following fixed-width field whose leading byte is `0x01`
+// loses it. A non-unique entry key is exactly that shape: the value, then a
+// raw row id.
+impl<F> Encode<F> for CanonicalKey {
+    fn encode<W: std::io::Write>(
+        &self,
+        w: &mut storekey::Writer<W>,
+    ) -> std::result::Result<(), storekey::EncodeError> {
+        w.write_slice(&self.0)
+    }
+}
+
+impl<F> Decode<F> for CanonicalKey {
+    fn decode<R: std::io::BufRead>(
+        r: &mut storekey::Reader<R>,
+    ) -> std::result::Result<Self, storekey::DecodeError> {
+        Ok(Self(r.read_vec()?))
+    }
+}
 
 impl CanonicalKey {
     /// A key with no framed content, for subspace-prefix derivation only —
@@ -170,8 +194,15 @@ pub(crate) fn encode_key(values: &[IndexKeyValue]) -> Result<CanonicalKey> {
             "index key of {total} bytes exceeds the {MAX_INDEX_KEY_BYTES}-byte limit"
         )));
     }
-    // Infallible by construction: a `Vec` sink raises no io error and the
-    // derived `Encode` raises no custom error.
+    // This inner framing keeps storekey's sequence codec, which the entry
+    // key's own framing deliberately avoids: the two are different layers,
+    // and only this one is write-only — nothing decodes components back out,
+    // and a sequence of sequences ends in a terminator, never in a
+    // fixed-width field that could swallow the escape state. Adding a
+    // trailing fixed-width component here would reintroduce that hazard.
+    //
+    // Infallible by construction: a `Vec` sink raises no io error and
+    // storekey's `Vec` encoder raises no custom error.
     #[allow(clippy::expect_used)]
     let framed = storekey::encode_vec(&components).expect("storekey encode into a Vec cannot fail");
     Ok(CanonicalKey(framed))

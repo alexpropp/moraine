@@ -573,9 +573,11 @@ pub(crate) fn current_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<
 
 #[cfg(test)]
 mod tests {
+
     use proptest::prelude::*;
 
     use super::*;
+    use crate::store::index_encoding::{IndexKeyValue, IntWidth, encode_key};
 
     fn be(v: u64) -> Vec<u8> {
         v.to_be_bytes().to_vec()
@@ -722,6 +724,7 @@ mod tests {
                 row_id: 9,
             },
         ];
+
         for op in ops {
             let live = Key::Inline(InlineKey::Live(op)).encode();
             let arch = Key::Inline(InlineKey::Arch(op)).encode();
@@ -735,15 +738,12 @@ mod tests {
         }
     }
 
-    // Decode: exact inverse, loud failure.
-
-    fn canon(values: &[crate::store::index_encoding::IndexKeyValue]) -> CanonicalKey {
-        crate::store::index_encoding::encode_key(values).unwrap()
+    fn canon(values: &[IndexKeyValue]) -> CanonicalKey {
+        encode_key(values).unwrap()
     }
 
     #[test]
     fn golden_idx_unique_key_leads_with_subspace_and_index() {
-        use crate::store::index_encoding::{IndexKeyValue, IntWidth};
         let key = Key::Idx(IdxKey::Unique {
             index_id: 1,
             key: canon(&[IndexKeyValue::Int {
@@ -758,9 +758,69 @@ mod tests {
         assert!(bytes.starts_with(&prefix), "{bytes:?}");
     }
 
+    /// A non-unique entry key ends in a raw row id, directly after the
+    /// value's terminator. A row id whose leading byte is the escape byte
+    /// (`0x01`) must not be mistaken for an escaped byte of the value —
+    /// that is every row id in `[2^56, 2^57)`.
+    #[test]
+    fn idx_multi_key_roundtrips_when_the_row_id_leads_with_the_escape_byte() {
+        // The last case is the shortest possible value — no components at
+        // all, which frames to the bare terminator.
+        let values = [
+            vec![IndexKeyValue::Str("a".to_owned())],
+            vec![IndexKeyValue::Int {
+                value: 0,
+                width: IntWidth::I64,
+            }],
+            vec![IndexKeyValue::Bytes(vec![0, 1, 2])],
+            vec![],
+        ];
+        for row_id in [1u64 << 56, (1 << 56) + 1, (1 << 57) - 1] {
+            for value in &values {
+                let key = Key::Idx(IdxKey::Multi {
+                    index_id: 1,
+                    key: canon(value),
+                    row_id,
+                });
+                assert_eq!(Key::decode(&key.encode()).unwrap(), key, "row_id {row_id}");
+            }
+        }
+    }
+
+    /// The value rides as a storekey byte string — `0x00` and `0x01` escape
+    /// behind `0x01`, a `0x00` terminates — and the raw row id follows it.
+    /// A [`CanonicalKey`](crate::store::index_encoding::CanonicalKey) already
+    /// holds framed bytes, so the entry key frames them a second time.
+    /// Pinned because these bytes are on disk: the decode fix must not move
+    /// them.
+    #[test]
+    fn golden_idx_multi_value_framing_and_trailing_row_id() {
+        let key = Key::Idx(IdxKey::Multi {
+            index_id: 1,
+            key: canon(&[IndexKeyValue::Bytes(vec![0x00, 0x01, 0x41])]),
+            row_id: 1 << 56,
+        });
+        let mut expected = vec![0x07, 0x03];
+        expected.extend(be(1));
+        // Inner framing of one component `00 01 41` is `01 00 01 01 41 00 00`;
+        // the outer framing escapes each of its low bytes again and
+        // terminates.
+        expected.extend([
+            0x01, 0x01, // 0x01
+            0x01, 0x00, // 0x00
+            0x01, 0x01, // 0x01
+            0x01, 0x01, // 0x01
+            0x41, // 'A'
+            0x01, 0x00, // 0x00
+            0x01, 0x00, // 0x00
+            0x00, // terminator
+        ]);
+        expected.extend(be(1 << 56));
+        assert_eq!(key.encode(), expected);
+    }
+
     #[test]
     fn golden_idx_multi_key_leads_with_subspace_and_index() {
-        use crate::store::index_encoding::{IndexKeyValue, IntWidth};
         let key = Key::Idx(IdxKey::Multi {
             index_id: 1,
             key: canon(&[IndexKeyValue::Int {
@@ -785,7 +845,6 @@ mod tests {
 
     #[test]
     fn idx_composite_framing_distinct_at_key_level() {
-        use crate::store::index_encoding::IndexKeyValue;
         let ab_c = Key::Idx(IdxKey::Unique {
             index_id: 1,
             key: canon(&[
@@ -805,7 +864,6 @@ mod tests {
 
     #[test]
     fn idx_index_prefix_covers_one_index_and_kind() {
-        use crate::store::index_encoding::IndexKeyValue;
         let value = canon(&[IndexKeyValue::Str("v".into())]);
 
         let unique = Key::Idx(IdxKey::Unique {
@@ -830,7 +888,6 @@ mod tests {
 
     #[test]
     fn idx_multi_value_prefix_covers_all_row_ids_of_one_value() {
-        use crate::store::index_encoding::IndexKeyValue;
         let value = canon(&[IndexKeyValue::Str("shared".into())]);
         let prefix = idx_multi_value_prefix(9, &value);
         for row_id in [0, 1, u64::MAX] {
@@ -865,7 +922,6 @@ mod tests {
 
     #[test]
     fn idx_keys_roundtrip() {
-        use crate::store::index_encoding::{IndexKeyValue, IntWidth};
         let keys = [
             Key::Idx(IdxKey::Unique {
                 index_id: 5,
@@ -1126,9 +1182,9 @@ mod tests {
             |components| {
                 let values = components
                     .into_iter()
-                    .map(crate::store::index_encoding::IndexKeyValue::Bytes)
+                    .map(IndexKeyValue::Bytes)
                     .collect::<Vec<_>>();
-                crate::store::index_encoding::encode_key(&values).unwrap()
+                encode_key(&values).unwrap()
             },
         )
     }
