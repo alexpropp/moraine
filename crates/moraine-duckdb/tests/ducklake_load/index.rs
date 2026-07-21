@@ -451,3 +451,64 @@ fn moraine_index_bulk_insert_without_a_data_store_is_refused() {
         "expected the missing-store reason, got: {stderr}"
     );
 }
+
+/// UPDATE and both compaction shapes write per-row-id files; the index
+/// tracks every move, and a rebuilt index backfills them.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_survives_update_and_compaction() {
+    let store = TempDir::new("index-rewrite-store");
+    let data = TempDir::new("index-rewrite-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    let count = |sql: &str| csv_rows(&run(sql));
+    let lookup_count = |key: i64| {
+        count(&format!(
+            "SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {key});"
+        ))
+    };
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    // UPDATE writes a per-row-id file (delete plus re-insert under
+    // preserved ids); the unchanged key still resolves exactly once.
+    run("UPDATE lake.main.t SET b = 'updated' WHERE a = 7;");
+    assert_eq!(lookup_count(7), vec![vec!["1".to_string()]]);
+
+    // Deletes then rewrite: the compacted replacement re-derives its
+    // surviving rows' entries as no-ops.
+    run("DELETE FROM lake.main.t WHERE a IN (1, 2, 3);");
+    run("CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.01);");
+    assert_eq!(
+        lookup_count(1),
+        vec![vec!["0".to_string()]],
+        "deleted keys stay gone after the rewrite"
+    );
+    assert_eq!(
+        lookup_count(50),
+        vec![vec!["1".to_string()]],
+        "survivors stay found after the rewrite"
+    );
+
+    // A delete against the rewritten (per-row-id) file.
+    run("DELETE FROM lake.main.t WHERE a = 50;");
+    assert_eq!(lookup_count(50), vec![vec!["0".to_string()]]);
+
+    // Merge-adjacent over the mixed file set.
+    run("INSERT INTO lake.main.t SELECT i, 'y' FROM range(100, 200) t(i);");
+    run("CALL ducklake_merge_adjacent_files('lake');");
+    assert_eq!(lookup_count(150), vec![vec!["1".to_string()]]);
+    assert_eq!(lookup_count(7), vec![vec!["1".to_string()]]);
+
+    // Rebuild: backfill must read the per-row-id files.
+    run("CALL moraine_index_drop('lake', 'main', 't', 'by_a');");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    assert_eq!(lookup_count(150), vec![vec!["1".to_string()]]);
+    assert_eq!(
+        lookup_count(1),
+        vec![vec!["0".to_string()]],
+        "the rebuilt index omits rows deleted before compaction"
+    );
+}
