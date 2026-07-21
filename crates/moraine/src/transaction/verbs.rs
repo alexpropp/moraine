@@ -896,32 +896,43 @@ impl Transaction {
         Ok(())
     }
 
-    /// Registers a delete file targeting a live data file's rows.
+    /// Registers a delete file targeting a live data file's rows, removing
+    /// the equality-index entries of the rows it kills. Each entry's
+    /// `ordinal` is a position within the **target data file**, matching the
+    /// delete file's recorded positions, and its values are those the dead
+    /// row was indexed under — entries are keyed by value, so a removal
+    /// cannot be derived from a row id alone.
     ///
     /// Delete files do not change table statistics — `record_count`
     /// counts data-file rows, not delete markers.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotFound`] if the table does not exist, or if
-    /// `file.data_file_id` is not live on the table.
+    /// Returns [`Error::NotFound`] if the table does not exist, if
+    /// `file.data_file_id` is not live on the table, or if an
+    /// `index_entries` entry names an index not live on the table.
+    /// Returns [`Error::Constraint`] if the table has live indexes and a
+    /// non-empty delete file supplies no `index_entries` (a silently
+    /// over-covered index is as much a lie as an under-covered one), an
+    /// entry's `ordinal` is outside the target file's rows, the target
+    /// carries per-row ids rather than a dense range, or an entry's value
+    /// count does not match its index's column count.
     pub fn register_delete_file(
         &mut self,
         table: TableId,
         file: DeleteFile,
+        index_entries: &[FileIndexEntry],
     ) -> Result<DeleteFileId> {
         self.live_table(table)?;
-        let data_file_live = self
+        let data_file = self
             .state
             .data_files
             .get(&table.get())
-            .is_some_and(|files| files.contains_key(&file.data_file_id.get()));
-        if !data_file_live {
-            return Err(Error::NotFound(format!(
-                "data file {} of table {table}",
-                file.data_file_id
-            )));
-        }
+            .and_then(|files| files.get(&file.data_file_id.get()))
+            .cloned()
+            .ok_or_else(|| {
+                Error::NotFound(format!("data file {} of table {table}", file.data_file_id))
+            })?;
 
         // One live delete file per data file: a new one carries all deletes
         // and must supersede its predecessor, never sit beside it.
@@ -941,6 +952,28 @@ impl Transaction {
                 file.data_file_id
             )));
         }
+        let live_index_count = self
+            .state
+            .indexes
+            .get(&table.get())
+            .map_or(0, BTreeMap::len);
+        if live_index_count > 0 && file.delete_count > 0 && index_entries.is_empty() {
+            return Err(Error::Constraint(format!(
+                "register_delete_file on indexed table {table} must supply index entries"
+            )));
+        }
+        // An entry's row is the target's `row_id_start + ordinal`, so an
+        // ordinal past that file's rows would name a row it does not hold.
+        for entry in index_entries {
+            if entry.ordinal >= data_file.record_count {
+                return Err(Error::Constraint(format!(
+                    "register_delete_file: index entry ordinal {} is outside the target file's \
+                     record count {} on table {table}",
+                    entry.ordinal, data_file.record_count
+                )));
+            }
+        }
+
         let delete_file_id = self.alloc_file_id();
 
         self.state.put_delete_file(DeleteFileValue {
@@ -958,6 +991,41 @@ impl Transaction {
             encryption_key: file.encryption_key,
             partial_max: None,
         });
+
+        if !index_entries.is_empty() {
+            let row_id_start = data_file.row_id_start.ok_or_else(|| {
+                Error::Constraint(format!(
+                    "data file {} of table {table} carries per-row ids; index maintenance of \
+                     rewrite files is a follow-up",
+                    file.data_file_id
+                ))
+            })?;
+            for file_entry in index_entries {
+                let (unique, column_count) = {
+                    let index = self
+                        .state
+                        .indexes
+                        .get(&table.get())
+                        .and_then(|per_table| per_table.get(&file_entry.index.get()))
+                        .ok_or_else(|| {
+                            Error::NotFound(format!("index {} on table {table}", file_entry.index))
+                        })?;
+                    (index.unique, index.column_ids.len())
+                };
+                let row_id = row_id_start.saturating_add(file_entry.ordinal);
+                self.stage_index_entry(
+                    file_entry.index.get(),
+                    unique,
+                    column_count,
+                    &IndexEntry {
+                        row_id,
+                        values: file_entry.values.clone(),
+                    },
+                    true,
+                )?;
+            }
+        }
+
         self.ops.push(Operation::RegisterDeleteFile {
             table_id: table.get(),
         });
@@ -1762,6 +1830,7 @@ mod tests {
                     footer_size: 4,
                     encryption_key: None,
                 },
+                &[],
             )
             .unwrap();
         assert_eq!(transaction.delete_files_of(t)[0].id, d);
@@ -1801,6 +1870,7 @@ mod tests {
                     footer_size: 4,
                     encryption_key: None,
                 },
+                &[],
             ),
             Err(Error::NotFound(_))
         ));
@@ -1829,15 +1899,19 @@ mod tests {
             .register_data_file(t, datafile(100, vec![]), &[])
             .unwrap();
 
-        let first = transaction.register_delete_file(t, delete_file(f)).unwrap();
+        let first = transaction
+            .register_delete_file(t, delete_file(f), &[])
+            .unwrap();
         assert!(matches!(
-            transaction.register_delete_file(t, delete_file(f)),
+            transaction.register_delete_file(t, delete_file(f), &[]),
             Err(Error::Constraint(_))
         ));
 
         // Expiring the predecessor frees the slot.
         transaction.expire_delete_file(t, first).unwrap();
-        transaction.register_delete_file(t, delete_file(f)).unwrap();
+        transaction
+            .register_delete_file(t, delete_file(f), &[])
+            .unwrap();
     }
 
     #[test]

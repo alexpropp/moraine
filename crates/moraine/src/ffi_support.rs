@@ -531,6 +531,7 @@ mod tests {
                         footer_size: 32,
                         encryption_key: None,
                     },
+                    &[],
                 )?;
                 tx.update_column_stats(
                     table,

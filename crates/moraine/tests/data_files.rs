@@ -135,6 +135,7 @@ async fn encryption_keys_round_trip_verbatim() {
                     footer_size: 4,
                     encryption_key: Some("ZGVsZXRlLWtleQ==".into()),
                 },
+                &[],
             )?;
             Ok(())
         })
@@ -171,6 +172,7 @@ async fn delete_files_cascade_with_their_data_file() {
                     footer_size: 4,
                     encryption_key: None,
                 },
+                &[],
             )?;
             Ok(())
         })
@@ -202,6 +204,7 @@ async fn delete_files_cascade_with_their_data_file() {
                     footer_size: 4,
                     encryption_key: None,
                 },
+                &[],
             )
             .map(|_| ())
         })

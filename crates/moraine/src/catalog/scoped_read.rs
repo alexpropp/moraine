@@ -141,7 +141,7 @@ fn array_value(array: &dyn Array, row: usize) -> Result<Option<IndexKeyValue>> {
     Ok(Some(value))
 }
 
-/// Reads the row-id column value at `row` as a `u64` (`Int64`/`UInt64`).
+/// Reads a row id or row position at `row` as a `u64` (`Int64`/`UInt64`).
 fn row_id_value(array: &dyn Array, row: usize) -> Result<u64> {
     match array.data_type() {
         DataType::Int64 => u64::try_from(downcast::<Int64Array>(array)?.value(row))
@@ -253,6 +253,53 @@ fn record_batch_entries(
             Ok(ScopedReadEntry { row_id, values })
         })
         .collect()
+}
+
+/// The row positions a DuckLake delete file marks dead, read from its `pos`
+/// column. A delete file names positions within one data file, so its
+/// `file_path` column carries no information the caller lacks.
+pub(crate) async fn delete_file_positions(
+    object_store: &dyn ObjectStore,
+    path: &Path,
+) -> Result<Vec<u64>> {
+    let bytes: Bytes = object_store
+        .get(path)
+        .await
+        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?
+        .bytes()
+        .await
+        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+
+    let position = builder
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == "pos")
+        .ok_or_else(|| Error::Corruption("delete file has no `pos` column".to_owned()))?;
+
+    let mask = ProjectionMask::roots(builder.parquet_schema(), [position]);
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+
+    let mut positions = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+        let column = batch.column(0).as_ref();
+        for row in 0..batch.num_rows() {
+            if column.is_null(row) {
+                return Err(Error::Corruption(
+                    "delete file has a NULL position".to_owned(),
+                ));
+            }
+            positions.push(row_id_value(column, row)?);
+        }
+    }
+    Ok(positions)
 }
 
 /// Decodes an inline-insert Arrow body — `[u32-le message length][record-
