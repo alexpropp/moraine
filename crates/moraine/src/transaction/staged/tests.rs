@@ -1169,6 +1169,130 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
     assert_eq!(row_ids, vec![100, 102]);
 }
 
+/// Registers values 10,20,30 in a per-row-id file (file 1, embedded ids
+/// 5,9,12) on the indexed table, returning the store it lives on.
+async fn register_per_row_id_file(catalog: &Catalog) -> Arc<InMemory> {
+    let store = Arc::new(InMemory::new());
+    let size =
+        write_parquet_with_row_ids(&store, "main/t/rewrite.parquet", &[10, 20, 30], &[5, 9, 12])
+            .await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: rewrite_data_file_row(1, 3, "rewrite.parquet", 3, size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+    store
+}
+
+/// A delete file targeting a per-row-id file removes exactly the named
+/// positions' entries, resolved through the embedded ids.
+#[tokio::test]
+async fn delete_file_against_per_row_id_target_removes_named_positions() {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_per_row_id_file(&catalog).await;
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 3);
+
+    // Kill position 1 (value 20, embedded id 9): a DuckLake delete file
+    // is a `file_path`/`pos` Parquet naming positions within the target.
+    let deletes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["rewrite.parquet"])),
+            Arc::new(Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: vec![
+            Cell::U64(2),
+            Cell::U64(1),
+            Cell::U64(4),
+            Cell::Null,
+            Cell::U64(1), // data_file_id: the per-row-id target
+            Cell::Str("deletes.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(1), // delete_count
+            Cell::U64(512),
+            Cell::U64(64),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        2,
+        "exactly the killed position's entry is gone"
+    );
+}
+
+/// An inline file-delete names a row id directly; against a per-row-id
+/// target the id matches the embedded column, not any dense range.
+#[tokio::test]
+async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_per_row_id_file(&catalog).await;
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 3);
+
+    // Row id 9 is the embedded id of position 1 (value 20).
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    tx.stage(RowOperation::InlineFileDelete {
+        table_id: 1,
+        data_file_id: 1,
+        row_id: 9,
+        begin_snapshot: 4,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inlined_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        2,
+        "the named row's entry is gone"
+    );
+}
+
 /// An inlined delete against a Parquet-file row removes that row's
 /// entry, read back out of the target file.
 #[tokio::test]

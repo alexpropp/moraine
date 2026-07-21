@@ -5,7 +5,7 @@
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
     InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, ScopedReadEntry,
-    StagedIndexEntry, TableId, TableKind, commit, data_file_row_id_start,
+    StagedIndexEntry, TableId, TableKind, commit,
     decode::{decode_data_file, decode_delete_file},
     encode_key, proto, scoped_read, stage_index_entries, store_inline,
 };
@@ -108,7 +108,7 @@ pub(super) async fn stage_index_maintenance(
     // Rows this commit kills, grouped by where their values must be read
     // from: an inline chunk, or a position range of one data file.
     let mut inline_deletes: HashMap<u64, Vec<u64>> = HashMap::new();
-    let mut file_deletes: HashMap<(u64, u64), Vec<u64>> = HashMap::new();
+    let mut file_deletes: HashMap<(u64, u64), KilledRows> = HashMap::new();
 
     for op in ops {
         match op {
@@ -164,7 +164,7 @@ pub(super) async fn stage_index_maintenance(
                 file_deletes
                     .entry((*table_id, *data_file_id))
                     .or_default()
-                    .push(*row_id);
+                    .insert_row_id(*row_id);
             }
             _ => {}
         }
@@ -182,12 +182,12 @@ pub(super) async fn stage_index_maintenance(
         )
         .await?;
     }
-    for ((table_id, data_file_id), row_ids) in &file_deletes {
+    for ((table_id, data_file_id), killed) in &file_deletes {
         stage_file_delete_entries(
             base,
             *table_id,
             *data_file_id,
-            row_ids,
+            killed,
             data_store,
             data_prefix,
             &mut entries,
@@ -376,15 +376,33 @@ pub(super) async fn stage_inline_delete_entries(
     Ok(())
 }
 
-/// Records the rows a staged `register_delete_file` kills, by reading the
-/// positions out of the delete file and resolving them against its target's
-/// row-id range.
+/// Rows a commit kills inside one data file, named two ways: positions
+/// from a delete file, row ids from inline file-deletes.
+#[derive(Debug, Default)]
+pub(super) struct KilledRows {
+    /// Killed positions within the target file, as its delete file
+    /// records them.
+    positions: HashSet<u64>,
+    /// Killed row ids, as inline file-deletes name them.
+    row_ids: HashSet<u64>,
+}
+
+impl KilledRows {
+    /// Records an inline file-delete's row id.
+    pub(super) fn insert_row_id(&mut self, row_id: u64) {
+        self.row_ids.insert(row_id);
+    }
+}
+
+/// Records the positions a staged `register_delete_file` kills, read out
+/// of the delete file verbatim — resolving them to row ids would bake in
+/// the dense assumption the target's scoped read decides.
 pub(super) async fn collect_delete_file_rows(
     base: &CatalogSnapshot,
     cells: &[Cell],
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
-    file_deletes: &mut HashMap<(u64, u64), Vec<u64>>,
+    file_deletes: &mut HashMap<(u64, u64), KilledRows>,
 ) -> Result<()> {
     let delete_file = decode_delete_file(cells)?;
     let table = TableId::new(delete_file.table_id);
@@ -392,8 +410,6 @@ pub(super) async fn collect_delete_file_rows(
         return Ok(());
     }
 
-    let data_file = live_data_file(base, delete_file.table_id, delete_file.data_file_id)?;
-    let row_id_start = data_file_row_id_start(&data_file)?;
     let data_store = data_store.ok_or_else(|| {
         Error::Constraint(format!(
             "delete file {} on indexed table {} cannot be read to maintain its equality index: no \
@@ -404,20 +420,11 @@ pub(super) async fn collect_delete_file_rows(
 
     let path = delete_file_object_path(base, &delete_file, data_prefix)?;
     let positions = scoped_read::delete_file_positions(data_store, &path).await?;
-    let killed = file_deletes
+    file_deletes
         .entry((delete_file.table_id, delete_file.data_file_id))
-        .or_default();
-
-    for position in positions {
-        let row_id = row_id_start.checked_add(position).ok_or_else(|| {
-            Error::Corruption(format!(
-                "delete file {} names position {position}, which overflows the row-id range of \
-                 data file {} on table {}",
-                delete_file.delete_file_id, delete_file.data_file_id, delete_file.table_id
-            ))
-        })?;
-        killed.push(row_id);
-    }
+        .or_default()
+        .positions
+        .extend(positions);
     Ok(())
 }
 
@@ -427,7 +434,7 @@ pub(super) async fn stage_file_delete_entries(
     base: &CatalogSnapshot,
     table_id: u64,
     data_file_id: u64,
-    row_ids: &[u64],
+    killed: &KilledRows,
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
     entries: &mut Vec<StagedIndexEntry>,
@@ -447,13 +454,20 @@ pub(super) async fn stage_file_delete_entries(
     })?;
 
     let path = data_file_object_path(base, &file, data_prefix)?;
-    let killed: HashSet<u64> = row_ids.iter().copied().collect();
     let per_index =
         per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
+    // An entry dies when a delete file names its ordinal or an inline
+    // file-delete names its row id — one rule for dense and per-row-id
+    // targets alike.
     for (index, scoped) in indexes.iter().zip(per_index) {
         let scoped = scoped
             .into_iter()
-            .filter(|entry| killed.contains(&entry.row_id))
+            .enumerate()
+            .filter(|(ordinal, entry)| {
+                let ordinal = u64::try_from(*ordinal).unwrap_or(u64::MAX);
+                killed.positions.contains(&ordinal) || killed.row_ids.contains(&entry.row_id)
+            })
+            .map(|(_, entry)| entry)
             .collect();
         push_index_entries(entries, index, scoped, true)?;
     }
