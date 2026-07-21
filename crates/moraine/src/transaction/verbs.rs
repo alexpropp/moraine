@@ -966,10 +966,18 @@ impl Transaction {
         // not hold. A per-row-id target's ids are the writer's to supply —
         // it read them from the file's embedded row-id column.
         if let Some(start) = data_file.row_id_start {
+            // A range whose end overflows names more rows than a u64 can
+            // hold: catalog corruption, refused rather than saturated (which
+            // would admit out-of-range ids).
+            let end = start.checked_add(data_file.record_count).ok_or_else(|| {
+                Error::Constraint(format!(
+                    "register_delete_file: target data file {}'s row-id range overflows u64 \
+                     on table {table}",
+                    file.data_file_id
+                ))
+            })?;
             for entry in index_entries {
-                let in_range = entry.row_id >= start
-                    && entry.row_id < start.saturating_add(data_file.record_count);
-                if !in_range {
+                if entry.row_id < start || entry.row_id >= end {
                     return Err(Error::Constraint(format!(
                         "register_delete_file: index entry row id {} is outside the target \
                          file's row-id range on table {table}",
@@ -2394,6 +2402,59 @@ mod tests {
                 &[FileIndexRemoval {
                     index,
                     row_id: 3,
+                    values: removal_value(30),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+    }
+
+    #[test]
+    fn delete_removals_against_a_dense_target_whose_range_overflows_are_refused() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let col_a = transaction.state.columns_of(t)[0].id;
+        let index = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![col_a],
+                    unique: false,
+                },
+                &[],
+            )
+            .unwrap();
+        // A dense file whose recorded range end runs off the top of u64:
+        // start + record_count cannot be represented, so no id is in range.
+        transaction.state.put_data_file(DataFileValue {
+            data_file_id: 88,
+            table_id: t.get(),
+            begin_snapshot: 1,
+            end_snapshot: None,
+            file_order: None,
+            path: "dense.parquet".into(),
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: 3,
+            file_size_bytes: 1024,
+            footer_size: 64,
+            row_id_start: Some(u64::MAX - 1),
+            partition_id: None,
+            encryption_key: None,
+            mapping_id: None,
+            partial_max: None,
+            partition_values: vec![],
+        });
+
+        let err = transaction
+            .register_delete_file(
+                t,
+                delete_file_over(DataFileId::new(88), 1),
+                &[FileIndexRemoval {
+                    index,
+                    row_id: u64::MAX,
                     values: removal_value(30),
                 }],
             )

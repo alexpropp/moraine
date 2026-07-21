@@ -453,6 +453,19 @@ pub(super) async fn stage_file_delete_entries(
         ))
     })?;
 
+    // Positions are physical row ordinals read out of the delete file; one
+    // naming a row the target does not hold could never match a scoped
+    // entry and would silently orphan index rows, so refuse it here.
+    for &position in &killed.positions {
+        if position >= file.record_count {
+            return Err(Error::Constraint(format!(
+                "delete file for data file {data_file_id} on table {table_id} names position \
+                 {position} outside the file's record count {}",
+                file.record_count
+            )));
+        }
+    }
+
     let path = data_file_object_path(base, &file, data_prefix)?;
     let per_index =
         per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
@@ -464,7 +477,7 @@ pub(super) async fn stage_file_delete_entries(
             .into_iter()
             .enumerate()
             .filter(|(ordinal, entry)| {
-                let ordinal = u64::try_from(*ordinal).unwrap_or(u64::MAX);
+                let ordinal = *ordinal as u64;
                 killed.positions.contains(&ordinal) || killed.row_ids.contains(&entry.row_id)
             })
             .map(|(_, entry)| entry)

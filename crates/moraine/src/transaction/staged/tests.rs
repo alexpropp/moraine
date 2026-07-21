@@ -1411,6 +1411,65 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     );
 }
 
+/// A delete file naming a position past the target file's row count could
+/// never match a scoped entry; rather than silently orphan index rows, the
+/// commit is refused.
+#[tokio::test]
+async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let (catalog, _index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+    // The target holds 3 rows (positions 0..=2); position 5 names none.
+    let deletes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int64Array::from(vec![5])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: vec![
+            Cell::U64(2),
+            Cell::U64(1),
+            Cell::U64(4),
+            Cell::Null,
+            Cell::U64(1), // data_file_id
+            Cell::Str("deletes.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(1), // delete_count
+            Cell::U64(512),
+            Cell::U64(64),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+}
+
 /// `InlineFlushDelete` removes chunks begun at or before the flush
 /// snapshot for the named schema version, plus the `inline/inline_delete`
 /// tombstones those chunks' rows consumed — a later schema version's
