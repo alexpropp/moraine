@@ -271,8 +271,7 @@ pub unsafe extern "C" fn moraine_arrow_decode_body(
             return Err("null schema or body".to_string());
         }
         // SAFETY: caller guarantees `schema_ipc_len` bytes are readable at `schema_ipc`.
-        let schema_bytes =
-            unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) }.to_vec();
+        let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) };
         // SAFETY: caller guarantees `body_len` bytes are readable at `body`.
         let body_bytes = unsafe { std::slice::from_raw_parts(body, body_len) };
 
@@ -335,7 +334,7 @@ pub unsafe extern "C" fn moraine_arrow_decode_stream(
             return Err("null body".to_string());
         }
         // SAFETY: caller guarantees `body_len` readable bytes at `body`.
-        let bytes = unsafe { std::slice::from_raw_parts(body, body_len) }.to_vec();
+        let bytes = unsafe { std::slice::from_raw_parts(body, body_len) };
         let mut reader =
             StreamReader::try_new(Cursor::new(bytes), None).map_err(|e| format!("reader: {e}"))?;
         let schema = reader.schema();

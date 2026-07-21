@@ -1,21 +1,9 @@
 //! Macros through the public API: versioned lifecycle, the macro-only
 //! namespace, and time travel — real SlateDB on in-memory object storage.
 
-use std::sync::Arc;
+use moraine::{Error, MacroImplementationDef, MacroParameterDef};
 
-use moraine::{
-    Catalog, CatalogOptions, ColumnDef, Error, MacroImplementationDef, MacroParameterDef,
-};
-use object_store::memory::InMemory;
-
-fn col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-    }
-}
+use crate::fixtures::{col, open_memory};
 
 fn scalar_impl(sql: &str, parameters: Vec<MacroParameterDef>) -> MacroImplementationDef {
     MacroImplementationDef {
@@ -33,13 +21,6 @@ fn parameter(name: &str) -> MacroParameterDef {
         default_value: None,
         default_value_type: "unknown".into(),
     }
-}
-
-#[allow(clippy::unwrap_used)]
-async fn open_memory() -> Catalog {
-    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap()
 }
 
 #[tokio::test]

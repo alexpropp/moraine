@@ -215,6 +215,24 @@ pub(crate) enum EntityKey {
     },
 }
 
+impl EntityKey {
+    /// Whether records of this kind carry a begin/end lifecycle and mirror
+    /// to history when ended. Unversioned kinds (statistics, options, tags,
+    /// mappings) are overwritten in place — or written once — and never
+    /// appear in the history subspace.
+    pub(crate) const fn is_versioned(self) -> bool {
+        !matches!(
+            self,
+            Self::FileColumnStats { .. }
+                | Self::TableStats { .. }
+                | Self::TableColumnStats { .. }
+                | Self::Option { .. }
+                | Self::Tag { .. }
+                | Self::Mapping { .. }
+        )
+    }
+}
+
 /// An inlined-data key: the per-schema-version Arrow schema, a live
 /// record, or the archived (post-flush) form of a live record. `Live` and
 /// `Arch` share [`InlineOp`], so an archive key has exactly the components
@@ -467,12 +485,20 @@ impl InlineOperationKind {
 /// `InlineKey::Live`, op kind.
 const INLINE_LIVE_KIND_PREFIX_LEN: usize = 3;
 
+/// Encodes `key` and keeps its first `len` bytes.
+fn prefix_of(key: &Key, len: usize) -> Vec<u8> {
+    let mut bytes = key.encode();
+    bytes.truncate(len);
+    bytes
+}
+
 /// Byte prefix of every live `inline/*` key of `kind` scoped to
 /// `table_id`.
 pub(crate) fn inline_live_table_prefix(kind: InlineOperationKind, table_id: u64) -> Vec<u8> {
-    let mut bytes = Key::Inline(InlineKey::Live(kind.sample(table_id))).encode();
-    bytes.truncate(INLINE_LIVE_KIND_PREFIX_LEN + size_of::<u64>());
-    bytes
+    prefix_of(
+        &Key::Inline(InlineKey::Live(kind.sample(table_id))),
+        INLINE_LIVE_KIND_PREFIX_LEN + size_of::<u64>(),
+    )
 }
 
 /// Discriminant bytes preceding an `inline/schema` key's components:
@@ -482,24 +508,24 @@ const INLINE_SCHEMA_PREFIX_LEN: usize = 2;
 /// Byte prefix of every `inline/schema` key scoped to `table_id`, across
 /// all schema versions.
 pub(crate) fn inline_schema_table_prefix(table_id: u64) -> Vec<u8> {
-    let mut bytes = Key::Inline(InlineKey::Schema {
-        table_id,
-        schema_version: 0,
-    })
-    .encode();
-    bytes.truncate(INLINE_SCHEMA_PREFIX_LEN + size_of::<u64>());
-    bytes
+    prefix_of(
+        &Key::Inline(InlineKey::Schema {
+            table_id,
+            schema_version: 0,
+        }),
+        INLINE_SCHEMA_PREFIX_LEN + size_of::<u64>(),
+    )
 }
 
 /// Byte prefix of every `inline/schema` key, across every table.
 pub(crate) fn inline_schema_prefix() -> Vec<u8> {
-    let mut bytes = Key::Inline(InlineKey::Schema {
-        table_id: 0,
-        schema_version: 0,
-    })
-    .encode();
-    bytes.truncate(INLINE_SCHEMA_PREFIX_LEN);
-    bytes
+    prefix_of(
+        &Key::Inline(InlineKey::Schema {
+            table_id: 0,
+            schema_version: 0,
+        }),
+        INLINE_SCHEMA_PREFIX_LEN,
+    )
 }
 
 /// Discriminant bytes preceding an index entry's components: the `idx`
@@ -534,9 +560,7 @@ pub(crate) fn idx_index_prefix(kind: IdxKind, index_id: u64) -> Vec<u8> {
             row_id: 0,
         }),
     };
-    let mut bytes = key.encode();
-    bytes.truncate(IDX_KIND_PREFIX_LEN + size_of::<u64>());
-    bytes
+    prefix_of(&key, IDX_KIND_PREFIX_LEN + size_of::<u64>())
 }
 
 /// Byte prefix of every non-unique entry sharing one `(index_id, value)` —
@@ -557,18 +581,17 @@ pub(crate) fn idx_multi_value_prefix(index_id: u64, value: &CanonicalKey) -> Vec
 /// Byte prefix of every key in a subspace (exactly `TAG_PREFIX_LEN`
 /// bytes — the same prefix the segment extractor derives).
 pub(crate) fn subspace_prefix(subspace: Subspace) -> Vec<u8> {
-    let mut bytes = subspace.sample().encode();
-    bytes.truncate(TAG_PREFIX_LEN);
-    bytes
+    prefix_of(&subspace.sample(), TAG_PREFIX_LEN)
 }
 
 /// Byte prefix of every live key of `kind` scoped to `table_id`.
 // No caller yet; pinned by the prefix tests below.
 #[allow(dead_code)]
 pub(crate) fn current_table_prefix(kind: TableScopedKind, table_id: u64) -> Vec<u8> {
-    let mut bytes = Key::current(kind.sample(table_id)).encode();
-    bytes.truncate(CUR_KIND_PREFIX_LEN + size_of::<u64>());
-    bytes
+    prefix_of(
+        &Key::current(kind.sample(table_id)),
+        CUR_KIND_PREFIX_LEN + size_of::<u64>(),
+    )
 }
 
 #[cfg(test)]
@@ -834,13 +857,7 @@ mod tests {
         prefix.extend(be(1));
         assert!(bytes.starts_with(&prefix), "{bytes:?}");
         // The row id is the final component, appended after the value.
-        let mut tail = bytes.clone();
-        tail.reverse();
-        assert!(tail.starts_with(&{
-            let mut r = be(3);
-            r.reverse();
-            r
-        }));
+        assert!(bytes.ends_with(&be(3)), "{bytes:?}");
     }
 
     #[test]

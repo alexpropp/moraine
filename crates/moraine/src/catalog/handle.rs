@@ -8,8 +8,8 @@ use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnId, FileIndexEntry, IndexEntry, IndexId, IndexState, RowHolder,
-        RowLocation, SnapshotId, TableId, projection::ProjectionCache, scoped_read,
+        CatalogSnapshot, ColumnId, DataFileInfo, FileIndexEntry, IndexEntry, IndexId, IndexState,
+        RowHolder, RowLocation, SnapshotId, TableId, projection::ProjectionCache, scoped_read,
     },
     error::{Error, Result},
     store::{
@@ -240,9 +240,7 @@ impl Catalog {
         let outcome = async {
             let view = commit::materialize(handle, None).await?;
             let info = view
-                .indexes_of(table)
-                .into_iter()
-                .find(|info| info.id == index)
+                .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
 
             match info.state {
@@ -256,14 +254,14 @@ impl Catalog {
                     return Err(Error::NotFound(format!("index {index} was poisoned")));
                 }
             }
-            let key = crate::store::index_encoding::encode_key(values)?;
             let row_ids =
-                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await?;
+                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, values).await?;
+            let files = view.data_files_of(table);
             Ok(row_ids
                 .into_iter()
                 .map(|row_id| RowLocation {
                     row_id,
-                    holder: resolve_row_holder(&view, table, row_id),
+                    holder: resolve_row_holder(&files, row_id),
                 })
                 .collect())
         }
@@ -541,12 +539,12 @@ impl Catalog {
     }
 }
 
-/// Resolves a row id to its current holder against a materialized view: the
-/// data file whose live dense row-id range contains it, else `Inline`
+/// Resolves a row id to its current holder among a table's data files: the
+/// file whose live dense row-id range contains it, else `Inline`
 /// (an inlined row, or a file that carries explicit per-row ids rather than
 /// a dense range).
-fn resolve_row_holder(view: &CatalogSnapshot, table: TableId, row_id: u64) -> RowHolder {
-    for file in view.data_files_of(table) {
+fn resolve_row_holder(files: &[DataFileInfo], row_id: u64) -> RowHolder {
+    for file in files {
         if let Some(start) = file.row_id_start
             && row_id >= start
             && row_id < start.saturating_add(file.record_count)

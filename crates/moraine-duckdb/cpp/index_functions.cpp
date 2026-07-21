@@ -42,7 +42,7 @@ MoraineCatalogHandle *ResolveHandle(duckdb::ClientContext &context, const std::s
 	    catalog_name);
 }
 
-// ---- moraine_indexes: list a table's live equality indexes ----
+// moraine_indexes: lists a table's live equality indexes.
 
 struct IndexesBindData : public duckdb::FunctionData {
 	std::string catalog_name;
@@ -130,7 +130,7 @@ void IndexesImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 	output.SetCardinality(count);
 }
 
-// ---- moraine_index_create / moraine_index_drop: autonomous-commit DDL ----
+// moraine_index_create / moraine_index_drop: autonomous-commit DDL.
 
 struct IndexDdlBindData : public duckdb::FunctionData {
 	bool is_create = false;
@@ -232,7 +232,7 @@ duckdb::unique_ptr<duckdb::FunctionData> DropBind(duckdb::ClientContext &, duckd
 	return std::move(bind_data);
 }
 
-// ---- moraine_index_lookup: resolve a value to the rows holding it ----
+// moraine_index_lookup: resolves a value to the rows holding it.
 
 struct LookupBindData : public duckdb::FunctionData {
 	std::string catalog_name;

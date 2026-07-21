@@ -959,8 +959,9 @@ fn apply_op(
             apply_update_set_begin(base, state, *table, cells, new_id)
         }
         RowOperation::Delete { table, cells } => apply_delete(state, *table, cells, direct),
-        // Inline ops never reach here — `translate` routes them to
-        // `translate_inline`. Kept only for match exhaustiveness.
+        // Inline ops contribute no snapshot diff — their writes come from
+        // `translate_inline` — so both `translate` and
+        // `translate_maintenance` pass them through here as no-ops.
         RowOperation::InlineSchema { .. }
         | RowOperation::InlineInsert { .. }
         | RowOperation::InlineInlineDelete { .. }
@@ -2759,7 +2760,8 @@ fn translate_maintenance(
         ) || is_inline_op(op);
         if !allowed {
             return Err(Error::Constraint(
-                "a staged commit without a ducklake_snapshot insert may only reclaim state                  (maintenance deletes and deletion-schedule inserts)"
+                "a staged commit without a ducklake_snapshot insert may only reclaim state \
+                 (maintenance deletes and deletion-schedule inserts)"
                     .to_string(),
             ));
         }

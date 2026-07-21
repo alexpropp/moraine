@@ -10,18 +10,18 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
+#include <deque>
+
 namespace moraine_duckdb {
 
 namespace {
 
 // Converts one scanned cell to a `MoraineCell`, appending any decoded
-// string into `string_storage`. The caller must reserve `string_storage` to
-// at least the row's full column count before the first call for that row:
-// the `std::string::c_str()` pointers taken here are borrowed by
-// `moraine_tx_stage`, and a `std::vector` reallocation on `push_back` would
-// invalidate any already-taken pointer.
+// string into `string_storage` — a deque because the `c_str()` pointers
+// taken here are borrowed by `moraine_tx_stage` and must survive later
+// appends.
 MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType &type,
-                          std::vector<std::string> &string_storage) {
+                          std::deque<std::string> &string_storage) {
 	MoraineCell cell {};
 	if (value.IsNull()) {
 		cell.kind = 0;
@@ -165,8 +165,7 @@ public:
 		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			std::vector<std::string> string_storage;
-			string_storage.reserve(spec_.columns.size());
+			std::deque<std::string> string_storage;
 			std::vector<MoraineCell> cells;
 			cells.reserve(chunk.ColumnCount());
 			for (duckdb::idx_t col = 0; col < chunk.ColumnCount(); col++) {
@@ -238,8 +237,7 @@ public:
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
 			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_col, row), context.client);
-			std::vector<std::string> string_storage;
-			string_storage.reserve(spec_.columns.size() + 1);
+			std::deque<std::string> string_storage;
 			std::vector<MoraineCell> cells;
 
 			if (lifecycle_op_ >= 0) {
@@ -304,8 +302,7 @@ public:
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
 			auto &old_row = ResolveRow(state, chunk.GetValue(row_id_chunk_index_, row), context.client);
-			std::vector<std::string> string_storage;
-			string_storage.reserve(spec_.delete_key_columns.size());
+			std::deque<std::string> string_storage;
 			std::vector<MoraineCell> cells;
 			cells.reserve(spec_.delete_key_columns.size());
 			for (auto key_col : spec_.delete_key_columns) {

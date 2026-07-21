@@ -12,7 +12,7 @@ use crate::{
     error::{Error, Result},
     store::{
         handle::ReadHandle,
-        index_encoding::CanonicalKey,
+        index_encoding::{CanonicalKey, IndexKeyValue, encode_key},
         key::{IdxKey, Key, idx_multi_value_prefix},
     },
     transaction::commit::StagedWrite,
@@ -128,8 +128,9 @@ pub(crate) async fn lookup_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
     unique: bool,
-    key: &CanonicalKey,
+    values: &[IndexKeyValue],
 ) -> Result<Vec<u64>> {
+    let key = &encode_key(values)?;
     if unique {
         let entry_key = Key::Idx(IdxKey::Unique {
             index_id,

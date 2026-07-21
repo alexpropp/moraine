@@ -1,7 +1,10 @@
 //! Opening, bootstrap, and snapshot materialization. The commit cycle
 //! itself builds on these.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
 use uuid::Uuid;
@@ -21,7 +24,7 @@ use crate::{
     transaction::{
         index_maintenance,
         operations::{ChangeSet, Operation},
-        verbs::Transaction,
+        verbs::{Transaction, TransactionParts},
     },
 };
 
@@ -322,17 +325,13 @@ fn stage_overwrite<M: prost::Message + PartialEq>(
 /// Stages the transition of every entity in one id-keyed map pair.
 fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
-    base: &std::collections::BTreeMap<K, M>,
-    state: &std::collections::BTreeMap<K, M>,
+    base: &BTreeMap<K, M>,
+    state: &BTreeMap<K, M>,
     make_key: impl Fn(K) -> EntityKey,
     new_snapshot: u64,
     set_end: impl Fn(&M) -> M,
 ) {
-    for &id in base
-        .keys()
-        .chain(state.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-    {
+    for &id in base.keys().chain(state.keys()).collect::<BTreeSet<_>>() {
         stage_transition(
             writes,
             make_key(id),
@@ -348,18 +347,14 @@ fn diff_versioned_map<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
 /// pair (`table_id` → `id` → record).
 fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
     writes: &mut Vec<StagedWrite>,
-    base: &std::collections::BTreeMap<u64, std::collections::BTreeMap<K, M>>,
-    state: &std::collections::BTreeMap<u64, std::collections::BTreeMap<K, M>>,
+    base: &BTreeMap<u64, BTreeMap<K, M>>,
+    state: &BTreeMap<u64, BTreeMap<K, M>>,
     make_key: impl Fn(u64, K) -> EntityKey,
     new_snapshot: u64,
     set_end: impl Fn(&M) -> M,
 ) {
-    let empty = std::collections::BTreeMap::new();
-    for &table_id in base
-        .keys()
-        .chain(state.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-    {
+    let empty = BTreeMap::new();
+    for &table_id in base.keys().chain(state.keys()).collect::<BTreeSet<_>>() {
         diff_versioned_map(
             writes,
             base.get(&table_id).unwrap_or(&empty),
@@ -375,15 +370,11 @@ fn diff_nested_versioned<K: Copy + Ord, M: prost::Message + Clone + PartialEq>(
 /// pair — unversioned kinds with no history mirror.
 fn diff_overwrite_map<K: Copy + Ord, M: prost::Message + PartialEq>(
     writes: &mut Vec<StagedWrite>,
-    base: &std::collections::BTreeMap<K, M>,
-    state: &std::collections::BTreeMap<K, M>,
+    base: &BTreeMap<K, M>,
+    state: &BTreeMap<K, M>,
     make_key: impl Fn(K) -> EntityKey,
 ) {
-    for &id in base
-        .keys()
-        .chain(state.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-    {
+    for &id in base.keys().chain(state.keys()).collect::<BTreeSet<_>>() {
         stage_overwrite(writes, make_key(id), base.get(&id), state.get(&id));
     }
 }
@@ -423,7 +414,7 @@ fn diff_tables(
     }
 
     let table_ids = base.tables.keys().chain(state.tables.keys());
-    for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
+    for &table_id in table_ids.collect::<BTreeSet<_>>() {
         let entity = EntityKey::Table { table_id };
 
         // A counter-only change overwrites the record in place: the
@@ -486,22 +477,16 @@ fn diff_options(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &C
 }
 
 fn diff_tags(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
-    let object_ids = base.tags.keys().chain(state.tags.keys());
-    for &object_id in object_ids.collect::<std::collections::BTreeSet<_>>() {
-        stage_overwrite(
-            writes,
-            EntityKey::Tag { object_id },
-            base.tags.get(&object_id),
-            state.tags.get(&object_id),
-        );
-    }
+    diff_overwrite_map(writes, &base.tags, &state.tags, |object_id| {
+        EntityKey::Tag { object_id }
+    });
 }
 
 /// Deletion-schedule rows: live bookkeeping under `current/gcfile`,
 /// overwritten or removed in place — never mirrored to history.
 fn diff_gc_files(writes: &mut Vec<StagedWrite>, base: &CatalogSnapshot, state: &CatalogSnapshot) {
     let file_ids = base.gc_files.keys().chain(state.gc_files.keys());
-    for &data_file_id in file_ids.collect::<std::collections::BTreeSet<_>>() {
+    for &data_file_id in file_ids.collect::<BTreeSet<_>>() {
         let key = Key::Current(CurrentKey::GcFile { data_file_id });
         match (
             base.gc_files.get(&data_file_id),
@@ -522,20 +507,17 @@ fn diff_macros(
     state: &CatalogSnapshot,
     new_snapshot: u64,
 ) {
-    let macro_ids = base.macros.keys().chain(state.macros.keys());
-    for &macro_id in macro_ids.collect::<std::collections::BTreeSet<_>>() {
-        stage_transition(
-            writes,
-            EntityKey::Macro { macro_id },
-            base.macros.get(&macro_id),
-            state.macros.get(&macro_id),
-            new_snapshot,
-            |prior| proto::MacroValue {
-                end_snapshot: Some(new_snapshot),
-                ..prior.clone()
-            },
-        );
-    }
+    diff_versioned_map(
+        writes,
+        &base.macros,
+        &state.macros,
+        |macro_id| EntityKey::Macro { macro_id },
+        new_snapshot,
+        |prior| proto::MacroValue {
+            end_snapshot: Some(new_snapshot),
+            ..prior.clone()
+        },
+    );
 }
 
 /// Mappings are immutable create-only records: `stage_overwrite`'s
@@ -578,15 +560,14 @@ fn diff_columns(
     }
 
     let column_tables = base.columns.keys().chain(state.columns.keys());
-    for &table_id in column_tables.collect::<std::collections::BTreeSet<_>>() {
-        static EMPTY: std::collections::BTreeMap<u64, proto::ColumnValue> =
-            std::collections::BTreeMap::new();
+    for &table_id in column_tables.collect::<BTreeSet<_>>() {
+        static EMPTY: BTreeMap<u64, proto::ColumnValue> = BTreeMap::new();
         let base_cols = base.columns.get(&table_id).unwrap_or(&EMPTY);
         let state_cols = state.columns.get(&table_id).unwrap_or(&EMPTY);
         for &column_id in base_cols
             .keys()
             .chain(state_cols.keys())
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
         {
             let entity = EntityKey::Column {
                 table_id,
@@ -742,12 +723,12 @@ fn diff_table_column_stats(
     base: &CatalogSnapshot,
     state: &CatalogSnapshot,
 ) {
-    let empty = std::collections::BTreeMap::new();
+    let empty = BTreeMap::new();
     let table_ids = base
         .table_column_stats
         .keys()
         .chain(state.table_column_stats.keys());
-    for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
+    for &table_id in table_ids.collect::<BTreeSet<_>>() {
         diff_overwrite_map(
             writes,
             base.table_column_stats.get(&table_id).unwrap_or(&empty),
@@ -769,11 +750,9 @@ fn diff_file_column_stats(
         .file_column_stats
         .keys()
         .chain(state.file_column_stats.keys());
-    for &table_id in table_ids.collect::<std::collections::BTreeSet<_>>() {
-        static EMPTY: std::collections::BTreeMap<(u64, u64), proto::FileColumnStatsValue> =
-            std::collections::BTreeMap::new();
-        static EMPTY_FILES: std::collections::BTreeMap<u64, proto::DataFileValue> =
-            std::collections::BTreeMap::new();
+    for &table_id in table_ids.collect::<BTreeSet<_>>() {
+        static EMPTY: BTreeMap<(u64, u64), proto::FileColumnStatsValue> = BTreeMap::new();
+        static EMPTY_FILES: BTreeMap<u64, proto::DataFileValue> = BTreeMap::new();
         let base_cols = base.file_column_stats.get(&table_id).unwrap_or(&EMPTY);
         let state_cols = state.file_column_stats.get(&table_id).unwrap_or(&EMPTY);
         let base_files = base.data_files.get(&table_id).unwrap_or(&EMPTY_FILES);
@@ -781,7 +760,7 @@ fn diff_file_column_stats(
         for &(data_file_id, column_id) in base_cols
             .keys()
             .chain(state_cols.keys())
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
         {
             // A file registered and expired within this commit exists in
             // neither side's data_files; its stats must not be staged.
@@ -899,6 +878,28 @@ enum Prepared {
     },
 }
 
+/// The store format the staged state requires: a `building` index implies
+/// [`FORMAT_WITH_STAGED_INDEX`], any other index [`FORMAT_WITH_INDEX`],
+/// else the base [`FORMAT_VERSION`].
+fn target_format(state: &CatalogSnapshot) -> u64 {
+    if state
+        .indexes
+        .values()
+        .flat_map(BTreeMap::values)
+        .any(|index| index.build_state.is_some())
+    {
+        FORMAT_WITH_STAGED_INDEX
+    } else if state
+        .indexes
+        .values()
+        .any(|per_table| !per_table.is_empty())
+    {
+        FORMAT_WITH_INDEX
+    } else {
+        FORMAT_VERSION
+    }
+}
+
 /// Materializes, runs the closure, and stages the resulting writes.
 /// Options-only commits stage no snapshot record and no head advance.
 async fn prepare_and_stage<F>(db_tx: &DbTransaction, f: &F) -> Result<Prepared>
@@ -911,7 +912,13 @@ where
 
     let mut tx = Transaction::new(base.clone(), new_id);
     f(&mut tx)?;
-    let (operations, index_entries, state, next_catalog_id, next_file_id) = tx.into_parts();
+    let TransactionParts {
+        operations,
+        index_entries,
+        state,
+        next_catalog_id,
+        next_file_id,
+    } = tx.into_parts();
 
     if operations.is_empty() {
         let mut writes = Vec::new();
@@ -938,25 +945,9 @@ where
 
     let mut writes = diff_writes(&base, &state, new_id);
 
-    // A staged (`building`) index implies format 3; any other index implies
-    // format 2. Stamp lazily, in the same batch, and only ever upward — a
+    // Stamp the format lazily, in the same batch, and only ever upward — a
     // completed or dropped build never downgrades the stamp.
-    let target_format = if state
-        .indexes
-        .values()
-        .flat_map(std::collections::BTreeMap::values)
-        .any(|index| index.build_state.is_some())
-    {
-        FORMAT_WITH_STAGED_INDEX
-    } else if state
-        .indexes
-        .values()
-        .any(|per_table| !per_table.is_empty())
-    {
-        FORMAT_WITH_INDEX
-    } else {
-        FORMAT_VERSION
-    };
+    let target_format = target_format(&state);
     if target_format > FORMAT_VERSION {
         let current = read::read_format(ReadHandle::Tx(db_tx))
             .await?
@@ -978,7 +969,7 @@ where
     let schema_changed_table_ids: Vec<u64> = operations
         .iter()
         .filter_map(Operation::schema_changed_table_id)
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
     let ours = ChangeSet::from_operations(&operations);
@@ -1222,7 +1213,7 @@ mod tests {
             )
             .unwrap();
         let column = setup.columns_of(table)[0].id;
-        let (_, _, base, _, _) = setup.into_parts();
+        let base = setup.into_parts().state;
 
         // Register a file with column stats, then expire it — all inside
         // this one commit's transaction.
@@ -1253,7 +1244,7 @@ mod tests {
             )
             .unwrap();
         tx.expire_data_file(table, file).unwrap();
-        let (_, _, state, _, _) = tx.into_parts();
+        let state = tx.into_parts().state;
 
         let writes = diff_writes(&base, &state, 2);
         for (key_bytes, _) in &writes {

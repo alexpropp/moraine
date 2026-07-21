@@ -20,6 +20,7 @@ use moraine::ffi_support::inline::InlineScanKind;
 
 use crate::{
     abi::{free_array, guard, write_array},
+    dumps::opt_u64,
     error::{AbiError, MoraineError, codes},
     runtime::{MoraineCatalogHandle, MoraineInterruptProbe},
 };
@@ -144,8 +145,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
         Ok(rows
             .into_iter()
             .map(|row| {
-                let (has_end_snapshot, end_snapshot) =
-                    row.end_snapshot.map_or((false, 0), |v| (true, v));
+                let (has_end_snapshot, end_snapshot) = opt_u64(row.end_snapshot);
                 let (chunk_body, chunk_body_len) = into_owned_bytes(row.chunk_body);
                 MoraineInlineRow {
                     row_id: row.row_id,

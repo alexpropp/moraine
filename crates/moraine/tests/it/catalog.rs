@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use moraine::{
-    Catalog, CatalogOptions, ColumnDef, ColumnId, Error, OptionScope, SchemaId, SnapshotId,
-};
+use moraine::{Catalog, CatalogOptions, ColumnId, Error, OptionScope, SchemaId, SnapshotId};
 use object_store::memory::InMemory;
+
+use crate::fixtures::{col, open_memory};
 
 #[tokio::test]
 async fn encrypted_flag_is_fixed_at_bootstrap() {
@@ -123,25 +123,6 @@ async fn committed_state_survives_reopen() {
     let s = head.schema_by_name("durable").unwrap();
     assert!(head.table_by_name(s.id, "t").is_some());
     catalog.close().await.unwrap();
-}
-
-fn col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-    }
-}
-
-// Test-only helper: `unwrap_used` is a library-code lint, not exempted
-// automatically for a plain (non-`#[test]`) function even in an
-// integration-test crate.
-#[allow(clippy::unwrap_used)]
-async fn open_memory() -> Catalog {
-    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap()
 }
 
 #[tokio::test]

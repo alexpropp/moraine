@@ -36,22 +36,99 @@ pub struct CatalogSnapshot {
     pub(crate) macros: BTreeMap<u64, MacroValue>,
     pub(crate) columns: BTreeMap<u64, BTreeMap<u64, ColumnValue>>,
     pub(crate) schema_names: HashMap<String, u64>,
-    pub(crate) table_names: HashMap<(u64, String), u64>,
-    pub(crate) view_names: HashMap<(u64, String), u64>,
-    pub(crate) macro_names: HashMap<(u64, String), u64>,
+    pub(crate) table_names: ScopedNames,
+    pub(crate) view_names: ScopedNames,
+    pub(crate) macro_names: ScopedNames,
     pub(crate) data_files: BTreeMap<u64, BTreeMap<u64, DataFileValue>>,
     pub(crate) delete_files: BTreeMap<u64, BTreeMap<u64, DeleteFileValue>>,
     pub(crate) partitions: BTreeMap<u64, BTreeMap<u64, PartitionValue>>,
     pub(crate) sorts: BTreeMap<u64, BTreeMap<u64, SortValue>>,
     pub(crate) mappings: BTreeMap<u64, BTreeMap<u64, MappingValue>>,
     pub(crate) indexes: BTreeMap<u64, BTreeMap<u64, IndexValue>>,
-    pub(crate) index_names: HashMap<(u64, String), u64>,
+    pub(crate) index_names: ScopedNames,
     pub(crate) table_stats: BTreeMap<u64, TableStatsValue>,
     pub(crate) table_column_stats: BTreeMap<u64, BTreeMap<u64, TableColumnStatsValue>>,
     pub(crate) file_column_stats: BTreeMap<u64, BTreeMap<(u64, u64), FileColumnStatsValue>>,
     pub(crate) options: BTreeMap<(u64, u64), OptionScopeValue>,
     pub(crate) tags: BTreeMap<u64, TagValue>,
     pub(crate) gc_files: BTreeMap<u64, GcFileValue>,
+}
+
+/// A per-scope name index: schema or table id, then name, to entity id.
+pub(crate) type ScopedNames = HashMap<u64, HashMap<String, u64>>;
+
+/// The id `name` resolves to inside `scope`, if any.
+fn scoped_name(names: &ScopedNames, scope: u64, name: &str) -> Option<u64> {
+    names.get(&scope)?.get(name).copied()
+}
+
+fn remove_scoped_name(names: &mut ScopedNames, scope: u64, name: &str) {
+    if let Some(per_scope) = names.get_mut(&scope) {
+        per_scope.remove(name);
+        if per_scope.is_empty() {
+            names.remove(&scope);
+        }
+    }
+}
+
+/// Inserts a name-scoped entity, first unlinking the replaced version's
+/// name so a rename never leaves a stale name entry.
+fn put_named<V>(
+    values: &mut BTreeMap<u64, V>,
+    names: &mut ScopedNames,
+    value: V,
+    identity: impl for<'v> Fn(&'v V) -> (u64, u64, &'v str),
+) {
+    let (id, scope, name) = identity(&value);
+    let (scope, name) = (scope, name.to_owned());
+    if let Some(old) = values.get(&id) {
+        let (_, old_scope, old_name) = identity(old);
+        let (old_scope, old_name) = (old_scope, old_name.to_owned());
+        remove_scoped_name(names, old_scope, &old_name);
+    }
+    names.entry(scope).or_default().insert(name, id);
+    values.insert(id, value);
+}
+
+/// Removes a name-scoped entity and its name entry, if present.
+fn delete_named<V>(
+    values: &mut BTreeMap<u64, V>,
+    names: &mut ScopedNames,
+    id: u64,
+    identity: impl for<'v> Fn(&'v V) -> (u64, u64, &'v str),
+) {
+    if let Some(old) = values.remove(&id) {
+        let (_, scope, name) = identity(&old);
+        remove_scoped_name(names, scope, name);
+    }
+}
+
+fn table_identity(value: &TableValue) -> (u64, u64, &str) {
+    (value.table_id, value.schema_id, &value.table_name)
+}
+
+fn view_identity(value: &ViewValue) -> (u64, u64, &str) {
+    (value.view_id, value.schema_id, &value.view_name)
+}
+
+fn macro_identity(value: &MacroValue) -> (u64, u64, &str) {
+    (value.macro_id, value.schema_id, &value.macro_name)
+}
+
+fn index_identity(value: &IndexValue) -> (u64, u64, &str) {
+    (value.index_id, value.table_id, &value.index_name)
+}
+
+/// Inserts into a table-scoped nested map.
+fn put_nested<K: Ord, V>(map: &mut BTreeMap<u64, BTreeMap<K, V>>, table_id: u64, key: K, value: V) {
+    map.entry(table_id).or_default().insert(key, value);
+}
+
+/// Removes from a table-scoped nested map, if present.
+fn remove_nested<K: Ord, V>(map: &mut BTreeMap<u64, BTreeMap<K, V>>, table_id: u64, key: &K) {
+    if let Some(per_table) = map.get_mut(&table_id) {
+        per_table.remove(key);
+    }
 }
 
 impl CatalogSnapshot {
@@ -76,81 +153,37 @@ impl CatalogSnapshot {
             Some(s) => begin <= s && end.is_none_or(|e| e > s),
         };
         for record in current.into_iter().chain(history) {
+            // Unversioned kinds (no lifecycle) are live at any time-travel
+            // target: mappings are immutable, tag entries filter at read,
+            // stats/options/gc rows are current-state bookkeeping.
+            if record
+                .lifecycle()
+                .is_some_and(|(begin, end)| !included(begin, end))
+            {
+                continue;
+            }
             match record {
-                EntityRecord::Schema(s) if included(s.begin_snapshot, s.end_snapshot) => {
-                    view.put_schema(s);
-                }
-                EntityRecord::Table(t) if included(t.begin_snapshot, t.end_snapshot) => {
-                    view.put_table(t);
-                }
-                EntityRecord::Column(c) if included(c.begin_snapshot, c.end_snapshot) => {
-                    view.put_column(c);
-                }
-                EntityRecord::File(f) if included(f.begin_snapshot, f.end_snapshot) => {
-                    view.put_data_file(f);
-                }
-                EntityRecord::DeleteFile(d) if included(d.begin_snapshot, d.end_snapshot) => {
-                    view.put_delete_file(d);
-                }
-                EntityRecord::View(v) if included(v.begin_snapshot, v.end_snapshot) => {
-                    view.put_view(v);
-                }
-                EntityRecord::Partition(p) if included(p.begin_snapshot, p.end_snapshot) => {
-                    view.put_partition(p);
-                }
-                EntityRecord::Sort(s) if included(s.begin_snapshot, s.end_snapshot) => {
-                    view.put_sort(s);
-                }
-                EntityRecord::Macro(m) if included(m.begin_snapshot, m.end_snapshot) => {
-                    view.put_macro(m);
-                }
-                EntityRecord::Index(i) if included(i.begin_snapshot, i.end_snapshot) => {
-                    view.put_index(i);
-                }
-                // Mappings are unversioned and immutable: included at any
-                // time-travel target, since a historical file read still
-                // resolves through its mapping.
-                EntityRecord::Mapping(m) => {
-                    view.put_mapping(m);
-                }
-                EntityRecord::FileColumnStats(fcs) => {
-                    view.put_file_column_stats(fcs);
-                }
-                EntityRecord::TableStats(ts) => {
-                    view.put_table_stats(ts);
-                }
-                EntityRecord::TableColumnStats(tcs) => {
-                    view.put_table_column_stats(tcs);
-                }
+                EntityRecord::Schema(s) => view.put_schema(s),
+                EntityRecord::Table(t) => view.put_table(t),
+                EntityRecord::Column(c) => view.put_column(c),
+                EntityRecord::File(f) => view.put_data_file(f),
+                EntityRecord::DeleteFile(d) => view.put_delete_file(d),
+                EntityRecord::View(v) => view.put_view(v),
+                EntityRecord::Partition(p) => view.put_partition(p),
+                EntityRecord::Sort(s) => view.put_sort(s),
+                EntityRecord::Macro(m) => view.put_macro(m),
+                EntityRecord::Index(i) => view.put_index(i),
+                EntityRecord::Mapping(m) => view.put_mapping(m),
+                EntityRecord::FileColumnStats(fcs) => view.put_file_column_stats(fcs),
+                EntityRecord::TableStats(ts) => view.put_table_stats(ts),
+                EntityRecord::TableColumnStats(tcs) => view.put_table_column_stats(tcs),
                 EntityRecord::Option {
                     scope_kind,
                     scope_id,
                     value,
-                } => {
-                    view.set_option_record((scope_kind, scope_id), value);
-                }
-                // Tag containers are unversioned; their embedded entries
-                // carry begin/end individually and are filtered at read.
-                EntityRecord::Tag(t) => {
-                    view.put_tag(t);
-                }
-                // Deletion-schedule rows are live bookkeeping with no
-                // temporal lifecycle.
-                EntityRecord::GcFile(g) => {
-                    view.put_gc_file(g);
-                }
-                EntityRecord::Schema(_)
-                | EntityRecord::Table(_)
-                | EntityRecord::Column(_)
-                | EntityRecord::File(_)
-                | EntityRecord::DeleteFile(_)
-                | EntityRecord::View(_)
-                | EntityRecord::Partition(_)
-                | EntityRecord::Sort(_)
-                | EntityRecord::Macro(_)
-                | EntityRecord::Index(_) => {
-                    // Filtered out by version range
-                }
+                } => view.set_option_record((scope_kind, scope_id), value),
+                EntityRecord::Tag(t) => view.put_tag(t),
+                EntityRecord::GcFile(g) => view.put_gc_file(g),
             }
         }
         view
@@ -200,9 +233,8 @@ impl CatalogSnapshot {
     /// One table by name within a schema.
     #[must_use]
     pub fn table_by_name(&self, schema: SchemaId, name: &str) -> Option<TableInfo> {
-        self.table_names
-            .get(&(schema.get(), name.to_owned()))
-            .and_then(|id| self.tables.get(id))
+        scoped_name(&self.table_names, schema.get(), name)
+            .and_then(|id| self.tables.get(&id))
             .map(table_info)
     }
 
@@ -248,9 +280,8 @@ impl CatalogSnapshot {
     /// One view by name within a schema.
     #[must_use]
     pub fn view_by_name(&self, schema: SchemaId, name: &str) -> Option<ViewInfo> {
-        self.view_names
-            .get(&(schema.get(), name.to_owned()))
-            .and_then(|id| self.views.get(id))
+        scoped_name(&self.view_names, schema.get(), name)
+            .and_then(|id| self.views.get(&id))
             .map(view_info)
     }
 
@@ -274,9 +305,8 @@ impl CatalogSnapshot {
     /// namespace, separate from tables and views.
     #[must_use]
     pub fn macro_by_name(&self, schema: SchemaId, name: &str) -> Option<MacroInfo> {
-        self.macro_names
-            .get(&(schema.get(), name.to_owned()))
-            .and_then(|id| self.macros.get(id))
+        scoped_name(&self.macro_names, schema.get(), name)
+            .and_then(|id| self.macros.get(&id))
             .map(macro_info)
     }
 
@@ -308,34 +338,39 @@ impl CatalogSnapshot {
     /// One equality index by name within a table.
     #[must_use]
     pub fn index_by_name(&self, table: TableId, name: &str) -> Option<IndexInfo> {
-        self.index_names
-            .get(&(table.get(), name.to_owned()))
-            .and_then(|id| self.indexes.get(&table.get()).and_then(|m| m.get(id)))
+        scoped_name(&self.index_names, table.get(), name)
+            .and_then(|id| self.indexes.get(&table.get()).and_then(|m| m.get(&id)))
+            .map(index_info)
+    }
+
+    /// One equality index by id within a table.
+    #[must_use]
+    pub fn index_by_id(&self, table: TableId, id: IndexId) -> Option<IndexInfo> {
+        self.indexes
+            .get(&table.get())
+            .and_then(|per_table| per_table.get(&id.get()))
             .map(index_info)
     }
 
     pub(crate) fn put_index(&mut self, value: IndexValue) {
-        if let Some(old) = self
-            .indexes
-            .get(&value.table_id)
-            .and_then(|m| m.get(&value.index_id))
-        {
-            self.index_names
-                .remove(&(old.table_id, old.index_name.clone()));
+        let per_table = self.indexes.entry(value.table_id).or_default();
+        if let Some(old) = per_table.get(&value.index_id) {
+            let (_, old_scope, old_name) = index_identity(old);
+            let (old_scope, old_name) = (old_scope, old_name.to_owned());
+            remove_scoped_name(&mut self.index_names, old_scope, &old_name);
         }
         self.index_names
-            .insert((value.table_id, value.index_name.clone()), value.index_id);
-        self.indexes
             .entry(value.table_id)
             .or_default()
-            .insert(value.index_id, value);
+            .insert(value.index_name.clone(), value.index_id);
+        per_table.insert(value.index_id, value);
     }
 
     pub(crate) fn delete_index(&mut self, table_id: u64, index_id: u64) {
         if let Some(per_table) = self.indexes.get_mut(&table_id) {
             if let Some(old) = per_table.remove(&index_id) {
-                self.index_names
-                    .remove(&(old.table_id, old.index_name.clone()));
+                let (_, scope, name) = index_identity(&old);
+                remove_scoped_name(&mut self.index_names, scope, name);
             }
         }
     }
@@ -434,93 +469,80 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn put_table(&mut self, value: TableValue) {
-        if let Some(old) = self.tables.get(&value.table_id) {
-            self.table_names
-                .remove(&(old.schema_id, old.table_name.clone()));
-        }
-        self.table_names
-            .insert((value.schema_id, value.table_name.clone()), value.table_id);
-        self.tables.insert(value.table_id, value);
+        put_named(
+            &mut self.tables,
+            &mut self.table_names,
+            value,
+            table_identity,
+        );
     }
 
     pub(crate) fn delete_table(&mut self, table_id: u64) {
-        if let Some(old) = self.tables.remove(&table_id) {
-            self.table_names
-                .remove(&(old.schema_id, old.table_name.clone()));
-        }
+        delete_named(
+            &mut self.tables,
+            &mut self.table_names,
+            table_id,
+            table_identity,
+        );
         self.columns.remove(&table_id);
         self.data_files.remove(&table_id);
         self.delete_files.remove(&table_id);
         self.partitions.remove(&table_id);
         self.sorts.remove(&table_id);
-        if let Some(per_table) = self.indexes.remove(&table_id) {
-            for value in per_table.values() {
-                self.index_names
-                    .remove(&(value.table_id, value.index_name.clone()));
-            }
-        }
+        self.indexes.remove(&table_id);
+        self.index_names.remove(&table_id);
         self.table_stats.remove(&table_id);
         self.table_column_stats.remove(&table_id);
         self.remove_option_record(OptionScope::Table(TableId::new(table_id)).key_components());
         // file_column_stats is kept: per-file stats outlive the file's
-        // live version until its history is garbage-collected.
+        // live version until its history is garbage-collected. mappings
+        // are kept for the same reason: historical file reads still
+        // resolve through them.
     }
 
     pub(crate) fn put_view(&mut self, value: ViewValue) {
-        if let Some(old) = self.views.get(&value.view_id) {
-            self.view_names
-                .remove(&(old.schema_id, old.view_name.clone()));
-        }
-        self.view_names
-            .insert((value.schema_id, value.view_name.clone()), value.view_id);
-        self.views.insert(value.view_id, value);
+        put_named(&mut self.views, &mut self.view_names, value, view_identity);
     }
 
     pub(crate) fn delete_view(&mut self, view_id: u64) {
-        if let Some(old) = self.views.remove(&view_id) {
-            self.view_names
-                .remove(&(old.schema_id, old.view_name.clone()));
-        }
+        delete_named(
+            &mut self.views,
+            &mut self.view_names,
+            view_id,
+            view_identity,
+        );
     }
 
     pub(crate) fn put_mapping(&mut self, value: MappingValue) {
-        self.mappings
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.mapping_id, value);
+        put_nested(&mut self.mappings, value.table_id, value.mapping_id, value);
     }
 
     pub(crate) fn put_macro(&mut self, value: MacroValue) {
-        if let Some(old) = self.macros.get(&value.macro_id) {
-            self.macro_names
-                .remove(&(old.schema_id, old.macro_name.clone()));
-        }
-        self.macro_names
-            .insert((value.schema_id, value.macro_name.clone()), value.macro_id);
-        self.macros.insert(value.macro_id, value);
+        put_named(
+            &mut self.macros,
+            &mut self.macro_names,
+            value,
+            macro_identity,
+        );
     }
+
     pub(crate) fn delete_macro(&mut self, macro_id: u64) {
-        if let Some(old) = self.macros.remove(&macro_id) {
-            self.macro_names
-                .remove(&(old.schema_id, old.macro_name.clone()));
-        }
+        delete_named(
+            &mut self.macros,
+            &mut self.macro_names,
+            macro_id,
+            macro_identity,
+        );
     }
 
     pub(crate) fn put_column(&mut self, value: ColumnValue) {
-        self.columns
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.column_id, value);
+        put_nested(&mut self.columns, value.table_id, value.column_id, value);
     }
 
     pub(crate) fn delete_column(&mut self, table_id: u64, column_id: u64) {
-        if let Some(columns) = self.columns.get_mut(&table_id) {
-            columns.remove(&column_id);
-        }
+        remove_nested(&mut self.columns, table_id, &column_id);
         // Column stats describe current state and die with the column.
-        if let Some(cols) = self.table_column_stats.get_mut(&table_id) {
-            cols.remove(&column_id);
-        }
+        remove_nested(&mut self.table_column_stats, table_id, &column_id);
     }
 
     /// The table's data files live at this view's snapshot, ordered by id.
@@ -563,55 +585,50 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn put_data_file(&mut self, value: DataFileValue) {
-        self.data_files
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.data_file_id, value);
+        put_nested(
+            &mut self.data_files,
+            value.table_id,
+            value.data_file_id,
+            value,
+        );
     }
 
     pub(crate) fn delete_data_file(&mut self, table_id: u64, data_file_id: u64) {
-        if let Some(files) = self.data_files.get_mut(&table_id) {
-            files.remove(&data_file_id);
-        }
+        remove_nested(&mut self.data_files, table_id, &data_file_id);
     }
 
     pub(crate) fn put_partition(&mut self, value: PartitionValue) {
-        self.partitions
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.partition_id, value);
+        put_nested(
+            &mut self.partitions,
+            value.table_id,
+            value.partition_id,
+            value,
+        );
     }
 
     pub(crate) fn delete_partition(&mut self, table_id: u64, partition_id: u64) {
-        if let Some(specs) = self.partitions.get_mut(&table_id) {
-            specs.remove(&partition_id);
-        }
+        remove_nested(&mut self.partitions, table_id, &partition_id);
     }
 
     pub(crate) fn put_sort(&mut self, value: SortValue) {
-        self.sorts
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.sort_id, value);
+        put_nested(&mut self.sorts, value.table_id, value.sort_id, value);
     }
 
     pub(crate) fn delete_sort(&mut self, table_id: u64, sort_id: u64) {
-        if let Some(specs) = self.sorts.get_mut(&table_id) {
-            specs.remove(&sort_id);
-        }
+        remove_nested(&mut self.sorts, table_id, &sort_id);
     }
 
     pub(crate) fn put_delete_file(&mut self, value: DeleteFileValue) {
-        self.delete_files
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.delete_file_id, value);
+        put_nested(
+            &mut self.delete_files,
+            value.table_id,
+            value.delete_file_id,
+            value,
+        );
     }
 
     pub(crate) fn delete_delete_file(&mut self, table_id: u64, delete_file_id: u64) {
-        if let Some(files) = self.delete_files.get_mut(&table_id) {
-            files.remove(&delete_file_id);
-        }
+        remove_nested(&mut self.delete_files, table_id, &delete_file_id);
     }
 
     pub(crate) fn put_table_stats(&mut self, value: TableStatsValue) {
@@ -619,17 +636,21 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn put_table_column_stats(&mut self, value: TableColumnStatsValue) {
-        self.table_column_stats
-            .entry(value.table_id)
-            .or_default()
-            .insert(value.column_id, value);
+        put_nested(
+            &mut self.table_column_stats,
+            value.table_id,
+            value.column_id,
+            value,
+        );
     }
 
     pub(crate) fn put_file_column_stats(&mut self, value: FileColumnStatsValue) {
-        self.file_column_stats
-            .entry(value.table_id)
-            .or_default()
-            .insert((value.data_file_id, value.column_id), value);
+        put_nested(
+            &mut self.file_column_stats,
+            value.table_id,
+            (value.data_file_id, value.column_id),
+            value,
+        );
     }
 
     pub(crate) fn set_option_record(&mut self, components: (u64, u64), value: OptionScopeValue) {

@@ -14,7 +14,7 @@
 //! each call reads at whatever the current head is when it runs.
 
 use crate::{
-    catalog::Catalog,
+    catalog::{Catalog, projection::ProjectionCache},
     error::Result,
     store::{
         proto::{
@@ -36,9 +36,7 @@ async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Opt
 
 /// Locks the shared projection state for reading, recovering a poisoned
 /// lock (folds never panic mid-flight, so the state is whole).
-fn projections_read(
-    catalog: &Catalog,
-) -> std::sync::RwLockReadGuard<'_, crate::catalog::projection::ProjectionCache> {
+fn projections_read(catalog: &Catalog) -> std::sync::RwLockReadGuard<'_, ProjectionCache> {
     catalog
         .projections()
         .read()
@@ -46,9 +44,7 @@ fn projections_read(
 }
 
 /// As [`projections_read`], for writing (installs).
-fn projections_write(
-    catalog: &Catalog,
-) -> std::sync::RwLockWriteGuard<'_, crate::catalog::projection::ProjectionCache> {
+fn projections_write(catalog: &Catalog) -> std::sync::RwLockWriteGuard<'_, ProjectionCache> {
     catalog
         .projections()
         .write()
@@ -137,7 +133,7 @@ pub async fn dump_macros(catalog: &Catalog) -> Result<Vec<MacroValue>> {
 /// rows.
 #[doc(hidden)]
 pub async fn dump_mappings(catalog: &Catalog) -> Result<Vec<MappingValue>> {
-    dump_entities(catalog, |r| match r {
+    dump_current_entities(catalog, |r| match r {
         EntityRecord::Mapping(m) => Some(m),
         _ => None,
     })
@@ -196,40 +192,54 @@ pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
     .await
 }
 
+/// Scans `current` for one unversioned kind, serving and maintaining the
+/// projection cache: rows come from the projection when its head matches,
+/// and a scan on a miss installs them for the next call.
+async fn dump_projected_current<T: Clone>(
+    catalog: &Catalog,
+    read: impl Fn(&ProjectionCache, u64) -> Option<Vec<T>>,
+    install: impl Fn(&mut ProjectionCache, u64, Vec<T>),
+    extract: impl Fn(EntityRecord) -> Option<T>,
+) -> Result<Vec<T>> {
+    let session = catalog.begin_read().await?;
+    let head = session_head(&session).await?;
+
+    let cache_at = match (catalog.maintains_projections(), head) {
+        (true, Some(head)) => {
+            if let Some(rows) = read(&projections_read(catalog), head) {
+                session.finish();
+                return Ok(rows);
+            }
+            Some(head)
+        }
+        _ => None,
+    };
+
+    let current = scan_current_entities(session.handle()).await;
+    session.finish();
+    let rows: Vec<T> = current?.into_iter().filter_map(extract).collect();
+    if let Some(head) = cache_at {
+        install(&mut projections_write(catalog), head, rows.clone());
+    }
+    Ok(rows)
+}
+
 /// Every `ducklake_table_stats` row. Unversioned (overwritten in place,
 /// never mirrored to history), so this is always exactly the live rows.
 /// Served from the maintained projection when its head matches; a fresh
 /// scan installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>> {
-    let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
-    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).table_stats_at(head) {
-            session.finish();
-            return Ok(rows);
-        }
-        let current = scan_current_entities(session.handle()).await;
-        session.finish();
-        let rows: Vec<TableStatsValue> = current?
-            .into_iter()
-            .filter_map(|r| match r {
-                EntityRecord::TableStats(v) => Some(v),
-                _ => None,
-            })
-            .collect();
-        projections_write(catalog).install_table_stats(head, rows.clone());
-        return Ok(rows);
-    }
-    let current = scan_current_entities(session.handle()).await;
-    session.finish();
-    Ok(current?
-        .into_iter()
-        .filter_map(|r| match r {
+    dump_projected_current(
+        catalog,
+        ProjectionCache::table_stats_at,
+        ProjectionCache::install_table_stats,
+        |r| match r {
             EntityRecord::TableStats(v) => Some(v),
             _ => None,
-        })
-        .collect())
+        },
+    )
+    .await
 }
 
 /// Every `ducklake_table_column_stats` row. Unversioned, as
@@ -237,34 +247,16 @@ pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>>
 /// same way.
 #[doc(hidden)]
 pub async fn dump_table_column_stats(catalog: &Catalog) -> Result<Vec<TableColumnStatsValue>> {
-    let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
-    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).table_column_stats_at(head) {
-            session.finish();
-            return Ok(rows);
-        }
-        let current = scan_current_entities(session.handle()).await;
-        session.finish();
-        let rows: Vec<TableColumnStatsValue> = current?
-            .into_iter()
-            .filter_map(|r| match r {
-                EntityRecord::TableColumnStats(v) => Some(v),
-                _ => None,
-            })
-            .collect();
-        projections_write(catalog).install_table_column_stats(head, rows.clone());
-        return Ok(rows);
-    }
-    let current = scan_current_entities(session.handle()).await;
-    session.finish();
-    Ok(current?
-        .into_iter()
-        .filter_map(|r| match r {
+    dump_projected_current(
+        catalog,
+        ProjectionCache::table_column_stats_at,
+        ProjectionCache::install_table_column_stats,
+        |r| match r {
             EntityRecord::TableColumnStats(v) => Some(v),
             _ => None,
-        })
-        .collect())
+        },
+    )
+    .await
 }
 
 /// Every `ducklake_file_column_stats` row. Unversioned, as

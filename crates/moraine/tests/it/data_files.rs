@@ -2,54 +2,17 @@
 //! data-only schema-version path — public API only, real SlateDB on
 //! in-memory object storage.
 
-use std::sync::Arc;
-
 use moraine::{
-    Catalog, CatalogOptions, ColumnDef, ColumnId, ColumnStats, DataFile, DataFileId, DeleteFile,
-    Error, FileColumnStats, TableId,
+    Catalog, ColumnId, ColumnStats, DataFile, DataFileId, DeleteFile, Error, FileColumnStats,
+    TableId,
 };
-use object_store::memory::InMemory;
 
-fn col(name: &str) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-    }
-}
+use crate::fixtures::datafile;
 
-fn datafile(rows: u64) -> DataFile {
-    DataFile {
-        path: format!("data-{rows}.parquet"),
-        path_is_relative: true,
-        file_format: "parquet".into(),
-        record_count: rows,
-        file_size_bytes: rows * 10,
-        footer_size: 4,
-        encryption_key: None,
-        column_stats: vec![],
-    }
-}
-
-#[allow(clippy::unwrap_used)]
+/// The shared fixture narrowed to the single table these tests use.
 async fn seeded() -> (Catalog, TableId) {
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap();
-    catalog
-        .commit(|tx| {
-            let s = tx.create_schema("s")?;
-            tx.create_table(s, "t", &[col("a")])?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let snapshot = catalog.snapshot().await.unwrap();
-    let s = snapshot.schema_by_name("s").unwrap();
-    let t = snapshot.table_by_name(s.id, "t").unwrap();
-
-    (catalog, t.id)
+    let (catalog, _schema, table, _other) = crate::fixtures::seeded().await;
+    (catalog, table)
 }
 
 #[tokio::test]
