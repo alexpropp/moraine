@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     catalog::{
         CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnStats, DataFile, DataFileId,
-        DeleteFile, DeleteFileId, FileIndexEntry, IndexDef, IndexEntry, IndexId, IndexState,
-        MacroId, MacroImplementationDef, OptionScope, SchemaId, TableId, ViewId,
+        DeleteFile, DeleteFileId, FileIndexEntry, FileIndexRemoval, IndexDef, IndexEntry, IndexId,
+        IndexState, MacroId, MacroImplementationDef, OptionScope, SchemaId, TableId, ViewId,
     },
     error::{Error, Result},
     store::{
@@ -805,7 +805,7 @@ impl Transaction {
             });
         }
         for file_entry in index_entries {
-            self.stage_file_index_entry(table, row_id_start, file_entry, false)?;
+            self.stage_file_index_entry(table, row_id_start, file_entry)?;
         }
         self.ops.push(Operation::RegisterDataFile {
             table_id: table.get(),
@@ -813,8 +813,7 @@ impl Transaction {
         Ok(DataFileId::new(data_file_id))
     }
 
-    /// Stages one file-supplied index entry, adding (`delete: false`) or
-    /// removing (`delete: true`) the value of the row at
+    /// Stages one file-supplied index entry for the row at
     /// `row_id_start + ordinal`. Overflow is refused: a clamped row id
     /// would alias another row's entry.
     fn stage_file_index_entry(
@@ -822,19 +821,8 @@ impl Transaction {
         table: TableId,
         row_id_start: u64,
         file_entry: &FileIndexEntry,
-        delete: bool,
     ) -> Result<()> {
-        let (unique, column_count) = {
-            let index = self
-                .state
-                .indexes
-                .get(&table.get())
-                .and_then(|per_table| per_table.get(&file_entry.index.get()))
-                .ok_or_else(|| {
-                    Error::NotFound(format!("index {} on table {table}", file_entry.index))
-                })?;
-            (index.unique, index.column_ids.len())
-        };
+        let (unique, column_count) = self.live_index_shape(table, file_entry.index)?;
         let row_id = row_id_start
             .checked_add(file_entry.ordinal)
             .ok_or_else(|| {
@@ -851,7 +839,7 @@ impl Transaction {
                 row_id,
                 values: file_entry.values.clone(),
             },
-            delete,
+            false,
         )
     }
 
@@ -901,11 +889,11 @@ impl Transaction {
     }
 
     /// Registers a delete file targeting a live data file's rows, removing
-    /// the equality-index entries of the rows it kills. Each entry's
-    /// `ordinal` is a position within the **target data file**, matching the
-    /// delete file's recorded positions, and its values are those the dead
-    /// row was indexed under — entries are keyed by value, so a removal
-    /// cannot be derived from a row id alone.
+    /// the equality-index entries of the rows it kills. Each removal names
+    /// the killed row **by its id** — inside a dense target's row-id range,
+    /// or a per-row-id target's embedded id supplied verbatim — with the
+    /// values the dead row was indexed under: entries are keyed by value,
+    /// so a removal cannot be derived from a row id alone.
     ///
     /// Delete files do not change table statistics — `record_count`
     /// counts data-file rows, not delete markers.
@@ -918,14 +906,13 @@ impl Transaction {
     /// Returns [`Error::Constraint`] if the table has live indexes and a
     /// non-empty delete file supplies no `index_entries` (a silently
     /// over-covered index is as much a lie as an under-covered one), an
-    /// entry's `ordinal` is outside the target file's rows, the target
-    /// carries per-row ids rather than a dense range, or an entry's value
-    /// count does not match its index's column count.
+    /// entry's row id is outside a dense target's row-id range, or an
+    /// entry's value count does not match its index's column count.
     pub fn register_delete_file(
         &mut self,
         table: TableId,
         file: DeleteFile,
-        index_entries: &[FileIndexEntry],
+        index_entries: &[FileIndexRemoval],
     ) -> Result<DeleteFileId> {
         self.live_table(table)?;
         let data_file = self
@@ -974,15 +961,21 @@ impl Transaction {
             )));
         }
 
-        // An entry's row is the target's `row_id_start + ordinal`, so an
-        // ordinal past that file's rows would name a row it does not hold.
-        for entry in index_entries {
-            if entry.ordinal >= data_file.record_count {
-                return Err(Error::Constraint(format!(
-                    "register_delete_file: index entry ordinal {} is outside the target file's \
-                     record count {} on table {table}",
-                    entry.ordinal, data_file.record_count
-                )));
+        // A dense target's ids are `row_id_start..row_id_start +
+        // record_count`; an id outside that range names a row the file does
+        // not hold. A per-row-id target's ids are the writer's to supply —
+        // it read them from the file's embedded row-id column.
+        if let Some(start) = data_file.row_id_start {
+            for entry in index_entries {
+                let in_range = entry.row_id >= start
+                    && entry.row_id < start.saturating_add(data_file.record_count);
+                if !in_range {
+                    return Err(Error::Constraint(format!(
+                        "register_delete_file: index entry row id {} is outside the target \
+                         file's row-id range on table {table}",
+                        entry.row_id
+                    )));
+                }
             }
         }
 
@@ -1004,7 +997,7 @@ impl Transaction {
             partial_max: None,
         });
 
-        self.stage_delete_file_index_entries(table, &data_file, index_entries)?;
+        self.stage_delete_file_index_entries(table, index_entries)?;
 
         self.ops.push(Operation::RegisterDeleteFile {
             table_id: table.get(),
@@ -1013,25 +1006,38 @@ impl Transaction {
         Ok(DeleteFileId::new(delete_file_id))
     }
 
-    /// Stages the entry removals a delete file's index entries name, resolving
-    /// each ordinal against the target file's row-id range.
+    /// Stages the entry removals a delete file's index entries name, each
+    /// under its writer-supplied row id.
     fn stage_delete_file_index_entries(
         &mut self,
         table: TableId,
-        data_file: &DataFileValue,
-        index_entries: &[FileIndexEntry],
+        index_entries: &[FileIndexRemoval],
     ) -> Result<()> {
-        if index_entries.is_empty() {
-            return Ok(());
-        }
-
-        let row_id_start =
-            crate::transaction::index_maintenance::data_file_row_id_start(data_file)?;
-
-        for file_entry in index_entries {
-            self.stage_file_index_entry(table, row_id_start, file_entry, true)?;
+        for entry in index_entries {
+            let (unique, column_count) = self.live_index_shape(table, entry.index)?;
+            self.stage_index_entry(
+                entry.index.get(),
+                unique,
+                column_count,
+                &IndexEntry {
+                    row_id: entry.row_id,
+                    values: entry.values.clone(),
+                },
+                true,
+            )?;
         }
         Ok(())
+    }
+
+    /// A live index's uniqueness flag and column count.
+    fn live_index_shape(&self, table: TableId, index: IndexId) -> Result<(bool, usize)> {
+        let value = self
+            .state
+            .indexes
+            .get(&table.get())
+            .and_then(|per_table| per_table.get(&index.get()))
+            .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+        Ok((value.unique, value.column_ids.len()))
     }
 
     /// Expires a delete file, removing it.
@@ -1449,7 +1455,10 @@ mod tests {
     use super::*;
     use crate::{
         catalog::{CatalogSnapshot, FileColumnStats},
-        store::proto::SnapshotValue,
+        store::{
+            index_encoding::{IndexKeyValue, IntWidth},
+            proto::SnapshotValue,
+        },
     };
 
     fn empty_transaction() -> Transaction {
@@ -2183,5 +2192,212 @@ mod tests {
         transaction
             .set_option(OptionScope::Global, "other", "v")
             .unwrap();
+    }
+
+    /// A `DeleteFile` over `data_file_id` with `delete_count` deletes —
+    /// the repeated literal the removal tests share.
+    fn delete_file_over(data_file_id: DataFileId, delete_count: u64) -> DeleteFile {
+        DeleteFile {
+            data_file_id,
+            path: "d.parquet".into(),
+            path_is_relative: true,
+            format: "parquet".into(),
+            delete_count,
+            file_size_bytes: 50,
+            footer_size: 4,
+            encryption_key: None,
+        }
+    }
+
+    /// A `DataFileValue` carrying per-row ids, placed directly in state —
+    /// only DuckLake's staged path can create one, but the embedding API
+    /// must still maintain deletes against it.
+    fn seed_per_row_id_file(transaction: &mut Transaction, table: TableId, data_file_id: u64) {
+        transaction.state.put_data_file(DataFileValue {
+            data_file_id,
+            table_id: table.get(),
+            begin_snapshot: 1,
+            end_snapshot: None,
+            file_order: None,
+            path: "rewrite.parquet".into(),
+            path_is_relative: true,
+            file_format: "parquet".into(),
+            record_count: 3,
+            file_size_bytes: 1024,
+            footer_size: 64,
+            row_id_start: None,
+            partition_id: None,
+            encryption_key: None,
+            mapping_id: None,
+            partial_max: None,
+            partition_values: vec![],
+        });
+    }
+
+    /// One `BIGINT` removal value.
+    fn removal_value(value: i64) -> Vec<Option<IndexKeyValue>> {
+        vec![Some(IndexKeyValue::Int {
+            value: i128::from(value),
+            width: IntWidth::I64,
+        })]
+    }
+
+    #[test]
+    fn delete_removals_land_verbatim_against_a_per_row_id_target() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let col_a = transaction.state.columns_of(t)[0].id;
+        let index = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![col_a],
+                    unique: false,
+                },
+                &[],
+            )
+            .unwrap();
+        seed_per_row_id_file(&mut transaction, t, 77);
+
+        transaction
+            .register_delete_file(
+                t,
+                delete_file_over(DataFileId::new(77), 1),
+                &[FileIndexRemoval {
+                    index,
+                    row_id: 42,
+                    values: removal_value(7),
+                }],
+            )
+            .unwrap();
+
+        assert!(
+            transaction
+                .index_entries
+                .iter()
+                .any(|e| e.delete && e.row_id == 42),
+            "the removal is staged under the supplied row id"
+        );
+    }
+
+    #[test]
+    fn delete_removals_are_range_checked_against_a_dense_target() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let col_a = transaction.state.columns_of(t)[0].id;
+        let index = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![col_a],
+                    unique: false,
+                },
+                &[],
+            )
+            .unwrap();
+        // Rows 0..=2 land as ids 0..=2; the file's entries ride
+        // registration.
+        let file = transaction
+            .register_data_file(
+                t,
+                datafile(3, vec![]),
+                &[
+                    FileIndexEntry {
+                        index,
+                        ordinal: 0,
+                        values: removal_value(10),
+                    },
+                    FileIndexEntry {
+                        index,
+                        ordinal: 1,
+                        values: removal_value(20),
+                    },
+                    FileIndexEntry {
+                        index,
+                        ordinal: 2,
+                        values: removal_value(30),
+                    },
+                ],
+            )
+            .unwrap();
+
+        // An id inside the range [0, 3) stages; row id 1 kills value 20.
+        transaction
+            .register_delete_file(
+                t,
+                delete_file_over(file, 1),
+                &[FileIndexRemoval {
+                    index,
+                    row_id: 1,
+                    values: removal_value(20),
+                }],
+            )
+            .unwrap();
+        assert!(
+            transaction
+                .index_entries
+                .iter()
+                .any(|e| e.delete && e.row_id == 1)
+        );
+    }
+
+    #[test]
+    fn delete_removals_outside_a_dense_targets_range_are_refused() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction.create_table(s, "t", &[col("a")]).unwrap();
+        let col_a = transaction.state.columns_of(t)[0].id;
+        let index = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![col_a],
+                    unique: false,
+                },
+                &[],
+            )
+            .unwrap();
+        let file = transaction
+            .register_data_file(
+                t,
+                datafile(3, vec![]),
+                &[
+                    FileIndexEntry {
+                        index,
+                        ordinal: 0,
+                        values: removal_value(10),
+                    },
+                    FileIndexEntry {
+                        index,
+                        ordinal: 1,
+                        values: removal_value(20),
+                    },
+                    FileIndexEntry {
+                        index,
+                        ordinal: 2,
+                        values: removal_value(30),
+                    },
+                ],
+            )
+            .unwrap();
+
+        // The file holds ids 0..=2, so row id 3 names no row of it.
+        let err = transaction
+            .register_delete_file(
+                t,
+                delete_file_over(file, 1),
+                &[FileIndexRemoval {
+                    index,
+                    row_id: 3,
+                    values: removal_value(30),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
     }
 }
