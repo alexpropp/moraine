@@ -342,14 +342,16 @@ impl Catalog {
     /// Indexed columns are located by resolving each field id to its physical
     /// position (the file's columns follow the table's column order).
     ///
-    /// v1 covers dense-range files (`row_id_start + ordinal`); a file that
-    /// carries explicit per-row ids (compaction output) is refused.
+    /// Row ids resolve per file: the embedded row-id column when the file
+    /// carries one (rewrite and flush output), else `row_id_start +
+    /// ordinal`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the table or a column is not live,
-    /// [`Error::Constraint`] for a per-row-id file or a non-indexable type,
-    /// or [`Error::Corruption`] if a file cannot be read.
+    /// [`Error::Constraint`] for a non-indexable type, or
+    /// [`Error::Corruption`] if a file cannot be read or names no row-id
+    /// source.
     pub async fn scoped_backfill_entries(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -378,12 +380,6 @@ impl Catalog {
 
         let mut entries = Vec::new();
         for file in snapshot.data_files_of(table) {
-            let row_id_start = file.row_id_start.ok_or_else(|| {
-                Error::Constraint(format!(
-                    "data file {} carries per-row ids; scoped backfill of rewrite files is a follow-up",
-                    file.id
-                ))
-            })?;
             let relative = match (file.path_is_relative, data_prefix.is_empty()) {
                 (false, _) => file.path.clone(),
                 (true, true) => format!("{table_prefix}{}", file.path),
@@ -395,7 +391,7 @@ impl Catalog {
                 &path,
                 &positions,
                 scoped_read::RowIdSource::Resolve {
-                    row_id_start: Some(row_id_start),
+                    row_id_start: file.row_id_start,
                 },
                 Some(file.file_size_bytes),
             )

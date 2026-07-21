@@ -1293,6 +1293,24 @@ async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
     );
 }
 
+/// Backfill over a table holding a per-row-id file derives its entries
+/// under the embedded ids.
+#[tokio::test]
+async fn backfill_derives_per_row_id_file_entries_under_embedded_ids() {
+    use crate::catalog::{ColumnId, TableId};
+
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    let store = register_per_row_id_file(&catalog).await;
+
+    let entries = catalog
+        .scoped_backfill_entries(store, "", TableId::new(1), &[ColumnId::new(1)])
+        .await
+        .unwrap();
+    let mut row_ids: Vec<u64> = entries.iter().map(|e| e.row_id).collect();
+    row_ids.sort_unstable();
+    assert_eq!(row_ids, vec![5, 9, 12], "ids come from the embedded column");
+}
+
 /// An inlined delete against a Parquet-file row removes that row's
 /// entry, read back out of the target file.
 #[tokio::test]
