@@ -584,12 +584,22 @@ internal columns trailing, so table-column positions are undisturbed.
 **Embedding-API boundary.** The verb surface has no way to register a
 per-row-id file — `register_data_file` allocates dense ranges — so such a
 file reaches an embedded catalog only when DuckLake SQL writers share the
-lake. `register_delete_file` against a per-row-id target keeps its typed
-`Constraint` refusal: writer-supplied entries name ordinals, the entry
-removal needs the row's embedded id, and the synchronous commit closure
-has no data store to read it from. Rewrite-file maintenance is exclusively
-the staged path's. The Coverage table's `(row_id, key values)` clause
-remains the contract a future rewrite-registration verb would use.
+lake. Deletes against one still owe the index its removals, and the
+writer-supplied contract already carries the answer — the Coverage
+table's `(row_id, key values)` clause. A `register_delete_file` entry
+names its row **by ordinal** against a dense target (bounds-checked,
+resolved as `row_id_start + ordinal`) or **by row id** against a
+per-row-id target (taken verbatim, trusted exactly as the entry's values
+are: the writer read the target to learn its positions and values, and
+the embedded row-id column sits in the same file — no new trust class).
+The shapes are strict per target — ordinals against a per-row-id target
+and row ids against a dense one are both `Constraint` refusals — so there
+is never more than one way to name a row and nothing to drift. What stays
+out is a rewrite-*registration* verb: the embedding API cannot express a
+file that preserves row ids, indexed or not — that is absent compaction
+surface (RFC 0008 keeps compaction DuckLake-driven), not index
+maintenance, and would be its own RFC. The entry shape above is the
+contract such a verb would reuse.
 
 ### Format gate
 
@@ -691,6 +701,10 @@ tests against real SlateDB on in-memory `object_store`:
   removes exactly the named positions' entries; an inline file-delete
   against one removes exactly the named row's. Backfill over a table
   holding per-row-id files derives their entries under embedded ids.
+  Embedding: `register_delete_file` with row-id-shaped entries against a
+  per-row-id target removes exactly the named rows' entries; ordinal
+  entries against a per-row-id target and row-id entries against a dense
+  target both refuse with `Constraint`.
 - **SQL-path uniqueness.** A staged registration whose file duplicates an
   existing unique value aborts with `Constraint`, message free of the four
   retry substrings — no retry storm; a non-duplicate registration lands and
