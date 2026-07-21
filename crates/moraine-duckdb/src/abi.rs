@@ -1396,7 +1396,7 @@ pub unsafe extern "C" fn moraine_index_create(
         let backfill = if snapshot.data_files_of(table_id).is_empty() {
             Vec::new()
         } else {
-            let store = handle_ref.data_store.as_deref().ok_or_else(|| {
+            let store = handle_ref.data_store.clone().ok_or_else(|| {
                 AbiError::from(moraine::Error::Constraint(
                     "the table already holds data; attach with META_DATA_PATH so its files can be \
                      scoped-read"

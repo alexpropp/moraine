@@ -2088,7 +2088,7 @@ mod tests {
 
         // A DATA_PATH object store holds a Parquet file with the indexed
         // column "a" at physical position 0.
-        let data = InMemory::new();
+        let data = Arc::new(InMemory::new());
         let path = Path::from("t/data-1.parquet");
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let batch =
@@ -2106,7 +2106,7 @@ mod tests {
         // at position 0), then registration lands them — DuckLake supplied
         // none, and the read stands in for the refusal.
         let entries = catalog
-            .scoped_file_index_entries(&data, &path, index, &[0])
+            .scoped_file_index_entries(data.clone(), &path, index, &[0])
             .await
             .unwrap();
         assert_eq!(entries.len(), 3);

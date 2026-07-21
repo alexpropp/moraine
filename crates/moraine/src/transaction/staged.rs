@@ -2004,7 +2004,7 @@ impl StagedTransaction {
                     &db_tx,
                     &base,
                     &ops,
-                    data_store.as_deref(),
+                    data_store.as_ref(),
                     &data_prefix,
                     &mut writes,
                 )
@@ -2048,7 +2048,7 @@ impl StagedTransaction {
 async fn stage_data_file_index_entries(
     base: &CatalogSnapshot,
     cells: &[Cell],
-    data_store: Option<&dyn ObjectStore>,
+    data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
     entries: &mut Vec<StagedIndexEntry>,
 ) -> Result<()> {
@@ -2069,22 +2069,75 @@ async fn stage_data_file_index_entries(
     })?;
     let row_id_start = data_file_row_id_start(&file)?;
     let path = data_file_object_path(base, &file, data_prefix)?;
-    let live_columns = base.columns_of(table);
-    for index in &indexes {
-        let positions = index_positions(&live_columns, index, table)?;
-        let scoped =
-            scoped_read::scoped_read_entries(data_store, &path, &positions, None, row_id_start)
-                .await?;
+    let per_index = per_index_scoped_entries(
+        base,
+        &indexes,
+        table,
+        data_store,
+        &file,
+        &path,
+        row_id_start,
+    )
+    .await?;
+
+    for (index, scoped) in indexes.iter().zip(per_index) {
         push_index_entries(entries, index, scoped, false)?;
     }
     Ok(())
+}
+
+/// One scoped read of `file` covering every index's columns at once — the
+/// footer and any shared column chunks are fetched a single time — split
+/// back into per-index entry lists, ordered as `indexes`.
+async fn per_index_scoped_entries(
+    base: &CatalogSnapshot,
+    indexes: &[IndexInfo],
+    table: TableId,
+    data_store: &Arc<dyn ObjectStore>,
+    file: &proto::DataFileValue,
+    path: &object_store::path::Path,
+    row_id_start: u64,
+) -> Result<Vec<Vec<ScopedReadEntry>>> {
+    let live_columns = base.columns_of(table);
+    let mut all_positions = Vec::new();
+    let mut spans = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let positions = index_positions(&live_columns, index, table)?;
+        spans.push((all_positions.len(), positions.len()));
+        all_positions.extend(positions);
+    }
+
+    // Values come back ordered exactly as `all_positions`, so each index's
+    // slice of a row's values is its own columns in its own order.
+    let scoped = scoped_read::scoped_read_entries(
+        Arc::clone(data_store),
+        path,
+        &all_positions,
+        None,
+        row_id_start,
+        Some(file.file_size_bytes),
+    )
+    .await?;
+
+    Ok(spans
+        .into_iter()
+        .map(|(start, len)| {
+            scoped
+                .iter()
+                .map(|entry| ScopedReadEntry {
+                    row_id: entry.row_id,
+                    values: entry.values[start..start + len].to_vec(),
+                })
+                .collect()
+        })
+        .collect())
 }
 
 async fn stage_index_maintenance(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
-    data_store: Option<&dyn ObjectStore>,
+    data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
@@ -2368,7 +2421,7 @@ async fn stage_inline_delete_entries(
 async fn collect_delete_file_rows(
     base: &CatalogSnapshot,
     cells: &[Cell],
-    data_store: Option<&dyn ObjectStore>,
+    data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
     file_deletes: &mut HashMap<(u64, u64), Vec<u64>>,
 ) -> Result<()> {
@@ -2414,7 +2467,7 @@ async fn stage_file_delete_entries(
     table_id: u64,
     data_file_id: u64,
     row_ids: &[u64],
-    data_store: Option<&dyn ObjectStore>,
+    data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
     entries: &mut Vec<StagedIndexEntry>,
 ) -> Result<()> {
@@ -2434,16 +2487,22 @@ async fn stage_file_delete_entries(
     })?;
 
     let path = data_file_object_path(base, &file, data_prefix)?;
-    let live_columns = base.columns_of(table);
     let killed: HashSet<u64> = row_ids.iter().copied().collect();
-    for index in &indexes {
-        let positions = index_positions(&live_columns, index, table)?;
-        let scoped =
-            scoped_read::scoped_read_entries(data_store, &path, &positions, None, row_id_start)
-                .await?
-                .into_iter()
-                .filter(|entry| killed.contains(&entry.row_id))
-                .collect();
+    let per_index = per_index_scoped_entries(
+        base,
+        &indexes,
+        table,
+        data_store,
+        &file,
+        &path,
+        row_id_start,
+    )
+    .await?;
+    for (index, scoped) in indexes.iter().zip(per_index) {
+        let scoped = scoped
+            .into_iter()
+            .filter(|entry| killed.contains(&entry.row_id))
+            .collect();
         push_index_entries(entries, index, scoped, true)?;
     }
     Ok(())
@@ -3930,8 +3989,11 @@ mod tests {
         );
     }
 
-    /// Writes `batch` to `path` on `store` as Parquet.
-    async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::RecordBatch) {
+    /// Writes `batch` to `path` on `store` as Parquet, returning the
+    /// written object's size — the maintenance read locates the footer by
+    /// the recorded `file_size_bytes`, so fixtures must record the truth,
+    /// exactly as DuckLake records the real written size.
+    async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::RecordBatch) -> u64 {
         use object_store::ObjectStoreExt;
 
         let mut buffer = Vec::new();
@@ -3941,14 +4003,17 @@ mod tests {
             writer.write(batch).unwrap();
             writer.close().unwrap();
         }
+        let object_len = u64::try_from(buffer.len()).unwrap();
         store
             .put(&object_store::path::Path::from(path), buffer.into())
             .await
             .unwrap();
+        object_len
     }
 
-    /// A `ducklake_data_file` row for a file of `record_count` rows.
-    fn indexed_data_file_row(record_count: u64) -> Vec<Cell> {
+    /// A `ducklake_data_file` row for a file of `record_count` rows and
+    /// `file_size_bytes` bytes on the store.
+    fn indexed_data_file_row(record_count: u64, file_size_bytes: u64) -> Vec<Cell> {
         vec![
             Cell::U64(1),
             Cell::U64(1),
@@ -3959,7 +4024,7 @@ mod tests {
             Cell::Bool(true),
             Cell::Str("parquet".into()),
             Cell::U64(record_count),
-            Cell::U64(1024),
+            Cell::U64(file_size_bytes),
             Cell::U64(64),
             Cell::U64(0), // row_id_start
             Cell::Null,
@@ -3975,13 +4040,13 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let (_, batch) = bigint_batch(values);
         // `s/` and `t/` are the bootstrap schema and table path prefixes.
-        write_parquet(&store, "main/t/data.parquet", &batch).await;
+        let file_size = write_parquet(&store, "main/t/data.parquet", &batch).await;
 
         let db_tx = catalog.begin_write_tx().await.unwrap();
         let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
         tx.stage(RowOperation::Insert {
             table: TableKind::DataFile,
-            cells: indexed_data_file_row(u64::try_from(values.len()).unwrap()),
+            cells: indexed_data_file_row(u64::try_from(values.len()).unwrap(), file_size),
         });
         tx.stage(RowOperation::Insert {
             table: TableKind::Snapshot,

@@ -12,8 +12,10 @@ rust-version = "1.85"
 [workspace.dependencies]
 anyhow = "1"
 arrow = { version = "59.1.0", default-features = false }
+async-trait = "0.1"
 bytes = "1"
-parquet = { version = "59.1.0", default-features = false, features = ["arrow", "snap", "zstd"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 cc = "1"
 moraine = { path = "crates/moraine", version = "0.2.0" }
 # object_store must stay on the same minor as slatedb's
