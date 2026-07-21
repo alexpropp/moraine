@@ -37,18 +37,9 @@ pub(super) async fn stage_data_file_index_entries(
             file.data_file_id, file.table_id
         ))
     })?;
-    let row_id_start = data_file_row_id_start(&file)?;
     let path = data_file_object_path(base, &file, data_prefix)?;
-    let per_index = per_index_scoped_entries(
-        base,
-        &indexes,
-        table,
-        data_store,
-        &file,
-        &path,
-        row_id_start,
-    )
-    .await?;
+    let per_index =
+        per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
 
     for (index, scoped) in indexes.iter().zip(per_index) {
         push_index_entries(entries, index, scoped, false)?;
@@ -66,7 +57,6 @@ pub(super) async fn per_index_scoped_entries(
     data_store: &Arc<dyn ObjectStore>,
     file: &proto::DataFileValue,
     path: &object_store::path::Path,
-    row_id_start: u64,
 ) -> Result<Vec<Vec<ScopedReadEntry>>> {
     let live_columns = base.columns_of(table);
     let mut all_positions = Vec::new();
@@ -84,7 +74,7 @@ pub(super) async fn per_index_scoped_entries(
         path,
         &all_positions,
         scoped_read::RowIdSource::Resolve {
-            row_id_start: Some(row_id_start),
+            row_id_start: file.row_id_start,
         },
         Some(file.file_size_bytes),
     )
@@ -449,7 +439,6 @@ pub(super) async fn stage_file_delete_entries(
     }
 
     let file = live_data_file(base, table_id, data_file_id)?;
-    let row_id_start = data_file_row_id_start(&file)?;
     let data_store = data_store.ok_or_else(|| {
         Error::Constraint(format!(
             "data file {data_file_id} on indexed table {table_id} cannot be read to maintain its \
@@ -459,16 +448,8 @@ pub(super) async fn stage_file_delete_entries(
 
     let path = data_file_object_path(base, &file, data_prefix)?;
     let killed: HashSet<u64> = row_ids.iter().copied().collect();
-    let per_index = per_index_scoped_entries(
-        base,
-        &indexes,
-        table,
-        data_store,
-        &file,
-        &path,
-        row_id_start,
-    )
-    .await?;
+    let per_index =
+        per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
     for (index, scoped) in indexes.iter().zip(per_index) {
         let scoped = scoped
             .into_iter()
