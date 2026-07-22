@@ -284,6 +284,22 @@ impl AsyncFileReader for ObjectStoreReader {
     }
 }
 
+/// A `map_err` builder for corruption context `what`: turns any displayable
+/// reader error into `Error::Corruption("{what}: {err}")`. One place for the
+/// shape every scoped/delete/inline read shares.
+fn corrupt<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> Error {
+    move |err| Error::Corruption(format!("{what}: {err}"))
+}
+
+/// A `usize` row count or offset as a `u64`. Infallible on every target
+/// moraine supports (`usize` is at most 64 bits), so the conversion cannot
+/// fail — a failure would mean a wider-than-64-bit platform, which would
+/// otherwise silently mint a wrong row id.
+fn usize_as_u64(value: usize) -> u64 {
+    #[allow(clippy::expect_used)]
+    u64::try_from(value).expect("usize fits in u64 on supported targets")
+}
+
 /// Derives one [`ScopedReadEntry`] per row of the Parquet file at `path`,
 /// fetching only the footer, the columns at `indexed_positions` (the
 /// indexed columns, in the index's column order), and the embedded row-id
@@ -306,7 +322,7 @@ pub(crate) async fn scoped_read_entries(
             object_store
                 .head(path)
                 .await
-                .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?
+                .map_err(corrupt("scoped read"))?
                 .size
         }
     };
@@ -327,7 +343,7 @@ pub(crate) async fn scoped_read_entries(
     };
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
-        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+        .map_err(corrupt("scoped read"))?;
     let (row_id_position, row_id_start) =
         resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
     let (mask, indexed_output, row_id_output) =
@@ -335,12 +351,12 @@ pub(crate) async fn scoped_read_entries(
     let mut stream = builder
         .with_projection(mask)
         .build()
-        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+        .map_err(corrupt("scoped read"))?;
 
     let mut entries = Vec::new();
     let mut ordinal_base = 0u64;
     while let Some(batch) = stream.next().await {
-        let batch = batch.map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+        let batch = batch.map_err(corrupt("scoped read"))?;
         entries.extend(record_batch_entries(
             &batch,
             &indexed_output,
@@ -348,8 +364,7 @@ pub(crate) async fn scoped_read_entries(
             row_id_start,
             ordinal_base,
         )?);
-        ordinal_base =
-            ordinal_base.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+        ordinal_base = ordinal_base.saturating_add(usize_as_u64(batch.num_rows()));
     }
 
     Ok(entries)
@@ -374,12 +389,12 @@ async fn whole_object_entries(
     let bytes: Bytes = object_store
         .get(path)
         .await
-        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?
+        .map_err(corrupt("scoped read"))?
         .bytes()
         .await
-        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+        .map_err(corrupt("scoped read"))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
     let (row_id_position, row_id_start) =
         resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
     let (mask, indexed_output, row_id_output) =
@@ -387,12 +402,12 @@ async fn whole_object_entries(
     let reader = builder
         .with_projection(mask)
         .build()
-        .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+        .map_err(corrupt("scoped read"))?;
 
     let mut entries = Vec::new();
     let mut ordinal_base = 0u64;
     for batch in reader {
-        let batch = batch.map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+        let batch = batch.map_err(corrupt("scoped read"))?;
         entries.extend(record_batch_entries(
             &batch,
             &indexed_output,
@@ -400,8 +415,7 @@ async fn whole_object_entries(
             row_id_start,
             ordinal_base,
         )?);
-        ordinal_base =
-            ordinal_base.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+        ordinal_base = ordinal_base.saturating_add(usize_as_u64(batch.num_rows()));
     }
     Ok(entries)
 }
@@ -457,7 +471,7 @@ fn record_batch_entries(
                 Some(position) => row_id_value(batch.column(position).as_ref(), row)?,
                 None => row_id_start
                     .saturating_add(ordinal_base)
-                    .saturating_add(u64::try_from(row).unwrap_or(u64::MAX)),
+                    .saturating_add(usize_as_u64(row)),
             };
             Ok(ScopedReadEntry { row_id, values })
         })
@@ -474,13 +488,13 @@ pub(crate) async fn delete_file_positions(
     let bytes: Bytes = object_store
         .get(path)
         .await
-        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?
+        .map_err(corrupt("delete-file read"))?
         .bytes()
         .await
-        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+        .map_err(corrupt("delete-file read"))?;
 
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("delete-file read"))?;
 
     let position = builder
         .schema()
@@ -493,11 +507,11 @@ pub(crate) async fn delete_file_positions(
     let reader = builder
         .with_projection(mask)
         .build()
-        .map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+        .map_err(corrupt("delete-file read"))?;
 
     let mut positions = Vec::new();
     for batch in reader {
-        let batch = batch.map_err(|err| Error::Corruption(format!("delete-file read: {err}")))?;
+        let batch = batch.map_err(corrupt("delete-file read"))?;
         let column = batch.column(0).as_ref();
         for row in 0..batch.num_rows() {
             if column.is_null(row) {
@@ -517,7 +531,7 @@ pub(crate) async fn delete_file_positions(
 /// schema once per version, so the body carries none of its own.
 fn decode_inline_batch(schema_ipc: &[u8], body: &[u8]) -> Result<RecordBatch> {
     let schema = StreamReader::try_new(std::io::Cursor::new(schema_ipc.to_vec()), None)
-        .map_err(|err| Error::Corruption(format!("inline schema: {err}")))?
+        .map_err(corrupt("inline schema"))?
         .schema();
     if body.len() < 4 {
         return Err(Error::Corruption("inline body truncated".to_owned()));
@@ -531,8 +545,7 @@ fn decode_inline_batch(schema_ipc: &[u8], body: &[u8]) -> Result<RecordBatch> {
     if message_end > body.len() {
         return Err(Error::Corruption("inline body truncated".to_owned()));
     }
-    let message = root_as_message(&body[4..message_end])
-        .map_err(|err| Error::Corruption(format!("inline message: {err}")))?;
+    let message = root_as_message(&body[4..message_end]).map_err(corrupt("inline message"))?;
     let record_batch = message
         .header_as_record_batch()
         .ok_or_else(|| Error::Corruption("inline body is not a record batch".to_owned()))?;
@@ -546,7 +559,7 @@ fn decode_inline_batch(schema_ipc: &[u8], body: &[u8]) -> Result<RecordBatch> {
         None,
         &version,
     )
-    .map_err(|err| Error::Corruption(format!("inline batch: {err}")))
+    .map_err(corrupt("inline batch"))
 }
 
 /// Derives entries from an inline-insert chunk: decodes its body against the

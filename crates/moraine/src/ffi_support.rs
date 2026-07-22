@@ -13,6 +13,8 @@
 //! back. Views spanning several `dump_*` calls are not snapshot-consistent:
 //! each call reads at whatever the current head is when it runs.
 
+use std::sync::Arc;
+
 use crate::{
     catalog::{Catalog, projection::ProjectionCache},
     error::Result,
@@ -68,7 +70,7 @@ pub use crate::store::proto::SnapshotValue as SnapshotRecord;
 /// pair installs it otherwise. Populating DuckLake's metadata tables
 /// issues ~two dozen `dump_*` calls, and this collapses their store cost
 /// to one scan pair per head.
-async fn all_entities(catalog: &Catalog) -> Result<std::sync::Arc<Vec<EntityRecord>>> {
+async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
 
@@ -88,10 +90,11 @@ async fn all_entities(catalog: &Catalog) -> Result<std::sync::Arc<Vec<EntityReco
     session.finish();
     let mut records = current?;
     records.extend(history?);
-    let records = std::sync::Arc::new(records);
+    let records = Arc::new(records);
     if let Some(head) = cache_at {
         projections_write(catalog).install_entities(head, records.as_ref().clone());
     }
+
     Ok(records)
 }
 
@@ -729,8 +732,6 @@ pub async fn dump_sort_expression_rows(catalog: &Catalog) -> Result<Vec<SortExpr
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use object_store::memory::InMemory;
 
     use super::*;

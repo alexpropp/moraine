@@ -128,6 +128,81 @@ pub(crate) unsafe fn free_array<T>(items: *mut T, len: usize, mut drop_elem: imp
     drop(unsafe { Box::from_raw(raw_slice) });
 }
 
+/// The shared shell of a **snapshot** list export: null-check the outputs,
+/// borrow the snapshot, run `produce` under the panic/error guard, and write
+/// the array. `produce` returns owned `Row`s — any raw pointers built only
+/// after every conversion succeeds, so a partial failure leaks nothing.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+/// be writable.
+unsafe fn snapshot_list<Row>(
+    snapshot: *mut MoraineSnapshotHandle,
+    out_items: *mut *mut Row,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+    produce: impl FnOnce(&moraine::CatalogSnapshot) -> Result<Vec<Row>, AbiError>,
+) -> i32 {
+    let attempt = || -> Result<Vec<Row>, AbiError> {
+        if snapshot.is_null() {
+            return Err(AbiError::invalid_argument("`snapshot` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `snapshot`.
+        produce(unsafe { &(*snapshot).snapshot })
+    };
+
+    // SAFETY: `err` validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// The shared shell of a **handle** list export: null-check the handle and
+/// outputs, borrow the handle, run `produce` (which drives its own
+/// `block_on_cancellable`) under the guard, and write the array.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+/// be writable.
+unsafe fn handle_list<Row>(
+    handle: *mut MoraineCatalogHandle,
+    out_items: *mut *mut Row,
+    out_len: *mut usize,
+    err: *mut MoraineError,
+    produce: impl FnOnce(&MoraineCatalogHandle) -> Result<Vec<Row>, AbiError>,
+) -> i32 {
+    let attempt = || -> Result<Vec<Row>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        produce(unsafe { &*handle })
+    };
+
+    // SAFETY: `err` validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// Mirrors the C `MoraineS3Config`: S3 credentials for an `s3://` store,
 /// sourced from a DuckDB secret. Null/empty fields fall back to the AWS_*
 /// environment; `use_ssl` is -1 unset, 0 false, 1 true.
@@ -822,39 +897,25 @@ pub unsafe extern "C" fn moraine_snapshot_schemas(
     out_len: *mut usize,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineSchemaDesc>, AbiError> {
-        if snapshot.is_null() {
-            return Err(AbiError::invalid_argument("`snapshot` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `snapshot`.
-        let snapshot = unsafe { &(*snapshot).snapshot };
-        // Owned-first: no raw pointers until every string converts, so a
-        // partial failure leaks nothing.
-        let owned: Vec<(u64, CString)> = snapshot
-            .schemas()
-            .into_iter()
-            .map(|s| Ok((s.id.get(), to_c_string(&s.name)?)))
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|(id, name)| MoraineSchemaDesc {
-                id,
-                name: name.into_raw(),
-            })
-            .collect())
-    };
+    // SAFETY: caller contract for the pointers.
+    unsafe {
+        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
+            // Owned-first: no raw pointers until every string converts, so a
+            // partial failure leaks nothing.
+            let owned: Vec<(u64, CString)> = snapshot
+                .schemas()
+                .into_iter()
+                .map(|s| Ok((s.id.get(), to_c_string(&s.name)?)))
+                .collect::<Result<_, AbiError>>()?;
 
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+            Ok(owned
+                .into_iter()
+                .map(|(id, name)| MoraineSchemaDesc {
+                    id,
+                    name: name.into_raw(),
+                })
+                .collect())
+        })
     }
 }
 
@@ -902,40 +963,26 @@ pub unsafe extern "C" fn moraine_snapshot_tables_in(
     out_len: *mut usize,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineTableDesc>, AbiError> {
-        if snapshot.is_null() {
-            return Err(AbiError::invalid_argument("`snapshot` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `snapshot`.
-        let snapshot = unsafe { &(*snapshot).snapshot };
-        // Owned-first: no raw pointers until every string converts, so a
-        // partial failure leaks nothing.
-        let owned: Vec<(u64, u64, CString)> = snapshot
-            .tables_in(moraine::SchemaId::new(schema_id))
-            .into_iter()
-            .map(|t| Ok((t.id.get(), t.schema_id.get(), to_c_string(&t.name)?)))
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|(id, schema_id, name)| MoraineTableDesc {
-                id,
-                schema_id,
-                name: name.into_raw(),
-            })
-            .collect())
-    };
+    // SAFETY: caller contract for the pointers.
+    unsafe {
+        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
+            // Owned-first: no raw pointers until every string converts, so a
+            // partial failure leaks nothing.
+            let owned: Vec<(u64, u64, CString)> = snapshot
+                .tables_in(moraine::SchemaId::new(schema_id))
+                .into_iter()
+                .map(|t| Ok((t.id.get(), t.schema_id.get(), to_c_string(&t.name)?)))
+                .collect::<Result<_, AbiError>>()?;
 
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+            Ok(owned
+                .into_iter()
+                .map(|(id, schema_id, name)| MoraineTableDesc {
+                    id,
+                    schema_id,
+                    name: name.into_raw(),
+                })
+                .collect())
+        })
     }
 }
 
@@ -991,53 +1038,38 @@ pub unsafe extern "C" fn moraine_snapshot_columns_of(
     out_len: *mut usize,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineColumnDesc>, AbiError> {
-        if snapshot.is_null() {
-            return Err(AbiError::invalid_argument("`snapshot` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `snapshot`.
-        let snapshot = unsafe { &(*snapshot).snapshot };
-        // Owned-first: no raw pointers until every string converts, so a
-        // partial failure leaks nothing.
-        let owned: Vec<(u64, CString, CString, bool, Option<u64>)> = snapshot
-            .columns_of(moraine::TableId::new(table_id))
-            .into_iter()
-            .map(|c| {
-                Ok((
-                    c.id.get(),
-                    to_c_string(&c.name)?,
-                    to_c_string(&c.column_type)?,
-                    c.nulls_allowed,
-                    c.parent_column.map(moraine::ColumnId::get),
-                ))
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(
-                |(id, name, sql_type, nulls_allowed, parent)| MoraineColumnDesc {
-                    id,
-                    name: name.into_raw(),
-                    sql_type: sql_type.into_raw(),
-                    nulls_allowed,
-                    has_parent_column: parent.is_some(),
-                    parent_column: parent.unwrap_or(0),
-                },
-            )
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+    // SAFETY: caller contract for the pointers.
+    unsafe {
+        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
+            // Owned-first: no raw pointers until every string converts, so a
+            // partial failure leaks nothing.
+            let owned: Vec<(u64, CString, CString, bool, Option<u64>)> = snapshot
+                .columns_of(moraine::TableId::new(table_id))
+                .into_iter()
+                .map(|c| {
+                    Ok((
+                        c.id.get(),
+                        to_c_string(&c.name)?,
+                        to_c_string(&c.column_type)?,
+                        c.nulls_allowed,
+                        c.parent_column.map(moraine::ColumnId::get),
+                    ))
+                })
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(
+                    |(id, name, sql_type, nulls_allowed, parent)| MoraineColumnDesc {
+                        id,
+                        name: name.into_raw(),
+                        sql_type: sql_type.into_raw(),
+                        nulls_allowed,
+                        has_parent_column: parent.is_some(),
+                        parent_column: parent.unwrap_or(0),
+                    },
+                )
+                .collect())
+        })
     }
 }
 
@@ -1097,50 +1129,35 @@ pub unsafe extern "C" fn moraine_snapshot_views_in(
     out_len: *mut usize,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineViewDesc>, AbiError> {
-        if snapshot.is_null() {
-            return Err(AbiError::invalid_argument("`snapshot` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `snapshot`.
-        let snapshot = unsafe { &(*snapshot).snapshot };
-        // Owned-first: no raw pointers until every string converts, so a
-        // partial failure leaks nothing.
-        let owned: Vec<(u64, u64, CString, CString, CString)> = snapshot
-            .views_in(moraine::SchemaId::new(schema_id))
-            .into_iter()
-            .map(|v| {
-                Ok((
-                    v.id.get(),
-                    v.schema_id.get(),
-                    to_c_string(&v.name)?,
-                    to_c_string(&v.dialect)?,
-                    to_c_string(&v.sql)?,
-                ))
-            })
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|(id, schema_id, name, dialect, sql)| MoraineViewDesc {
-                id,
-                schema_id,
-                name: name.into_raw(),
-                dialect: dialect.into_raw(),
-                sql: sql.into_raw(),
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+    // SAFETY: caller contract for the pointers.
+    unsafe {
+        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
+            // Owned-first: no raw pointers until every string converts, so a
+            // partial failure leaks nothing.
+            let owned: Vec<(u64, u64, CString, CString, CString)> = snapshot
+                .views_in(moraine::SchemaId::new(schema_id))
+                .into_iter()
+                .map(|v| {
+                    Ok((
+                        v.id.get(),
+                        v.schema_id.get(),
+                        to_c_string(&v.name)?,
+                        to_c_string(&v.dialect)?,
+                        to_c_string(&v.sql)?,
+                    ))
+                })
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(id, schema_id, name, dialect, sql)| MoraineViewDesc {
+                    id,
+                    schema_id,
+                    name: name.into_raw(),
+                    dialect: dialect.into_raw(),
+                    sql: sql.into_raw(),
+                })
+                .collect())
+        })
     }
 }
 
@@ -1204,45 +1221,30 @@ pub unsafe extern "C" fn moraine_snapshot_data_files_of(
     out_len: *mut usize,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineDataFileDesc>, AbiError> {
-        if snapshot.is_null() {
-            return Err(AbiError::invalid_argument("`snapshot` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `snapshot`.
-        let snapshot = unsafe { &(*snapshot).snapshot };
-        // Owned-first: no raw pointers until every string converts, so a
-        // partial failure leaks nothing.
-        let owned: Vec<(CString, moraine::DataFileInfo)> = snapshot
-            .data_files_of(moraine::TableId::new(table_id))
-            .into_iter()
-            .map(|f| Ok((to_c_string(&f.path)?, f)))
-            .collect::<Result<_, AbiError>>()?;
-        Ok(owned
-            .into_iter()
-            .map(|(path, f)| MoraineDataFileDesc {
-                id: f.id.get(),
-                path: path.into_raw(),
-                path_is_relative: f.path_is_relative,
-                record_count: f.record_count,
-                has_row_id_start: f.row_id_start.is_some(),
-                row_id_start: f.row_id_start.unwrap_or_default(),
-                file_size_bytes: f.file_size_bytes,
-                footer_size: f.footer_size,
-            })
-            .collect())
-    };
-
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
+    // SAFETY: caller contract for the pointers.
+    unsafe {
+        snapshot_list(snapshot, out_items, out_len, err, |snapshot| {
+            // Owned-first: no raw pointers until every string converts, so a
+            // partial failure leaks nothing.
+            let owned: Vec<(CString, moraine::DataFileInfo)> = snapshot
+                .data_files_of(moraine::TableId::new(table_id))
+                .into_iter()
+                .map(|f| Ok((to_c_string(&f.path)?, f)))
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(path, f)| MoraineDataFileDesc {
+                    id: f.id.get(),
+                    path: path.into_raw(),
+                    path_is_relative: f.path_is_relative,
+                    record_count: f.record_count,
+                    has_row_id_start: f.row_id_start.is_some(),
+                    row_id_start: f.row_id_start.unwrap_or_default(),
+                    file_size_bytes: f.file_size_bytes,
+                    footer_size: f.footer_size,
+                })
+                .collect())
+        })
     }
 }
 
@@ -1564,15 +1566,7 @@ pub unsafe extern "C" fn moraine_indexes(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineIndexDesc>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineIndexDesc>, AbiError> {
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
@@ -1607,15 +1601,8 @@ pub unsafe extern "C" fn moraine_indexes(
             .collect())
     };
 
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
-    }
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
 }
 
 /// Frees the array a [`moraine_indexes`] call returned.
@@ -1732,18 +1719,10 @@ pub unsafe extern "C" fn moraine_index_lookup(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineRowLocation>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowLocation>, AbiError> {
         if lookup_value.is_null() {
             return Err(AbiError::invalid_argument("`lookup_value` is null"));
         }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
@@ -1800,15 +1779,8 @@ pub unsafe extern "C" fn moraine_index_lookup(
             .collect())
     };
 
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
-    }
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
 }
 
 /// Frees the array a [`moraine_index_lookup`] call returned.
@@ -1857,20 +1829,12 @@ pub unsafe extern "C" fn moraine_index_range(
 ) -> i32 {
     use std::ops::Bound;
 
-    let attempt = || -> Result<Vec<MoraineRowLocation>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowLocation>, AbiError> {
         if lower_value.is_null() && upper_value.is_null() {
             return Err(AbiError::invalid_argument(
                 "index range: at least one bound must be present",
             ));
         }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
@@ -1944,15 +1908,8 @@ pub unsafe extern "C" fn moraine_index_range(
             .collect())
     };
 
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
-    }
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
 }
 
 /// Frees the array a [`moraine_index_range`] call returned.
@@ -1998,13 +1955,7 @@ pub unsafe extern "C" fn moraine_index_nulls(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
-    let attempt = || -> Result<Vec<MoraineRowLocation>, AbiError> {
-        if handle.is_null() {
-            return Err(AbiError::invalid_argument("`handle` is null"));
-        }
-        if out_items.is_null() || out_len.is_null() {
-            return Err(AbiError::invalid_argument("output pointer is null"));
-        }
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowLocation>, AbiError> {
         if prefix_len == 0 {
             return Err(AbiError::invalid_argument(
                 "index nulls: the prefix names no predicate",
@@ -2013,8 +1964,6 @@ pub unsafe extern "C" fn moraine_index_nulls(
         if prefix.is_null() {
             return Err(AbiError::invalid_argument("`prefix` is null"));
         }
-        // SAFETY: caller contract for `handle`.
-        let handle_ref = unsafe { &*handle };
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
         // SAFETY: caller contract.
@@ -2051,8 +2000,8 @@ pub unsafe extern "C" fn moraine_index_nulls(
                     "index {name} covers column {column_id} absent from table {table_id}"
                 )))
             })?;
-            // SAFETY: caller contract — a value predicate's string/bytes fields
-            // (if its kind uses them) are valid for this call.
+            // SAFETY: caller contract — a value predicate's string/bytes
+            // fields (if its kind uses them) are valid for this call.
             let value = unsafe { coerce_lookup_value(predicate, &column.column_type) }?;
             values.push(Some(value));
         }
@@ -2083,15 +2032,8 @@ pub unsafe extern "C" fn moraine_index_nulls(
             .collect())
     };
 
-    // SAFETY: `err` validity is this function's own safety contract.
-    match unsafe { guard(err, attempt) } {
-        Ok(items) => {
-            // SAFETY: checked non-null above; caller contract.
-            unsafe { write_array(items, out_items, out_len) };
-            codes::OK
-        }
-        Err(code) => code,
-    }
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
 }
 
 /// Frees the array a [`moraine_index_nulls`] call returned.
