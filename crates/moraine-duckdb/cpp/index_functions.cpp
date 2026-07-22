@@ -181,14 +181,11 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexDdlInitGlobal(duckdb::
 		for (auto &column : bind_data.columns) {
 			column_ptrs.push_back(column.c_str());
 		}
-		// `descending`/`nulls_first` store one 0/1 byte per column; reinterpret
-		// as the ABI's `bool` arrays, or pass null to default that axis.
-		const bool *directions =
-		    bind_data.descending.empty() ? nullptr
-		                                 : reinterpret_cast<const bool *>(bind_data.descending.data());
-		const bool *nulls_first =
-		    bind_data.nulls_first.empty() ? nullptr
-		                                  : reinterpret_cast<const bool *>(bind_data.nulls_first.data());
+		// `descending`/`nulls_first` store one 0/1 byte per column; the ABI
+		// takes `uint8_t` arrays (not `bool`, which is UB to alias here), so
+		// pass the vector storage directly, or null to default that axis.
+		const uint8_t *directions = bind_data.descending.empty() ? nullptr : bind_data.descending.data();
+		const uint8_t *nulls_first = bind_data.nulls_first.empty() ? nullptr : bind_data.nulls_first.data();
 		code = moraine_index_create(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
 		                            bind_data.index_name.c_str(), column_ptrs.data(), column_ptrs.size(),
 		                            directions, nulls_first, bind_data.unique, moraine_shim_is_interrupted,

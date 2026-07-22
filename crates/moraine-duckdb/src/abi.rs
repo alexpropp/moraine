@@ -1320,36 +1320,38 @@ unsafe fn borrow_str_array<'a>(
 }
 
 /// Builds the per-column [`moraine::ColumnOrder`]s from the ABI's parallel
-/// direction / null-placement flag arrays. Each null pointer defaults its
+/// direction / null-placement flag arrays — one `0`/`1` byte per column
+/// (`bool` is avoided at the array boundary, where reinterpreting a C++
+/// `uint8_t` buffer as `bool` is undefined). Each null pointer defaults its
 /// axis (ascending / NULLS LAST); both null yields an empty vec.
 ///
 /// # Safety
 ///
-/// Each non-null pointer must point to `column_count` bools.
+/// Each non-null pointer must point to `column_count` bytes.
 unsafe fn column_orders(
-    column_descending: *const bool,
-    column_nulls_first: *const bool,
+    column_descending: *const u8,
+    column_nulls_first: *const u8,
     column_count: usize,
 ) -> Vec<moraine::ColumnOrder> {
     if column_descending.is_null() && column_nulls_first.is_null() {
         return Vec::new();
     }
     let descending = (!column_descending.is_null()).then(|| {
-        // SAFETY: caller contract — non-null points to `column_count` bools.
+        // SAFETY: caller contract — non-null points to `column_count` bytes.
         unsafe { std::slice::from_raw_parts(column_descending, column_count) }
     });
     let nulls_first = (!column_nulls_first.is_null()).then(|| {
-        // SAFETY: caller contract — non-null points to `column_count` bools.
+        // SAFETY: caller contract — non-null points to `column_count` bytes.
         unsafe { std::slice::from_raw_parts(column_nulls_first, column_count) }
     });
     (0..column_count)
         .map(|i| moraine::ColumnOrder {
-            direction: if descending.is_some_and(|flags| flags[i]) {
+            direction: if descending.is_some_and(|flags| flags[i] != 0) {
                 moraine::Direction::Descending
             } else {
                 moraine::Direction::Ascending
             },
-            nulls: if nulls_first.is_some_and(|flags| flags[i]) {
+            nulls: if nulls_first.is_some_and(|flags| flags[i] != 0) {
                 moraine::NullOrder::First
             } else {
                 moraine::NullOrder::Last
@@ -1373,8 +1375,8 @@ pub unsafe extern "C" fn moraine_index_create(
     index_name: *const c_char,
     column_names: *const *const c_char,
     column_count: usize,
-    column_descending: *const bool,
-    column_nulls_first: *const bool,
+    column_descending: *const u8,
+    column_nulls_first: *const u8,
     unique: bool,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,

@@ -734,6 +734,53 @@ async fn index_range_reverse_serves_the_opposite_order() {
 }
 
 #[tokio::test]
+async fn index_range_refuses_a_bound_wider_than_the_index() {
+    use std::ops::Bound;
+
+    use crate::catalog::{ColumnId, IndexDef};
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[entry(0, 10), entry(1, 20), entry(2, 30)],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    let value = |v: i128| crate::store::index_encoding::IndexKeyValue::Int {
+        value: v,
+        width: crate::store::index_encoding::IntWidth::I64,
+    };
+    // The index has one column; a two-value bound names a column it lacks.
+    let err = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![value(10), value(20)]),
+            Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn index_range_over_a_non_unique_index_returns_every_matching_row() {
     use std::ops::Bound;
 

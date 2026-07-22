@@ -332,10 +332,21 @@ impl Catalog {
                 Bound::Included(values) | Bound::Excluded(values) => values.len(),
                 Bound::Unbounded => 0,
             };
+            // A bound naming more columns than the index has would encode
+            // components no stored key carries, silently returning the wrong
+            // rows; refuse it instead.
+            let widest = bound_len(&lower).max(bound_len(&upper));
+            if widest > info.columns.len() {
+                return Err(Error::Constraint(format!(
+                    "index_range: a bound of {widest} values does not fit the {}-column index \
+                     {index}",
+                    info.columns.len()
+                )));
+            }
             // The range column is the last one the bounds name (leading
             // columns are pinned to equality); its direction decides whether
             // value order runs with or against the index's byte order.
-            let range_column = bound_len(&lower).max(bound_len(&upper)).saturating_sub(1);
+            let range_column = widest.saturating_sub(1);
             let descending = info.directions.get(range_column).copied()
                 == Some(crate::store::index_encoding::Direction::Descending);
 
