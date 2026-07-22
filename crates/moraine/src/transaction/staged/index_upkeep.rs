@@ -158,13 +158,15 @@ pub(super) async fn stage_index_maintenance(
             RowOperation::InlineFileDelete {
                 table_id,
                 data_file_id,
-                row_id,
+                row_id: position,
                 ..
             } => {
+                // An inlined file-delete names a physical position in the
+                // file, exactly as a delete file's `pos` does.
                 file_deletes
                     .entry((*table_id, *data_file_id))
                     .or_default()
-                    .insert_row_id(*row_id);
+                    .insert_position(*position);
             }
             _ => {}
         }
@@ -376,21 +378,19 @@ pub(super) async fn stage_inline_delete_entries(
     Ok(())
 }
 
-/// Rows a commit kills inside one data file, named two ways: positions
-/// from a delete file, row ids from inline file-deletes.
+/// The physical row positions a commit kills inside one data file. Both a
+/// delete file's `pos` column and an inlined file-delete name positions,
+/// not row ids; the target's scoped read resolves each position to the row
+/// it holds.
 #[derive(Debug, Default)]
 pub(super) struct KilledRows {
-    /// Killed positions within the target file, as its delete file
-    /// records them.
     positions: HashSet<u64>,
-    /// Killed row ids, as inline file-deletes name them.
-    row_ids: HashSet<u64>,
 }
 
 impl KilledRows {
-    /// Records an inline file-delete's row id.
-    pub(super) fn insert_row_id(&mut self, row_id: u64) {
-        self.row_ids.insert(row_id);
+    /// Records a killed physical row position.
+    pub(super) fn insert_position(&mut self, position: u64) {
+        self.positions.insert(position);
     }
 }
 
@@ -469,17 +469,14 @@ pub(super) async fn stage_file_delete_entries(
     let path = data_file_object_path(base, &file, data_prefix)?;
     let per_index =
         per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
-    // An entry dies when a delete file names its ordinal or an inline
-    // file-delete names its row id — one rule for dense and per-row-id
-    // targets alike.
+    // An entry dies when a delete names its physical position; the scoped
+    // read resolves that position to the row it holds — one rule for dense
+    // and per-row-id targets alike.
     for (index, scoped) in indexes.iter().zip(per_index) {
         let scoped = scoped
             .into_iter()
             .enumerate()
-            .filter(|(ordinal, entry)| {
-                let ordinal = *ordinal as u64;
-                killed.positions.contains(&ordinal) || killed.row_ids.contains(&entry.row_id)
-            })
+            .filter(|(ordinal, _)| killed.positions.contains(&(*ordinal as u64)))
             .map(|(_, entry)| entry)
             .collect();
         push_index_entries(entries, index, scoped, true)?;

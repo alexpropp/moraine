@@ -1259,21 +1259,23 @@ async fn delete_file_against_per_row_id_target_removes_named_positions() {
     );
 }
 
-/// An inline file-delete names a row id directly; against a per-row-id
-/// target the id matches the embedded column, not any dense range.
+/// An inlined file-delete names a physical position; against a per-row-id
+/// target the scoped read resolves it to the row it holds, not any dense
+/// range.
 #[tokio::test]
 async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
     let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
     let store = register_per_row_id_file(&catalog).await;
     assert_eq!(index_entry_count(&catalog, true, index_id).await, 3);
 
-    // Row id 9 is the embedded id of position 1 (value 20).
+    // Position 1 holds value 20 (embedded id 9); the delete names the
+    // position, and its entry resolves out of the file.
     let db_tx = catalog.begin_write_tx().await.unwrap();
     let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
     tx.stage(RowOperation::InlineFileDelete {
         table_id: 1,
         data_file_id: 1,
-        row_id: 9,
+        row_id: 1,
         begin_snapshot: 4,
     });
     tx.stage(RowOperation::Insert {
