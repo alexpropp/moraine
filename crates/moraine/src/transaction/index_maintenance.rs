@@ -6,13 +6,16 @@
 //! write-write detection: two commits inserting the same value collide
 //! mechanically, and the loser re-runs and sees the winner's entry.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Bound,
+};
 
 use crate::{
     error::{Error, Result},
     store::{
         handle::ReadHandle,
-        index_encoding::{CanonicalKey, IndexKeyValue, encode_key},
+        index_encoding::CanonicalKey,
         key::{IdxKey, IdxKind, Key, idx_index_prefix, idx_multi_value_prefix},
     },
     transaction::commit::StagedWrite,
@@ -158,9 +161,8 @@ pub(crate) async fn lookup_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
     unique: bool,
-    values: &[IndexKeyValue],
+    key: &CanonicalKey,
 ) -> Result<Vec<u64>> {
-    let key = &encode_key(values)?;
     if unique {
         let entry_key = Key::Idx(IdxKey::Unique {
             index_id,
@@ -187,4 +189,126 @@ pub(crate) async fn lookup_row_ids(
         }
     }
     Ok(row_ids)
+}
+
+/// The row ids whose indexed value falls between `lower` and `upper`, in the
+/// index's stored order. Ordered encoding makes byte order equal value order,
+/// so the query is a bounded sub-scan of the index's contiguous range; the
+/// bounds are the canonical values, already encoded in the columns' declared
+/// directions. A unique entry carries its row id in the value, a non-unique
+/// one in the key.
+pub(crate) async fn range_row_ids(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    unique: bool,
+    lower: Bound<CanonicalKey>,
+    upper: Bound<CanonicalKey>,
+) -> Result<Vec<u64>> {
+    let kind = if unique {
+        IdxKind::Unique
+    } else {
+        IdxKind::Multi
+    };
+    let prefix = idx_index_prefix(kind, index_id);
+    let prefix_len = prefix.len();
+
+    // The framed value bytes as they appear in an entry key after the
+    // `(kind, index_id)` prefix — the suffix a subrange bounds against.
+    let suffix = |canon: &CanonicalKey| -> Vec<u8> {
+        let full = match kind {
+            IdxKind::Unique => Key::Idx(IdxKey::Unique {
+                index_id,
+                key: canon.clone(),
+            })
+            .encode(),
+            IdxKind::Multi => idx_multi_value_prefix(index_id, canon),
+        };
+        full[prefix_len..].to_vec()
+    };
+
+    let start = match lower {
+        Bound::Included(canon) => Bound::Included(suffix(&canon)),
+        // Skip every entry sharing the bound value: start above them all.
+        Bound::Excluded(canon) => match increment_prefix(&suffix(&canon)) {
+            Some(above) => Bound::Included(above),
+            None => Bound::Excluded(suffix(&canon)),
+        },
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    let end = match upper {
+        // Include every entry sharing the bound value: end above them all.
+        Bound::Included(canon) => match increment_prefix(&suffix(&canon)) {
+            Some(above) => Bound::Excluded(above),
+            None => Bound::Unbounded,
+        },
+        Bound::Excluded(canon) => Bound::Excluded(suffix(&canon)),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+
+    let mut iter = reader
+        .scan_prefix(prefix, (start, end))
+        .await
+        .map_err(Error::from)?;
+    let mut row_ids = Vec::new();
+    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+        if unique {
+            row_ids.push(decode_row_id(entry.value.as_ref())?);
+        } else {
+            match Key::decode(&entry.key)? {
+                Key::Idx(IdxKey::Multi { row_id, .. }) => row_ids.push(row_id),
+                other => {
+                    return Err(Error::Corruption(format!(
+                        "non-multi key in index range scan: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(row_ids)
+}
+
+/// The row ids of live rows whose leading indexed columns match `prefix` — a
+/// canonical key over a leading run of `= value` and `IS NULL` predicates.
+/// A row with any NULL indexed column is stored multi-shaped, so `IS NULL`
+/// queries scan the `multi` subrange; the value framing's terminator is
+/// dropped from the scan prefix so it matches every key that extends the run.
+pub(crate) async fn null_prefix_row_ids(
+    reader: ReadHandle<'_>,
+    index_id: u64,
+    prefix: &CanonicalKey,
+) -> Result<Vec<u64>> {
+    let mut scan_prefix = idx_multi_value_prefix(index_id, prefix);
+    // `idx_multi_value_prefix` frames the value and appends a terminator for an
+    // exact-value scan; dropping it turns the bytes into a true leading prefix.
+    scan_prefix.pop();
+    let mut iter = reader
+        .scan_prefix(scan_prefix, ..)
+        .await
+        .map_err(Error::from)?;
+    let mut row_ids = Vec::new();
+    while let Some(entry) = iter.next().await.map_err(Error::from)? {
+        match Key::decode(&entry.key)? {
+            Key::Idx(IdxKey::Multi { row_id, .. }) => row_ids.push(row_id),
+            other => {
+                return Err(Error::Corruption(format!(
+                    "non-multi key in null-prefix scan: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(row_ids)
+}
+
+/// The smallest byte string lexicographically greater than every string that
+/// begins with `prefix`, or `None` when `prefix` is all `0xff`.
+fn increment_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut bytes = prefix.to_vec();
+    while let Some(last) = bytes.last_mut() {
+        if *last != u8::MAX {
+            *last += 1;
+            return Some(bytes);
+        }
+        bytes.pop();
+    }
+    None
 }

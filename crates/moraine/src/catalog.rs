@@ -14,10 +14,10 @@ pub use handle::{Catalog, CatalogOptions};
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
 pub use types::{
-    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnStats, DataFile, DataFileId,
-    DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry,
-    FileIndexRemoval, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, MacroId,
-    MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId, MappingInfo, NameMappingDef,
-    OptionScope, RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
-    SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
+    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, DataFile,
+    DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats,
+    FileIndexEntry, FileIndexRemoval, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState,
+    MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MappingId, MappingInfo,
+    NameMappingDef, OptionScope, RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo,
+    SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
 };

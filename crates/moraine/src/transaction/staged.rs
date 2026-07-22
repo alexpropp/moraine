@@ -36,7 +36,7 @@ use crate::{
     error::{Error, Result},
     store::{
         handle::ReadHandle,
-        index_encoding::encode_key,
+        index_encoding::encode_ordered_values,
         inline as store_inline,
         key::{EntityKey, InlineKey, InlineOperation, Key, SysKey},
         proto, read, value,

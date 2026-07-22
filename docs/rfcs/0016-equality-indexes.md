@@ -1,4 +1,4 @@
-# RFC 0016: Equality indexes
+# RFC 0016: Equality and range indexes
 
 - **Date:** 2026-07-10
 - **Revised:** 2026-07-19 — staged (multi-commit) builds designed in;
@@ -6,6 +6,10 @@
 - **Revised:** 2026-07-21 — rewrite-file row-id resolution designed in
   (Rewrite files); previously an implementation follow-up behind a typed
   refusal.
+- **Revised:** 2026-07-22 — the index becomes **ordered**: order-preserving
+  encoding, per-column direction and NULL placement, and comparison
+  accessors (Range and comparison queries). `=` is now the degenerate closed
+  `[v, v]` range over the same storage.
 
 ## Summary
 
@@ -28,6 +32,16 @@ Builds too large for one commit run **staged**: the definition lands in a
 `building` state, backfill streams in bounded batches while writers maintain
 entries from day one, and a final commit flips the index `ready` (Staged
 builds).
+
+The index is **ordered**. The canonical encoding is order-preserving for
+every type, so the same `idx` storage answers comparison queries
+(`<`, `<=`, `>`, `>=`, `BETWEEN`, half-open) as a bounded sub-scan —
+equality is the degenerate closed `[v, v]` case. Each column carries a
+declared **direction** (`ASC`/`DESC`, realized by complementing its framed
+bytes, so one forward-only scan yields the declared order) and a **NULL
+placement** (`NULLS FIRST`/`LAST`). None of this adds a maintenance path:
+coverage, staged builds, uniqueness, and the scoped read are unchanged —
+they just call the ordered encoder (Range and comparison queries).
 
 The store is one index; the ways in are two. The **embedding (verb) API**
 creates and maintains indexes directly — the bulk of this RFC. The
@@ -57,15 +71,17 @@ user-table binder and refuses index DDL before moraine is consulted
 
 Non-goals:
 
-- **Range scans.** The contract is equality only. Canonical encodings are
-  chosen order-compatible where that is free (see Encoding), so a future
-  range contract is an upgrade, not a rewrite — but nothing here promises
-  order.
 - **Serving DuckLake's planner transparently.** DuckLake owns the user-table
-  binder and optimizer, so index-routed pushdown waits on DuckLake (Extension
-  path, Future directions). The extension path integrates through an explicit
-  surface — registered functions and the scoped read — never `ducklake_*`
-  changes or the planner.
+  binder and optimizer, so index-routed pushdown — including range and
+  `ORDER BY` pushdown — waits on DuckLake (Extension path, Future
+  directions). The extension path integrates through an explicit surface —
+  registered functions and the scoped read — never `ducklake_*` changes or
+  the planner.
+- **Reverse iteration.** The store scans forward only (RFC 0002). One index
+  serves one declared order; the exact opposite order is a second index or a
+  future reverse-scan capability, not this RFC.
+- **Locale/collation-aware order.** String order is DuckDB's default binary
+  (bytewise) order; collation-sensitive ordering is out of scope.
 - **Approximate structures** (bloom filters, zone maps) — they cannot carry
   uniqueness; RFC 0013's pruning stance already covers the skipping use case.
 
@@ -174,25 +190,44 @@ lookups scan and drop orphans (Reclamation).
 Entry keys embed column values — a deliberate, bounded exception to
 RFC 0002's "no strings in keys" rule, which exists so *entity* keys stay
 rename-stable; an index key's whole job is to be the value. The contract is
-**canonical bytes for equality**, per DuckLake column type, pinned by golden
-vectors and proptest roundtrips like every other store codec:
+**canonical *and* order-preserving bytes**, per DuckLake column type
+(`encode(x) < encode(y)` as unsigned bytes iff `x < y` in the type's SQL
+order), pinned by golden vectors and proptest roundtrips like every other
+store codec:
 
 - Integers: fixed-width big-endian, sign bit flipped; widths normalized per
-  the column's type. Order-compatible, though order is not contracted.
+  the column's type. Order-preserving.
 - Strings/blobs: the UTF-8/raw bytes, `storekey`-escaped so component
-  boundaries stay unambiguous in composite keys.
-- Floats: IEEE bits with `-0.0` normalized to `+0.0` and all NaNs collapsed
-  to one quiet-NaN pattern — matching DuckDB's total-order equality, where
-  `NaN = NaN` holds.
+  boundaries stay unambiguous in composite keys; bytewise order is DuckDB's
+  default binary order.
+- Floats: `-0.0` normalized to `+0.0` and every NaN collapsed to one pattern,
+  then the standard total-order transform (flip the sign bit of a
+  non-negative value, all bits of a negative one) so the big-endian bytes
+  sort numerically, with NaN greatest.
 - Temporal types: their underlying integer representation.
 - Composite indexes concatenate component encodings in declared column
   order; `storekey` tuple framing keeps `("ab","c")` distinct from
-  `("a","bc")`.
+  `("a","bc")` **and** preserves order (a shorter value sorts before its
+  extension).
 
-**NULL semantics follow SQL:** a row with NULL in any indexed column gets
-**no entry** — a unique index admits any number of such rows, and an
-equality lookup on NULL has no index answer (typed error; NULL scans were
-never point lookups).
+**Direction** is per column. A `DESC` column stores the bitwise complement
+of its fully framed component (terminator included, so variable-length
+values reverse correctly — `"ab" < "a"`); the leading NULL flag is not
+complemented, so NULL placement is independent of direction. A forward-only
+scan then yields the declared composite order in one pass, no reverse
+iterator.
+
+**NULL placement** is per column (`NULLS FIRST`/`LAST`). Each column's
+component carries a leading flag byte separating NULL from non-null, ordered
+per the placement. A row with a NULL in an indexed column **is stored** — so
+`IS NULL` can find it (Range and comparison queries) — but always
+**multi-shaped** (the row id is in the key) and **exempt from the value
+collision**: SQL treats NULLs as distinct, so a unique index still admits any
+number of NULL rows. An equality *point* lookup on NULL still has no answer
+(`= NULL` is unknown); NULL rows are reached only through `IS NULL`. What the
+flag does not yet drive is *ordered emission* of NULL rows at the declared end
+for `ORDER BY … NULLS FIRST/LAST` — that waits on `ORDER BY` pushdown (Open
+questions).
 
 **Oversized values are refused.** Indexed values beyond a fixed cap fail
 with `Constraint` at insert/registration — huge keys degrade the whole
@@ -288,11 +323,67 @@ cut:
   live row-id range contains the id. The consumer applies delete files as
   any DuckLake scan does — moraine returns candidates, not adjudicated rows.
   The extension path surfaces this accessor as `moraine_index_lookup`.
+- `index_range(table, index, lower, upper) -> Vec<RowLocation>` — the
+  comparison accessor (Range and comparison queries). Each bound is
+  `Included`/`Excluded`/`Unbounded`; results come back in the index's stored
+  order. The extension path surfaces it as `moraine_index_range`.
+- `index_nulls(table, index, prefix) -> Vec<RowLocation>` — the `IS NULL`
+  accessor. `prefix` is a leading run of `Some(value)` (equality) and `None`
+  (`IS NULL`) predicates — `[None]` is `a IS NULL`, `[Some(5), None]` is
+  `a = 5 AND b IS NULL`. At least one `None` is required; a gap (an
+  unconstrained leading column, so a bare non-leading `IS NULL`) is not
+  expressible and is left to a scan filter. Surfaced as `moraine_index_nulls`.
 
-Lookups are **head-only**: entries are live-only, so `snapshot_at(S)` fails
-with a typed error and time travel falls back to what it always was — a scan
-problem. The hot path (current head) gets the index; the rare path pays
-nothing to keep it honest.
+Lookups, ranges, and null queries are **head-only**: entries are live-only, so
+`snapshot_at(S)` fails with a typed error and time travel falls back to what
+it always was — a scan problem. The hot path (current head) gets the index;
+the rare path pays nothing to keep it honest.
+
+### Range and comparison queries
+
+Because the canonical encoding is order-preserving (Canonical value
+encoding), byte order *is* value order, so both entry kinds — `idx/unique`
+(one value per key) and `idx/multi` (value then row id) — are already single
+contiguous value-ordered ranges. A comparison query is therefore a bounded
+`ByteRangeBounds` sub-scan of the same range an equality lookup keys into.
+There is **no new index kind, no new discriminant, and no new maintenance
+surface**; the whole feature is the ordered encoding plus the accessor.
+
+- **Equality stays a point-get.** `=` is a degenerate closed `[v, v]` range,
+  but a unique lookup remains one `get` and a non-unique one a value-prefix
+  scan; the model unifies the surface without making the point case pay a
+  range's cost.
+- **The definition carries per-column direction and NULL placement.** The
+  definition value grows a direction (`ASC`/`DESC`, default `ASC`) and a NULL
+  placement (`FIRST`/`LAST`, default `LAST`) per column, recorded only when
+  they diverge from the default so an ascending index is byte-unchanged on
+  disk. `create_index` gains an ordered variant; the rest of the verb surface
+  is untouched.
+- **Direction orients the scan.** A `DESC` column's byte order reverses value
+  order, so `index_range` maps a value-lower bound to the byte-upper bound
+  (and vice versa) for the range column — a single-column `DESC` index scans
+  high value first, and half-open bounds map correctly.
+- **The B-tree access rule.** A range query names an equality prefix over the
+  leading columns plus one range on the next column (`a = 5 AND b > 10`); a
+  bare range on a non-leading column cannot use the index and is refused,
+  never scanned wrong. `BETWEEN` is a closed lower and upper; the strict
+  comparisons are half-open; `Unbounded` is an open side.
+- **`IS NULL` is a prefix scan of the stored NULL rows.** Comparison
+  predicates never match a NULL (SQL: `NULL > 5` is unknown), so range results
+  exclude NULLs by construction. `IS NULL` is served separately: `= v` and
+  `IS NULL` are both *exact* prefixes (a fixed value blob, or a fixed null
+  flag), so a leading run of them is one bounded scan. Because a NULL-bearing
+  row is stored multi-shaped (Canonical value encoding), `index_nulls` scans
+  the `multi` subrange on the encoded prefix, with the value framing's
+  terminator dropped so it matches every key that extends the run. A gap
+  (unconstrained leading column) is not a prefix and is not expressible.
+
+Everything else — coverage, uniqueness enforcement, the value-keyed
+collision, staged builds, the scoped read, rewrite-file resolution — is
+unchanged, calling the ordered encoder. Storing NULL rows is the one coverage
+change: a NULL-bearing row is now maintained as a collision-exempt multi
+entry, so `IS NULL` is total over live rows. Movement invariance holds
+identically: order lives in the key, which flush and compaction do not touch.
 
 ### Staged builds — multi-commit backfill
 
@@ -410,9 +501,11 @@ the native index without touching DuckLake's binder:
 
 | Function | Effect |
 |---|---|
-| `CALL moraine_create_index('lake.t', 'name', columns := ['c'], unique := b, staged := b)` | insert the definition, backfill live rows (Coverage; staged drives the multi-commit protocol, Staged builds) |
+| `CALL moraine_create_index('lake.t', 'name', columns := ['c'], unique := b, staged := b, directions := ['asc'\|'desc'], nulls := ['first'\|'last'])` | insert the definition, backfill live rows (Coverage; staged drives the multi-commit protocol, Staged builds). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST |
 | `CALL moraine_drop_index('lake.t', 'name')` | end the definition (Reclamation) |
 | `moraine_index_lookup('lake.t', 'name', v)` | table function: row ids and holders for value `v` |
+| `moraine_index_range('lake.t', 'name', lower, upper, lower_inclusive, upper_inclusive)` | table function: row ids and holders for a value window; a NULL bound is an open side (half-open) |
+| `moraine_index_nulls('lake.t', 'name', prefix…)` | table function: row ids and holders for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
 | `moraine_indexes('lake.t')` | table function: index introspection |
 
 Each resolves the store handle from the attached catalog and the `table_id`
@@ -631,6 +724,17 @@ tests against real SlateDB on in-memory `object_store`:
   kinds; golden vectors pin the `idx` discriminant and the canonical
   encoding of every indexable type, including the float normalizations, NULL
   skip, and composite framing (`("ab","c") ≠ ("a","bc")`).
+- **Order preservation.** For every indexable type, `encode(x) < encode(y)`
+  iff `x < y` in the type's SQL order (proptest); `DESC` reverses it,
+  variable-length strings included (`"ab" < "a"`); a mixed `(a ASC, b DESC)`
+  composite yields the declared order in one forward pass; `NULLS
+  FIRST`/`LAST` place the null flag correctly under both directions.
+- **Comparison accessors.** `<`, `<=`, `>`, `>=`, `BETWEEN`, and half-open
+  bounds return exactly the matching live rows; a `DESC` index returns them
+  high-value first; a leading-equality prefix plus a trailing range uses the
+  index; a bare non-leading range is refused; equality stays a point-get on a
+  unique index. `moraine_index_range` and a `directions`/`nulls`-carrying
+  `moraine_create_index` drive these end to end.
 - **Unique race.** Two concurrent commits inserting the same unique value:
   exactly one lands; the other returns `Constraint` after its closure re-run
   — never two entries, never a lost insert.
@@ -744,9 +848,21 @@ tests against real SlateDB on in-memory `object_store`:
   (post-commit) mode could shed it for non-unique indexes at the cost of an
   under-coverage window. Unique indexes cannot defer: enforcement *is* the
   commit.
-- **Range upgrade.** If equality proves insufficient, contracting order for
-  the already-order-compatible encodings — which would reopen the type-aware
-  comparison questions RFC 0002 warns about, deliberately dodged here.
+- **Ordered NULL *emission*.** NULL rows are now stored (multi-shaped,
+  collision-exempt) and reachable by `IS NULL`, but the placement's *ordering*
+  effect — emitting NULL rows at the declared `FIRST`/`LAST` end of an
+  ordered scan — is only meaningful for `ORDER BY`, which is not yet routed to
+  the index (see pushdown, below). Until then `NULLS FIRST`/`LAST` governs the
+  stored flag byte and nothing a reader observes about order.
+- **Reverse-direction scans.** The store scans forward only, so one index
+  serves one declared order. Whether to grow a store-level reverse iterator
+  (letting one index serve both directions, and a composite its exact-opposite
+  order) versus the current "declare the direction, or build a second index"
+  is open.
+- **Transparent range/`ORDER BY` pushdown.** The ordered encoding removes the
+  encoding blocker; routing comparison and `ORDER BY` pushdown into DuckLake's
+  optimizer still waits on a DuckLake binder change (Extension path, Future
+  directions).
 
 ## Alternatives considered
 
@@ -830,9 +946,10 @@ values" doc confirms the NULL-exempt semantics, arrived at independently.
 
 **Range is equality plus committed order.** `RangeIndexDirection` bakes the
 sort direction into the stored key, not applied at read time — exactly the
-upgrade the Encoding section reserves: order-compatible bytes plus a
-committed order contract plus a direction bit. Shipped that way, it is
-evidence the deferral here is an upgrade path, not a rewrite.
+shape this RFC adopts (Range and comparison queries): order-preserving bytes
+plus a committed order contract plus a per-column direction, realized by
+complementing the framed component. Independent convergence on the same
+design.
 
 **The pushdown boundary is drawn in the same place.** HelixDB splits a
 restricted `SourcePredicate` (`Eq`/`Neq`/`Gt`/`Between`/`StartsWith`/`And`/

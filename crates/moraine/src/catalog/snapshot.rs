@@ -726,6 +726,7 @@ fn mapping_info(value: &MappingValue) -> MappingInfo {
 }
 
 fn index_info(value: &IndexValue) -> IndexInfo {
+    use crate::store::index_encoding::{Direction, NullOrder};
     let state = if value.poisoned == Some(true) {
         IndexState::Poisoned
     } else if value.build_state.is_some() {
@@ -733,16 +734,39 @@ fn index_info(value: &IndexValue) -> IndexInfo {
     } else {
         IndexState::Ready
     };
+    let columns: Vec<ColumnId> = value
+        .column_ids
+        .iter()
+        .copied()
+        .map(ColumnId::new)
+        .collect();
+    // Absent per-column orders default to ascending / NULLS LAST, so an
+    // ascending index reads the same whether or not it recorded them.
+    let directions = (0..columns.len())
+        .map(|i| {
+            if value.column_descending.get(i).copied().unwrap_or(false) {
+                Direction::Descending
+            } else {
+                Direction::Ascending
+            }
+        })
+        .collect();
+    let nulls = (0..columns.len())
+        .map(|i| {
+            if value.column_nulls_first.get(i).copied().unwrap_or(false) {
+                NullOrder::First
+            } else {
+                NullOrder::Last
+            }
+        })
+        .collect();
     IndexInfo {
         id: IndexId::new(value.index_id),
         table_id: TableId::new(value.table_id),
         name: value.index_name.clone(),
-        columns: value
-            .column_ids
-            .iter()
-            .copied()
-            .map(ColumnId::new)
-            .collect(),
+        columns,
+        directions,
+        nulls,
         unique: value.unique,
         state,
     }
@@ -1207,6 +1231,8 @@ mod tests {
             index_name: name.into(),
             column_ids: columns,
             unique,
+            column_descending: Vec::new(),
+            column_nulls_first: Vec::new(),
             build_state: None,
             build_cursor_file: None,
             build_cursor_row_id: None,

@@ -195,7 +195,8 @@ typedef struct MoraineIndexDesc {
 // fills the field matching `kind`; the ABI coerces it to the indexed
 // column's canonical form.
 typedef struct MoraineLookupValue {
-  // `1`=i64, `2`=u64, `3`=f64, `4`=bool, `5`=string, `6`=bytes.
+  // `0`=IS NULL (a prefix predicate for [`moraine_index_nulls`]), `1`=i64,
+  // `2`=u64, `3`=f64, `4`=bool, `5`=string, `6`=bytes.
   int32_t kind;
   // Valid iff `kind == 1`.
   int64_t i64_value;
@@ -1082,6 +1083,8 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
                              const char *index_name,
                              const char *const *column_names,
                              size_t column_count,
+                             const uint8_t *column_descending,
+                             const uint8_t *column_nulls_first,
                              bool unique,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
@@ -1150,6 +1153,69 @@ int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_index_lookup`] call, not yet freed.
 void moraine_index_lookup_free(struct MoraineRowLocation *items, size_t len);
+
+// Resolves a comparison query on a single-column index to the rows whose
+// value falls between the bounds. A null bound pointer is unbounded (an open
+// side); a present bound is `Included` when its `*_inclusive` flag is set,
+// `Excluded` otherwise. Results come back in the index's stored order.
+//
+// # Safety
+//
+// Every non-null pointer must be valid per the ABI contract; `err`, if
+// non-null, must be writable.
+int32_t moraine_index_range(struct MoraineCatalogHandle *handle,
+                            const char *schema_name,
+                            const char *table_name,
+                            const char *index_name,
+                            const struct MoraineLookupValue *lower_value,
+                            bool lower_inclusive,
+                            const struct MoraineLookupValue *upper_value,
+                            bool upper_inclusive,
+                            bool reverse,
+                            struct MoraineRowLocation **out_items,
+                            size_t *out_len,
+                            MoraineInterruptProbe probe,
+                            void *probe_ctx,
+                            struct MoraineError *err);
+
+// Frees the array a [`moraine_index_range`] call returned.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a matching
+// [`moraine_index_range`] call, not yet freed.
+void moraine_index_range_free(struct MoraineRowLocation *items, size_t len);
+
+// Resolves an `IS NULL` query on an index to the matching rows. `prefix` is a
+// leading run of predicates over the index's columns: a `MoraineLookupValue`
+// of `kind == 0` is `IS NULL` for that column, any other kind is `= value`.
+// At least one must be `IS NULL`; a bare non-leading `IS NULL` is not
+// expressible (the prefix covers the leading columns).
+//
+// # Safety
+//
+// Every non-null pointer must be valid per the ABI contract; `prefix` points
+// to `prefix_len` values; `err`, if non-null, must be writable.
+int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
+                            const char *schema_name,
+                            const char *table_name,
+                            const char *index_name,
+                            const struct MoraineLookupValue *prefix,
+                            size_t prefix_len,
+                            bool reverse,
+                            struct MoraineRowLocation **out_items,
+                            size_t *out_len,
+                            MoraineInterruptProbe probe,
+                            void *probe_ctx,
+                            struct MoraineError *err);
+
+// Frees the array a [`moraine_index_nulls`] call returned.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a matching
+// [`moraine_index_nulls`] call, not yet freed.
+void moraine_index_nulls_free(struct MoraineRowLocation *items, size_t len);
 
 // Frees a buffer returned by an encode call.
 //

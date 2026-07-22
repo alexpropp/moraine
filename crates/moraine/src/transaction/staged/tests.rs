@@ -681,6 +681,24 @@ fn bigint_batch(values: &[i64]) -> (arrow::datatypes::Schema, arrow::array::Reco
     (schema, batch)
 }
 
+/// A single-`BIGINT`-column batch whose `None`s are SQL NULL.
+fn nullable_bigint_batch(
+    values: &[Option<i64>],
+) -> (arrow::datatypes::Schema, arrow::array::RecordBatch) {
+    use arrow::{
+        array::{Int64Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(values.to_vec()))],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
 /// Creates table 1 with one `BIGINT` column and an equality index over
 /// it, returning the catalog and the index id.
 async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {
@@ -1311,6 +1329,182 @@ async fn backfill_derives_per_row_id_file_entries_under_embedded_ids() {
     let mut row_ids: Vec<u64> = entries.iter().map(|e| e.row_id).collect();
     row_ids.sort_unstable();
     assert_eq!(row_ids, vec![5, 9, 12], "ids come from the embedded column");
+}
+
+/// Creating an index over a table with pre-existing **inline** rows backfills
+/// them — including NULL rows, which become collision-exempt entries `IS NULL`
+/// can find. Regression: inline chunks were previously skipped at create.
+#[tokio::test]
+async fn create_index_backfills_inline_null_rows() {
+    use crate::catalog::{ColumnId, IndexDef, TableId};
+
+    let catalog = open().await;
+
+    // Table 1 with one BIGINT column `a`, no index yet.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(db_tx);
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "created_table:1"),
+    });
+    setup.commit().await.unwrap();
+
+    // Inline-insert three rows before any index exists: 10, NULL, 30.
+    let (schema, batch) = nullable_bigint_batch(&[Some(10), None, Some(30)]);
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: inline_schema_ipc(&schema),
+    });
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 2,
+        row_id_start: 0,
+        row_count: 3,
+        arrow_body: inline_body(&batch),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "inlined_insert:1"),
+    });
+    tx.commit().await.unwrap();
+
+    // Backfill sees all three inline rows, with a `None` for the NULL row.
+    let backfill = catalog
+        .inline_backfill_entries(TableId::new(1), &[ColumnId::new(1)])
+        .await
+        .unwrap();
+    assert_eq!(backfill.len(), 3, "every live inline row is backfilled");
+    assert!(
+        backfill
+            .iter()
+            .any(|entry| entry.row_id == 1 && entry.values == vec![None]),
+        "the NULL row backfills as a None value"
+    );
+
+    // Create a unique index with that backfill; IS NULL finds the NULL row.
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                TableId::new(1),
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &backfill,
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    let nulls = catalog
+        .index_nulls(TableId::new(1), index, vec![None], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        nulls.into_iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
+        vec![1],
+        "IS NULL finds the pre-existing inline NULL row"
+    );
+}
+
+/// A data-file row already dead (by a delete file) when the index is built
+/// must not be backfilled — otherwise a unique index keeps a zombie entry
+/// that manufactures a false `Constraint` when the freed value is
+/// re-inserted. Regression.
+#[tokio::test]
+async fn scoped_backfill_excludes_delete_file_rows() {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use crate::catalog::{ColumnId, TableId};
+
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    // A data file with values 10, 20, 30 at positions/rows 0, 1, 2.
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+    // A delete file killing position 1 (value 20) of that data file.
+    let deletes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: vec![
+            Cell::U64(2),
+            Cell::U64(1),
+            Cell::U64(4),
+            Cell::Null,
+            Cell::U64(1), // data_file_id: the target
+            Cell::Str("deletes.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(1),
+            Cell::U64(512),
+            Cell::U64(64),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    // Backfill must exclude the dead row 1 (value 20).
+    let entries = catalog
+        .scoped_backfill_entries(store, "", TableId::new(1), &[ColumnId::new(1)])
+        .await
+        .unwrap();
+    let mut row_ids: Vec<u64> = entries.iter().map(|entry| entry.row_id).collect();
+    row_ids.sort_unstable();
+    assert_eq!(
+        row_ids,
+        vec![0, 2],
+        "the delete-file row is excluded from backfill"
+    );
 }
 
 /// An inlined delete against a Parquet-file row removes that row's

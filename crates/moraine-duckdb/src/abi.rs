@@ -1319,6 +1319,47 @@ unsafe fn borrow_str_array<'a>(
         .collect()
 }
 
+/// Builds the per-column [`moraine::ColumnOrder`]s from the ABI's parallel
+/// direction / null-placement flag arrays — one `0`/`1` byte per column
+/// (`bool` is avoided at the array boundary, where reinterpreting a C++
+/// `uint8_t` buffer as `bool` is undefined). Each null pointer defaults its
+/// axis (ascending / NULLS LAST); both null yields an empty vec.
+///
+/// # Safety
+///
+/// Each non-null pointer must point to `column_count` bytes.
+unsafe fn column_orders(
+    column_descending: *const u8,
+    column_nulls_first: *const u8,
+    column_count: usize,
+) -> Vec<moraine::ColumnOrder> {
+    if column_descending.is_null() && column_nulls_first.is_null() {
+        return Vec::new();
+    }
+    let descending = (!column_descending.is_null()).then(|| {
+        // SAFETY: caller contract — non-null points to `column_count` bytes.
+        unsafe { std::slice::from_raw_parts(column_descending, column_count) }
+    });
+    let nulls_first = (!column_nulls_first.is_null()).then(|| {
+        // SAFETY: caller contract — non-null points to `column_count` bytes.
+        unsafe { std::slice::from_raw_parts(column_nulls_first, column_count) }
+    });
+    (0..column_count)
+        .map(|i| moraine::ColumnOrder {
+            direction: if descending.is_some_and(|flags| flags[i] != 0) {
+                moraine::Direction::Descending
+            } else {
+                moraine::Direction::Ascending
+            },
+            nulls: if nulls_first.is_some_and(|flags| flags[i] != 0) {
+                moraine::NullOrder::First
+            } else {
+                moraine::NullOrder::Last
+            },
+        })
+        .collect()
+}
+
 /// Creates an equality index, committing autonomously. Refuses a table that
 /// already holds data (SQL-path backfill is a follow-up).
 ///
@@ -1334,6 +1375,8 @@ pub unsafe extern "C" fn moraine_index_create(
     index_name: *const c_char,
     column_names: *const *const c_char,
     column_count: usize,
+    column_descending: *const u8,
+    column_nulls_first: *const u8,
     unique: bool,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
@@ -1373,10 +1416,12 @@ pub unsafe extern "C" fn moraine_index_create(
             column_ids.push(found.id);
         }
 
-        // A table that already holds data must be backfilled by scoped-reading
-        // its files from the DATA_PATH store (resolved at attach from
-        // `META_DATA_PATH`); without it, refuse rather than under-cover.
-        let backfill = if snapshot.data_files_of(table_id).is_empty() {
+        // A table that already holds data must be backfilled: external files
+        // by scoped-reading them from the DATA_PATH store (resolved at attach
+        // from `META_DATA_PATH`) — without it, refuse rather than under-cover —
+        // and inline rows by scanning the catalog store, which is always
+        // reachable.
+        let mut backfill = if snapshot.data_files_of(table_id).is_empty() {
             Vec::new()
         } else {
             let store = handle_ref.data_store.clone().ok_or_else(|| {
@@ -1400,6 +1445,21 @@ pub unsafe extern "C" fn moraine_index_create(
                 )
             }?
         };
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let inline = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .inline_backfill_entries(table_id, &column_ids),
+            )
+        }?;
+        backfill.extend(inline);
+
+        // SAFETY: each non-null orders pointer points to `column_count` bools,
+        // per the caller contract.
+        let orders = unsafe { column_orders(column_descending, column_nulls_first, column_count) };
 
         let def = moraine::IndexDef {
             name: name.to_owned(),
@@ -1412,7 +1472,11 @@ pub unsafe extern "C" fn moraine_index_create(
                 probe,
                 probe_ctx,
                 handle_ref.catalog.commit(|tx| {
-                    tx.create_index(table_id, &def, &backfill)?;
+                    if orders.is_empty() {
+                        tx.create_index(table_id, &def, &backfill)?;
+                    } else {
+                        tx.create_index_ordered(table_id, &def, &orders, &backfill)?;
+                    }
                     Ok(())
                 }),
             )
@@ -1587,7 +1651,8 @@ pub struct MoraineRowLocation {
 /// column's canonical form.
 #[repr(C)]
 pub struct MoraineLookupValue {
-    /// `1`=i64, `2`=u64, `3`=f64, `4`=bool, `5`=string, `6`=bytes.
+    /// `0`=IS NULL (a prefix predicate for [`moraine_index_nulls`]), `1`=i64,
+    /// `2`=u64, `3`=f64, `4`=bool, `5`=string, `6`=bytes.
     pub kind: i32,
     /// Valid iff `kind == 1`.
     pub i64_value: i64,
@@ -1754,6 +1819,289 @@ pub unsafe extern "C" fn moraine_index_lookup(
 /// matching [`moraine_index_lookup`] call, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineRowLocation, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above. The descriptor owns no heap.
+        unsafe {
+            free_array(items, len, |_| {});
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Resolves a comparison query on a single-column index to the rows whose
+/// value falls between the bounds. A null bound pointer is unbounded (an open
+/// side); a present bound is `Included` when its `*_inclusive` flag is set,
+/// `Excluded` otherwise. Results come back in the index's stored order.
+///
+/// # Safety
+///
+/// Every non-null pointer must be valid per the ABI contract; `err`, if
+/// non-null, must be writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_index_range(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    index_name: *const c_char,
+    lower_value: *const MoraineLookupValue,
+    lower_inclusive: bool,
+    upper_value: *const MoraineLookupValue,
+    upper_inclusive: bool,
+    reverse: bool,
+    out_items: *mut *mut MoraineRowLocation,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    use std::ops::Bound;
+
+    let attempt = || -> Result<Vec<MoraineRowLocation>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        if lower_value.is_null() && upper_value.is_null() {
+            return Err(AbiError::invalid_argument(
+                "index range: at least one bound must be present",
+            ));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        // SAFETY: caller contract.
+        let name = unsafe { borrow_str(index_name, "index_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let index = snapshot
+            .index_by_name(table_id, name)
+            .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
+        // v1 bounds a single value, so only a single-column index.
+        let [column_id] = index.columns[..] else {
+            return Err(AbiError::invalid_argument(
+                "index range: a single value bounds only a single-column index",
+            ));
+        };
+        let columns = snapshot.columns_of(table_id);
+        let column = columns.iter().find(|c| c.id == column_id).ok_or_else(|| {
+            AbiError::from(moraine::Error::Corruption(format!(
+                "index {name} covers column {column_id} absent from table {table_id}"
+            )))
+        })?;
+
+        let build_bound = |value: *const MoraineLookupValue,
+                           inclusive: bool|
+         -> Result<Bound<Vec<moraine::IndexKeyValue>>, AbiError> {
+            if value.is_null() {
+                return Ok(Bound::Unbounded);
+            }
+            // SAFETY: non-null checked; caller contract — the value's
+            // string/bytes fields (if its kind uses them) are valid for this
+            // call.
+            let coerced = unsafe { coerce_lookup_value(&*value, &column.column_type) }?;
+            Ok(if inclusive {
+                Bound::Included(vec![coerced])
+            } else {
+                Bound::Excluded(vec![coerced])
+            })
+        };
+        let lower = build_bound(lower_value, lower_inclusive)?;
+        let upper = build_bound(upper_value, upper_inclusive)?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let locations = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .index_range(table_id, index.id, lower, upper, reverse),
+            )
+        }?;
+        Ok(locations
+            .into_iter()
+            .map(|location| {
+                let (data_file_id, is_inline) = match location.holder {
+                    moraine::RowHolder::DataFile(id) => (id.get(), false),
+                    moraine::RowHolder::Inline => (0, true),
+                };
+                MoraineRowLocation {
+                    row_id: location.row_id,
+                    data_file_id,
+                    is_inline,
+                }
+            })
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees the array a [`moraine_index_range`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a matching
+/// [`moraine_index_range`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_range_free(items: *mut MoraineRowLocation, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above. The descriptor owns no heap.
+        unsafe {
+            free_array(items, len, |_| {});
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Resolves an `IS NULL` query on an index to the matching rows. `prefix` is a
+/// leading run of predicates over the index's columns: a `MoraineLookupValue`
+/// of `kind == 0` is `IS NULL` for that column, any other kind is `= value`.
+/// At least one must be `IS NULL`; a bare non-leading `IS NULL` is not
+/// expressible (the prefix covers the leading columns).
+///
+/// # Safety
+///
+/// Every non-null pointer must be valid per the ABI contract; `prefix` points
+/// to `prefix_len` values; `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_index_nulls(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    index_name: *const c_char,
+    prefix: *const MoraineLookupValue,
+    prefix_len: usize,
+    reverse: bool,
+    out_items: *mut *mut MoraineRowLocation,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Vec<MoraineRowLocation>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_items.is_null() || out_len.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        if prefix_len == 0 {
+            return Err(AbiError::invalid_argument(
+                "index nulls: the prefix names no predicate",
+            ));
+        }
+        if prefix.is_null() {
+            return Err(AbiError::invalid_argument("`prefix` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        // SAFETY: caller contract.
+        let name = unsafe { borrow_str(index_name, "index_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let index = snapshot
+            .index_by_name(table_id, name)
+            .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
+        if prefix_len > index.columns.len() {
+            return Err(AbiError::invalid_argument(
+                "index nulls: the prefix is longer than the index",
+            ));
+        }
+        let columns = snapshot.columns_of(table_id);
+        // SAFETY: non-null checked; caller contract — `prefix` points to
+        // `prefix_len` values.
+        let prefix_slice = unsafe { std::slice::from_raw_parts(prefix, prefix_len) };
+        let mut values: Vec<Option<moraine::IndexKeyValue>> = Vec::with_capacity(prefix_len);
+        for (position, predicate) in prefix_slice.iter().enumerate() {
+            if predicate.kind == 0 {
+                values.push(None);
+                continue;
+            }
+            let column_id = index.columns[position];
+            let column = columns.iter().find(|c| c.id == column_id).ok_or_else(|| {
+                AbiError::from(moraine::Error::Corruption(format!(
+                    "index {name} covers column {column_id} absent from table {table_id}"
+                )))
+            })?;
+            // SAFETY: caller contract — a value predicate's string/bytes fields
+            // (if its kind uses them) are valid for this call.
+            let value = unsafe { coerce_lookup_value(predicate, &column.column_type) }?;
+            values.push(Some(value));
+        }
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let locations = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .index_nulls(table_id, index.id, values, reverse),
+            )
+        }?;
+        Ok(locations
+            .into_iter()
+            .map(|location| {
+                let (data_file_id, is_inline) = match location.holder {
+                    moraine::RowHolder::DataFile(id) => (id.get(), false),
+                    moraine::RowHolder::Inline => (0, true),
+                };
+                MoraineRowLocation {
+                    row_id: location.row_id,
+                    data_file_id,
+                    is_inline,
+                }
+            })
+            .collect())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(items) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe { write_array(items, out_items, out_len) };
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Frees the array a [`moraine_index_nulls`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a matching
+/// [`moraine_index_nulls`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_nulls_free(items: *mut MoraineRowLocation, len: usize) {
     let attempt = || {
         // SAFETY: caller contract above. The descriptor owns no heap.
         unsafe {

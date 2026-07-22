@@ -63,6 +63,10 @@ mod tests {
     macro_rules! codec_tests {
         ($roundtrip:ident, $garbage:ident, $ty:ty) => {
             proptest! {
+                // Codec roundtrips need breadth, not depth: 48 cases cover the
+                // wire shapes without the default 256 generating multi-megabyte
+                // trees for the deeply-nested messages (e.g. `MacroValue`).
+                #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
                 #[test]
                 fn $roundtrip(msg in any::<$ty>()) {
                     let encoded = encode_value(&msg);

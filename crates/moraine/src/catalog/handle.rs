@@ -1,7 +1,12 @@
 //! The catalog handle: the entry point a host opens, reads, and commits
 //! through.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Bound,
+    sync::Arc,
+    time::Duration,
+};
 
 use object_store::{ObjectStore, path::Path};
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
@@ -12,7 +17,13 @@ use crate::{
         RowHolder, RowLocation, SnapshotId, TableId, projection::ProjectionCache, scoped_read,
     },
     error::{Error, Result},
-    store::{handle::ReadSession, index_encoding::IndexKeyValue, open::StoreBuilder},
+    store::{
+        handle::ReadSession,
+        index_encoding::{IndexKeyValue, encode_ordered_values},
+        inline as store_inline,
+        key::InlineOperation,
+        open::StoreBuilder,
+    },
     transaction::{Transaction, commit, index_maintenance},
 };
 
@@ -249,8 +260,211 @@ impl Catalog {
                     return Err(Error::NotFound(format!("index {index} was poisoned")));
                 }
             }
+            let key = encode_ordered_values(
+                &values.iter().cloned().map(Some).collect::<Vec<_>>(),
+                &info.directions,
+                &info.nulls,
+            )?;
             let row_ids =
-                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, values).await?;
+                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await?;
+            let files = view.data_files_of(table);
+            Ok(row_ids
+                .into_iter()
+                .map(|row_id| RowLocation {
+                    row_id,
+                    holder: resolve_row_holder(&files, row_id),
+                })
+                .collect())
+        }
+        .await;
+        session.finish();
+
+        outcome
+    }
+
+    /// Resolves a comparison query to the rows whose indexed value falls
+    /// between `lower` and `upper` (`<`, `<=`, `>`, `>=`, `BETWEEN`, and their
+    /// half-open forms via [`Bound::Unbounded`]). Each bound names the leading
+    /// columns' values; equality is the degenerate closed `[v, v]` range.
+    ///
+    /// Head-only and candidate-returning, exactly like
+    /// [`index_lookup`](Self::index_lookup): the scan and the catalog it
+    /// resolves against are one consistent cut, and the caller applies delete
+    /// files. Results are in the index's stored order, or its exact opposite
+    /// when `reverse` is set — the reverse of the materialized result, which
+    /// needs no reverse iterator.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the index does not exist, [`Error::IndexBuilding`]
+    /// if its staged backfill has not completed, [`Error::Constraint`] if a
+    /// bound value exceeds the size cap, or a store error if the scan fails.
+    pub async fn index_range(
+        &self,
+        table: TableId,
+        index: IndexId,
+        lower: Bound<Vec<IndexKeyValue>>,
+        upper: Bound<Vec<IndexKeyValue>>,
+        reverse: bool,
+    ) -> Result<Vec<RowLocation>> {
+        let session = self.begin_read().await?;
+        let handle = session.handle();
+
+        let outcome = async {
+            let view = commit::materialize(handle, None).await?;
+            let info = view
+                .index_by_id(table, index)
+                .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+
+            match info.state {
+                IndexState::Ready => {}
+                IndexState::Building => {
+                    return Err(Error::IndexBuilding(format!(
+                        "index {index} is still building"
+                    )));
+                }
+                IndexState::Poisoned => {
+                    return Err(Error::NotFound(format!("index {index} was poisoned")));
+                }
+            }
+
+            let bound_len = |bound: &Bound<Vec<IndexKeyValue>>| match bound {
+                Bound::Included(values) | Bound::Excluded(values) => values.len(),
+                Bound::Unbounded => 0,
+            };
+            // A bound naming more columns than the index has would encode
+            // components no stored key carries, silently returning the wrong
+            // rows; refuse it instead.
+            let widest = bound_len(&lower).max(bound_len(&upper));
+            if widest > info.columns.len() {
+                return Err(Error::Constraint(format!(
+                    "index_range: a bound of {widest} values does not fit the {}-column index \
+                     {index}",
+                    info.columns.len()
+                )));
+            }
+            // The range column is the last one the bounds name (leading
+            // columns are pinned to equality); its direction decides whether
+            // value order runs with or against the index's byte order.
+            let range_column = widest.saturating_sub(1);
+            let descending = info.directions.get(range_column).copied()
+                == Some(crate::store::index_encoding::Direction::Descending);
+
+            let encode_bound = |bound: Bound<Vec<IndexKeyValue>>| -> Result<Bound<_>> {
+                let encode = |values: Vec<IndexKeyValue>| {
+                    encode_ordered_values(
+                        &values.into_iter().map(Some).collect::<Vec<_>>(),
+                        &info.directions,
+                        &info.nulls,
+                    )
+                };
+                Ok(match bound {
+                    Bound::Included(values) => Bound::Included(encode(values)?),
+                    Bound::Excluded(values) => Bound::Excluded(encode(values)?),
+                    Bound::Unbounded => Bound::Unbounded,
+                })
+            };
+
+            // A descending column's byte order reverses value order, so the
+            // value-lower bound is the byte-upper bound and vice versa.
+            let (byte_lower, byte_upper) = if descending {
+                (encode_bound(upper)?, encode_bound(lower)?)
+            } else {
+                (encode_bound(lower)?, encode_bound(upper)?)
+            };
+
+            let mut row_ids = index_maintenance::range_row_ids(
+                handle,
+                index.get(),
+                info.unique,
+                byte_lower,
+                byte_upper,
+            )
+            .await?;
+            // The scan yields the index's declared order; reversing the
+            // materialized result serves the exact opposite order.
+            if reverse {
+                row_ids.reverse();
+            }
+            let files = view.data_files_of(table);
+            Ok(row_ids
+                .into_iter()
+                .map(|row_id| RowLocation {
+                    row_id,
+                    holder: resolve_row_holder(&files, row_id),
+                })
+                .collect())
+        }
+        .await;
+        session.finish();
+
+        outcome
+    }
+
+    /// Resolves an `IS NULL` query to the rows whose leading indexed columns
+    /// match `prefix` — a leading run of `Some(value)` (equality) and `None`
+    /// (`IS NULL`) predicates, e.g. `[None]` for `a IS NULL` or
+    /// `[Some(5), None]` for `a = 5 AND b IS NULL`. The prefix must cover the
+    /// leading columns contiguously and name at least one `IS NULL`; a gap
+    /// (an unconstrained leading column) is not expressible, so a bare
+    /// non-leading `IS NULL` is not served — use a scan filter for that.
+    ///
+    /// Head-only and candidate-returning like [`index_lookup`](Self::index_lookup).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the index does not exist, [`Error::IndexBuilding`]
+    /// while its staged backfill runs, or [`Error::Constraint`] if the prefix
+    /// is empty, longer than the index, or names no `IS NULL`.
+    pub async fn index_nulls(
+        &self,
+        table: TableId,
+        index: IndexId,
+        prefix: Vec<Option<IndexKeyValue>>,
+        reverse: bool,
+    ) -> Result<Vec<RowLocation>> {
+        let session = self.begin_read().await?;
+        let handle = session.handle();
+
+        let outcome = async {
+            let view = commit::materialize(handle, None).await?;
+            let info = view
+                .index_by_id(table, index)
+                .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
+
+            match info.state {
+                IndexState::Ready => {}
+                IndexState::Building => {
+                    return Err(Error::IndexBuilding(format!(
+                        "index {index} is still building"
+                    )));
+                }
+                IndexState::Poisoned => {
+                    return Err(Error::NotFound(format!("index {index} was poisoned")));
+                }
+            }
+
+            if prefix.is_empty() || prefix.len() > info.columns.len() {
+                return Err(Error::Constraint(format!(
+                    "index_nulls: a prefix of {} predicates does not fit the {}-column index \
+                     {index}",
+                    prefix.len(),
+                    info.columns.len()
+                )));
+            }
+            if prefix.iter().all(Option::is_some) {
+                return Err(Error::Constraint(
+                    "index_nulls: the prefix names no IS NULL; use index_lookup for pure equality"
+                        .to_owned(),
+                ));
+            }
+
+            let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
+            let mut row_ids =
+                index_maintenance::null_prefix_row_ids(handle, index.get(), &key).await?;
+            if reverse {
+                row_ids.reverse();
+            }
             let files = view.data_files_of(table);
             Ok(row_ids
                 .into_iter()
@@ -344,7 +558,8 @@ impl Catalog {
     ///
     /// Row ids resolve per file: the embedded row-id column when the file
     /// carries one (rewrite and flush output), else `row_id_start +
-    /// ordinal`.
+    /// ordinal`. Rows already dead — named by a delete file's positions or an
+    /// inline file-delete's row ids — are excluded, so entries stay live-only.
     ///
     /// # Errors
     ///
@@ -359,49 +574,174 @@ impl Catalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let snapshot = self.snapshot().await?;
-        // `columns_of` is ordered by the column's ordinal, so a column's
-        // 0-based index here is its physical position in a file written under
-        // this schema — the mapping the scoped read needs. (Ordinals are
-        // 1-based in the stored value, so the stored order can't be used
-        // directly.)
-        let live_columns = snapshot.columns_of(table);
-        let positions = columns
-            .iter()
-            .map(|column| {
-                live_columns
-                    .iter()
-                    .position(|c| c.id == *column)
-                    .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let session = self.begin_read().await?;
 
-        let table_prefix = snapshot.table_data_prefix(table)?;
+        let outcome = async {
+            let snapshot = commit::materialize(session.handle(), None).await?;
+            // `columns_of` is ordered by the column's ordinal, so a column's
+            // 0-based index here is its physical position in a file written
+            // under this schema — the mapping the scoped read needs. (Ordinals
+            // are 1-based in the stored value, so the stored order can't be
+            // used directly.)
+            let live_columns = snapshot.columns_of(table);
+            let positions = columns
+                .iter()
+                .map(|column| {
+                    live_columns
+                        .iter()
+                        .position(|c| c.id == *column)
+                        .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-        let mut entries = Vec::new();
-        for file in snapshot.data_files_of(table) {
-            let relative = match (file.path_is_relative, data_prefix.is_empty()) {
-                (false, _) => file.path.clone(),
-                (true, true) => format!("{table_prefix}{}", file.path),
-                (true, false) => format!("{data_prefix}/{table_prefix}{}", file.path),
+            let table_prefix = snapshot.table_data_prefix(table)?;
+            let resolve = |path: &str, is_relative: bool| {
+                let relative = match (is_relative, data_prefix.is_empty()) {
+                    (false, _) => path.to_owned(),
+                    (true, true) => format!("{table_prefix}{path}"),
+                    (true, false) => format!("{data_prefix}/{table_prefix}{path}"),
+                };
+                object_store::path::Path::from(relative.as_str())
             };
-            let path = object_store::path::Path::from(relative.as_str());
-            let scoped = scoped_read::scoped_read_entries(
-                Arc::clone(&object_store),
-                &path,
-                &positions,
-                scoped_read::RowIdSource::Resolve {
-                    row_id_start: file.row_id_start,
-                },
-                Some(file.file_size_bytes),
-            )
-            .await?;
-            entries.extend(scoped.into_iter().map(|entry| IndexEntry {
-                row_id: entry.row_id,
-                values: entry.values,
-            }));
+
+            // Rows already dead when the index is built must not be backfilled
+            // (entries are live-only): delete files name positions within their
+            // target, inline file-deletes name row ids.
+            let mut killed_positions: HashMap<u64, HashSet<u64>> = HashMap::new();
+            let mut killed_row_ids: HashMap<u64, HashSet<u64>> = HashMap::new();
+            for (data_file_id, row_id, _) in
+                store_inline::scan_inline_file_deletes(session.handle(), table.get()).await?
+            {
+                killed_row_ids
+                    .entry(data_file_id)
+                    .or_default()
+                    .insert(row_id);
+            }
+            for delete in snapshot.delete_files_of(table) {
+                let path = resolve(&delete.path, delete.path_is_relative);
+                let positions =
+                    scoped_read::delete_file_positions(object_store.as_ref(), &path).await?;
+                killed_positions
+                    .entry(delete.data_file_id.get())
+                    .or_default()
+                    .extend(positions);
+            }
+
+            let mut entries = Vec::new();
+            for file in snapshot.data_files_of(table) {
+                let path = resolve(&file.path, file.path_is_relative);
+                let scoped = scoped_read::scoped_read_entries(
+                    Arc::clone(&object_store),
+                    &path,
+                    &positions,
+                    scoped_read::RowIdSource::Resolve {
+                        row_id_start: file.row_id_start,
+                    },
+                    Some(file.file_size_bytes),
+                )
+                .await?;
+                let dead_positions = killed_positions.get(&file.id.get());
+                let dead_row_ids = killed_row_ids.get(&file.id.get());
+                entries.extend(
+                    scoped
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(ordinal, entry)| {
+                            let ordinal = u64::try_from(ordinal).unwrap_or(u64::MAX);
+                            let dead = dead_positions.is_some_and(|dead| dead.contains(&ordinal))
+                                || dead_row_ids.is_some_and(|dead| dead.contains(&entry.row_id));
+                            (!dead).then_some(IndexEntry {
+                                row_id: entry.row_id,
+                                values: entry.values,
+                            })
+                        }),
+                );
+            }
+            Ok(entries)
         }
-        Ok(entries)
+        .await;
+        session.finish();
+
+        outcome
+    }
+
+    /// Backfill entries for a table's live **inline** rows, by scanning its
+    /// inline chunks — the counterpart to [`Self::scoped_backfill_entries`]
+    /// for rows moraine holds in the store rather than external files.
+    /// Tombstoned (inline-deleted) rows are excluded; a NULL indexed value
+    /// yields a `None`, so `IS NULL` finds the row. Reads the catalog store,
+    /// so it needs no data object store.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if a column is not live, or [`Error::Corruption`]
+    /// if a chunk names no recorded schema or cannot be decoded.
+    pub async fn inline_backfill_entries(
+        &self,
+        table: TableId,
+        columns: &[ColumnId],
+    ) -> Result<Vec<IndexEntry>> {
+        let session = self.begin_read().await?;
+
+        let outcome = async {
+            let snapshot = commit::materialize(session.handle(), None).await?;
+            let live_columns = snapshot.columns_of(table);
+            let positions = columns
+                .iter()
+                .map(|column| {
+                    live_columns
+                        .iter()
+                        .position(|c| c.id == *column)
+                        .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            // Rows tombstoned out of their chunk by an inline delete are dead
+            // and must not be indexed.
+            let dead: std::collections::HashSet<u64> =
+                store_inline::scan_inline_inline_deletes(session.handle(), table.get())
+                    .await?
+                    .into_iter()
+                    .map(|(row_id, _)| row_id)
+                    .collect();
+
+            let mut entries = Vec::new();
+            for (op, chunk) in
+                store_inline::scan_inline_chunks(session.handle(), table.get()).await?
+            {
+                let InlineOperation::Insert { schema_version, .. } = op else {
+                    continue;
+                };
+                let schema =
+                    store_inline::read_inline_schema(session.handle(), table.get(), schema_version)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "no inline schema for table {table} version {schema_version}"
+                            ))
+                        })?;
+                let scoped = scoped_read::inline_batch_entries(
+                    &schema.arrow_schema,
+                    &chunk.body,
+                    &positions,
+                    chunk.row_id_start,
+                )?;
+                entries.extend(
+                    scoped
+                        .into_iter()
+                        .filter(|entry| !dead.contains(&entry.row_id))
+                        .map(|entry| IndexEntry {
+                            row_id: entry.row_id,
+                            values: entry.values,
+                        }),
+                );
+            }
+            Ok(entries)
+        }
+        .await;
+        session.finish();
+
+        outcome
     }
 
     /// Deletes up to `limit` orphaned entries of a dropped index, in one

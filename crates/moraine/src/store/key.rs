@@ -825,18 +825,19 @@ mod tests {
         });
         let mut expected = vec![0x07, 0x03];
         expected.extend(be(1));
-        // Inner framing of one component `00 01 41` is `01 00 01 01 41 00 00`;
-        // the outer framing escapes each of its low bytes again and
-        // terminates.
+        // The canonical key is a non-null flag (`00`, the ascending
+        // NULLS-LAST flag) then the value framed as a storekey byte string
+        // (`00 01 41` -> `01 00 01 01 41 00`); the outer key framing escapes
+        // each of those bytes again and terminates.
         expected.extend([
-            0x01, 0x01, // 0x01
-            0x01, 0x00, // 0x00
-            0x01, 0x01, // 0x01
-            0x01, 0x01, // 0x01
-            0x41, // 'A'
-            0x01, 0x00, // 0x00
-            0x01, 0x00, // 0x00
-            0x00, // terminator
+            0x01, 0x00, // 0x00 — non-null flag
+            0x01, 0x01, // 0x01 — framed value byte 0 (escape lead)
+            0x01, 0x00, // 0x00 — framed value byte 1 (escaped 0x00)
+            0x01, 0x01, // 0x01 — framed value byte 2 (escape lead)
+            0x01, 0x01, // 0x01 — framed value byte 3 (escaped 0x01)
+            0x41, // 'A' — framed value byte 4
+            0x01, 0x00, // 0x00 — framed value byte 5 (terminator)
+            0x00, // outer terminator
         ]);
         expected.extend(be(1 << 56));
         assert_eq!(key.encode(), expected);

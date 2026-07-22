@@ -54,6 +54,189 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
     );
 }
 
+/// The range SQL surface: `moraine_index_range` resolves a comparison
+/// window over the same index the lookup uses — closed, open, and half-open
+/// (a NULL bound is an open side).
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_range_selects_a_comparison_window() {
+    let store = TempDir::new("index-range-store");
+    let data = TempDir::new("index-range-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    let count = |sql: &str| csv_rows(&run(sql));
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    // BETWEEN 10 AND 20, both inclusive: values 10..=20 -> 11 rows.
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
+        ),
+        vec![vec!["11".to_string()]],
+        "closed [10, 20] selects eleven rows"
+    );
+    // 10 < a < 20, both exclusive: values 11..=19 -> 9 rows.
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, false, false);"
+        ),
+        vec![vec!["9".to_string()]],
+        "open (10, 20) selects nine rows"
+    );
+    // a >= 90 with an open upper side (NULL bound): values 90..=99 -> 10 rows.
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', 90, NULL::BIGINT, true, true);"
+        ),
+        vec![vec!["10".to_string()]],
+        "half-open [90, +inf) selects ten rows"
+    );
+    // a < 5 with an open lower side: values 0..=4 -> 5 rows.
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', NULL::BIGINT, 5, true, false);"
+        ),
+        vec![vec!["5".to_string()]],
+        "half-open (-inf, 5) selects five rows"
+    );
+
+    // `reverse := true` returns the window high value first: row_id == value
+    // here (row i holds value i), so [10, 20] reversed leads with 20.
+    assert_eq!(
+        csv_rows(&run("SELECT row_id FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true, reverse := true) \
+             LIMIT 1;")),
+        vec![vec!["20".to_string()]],
+        "reverse leads with the high end of the window"
+    );
+    // Ascending (the default) leads with the low end.
+    assert_eq!(
+        csv_rows(&run("SELECT row_id FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true) LIMIT 1;")),
+        vec![vec!["10".to_string()]],
+        "the default order leads with the low end"
+    );
+}
+
+/// A descending index created via the `directions := ['desc']` named
+/// parameter answers both a range window and an equality lookup — the
+/// per-column direction rides `moraine_index_create` into the stored order.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_create_descending_answers_range_and_lookup() {
+    let store = TempDir::new("index-desc-store");
+    let data = TempDir::new("index-desc-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    let count = |sql: &str| csv_rows(&run(sql));
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run(
+        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
+         directions := ['desc']);",
+    );
+
+    // A descending index answers a closed value window: 10..=20 -> 11 rows.
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
+        ),
+        vec![vec!["11".to_string()]],
+        "the descending index answers a closed window"
+    );
+    // And an equality lookup on the same descending index.
+    assert_eq!(
+        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+        vec![vec!["1".to_string()]],
+        "the descending index answers an equality lookup"
+    );
+}
+
+/// A NULLS FIRST index created via `nulls := ['first']`: the placement rides
+/// into the stored key's null flag, and the same flag is used when encoding a
+/// query bound — so values still resolve, proving the parameter threads
+/// through both the entry and the query paths.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_create_nulls_first_still_resolves_values() {
+    let store = TempDir::new("index-nulls-store");
+    let data = TempDir::new("index-nulls-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    let count = |sql: &str| csv_rows(&run(sql));
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run(
+        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
+         directions := ['desc'], nulls := ['first']);",
+    );
+
+    assert_eq!(
+        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 42);"),
+        vec![vec!["1".to_string()]],
+        "a NULLS FIRST index still resolves an equality lookup"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM \
+             moraine_index_range('lake', 'main', 't', 'by_a', 10, 20, true, true);"
+        ),
+        vec![vec!["11".to_string()]],
+        "a NULLS FIRST index still answers a range window"
+    );
+}
+
+/// The `IS NULL` SQL surface: `moraine_index_nulls` finds the rows whose
+/// leading indexed column is NULL (a NULL variadic arg means `IS NULL`), and
+/// a unique index admits multiple NULL rows — both a bulk (Parquet) and an
+/// inline NULL are covered.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_nulls_finds_null_rows() {
+    let store = TempDir::new("index-isnull-store");
+    let data = TempDir::new("index-isnull-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    let count = |sql: &str| csv_rows(&run(sql));
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    // 98 non-null rows in a bulk (Parquet) file, plus two NULL rows.
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(98) t(i);");
+    run("INSERT INTO lake.main.t VALUES (NULL, 'n1'), (NULL, 'n2');");
+    // A unique index must accept the two NULL rows (SQL treats NULLs distinct).
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    // a IS NULL resolves to exactly the two NULL rows.
+    assert_eq!(
+        count("SELECT count(*) FROM moraine_index_nulls('lake', 'main', 't', 'by_a', NULL);"),
+        vec![vec!["2".to_string()]],
+        "IS NULL finds both NULL rows"
+    );
+    // A non-null value is still uniquely resolvable, unaffected.
+    assert_eq!(
+        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', 5);"),
+        vec![vec!["1".to_string()]],
+        "a non-null value is still uniquely resolvable"
+    );
+    // An inline NULL added after the index also becomes findable.
+    run("INSERT INTO lake.main.t VALUES (NULL, 'n3');");
+    assert_eq!(
+        count("SELECT count(*) FROM moraine_index_nulls('lake', 'main', 't', 'by_a', NULL);"),
+        vec![vec!["3".to_string()]],
+        "an inline NULL inserted after create is indexed too"
+    );
+}
+
 /// Write-path coverage: a bulk INSERT *after* the index exists is
 /// maintained by the staged commit scoped-reading the new Parquet from
 /// `DATA_PATH`, and a duplicate INSERT is rejected on the unique index.

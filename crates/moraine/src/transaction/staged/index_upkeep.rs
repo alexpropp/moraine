@@ -7,7 +7,7 @@ use super::{
     InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, ScopedReadEntry,
     StagedIndexEntry, TableId, TableKind, commit,
     decode::{decode_data_file, decode_delete_file},
-    encode_key, proto, scoped_read, stage_index_entries, store_inline,
+    encode_ordered_values, proto, scoped_read, stage_index_entries, store_inline,
 };
 
 /// Derives and appends the equality-index entries for one registered data
@@ -576,8 +576,8 @@ pub(super) fn index_positions(
 }
 
 /// Turns scoped-read entries into staged index entries — puts when `delete`
-/// is false, removals when it is true — skipping any row with a NULL indexed
-/// value (which gets no entry, so has none to remove either).
+/// is false, removals when it is true. A row with a NULL indexed value is
+/// stored multi-shaped (so `IS NULL` finds it) rather than skipped.
 pub(super) fn push_index_entries(
     entries: &mut Vec<StagedIndexEntry>,
     index: &IndexInfo,
@@ -585,14 +585,14 @@ pub(super) fn push_index_entries(
     delete: bool,
 ) -> Result<()> {
     for entry in scoped {
-        if entry.values.iter().any(Option::is_none) {
-            continue;
-        }
-        let values: Vec<_> = entry.values.into_iter().flatten().collect();
+        // A row with any NULL indexed column is stored so `IS NULL` finds it,
+        // but multi-shaped and collision-exempt — a unique index still admits
+        // any number of NULL rows.
+        let has_null = entry.values.iter().any(Option::is_none);
         entries.push(StagedIndexEntry {
             index_id: index.id.get(),
-            unique: index.unique,
-            key: encode_key(&values)?,
+            unique: index.unique && !has_null,
+            key: encode_ordered_values(&entry.values, &index.directions, &index.nulls)?,
             row_id: entry.row_id,
             delete,
         });
