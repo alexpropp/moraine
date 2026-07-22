@@ -729,8 +729,8 @@ async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {
     (catalog, index.get().unwrap().get())
 }
 
-/// The stored entry count for one index.
-async fn index_entry_count(catalog: &Catalog, unique: bool, index_id: u64) -> usize {
+/// Every stored entry key of one index, in scan order.
+async fn index_entry_keys(catalog: &Catalog, unique: bool, index_id: u64) -> Vec<Vec<u8>> {
     use crate::store::key::{IdxKind, idx_index_prefix};
 
     let kind = if unique {
@@ -743,12 +743,17 @@ async fn index_entry_count(catalog: &Catalog, unique: bool, index_id: u64) -> us
         .scan_prefix(idx_index_prefix(kind, index_id), ..)
         .await
         .unwrap();
-    let mut count = 0;
-    while iter.next().await.unwrap().is_some() {
-        count += 1;
+    let mut keys = Vec::new();
+    while let Some(entry) = iter.next().await.unwrap() {
+        keys.push(entry.key.to_vec());
     }
     tx.rollback();
-    count
+    keys
+}
+
+/// The stored entry count for one index.
+async fn index_entry_count(catalog: &Catalog, unique: bool, index_id: u64) -> usize {
+    index_entry_keys(catalog, unique, index_id).await.len()
 }
 
 /// Stages one inline chunk of `values` starting at `row_id_start`,
@@ -980,6 +985,334 @@ async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<In
     store
 }
 
+/// Writes a two-column Parquet of `values` beside their preserved
+/// `row_ids`, the trailing row-id column tagged with DuckDB's reserved
+/// field id — the shape DuckLake's rewrite and flush writers emit.
+async fn write_parquet_with_row_ids(
+    store: &InMemory,
+    path: &str,
+    values: &[i64],
+    row_ids: &[i64],
+) -> u64 {
+    use arrow::{
+        array::{Int64Array, RecordBatch},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let row_id_field = Field::new("_ducklake_internal_row_id", DataType::Int64, false)
+        .with_metadata(std::collections::HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+            "2147483540".to_string(),
+        )]));
+    let schema = Schema::new(vec![Field::new("a", DataType::Int64, true), row_id_field]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int64Array::from(values.to_vec())),
+            Arc::new(Int64Array::from(row_ids.to_vec())),
+        ],
+    )
+    .unwrap();
+    write_parquet(store, path, &batch).await
+}
+
+/// A `ducklake_data_file` row for a rewrite file: per-row ids
+/// (`row_id_start` NULL), otherwise as `indexed_data_file_row`.
+fn rewrite_data_file_row(
+    data_file_id: u64,
+    begin: u64,
+    path: &str,
+    record_count: u64,
+    file_size_bytes: u64,
+) -> Vec<Cell> {
+    vec![
+        Cell::U64(data_file_id),
+        Cell::U64(1),
+        Cell::U64(begin),
+        Cell::Null,
+        Cell::Null,
+        Cell::Str(path.into()),
+        Cell::Bool(true),
+        Cell::Str("parquet".into()),
+        Cell::U64(record_count),
+        Cell::U64(file_size_bytes),
+        Cell::U64(64),
+        Cell::Null, // row_id_start: this file carries per-row ids
+        Cell::Null,
+        Cell::Null,
+        Cell::Null,
+        Cell::Null,
+    ]
+}
+
+/// A compaction-shaped commit re-registers surviving rows in a
+/// per-row-id file: every derived entry already exists, the commit
+/// lands, and the `idx` range is byte-identical.
+#[tokio::test]
+async fn rewrite_registration_re_derives_entries_idempotently() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+    let before = index_entry_keys(&catalog, true, index_id).await;
+    assert_eq!(before.len(), 3);
+
+    // The rewrite: same values, preserved ids 0..=2, per-row-id file 12
+    // replacing file 1.
+    let size =
+        write_parquet_with_row_ids(&store, "main/t/rewrite.parquet", &[10, 20, 30], &[0, 1, 2])
+            .await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: rewrite_data_file_row(12, 4, "rewrite.parquet", 3, size),
+    });
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(4)],
+    });
+    tx.stage(RowOperation::UpdateSetBegin {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(12), Cell::U64(4)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "rewrite_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_keys(&catalog, true, index_id).await,
+        before,
+        "the idx range is byte-identical: re-derived entries are no-ops"
+    );
+}
+
+/// An UPDATE-shaped per-row-id file carries changed values under
+/// preserved ids; its entries land as adds.
+#[tokio::test]
+async fn update_shaped_registration_adds_changed_value_entries() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+    // Row 1's value changes 20 -> 99; its id is preserved.
+    let size = write_parquet_with_row_ids(&store, "main/t/update.parquet", &[99], &[1]).await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: rewrite_data_file_row(12, 4, "update.parquet", 1, size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, false, index_id).await,
+        4,
+        "the changed value's entry is added under the preserved id"
+    );
+}
+
+/// A file recording a dense start while carrying embedded ids with a gap
+/// (the flushed shape) derives entries under the embedded ids.
+#[tokio::test]
+async fn embedded_ids_win_over_a_recorded_dense_start() {
+    use crate::store::key::{IdxKind, idx_index_prefix};
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+    // Ids 100 and 102 — the gap at 101 is a row deleted before the flush.
+    let store = Arc::new(InMemory::new());
+    let size =
+        write_parquet_with_row_ids(&store, "main/t/flushed.parquet", &[10, 30], &[100, 102]).await;
+    let mut cells = rewrite_data_file_row(1, 3, "flushed.parquet", 2, size);
+    cells[11] = Cell::U64(100); // row_id_start recorded, as a flush does
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 2);
+
+    // The unique entries hold ids 100 and 102 — not 100 and 101.
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let mut iter = ReadHandle::Tx(&tx)
+        .scan_prefix(idx_index_prefix(IdxKind::Unique, index_id), ..)
+        .await
+        .unwrap();
+    let mut row_ids = Vec::new();
+    while let Some(entry) = iter.next().await.unwrap() {
+        row_ids.push(u64::from_be_bytes(entry.value.as_ref().try_into().unwrap()));
+    }
+    tx.rollback();
+    row_ids.sort_unstable();
+    assert_eq!(row_ids, vec![100, 102]);
+}
+
+/// Registers values 10,20,30 in a per-row-id file (file 1, embedded ids
+/// 5,9,12) on the indexed table, returning the store it lives on.
+async fn register_per_row_id_file(catalog: &Catalog) -> Arc<InMemory> {
+    let store = Arc::new(InMemory::new());
+    let size =
+        write_parquet_with_row_ids(&store, "main/t/rewrite.parquet", &[10, 20, 30], &[5, 9, 12])
+            .await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: rewrite_data_file_row(1, 3, "rewrite.parquet", 3, size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+    store
+}
+
+/// A delete file targeting a per-row-id file removes exactly the named
+/// positions' entries, resolved through the embedded ids.
+#[tokio::test]
+async fn delete_file_against_per_row_id_target_removes_named_positions() {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_per_row_id_file(&catalog).await;
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 3);
+
+    // Kill position 1 (value 20, embedded id 9): a DuckLake delete file
+    // is a `file_path`/`pos` Parquet naming positions within the target.
+    let deletes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["rewrite.parquet"])),
+            Arc::new(Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: vec![
+            Cell::U64(2),
+            Cell::U64(1),
+            Cell::U64(4),
+            Cell::Null,
+            Cell::U64(1), // data_file_id: the per-row-id target
+            Cell::Str("deletes.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(1), // delete_count
+            Cell::U64(512),
+            Cell::U64(64),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        2,
+        "exactly the killed position's entry is gone"
+    );
+}
+
+/// An inlined file-delete names a physical position; against a per-row-id
+/// target the scoped read resolves it to the row it holds, not any dense
+/// range.
+#[tokio::test]
+async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_per_row_id_file(&catalog).await;
+    assert_eq!(index_entry_count(&catalog, true, index_id).await, 3);
+
+    // Position 1 holds value 20 (embedded id 9); the delete names the
+    // position, and its entry resolves out of the file.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    tx.stage(RowOperation::InlineFileDelete {
+        table_id: 1,
+        data_file_id: 1,
+        row_id: 1,
+        begin_snapshot: 4,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inlined_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        2,
+        "the named row's entry is gone"
+    );
+}
+
+/// Backfill over a table holding a per-row-id file derives its entries
+/// under the embedded ids.
+#[tokio::test]
+async fn backfill_derives_per_row_id_file_entries_under_embedded_ids() {
+    use crate::catalog::{ColumnId, TableId};
+
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    let store = register_per_row_id_file(&catalog).await;
+
+    let entries = catalog
+        .scoped_backfill_entries(store, "", TableId::new(1), &[ColumnId::new(1)])
+        .await
+        .unwrap();
+    let mut row_ids: Vec<u64> = entries.iter().map(|e| e.row_id).collect();
+    row_ids.sort_unstable();
+    assert_eq!(row_ids, vec![5, 9, 12], "ids come from the embedded column");
+}
+
 /// An inlined delete against a Parquet-file row removes that row's
 /// entry, read back out of the target file.
 #[tokio::test]
@@ -1078,6 +1411,65 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
         1,
         "positions 0 and 2 are unindexed; only row 1 survives"
     );
+}
+
+/// A delete file naming a position past the target file's row count could
+/// never match a scoped entry; rather than silently orphan index rows, the
+/// commit is refused.
+#[tokio::test]
+async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let (catalog, _index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+    // The target holds 3 rows (positions 0..=2); position 5 names none.
+    let deletes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int64Array::from(vec![5])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: vec![
+            Cell::U64(2),
+            Cell::U64(1),
+            Cell::U64(4),
+            Cell::Null,
+            Cell::U64(1), // data_file_id
+            Cell::Str("deletes.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(1), // delete_count
+            Cell::U64(512),
+            Cell::U64(64),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
 }
 
 /// `InlineFlushDelete` removes chunks begun at or before the flush

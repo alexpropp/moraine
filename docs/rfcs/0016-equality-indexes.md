@@ -3,6 +3,9 @@
 - **Date:** 2026-07-10
 - **Revised:** 2026-07-19 — staged (multi-commit) builds designed in;
   previously deferred to Open questions.
+- **Revised:** 2026-07-21 — rewrite-file row-id resolution designed in
+  (Rewrite files); previously an implementation follow-up behind a typed
+  refusal.
 
 ## Summary
 
@@ -513,6 +516,89 @@ upstream change moraine would own. Neither is designed further in this RFC.
 
 Read-only attaches over an indexed store are unaffected.
 
+### Rewrite files: row-id resolution
+
+The scoped read's "embedded row-id column if present" rule (Coverage) is
+made concrete here. Source-verified in DuckLake: UPDATE (always),
+`rewrite_data_files` (always), and `merge_adjacent_files` (only when the
+merged files' row-id ranges are not adjacent) append a trailing
+`_ducklake_internal_row_id` BIGINT column to the files they write, tagged
+with DuckDB's reserved Parquet **field id 2147483540**
+(`MultiFileReader::ROW_ID_FIELD_ID`); its catalog row carries
+`row_id_start` NULL. `merge_adjacent_files` and inline-data flush also
+append `_ducklake_internal_snapshot_id` (field id 2147483539), which
+index maintenance ignores. DuckLake's reader resolves a row's id as: the
+field-id column when the file carries one, else `row_id_start + position`,
+else a read error. Moraine's scoped read applies the identical rule.
+
+**Column presence wins over `row_id_start` — the precedence is
+load-bearing, not a tiebreak.** A flushed inline-data file carries embedded
+row ids *and* a non-NULL `row_id_start` (DuckLake records the file's
+minimum embedded id there), and its ids may hold gaps: inline rows deleted
+before the flush are materialized out, but the survivors keep their
+original ids. Dense derivation against such a file writes entries under
+row ids the rows do not have — silent index corruption, no error raised.
+Any resolution that consults `row_id_start` first is therefore wrong by
+construction; the fallback order is fixed as column, then range, then
+refusal.
+
+**Resolution lives inside the scoped read.** The reader already fetches the
+file's footer; discovering the field-id column there costs nothing and
+keeps the precedence rule in one place instead of at every call site.
+Callers state intent, two modes:
+
+- **DuckLake-parity** — registration, delete-side maintenance, and index
+  backfill. The caller passes the catalog row's `row_id_start` verbatim
+  (`Option`); the reader prefers the field-id column, falls back to the
+  dense range, and refuses (`Corruption` — the catalog row and the file
+  disagree) when neither exists. A NULL or negative embedded id is
+  likewise `Corruption`.
+- **Ordinal** — the extension-path registration helper, whose contract is
+  positions for `register_data_file` to re-map onto a freshly allocated
+  dense range. In this mode a file carrying the field-id column is
+  **refused**: registering a rewrite file under new dense ids would fork
+  its identity — readers honour the embedded column, the catalog would
+  claim the dense range, and the index would follow the wrong one.
+
+**The delete side filters by position, not by pre-computed row id.** A
+delete file names positions within its target; converting them to row ids
+before reading the target bakes in the dense assumption. Instead the
+killed positions ride verbatim to the target's scoped read, which returns
+entries in file order — an entry is removed when its ordinal is named by
+a delete file, or its resolved row id is named by an inline file-delete
+(those carry row ids directly). One rule serves dense and per-row-id
+targets alike.
+
+**Maintenance stays derivation, never removal.** Registering a rewrite
+file only re-derives entries that exist (compaction: the idempotent puts
+and the unique same-row-id no-op arm, Uniqueness enforcement) or adds
+entries for changed values (UPDATE: the paired delete file removes the
+old-value entries in the same commit). No register-side path stages an
+entry delete, so a rewrite cannot drop a surviving row's entry — the
+property that makes re-derivation safe to run unconditionally.
+
+Indexed columns keep their positional location (Coverage): rewrite and
+flush outputs are written under the table's current schema with the
+internal columns trailing, so table-column positions are undisturbed.
+
+**Embedding-API boundary.** The verb surface has no way to register a
+per-row-id file — `register_data_file` allocates dense ranges, which is
+why its entries name rows by ordinal: the ids do not exist until the
+commit allocates them. Deletion never has that problem — the target is
+registered and its ids are known facts — so `register_delete_file`
+removals name rows **by row id against every target**, exactly the
+Coverage table's `(row_id, key values)` contract: `row_id_start +
+ordinal` for a dense target, where moraine checks the id lies inside the
+target's range (the same strength as an ordinal bounds check), and the
+embedded id for a per-row-id target, taken verbatim and trusted exactly
+as the entry's values are — the writer read the target to learn its
+positions and values, and the row-id column sits in the same file. One
+shape, one staging path, no per-target rules. What stays out is a
+rewrite-*registration* verb: the embedding API cannot express a file
+that preserves row ids, indexed or not — that is absent compaction
+surface (RFC 0008 keeps compaction DuckLake-driven), not index
+maintenance, and would be its own RFC.
+
 ### Format gate
 
 An older moraine writer committing to an indexed table would maintain no
@@ -598,9 +684,25 @@ tests against real SlateDB on in-memory `object_store`:
   file fixtures pin the reader against each indexable type. A staged
   `register_delete_file` removes exactly the named positions' entries.
 - **Rewrite idempotence.** A rewrite file carrying a row-id column derives
-  entries under the preserved ids; DuckLake UPDATE and compaction over an
-  indexed table (unique included) leave the `idx` range byte-identical and
-  never abort on the rows' own existing entries.
+  entries under the preserved ids; DuckLake compaction over an indexed
+  table (unique included) leaves the `idx` range byte-identical and never
+  aborts on the rows' own existing entries. An UPDATE-shaped commit
+  (delete file plus per-row-id file with changed values) removes the
+  old-value entries and lands the new-value entries in one commit; an
+  unchanged indexed value survives its same-commit delete-then-re-add.
+- **Row-id precedence.** A file carrying both the field-id column and a
+  non-NULL `row_id_start`, with gaps in its embedded ids (the flushed
+  shape), derives entries under the embedded ids — a golden fixture pins
+  the precedence. A per-row-id catalog row over a file lacking the column
+  fails `Corruption`; ordinal mode refuses a file that carries it.
+- **Rewrite delete side.** A delete file targeting a per-row-id file
+  removes exactly the named positions' entries; an inline file-delete
+  against one removes exactly the named row's. Backfill over a table
+  holding per-row-id files derives their entries under embedded ids.
+  Embedding: `register_delete_file` removals name rows by id against any
+  target — verbatim against a per-row-id file, range-checked against a
+  dense one; an id outside a dense target's range refuses with
+  `Constraint`.
 - **SQL-path uniqueness.** A staged registration whose file duplicates an
   existing unique value aborts with `Constraint`, message free of the four
   retry substrings — no retry storm; a non-duplicate registration lands and
@@ -614,7 +716,12 @@ tests against real SlateDB on in-memory `object_store`:
   a `CALL moraine_create_index` then a bulk `INSERT` that duplicates a
   unique value fails the `INSERT` without a retry storm (message-text
   contract), and one that does not duplicate lands and is found by
-  `moraine_index_lookup`.
+  `moraine_index_lookup`. Over an indexed table: `UPDATE`, then
+  `rewrite_data_files`, then `merge_adjacent_files` (one adjacent merge,
+  one not — dense and per-row-id outputs) all commit; lookups stay
+  correct after each; a `DELETE` against the rewritten file removes its
+  entries; `moraine_create_index` on a table already holding rewrite
+  files backfills them.
 
 ## Open questions
 

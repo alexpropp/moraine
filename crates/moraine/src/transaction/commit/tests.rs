@@ -734,7 +734,7 @@ fn delete_file(data_file: crate::catalog::DataFileId) -> crate::catalog::DeleteF
 #[tokio::test]
 async fn register_delete_file_removes_the_entries_it_names() {
     use crate::{
-        catalog::FileIndexEntry,
+        catalog::FileIndexRemoval,
         store::index_encoding::{IndexKeyValue, IntWidth},
     };
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
@@ -748,9 +748,9 @@ async fn register_delete_file_removes_the_entries_it_names() {
             tx.register_delete_file(
                 table,
                 delete_file(file),
-                &[FileIndexEntry {
+                &[FileIndexRemoval {
                     index,
-                    ordinal: 1,
+                    row_id: 1,
                     values: vec![Some(int(20))],
                 }],
             )
@@ -799,7 +799,7 @@ async fn register_delete_file_must_supply_index_entries() {
 #[tokio::test]
 async fn register_delete_file_rejects_index_entries_without_deletes() {
     use crate::{
-        catalog::FileIndexEntry,
+        catalog::FileIndexRemoval,
         store::index_encoding::{IndexKeyValue, IntWidth},
     };
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
@@ -811,9 +811,9 @@ async fn register_delete_file_rejects_index_entries_without_deletes() {
                     delete_count: 0,
                     ..delete_file(file)
                 },
-                &[FileIndexEntry {
+                &[FileIndexRemoval {
                     index,
-                    ordinal: 1,
+                    row_id: 1,
                     values: vec![Some(IndexKeyValue::Int {
                         value: 20,
                         width: IntWidth::I64,
@@ -827,11 +827,11 @@ async fn register_delete_file_rejects_index_entries_without_deletes() {
     catalog.close().await.unwrap();
 }
 
-/// An ordinal past the target file's rows would name a row id outside it.
+/// A row id past a dense target's range would name a row it does not hold.
 #[tokio::test]
-async fn register_delete_file_rejects_an_out_of_range_index_ordinal() {
+async fn register_delete_file_rejects_an_out_of_range_row_id() {
     use crate::{
-        catalog::FileIndexEntry,
+        catalog::FileIndexRemoval,
         store::index_encoding::{IndexKeyValue, IntWidth},
     };
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
@@ -840,9 +840,9 @@ async fn register_delete_file_rejects_an_out_of_range_index_ordinal() {
             tx.register_delete_file(
                 table,
                 delete_file(file),
-                &[FileIndexEntry {
+                &[FileIndexRemoval {
                     index,
-                    ordinal: 2,
+                    row_id: 2,
                     values: vec![Some(IndexKeyValue::Int {
                         value: 30,
                         width: IntWidth::I64,

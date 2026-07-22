@@ -345,6 +345,23 @@ pub struct FileIndexEntry {
     pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
 }
 
+/// One writer-supplied entry removal for a registered delete file: the
+/// killed row's id and the values it was indexed under. Against a
+/// dense-range target the id must lie inside the target's row-id range;
+/// against a per-row-id target it is the file's embedded id, supplied
+/// verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileIndexRemoval {
+    /// The index the removal belongs to.
+    pub index: IndexId,
+    /// The killed row's id.
+    pub row_id: u64,
+    /// The indexed column values the dead row held, positionally
+    /// matching the index's columns; a `None` is SQL NULL (no entry
+    /// existed, none is removed).
+    pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
+}
+
 /// The build lifecycle of an equality index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexState {

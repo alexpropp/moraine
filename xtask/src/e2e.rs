@@ -17,7 +17,7 @@ const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb"
 /// `--exact`, since there are many). Needs network access to `INSTALL
 /// ducklake`. Adding a test there means bumping this count, or `e2e`
 /// fails — deliberate, so a silently-filtered test can never pass.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "37 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "38 passed";
 
 /// Downloads/caches the pinned DuckDB CLI, builds and packages the
 /// extension, runs the crate's test suite, then runs `duckdb_load.rs`

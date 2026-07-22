@@ -121,20 +121,6 @@ fn unique_violation(index_id: u64) -> Error {
     ))
 }
 
-/// The dense row-id start of a data file under index maintenance, or the
-/// shared refusal for rewrite files (per-row ids, no dense range) — a
-/// documented follow-up, one constructor so the refusal sites cannot
-/// drift apart.
-pub(crate) fn data_file_row_id_start(file: &crate::store::proto::DataFileValue) -> Result<u64> {
-    file.row_id_start.ok_or_else(|| {
-        Error::Constraint(format!(
-            "data file {} on indexed table {} carries per-row ids; index maintenance of rewrite \
-             files is a follow-up",
-            file.data_file_id, file.table_id
-        ))
-    })
-}
-
 /// Deletes up to `limit` orphaned entries of one dropped index inside an
 /// open transaction, returning how many deletes were staged. An index is
 /// exclusively one kind, so only one prefix holds entries; scanning both

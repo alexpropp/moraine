@@ -52,6 +52,62 @@ pub(crate) struct ScopedReadEntry {
     pub(crate) values: Vec<Option<IndexKeyValue>>,
 }
 
+/// DuckDB's reserved Parquet field id tagging the embedded row-id column
+/// (`_ducklake_internal_row_id`) that rewrite and flush files carry.
+const ROW_ID_FIELD_ID: i32 = 2_147_483_540;
+
+/// How a scoped read resolves each row's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowIdSource {
+    /// The embedded row-id column when the file carries one — preferred
+    /// even over a recorded dense start, since flushed files carry both
+    /// and their embedded ids may hold gaps — else `start + ordinal`,
+    /// else refusal.
+    Resolve {
+        /// The catalog row's dense start, if it records one.
+        row_id_start: Option<u64>,
+    },
+    /// Row ids are file ordinals from 0. A file carrying the embedded
+    /// column is refused: its rows already have ids, and renumbering
+    /// them would fork the file's identity.
+    Ordinal,
+}
+
+/// The root position of the embedded row-id column, if the file has one.
+fn embedded_row_id_position(schema: &parquet::schema::types::SchemaDescriptor) -> Option<usize> {
+    schema.root_schema().get_fields().iter().position(|field| {
+        let info = field.get_basic_info();
+        info.has_id() && info.id() == ROW_ID_FIELD_ID
+    })
+}
+
+/// Resolves `source` against the file's schema into the projection
+/// inputs: the row-id column's position (when it is to be read) and the
+/// dense start.
+fn resolve_row_id_source(
+    schema: &parquet::schema::types::SchemaDescriptor,
+    source: RowIdSource,
+    path: &Path,
+) -> Result<(Option<usize>, u64)> {
+    match (source, embedded_row_id_position(schema)) {
+        (RowIdSource::Ordinal, Some(_)) => Err(Error::Constraint(format!(
+            "scoped read: {path} carries an embedded row-id column and cannot be read by ordinal"
+        ))),
+        (RowIdSource::Ordinal, None) => Ok((None, 0)),
+        (RowIdSource::Resolve { .. }, Some(position)) => Ok((Some(position), 0)),
+        (
+            RowIdSource::Resolve {
+                row_id_start: Some(start),
+            },
+            None,
+        ) => Ok((None, start)),
+        (RowIdSource::Resolve { row_id_start: None }, None) => Err(Error::Corruption(format!(
+            "scoped read: {path} is recorded as carrying per-row ids but has no embedded \
+             row-id column"
+        ))),
+    }
+}
+
 fn downcast<A: 'static>(array: &dyn Array) -> Result<&A> {
     array
         .as_any()
@@ -157,6 +213,11 @@ fn array_value(array: &dyn Array, row: usize) -> Result<Option<IndexKeyValue>> {
 
 /// Reads a row id or row position at `row` as a `u64` (`Int64`/`UInt64`).
 fn row_id_value(array: &dyn Array, row: usize) -> Result<u64> {
+    if array.is_null(row) {
+        return Err(Error::Corruption(
+            "scoped read: row-id column holds a NULL".to_owned(),
+        ));
+    }
     match array.data_type() {
         DataType::Int64 => u64::try_from(downcast::<Int64Array>(array)?.value(row))
             .map_err(|_| Error::Corruption("scoped read: negative row id".to_owned())),
@@ -224,19 +285,19 @@ impl AsyncFileReader for ObjectStoreReader {
 }
 
 /// Derives one [`ScopedReadEntry`] per row of the Parquet file at `path`,
-/// fetching only the footer and the columns at `indexed_positions` (the
-/// indexed columns, in the index's column order) plus `row_id_position` when
-/// present — byte-range reads, never the whole object. Row ids come from the
-/// embedded row-id column if `row_id_position` is set — rewrite files from
-/// UPDATE and compaction preserve old ids there — else `row_id_start +
-/// ordinal`. `file_size` is the object's length when the caller knows it
-/// (DuckLake records it per data file); `None` costs one `head` request.
+/// fetching only the footer, the columns at `indexed_positions` (the
+/// indexed columns, in the index's column order), and the embedded row-id
+/// column when the file carries one — byte-range reads, never the whole
+/// object. Row ids resolve per `row_id_source`: the field-id-tagged
+/// embedded column if present — rewrite files from UPDATE and compaction
+/// preserve old ids there — else `row_id_start + ordinal`, else refusal.
+/// `file_size` is the object's length when the caller knows it (DuckLake
+/// records it per data file); `None` costs one `head` request.
 pub(crate) async fn scoped_read_entries(
     object_store: Arc<dyn ObjectStore>,
     path: &Path,
     indexed_positions: &[usize],
-    row_id_position: Option<usize>,
-    row_id_start: u64,
+    row_id_source: RowIdSource,
     file_size: Option<u64>,
 ) -> Result<Vec<ScopedReadEntry>> {
     let file_size = match file_size {
@@ -254,8 +315,7 @@ pub(crate) async fn scoped_read_entries(
             object_store.as_ref(),
             path,
             indexed_positions,
-            row_id_position,
-            row_id_start,
+            row_id_source,
         )
         .await;
     }
@@ -268,6 +328,8 @@ pub(crate) async fn scoped_read_entries(
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
         .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+    let (row_id_position, row_id_start) =
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
     let (mask, indexed_output, row_id_output) =
         projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
     let mut stream = builder
@@ -307,8 +369,7 @@ async fn whole_object_entries(
     object_store: &dyn ObjectStore,
     path: &Path,
     indexed_positions: &[usize],
-    row_id_position: Option<usize>,
-    row_id_start: u64,
+    row_id_source: RowIdSource,
 ) -> Result<Vec<ScopedReadEntry>> {
     let bytes: Bytes = object_store
         .get(path)
@@ -319,6 +380,8 @@ async fn whole_object_entries(
         .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|err| Error::Corruption(format!("scoped read: {err}")))?;
+    let (row_id_position, row_id_start) =
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
     let (mask, indexed_output, row_id_output) =
         projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
     let reader = builder
@@ -675,9 +738,10 @@ mod tests {
         let object_len = write_wide_fixture(store.as_ref(), &path, 20_000).await;
         assert!(object_len >= WHOLE_OBJECT_THRESHOLD);
 
-        let entries = scoped_read_entries(store.clone(), &path, &[1, 0], None, 0, None)
-            .await
-            .unwrap();
+        let entries =
+            scoped_read_entries(store.clone(), &path, &[1, 0], RowIdSource::Ordinal, None)
+                .await
+                .unwrap();
         assert_eq!(entries.len(), 20_000);
         assert_eq!(
             entries[19_999].values,
@@ -757,9 +821,10 @@ mod tests {
             } else {
                 write_narrow_fixture(store.as_ref(), &path, rows).await
             };
-            let entries = scoped_read_entries(store.clone(), &path, positions, None, 0, None)
-                .await
-                .unwrap();
+            let entries =
+                scoped_read_entries(store.clone(), &path, positions, RowIdSource::Ordinal, None)
+                    .await
+                    .unwrap();
             assert_eq!(entries.len(), rows);
             println!(
                 "{label}: object {object_len:>8} B, fetched {:>7} B ({:>2}%), {} requests",
@@ -925,9 +990,10 @@ mod tests {
             let whole_file = started.elapsed();
 
             let started = std::time::Instant::now();
-            let new_entries = scoped_read_entries(store.clone(), &path, &[0], None, 0, None)
-                .await
-                .unwrap();
+            let new_entries =
+                scoped_read_entries(store.clone(), &path, &[0], RowIdSource::Ordinal, None)
+                    .await
+                    .unwrap();
             let range_read = started.elapsed();
 
             assert_eq!(
@@ -1006,16 +1072,55 @@ mod tests {
         );
     }
 
+    /// The row-id column DuckLake's rewrite and flush writers append:
+    /// BIGINT, tagged with the reserved field id — at any position.
+    fn tagged_row_id_field(nullable: bool) -> Field {
+        Field::new("_ducklake_internal_row_id", DataType::Int64, nullable).with_metadata(
+            std::collections::HashMap::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2147483540".to_string(),
+            )]),
+        )
+    }
+
+    /// `fixture_batch` with the row-id column carrying the field id, so
+    /// discovery finds it (at position 2, not trailing).
+    fn tagged_fixture_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            tagged_row_id_field(false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                Arc::new(Int64Array::from(vec![100, 101, 102])),
+                Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            ],
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn reads_indexed_columns_and_embedded_row_ids() {
         let store = Arc::new(InMemory::new());
         let path = Path::from("data.parquet");
-        write_fixture(&store, &path, &fixture_batch()).await;
+        write_fixture(&store, &path, &tagged_fixture_batch()).await;
 
-        // Index over (id, name); the file carries a row-id column at 2.
-        let entries = scoped_read_entries(store.clone(), &path, &[0, 1], Some(2), 0, None)
-            .await
-            .unwrap();
+        // Index over (id, name); the file carries the field-id-tagged
+        // row-id column at position 2, found without a caller hint.
+        let entries = scoped_read_entries(
+            store.clone(),
+            &path,
+            &[0, 1],
+            RowIdSource::Resolve { row_id_start: None },
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(
             entries[0],
@@ -1045,9 +1150,10 @@ mod tests {
         let path = Path::from("data.parquet");
         write_fixture(&store, &path, &fixture_batch()).await;
 
-        let entries = scoped_read_entries(store.clone(), &path, &[1, 0, 0], None, 0, None)
-            .await
-            .unwrap();
+        let entries =
+            scoped_read_entries(store.clone(), &path, &[1, 0, 0], RowIdSource::Ordinal, None)
+                .await
+                .unwrap();
         assert_eq!(
             entries[0].values,
             vec![
@@ -1070,13 +1176,126 @@ mod tests {
         let path = Path::from("data.parquet");
         write_fixture(&store, &path, &fixture_batch()).await;
 
-        // No row-id column: ids are row_id_start (500) + ordinal.
-        let entries = scoped_read_entries(store.clone(), &path, &[0], None, 500, None)
-            .await
-            .unwrap();
+        // `fixture_batch`'s "row_id" column carries no field id, so it is
+        // not the embedded column — names mean nothing to discovery — and
+        // ids fall back to row_id_start (500) + ordinal.
+        let entries = scoped_read_entries(
+            store.clone(),
+            &path,
+            &[0],
+            RowIdSource::Resolve {
+                row_id_start: Some(500),
+            },
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             entries.iter().map(|e| e.row_id).collect::<Vec<_>>(),
             vec![500, 501, 502]
         );
+    }
+
+    /// The embedded column wins even when a dense start is recorded:
+    /// flushed files carry both, and their ids may hold gaps.
+    #[tokio::test]
+    async fn embedded_row_id_column_wins_over_dense_start() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("rewrite.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            tagged_row_id_field(false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int64Array::from(vec![5, 9, 12])),
+            ],
+        )
+        .unwrap();
+        write_fixture(&store, &path, &batch).await;
+
+        let entries = scoped_read_entries(
+            store.clone(),
+            &path,
+            &[0],
+            RowIdSource::Resolve {
+                row_id_start: Some(100),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.row_id).collect::<Vec<_>>(),
+            vec![5, 9, 12],
+            "ids come from the column, not 100 + ordinal"
+        );
+    }
+
+    /// A per-row-id catalog row over a file lacking the column is a
+    /// disagreement between catalog and file.
+    #[tokio::test]
+    async fn resolve_with_neither_source_fails_corruption() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("plain.parquet");
+        write_fixture(&store, &path, &fixture_batch()).await;
+
+        let err = scoped_read_entries(
+            store.clone(),
+            &path,
+            &[0],
+            RowIdSource::Resolve { row_id_start: None },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "{err}");
+    }
+
+    /// Ordinal mode refuses a file that already carries row ids —
+    /// renumbering its rows would fork their identity.
+    #[tokio::test]
+    async fn ordinal_mode_refuses_an_embedded_row_id_column() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("rewrite.parquet");
+        write_fixture(&store, &path, &tagged_fixture_batch()).await;
+
+        let err = scoped_read_entries(store.clone(), &path, &[0], RowIdSource::Ordinal, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+    }
+
+    /// A NULL embedded row id has no dense fallback to hide behind.
+    #[tokio::test]
+    async fn null_embedded_row_id_fails_corruption() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("null-id.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            tagged_row_id_field(true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int64Array::from(vec![Some(5), None])),
+            ],
+        )
+        .unwrap();
+        write_fixture(&store, &path, &batch).await;
+
+        let err = scoped_read_entries(
+            store.clone(),
+            &path,
+            &[0],
+            RowIdSource::Resolve { row_id_start: None },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "{err}");
     }
 }
