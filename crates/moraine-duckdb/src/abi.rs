@@ -1405,14 +1405,14 @@ pub unsafe extern "C" fn moraine_index_create(
         let live_columns = snapshot.columns_of(table_id);
         let mut column_ids = Vec::with_capacity(columns.len());
         for column in &columns {
+            // Indexability (e.g. the 128-bit refusal) is enforced by
+            // `create_index` itself now, so no per-caller check here.
             let found = live_columns
                 .iter()
                 .find(|c| c.name == *column)
                 .ok_or_else(|| {
                     AbiError::from(moraine::Error::NotFound(format!("column {column}")))
                 })?;
-            moraine::ffi_support::index::ensure_indexable(column, &found.column_type)
-                .map_err(AbiError::from)?;
             column_ids.push(found.id);
         }
 

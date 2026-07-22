@@ -652,7 +652,8 @@ impl Transaction {
             )));
         }
         for &column in &def.columns {
-            self.live_column(table, column)?;
+            let live = self.live_column(table, column)?;
+            crate::catalog::index_policy::ensure_indexable(&live.column_name, &live.column_type)?;
         }
         self.index_name_free(table, &def.name)?;
 
@@ -1590,6 +1591,39 @@ mod tests {
             nulls_allowed: true,
             default_value: None,
         }
+    }
+
+    #[test]
+    fn create_index_refuses_a_non_indexable_column() {
+        // The indexability rule is enforced by the verb, so the embedding
+        // path refuses a HUGEINT index just as the extension path does.
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction
+            .create_table(
+                s,
+                "t",
+                &[ColumnDef {
+                    name: "big".into(),
+                    column_type: "HUGEINT".into(),
+                    nulls_allowed: true,
+                    default_value: None,
+                }],
+            )
+            .unwrap();
+        let col_big = transaction.state.columns_of(t)[0].id;
+        let err = transaction
+            .create_index(
+                t,
+                &IndexDef {
+                    name: "by_big".into(),
+                    columns: vec![col_big],
+                    unique: true,
+                },
+                &[],
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
     }
 
     #[test]

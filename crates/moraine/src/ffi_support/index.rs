@@ -1,41 +1,13 @@
-//! Index type policy for the ABI: which DuckLake column types equality
-//! indexes cover, and how a lookup value coerces to a column's canonical
-//! stored form. Lives in the core so the type vocabulary cannot drift
-//! from index maintenance, which derives stored keys from the same types.
+//! How a lookup value coerces to a column's canonical stored form. Lives in
+//! the core so the type vocabulary cannot drift from index maintenance, which
+//! derives stored keys from the same types. The indexability rule and
+//! base-type extraction live in the catalog's `index_policy`, enforced at
+//! index creation.
 
 use crate::{
-    error::{Error, Result},
+    catalog::index_policy::ducklake_base_type,
     store::index_encoding::{IndexKeyValue, IntWidth},
 };
-
-/// The base name of a DuckLake column type — `DECIMAL` from
-/// `DECIMAL(18,3)` — uppercased.
-#[must_use]
-pub fn ducklake_base_type(column_type: &str) -> String {
-    column_type
-        .split('(')
-        .next()
-        .unwrap_or(column_type)
-        .trim()
-        .to_ascii_uppercase()
-}
-
-/// Refuses a column equality indexes cannot cover faithfully. DuckDB
-/// writes a 128-bit integer to Parquet as a lossy `double`, so distinct
-/// values could collide and the column's data-file and inline forms
-/// disagree — refused rather than indexed silently wrong.
-pub fn ensure_indexable(column_name: &str, column_type: &str) -> Result<()> {
-    if matches!(
-        ducklake_base_type(column_type).as_str(),
-        "HUGEINT" | "UHUGEINT" | "INT128" | "UINT128"
-    ) {
-        return Err(Error::Constraint(format!(
-            "column {column_name} is {column_type}; a 128-bit integer is not indexable because \
-             DuckDB stores it as a lossy double in Parquet"
-        )));
-    }
-    Ok(())
-}
 
 /// A lookup value as the ABI delivers it, owned, before coercion to the
 /// indexed column's canonical form.

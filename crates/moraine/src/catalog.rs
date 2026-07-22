@@ -4,6 +4,7 @@
 //! [`crate::transaction`] drives it.
 
 mod handle;
+pub(crate) mod index_policy;
 pub(crate) mod inline;
 pub(crate) mod projection;
 pub(crate) mod scoped_read;
