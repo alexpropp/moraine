@@ -73,6 +73,11 @@ jobs:
         with:
           path: build
           key: duckdb-build-${{ runner.os }}-${{ hashFiles('.gitmodules', 'CMakeLists.txt', 'extension_config.cmake', 'crates/moraine-duckdb/cpp/**') }}
+          # Fall back to the newest prior build tree when the key changes (a
+          # cpp/cmake/submodule touch) so cargo goes incremental instead of
+          # cold-rebuilding the whole dependency graph.
+          restore-keys: |
+            duckdb-build-${{ runner.os }}-
       # The pinned DuckDB CLI xtask downloads, keyed on xtask/src/duckdb.rs,
       # which owns the pin.
       - uses: actions/cache@v6
