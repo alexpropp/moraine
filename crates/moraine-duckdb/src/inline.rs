@@ -7,9 +7,10 @@
 //! discipline via [`guard`](crate::abi), owned-first, one `_free` per
 //! array. Write-side staging lives in [`crate::staged`].
 //!
-//! Each returned [`MoraineInlineRow`] owns an independent copy of its
-//! chunk's full Arrow IPC body, so every row frees independently with no
-//! cross-element lifetime coupling.
+//! A scan returns two parallel arrays: the [`MoraineInlineRow`]s and the
+//! deduplicated [`MoraineInlineChunk`]s their `chunk_index` points into, so
+//! each chunk's Arrow IPC body is materialized once however many rows
+//! reference it and the shim decodes it once.
 
 use std::{
     ffi::c_void,

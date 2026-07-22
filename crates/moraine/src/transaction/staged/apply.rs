@@ -830,10 +830,12 @@ pub(super) fn apply_embedded_delete(
 }
 
 /// A stats delete naming an absent row is a no-op, unlike every other
-/// delete path (where a miss means drift and fails loudly): DuckLake's
-/// drop cleanup issues bulk `DELETE ... WHERE table_id IN (...)` against
-/// the stats tables without reading them first, so zero matches is a
-/// legitimate outcome, exactly as it is in SQL.
+/// delete path (where a miss means drift and fails loudly). The snapshot-
+/// expiry cleanup fires one bulk `DELETE ... WHERE table_id IN (<ids>)` per
+/// metadata table across the whole dropped-table id set — the stats tables
+/// among a dozen others — without reading any of them first, so a dropped
+/// table that carried no stats rows legitimately matches zero, exactly as
+/// in SQL.
 pub(super) fn apply_stats_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
