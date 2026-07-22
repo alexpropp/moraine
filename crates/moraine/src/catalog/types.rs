@@ -341,7 +341,8 @@ pub struct FileIndexEntry {
     /// The row's 0-based position within the file.
     pub ordinal: u64,
     /// The indexed column values, positionally matching the index's
-    /// columns; a `None` is SQL NULL and yields no entry.
+    /// columns; a `None` is SQL NULL (stored as a collision-exempt
+    /// multi-shaped entry so `IS NULL` finds the row).
     pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
 }
 
@@ -357,8 +358,8 @@ pub struct FileIndexRemoval {
     /// The killed row's id.
     pub row_id: u64,
     /// The indexed column values the dead row held, positionally
-    /// matching the index's columns; a `None` is SQL NULL (no entry
-    /// existed, none is removed).
+    /// matching the index's columns; a `None` is SQL NULL (the row's
+    /// multi-shaped NULL entry is removed).
     pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
 }
 
@@ -375,6 +376,25 @@ pub enum IndexState {
     Poisoned,
 }
 
+/// The sort order of one indexed column: its direction and NULL placement.
+/// Defaults to ascending, NULLS LAST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnOrder {
+    /// Ascending or descending.
+    pub direction: crate::store::index_encoding::Direction,
+    /// NULL placement relative to non-null values.
+    pub nulls: crate::store::index_encoding::NullOrder,
+}
+
+impl Default for ColumnOrder {
+    fn default() -> Self {
+        Self {
+            direction: crate::store::index_encoding::Direction::Ascending,
+            nulls: crate::store::index_encoding::NullOrder::Last,
+        }
+    }
+}
+
 /// A live equality index, as read from a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexInfo {
@@ -386,6 +406,10 @@ pub struct IndexInfo {
     pub name: String,
     /// Indexed columns by field id, in declared order.
     pub columns: Vec<ColumnId>,
+    /// Per-column sort direction, parallel to `columns`.
+    pub directions: Vec<crate::store::index_encoding::Direction>,
+    /// Per-column NULL placement, parallel to `columns`.
+    pub nulls: Vec<crate::store::index_encoding::NullOrder>,
     /// Whether the index enforces uniqueness.
     pub unique: bool,
     /// The build lifecycle state.
@@ -404,9 +428,10 @@ pub struct IndexDef {
 }
 
 /// One writer-supplied index entry: a row and its indexed column values,
-/// in the index's column order. A `None` in any position is SQL NULL, and
-/// a row with any NULL indexed value gets no entry — the caller passes the
-/// row through and the maintenance layer skips it.
+/// in the index's column order. A `None` in any position is SQL NULL; a
+/// row with any NULL indexed value is stored as a collision-exempt
+/// multi-shaped entry, so `IS NULL` finds it and a unique index still admits
+/// unlimited NULL rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexEntry {
     /// The row this entry points at.

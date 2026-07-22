@@ -9,13 +9,14 @@ use uuid::Uuid;
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnStats, DataFile, DataFileId,
-        DeleteFile, DeleteFileId, FileIndexEntry, FileIndexRemoval, IndexDef, IndexEntry, IndexId,
-        IndexState, MacroId, MacroImplementationDef, OptionScope, SchemaId, TableId, ViewId,
+        CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnOrder, ColumnStats, DataFile,
+        DataFileId, DeleteFile, DeleteFileId, FileIndexEntry, FileIndexRemoval, IndexDef,
+        IndexEntry, IndexId, IndexState, MacroId, MacroImplementationDef, OptionScope, SchemaId,
+        TableId, ViewId,
     },
     error::{Error, Result},
     store::{
-        index_encoding::encode_key,
+        index_encoding::{Direction, NullOrder, encode_ordered_values},
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, IndexValue,
             MacroImplementation, MacroParameter, MacroValue, SchemaValue, TableColumnStatsValue,
@@ -517,13 +518,16 @@ impl Transaction {
         Ok(())
     }
 
-    /// Encodes one writer-supplied entry and stages it. A NULL in any
-    /// indexed column yields no entry, matching SQL: the row is skipped.
+    /// Encodes one writer-supplied entry and stages it. A row with any NULL
+    /// indexed column is stored multi-shaped and exempt from the value
+    /// collision, so `IS NULL` finds it and a unique index still admits any
+    /// number of NULL rows.
     fn stage_index_entry(
         &mut self,
         index_id: u64,
         unique: bool,
         column_count: usize,
+        orders: &[ColumnOrder],
         entry: &IndexEntry,
         delete: bool,
     ) -> Result<()> {
@@ -533,18 +537,41 @@ impl Transaction {
                 entry.values.len()
             )));
         }
-        let Some(values) = entry.values.iter().cloned().collect::<Option<Vec<_>>>() else {
-            return Ok(());
-        };
-        let key = encode_key(&values)?;
+        // A row with any NULL indexed column is stored, so `IS NULL` can find
+        // it, but always multi-shaped (row id in the key) and exempt from the
+        // value collision — SQL treats NULLs as distinct, so a unique index
+        // still admits any number of such rows.
+        let has_null = entry.values.iter().any(Option::is_none);
+        let directions: Vec<_> = orders.iter().map(|order| order.direction).collect();
+        let nulls: Vec<_> = orders.iter().map(|order| order.nulls).collect();
+        let key = encode_ordered_values(&entry.values, &directions, &nulls)?;
         self.index_entries.push(StagedIndexEntry {
             index_id,
-            unique,
+            unique: unique && !has_null,
             key,
             row_id: entry.row_id,
             delete,
         });
         Ok(())
+    }
+
+    /// The declared per-column orders of a stored index definition —
+    /// ascending / NULLS LAST wherever the record omits them.
+    fn column_orders(value: &IndexValue) -> Vec<ColumnOrder> {
+        (0..value.column_ids.len())
+            .map(|i| ColumnOrder {
+                direction: if value.column_descending.get(i).copied().unwrap_or(false) {
+                    Direction::Descending
+                } else {
+                    Direction::Ascending
+                },
+                nulls: if value.column_nulls_first.get(i).copied().unwrap_or(false) {
+                    NullOrder::First
+                } else {
+                    NullOrder::Last
+                },
+            })
+            .collect()
     }
 
     /// Creates an equality index over a table, staging entries for the
@@ -566,9 +593,40 @@ impl Transaction {
         def: &IndexDef,
         backfill: &[IndexEntry],
     ) -> Result<IndexId> {
-        let index_id = self.insert_index_definition(table, def, None)?;
+        let index_id = self.insert_index_definition(table, def, None, &[])?;
         for entry in backfill {
-            self.stage_index_entry(index_id, def.unique, def.columns.len(), entry, false)?;
+            self.stage_index_entry(index_id, def.unique, def.columns.len(), &[], entry, false)?;
+        }
+        self.mark_altered(table.get());
+        Ok(IndexId::new(index_id))
+    }
+
+    /// Creates an index with explicit per-column sort orders — ascending or
+    /// descending, NULLS FIRST or LAST. `orders` runs parallel to
+    /// `def.columns`; an empty slice is all-ascending / NULLS LAST, exactly
+    /// [`Self::create_index`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_index`], plus [`Error::Constraint`] if `orders` is
+    /// non-empty and its length does not match the column count.
+    pub fn create_index_ordered(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        backfill: &[IndexEntry],
+    ) -> Result<IndexId> {
+        let index_id = self.insert_index_definition(table, def, None, orders)?;
+        for entry in backfill {
+            self.stage_index_entry(
+                index_id,
+                def.unique,
+                def.columns.len(),
+                orders,
+                entry,
+                false,
+            )?;
         }
         self.mark_altered(table.get());
         Ok(IndexId::new(index_id))
@@ -576,12 +634,14 @@ impl Transaction {
 
     /// Validates an index definition against the live table and stages its
     /// definition record. `build_state` is `None` for a single-commit build
-    /// and `Some("building")` for a staged one.
+    /// and `Some("building")` for a staged one. `orders` gives the per-column
+    /// sort orders; empty means all-ascending / NULLS LAST.
     fn insert_index_definition(
         &mut self,
         table: TableId,
         def: &IndexDef,
         build_state: Option<String>,
+        orders: &[ColumnOrder],
     ) -> Result<u64> {
         nonempty_name("index", &def.name)?;
         self.live_table(table)?;
@@ -596,6 +656,30 @@ impl Transaction {
         }
         self.index_name_free(table, &def.name)?;
 
+        if !orders.is_empty() && orders.len() != def.columns.len() {
+            return Err(Error::Constraint(format!(
+                "index {} has {} columns but {} sort orders",
+                def.name,
+                def.columns.len(),
+                orders.len()
+            )));
+        }
+        // Record per-column orders only when they diverge from the default,
+        // so an ascending / NULLS-LAST index stays byte-identical on disk.
+        let column_descending = if orders.iter().all(|o| o.direction == Direction::Ascending) {
+            Vec::new()
+        } else {
+            orders
+                .iter()
+                .map(|o| o.direction == Direction::Descending)
+                .collect()
+        };
+        let column_nulls_first = if orders.iter().all(|o| o.nulls == NullOrder::Last) {
+            Vec::new()
+        } else {
+            orders.iter().map(|o| o.nulls == NullOrder::First).collect()
+        };
+
         let index_id = self.alloc_catalog_id();
         self.state.put_index(IndexValue {
             index_id,
@@ -605,6 +689,8 @@ impl Transaction {
             index_name: def.name.clone(),
             column_ids: def.columns.iter().map(|c| c.get()).collect(),
             unique: def.unique,
+            column_descending,
+            column_nulls_first,
             build_state,
             build_cursor_file: None,
             build_cursor_row_id: None,
@@ -654,7 +740,8 @@ impl Transaction {
     /// not live, [`Error::AlreadyExists`] if the name is taken, or
     /// [`Error::Constraint`] if the column list is empty.
     pub fn create_index_staged(&mut self, table: TableId, def: &IndexDef) -> Result<IndexId> {
-        let index_id = self.insert_index_definition(table, def, Some("building".to_owned()))?;
+        let index_id =
+            self.insert_index_definition(table, def, Some("building".to_owned()), &[])?;
         self.mark_altered(table.get());
         Ok(IndexId::new(index_id))
     }
@@ -684,10 +771,11 @@ impl Transaction {
 
         let unique = value.unique;
         let column_count = value.column_ids.len();
+        let orders = Self::column_orders(&value);
         let mut cursor = value.build_cursor_row_id.unwrap_or(0);
         for entry in batch {
             cursor = cursor.max(entry.row_id);
-            self.stage_index_entry(index.get(), unique, column_count, entry, false)?;
+            self.stage_index_entry(index.get(), unique, column_count, &orders, entry, false)?;
         }
 
         value.begin_snapshot = self.new_snapshot_id;
@@ -822,7 +910,7 @@ impl Transaction {
         row_id_start: u64,
         file_entry: &FileIndexEntry,
     ) -> Result<()> {
-        let (unique, column_count) = self.live_index_shape(table, file_entry.index)?;
+        let (unique, column_count, orders) = self.live_index_shape(table, file_entry.index)?;
         let row_id = row_id_start
             .checked_add(file_entry.ordinal)
             .ok_or_else(|| {
@@ -835,6 +923,7 @@ impl Transaction {
             file_entry.index.get(),
             unique,
             column_count,
+            &orders,
             &IndexEntry {
                 row_id,
                 values: file_entry.values.clone(),
@@ -1022,11 +1111,12 @@ impl Transaction {
         index_entries: &[FileIndexRemoval],
     ) -> Result<()> {
         for entry in index_entries {
-            let (unique, column_count) = self.live_index_shape(table, entry.index)?;
+            let (unique, column_count, orders) = self.live_index_shape(table, entry.index)?;
             self.stage_index_entry(
                 entry.index.get(),
                 unique,
                 column_count,
+                &orders,
                 &IndexEntry {
                     row_id: entry.row_id,
                     values: entry.values.clone(),
@@ -1037,15 +1127,23 @@ impl Transaction {
         Ok(())
     }
 
-    /// A live index's uniqueness flag and column count.
-    fn live_index_shape(&self, table: TableId, index: IndexId) -> Result<(bool, usize)> {
+    /// A live index's uniqueness flag, column count, and per-column orders.
+    fn live_index_shape(
+        &self,
+        table: TableId,
+        index: IndexId,
+    ) -> Result<(bool, usize, Vec<ColumnOrder>)> {
         let value = self
             .state
             .indexes
             .get(&table.get())
             .and_then(|per_table| per_table.get(&index.get()))
             .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
-        Ok((value.unique, value.column_ids.len()))
+        Ok((
+            value.unique,
+            value.column_ids.len(),
+            Self::column_orders(value),
+        ))
     }
 
     /// Expires a delete file, removing it.

@@ -48,7 +48,7 @@ use crate::{
 pub(crate) struct ScopedReadEntry {
     /// The row this entry points at.
     pub(crate) row_id: u64,
-    /// The indexed column values; a `None` is SQL NULL (no entry).
+    /// The indexed column values; a `None` is SQL NULL (stored multi-shaped).
     pub(crate) values: Vec<Option<IndexKeyValue>>,
 }
 

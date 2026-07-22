@@ -84,8 +84,6 @@ pub(crate) async fn scan_inline_file_deletes(
 }
 
 /// One table's Arrow IPC schema at `schema_version`, if recorded.
-// No production caller yet; see `scan_inline_chunks`.
-#[allow(dead_code)]
 pub(crate) async fn read_inline_schema(
     handle: ReadHandle<'_>,
     table_id: u64,

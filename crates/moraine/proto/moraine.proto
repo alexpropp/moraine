@@ -154,6 +154,12 @@ message IndexValue {
   // Indexed columns by field id, in declared order.
   repeated uint64 column_ids = 6;
   bool unique = 7;
+  // Per-column sort direction, parallel to column_ids (true = descending).
+  // Empty => every column ascending, so an ascending index is byte-unchanged.
+  repeated bool column_descending = 14;
+  // Per-column NULL placement, parallel to column_ids (true = NULLS FIRST).
+  // Empty => every column NULLS LAST.
+  repeated bool column_nulls_first = 15;
   // Staged-build lifecycle. Absent => a single-commit `ready` index.
   optional string build_state = 8;
   // Backfill watermark: the last covered file and row id.

@@ -63,9 +63,9 @@ impl IntWidth {
     }
 }
 
-/// A single indexed column value, typed by the column's category. NULL is
-/// never represented here: a NULL in any indexed column yields no entry,
-/// so the maintenance layer skips such rows before encoding.
+/// A single non-null indexed column value, typed by the column's category.
+/// NULL is not a variant here — it is the `None` of a column's optional
+/// value, which encodes to a leading null flag.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexKeyValue {
     /// A signed integer of a fixed width.
@@ -123,7 +123,11 @@ impl IndexKeyValue {
                     // other value.
                     (value + 0.0).to_bits()
                 };
-                bits.to_be_bytes().to_vec()
+                // Total-order transform: flip the sign bit of a non-negative
+                // value, every bit of a negative one, so the big-endian bytes
+                // sort in numeric order (NaN, collapsed above, sorts greatest).
+                let mask = 0x8000_0000_u32 | 0_u32.wrapping_sub(bits >> 31);
+                (bits ^ mask).to_be_bytes().to_vec()
             }
             Self::F64(value) => {
                 let bits = if value.is_nan() {
@@ -131,7 +135,8 @@ impl IndexKeyValue {
                 } else {
                     (value + 0.0).to_bits()
                 };
-                bits.to_be_bytes().to_vec()
+                let mask = 0x8000_0000_0000_0000_u64 | 0_u64.wrapping_sub(bits >> 63);
+                (bits ^ mask).to_be_bytes().to_vec()
             }
             Self::Bool(value) => vec![u8::from(*value)],
             // The per-component escaping that keeps composite boundaries
@@ -141,6 +146,39 @@ impl IndexKeyValue {
             Self::Bytes(value) => value.clone(),
         }
     }
+}
+
+/// Sort direction of an indexed column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Ascending — smaller values first.
+    Ascending,
+    /// Descending — larger values first, realized by complementing the
+    /// column's framed bytes so that one forward scan yields reverse value
+    /// order without a reverse iterator.
+    Descending,
+}
+
+/// Where NULLs sort relative to the non-null values of an indexed column,
+/// independent of the column's [`Direction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullOrder {
+    /// NULLs sort before every non-null value.
+    First,
+    /// NULLs sort after every non-null value.
+    Last,
+}
+
+/// One column of an ordered index key: its value (`None` is SQL NULL) and
+/// the ordering the column was declared with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderedColumn {
+    /// The column value, or `None` for NULL.
+    pub value: Option<IndexKeyValue>,
+    /// Ascending or descending.
+    pub direction: Direction,
+    /// NULL placement relative to non-null values.
+    pub nulls: NullOrder,
 }
 
 /// The canonical encoding of an index's ordered column values: the
@@ -192,14 +230,48 @@ impl CanonicalKey {
     }
 }
 
-/// Canonically encode an index's ordered column values into a
-/// [`CanonicalKey`]. Fails as [`Error::Constraint`] when the summed
-/// component size exceeds [`MAX_INDEX_KEY_BYTES`] or an integer value
-/// does not fit its declared width (truncating would map distinct values
-/// to one key). Every value must be non-null: a NULL in any indexed
-/// column yields no entry, so the caller skips such rows before encoding.
+/// Canonically encode an equality lookup's column values — the degenerate
+/// all-ascending, non-null case of [`encode_ordered_key`]. A test-only
+/// convenience; production paths call [`encode_ordered_values`] with the
+/// index's declared orders.
+#[cfg(test)]
 pub(crate) fn encode_key(values: &[IndexKeyValue]) -> Result<CanonicalKey> {
-    for value in values {
+    let columns: Vec<OrderedColumn> = values
+        .iter()
+        .map(|value| OrderedColumn {
+            value: Some(value.clone()),
+            direction: Direction::Ascending,
+            nulls: NullOrder::Last,
+        })
+        .collect();
+    encode_ordered_key(&columns)
+}
+
+/// Canonically encode an index's ordered columns into a [`CanonicalKey`].
+///
+/// Each column contributes a self-delimiting, order-preserving blob: a
+/// leading flag byte separating NULL from non-null (placed per the column's
+/// [`NullOrder`], never complemented, so null placement is independent of
+/// direction), then — for a non-null value — its canonical bytes framed as a
+/// storekey byte string, complemented in full (terminator included) when the
+/// column is [`Direction::Descending`] so variable-length values reverse
+/// correctly. Concatenating the blobs makes byte order equal SQL tuple order.
+///
+/// Fails as [`Error::Constraint`] when the summed non-null value size exceeds
+/// [`MAX_INDEX_KEY_BYTES`] or an integer value does not fit its declared
+/// width (truncating would map distinct values to one key).
+pub(crate) fn encode_ordered_key(columns: &[OrderedColumn]) -> Result<CanonicalKey> {
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    for column in columns {
+        let (null_flag, non_null_flag) = match column.nulls {
+            NullOrder::First => (0x00u8, 0x01u8),
+            NullOrder::Last => (0x01u8, 0x00u8),
+        };
+        let Some(value) = &column.value else {
+            out.push(null_flag);
+            continue;
+        };
         let fits = match value {
             IndexKeyValue::Int { value, width } => width.holds_signed(*value),
             IndexKeyValue::UInt { value, width } => width.holds_unsigned(*value),
@@ -210,27 +282,57 @@ pub(crate) fn encode_key(values: &[IndexKeyValue]) -> Result<CanonicalKey> {
                 "index key value {value:?} does not fit its declared integer width"
             )));
         }
+        let raw = value.encode();
+        total += raw.len();
+        let framed = frame_bytes(&raw);
+        out.push(non_null_flag);
+        match column.direction {
+            Direction::Ascending => out.extend_from_slice(&framed),
+            Direction::Descending => out.extend(framed.iter().map(|byte| !byte)),
+        }
     }
-
-    let components: Vec<Vec<u8>> = values.iter().map(IndexKeyValue::encode).collect();
-    let total: usize = components.iter().map(Vec::len).sum();
     if total > MAX_INDEX_KEY_BYTES {
         return Err(Error::Constraint(format!(
             "index key of {total} bytes exceeds the {MAX_INDEX_KEY_BYTES}-byte limit"
         )));
     }
-    // This inner framing keeps storekey's sequence codec, which the entry
-    // key's own framing deliberately avoids: the two are different layers,
-    // and only this one is write-only — nothing decodes components back out,
-    // and a sequence of sequences ends in a terminator, never in a
-    // fixed-width field that could swallow the escape state. Adding a
-    // trailing fixed-width component here would reintroduce that hazard.
-    //
+    Ok(CanonicalKey(out))
+}
+
+/// Encode index values in their columns' declared orders. `directions` and
+/// `nulls` run parallel to `values`; where either is shorter (or empty) the
+/// column defaults to ascending / NULLS LAST, so an empty slice means the
+/// all-ascending equality shape. A `None` value is SQL NULL.
+pub(crate) fn encode_ordered_values(
+    values: &[Option<IndexKeyValue>],
+    directions: &[Direction],
+    nulls: &[NullOrder],
+) -> Result<CanonicalKey> {
+    let columns: Vec<OrderedColumn> = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| OrderedColumn {
+            value: value.clone(),
+            direction: directions
+                .get(index)
+                .copied()
+                .unwrap_or(Direction::Ascending),
+            nulls: nulls.get(index).copied().unwrap_or(NullOrder::Last),
+        })
+        .collect();
+    encode_ordered_key(&columns)
+}
+
+/// A single slice framed as a storekey byte string: low bytes escaped behind
+/// `0x01`, a `0x00` terminator — order-preserving and prefix-free, so a
+/// shorter value sorts before its extension and component boundaries stay
+/// unambiguous under concatenation.
+fn frame_bytes(raw: &[u8]) -> Vec<u8> {
     // Infallible by construction: a `Vec` sink raises no io error and
-    // storekey's `Vec` encoder raises no custom error.
+    // storekey's `Vec<u8>` encoder (a byte string, not the generic sequence
+    // codec) raises no custom error.
     #[allow(clippy::expect_used)]
-    let framed = storekey::encode_vec(&components).expect("storekey encode into a Vec cannot fail");
-    Ok(CanonicalKey(framed))
+    storekey::encode_vec(&raw.to_vec()).expect("storekey encode into a Vec cannot fail")
 }
 
 #[cfg(test)]
@@ -508,6 +610,122 @@ mod tests {
         );
     }
 
+    fn int(value: i128) -> IndexKeyValue {
+        IndexKeyValue::Int {
+            value,
+            width: IntWidth::I64,
+        }
+    }
+
+    fn ordered(value: Option<IndexKeyValue>, direction: Direction, nulls: NullOrder) -> Vec<u8> {
+        encode_ordered_key(&[OrderedColumn {
+            value,
+            direction,
+            nulls,
+        }])
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+    }
+
+    #[test]
+    fn float_encoding_is_order_preserving() {
+        let enc = |v: f64| IndexKeyValue::F64(v).encode();
+        let rising = [
+            f64::NEG_INFINITY,
+            -1e300,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            1e300,
+            f64::INFINITY,
+        ];
+        for pair in rising.windows(2) {
+            assert!(enc(pair[0]) <= enc(pair[1]), "{} !<= {}", pair[0], pair[1]);
+        }
+        // Strict where the values differ, and NaN sorts greatest of all.
+        assert!(enc(-1.0) < enc(1.0));
+        assert!(enc(f64::NEG_INFINITY) < enc(-1e300));
+        assert!(enc(f64::INFINITY) < enc(f64::NAN));
+        // -0.0 and 0.0 collapse to one encoding.
+        assert_eq!(enc(-0.0), enc(0.0));
+    }
+
+    #[test]
+    fn descending_reverses_numeric_order() {
+        let asc = |v: i128| ordered(Some(int(v)), Direction::Ascending, NullOrder::Last);
+        let desc = |v: i128| ordered(Some(int(v)), Direction::Descending, NullOrder::Last);
+        assert!(asc(1) < asc(2));
+        // The larger value sorts first under descending.
+        assert!(desc(2) < desc(1));
+    }
+
+    #[test]
+    fn descending_reverses_variable_length_strings() {
+        let string = |s: &str| IndexKeyValue::Str(s.to_owned());
+        let asc = |s: &str| ordered(Some(string(s)), Direction::Ascending, NullOrder::Last);
+        let desc = |s: &str| ordered(Some(string(s)), Direction::Descending, NullOrder::Last);
+        // Ascending "a" < "ab"; descending must reverse it, length included —
+        // the property that breaks if only the raw bytes are complemented.
+        assert!(asc("a") < asc("ab"));
+        assert!(desc("ab") < desc("a"));
+    }
+
+    #[test]
+    fn null_placement_respects_first_and_last_under_both_directions() {
+        for direction in [Direction::Ascending, Direction::Descending] {
+            let null_first = ordered(None, direction, NullOrder::First);
+            let value_first = ordered(Some(int(0)), direction, NullOrder::First);
+            assert!(null_first < value_first, "NULLS FIRST under {direction:?}");
+
+            let null_last = ordered(None, direction, NullOrder::Last);
+            let value_last = ordered(Some(int(0)), direction, NullOrder::Last);
+            assert!(value_last < null_last, "NULLS LAST under {direction:?}");
+        }
+    }
+
+    #[test]
+    fn composite_order_matches_declared_per_column_directions() {
+        // Index (a ASC, b DESC).
+        let key = |a: i128, b: i128| {
+            encode_ordered_key(&[
+                OrderedColumn {
+                    value: Some(int(a)),
+                    direction: Direction::Ascending,
+                    nulls: NullOrder::Last,
+                },
+                OrderedColumn {
+                    value: Some(int(b)),
+                    direction: Direction::Descending,
+                    nulls: NullOrder::Last,
+                },
+            ])
+            .unwrap()
+        };
+        // `a` ascending is the primary sort, whatever `b` holds.
+        assert!(key(1, 100) < key(2, 100));
+        assert!(key(1, 0) < key(2, 100));
+        // Within one `a`, `b` sorts descending.
+        assert!(key(1, 100) < key(1, 50));
+        assert!(key(1, 50) < key(1, 10));
+    }
+
+    #[test]
+    fn ordered_encoding_is_deterministic_for_uniqueness() {
+        // A unique index keys on the value alone; the same value must encode
+        // identically under any direction so racing inserts collide.
+        let one = ordered(Some(int(7)), Direction::Descending, NullOrder::First);
+        assert_eq!(
+            one,
+            ordered(Some(int(7)), Direction::Descending, NullOrder::First)
+        );
+        assert_ne!(
+            one,
+            ordered(Some(int(8)), Direction::Descending, NullOrder::First)
+        );
+    }
+
     mod properties {
         use proptest::prelude::*;
 
@@ -545,6 +763,18 @@ mod tests {
                 let one = encode(u128::from(a));
                 let two = encode(u128::from(b));
                 prop_assert_eq!(a.cmp(&b), one.cmp(&two));
+            }
+
+            /// Non-NaN float bytes sort in numeric total order, with -0.0 and
+            /// +0.0 collapsed to one value.
+            #[test]
+            fn float_encoding_preserves_total_order(a: f64, b: f64) {
+                prop_assume!(!a.is_nan() && !b.is_nan());
+                let one = IndexKeyValue::F64(a).encode();
+                let two = IndexKeyValue::F64(b).encode();
+                let norm = |v: f64| if v == 0.0 { 0.0 } else { v };
+                let expected = norm(a).partial_cmp(&norm(b)).unwrap();
+                prop_assert_eq!(expected, one.cmp(&two));
             }
 
             /// In-range narrow values encode injectively — the property the
