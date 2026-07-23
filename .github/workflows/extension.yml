@@ -16,7 +16,7 @@ on:
 jobs:
   build:
     name: Build (extension-ci-tools)
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
     with:
       extension_name: moraine
       duckdb_version: v1.5.4
