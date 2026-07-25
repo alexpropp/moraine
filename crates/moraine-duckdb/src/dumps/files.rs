@@ -151,8 +151,8 @@ pub unsafe extern "C" fn moraine_dump_data_files(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_data_files`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_data_files`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_data_files_free(items: *mut MoraineDataFileRow, len: usize) {
     // SAFETY: forwarded caller contract.
@@ -275,8 +275,8 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_delete_files`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_delete_files`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_delete_files_free(
     items: *mut MoraineDeleteFileRow,
@@ -370,8 +370,8 @@ pub unsafe extern "C" fn moraine_dump_file_partition_values(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_file_partition_values`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_file_partition_values`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_file_partition_values_free(
     items: *mut MoraineFilePartitionValueRow,
@@ -457,8 +457,8 @@ pub unsafe extern "C" fn moraine_dump_scheduled_deletions(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_scheduled_deletions`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_scheduled_deletions`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_scheduled_deletions_free(
     items: *mut MoraineScheduledDeletionRow,

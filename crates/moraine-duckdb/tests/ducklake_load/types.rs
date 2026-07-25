@@ -5,19 +5,18 @@ use crate::helpers::*;
 /// materialized as a real table) and read back through DuckLake's own
 /// inlined-data reader, not this crate's scan.
 ///
-/// - `INSERT` (two statements, two chunks) of mixed types (`BIGINT`,
-///   `VARCHAR`, `DOUBLE`, `BOOLEAN`) and `NULL`s inlines; `SELECT`
-///   returns every row with the right values and types.
+/// - `INSERT` (two statements, two chunks) of mixed types (`BIGINT`, `VARCHAR`,
+///   `DOUBLE`, `BOOLEAN`) and `NULL`s inlines; `SELECT` returns every row with
+///   the right values and types.
 /// - `DELETE` of one row stages an `inline/inline_delete`; a follow-up `SELECT`
 ///   no longer sees it.
-/// - `CALL ducklake_flush_inlined_data('lake')` moves the remaining
-///   rows to a real Parquet file; `SELECT` afterward is still correct
-///   (now served by DuckLake's Parquet reader plus its delete-file join
-///   for the pre-flush `DELETE`), and the standalone `moraine:`
-///   attach's row-faithful projections confirm the `inline/insert` chunk
-///   is gone (0 remaining rows in the now-empty
-///   `ducklake_inlined_data_<t>_<v>` entry) and a `ducklake_data_file`
-///   is registered.
+/// - `CALL ducklake_flush_inlined_data('lake')` moves the remaining rows to a
+///   real Parquet file; `SELECT` afterward is still correct (now served by
+///   DuckLake's Parquet reader plus its delete-file join for the pre-flush
+///   `DELETE`), and the standalone `moraine:` attach's row-faithful projections
+///   confirm the `inline/insert` chunk is gone (0 remaining rows in the
+///   now-empty `ducklake_inlined_data_<t>_<v>` entry) and a
+///   `ducklake_data_file` is registered.
 ///
 /// The full DuckLake scalar type matrix — every scalar moraine maps —
 /// created, inlined, and round-tripped live through DuckLake's own SQL,

@@ -30,8 +30,8 @@ pub struct InlineRow {
 
 /// Every row across every chunk — one per `(chunk, offset)`, `row_id =
 /// chunk.row_id_start + offset` for `offset` in `0..chunk.row_count` —
-/// with `end_snapshot` resolved from `inline_deletes`. Includes tombstoned rows;
-/// callers apply the scan-kind predicate via [`InlineScanKind::select`].
+/// with `end_snapshot` resolved from `inline_deletes`. Includes tombstoned
+/// rows; callers apply the scan-kind predicate via [`InlineScanKind::select`].
 /// `chunks` entries that are not `InlineOperation::Insert` are skipped.
 pub fn materialize_inline_rows(
     chunks: &[(InlineOperation, InlineChunkValue)],

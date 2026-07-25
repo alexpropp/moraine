@@ -2,14 +2,13 @@
 //! catalog. Three layers, thin by policy — no DuckLake domain logic lives
 //! outside the core crate:
 //!
-//! 1. a **C++ shim** (`cpp/*.cpp`, compiled by the DuckDB extension
-//!    toolchain) links DuckDB's internal C++ API and registers a
-//!    `StorageExtension`;
-//! 2. a **C ABI** (the [`abi`] module, mirrored by hand in
-//!    `cpp/moraine_abi.h`) marshals calls across the language boundary and
-//!    owns the sync↔async bridge — one tokio runtime per attached catalog,
-//!    `block_on` at every entry point, `catch_unwind` so a core panic
-//!    surfaces as an error code, never an unwind into C++;
+//! 1. a **C++ shim** (`cpp/*.cpp`, compiled by the DuckDB extension toolchain)
+//!    links DuckDB's internal C++ API and registers a `StorageExtension`;
+//! 2. a **C ABI** (the [`abi`] module, mirrored by hand in `cpp/moraine_abi.h`)
+//!    marshals calls across the language boundary and owns the sync↔async
+//!    bridge — one tokio runtime per attached catalog, `block_on` at every
+//!    entry point, `catch_unwind` so a core panic surfaces as an error code,
+//!    never an unwind into C++;
 //! 3. the async [moraine] core, unaware any of this exists.
 //!
 //! **Primary path:** `ATTACH 'ducklake:moraine:<store>' AS lake (DATA_PATH

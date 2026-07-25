@@ -72,8 +72,8 @@ pub unsafe extern "C" fn moraine_dump_table_stats(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_table_stats`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_table_stats`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_table_stats_free(
     items: *mut MoraineTableStatsRow,
@@ -177,8 +177,8 @@ pub unsafe extern "C" fn moraine_dump_table_column_stats(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_table_column_stats`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_table_column_stats`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_table_column_stats_free(
     items: *mut MoraineTableColumnStatsRow,
@@ -293,8 +293,8 @@ pub unsafe extern "C" fn moraine_dump_file_column_stats(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_file_column_stats`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_file_column_stats`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_file_column_stats_free(
     items: *mut MoraineFileColumnStatsRow,

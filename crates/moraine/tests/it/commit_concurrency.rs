@@ -31,8 +31,8 @@ async fn disjoint_table_ddl_both_succeed() {
 async fn same_table_ddl_races_serialize_or_conflict() {
     let (catalog, _s, a, _b) = seeded().await;
     // Whether a round serializes or conflicts depends on scheduling; the
-    // classifier itself is pinned by the `transaction::operations` unit tests. This test
-    // only requires that races never corrupt state.
+    // classifier itself is pinned by the `transaction::operations` unit tests. This
+    // test only requires that races never corrupt state.
     let mut added = Vec::new();
     for round in 0..20 {
         let c1 = catalog.clone();

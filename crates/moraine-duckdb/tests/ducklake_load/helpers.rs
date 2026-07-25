@@ -133,11 +133,11 @@ pub fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
 /// Writes `<data_path>/main/t_old/data.parquet`. Two path facts drive
 /// this:
 ///
-/// - DuckLake resolves a relative data-file path against `<DATA_PATH
-///   from ATTACH>/<schema.path>/<table.path>/`, never against the
-///   metadata store's own directory.
-/// - `table.path` is fixed at `CREATE TABLE` time (here, `t_old/`) and
-///   is untouched by a later rename.
+/// - DuckLake resolves a relative data-file path against `<DATA_PATH from
+///   ATTACH>/<schema.path>/<table.path>/`, never against the metadata store's
+///   own directory.
+/// - `table.path` is fixed at `CREATE TABLE` time (here, `t_old/`) and is
+///   untouched by a later rename.
 ///
 /// Returns `(file_size_bytes, footer_size)` for the written file, per
 /// the Parquet spec's fixed trailer: the last 4 bytes are the magic

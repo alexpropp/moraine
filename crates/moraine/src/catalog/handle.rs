@@ -76,7 +76,10 @@ enum Store {
 ///
 /// ```
 /// let options = moraine::CatalogOptions::default();
-/// assert_eq!(options.flush_interval, std::time::Duration::from_millis(100));
+/// assert_eq!(
+///     options.flush_interval,
+///     std::time::Duration::from_millis(100)
+/// );
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -329,9 +332,10 @@ impl Catalog {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] if the index does not exist, [`Error::IndexBuilding`]
-    /// if its staged backfill has not completed, [`Error::Constraint`] if a
-    /// bound value exceeds the size cap, or a store error if the scan fails.
+    /// [`Error::NotFound`] if the index does not exist,
+    /// [`Error::IndexBuilding`] if its staged backfill has not completed,
+    /// [`Error::Constraint`] if a bound value exceeds the size cap, or a
+    /// store error if the scan fails.
     pub async fn index_range(
         &self,
         table: TableId,
@@ -442,13 +446,15 @@ impl Catalog {
     /// (an unconstrained leading column) is not expressible, so a bare
     /// non-leading `IS NULL` is not served — use a scan filter for that.
     ///
-    /// Head-only and candidate-returning like [`index_lookup`](Self::index_lookup).
+    /// Head-only and candidate-returning like
+    /// [`index_lookup`](Self::index_lookup).
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] if the index does not exist, [`Error::IndexBuilding`]
-    /// while its staged backfill runs, or [`Error::Constraint`] if the prefix
-    /// is empty, longer than the index, or names no `IS NULL`.
+    /// [`Error::NotFound`] if the index does not exist,
+    /// [`Error::IndexBuilding`] while its staged backfill runs, or
+    /// [`Error::Constraint`] if the prefix is empty, longer than the index,
+    /// or names no `IS NULL`.
     pub async fn index_nulls(
         &self,
         table: TableId,

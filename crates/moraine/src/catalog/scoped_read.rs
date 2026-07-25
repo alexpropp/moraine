@@ -810,7 +810,8 @@ mod tests {
 
     /// Prints the exact bytes and requests the range reader issues per
     /// fixture shape. Run with:
-    /// `cargo test -p moraine --lib -- --ignored --nocapture prints_fetch_profile`
+    /// `cargo test -p moraine --lib -- --ignored --nocapture
+    /// prints_fetch_profile`
     #[tokio::test]
     #[ignore = "fetch-profile probe; run manually with --nocapture"]
     async fn prints_fetch_profile() {

@@ -81,8 +81,8 @@ pub unsafe extern "C" fn moraine_dump_partition_info(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_partition_info`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_partition_info`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_partition_info_free(
     items: *mut MorainePartitionInfoRow,
@@ -171,8 +171,8 @@ pub unsafe extern "C" fn moraine_dump_partition_columns(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_partition_columns`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_partition_columns`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_partition_columns_free(
     items: *mut MorainePartitionColumnRow,
@@ -256,8 +256,8 @@ pub unsafe extern "C" fn moraine_dump_sort_info(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_info`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_info`]
+/// call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_sort_info_free(items: *mut MoraineSortInfoRow, len: usize) {
     // SAFETY: forwarded caller contract.
@@ -354,8 +354,8 @@ pub unsafe extern "C" fn moraine_dump_sort_expressions(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_expressions`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_sort_expressions`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_sort_expressions_free(
     items: *mut MoraineSortExpressionRow,

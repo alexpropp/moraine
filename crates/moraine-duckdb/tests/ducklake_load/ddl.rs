@@ -2,17 +2,15 @@ use crate::helpers::*;
 
 /// The staged-row write path, driven end to end by DuckLake's own SQL:
 ///
-/// - `CREATE TABLE` **completes** — its metadata INSERT batch
-///   translates through `PlanInsert` and lands as one atomic staged
-///   commit. Row inlining is on (the synthesized `ducklake_metadata`
-///   serves `data_inlining_row_limit = 10`, DuckLake's default), so
-///   `CREATE TABLE` also provisions the dynamic
-///   `ducklake_inlined_data_<t>_<v>` entry this shim recognizes and
-///   routes into the `inline/*` keyspace rather than materializing.
-/// - `ALTER TABLE ... RENAME TO` drives DuckLake's `UPDATE
-///   ducklake_table SET end_snapshot ... WHERE end_snapshot IS NULL AND
-///   table_id IN (...)` — the old version must land in history, the
-///   renamed one in current.
+/// - `CREATE TABLE` **completes** — its metadata INSERT batch translates
+///   through `PlanInsert` and lands as one atomic staged commit. Row inlining
+///   is on (the synthesized `ducklake_metadata` serves `data_inlining_row_limit
+///   = 10`, DuckLake's default), so `CREATE TABLE` also provisions the dynamic
+///   `ducklake_inlined_data_<t>_<v>` entry this shim recognizes and routes into
+///   the `inline/*` keyspace rather than materializing.
+/// - `ALTER TABLE ... RENAME TO` drives DuckLake's `UPDATE ducklake_table SET
+///   end_snapshot ... WHERE end_snapshot IS NULL AND table_id IN (...)` — the
+///   old version must land in history, the renamed one in current.
 /// - `DROP TABLE` drives the same UPDATE convention for the drop.
 ///
 /// Every step is verified through two independent surfaces: DuckLake's
@@ -493,9 +491,9 @@ fn ducklake_column_type_promotion_over_inlined_data() {
 /// writes two different tables mints exactly one `ducklake_snapshot`, and
 /// both tables' rows appear together or not at all.
 ///
-/// - `BEGIN; INSERT a; INSERT b; COMMIT;` across two tables lands both
-///   rows and advances the snapshot by exactly one (not one per
-///   statement) — the batching proof.
+/// - `BEGIN; INSERT a; INSERT b; COMMIT;` across two tables lands both rows and
+///   advances the snapshot by exactly one (not one per statement) — the
+///   batching proof.
 /// - `BEGIN; INSERT; ROLLBACK;` discards the write and mints no snapshot.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]

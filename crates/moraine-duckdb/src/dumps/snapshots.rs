@@ -109,8 +109,8 @@ pub unsafe extern "C" fn moraine_dump_snapshots(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_snapshots`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_snapshots`]
+/// call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_snapshots_free(items: *mut MoraineSnapshotRow, len: usize) {
     // SAFETY: forwarded caller contract.
@@ -185,8 +185,8 @@ pub unsafe extern "C" fn moraine_dump_schema_versions(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_schema_versions`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_schema_versions`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_schema_versions_free(
     items: *mut MoraineSchemaVersionRow,

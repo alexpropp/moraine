@@ -656,8 +656,8 @@ mod tests {
     /// `moraine_inline_scan` (`Table`) returns the row with the right
     /// `row_id`/`begin_snapshot`/body, and `moraine_inline_schemas`/
     /// `moraine_inline_registered_tables` see the schema. Staging an
-    /// `inline/inline_delete` then makes the row disappear from a `Table` scan at
-    /// or after its `end_snapshot`. Staging a flush-delete then empties
+    /// `inline/inline_delete` then makes the row disappear from a `Table` scan
+    /// at or after its `end_snapshot`. Staging a flush-delete then empties
     /// the scan and drops the table from the registered-tables list.
     #[test]
     #[allow(clippy::too_many_lines)]

@@ -851,12 +851,12 @@ mod tests {
     }
 
     /// The other two op kinds over the wire: an `update_set_end` row
-    /// (`operation_kind` 2 — the C++ UPDATE operator's staging for a rename/drop)
-    /// moves the old table version to history, and a raw `delete` row
-    /// (`operation_kind` 1) removes an unversioned statistics row. Cell layouts
-    /// here are exactly what `cpp/staged_write.cpp`'s Sinks emit: key
-    /// cells in decoder order, plus (for `update_set_end`) the new
-    /// `end_snapshot`.
+    /// (`operation_kind` 2 — the C++ UPDATE operator's staging for a
+    /// rename/drop) moves the old table version to history, and a raw
+    /// `delete` row (`operation_kind` 1) removes an unversioned statistics
+    /// row. Cell layouts here are exactly what `cpp/staged_write.cpp`'s
+    /// Sinks emit: key cells in decoder order, plus (for `update_set_end`)
+    /// the new `end_snapshot`.
     #[test]
     fn update_set_end_and_stats_delete_over_the_abi() {
         let dir = TempDir::new("end-delete");

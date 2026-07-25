@@ -1,12 +1,11 @@
 //! Repo automation. Invoked as `cargo xtask <command>`.
 //!
-//! - `e2e` packages the extension and drives it through a real DuckDB CLI
-//!   (see `e2e.rs`).
-//! - `bench` compares DuckLake metadata catalogs — moraine's SlateDB
-//!   store, a stock DuckDB file, and Postgres — on identical workloads
-//!   (see `bench.rs`).
-//! - `s3` runs the catalog's object storage suite against a pinned MinIO
-//!   server (see `s3.rs`).
+//! - `e2e` packages the extension and drives it through a real DuckDB CLI (see
+//!   `e2e.rs`).
+//! - `bench` compares DuckLake metadata catalogs — moraine's SlateDB store, a
+//!   stock DuckDB file, and Postgres — on identical workloads (see `bench.rs`).
+//! - `s3` runs the catalog's object storage suite against a pinned MinIO server
+//!   (see `s3.rs`).
 
 use anyhow::bail;
 

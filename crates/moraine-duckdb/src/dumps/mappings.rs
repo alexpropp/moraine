@@ -80,8 +80,8 @@ pub unsafe extern "C" fn moraine_dump_column_mappings(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_column_mappings`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_column_mappings`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_column_mappings_free(
     items: *mut MoraineColumnMappingRow,
@@ -180,8 +180,8 @@ pub unsafe extern "C" fn moraine_dump_name_mappings(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_name_mappings`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_name_mappings`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_name_mappings_free(
     items: *mut MoraineNameMappingRow,

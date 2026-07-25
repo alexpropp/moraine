@@ -90,8 +90,8 @@ pub unsafe extern "C" fn moraine_dump_macros(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_macros`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_macros`]
+/// call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macros_free(items: *mut MoraineMacroRow, len: usize) {
     // SAFETY: forwarded caller contract.
@@ -181,8 +181,8 @@ pub unsafe extern "C" fn moraine_dump_macro_impls(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_macro_impls`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_macro_impls`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macro_impls_free(
     items: *mut MoraineMacroImplRow,
@@ -300,8 +300,8 @@ pub unsafe extern "C" fn moraine_dump_macro_parameters(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_macro_parameters`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_macro_parameters`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_macro_parameters_free(
     items: *mut MoraineMacroParameterRow,

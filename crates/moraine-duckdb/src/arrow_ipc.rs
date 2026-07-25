@@ -265,7 +265,8 @@ pub unsafe extern "C" fn moraine_arrow_decode_body(
         if schema_ipc.is_null() || body.is_null() {
             return Err(AbiError::invalid_argument("null schema or body"));
         }
-        // SAFETY: caller guarantees `schema_ipc_len` bytes are readable at `schema_ipc`.
+        // SAFETY: caller guarantees `schema_ipc_len` bytes are readable at
+        // `schema_ipc`.
         let schema_bytes = unsafe { std::slice::from_raw_parts(schema_ipc, schema_ipc_len) };
         // SAFETY: caller guarantees `body_len` bytes are readable at `body`.
         let body_bytes = unsafe { std::slice::from_raw_parts(body, body_len) };

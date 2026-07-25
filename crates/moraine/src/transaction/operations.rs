@@ -246,7 +246,8 @@ fn split_entries(changes_made: &str) -> Vec<&str> {
 /// DuckLake's own wire grammar: comma-joined `kind:payload` entries,
 /// created entries carrying SQL-quoted names and all other entries
 /// carrying numeric ids, e.g.
-/// `dropped_schema:5,dropped_table:4,created_schema:"s1",created_table:"s1"."orders",altered_table:3`.
+/// `dropped_schema:5,dropped_table:4,created_schema:"s1",created_table:"s1"."
+/// orders",altered_table:3`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ChangeSet {
     /// Names of schemas created by this commit, unquoted.

@@ -98,8 +98,8 @@ pub unsafe extern "C" fn moraine_dump_schemas(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_schemas`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_schemas`]
+/// call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_schemas_free(items: *mut MoraineSchemaRow, len: usize) {
     // SAFETY: forwarded caller contract.
@@ -204,8 +204,8 @@ pub unsafe extern "C" fn moraine_dump_tables(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_tables`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_tables`]
+/// call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_tables_free(items: *mut MoraineTableRow, len: usize) {
     // SAFETY: forwarded caller contract.
@@ -314,8 +314,8 @@ pub unsafe extern "C" fn moraine_dump_views(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_views`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_views`]
+/// call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_views_free(items: *mut MoraineViewRow, len: usize) {
     // SAFETY: forwarded caller contract.
@@ -464,8 +464,8 @@ pub unsafe extern "C" fn moraine_dump_columns(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_columns`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching [`moraine_dump_columns`]
+/// call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_columns_free(items: *mut MoraineColumnRow, len: usize) {
     // SAFETY: forwarded caller contract.

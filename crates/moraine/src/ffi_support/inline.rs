@@ -149,8 +149,8 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
 
 /// Whether `table_id` has at least one recorded `inline/file_delete` record.
 /// DuckLake probes the inlined-delete table's existence via a catalog bind
-/// that must error until the first `inline/file_delete` is staged, so this reports
-/// the table missing (not merely unreferenced) until then.
+/// that must error until the first `inline/file_delete` is staged, so this
+/// reports the table missing (not merely unreferenced) until then.
 ///
 /// # Errors
 ///

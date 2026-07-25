@@ -190,8 +190,8 @@ pub unsafe extern "C" fn moraine_dump_column_tags(
 ///
 /// # Safety
 ///
-/// `items`/`len` must be exactly the pair a matching [`moraine_dump_column_tags`] call
-/// wrote, not yet freed.
+/// `items`/`len` must be exactly the pair a matching
+/// [`moraine_dump_column_tags`] call wrote, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_dump_column_tags_free(
     items: *mut MoraineColumnTagRow,
