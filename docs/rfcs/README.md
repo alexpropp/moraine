@@ -40,3 +40,4 @@ directly here as RFCs; there is no separate specs directory.
 | [0018](0018-column-and-name-mapping.md) | Column and name mapping for external Parquet |
 | [0019](0019-macros.md) | Scalar and table macros |
 | [0020](0020-change-data-feed.md) | Change data feed |
+| [0021](0021-maintenance-model.md) | Maintenance orchestration |

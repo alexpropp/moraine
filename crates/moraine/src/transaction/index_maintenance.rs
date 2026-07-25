@@ -1,5 +1,5 @@
 //! Index entry maintenance: turning writer-supplied entries into staged
-//! `idx` writes, with commit-time uniqueness enforcement.
+//! `index` writes, with commit-time uniqueness enforcement.
 //!
 //! Entries ride the same batch as the commit that owns them. A unique
 //! entry's store key *is* the value, so staging its put arms SlateDB's
@@ -16,7 +16,7 @@ use crate::{
     store::{
         handle::ReadHandle,
         index_encoding::CanonicalKey,
-        key::{IdxKey, IdxKind, Key, idx_index_prefix, idx_multi_value_prefix},
+        key::{IndexKey, IndexKind, Key, index_index_prefix, index_multi_value_prefix},
     },
     transaction::commit::StagedWrite,
 };
@@ -39,12 +39,12 @@ pub(crate) struct StagedIndexEntry {
 
 fn entry_key(entry: &StagedIndexEntry) -> Key {
     if entry.unique {
-        Key::Idx(IdxKey::Unique {
+        Key::Index(IndexKey::Unique {
             index_id: entry.index_id,
             key: entry.key.clone(),
         })
     } else {
-        Key::Idx(IdxKey::Multi {
+        Key::Index(IndexKey::Multi {
             index_id: entry.index_id,
             key: entry.key.clone(),
             row_id: entry.row_id,
@@ -134,12 +134,12 @@ pub(crate) async fn reclaim_entries(
     limit: usize,
 ) -> Result<usize> {
     let mut deleted = 0;
-    for kind in [IdxKind::Unique, IdxKind::Multi] {
+    for kind in [IndexKind::Unique, IndexKind::Multi] {
         if deleted >= limit {
             break;
         }
         let mut iter = ReadHandle::Tx(tx)
-            .scan_prefix(idx_index_prefix(kind, index_id), ..)
+            .scan_prefix(index_index_prefix(kind, index_id), ..)
             .await?;
         while deleted < limit {
             match iter.next().await? {
@@ -164,7 +164,7 @@ pub(crate) async fn lookup_row_ids(
     key: &CanonicalKey,
 ) -> Result<Vec<u64>> {
     if unique {
-        let entry_key = Key::Idx(IdxKey::Unique {
+        let entry_key = Key::Index(IndexKey::Unique {
             index_id,
             key: key.clone(),
         })
@@ -175,12 +175,12 @@ pub(crate) async fn lookup_row_ids(
         };
     }
 
-    let prefix = idx_multi_value_prefix(index_id, key);
+    let prefix = index_multi_value_prefix(index_id, key);
     let mut iter = reader.scan_prefix(prefix, ..).await.map_err(Error::from)?;
     let mut row_ids = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Idx(IdxKey::Multi { row_id, .. }) => row_ids.push(row_id),
+            Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
             other => {
                 return Err(Error::Corruption(format!(
                     "non-multi key in index scan: {other:?}"
@@ -205,23 +205,23 @@ pub(crate) async fn range_row_ids(
     upper: Bound<CanonicalKey>,
 ) -> Result<Vec<u64>> {
     let kind = if unique {
-        IdxKind::Unique
+        IndexKind::Unique
     } else {
-        IdxKind::Multi
+        IndexKind::Multi
     };
-    let prefix = idx_index_prefix(kind, index_id);
+    let prefix = index_index_prefix(kind, index_id);
     let prefix_len = prefix.len();
 
     // The framed value bytes as they appear in an entry key after the
     // `(kind, index_id)` prefix — the suffix a subrange bounds against.
     let suffix = |canon: &CanonicalKey| -> Vec<u8> {
         let full = match kind {
-            IdxKind::Unique => Key::Idx(IdxKey::Unique {
+            IndexKind::Unique => Key::Index(IndexKey::Unique {
                 index_id,
                 key: canon.clone(),
             })
             .encode(),
-            IdxKind::Multi => idx_multi_value_prefix(index_id, canon),
+            IndexKind::Multi => index_multi_value_prefix(index_id, canon),
         };
         full[prefix_len..].to_vec()
     };
@@ -255,7 +255,7 @@ pub(crate) async fn range_row_ids(
             row_ids.push(decode_row_id(entry.value.as_ref())?);
         } else {
             match Key::decode(&entry.key)? {
-                Key::Idx(IdxKey::Multi { row_id, .. }) => row_ids.push(row_id),
+                Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
                 other => {
                     return Err(Error::Corruption(format!(
                         "non-multi key in index range scan: {other:?}"
@@ -277,8 +277,8 @@ pub(crate) async fn null_prefix_row_ids(
     index_id: u64,
     prefix: &CanonicalKey,
 ) -> Result<Vec<u64>> {
-    let mut scan_prefix = idx_multi_value_prefix(index_id, prefix);
-    // `idx_multi_value_prefix` frames the value and appends a terminator for an
+    let mut scan_prefix = index_multi_value_prefix(index_id, prefix);
+    // `index_multi_value_prefix` frames the value and appends a terminator for an
     // exact-value scan; dropping it turns the bytes into a true leading prefix.
     scan_prefix.pop();
     let mut iter = reader
@@ -288,7 +288,7 @@ pub(crate) async fn null_prefix_row_ids(
     let mut row_ids = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
-            Key::Idx(IdxKey::Multi { row_id, .. }) => row_ids.push(row_id),
+            Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
             other => {
                 return Err(Error::Corruption(format!(
                     "non-multi key in null-prefix scan: {other:?}"

@@ -528,11 +528,39 @@ void MoraineSchemaEntry::Alter(duckdb::CatalogTransaction transaction, duckdb::A
 	throw duckdb::NotImplementedException("moraine: altering an entry is not supported (read-only catalog)");
 }
 
-MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path)
+MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path,
+                               MaintenanceConfig maintenance)
     : duckdb::Catalog(db), handle_(handle), path_(std::move(path)) {
+	// A throw here would abandon a partially constructed object, whose
+	// destructor never runs — so the handle would leak with no
+	// `moraine_detach`. Release it by hand and re-throw instead.
+	try {
+		scheduler_ = duckdb::make_uniq<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), handle_,
+		                                                     std::move(maintenance));
+		// A read-only attach never schedules — maintenance mutates, and
+		// a `DbReader` never opens a writer. The trigger refuses too.
+		if (!db.IsReadOnly()) {
+			scheduler_->Start();
+		}
+	} catch (...) {
+		if (scheduler_) {
+			scheduler_->Stop();
+			scheduler_.reset();
+		}
+		if (handle_ != nullptr) {
+			moraine_detach(handle_);
+			handle_ = nullptr;
+		}
+		throw;
+	}
 }
 
 MoraineCatalog::~MoraineCatalog() {
+	// The thread issues SQL against this database and calls through
+	// `handle_`, so it must be stopped before either goes away.
+	if (scheduler_) {
+		scheduler_->Stop();
+	}
 	if (handle_ != nullptr) {
 		moraine_detach(handle_);
 		handle_ = nullptr;
@@ -565,6 +593,17 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
 	// data layer and does not forward it to this metadata attach.)
 	std::string data_path;
+	// `MAINTENANCE_*` configures the scheduled pass: the cadence, and
+	// which of DuckLake's own maintenance functions it runs. Every step
+	// that mutates the lake is opt-in, so an attach naming none schedules
+	// only the orphaned-index sweep.
+	std::vector<std::pair<std::string, duckdb::Value>> maintenance_options;
+	for (auto &option : info.options) {
+		if (duckdb::StringUtil::StartsWith(duckdb::StringUtil::Lower(option.first), "maintenance_")) {
+			maintenance_options.emplace_back(option.first, option.second);
+		}
+	}
+	auto maintenance = ParseMaintenanceOptions(maintenance_options);
 	for (auto &option : info.options) {
 		auto name = duckdb::StringUtil::Lower(option.first);
 		if (name == "encrypted") {
@@ -619,7 +658,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	return duckdb::make_uniq<MoraineCatalog>(db, handle, info.path);
+	return duckdb::make_uniq<MoraineCatalog>(db, handle, info.path, std::move(maintenance));
 }
 
 void MoraineCatalog::Initialize(bool load_builtin) {
@@ -781,8 +820,16 @@ std::string MoraineCatalog::GetDBPath() {
 }
 
 void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {
-	// Deliberately empty: freeing handle_ here would race a concurrent
-	// StartTransaction reading it via Handle(); only the destructor frees it.
+	// The handle is deliberately *not* freed here: doing so would race a
+	// concurrent StartTransaction reading it via Handle(); only the
+	// destructor frees it. The scheduler thread is a different matter —
+	// it issues SQL against a database that is being detached, so it is
+	// stopped and joined here, at the last point a live context proves
+	// nothing is mid-teardown. Stop is idempotent; the destructor repeats
+	// it for the paths that never reach this hook.
+	if (scheduler_) {
+		scheduler_->Stop();
+	}
 }
 
 void MoraineCatalog::DropSchema(duckdb::ClientContext &, duckdb::DropInfo &) {

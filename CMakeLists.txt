@@ -26,6 +26,7 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/catalog.cpp
     ${CPP_DIR}/index_functions.cpp
     ${CPP_DIR}/inline_tables.cpp
+    ${CPP_DIR}/maintenance.cpp
     ${CPP_DIR}/metadata_tables.cpp
     ${CPP_DIR}/scan.cpp
     ${CPP_DIR}/staged_write.cpp

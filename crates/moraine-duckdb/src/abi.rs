@@ -433,6 +433,54 @@ pub(crate) unsafe fn borrow_bytes<'a>(
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
+/// Refuses an attach whose catalog store and data root sit on the same
+/// object store with one containing the other.
+///
+/// DuckLake's orphan cleanup lists the data root and deletes every object
+/// the catalog does not reference; it cannot know that some of those
+/// objects *are* the catalog. Nesting the two would let one cleanup call
+/// delete the store's SSTs, manifests, and WAL.
+///
+/// Containment is compared by path component, so sibling prefixes that
+/// merely share a textual prefix (`…/lake` and `…/lakehouse`) are
+/// unaffected. Symlinks and `..` in local paths are not resolved — the
+/// comparison is lexical.
+fn refuse_overlapping_data_path(store_path: &str, data_path: &str) -> Result<(), AbiError> {
+    let (store_kind, store_prefix) = StoreKind::from_path(store_path)?;
+    let (data_kind, data_prefix) = StoreKind::from_path(data_path)?;
+
+    let overlaps = |a: &str, b: &str| {
+        let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
+        a.starts_with(b) || b.starts_with(a)
+    };
+
+    let nested = match (&store_kind, &data_kind) {
+        // Same bucket: compare the bucket-relative key prefixes. An empty
+        // prefix is the bucket root, which contains everything in it.
+        (StoreKind::S3 { bucket: store }, StoreKind::S3 { bucket: data }) => {
+            store == data && overlaps(&store_prefix, &data_prefix)
+        }
+        // The whole path is the location for a local store.
+        (StoreKind::LocalFile, StoreKind::LocalFile) => overlaps(store_path, data_path),
+        // A `memory://` attach opens a fresh, empty store that shares
+        // objects with nothing; differing kinds and buckets are separate
+        // stores either way.
+        _ => false,
+    };
+
+    if nested {
+        return Err(AbiError::new(
+            codes::CONSTRAINT,
+            format!(
+                "the catalog store `{store_path}` and DATA_PATH `{data_path}` are nested on the \
+                 same object store; DuckLake's orphaned-file cleanup lists DATA_PATH and would \
+                 delete the catalog's own objects. Put them in sibling locations."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves the `DATA_PATH` object store a catalog maintains equality
 /// indexes against, and its bucket-relative key prefix.
 ///
@@ -445,6 +493,7 @@ pub(crate) unsafe fn borrow_bytes<'a>(
 fn resolve_data_store(
     runtime: &tokio::runtime::Runtime,
     catalog: &moraine::Catalog,
+    store_path: &str,
     data_path_arg: Option<String>,
     read_only: bool,
     s3_creds: Option<&S3Creds>,
@@ -453,6 +502,10 @@ fn resolve_data_store(
         .block_on(catalog.snapshot())
         .map_err(AbiError::from)?
         .data_path();
+    // Whether this attach is the one adopting the value, recorded only
+    // after the overlap check below — a refused attach must not leave the
+    // dangerous path behind for the next one to inherit.
+    let mut adopting = false;
     let data_root = match (data_path_arg, recorded) {
         (Some(given), Some(recorded)) => {
             if given.trim_end_matches('/') != recorded.trim_end_matches('/') {
@@ -464,19 +517,26 @@ fn resolve_data_store(
             Some(recorded)
         }
         (Some(given), None) => {
-            if !read_only {
-                let to_record = given.clone();
-                runtime
-                    .block_on(catalog.commit(move |tx| {
-                        tx.set_option(moraine::OptionScope::Global, "data_path", &to_record)?;
-                        Ok(())
-                    }))
-                    .map_err(AbiError::from)?;
-            }
+            adopting = !read_only;
             Some(given)
         }
         (None, recorded) => recorded,
     };
+
+    if let Some(root) = data_root.as_deref() {
+        refuse_overlapping_data_path(store_path, root)?;
+    }
+
+    if adopting {
+        let to_record = data_root.clone().unwrap_or_default();
+        runtime
+            .block_on(catalog.commit(move |tx| {
+                tx.set_option(moraine::OptionScope::Global, "data_path", &to_record)?;
+                Ok(())
+            }))
+            .map_err(AbiError::from)?;
+    }
+
     match data_root {
         Some(path) => {
             let (kind, prefix) = StoreKind::from_path(&path)?;
@@ -574,6 +634,15 @@ pub unsafe extern "C" fn moraine_attach(
         // null or empty means none was given.
         let data_path_arg = unsafe { opt_borrow_str(data_path, "data_path") }?.map(str::to_owned);
 
+        // Check the given path *before* opening: bootstrapping a fresh
+        // store records `data_path`, so a check that waited until after
+        // the open would leave the dangerous value behind for the next
+        // attach to inherit. The recorded-value case is checked again in
+        // `resolve_data_store`, for lakes stamped before this guard.
+        if let Some(given) = data_path_arg.as_deref() {
+            refuse_overlapping_data_path(path_str, given)?;
+        }
+
         // `CatalogOptions` is `#[non_exhaustive]`, so it is built through
         // `default()` and field assignment rather than a struct literal.
         let mut options = CatalogOptions::default();
@@ -607,6 +676,7 @@ pub unsafe extern "C" fn moraine_attach(
         let resolved = resolve_data_store(
             &runtime,
             &catalog,
+            path_str,
             data_path_arg,
             read_only,
             s3_creds.as_ref(),
@@ -1549,6 +1619,66 @@ pub unsafe extern "C" fn moraine_index_drop(
     }
 }
 
+/// Runs one moraine-owned maintenance pass, reclaiming the entry ranges
+/// of indexes no longer live, and writes what it reclaimed to
+/// `*indexes_swept` and `*entries_reclaimed`.
+///
+/// The pass mints no snapshot and leaves head unchanged. `batch_size` of
+/// 0 means "not given" and takes the core default; the pass commits at
+/// most that many deletes per batch.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; the out-parameters,
+/// if non-null, must be writable, and `err`, if non-null, must be
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_maintain(
+    handle: *mut MoraineCatalogHandle,
+    batch_size: u64,
+    indexes_swept: *mut u64,
+    entries_reclaimed: *mut u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        // `MaintenanceRequest` is `#[non_exhaustive]`, so it is built
+        // through `default()` and field assignment.
+        let mut request = moraine::MaintenanceRequest::default();
+        if batch_size > 0 {
+            request.batch_size = usize::try_from(batch_size).unwrap_or(usize::MAX);
+        }
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let report = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.maintain(request))
+        }?;
+
+        if !indexes_swept.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *indexes_swept = report.indexes_swept };
+        }
+        if !entries_reclaimed.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *entries_reclaimed = report.index_entries_reclaimed };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Lists a table's live equality indexes.
 ///
 /// # Safety
@@ -2242,6 +2372,195 @@ mod tests {
         );
         // SAFETY: freed exactly once.
         unsafe { moraine_detach(good_handle) };
+    }
+
+    /// The maintenance ABI runs a pass and writes its counts through the
+    /// out-parameters, tolerating null slots for either.
+    #[test]
+    fn maintain_reports_through_the_out_parameters() {
+        let dir = TempDir::new("maintain-abi");
+        seed(dir.path());
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "attach failed");
+
+        // A seeded store has no dropped indexes, so a pass reclaims
+        // nothing and says so rather than failing.
+        let mut indexes = u64::MAX;
+        let mut entries = u64::MAX;
+        // SAFETY: `handle` is live; both slots are writable locals.
+        let code = unsafe {
+            moraine_maintain(
+                handle,
+                0,
+                &raw mut indexes,
+                &raw mut entries,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "maintain failed");
+        assert_eq!(indexes, 0);
+        assert_eq!(entries, 0);
+
+        // Null out-parameters are accepted: a caller that wants only the
+        // status code passes neither slot.
+        // SAFETY: `handle` is live; null slots are explicitly allowed.
+        let code = unsafe {
+            moraine_maintain(
+                handle,
+                64,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "maintain with null out-params failed");
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// Nesting the catalog store inside `DATA_PATH` (or the reverse) on one
+    /// object store is refused; sibling locations, separate buckets, and
+    /// differing store kinds are not.
+    #[test]
+    fn overlapping_store_and_data_paths_are_refused() {
+        let nested = [
+            // The catalog sits under the swept data prefix.
+            ("s3://bucket/lake/catalog", "s3://bucket/lake"),
+            ("s3://bucket/lake/catalog", "s3://bucket/lake/"),
+            // ...and the reverse nesting is equally unsafe.
+            ("s3://bucket/lake", "s3://bucket/lake/data"),
+            // Identical locations.
+            ("s3://bucket/lake", "s3://bucket/lake"),
+            // An empty prefix is the bucket root, containing everything.
+            ("s3://bucket", "s3://bucket/data"),
+            ("/tmp/lake/catalog", "/tmp/lake"),
+            ("/tmp/lake", "/tmp/lake/data"),
+        ];
+        for (store, data) in nested {
+            let error = refuse_overlapping_data_path(store, data)
+                .expect_err("nested `{store}` / `{data}` must be refused");
+            assert_eq!(error.code, codes::CONSTRAINT, "for {store} / {data}");
+        }
+
+        let separate = [
+            // Sibling prefixes that merely share leading text.
+            ("s3://bucket/lakehouse", "s3://bucket/lake"),
+            ("s3://bucket/lake-catalog", "s3://bucket/lake"),
+            ("/tmp/lakehouse", "/tmp/lake"),
+            // True siblings.
+            ("s3://bucket/catalog", "s3://bucket/data"),
+            ("/tmp/catalog", "/tmp/data"),
+            // Different buckets, and different store kinds.
+            ("s3://catalogs/lake", "s3://data/lake"),
+            ("/tmp/catalog", "s3://bucket/data"),
+            ("memory://", "/tmp/data"),
+        ];
+        for (store, data) in separate {
+            assert!(
+                refuse_overlapping_data_path(store, data).is_ok(),
+                "`{store}` / `{data}` are separate and must attach"
+            );
+        }
+    }
+
+    /// The overlap guard runs at attach, and refuses *before* an adopted
+    /// data path is recorded — a refused attach must leave nothing behind
+    /// for the next one to inherit.
+    #[test]
+    fn attach_refuses_a_data_path_containing_the_store() {
+        // A *fresh* store, deliberately not seeded: bootstrapping records
+        // `data_path`, so this is the case where a late check would
+        // persist the dangerous value before refusing.
+        let dir = TempDir::new("overlap-guard");
+        let c_path = dir.c_path();
+
+        // DATA_PATH is the store's own parent, so orphan cleanup would
+        // sweep the catalog's objects.
+        let parent = dir
+            .path()
+            .parent()
+            .expect("temp dir has a parent")
+            .to_str()
+            .expect("utf-8")
+            .to_owned();
+        let c_data = CString::new(parent).expect("no NUL");
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                c_data.as_ptr(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(
+            code,
+            codes::CONSTRAINT,
+            "a nested DATA_PATH must be refused"
+        );
+        // SAFETY: on failure `guard` wrote a non-null message.
+        let message = unsafe { CStr::from_ptr(err.message) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains("nested"), "got: {message}");
+        // SAFETY: minted by the failed call, freed once.
+        unsafe { moraine_error_free(err.message) };
+
+        // Nothing was recorded, so a later attach with a safe path still
+        // adopts it.
+        let safe = TempDir::new("overlap-guard-data");
+        let c_safe = CString::new(safe.path().to_str().expect("utf-8")).expect("no NUL");
+        let mut ok_handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut ok_err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let ok_code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                c_safe.as_ptr(),
+                &raw mut ok_handle,
+                &raw mut ok_err,
+            )
+        };
+        // SAFETY: null or just written; `as_ref` allows null.
+        let ok_message = unsafe { ok_err.message.as_ref() };
+        assert_eq!(ok_code, codes::OK, "safe path failed: {ok_message:?}");
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(ok_handle) };
     }
 
     /// A lake with no data path recorded yet (created before the option

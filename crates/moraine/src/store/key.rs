@@ -40,7 +40,7 @@ pub(crate) enum Key {
     Inline(InlineKey),
     /// Equality-index entries. Live-only; keyed by index and canonical
     /// value.
-    Idx(IdxKey),
+    Index(IndexKey),
 }
 
 /// An equality-index entry key. The unique kind keys on the value alone —
@@ -49,7 +49,7 @@ pub(crate) enum Key {
 /// kind appends the row id, so rows sharing a value occupy distinct keys
 /// and concurrent appends stay benign.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
-pub(crate) enum IdxKey {
+pub(crate) enum IndexKey {
     /// A unique-index entry; value is the holding row id.
     Unique {
         /// The index this entry belongs to.
@@ -339,7 +339,7 @@ pub(crate) enum Subspace {
     // Entries are read by exact key or per-index prefix, not by a
     // whole-subspace scan yet.
     #[allow(dead_code)]
-    Idx,
+    Index,
 }
 
 impl Subspace {
@@ -354,7 +354,7 @@ impl Subspace {
                 table_id: 0,
                 schema_version: 0,
             }),
-            Self::Idx => Key::Idx(IdxKey::Unique {
+            Self::Index => Key::Index(IndexKey::Unique {
                 index_id: 0,
                 key: CanonicalKey::empty(),
             }),
@@ -528,47 +528,64 @@ pub(crate) fn inline_schema_prefix() -> Vec<u8> {
     )
 }
 
-/// Discriminant bytes preceding an index entry's components: the `idx`
-/// subspace byte and the [`IdxKey`] kind byte.
-const IDX_KIND_PREFIX_LEN: usize = 2;
+/// Discriminant bytes preceding an index entry's components: the `index`
+/// subspace byte and the [`IndexKey`] kind byte.
+const INDEX_KIND_PREFIX_LEN: usize = 2;
 
-/// The two entry kinds inside the `idx` subspace. An index is exclusively
+/// The two entry kinds inside the `index` subspace. An index is exclusively
 /// one kind, so its entries form one contiguous `(kind, index_id)` range.
 // The prefix builders below have no caller until index lookups and
 // reclamation land; the ranges are pinned by tests.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IdxKind {
-    /// `idx/unique`.
+pub(crate) enum IndexKind {
+    /// `index/unique`.
     Unique,
-    /// `idx/multi`.
+    /// `index/multi`.
     Multi,
+}
+
+/// Byte prefix of every entry of one kind, across all indexes — the range
+/// the orphan sweep walks, seeking by index id.
+pub(crate) fn index_kind_prefix(kind: IndexKind) -> Vec<u8> {
+    let key = match kind {
+        IndexKind::Unique => Key::Index(IndexKey::Unique {
+            index_id: 0,
+            key: CanonicalKey::empty(),
+        }),
+        IndexKind::Multi => Key::Index(IndexKey::Multi {
+            index_id: 0,
+            key: CanonicalKey::empty(),
+            row_id: 0,
+        }),
+    };
+
+    prefix_of(&key, INDEX_KIND_PREFIX_LEN)
 }
 
 /// Byte prefix of every entry of one index — the range reclamation sweeps
 /// after a drop.
-#[allow(dead_code)]
-pub(crate) fn idx_index_prefix(kind: IdxKind, index_id: u64) -> Vec<u8> {
+pub(crate) fn index_index_prefix(kind: IndexKind, index_id: u64) -> Vec<u8> {
     let key = match kind {
-        IdxKind::Unique => Key::Idx(IdxKey::Unique {
+        IndexKind::Unique => Key::Index(IndexKey::Unique {
             index_id,
             key: CanonicalKey::empty(),
         }),
-        IdxKind::Multi => Key::Idx(IdxKey::Multi {
+        IndexKind::Multi => Key::Index(IndexKey::Multi {
             index_id,
             key: CanonicalKey::empty(),
             row_id: 0,
         }),
     };
-    prefix_of(&key, IDX_KIND_PREFIX_LEN + size_of::<u64>())
+    prefix_of(&key, INDEX_KIND_PREFIX_LEN + size_of::<u64>())
 }
 
 /// Byte prefix of every non-unique entry sharing one `(index_id, value)` —
 /// the ascending scan a non-unique lookup runs. The row id is the fixed
 /// eight-byte final component, so dropping it yields the value prefix.
 #[allow(dead_code)]
-pub(crate) fn idx_multi_value_prefix(index_id: u64, value: &CanonicalKey) -> Vec<u8> {
-    let mut bytes = Key::Idx(IdxKey::Multi {
+pub(crate) fn index_multi_value_prefix(index_id: u64, value: &CanonicalKey) -> Vec<u8> {
+    let mut bytes = Key::Index(IndexKey::Multi {
         index_id,
         key: value.clone(),
         row_id: 0,
@@ -766,8 +783,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_idx_unique_key_leads_with_subspace_and_index() {
-        let key = Key::Idx(IdxKey::Unique {
+    fn golden_index_unique_key_leads_with_subspace_and_index() {
+        let key = Key::Index(IndexKey::Unique {
             index_id: 1,
             key: canon(&[IndexKeyValue::Int {
                 value: 7,
@@ -786,7 +803,7 @@ mod tests {
     /// (`0x01`) must not be mistaken for an escaped byte of the value —
     /// that is every row id in `[2^56, 2^57)`.
     #[test]
-    fn idx_multi_key_roundtrips_when_the_row_id_leads_with_the_escape_byte() {
+    fn index_multi_key_roundtrips_when_the_row_id_leads_with_the_escape_byte() {
         // The last case is the shortest possible value — no components at
         // all, which frames to the bare terminator.
         let values = [
@@ -800,7 +817,7 @@ mod tests {
         ];
         for row_id in [1u64 << 56, (1 << 56) + 1, (1 << 57) - 1] {
             for value in &values {
-                let key = Key::Idx(IdxKey::Multi {
+                let key = Key::Index(IndexKey::Multi {
                     index_id: 1,
                     key: canon(value),
                     row_id,
@@ -817,8 +834,8 @@ mod tests {
     /// Pinned because these bytes are on disk: the decode fix must not move
     /// them.
     #[test]
-    fn golden_idx_multi_value_framing_and_trailing_row_id() {
-        let key = Key::Idx(IdxKey::Multi {
+    fn golden_index_multi_value_framing_and_trailing_row_id() {
+        let key = Key::Index(IndexKey::Multi {
             index_id: 1,
             key: canon(&[IndexKeyValue::Bytes(vec![0x00, 0x01, 0x41])]),
             row_id: 1 << 56,
@@ -844,8 +861,8 @@ mod tests {
     }
 
     #[test]
-    fn golden_idx_multi_key_leads_with_subspace_and_index() {
-        let key = Key::Idx(IdxKey::Multi {
+    fn golden_index_multi_key_leads_with_subspace_and_index() {
+        let key = Key::Index(IndexKey::Multi {
             index_id: 1,
             key: canon(&[IndexKeyValue::Int {
                 value: 7,
@@ -862,15 +879,15 @@ mod tests {
     }
 
     #[test]
-    fn idx_composite_framing_distinct_at_key_level() {
-        let ab_c = Key::Idx(IdxKey::Unique {
+    fn index_composite_framing_distinct_at_key_level() {
+        let ab_c = Key::Index(IndexKey::Unique {
             index_id: 1,
             key: canon(&[
                 IndexKeyValue::Str("ab".into()),
                 IndexKeyValue::Str("c".into()),
             ]),
         });
-        let a_bc = Key::Idx(IdxKey::Unique {
+        let a_bc = Key::Index(IndexKey::Unique {
             index_id: 1,
             key: canon(&[
                 IndexKeyValue::Str("a".into()),
@@ -881,35 +898,65 @@ mod tests {
     }
 
     #[test]
-    fn idx_index_prefix_covers_one_index_and_kind() {
+    fn index_index_prefix_covers_one_index_and_kind() {
         let value = canon(&[IndexKeyValue::Str("v".into())]);
 
-        let unique = Key::Idx(IdxKey::Unique {
+        let unique = Key::Index(IndexKey::Unique {
             index_id: 4,
             key: value.clone(),
         })
         .encode();
-        assert!(unique.starts_with(&idx_index_prefix(IdxKind::Unique, 4)));
+        assert!(unique.starts_with(&index_index_prefix(IndexKind::Unique, 4)));
         // A different index id, and the other kind, do not match.
-        assert!(!unique.starts_with(&idx_index_prefix(IdxKind::Unique, 5)));
-        assert!(!unique.starts_with(&idx_index_prefix(IdxKind::Multi, 4)));
+        assert!(!unique.starts_with(&index_index_prefix(IndexKind::Unique, 5)));
+        assert!(!unique.starts_with(&index_index_prefix(IndexKind::Multi, 4)));
 
-        let multi = Key::Idx(IdxKey::Multi {
+        let multi = Key::Index(IndexKey::Multi {
             index_id: 4,
             key: value,
             row_id: 1,
         })
         .encode();
-        assert!(multi.starts_with(&idx_index_prefix(IdxKind::Multi, 4)));
-        assert!(!multi.starts_with(&idx_index_prefix(IdxKind::Unique, 4)));
+        assert!(multi.starts_with(&index_index_prefix(IndexKind::Multi, 4)));
+        assert!(!multi.starts_with(&index_index_prefix(IndexKind::Unique, 4)));
+    }
+
+    /// The orphan sweep seeks past a live index by scanning from
+    /// `index_index_prefix(kind, id + 1)`, which is only sound if index ids
+    /// sort ascending within a kind and every index prefix carries the
+    /// kind prefix.
+    #[test]
+    fn index_index_prefixes_sort_ascending_within_a_kind() {
+        for kind in [IndexKind::Unique, IndexKind::Multi] {
+            let kind_prefix = index_kind_prefix(kind);
+            let mut previous = index_index_prefix(kind, 0);
+            assert!(previous.starts_with(&kind_prefix));
+
+            for index_id in [1, 2, 255, 256, u64::MAX - 1, u64::MAX] {
+                let prefix = index_index_prefix(kind, index_id);
+                assert!(prefix.starts_with(&kind_prefix));
+                assert!(
+                    prefix > previous,
+                    "index {index_id} must sort after its predecessor in {kind:?}"
+                );
+                previous = prefix;
+            }
+        }
+
+        // The two kinds occupy disjoint ranges, so a per-kind scan never
+        // walks into the other.
+        assert_ne!(
+            index_kind_prefix(IndexKind::Unique),
+            index_kind_prefix(IndexKind::Multi)
+        );
     }
 
     #[test]
-    fn idx_multi_value_prefix_covers_all_row_ids_of_one_value() {
+    fn index_multi_value_prefix_covers_all_row_ids_of_one_value() {
         let value = canon(&[IndexKeyValue::Str("shared".into())]);
-        let prefix = idx_multi_value_prefix(9, &value);
+        let prefix = index_multi_value_prefix(9, &value);
         for row_id in [0, 1, u64::MAX] {
-            let key = Key::Idx(IdxKey::Multi {
+            let key = Key::Index(IndexKey::Multi {
                 index_id: 9,
                 key: value.clone(),
                 row_id,
@@ -919,7 +966,7 @@ mod tests {
         // A different value, and a different index, do not match.
         let other_value = canon(&[IndexKeyValue::Str("different".into())]);
         assert!(
-            !Key::Idx(IdxKey::Multi {
+            !Key::Index(IndexKey::Multi {
                 index_id: 9,
                 key: other_value,
                 row_id: 0,
@@ -928,7 +975,7 @@ mod tests {
             .starts_with(&prefix)
         );
         assert!(
-            !Key::Idx(IdxKey::Multi {
+            !Key::Index(IndexKey::Multi {
                 index_id: 10,
                 key: value,
                 row_id: 0,
@@ -939,13 +986,13 @@ mod tests {
     }
 
     #[test]
-    fn idx_keys_roundtrip() {
+    fn index_keys_roundtrip() {
         let keys = [
-            Key::Idx(IdxKey::Unique {
+            Key::Index(IndexKey::Unique {
                 index_id: 5,
                 key: canon(&[IndexKeyValue::Str("hello".into())]),
             }),
-            Key::Idx(IdxKey::Multi {
+            Key::Index(IndexKey::Multi {
                 index_id: 9,
                 key: canon(&[
                     IndexKeyValue::Int {
@@ -1207,13 +1254,13 @@ mod tests {
         )
     }
 
-    fn arb_idx() -> impl Strategy<Value = IdxKey> {
+    fn arb_index() -> impl Strategy<Value = IndexKey> {
         prop_oneof![
             (any::<u64>(), arb_canonical_key())
-                .prop_map(|(index_id, key)| IdxKey::Unique { index_id, key }),
+                .prop_map(|(index_id, key)| IndexKey::Unique { index_id, key }),
             (any::<u64>(), arb_canonical_key(), any::<u64>()).prop_map(
                 |(index_id, key, row_id)| {
-                    IdxKey::Multi {
+                    IndexKey::Multi {
                         index_id,
                         key,
                         row_id,
@@ -1240,7 +1287,7 @@ mod tests {
             }),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
-            arb_idx().prop_map(Key::Idx),
+            arb_index().prop_map(Key::Index),
         ]
     }
 

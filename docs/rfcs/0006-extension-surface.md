@@ -23,8 +23,12 @@ in `moraine`.
   SQL DuckLake issues against `ducklake_*`, moraine serves.
 - **Thin extension, language-agnostic.** No DuckLake domain logic lives in
   `moraine-duckdb` — only `StorageExtension` registration, C-ABI marshalling,
-  and the sync↔async bridge. Everything else is in the Rust core, testable
-  without DuckDB (RFC 0001 Unit/Integration tests).
+  the sync↔async bridge, and (RFC 0021) sequencing calls to DuckLake's own
+  maintenance SQL. Everything else is in the Rust core, testable without
+  DuckDB (RFC 0001 Unit/Integration tests). The maintenance carve-out exists
+  because the core cannot issue SQL at all, so no other layer can compose
+  those calls; it is bounded to sequencing — the shim decides nothing from
+  the results — and it is the one part of the shim that only e2e can cover.
 - **Faithful catalog state.** The `ducklake_*` rows are the source of truth;
   moraine stores and returns those rows (B1). No semantic re-modeling that
   could drift from DuckLake's own reading of its tables.

@@ -373,6 +373,32 @@ pub fn run_ducklake_sql_expect_err(store_dir: &Path, data_path: &Path, sql: &str
     combined_output(&output)
 }
 
+/// As [`run_ducklake_sql_expect_err`], but with extra attach options —
+/// for refusals that happen at attach rather than at the statement, so
+/// the failing option can be asserted on.
+pub fn run_ducklake_sql_expect_err_with_options(
+    store_dir: &Path,
+    data_path: &Path,
+    attach_options: &str,
+    sql: &str,
+) -> String {
+    let output = run_session(
+        &Attach::Moraine {
+            store_dir,
+            data_path,
+            options: attach_options,
+            read_only: false,
+        },
+        sql,
+    );
+    assert!(
+        !output.status.success(),
+        "`{sql}` with options `{attach_options}` unexpectedly succeeded:\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    combined_output(&output)
+}
+
 /// As [`run_reference_ducklake_sql`], but for a statement that must
 /// fail — the reference twin of [`run_ducklake_sql_expect_err`], so a
 /// refusal can be asserted on both catalogs.

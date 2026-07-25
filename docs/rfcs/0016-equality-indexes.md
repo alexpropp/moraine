@@ -15,7 +15,7 @@
 
 Adds a moraine-native **equality index**: a catalog object (`create_index` /
 `drop_index` on the [RFC 0003](0003-public-api-shape.md) verb surface) whose
-entries live in a new `idx` subspace and serve two reads — **row location**
+entries live in a new `index` subspace and serve two reads — **row location**
 (key values → row ids and the files/chunks that hold them) and **uniqueness
 enforcement** at commit. DuckLake v1.0 models no indexes, so this is a native
 feature: real inside moraine, invisible to every DuckLake catalog scan.
@@ -34,7 +34,7 @@ entries from day one, and a final commit flips the index `ready` (Staged
 builds).
 
 The index is **ordered**. The canonical encoding is order-preserving for
-every type, so the same `idx` storage answers comparison queries
+every type, so the same `index` storage answers comparison queries
 (`<`, `<=`, `>`, `>=`, `BETWEEN`, half-open) as a bounded sub-scan —
 equality is the degenerate closed `[v, v]` case. Each column carries a
 declared **direction** (`ASC`/`DESC`, realized by complementing its framed
@@ -45,7 +45,7 @@ they just call the ordered encoder (Range and comparison queries).
 
 The store is one index; the ways in are two. The **embedding (verb) API**
 creates and maintains indexes directly — the bulk of this RFC. The
-**extension path** reaches the same `idx` storage from DuckDB SQL through
+**extension path** reaches the same `index` storage from DuckDB SQL through
 registered moraine functions, and covers DuckLake-written Parquet by the
 scoped read, which also enforces uniqueness over SQL writes.
 DuckLake-native `CREATE INDEX` waits on DuckLake itself, which owns the
@@ -155,7 +155,7 @@ canonical encoding is type-bound, and a silent cascade would discard an
 object the host created deliberately. Drop the index first. `rename_column`
 is unaffected (field-id references).
 
-### The `idx` subspace and entry keys
+### The `index` subspace and entry keys
 
 A new subspace, one leading discriminant byte appended to the `Key` enum —
 a SlateDB segment of its own (RFC 0002), so entry churn from a hot indexed
@@ -164,8 +164,8 @@ table compacts independently of the metadata subspaces, the same isolation
 
 | Kind | Key components | Value |
 |---|---|---|
-| `idx/unique` | `index_id, canon(key values)` | `row_id` |
-| `idx/multi` | `index_id, canon(key values), row_id` | (empty) |
+| `index/unique` | `index_id, canon(key values)` | `row_id` |
+| `index/multi` | `index_id, canon(key values), row_id` | (empty) |
 
 Two shapes, one deliberate asymmetry:
 
@@ -180,7 +180,7 @@ Two shapes, one deliberate asymmetry:
   distinct keys: concurrent appends of different rows write disjoint entry
   keys and stay **benign** under the append-append refinement — indexing a
   table does not serialize its writers. A lookup for `v` is the ascending
-  prefix scan `idx/multi/{index_id}/{canon(v)}/` (RFC 0002 forward-only).
+  prefix scan `index/multi/{index_id}/{canon(v)}/` (RFC 0002 forward-only).
 
 `index_id`-first keying makes each index one contiguous range — the unit
 lookups scan and drop orphans (Reclamation).
@@ -317,7 +317,7 @@ read handle so the lookup and the catalog it points into are one consistent
 cut:
 
 - `index_lookup(table, index, key_values) -> Vec<RowLocation>` — point-get
-  (unique) or prefix scan (non-unique) in `idx`, then resolve each row id
+  (unique) or prefix scan (non-unique) in `index`, then resolve each row id
   against the snapshot's chunk and file ranges. A `RowLocation` names the
   row id and its holder: an inlined chunk, or candidate data file(s) whose
   live row-id range contains the id. The consumer applies delete files as
@@ -342,8 +342,8 @@ the rare path pays nothing to keep it honest.
 ### Range and comparison queries
 
 Because the canonical encoding is order-preserving (Canonical value
-encoding), byte order *is* value order, so both entry kinds — `idx/unique`
-(one value per key) and `idx/multi` (value then row id) — are already single
+encoding), byte order *is* value order, so both entry kinds — `index/unique`
+(one value per key) and `index/multi` (value then row id) — are already single
 contiguous value-ordered ranges. A comparison query is therefore a bounded
 `ByteRangeBounds` sub-scan of the same range an equality lookup keys into.
 There is **no new index kind, no new discriminant, and no new maintenance
@@ -601,7 +601,7 @@ DuckLake to move first.** (a) *DuckLake grows index metadata.* That catalog
 state would land in moraine like every other `ducklake_*` mapping, with
 maintenance arriving as writer-supplied entries (the Coverage contract,
 DuckLake as the writer); the protobuf definition value reserves a
-`ducklake_index_id` field for mapping such an index onto the same `idx`
+`ducklake_index_id` field for mapping such an index onto the same `index`
 range, and that reservation is the entire commitment made here. (b) *A
 DuckLake binder patch* — native `CREATE INDEX`/`PRIMARY KEY`, entry
 maintenance delegated to the metadata catalog, index-served pushdown; an
@@ -699,10 +699,10 @@ entries — silent index corruption. The gate is `sys/format`, bumped
 **lazily**: the first `create_index` writes format 2 in the same commit, and
 older binaries refuse to open a format-2 store (RFC 0002 bootstrap
 validation). Index-free stores stay format 1, byte-identical to today,
-compatible in both directions. Format 2 is format 1 plus the `idx` subspace
+compatible in both directions. Format 2 is format 1 plus the `index` subspace
 and `index` kind — no migration, no rewrite; dropping the last index does not
 downgrade the stamp. Staged builds bump once more, to format 3 (Staged
-builds), under the same lazy posture. The `idx` discriminant leaves the
+builds), under the same lazy posture. The `index` discriminant leaves the
 segment extractor ("first byte") untouched, so existing segments and the
 RFC 0011 crash matrix are unaffected.
 
@@ -710,10 +710,18 @@ RFC 0011 crash matrix are unaffected.
 
 `drop_index` (and `drop_table`, which ends the table's indexes with it)
 orphans the entry range. Entries are invisible the moment the definition
-ends, so reclamation is pure space hygiene: a bounded background sweep
-deletes `idx/{index_id}` in batches, riding RFC 0007's maintenance posture —
-never inside the dropping commit, whose batch must stay bounded. A SlateDB
-range-delete would collapse the sweep into one call (Open questions).
+ends, so reclamation is pure space hygiene: a bounded sweep deletes
+`index/{index_id}` in batches — never inside the dropping commit, whose
+batch must stay bounded.
+
+RFC 0021 specifies and implements that sweep, and gives it the home this
+RFC deferred: `Catalog::maintain` discovers dead index ids by seeking
+through the `index` subspace (ids are monotonic and never reused, so an id
+absent from the live catalog is dead forever) and reclaims each range in
+head-preserving batches. It runs as one step of the maintenance pass. The
+SlateDB range-delete that would collapse the sweep into one call still
+does not exist at the pinned version, so the batched scan-and-delete is
+the answer for now.
 
 ### Test obligations
 
@@ -721,7 +729,7 @@ Per RFC 0001 — store codecs get proptests, protocol claims get integration
 tests against real SlateDB on in-memory `object_store`:
 
 - **Encoding roundtrips + goldens.** `decode(encode(k)) == k` for both entry
-  kinds; golden vectors pin the `idx` discriminant and the canonical
+  kinds; golden vectors pin the `index` discriminant and the canonical
   encoding of every indexable type, including the float normalizations, NULL
   skip, and composite framing (`("ab","c") ≠ ("a","bc")`).
 - **Order preservation.** For every indexable type, `encode(x) < encode(y)`
@@ -741,7 +749,7 @@ tests against real SlateDB on in-memory `object_store`:
 - **Benign distinct-value appends.** Two concurrent appends of different
   values to one indexed table both land via the append-append path.
 - **Movement invariance.** Insert inlined rows → flush → compact: lookups
-  return the same rows throughout; the `idx` range is byte-identical before
+  return the same rows throughout; the `index` range is byte-identical before
   and after flush and compaction.
 - **Delete coverage.** Store-resident delete (self-sufficient) and
   writer-supplied delete both remove entries; delete-then-reinsert of a
@@ -762,7 +770,7 @@ tests against real SlateDB on in-memory `object_store`:
   single-commit-only stores remain format 2.
 - **Staged lifecycle.** A staged build over a table too large for one batch,
   under concurrent inserts, deletes, and updates: lookups fail typed while
-  `building`; after the flip, the `idx` range is byte-identical to a
+  `building`; after the flip, the `index` range is byte-identical to a
   from-scratch single-commit build over the same live rows.
 - **Staged delete races.** A row deleted between `S₀` and its batch is
   excluded via the delete bookkeeping; a row deleted *concurrently* with its
@@ -789,7 +797,7 @@ tests against real SlateDB on in-memory `object_store`:
   `register_delete_file` removes exactly the named positions' entries.
 - **Rewrite idempotence.** A rewrite file carrying a row-id column derives
   entries under the preserved ids; DuckLake compaction over an indexed
-  table (unique included) leaves the `idx` range byte-identical and never
+  table (unique included) leaves the `index` range byte-identical and never
   aborts on the rows' own existing entries. An UPDATE-shaped commit
   (delete file plus per-row-id file with changed values) removes the
   old-value entries and lands the new-value entries in one commit; an
@@ -836,9 +844,10 @@ tests against real SlateDB on in-memory `object_store`:
   knobs — and whether delete-file position→row-id resolution during the
   exclusion scan (Staged builds) is cheap enough inline or wants a small
   per-file cache for files that received deletes mid-build.
-- **Reclamation mechanics.** Whether the pinned SlateDB exposes (or grows) a
-  range-delete usable for orphaned entry ranges, versus the batched sweep;
-  and the sweep's scheduling knobs.
+- ~~**Reclamation mechanics.**~~ **Resolved by RFC 0021.** SlateDB 0.14.1
+  exposes no range-delete, so the sweep is a batched scan-and-delete;
+  scheduling is the maintenance pass, configured per attach. If a
+  range-delete appears, the sweep collapses to one call per dead index.
 - **Transparent pushdown.** Whether to carry the DuckLake binder patch
   (Extension path, Future directions) that accepts `CREATE INDEX`/`PRIMARY
   KEY` and routes equality pushdown to the index. Nothing in the layout

@@ -1104,6 +1104,27 @@ int32_t moraine_index_drop(struct MoraineCatalogHandle *handle,
                            void *probe_ctx,
                            struct MoraineError *err);
 
+// Runs one moraine-owned maintenance pass, reclaiming the entry ranges
+// of indexes no longer live, and writes what it reclaimed to
+// `*indexes_swept` and `*entries_reclaimed`.
+//
+// The pass mints no snapshot and leaves head unchanged. `batch_size` of
+// 0 means "not given" and takes the core default; the pass commits at
+// most that many deletes per batch.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; the out-parameters,
+// if non-null, must be writable, and `err`, if non-null, must be
+// writable.
+int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
+                         uint64_t batch_size,
+                         uint64_t *indexes_swept,
+                         uint64_t *entries_reclaimed,
+                         MoraineInterruptProbe probe,
+                         void *probe_ctx,
+                         struct MoraineError *err);
+
 // Lists a table's live equality indexes.
 //
 // # Safety
