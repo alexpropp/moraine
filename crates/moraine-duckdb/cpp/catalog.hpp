@@ -17,6 +17,7 @@
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
+#include "maintenance.hpp"
 #include "moraine_abi.h"
 
 namespace moraine_duckdb {
@@ -135,7 +136,8 @@ private:
 // duckdb::NotImplementedException.
 class MoraineCatalog : public duckdb::Catalog {
 public:
-	MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path);
+	MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path,
+	               MaintenanceConfig maintenance);
 	~MoraineCatalog() override;
 
 	// The attach_function_t the storage extension registers.
@@ -180,14 +182,37 @@ public:
 		return handle_;
 	}
 
+	// The store path this catalog was attached at.
+	const std::string &StorePath() const {
+		return path_;
+	}
+
+	// The maintenance driver for this attach. Always present — it serves
+	// the on-demand trigger even when no interval was configured.
+	MaintenanceScheduler &Scheduler() const {
+		return *scheduler_;
+	}
+
 private:
 	MoraineCatalogHandle *handle_;
 	std::string path_;
+	duckdb::unique_ptr<MaintenanceScheduler> scheduler_;
 
 	// Ensures the active transaction's schema cache is populated from the
 	// listing ABI, then returns it.
 	static duckdb::vector<duckdb::reference<duckdb::SchemaCatalogEntry>> LoadedSchemas(duckdb::Catalog &catalog,
 	                                                                                   duckdb::Transaction &tx);
 };
+
+// Resolves the moraine catalog behind `catalog_name`, accepting either
+// the DuckLake lake name or the name of its metadata catalog.
+//
+// The two are not related by name in general: an attach may pass
+// `METADATA_CATALOG` and name the metadata catalog itself, so DuckLake's
+// default `__ducklake_metadata_<lake>` is only one case. What does hold
+// is that the lake attaches `moraine:<store path>` over a catalog that
+// reports `<store path>`, so the fallback matches on that. Throws
+// `InvalidInputException` when neither names a moraine catalog.
+MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std::string &catalog_name);
 
 } // namespace moraine_duckdb

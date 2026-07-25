@@ -51,6 +51,7 @@ on that path.
 - [x] Snapshot expiry and orphaned-file cleanup / deletion scheduling; expired snapshots resolve cleanly (RFC 0007, `files_scheduled_for_deletion`)
 - [x] Data-file encryption: `ENCRYPTED` attaches, encrypted Parquet at rest, per-file keys round-tripped; moraine holds no crypto (RFC 0014)
 - [x] Table/column tags and catalog options via `COMMENT ON` and options (`tag`, `column_tag`, `metadata`)
+- [x] Maintenance orchestration: a scheduled in-writer pass runs DuckLake's own maintenance functions in a fixed order, then reclaims orphaned equality-index entries; `moraine_maintenance` triggers one on demand and `moraine_maintenance_status` reports the retained passes (RFC 0021)
 
 ## Performance
 - [x] Commit-served projections: `snapshot`, `table_stats`, and `table_column_stats` are folded forward from each commit and served from an in-memory cache when current, removing per-commit latency growth with snapshot history. Attach-tunable WAL flush cadence bounds the per-commit durable wait.

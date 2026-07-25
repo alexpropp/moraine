@@ -12,6 +12,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -73,6 +74,48 @@ std::string ToUpperAscii(const std::string &s) {
 }
 
 } // namespace
+
+MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std::string &catalog_name) {
+	// The name DuckLake gives its metadata catalog when the attach does
+	// not name one itself.
+	const std::string metadata_prefix = "__ducklake_metadata_";
+
+	auto as_moraine = [&](const std::string &name) -> MoraineCatalog * {
+		auto catalog = duckdb::Catalog::GetCatalogEntry(context, name);
+		if (catalog && catalog->GetCatalogType() == "moraine") {
+			return &catalog->Cast<MoraineCatalog>();
+		}
+		return nullptr;
+	};
+	// The metadata catalog's own name.
+	if (auto *catalog = as_moraine(catalog_name)) {
+		return *catalog;
+	}
+	// The lake name, under DuckLake's default metadata naming.
+	if (auto *catalog = as_moraine(metadata_prefix + catalog_name)) {
+		return *catalog;
+	}
+	// A lake attached with `METADATA_CATALOG` named its metadata catalog
+	// itself, so no name derivation finds it. Match on path instead.
+	auto named = duckdb::Catalog::GetCatalogEntry(context, catalog_name);
+	if (named) {
+		auto lake_path = named->GetDBPath();
+		for (auto &attached : duckdb::DatabaseManager::Get(context).GetDatabases(context)) {
+			auto &candidate = attached->GetCatalog();
+			if (candidate.GetCatalogType() != "moraine") {
+				continue;
+			}
+			auto store_path = candidate.Cast<MoraineCatalog>().StorePath();
+			if (!store_path.empty() && duckdb::StringUtil::EndsWith(lake_path, store_path)) {
+				return candidate.Cast<MoraineCatalog>();
+			}
+		}
+	}
+	throw duckdb::InvalidInputException(
+	    "\"%s\" is not a moraine-backed lake; pass the DuckLake lake name, or the name of its "
+	    "metadata catalog (\"%s<lake>\" by default, or whatever METADATA_CATALOG named it)",
+	    catalog_name, metadata_prefix);
+}
 
 extern "C" bool moraine_shim_is_interrupted(void *client_context) {
 	return static_cast<duckdb::ClientContext *>(client_context)->IsInterrupted();
@@ -528,11 +571,39 @@ void MoraineSchemaEntry::Alter(duckdb::CatalogTransaction transaction, duckdb::A
 	throw duckdb::NotImplementedException("moraine: altering an entry is not supported (read-only catalog)");
 }
 
-MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path)
+MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path,
+                               MaintenanceConfig maintenance)
     : duckdb::Catalog(db), handle_(handle), path_(std::move(path)) {
+	// A throw here would abandon a partially constructed object, whose
+	// destructor never runs — so the handle would leak with no
+	// `moraine_detach`. Release it by hand and re-throw instead.
+	try {
+		scheduler_ = duckdb::make_uniq<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
+		                                                     std::move(maintenance));
+		// A read-only attach never schedules — maintenance mutates, and
+		// a `DbReader` never opens a writer. The trigger refuses too.
+		if (!db.IsReadOnly()) {
+			scheduler_->Start();
+		}
+	} catch (...) {
+		if (scheduler_) {
+			scheduler_->Stop();
+			scheduler_.reset();
+		}
+		if (handle_ != nullptr) {
+			moraine_detach(handle_);
+			handle_ = nullptr;
+		}
+		throw;
+	}
 }
 
 MoraineCatalog::~MoraineCatalog() {
+	// The thread issues SQL against this database and calls through
+	// `handle_`, so it must be stopped before either goes away.
+	if (scheduler_) {
+		scheduler_->Stop();
+	}
 	if (handle_ != nullptr) {
 		moraine_detach(handle_);
 		handle_ = nullptr;
@@ -565,6 +636,17 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
 	// data layer and does not forward it to this metadata attach.)
 	std::string data_path;
+	// `MAINTENANCE_*` configures the scheduled pass: the cadence, and
+	// which of DuckLake's own maintenance functions it runs. Every step
+	// that mutates the lake is opt-in, so an attach naming none schedules
+	// only the orphaned-index sweep.
+	std::vector<std::pair<std::string, duckdb::Value>> maintenance_options;
+	for (auto &option : info.options) {
+		if (duckdb::StringUtil::StartsWith(duckdb::StringUtil::Lower(option.first), "maintenance_")) {
+			maintenance_options.emplace_back(option.first, option.second);
+		}
+	}
+	auto maintenance = ParseMaintenanceOptions(maintenance_options);
 	for (auto &option : info.options) {
 		auto name = duckdb::StringUtil::Lower(option.first);
 		if (name == "encrypted") {
@@ -619,7 +701,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	return duckdb::make_uniq<MoraineCatalog>(db, handle, info.path);
+	return duckdb::make_uniq<MoraineCatalog>(db, handle, info.path, std::move(maintenance));
 }
 
 void MoraineCatalog::Initialize(bool load_builtin) {
@@ -781,8 +863,16 @@ std::string MoraineCatalog::GetDBPath() {
 }
 
 void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {
-	// Deliberately empty: freeing handle_ here would race a concurrent
-	// StartTransaction reading it via Handle(); only the destructor frees it.
+	// The handle is deliberately *not* freed here: doing so would race a
+	// concurrent StartTransaction reading it via Handle(); only the
+	// destructor frees it. The scheduler thread is a different matter —
+	// it issues SQL against a database that is being detached, so it is
+	// stopped and joined here, at the last point a live context proves
+	// nothing is mid-teardown. Stop is idempotent; the destructor repeats
+	// it for the paths that never reach this hook.
+	if (scheduler_) {
+		scheduler_->Stop();
+	}
 }
 
 void MoraineCatalog::DropSchema(duckdb::ClientContext &, duckdb::DropInfo &) {

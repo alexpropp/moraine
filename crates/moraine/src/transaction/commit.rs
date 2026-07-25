@@ -33,7 +33,7 @@ use crate::{
 /// stores and readable by older binaries.
 pub(crate) const FORMAT_VERSION: u64 = 1;
 /// Format stamped lazily the first time an equality index exists: format 1
-/// plus the `idx` subspace and `index` kind. Older binaries, which
+/// plus the `index` subspace and `index` kind. Older binaries, which
 /// maintain no entries, refuse it.
 pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
 /// Format stamped the first time a staged (multi-commit) index build

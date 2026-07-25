@@ -749,16 +749,16 @@ async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {
 
 /// Every stored entry key of one index, in scan order.
 async fn index_entry_keys(catalog: &Catalog, unique: bool, index_id: u64) -> Vec<Vec<u8>> {
-    use crate::store::key::{IdxKind, idx_index_prefix};
+    use crate::store::key::{IndexKind, index_index_prefix};
 
     let kind = if unique {
-        IdxKind::Unique
+        IndexKind::Unique
     } else {
-        IdxKind::Multi
+        IndexKind::Multi
     };
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(idx_index_prefix(kind, index_id), ..)
+        .scan_prefix(index_index_prefix(kind, index_id), ..)
         .await
         .unwrap();
     let mut keys = Vec::new();
@@ -1065,7 +1065,7 @@ fn rewrite_data_file_row(
 
 /// A compaction-shaped commit re-registers surviving rows in a
 /// per-row-id file: every derived entry already exists, the commit
-/// lands, and the `idx` range is byte-identical.
+/// lands, and the `index` range is byte-identical.
 #[tokio::test]
 async fn rewrite_registration_re_derives_entries_idempotently() {
     let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
@@ -1105,7 +1105,7 @@ async fn rewrite_registration_re_derives_entries_idempotently() {
     assert_eq!(
         index_entry_keys(&catalog, true, index_id).await,
         before,
-        "the idx range is byte-identical: re-derived entries are no-ops"
+        "the index range is byte-identical: re-derived entries are no-ops"
     );
 }
 
@@ -1145,7 +1145,7 @@ async fn update_shaped_registration_adds_changed_value_entries() {
 /// (the flushed shape) derives entries under the embedded ids.
 #[tokio::test]
 async fn embedded_ids_win_over_a_recorded_dense_start() {
-    use crate::store::key::{IdxKind, idx_index_prefix};
+    use crate::store::key::{IndexKind, index_index_prefix};
 
     let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
 
@@ -1175,7 +1175,7 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
     // The unique entries hold ids 100 and 102 — not 100 and 101.
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(idx_index_prefix(IdxKind::Unique, index_id), ..)
+        .scan_prefix(index_index_prefix(IndexKind::Unique, index_id), ..)
         .await
         .unwrap();
     let mut row_ids = Vec::new();

@@ -21,11 +21,44 @@ use crate::{
         handle::ReadSession,
         index_encoding::{IndexKeyValue, encode_ordered_values},
         inline as store_inline,
-        key::InlineOperation,
+        key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
     },
     transaction::{Transaction, commit, index_maintenance},
 };
+
+/// What a maintenance pass should reclaim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MaintenanceRequest {
+    /// Reclaim the entry ranges of indexes that are no longer live —
+    /// orphaned by `drop_index`, or by a `drop_table` that ended the
+    /// table's indexes with it.
+    pub sweep_orphaned_index_entries: bool,
+    /// Maximum entries deleted per commit. Each batch is one atomic
+    /// write; the pass yields between them so a large reclamation never
+    /// holds the writer. Must be nonzero.
+    pub batch_size: usize,
+}
+
+impl Default for MaintenanceRequest {
+    fn default() -> Self {
+        Self {
+            sweep_orphaned_index_entries: true,
+            batch_size: 1024,
+        }
+    }
+}
+
+/// What a maintenance pass reclaimed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MaintenanceReport {
+    /// Dead indexes whose entry ranges were reclaimed.
+    pub indexes_swept: u64,
+    /// Entry keys deleted across those ranges.
+    pub index_entries_reclaimed: u64,
+}
 
 /// The open store behind a catalog: the read-write `Db` writer, or a
 /// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
@@ -222,7 +255,7 @@ impl Catalog {
     /// Resolves an equality lookup to the rows currently holding `values`.
     ///
     /// Head-only: the lookup materializes the current head and scans the
-    /// `idx` subspace under one read session, so the entries and the catalog
+    /// `index` subspace under one read session, so the entries and the catalog
     /// they resolve against are one consistent cut. Entries are live-only,
     /// so there is no time-travel variant. Returns candidate
     /// [`RowLocation`]s; the caller applies delete files as any DuckLake
@@ -773,6 +806,154 @@ impl Catalog {
             .map_err(Error::from)?;
 
         Ok(deleted)
+    }
+
+    /// Runs one maintenance pass, reclaiming what only moraine knows is
+    /// dead, and reports what it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only catalog,
+    /// [`Error::Configuration`] for a zero `batch_size`, or a store error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, MaintenanceRequest};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// // A fresh catalog has nothing to reclaim.
+    /// let report = catalog.maintain(MaintenanceRequest::default()).await?;
+    /// assert_eq!(report.index_entries_reclaimed, 0);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
+        // Refuse before doing anything, including before the
+        // nothing-to-do shortcut: a pass that reclaims nothing is still a
+        // pass, and answering it differently on a read-only catalog would
+        // make the outcome depend on the request rather than the handle.
+        self.writer()?;
+        if request.batch_size == 0 {
+            return Err(Error::Configuration(
+                "batch_size must be nonzero; zero would reclaim nothing and never terminate"
+                    .to_string(),
+            ));
+        }
+
+        let mut report = MaintenanceReport::default();
+        if !request.sweep_orphaned_index_entries {
+            return Ok(report);
+        }
+
+        // Index ids come from the monotonic catalog-id counter and are
+        // never reused, so an id absent from this view can never become
+        // live again: deciding liveness once, here, is sound for the
+        // whole pass however long it runs.
+        let live: HashSet<u64> = self
+            .snapshot()
+            .await?
+            .indexes
+            .values()
+            .flat_map(|per_table| per_table.keys().copied())
+            .collect();
+
+        for kind in [IndexKind::Unique, IndexKind::Multi] {
+            let mut from = 0u64;
+            while let Some(index_id) = self.first_index_id_from(kind, from).await? {
+                if !live.contains(&index_id) {
+                    let reclaimed = self
+                        .reclaim_dead_range(kind, index_id, request.batch_size)
+                        .await?;
+                    if reclaimed > 0 {
+                        report.indexes_swept += 1;
+                        report.index_entries_reclaimed += reclaimed;
+                    }
+                }
+                // Seek past this index rather than walking its entries.
+                match index_id.checked_add(1) {
+                    Some(next) => from = next,
+                    None => break,
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// The lowest index id at or after `from` holding an entry of `kind`,
+    /// or `None` past the last one. One seek per distinct index present —
+    /// the scan stops at the first key rather than walking the range.
+    pub(crate) async fn first_index_id_from(
+        &self,
+        kind: IndexKind,
+        from: u64,
+    ) -> Result<Option<u64>> {
+        let kind_prefix = index_kind_prefix(kind);
+        let start = index_index_prefix(kind, from);
+        // `scan_prefix` takes its bounds as a suffix of the prefix.
+        let suffix = start[kind_prefix.len()..].to_vec();
+
+        let session = self.begin_read().await?;
+        let first = session
+            .handle()
+            .scan_prefix(kind_prefix, suffix..)
+            .await
+            .map_err(Error::from)?
+            .next()
+            .await
+            .map_err(Error::from)?;
+        session.finish();
+
+        let Some(entry) = first else {
+            return Ok(None);
+        };
+        match Key::decode(&entry.key)? {
+            Key::Index(IndexKey::Unique { index_id, .. } | IndexKey::Multi { index_id, .. }) => {
+                Ok(Some(index_id))
+            }
+            other => Err(Error::Corruption(format!(
+                "key in the index subspace decoded as {other:?}"
+            ))),
+        }
+    }
+
+    /// Deletes every entry of one dead index, `batch_size` per commit,
+    /// returning the total. The caller has already established that the
+    /// index is not live.
+    async fn reclaim_dead_range(
+        &self,
+        kind: IndexKind,
+        index_id: u64,
+        batch_size: usize,
+    ) -> Result<u64> {
+        let mut total = 0u64;
+        // Each batch resumes where the last one stopped. Restarting at
+        // the range's beginning would make every batch step over the
+        // tombstones its predecessors left, which is quadratic in the
+        // size of the range.
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let tx = self.begin_write_tx().await?;
+            let (deleted, last) = index_maintenance::reclaim_entries_from(
+                &tx,
+                kind,
+                index_id,
+                batch_size,
+                cursor.as_deref(),
+            )
+            .await?;
+            if deleted == 0 {
+                tx.rollback();
+                return Ok(total);
+            }
+            tx.commit_with_options(&commit::durable())
+                .await
+                .map_err(Error::from)?;
+            total += deleted as u64;
+            cursor = last;
+        }
     }
 
     /// Closes the catalog, flushing background work.

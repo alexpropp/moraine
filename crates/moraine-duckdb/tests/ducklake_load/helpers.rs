@@ -281,6 +281,90 @@ pub fn run_session(attach: &Attach, sql: &str) -> std::process::Output {
         .expect("failed to spawn duckdb CLI")
 }
 
+/// Runs `before`, waits `pause`, then runs `after` — all in **one**
+/// session, by feeding the CLI through stdin rather than `-c`.
+///
+/// The scheduler's retained passes live in memory per attach, so a
+/// second session would observe a fresh, empty one. Watching a timer do
+/// anything therefore requires holding a session open across real
+/// wall-clock time, which is what this does.
+pub fn run_ducklake_sql_with_pause(
+    store_dir: &Path,
+    data_path: &Path,
+    attach_options: &str,
+    before: &str,
+    pause: std::time::Duration,
+    after: &str,
+) -> String {
+    use std::io::Write;
+
+    // Everything goes through stdin: the CLI runs its `-c` arguments and
+    // exits without ever reading stdin, so a session that must outlive a
+    // pause cannot use them.
+    let mut child = Command::new(cli_path())
+        .arg("-unsigned")
+        .arg("-csv")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn duckdb CLI");
+
+    let preamble = format!(
+        "SET threads=1;\n\
+         SET extension_directory='{}';\n\
+         INSTALL ducklake;\n\
+         LOAD ducklake;\n\
+         LOAD '{}';\n\
+         ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}'{attach_options});\n",
+        extension_directory().display(),
+        ext_path().display(),
+        store_dir.display(),
+        data_path.display(),
+    );
+
+    {
+        // Taking stdin means dropping it here closes the pipe, so the CLI
+        // sees EOF and exits rather than waiting for more input.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(preamble.as_bytes())
+            .expect("write the preamble");
+        stdin
+            .write_all(before.as_bytes())
+            .expect("write the first statements");
+        stdin.flush().expect("flush the first statements");
+        // The session stays open while the scheduler's timer runs.
+        std::thread::sleep(pause);
+        stdin
+            .write_all(after.as_bytes())
+            .expect("write the second statements");
+    }
+
+    // These sessions exercise paths that can legitimately block — a
+    // detach waits out a pass already running — so a bug there would
+    // otherwise wedge the whole suite. Bound the wait and fail loudly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match child.try_wait().expect("poll duckdb CLI") {
+            Some(_) => break,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let output = child.wait_with_output().expect("reap duckdb CLI");
+                panic!(
+                    "duckdb CLI did not exit within the deadline — the session is stuck.\n\
+                     stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    let output = child.wait_with_output().expect("await duckdb CLI");
+    assert_session_ok(output, "paused ducklake session", after)
+}
+
 /// Asserts the session succeeded and returns its stdout.
 pub fn assert_session_ok(output: std::process::Output, context: &str, sql: &str) -> String {
     assert!(
@@ -368,6 +452,32 @@ pub fn run_ducklake_sql_expect_err(store_dir: &Path, data_path: &Path, sql: &str
     assert!(
         !output.status.success(),
         "`{sql}` unexpectedly succeeded:\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    combined_output(&output)
+}
+
+/// As [`run_ducklake_sql_expect_err`], but with extra attach options —
+/// for refusals that happen at attach rather than at the statement, so
+/// the failing option can be asserted on.
+pub fn run_ducklake_sql_expect_err_with_options(
+    store_dir: &Path,
+    data_path: &Path,
+    attach_options: &str,
+    sql: &str,
+) -> String {
+    let output = run_session(
+        &Attach::Moraine {
+            store_dir,
+            data_path,
+            options: attach_options,
+            read_only: false,
+        },
+        sql,
+    );
+    assert!(
+        !output.status.success(),
+        "`{sql}` with options `{attach_options}` unexpectedly succeeded:\nstdout: {}",
         String::from_utf8_lossy(&output.stdout),
     );
     combined_output(&output)

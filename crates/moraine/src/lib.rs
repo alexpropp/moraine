@@ -54,6 +54,40 @@
 //! same [`Catalog::commit`] path, minting a snapshot without bumping the
 //! schema version.
 //!
+//! # Maintenance
+//!
+//! Dropping an equality index (or a table that has one) makes its entries
+//! invisible immediately but does not delete them, so the range would leak
+//! without a sweep. [`Catalog::maintain`] reclaims those ranges:
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use moraine::{Catalog, CatalogOptions, MaintenanceRequest};
+//! # use object_store::memory::InMemory;
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+//! let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+//!
+//! let report = catalog.maintain(MaintenanceRequest::default()).await?;
+//! // Nothing has been dropped, so there is nothing to reclaim.
+//! assert_eq!(report.indexes_swept, 0);
+//! # Ok::<(), moraine::Error>(()) }).unwrap();
+//! ```
+//!
+//! A pass mints no snapshot and leaves head unchanged, and deletes in
+//! bounded batches (`MaintenanceRequest::batch_size`) so a large
+//! reclamation never holds the writer. It is safe to interrupt: an
+//! abandoned pass leaves a smaller one for next time, never a torn one.
+//! Deciding what is dead rests on catalog ids never being reused, so a
+//! sweep can run alongside a live writer without coordinating with it.
+//!
+//! This is the *only* reclamation moraine owns. Snapshot expiry, file
+//! cleanup, and compaction belong to DuckLake and run through its own
+//! functions; the SlateDB store collects its superseded objects itself,
+//! unprompted. A host embedding this crate calls `maintain` on whatever
+//! cadence it likes — the crate spawns no threads and schedules nothing.
+//! Under the DuckDB extension, all of it is sequenced for you; see that
+//! crate's docs for `moraine_maintenance`.
+//!
 //! # Layering
 //!
 //! - `catalog` — the DuckLake domain model. Never touches SlateDB directly.
@@ -76,9 +110,9 @@ pub use catalog::{
     ColumnOrder, ColumnStats, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId,
     DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval, IndexDef, IndexEntry,
     IndexId, IndexInfo, IndexState, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef,
-    MappingId, MappingInfo, NameMappingDef, OptionScope, RowHolder, RowLocation, ScheduledDeletion,
-    SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry,
-    ViewId, ViewInfo,
+    MaintenanceReport, MaintenanceRequest, MappingId, MappingInfo, NameMappingDef, OptionScope,
+    RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo,
+    TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};

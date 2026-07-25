@@ -17,29 +17,12 @@ namespace moraine_duckdb {
 
 namespace {
 
-// Resolves a moraine catalog handle from `catalog_name`, accepting either the
-// DuckLake lake name (its metadata catalog is `__ducklake_metadata_<lake>`,
-// the default naming) or moraine's metadata catalog directly. The downcast is
-// unchecked, so the catalog kind is verified first — a non-moraine name errors
-// rather than crashing.
+// Resolves a moraine catalog handle from `catalog_name`. The lake name
+// and its metadata catalog's name are both accepted; `ResolveMoraineCatalog`
+// owns the mapping between them, so this and the maintenance functions
+// resolve identically.
 MoraineCatalogHandle *ResolveHandle(duckdb::ClientContext &context, const std::string &catalog_name) {
-	auto as_moraine = [&](const std::string &name) -> MoraineCatalogHandle * {
-		auto catalog = duckdb::Catalog::GetCatalogEntry(context, name);
-		if (catalog && catalog->GetCatalogType() == "moraine") {
-			return catalog->Cast<MoraineCatalog>().Handle();
-		}
-		return nullptr;
-	};
-	if (auto *handle = as_moraine(catalog_name)) {
-		return handle;
-	}
-	if (auto *handle = as_moraine("__ducklake_metadata_" + catalog_name)) {
-		return handle;
-	}
-	throw duckdb::InvalidInputException(
-	    "\"%s\" is not a moraine-backed lake; pass the DuckLake lake name, or moraine's "
-	    "\"__ducklake_metadata_<lake>\" metadata catalog",
-	    catalog_name);
+	return ResolveMoraineCatalog(context, catalog_name).Handle();
 }
 
 // moraine_indexes: lists a table's live equality indexes.

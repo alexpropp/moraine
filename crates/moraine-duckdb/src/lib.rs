@@ -38,10 +38,64 @@
 //! DuckLake's own `ducklake_*` writes) and querying a view's definition
 //! (no SQL parser vendored).
 //!
-//! **Single writer.** Attach always opens a read-write [`moraine::Catalog`]
-//! — there is no read-only attach option yet — so only one process may
-//! hold a given store attached; a second attach fences the first's writer
-//! rather than failing itself. See `README.md` for the pinned build shape.
+//! **Single writer.** A read-write attach opens a [`moraine::Catalog`]
+//! over the writer, so only one process may hold a given store attached
+//! that way; a second read-write attach fences the first's writer rather
+//! than failing itself. `READ_ONLY` opens a reader instead, which never
+//! fences the live writer, so any number may attach alongside it. See
+//! `README.md` for the pinned build shape.
+//!
+//! # Maintenance
+//!
+//! A read-write attach can carry a maintenance schedule. When
+//! `META_MAINTENANCE_INTERVAL` is given, the shim runs a thread that
+//! performs a pass on that cadence: DuckLake's own maintenance functions
+//! in a fixed order, then moraine's orphaned-index-entry sweep. Without an
+//! interval no thread starts, and a read-only attach never schedules.
+//!
+//! ```sql
+//! ATTACH 'ducklake:moraine:/lake/catalog' AS lake (
+//!     DATA_PATH '/lake/data', META_DATA_PATH '/lake/data',
+//!     META_MAINTENANCE_INTERVAL INTERVAL '1 hour',
+//!     META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '7 days',
+//!     META_MAINTENANCE_MERGE_ADJACENT_FILES true,
+//!     META_MAINTENANCE_CLEANUP_OLD_FILES_OLDER_THAN INTERVAL '1 hour');
+//! ```
+//!
+//! **Give `older_than` an interval, not a timestamp.** Attach options are
+//! evaluated once, so `now()` freezes into a literal and a schedule would
+//! keep expiring against its attach-time instant forever — retention
+//! quietly stopping as the lake moves on. An interval is rendered as a
+//! rolling window that DuckLake evaluates on each pass. A timestamp is
+//! still accepted, and is what you want for a one-off
+//! `moraine_maintenance` call.
+//!
+//! Every step that mutates the lake is opt-in, so an attach naming none of
+//! them reclaims only orphaned index entries — which no query can observe.
+//! Step options derive from DuckLake's own names:
+//! `META_MAINTENANCE_<function minus its `ducklake_` prefix>` enables a
+//! step with DuckLake's defaults, and appending `_<parameter>` passes one
+//! through unaltered. The steps run in this order: `expire_snapshots`,
+//! `flush_inlined_data`, `merge_adjacent_files`, `rewrite_data_files`,
+//! `cleanup_old_files`, `delete_orphaned_files`, then the sweep. A failed
+//! step abandons the rest of the DuckLake sequence — those steps depend on
+//! each other — but never the sweep, which depends on none of them.
+//! `META_MAINTENANCE_SWEEP_INDEXES false` disables the sweep and
+//! `META_MAINTENANCE_BATCH_SIZE` bounds its deletes per commit.
+//!
+//! Two table functions serve the same pass. `moraine_maintenance('lake')`
+//! runs one immediately and returns `(step, status, detail)`;
+//! `moraine_maintenance_status('lake')` reports the last 16 passes without
+//! running anything, adding `started_at` and whether each was `scheduled`
+//! or `manual`. Both accept either the lake name or the name of its
+//! metadata catalog. The trigger refuses inside an explicit transaction —
+//! it blocks while a second connection writes the catalog — and refuses on
+//! a read-only attach.
+//!
+//! One passthrough limit is worth knowing: DuckLake rejects an attach
+//! carrying a list-valued `META_` option, so `expire_snapshots`' `versions`
+//! is spelled as a string, `META_MAINTENANCE_EXPIRE_SNAPSHOTS_VERSIONS
+//! '[1,2]'`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

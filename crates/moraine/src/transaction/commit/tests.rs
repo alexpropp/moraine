@@ -308,7 +308,7 @@ async fn read_format_version(catalog: &crate::catalog::Catalog) -> u64 {
 async fn create_index_persists_definition_stamps_format_and_lands_entries() {
     use crate::{
         catalog::{ColumnId, IndexDef, IndexState},
-        store::key::{IdxKind, idx_index_prefix},
+        store::key::{IndexKind, index_index_prefix},
     };
     let (catalog, table) = catalog_with_two_column_table().await;
     assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
@@ -344,7 +344,7 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
     // Both backfill rows produced a stored entry.
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(idx_index_prefix(IdxKind::Unique, index_id.get()), ..)
+        .scan_prefix(index_index_prefix(IndexKind::Unique, index_id.get()), ..)
         .await
         .unwrap();
     let mut count = 0;
@@ -1598,16 +1598,16 @@ async fn ddl_on_an_indexed_column_is_guarded() {
     catalog.close().await.unwrap();
 }
 
-async fn scan_idx_entries(
+async fn scan_index_entries(
     catalog: &crate::catalog::Catalog,
     index: crate::catalog::IndexId,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
-    use crate::store::key::{IdxKind, idx_index_prefix};
+    use crate::store::key::{IndexKind, index_index_prefix};
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut entries = Vec::new();
-    for kind in [IdxKind::Unique, IdxKind::Multi] {
+    for kind in [IndexKind::Unique, IndexKind::Multi] {
         let mut iter = ReadHandle::Tx(&tx)
-            .scan_prefix(idx_index_prefix(kind, index.get()), ..)
+            .scan_prefix(index_index_prefix(kind, index.get()), ..)
             .await
             .unwrap();
         while let Some(entry) = iter.next().await.unwrap() {
@@ -1666,7 +1666,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
         .await
         .unwrap();
     let staged_index = staged_index.get().unwrap();
-    // Identical allocation sequence → identical index id, so the idx
+    // Identical allocation sequence → identical index id, so the index
     // keys can be compared directly.
     assert_eq!(single_index, staged_index);
 
@@ -1698,7 +1698,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
         .unwrap();
     assert_eq!(final_state.get().unwrap(), IndexState::Ready);
 
-    // After the flip: lookups serve, and the idx range is byte-identical
+    // After the flip: lookups serve, and the index range is byte-identical
     // to the single-commit build over the same rows.
     let hits = staged
         .index_lookup(table_staged, staged_index, &[value(20)])
@@ -1707,8 +1707,8 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].row_id, 1);
     assert_eq!(
-        scan_idx_entries(&single, single_index).await,
-        scan_idx_entries(&staged, staged_index).await
+        scan_index_entries(&single, single_index).await,
+        scan_index_entries(&staged, staged_index).await
     );
 
     single.close().await.unwrap();
@@ -1773,7 +1773,7 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
 async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
     use crate::{
         catalog::{ColumnId, IndexDef},
-        store::key::{IdxKind, idx_index_prefix},
+        store::key::{IndexKind, index_index_prefix},
     };
     let (catalog, table) = catalog_with_two_column_table().await;
     register_three_row_file(&catalog, table).await;
@@ -1812,14 +1812,434 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
     assert_eq!(second, 1);
     assert_eq!(catalog.reclaim_index_entries(index, 100).await.unwrap(), 0);
 
-    // The idx range is empty afterward.
+    // The index range is empty afterward.
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(idx_index_prefix(IdxKind::Unique, index.get()), ..)
+        .scan_prefix(index_index_prefix(IndexKind::Unique, index.get()), ..)
         .await
         .unwrap();
     assert!(iter.next().await.unwrap().is_none());
     tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// Creates an index over column `a` carrying `count` entries.
+async fn indexed(
+    catalog: &crate::catalog::Catalog,
+    table: crate::catalog::TableId,
+    name: &str,
+    count: u64,
+) -> crate::catalog::IndexId {
+    use crate::catalog::{ColumnId, IndexDef};
+    let entries: Vec<_> = (0..count).map(|i| entry(i, i128::from(i) * 10)).collect();
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: name.into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &entries,
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    index.get().unwrap()
+}
+
+/// Counts every entry left in the `index` subspace, across both kinds.
+async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
+    use crate::store::key::{IndexKind, index_kind_prefix};
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let mut total = 0;
+    for kind in [IndexKind::Unique, IndexKind::Multi] {
+        let mut iter = ReadHandle::Tx(&tx)
+            .scan_prefix(index_kind_prefix(kind), ..)
+            .await
+            .unwrap();
+        while iter.next().await.unwrap().is_some() {
+            total += 1;
+        }
+    }
+    tx.rollback();
+    total
+}
+
+/// A sweep reclaims a dropped index's whole range, reports what it did,
+/// and finds nothing left on a second pass.
+#[tokio::test]
+async fn maintain_sweeps_a_dropped_index_and_is_idempotent() {
+    use crate::catalog::MaintenanceRequest;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+    let index = indexed(&catalog, table, "by_a", 3).await;
+
+    // A live index is untouched.
+    let untouched = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(untouched.indexes_swept, 0);
+    assert_eq!(untouched.index_entries_reclaimed, 0);
+    assert_eq!(index_entry_count(&catalog).await, 3);
+
+    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+
+    let swept = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(swept.indexes_swept, 1);
+    assert_eq!(swept.index_entries_reclaimed, 3);
+    assert_eq!(index_entry_count(&catalog).await, 0);
+
+    let again = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(again.indexes_swept, 0);
+    assert_eq!(again.index_entries_reclaimed, 0);
+
+    catalog.close().await.unwrap();
+}
+
+/// With live and dead indexes interleaved by id, the sweep reclaims
+/// exactly the dead ones and every live index still answers lookups.
+#[tokio::test]
+async fn maintain_spares_live_indexes_interleaved_by_id() {
+    use crate::{
+        catalog::MaintenanceRequest,
+        store::index_encoding::{IndexKeyValue, IntWidth},
+    };
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let first = indexed(&catalog, table, "one", 3).await;
+    let live = indexed(&catalog, table, "two", 3).await;
+    let last = indexed(&catalog, table, "three", 3).await;
+    assert!(first.get() < live.get() && live.get() < last.get());
+
+    // Drop the lowest and highest ids, leaving a live index between them.
+    catalog.commit(|tx| tx.drop_index(first)).await.unwrap();
+    catalog.commit(|tx| tx.drop_index(last)).await.unwrap();
+
+    let report = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(report.indexes_swept, 2);
+    assert_eq!(report.index_entries_reclaimed, 6);
+
+    // The survivor kept every entry and still resolves them.
+    assert_eq!(index_entry_count(&catalog).await, 3);
+    for row_id in 0..3u64 {
+        let found = catalog
+            .index_lookup(
+                table,
+                live,
+                &[IndexKeyValue::Int {
+                    value: i128::from(row_id) * 10,
+                    width: IntWidth::I64,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|location| location.row_id)
+                .collect::<Vec<_>>(),
+            vec![row_id]
+        );
+    }
+
+    catalog.close().await.unwrap();
+}
+
+/// Dropping a table ends its indexes with it, and the sweep reclaims both
+/// ranges in one pass.
+#[tokio::test]
+async fn maintain_reclaims_both_indexes_of_a_dropped_table() {
+    use crate::catalog::MaintenanceRequest;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+    indexed(&catalog, table, "by_a", 3).await;
+    indexed(&catalog, table, "also_a", 2).await;
+    assert_eq!(index_entry_count(&catalog).await, 5);
+
+    catalog.commit(|tx| tx.drop_table(table)).await.unwrap();
+
+    let report = catalog
+        .maintain(MaintenanceRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(report.indexes_swept, 2);
+    assert_eq!(report.index_entries_reclaimed, 5);
+    assert_eq!(index_entry_count(&catalog).await, 0);
+
+    catalog.close().await.unwrap();
+}
+
+/// A range larger than the batch size is reclaimed across several
+/// commits, and `sys/head` is unchanged across the whole sweep.
+#[tokio::test]
+async fn maintain_batches_without_advancing_head() {
+    use crate::catalog::MaintenanceRequest;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+    let index = indexed(&catalog, table, "by_a", 10).await;
+    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+
+    let before = catalog.snapshot().await.unwrap().current_snapshot().id;
+
+    let report = catalog
+        .maintain(MaintenanceRequest {
+            batch_size: 3,
+            ..MaintenanceRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.indexes_swept, 1);
+    assert_eq!(report.index_entries_reclaimed, 10);
+    assert_eq!(index_entry_count(&catalog).await, 0);
+
+    let after = catalog.snapshot().await.unwrap().current_snapshot().id;
+    assert_eq!(before, after, "a maintenance pass must not advance head");
+
+    catalog.close().await.unwrap();
+}
+
+/// Batches resume where the previous one stopped rather than restarting
+/// at the range's beginning, so a range reclaims correctly however small
+/// the batch. With `batch_size` 1 every entry is its own commit, which is
+/// the shape that would expose a cursor that failed to advance — it would
+/// re-scan the same tombstones and stall, or skip live entries.
+#[tokio::test]
+async fn maintain_resumes_each_batch_where_the_last_one_stopped() {
+    use crate::catalog::MaintenanceRequest;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+    let index = indexed(&catalog, table, "by_a", 25).await;
+    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+
+    let report = catalog
+        .maintain(MaintenanceRequest {
+            batch_size: 1,
+            ..MaintenanceRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(report.indexes_swept, 1);
+    assert_eq!(
+        report.index_entries_reclaimed, 25,
+        "every entry must be reclaimed exactly once across 25 batches"
+    );
+    assert_eq!(index_entry_count(&catalog).await, 0);
+
+    catalog.close().await.unwrap();
+}
+
+/// A zero batch size would loop forever rather than reclaim nothing, so
+/// it is refused.
+#[tokio::test]
+async fn maintain_refuses_a_zero_batch_size() {
+    use crate::catalog::MaintenanceRequest;
+    let (catalog, _) = catalog_with_two_column_table().await;
+    assert!(matches!(
+        catalog
+            .maintain(MaintenanceRequest {
+                batch_size: 0,
+                ..MaintenanceRequest::default()
+            })
+            .await,
+        Err(Error::Configuration(_))
+    ));
+    catalog.close().await.unwrap();
+}
+
+/// Maintenance mutates, so a read-only catalog refuses it rather than
+/// reporting a no-op pass.
+#[tokio::test]
+async fn maintain_refuses_a_read_only_catalog() {
+    use crate::catalog::{Catalog, CatalogOptions, MaintenanceRequest};
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+
+    // Bootstrap and release the writer so the reader has a store to open.
+    let writer = Catalog::open(object_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        reader.maintain(MaintenanceRequest::default()).await,
+        Err(Error::Constraint(_))
+    ));
+    // A request with nothing to do is refused just the same: the answer
+    // depends on the handle, not on what the request happens to ask for.
+    assert!(matches!(
+        reader
+            .maintain(MaintenanceRequest {
+                sweep_orphaned_index_entries: false,
+                ..MaintenanceRequest::default()
+            })
+            .await,
+        Err(Error::Constraint(_))
+    ));
+    reader.close().await.unwrap();
+}
+
+/// Discovery seeks by index id: from any starting id it returns the
+/// lowest index at or after it, and `None` past the last — the property
+/// that lets the sweep skip a live index in one seek instead of walking
+/// its entries.
+#[tokio::test]
+async fn discovery_seeks_to_the_next_index_holding_entries() {
+    use crate::store::key::IndexKind;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let first = indexed(&catalog, table, "one", 3).await;
+    let second = indexed(&catalog, table, "two", 3).await;
+    let (low, high) = (first.get(), second.get());
+    assert!(low < high);
+
+    // From zero, from the id itself, and from just past the lower one.
+    assert_eq!(
+        catalog
+            .first_index_id_from(IndexKind::Unique, 0)
+            .await
+            .unwrap(),
+        Some(low)
+    );
+    assert_eq!(
+        catalog
+            .first_index_id_from(IndexKind::Unique, low)
+            .await
+            .unwrap(),
+        Some(low)
+    );
+    assert_eq!(
+        catalog
+            .first_index_id_from(IndexKind::Unique, low + 1)
+            .await
+            .unwrap(),
+        Some(high)
+    );
+    assert_eq!(
+        catalog
+            .first_index_id_from(IndexKind::Unique, high + 1)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // These are unique indexes, so the multi range is empty throughout.
+    assert_eq!(
+        catalog
+            .first_index_id_from(IndexKind::Multi, 0)
+            .await
+            .unwrap(),
+        None
+    );
+
+    catalog.close().await.unwrap();
+}
+
+/// A sweep interleaved with commits that insert into a *live* index
+/// completes without conflict, and the live index keeps every entry: the
+/// only keys the sweep writes are deletes under dead index ids, which no
+/// live commit touches.
+#[tokio::test]
+async fn maintain_does_not_conflict_with_a_live_writer() {
+    use crate::{
+        catalog::{DataFile, FileIndexEntry, MaintenanceRequest},
+        store::index_encoding::{IndexKeyValue, IntWidth},
+    };
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let dead = indexed(&catalog, table, "dead", 6).await;
+    let live = indexed(&catalog, table, "live", 3).await;
+    catalog.commit(|tx| tx.drop_index(dead)).await.unwrap();
+
+    // Interleave: sweep a batch, then land a file carrying a new entry
+    // for the live index, and repeat.
+    let mut reclaimed = 0;
+    for round in 0..3u64 {
+        let report = catalog
+            .maintain(MaintenanceRequest {
+                batch_size: 2,
+                ..MaintenanceRequest::default()
+            })
+            .await
+            .unwrap();
+        reclaimed += report.index_entries_reclaimed;
+
+        let path = format!("live-{round}.parquet");
+        catalog
+            .commit(move |tx| {
+                tx.register_data_file(
+                    table,
+                    DataFile {
+                        path: path.clone(),
+                        path_is_relative: true,
+                        file_format: "parquet".into(),
+                        record_count: 1,
+                        file_size_bytes: 10,
+                        footer_size: 4,
+                        encryption_key: None,
+                        column_stats: vec![],
+                    },
+                    &[FileIndexEntry {
+                        index: live,
+                        ordinal: 0,
+                        values: vec![Some(IndexKeyValue::Int {
+                            value: i128::from(1_000 + round),
+                            width: IntWidth::I64,
+                        })],
+                    }],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("a commit into a live index must not conflict with the sweep");
+    }
+
+    assert_eq!(reclaimed, 6, "the dead range is fully reclaimed");
+    // Three original entries plus the three landed mid-sweep.
+    assert_eq!(index_entry_count(&catalog).await, 6);
+
+    catalog.close().await.unwrap();
+}
+
+/// Sweeping is opt-out: a request that disables it reclaims nothing.
+#[tokio::test]
+async fn maintain_skips_the_sweep_when_disabled() {
+    use crate::catalog::MaintenanceRequest;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+    let index = indexed(&catalog, table, "by_a", 3).await;
+    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+
+    let report = catalog
+        .maintain(MaintenanceRequest {
+            sweep_orphaned_index_entries: false,
+            ..MaintenanceRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.index_entries_reclaimed, 0);
+    assert_eq!(index_entry_count(&catalog).await, 3);
+
     catalog.close().await.unwrap();
 }
 
