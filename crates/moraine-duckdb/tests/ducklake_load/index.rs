@@ -695,3 +695,56 @@ fn moraine_index_survives_update_and_compaction() {
         "the rebuilt index omits rows deleted before compaction"
     );
 }
+
+/// The index functions resolve a lake whose metadata catalog was named
+/// by `METADATA_CATALOG` rather than DuckLake's default
+/// `__ducklake_metadata_<lake>`. Name derivation cannot find such a
+/// catalog, so resolution matches attached databases on path — the same
+/// resolver the maintenance functions use.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
+    let store = TempDir::new("index-custom-meta-store");
+    let data = TempDir::new("index-custom-meta-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', METADATA_CATALOG 'custom_meta'",
+        data.path().display()
+    );
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &options, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(6) t(i);\
+         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],true);");
+
+    // Addressed by the lake name, whose metadata catalog shares no name
+    // with it.
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT index_name FROM moraine_indexes('lake','main','t');"
+        )),
+        vec![vec!["by_a".to_string()]]
+    );
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT row_id FROM moraine_index_lookup('lake','main','t','by_a', 3);"
+        )),
+        vec![vec!["3".to_string()]]
+    );
+
+    // ...and by the metadata catalog's own name.
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT index_name FROM moraine_indexes('custom_meta','main','t');"
+        )),
+        vec![vec!["by_a".to_string()]]
+    );
+
+    run("SELECT * FROM moraine_index_drop('lake','main','t','by_a');");
+    assert!(
+        csv_rows(&run(
+            "SELECT index_name FROM moraine_indexes('lake','main','t');"
+        ))
+        .is_empty(),
+        "the drop must land through the same resolution"
+    );
+}

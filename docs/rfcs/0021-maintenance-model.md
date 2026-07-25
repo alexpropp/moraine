@@ -180,6 +180,30 @@ A bare `META_MAINTENANCE_<step> true` runs it with DuckLake's own defaults;
 supplying a parameter implies enabling the step. Values pass through
 unvalidated — a nonsensical `delete_threshold` is DuckLake's to reject.
 
+One value shape does not survive the passthrough: DuckLake fails an attach
+carrying a **list-valued `META_` option**, and not only for moraine's
+options — any `META_<name> [1,2]` fails the same way. So
+`expire_snapshots`' `versions` is spelled as a string,
+`META_MAINTENANCE_EXPIRE_SNAPSHOTS_VERSIONS '[1,2]'`, which DuckLake
+accepts for that parameter. This is a property of the passthrough, not of
+the derivation rule, and needs no exception in it.
+
+The lake name the steps are called with is **not** derived from this
+catalog's own name. A lake attached with `METADATA_CATALOG` names its
+metadata catalog itself, so the default `__ducklake_metadata_<lake>`
+naming neither identifies it nor recovers the lake name by stripping. The
+pass instead matches attached databases on path — the lake attaches
+`moraine:<store path>` and this catalog reports `<store path>` — and falls
+back to the prefix rule only when no such lake is found (a standalone
+`moraine:` attach, which has no DuckLake above it).
+
+Resolving a *name* to a moraine catalog has the same problem and one
+answer: `ResolveMoraineCatalog` (`cpp/catalog.cpp`) accepts either name,
+matching on path when neither derivation finds one. The maintenance
+functions and the `moraine_index_*` family both go through it, so the
+whole extension resolves lakes identically — the index family previously
+carried its own copy of the prefix assumption and inherited the same bug.
+
 Two options are moraine's own rather than derived, because the sweep is:
 `META_MAINTENANCE_SWEEP_INDEXES` (default true) turns it off, and
 `META_MAINTENANCE_BATCH_SIZE` bounds the deletes per commit. Both are
@@ -221,8 +245,17 @@ configured, stopped and joined at detach *before* `moraine_detach`
 
 **Read-only attaches never schedule.** A `DbReader` never opens a writer.
 
-A failed step aborts that pass, naming the step; earlier effects stand, and
-the next tick re-runs from the top.
+**A failed step abandons the rest of the DuckLake sequence, but never the
+sweep.** The DuckLake steps depend on each other — cleanup drains what
+merge scheduled — so continuing past a failure would do partial work on a
+premise that did not hold. The sweep depends on none of them, and
+suppressing it would be worse than useless: a misconfigured `older_than`
+that DuckLake rejects would abort every future pass at step 1, so
+moraine's own reclamation would stop for as long as the misconfiguration
+stood while the leak it exists to fix kept growing. Abandoned steps are
+still reported (`skipped`, naming what aborted them) rather than dropped,
+so every pass emits the same rows and two passes stay comparable. Earlier
+effects stand, and the next tick re-runs from the top.
 
 Single-tier by design: one interval, one step set. Steps have genuinely
 different natural cadences — the sweep is two seeks when nothing was
@@ -382,30 +415,51 @@ Live (e2e):
   after a later pass that did not, each carrying its trigger.
 - **Read-only never schedules.** A read-only attach starts no thread, so
   its status window stays empty.
+- **A failed step does not suppress the sweep.** With a step DuckLake
+  rejects, the later DuckLake steps report `skipped` naming what aborted
+  them, and the sweep still reclaims its range.
+- **The scheduler runs a pass unattended.** An attach configuring only an
+  interval reclaims a range orphaned by an *earlier* session, with no
+  trigger call, and the window records the pass as `scheduled`.
+- **Ticks skip a pass already running.** Against a pass far longer than
+  the interval, exactly one pass takes the whole range and every other
+  takes nothing — a split would mean two passes ran over it at once.
+- **A custom `METADATA_CATALOG` resolves.** The trigger accepts either the
+  lake name or the metadata name, and the pass still calls DuckLake with
+  the lake name rather than the metadata one.
+- **A list parameter spelled as a string** reaches DuckLake unaltered and
+  expires exactly the named versions.
+- **Detach during a running pass completes**, rather than hanging on the
+  join or failing.
 - **Path overlap refused**; sibling locations attach normally.
+
+The timer tests hold one session open across a real pause: the retained
+window is per-attach and in memory, so a second session would observe a
+fresh, empty one. Contention is provoked with shipped knobs rather than
+test-only scaffolding — `MAINTENANCE_BATCH_SIZE 1` makes the sweep take
+one durable commit per entry, each waiting out the WAL flush cadence, so
+a twenty-entry range reliably outruns a 100ms interval. Together they
+cost a few seconds of the suite, and the paused-session helper bounds its
+own wait so a deadlock fails loudly instead of wedging the gate.
+
+Counting passes would *not* pin single-flight: once the slow pass ends,
+later ticks correctly run fast empty passes for the rest of the window.
+The invariant that distinguishes them is that no pass ever observes a
+partially reclaimed range.
 
 Shim unit tests cover the ABI edge the pass rides: `moraine_maintain`
 writes its counts through the out-parameters and accepts null slots for
 either, and the overlap guard is exercised across store kinds, buckets,
 and sibling-versus-nested prefixes without needing a lake.
 
-Verified against a live lake during bring-up but not yet pinned by a test,
-because each needs a multi-second wait that would slow the gate: the timer
-thread running a pass unattended, detach stopping it cleanly, and
-single-flight under a pass longer than the interval. These are the first
-candidates if the scheduler grows.
-
 ## Open questions
 
-- **Scheduler thread lifetime against DuckDB shutdown.** `OnDetach` stops
-  and joins, and the destructor repeats it for paths that never reach that
-  hook — both verified against a live scheduler between passes. Two cases
-  remain unresolved. A detach arriving *mid-pass* blocks until the pass
-  finishes, which is the property that keeps a pass from ever running
-  against a detached database, but it means detach waits on SQL running on
-  another connection against the same instance — whether that can deadlock
-  against whatever detach itself holds is untested. And a process torn
-  down without detaching at all has no defined outcome, since DuckDB's
+- **Scheduler thread lifetime against DuckDB shutdown.** Detaching
+  *during* a running pass is pinned by a test and completes: `Stop()`
+  blocks until the pass finishes — the property that keeps a pass from
+  ever touching a detached database — without deadlocking against what
+  detach itself holds. What remains is a process torn down without
+  detaching at all, which has no defined outcome, since DuckDB's
   extension teardown ordering is not something this design can assert.
 - **Trigger-under-transaction.** Resolved for the autocommit case: the
   trigger runs the pass through a second connection and works against a

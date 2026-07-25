@@ -705,3 +705,341 @@ fn maintenance_never_runs_on_a_read_only_attach() {
         "a read-only attach must start no scheduler"
     );
 }
+
+/// A failed DuckLake step abandons the rest of that sequence — its steps
+/// depend on each other — but never the sweep, which depends on none of
+/// them. Suppressing the sweep would stop moraine's own reclamation on
+/// every future pass for as long as the misconfiguration stood.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn maintenance_sweeps_even_when_a_ducklake_step_fails() {
+    let store = TempDir::new("maint-fail-store");
+    let data = TempDir::new("maint-fail-data");
+    // DuckLake rejects a delete threshold outside 0..1 at bind.
+    let options = format!(
+        ", META_DATA_PATH '{}', META_MAINTENANCE_REWRITE_DATA_FILES_DELETE_THRESHOLD 99.0",
+        data.path().display()
+    );
+
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(9) t(i);\
+         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
+         SELECT * FROM moraine_index_drop('lake','main','t','by_a');\
+         SELECT step, status, detail FROM moraine_maintenance('lake');",
+    ));
+    let by_step: std::collections::HashMap<_, _> = rows
+        .iter()
+        .filter(|row| row.len() == 3)
+        .map(|row| (row[0].as_str(), (row[1].as_str(), row[2].as_str())))
+        .collect();
+
+    assert_eq!(
+        by_step.get("rewrite_data_files").map(|entry| entry.0),
+        Some("failed"),
+        "{rows:?}"
+    );
+    // Steps after the failure are reported, not dropped, so every pass
+    // emits the same rows and two passes stay comparable.
+    for later in ["cleanup_old_files", "delete_orphaned_files"] {
+        let (status, detail) = by_step[later];
+        assert_eq!(status, "skipped", "{later} in {rows:?}");
+        assert!(
+            detail.contains("not attempted: rewrite_data_files failed"),
+            "{later} should name what aborted it: {detail}"
+        );
+    }
+    // The whole point: reclamation still happened.
+    let (status, detail) = by_step["sweep_indexes"];
+    assert_eq!(status, "ran", "the sweep must survive a failed step");
+    assert!(detail.contains("9 entries"), "got: {detail}");
+}
+
+/// The scheduler runs a pass with nobody driving it: an attach that
+/// configures an interval reclaims a pre-existing orphaned range on its
+/// own, and the retained window records the pass as `scheduled`.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn scheduler_runs_a_pass_unattended() {
+    let store = TempDir::new("maint-timer-store");
+    let data = TempDir::new("maint-timer-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+
+    // Orphan a range in a session with no scheduler, so the only thing
+    // that can reclaim it is the timer in the session that follows.
+    run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(11) t(i);\
+         SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
+         SELECT * FROM moraine_index_drop('lake','main','t','by_a');",
+    );
+
+    let scheduled = format!("{meta}, META_MAINTENANCE_INTERVAL INTERVAL '200 milliseconds'");
+    let output = run_ducklake_sql_with_pause(
+        store.path(),
+        data.path(),
+        &scheduled,
+        // Nothing but the attach; the timer is the only actor.
+        "SELECT 1;\n",
+        std::time::Duration::from_millis(1_500),
+        "SELECT 'PASS' AS marker, trigger, detail FROM moraine_maintenance_status('lake') \
+           WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
+    );
+    let passes: Vec<Vec<String>> = csv_rows(&output)
+        .into_iter()
+        .filter(|row| row.first().is_some_and(|marker| marker == "PASS"))
+        .collect();
+
+    assert!(
+        !passes.is_empty(),
+        "the timer must have run at least one pass: {output}"
+    );
+    assert!(
+        passes.iter().all(|pass| pass[1] == "scheduled"),
+        "every pass here is timer-driven, not triggered: {passes:?}"
+    );
+    // The first pass found the orphaned range; later ones find nothing,
+    // which also shows repeated ticks are harmless.
+    assert!(
+        passes[0][2].contains("11 entries"),
+        "the first unattended pass must reclaim the range: {passes:?}"
+    );
+    assert!(
+        passes[1..].iter().all(|pass| pass[2].contains("0 entries")),
+        "later passes must find nothing left: {passes:?}"
+    );
+}
+
+/// Orphans `entries` index entries in a session of its own, so a later
+/// session's scheduler has something slow to reclaim.
+///
+/// A pass over them with `MAINTENANCE_BATCH_SIZE 1` takes one durable
+/// commit per entry — each waiting out the WAL flush cadence — so the
+/// pass reliably outruns a sub-second interval. That is the only way to
+/// provoke tick contention without a test-only knob.
+fn orphaned_range(store: &TempDir, data: &TempDir, entries: u64) {
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        &format!(
+            "CREATE TABLE lake.main.t(a BIGINT);\
+             INSERT INTO lake.main.t SELECT i FROM range({entries}) t(i);\
+             SELECT * FROM moraine_index_create('lake','main','t','by_a',['a'],false);\
+             SELECT * FROM moraine_index_drop('lake','main','t','by_a');"
+        ),
+    );
+}
+
+/// Reads the marked pass rows out of a paused session's output.
+fn marked_passes(output: &str) -> Vec<Vec<String>> {
+    csv_rows(output)
+        .into_iter()
+        .filter(|row| row.first().is_some_and(|marker| marker == "PASS"))
+        .collect()
+}
+
+/// A tick arriving while a pass is still running skips rather than
+/// queueing behind it.
+///
+/// The signal is that **no pass ever observes a partially reclaimed
+/// range**: one pass takes the whole range and every other takes
+/// nothing. Two passes running concurrently over the same `index` range
+/// would each delete part of it and report a split. Counting passes
+/// would not work — once the slow pass finishes, later ticks correctly
+/// run fast empty passes for the rest of the window.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn scheduler_ticks_skip_a_pass_already_running() {
+    const ENTRIES: u64 = 20;
+    let store = TempDir::new("maint-single-store");
+    let data = TempDir::new("maint-single-data");
+    orphaned_range(&store, &data, ENTRIES);
+
+    // The pass takes ~20 durable commits; ticks fire every 100ms, so
+    // many of them land while it is still running.
+    let options = format!(
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
+         META_MAINTENANCE_BATCH_SIZE 1",
+        data.path().display()
+    );
+    let output = run_ducklake_sql_with_pause(
+        store.path(),
+        data.path(),
+        &options,
+        "SELECT 1;\n",
+        std::time::Duration::from_millis(3_500),
+        "SELECT 'PASS' AS marker, detail FROM moraine_maintenance_status('lake') \
+           WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
+    );
+    let passes = marked_passes(&output);
+    assert!(
+        passes.len() > 1,
+        "too few passes to prove anything: {output}"
+    );
+
+    let counts: Vec<u64> = passes
+        .iter()
+        .map(|pass| {
+            pass[1]
+                .split_whitespace()
+                .nth(1)
+                .and_then(|count| count.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("unparseable detail: {}", pass[1]))
+        })
+        .collect();
+
+    let claiming: Vec<u64> = counts.iter().copied().filter(|count| *count > 0).collect();
+    assert_eq!(
+        claiming,
+        vec![ENTRIES],
+        "exactly one pass must take the whole range; a split means two \
+         passes ran over it concurrently: {passes:?}"
+    );
+}
+
+/// Detaching *while a pass is running* stops and joins the thread before
+/// the handle is released. The join blocks until the pass finishes,
+/// which is what keeps a pass from ever touching a detached database —
+/// this pins that it completes rather than deadlocking against whatever
+/// detach itself holds.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn detach_during_a_running_pass_completes() {
+    let store = TempDir::new("maint-detach-store");
+    let data = TempDir::new("maint-detach-data");
+    orphaned_range(&store, &data, 20);
+
+    let options = format!(
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
+         META_MAINTENANCE_BATCH_SIZE 1",
+        data.path().display()
+    );
+    // The first tick fires at ~100ms and the pass then runs for well over
+    // a second, so detaching at 500ms lands squarely inside it.
+    let output = run_ducklake_sql_with_pause(
+        store.path(),
+        data.path(),
+        &options,
+        "SELECT 1;\n",
+        std::time::Duration::from_millis(500),
+        "DETACH lake;\nSELECT 'SURVIVED' AS marker;\n",
+    );
+
+    assert!(
+        csv_rows(&output)
+            .iter()
+            .any(|row| row.first().is_some_and(|marker| marker == "SURVIVED")),
+        "detaching mid-pass must complete, not hang or fail: {output}"
+    );
+}
+
+/// A lake attached with `METADATA_CATALOG` names its metadata catalog
+/// itself, so the default `__ducklake_metadata_<lake>` naming does not
+/// find it and stripping that prefix does not recover the lake name.
+/// Both are resolved by matching attached databases on path instead: the
+/// trigger accepts either name, and the pass still calls DuckLake's
+/// functions with the *lake* name.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn maintenance_resolves_a_custom_metadata_catalog_name() {
+    let store = TempDir::new("maint-custom-meta-store");
+    let data = TempDir::new("maint-custom-meta-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', METADATA_CATALOG 'custom_meta', \
+         META_MAINTENANCE_MERGE_ADJACENT_FILES true",
+        data.path().display()
+    );
+
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(6) t(i);\
+         SELECT 'LAKE' AS via, step, status FROM moraine_maintenance('lake') \
+           WHERE step = 'merge_adjacent_files';\
+         SELECT 'META' AS via, step, status FROM moraine_maintenance('custom_meta') \
+           WHERE step = 'merge_adjacent_files';",
+    ));
+
+    // Both spellings reach the same scheduler, and the DuckLake step runs
+    // rather than failing on a name DuckLake does not know.
+    for via in ["LAKE", "META"] {
+        let found = rows
+            .iter()
+            .find(|row| row.first().is_some_and(|marker| marker == via))
+            .unwrap_or_else(|| panic!("no row for {via}: {rows:?}"));
+        assert_eq!(found[2], "ran", "{via} did not run the step: {rows:?}");
+    }
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            store.path(),
+            data.path(),
+            &options,
+            "SELECT count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["6".to_string()]]
+    );
+}
+
+/// `expire_snapshots`' `versions` parameter takes a list, which
+/// DuckLake's `META_` passthrough cannot carry — a list-valued `META_`
+/// option fails the attach outright, and not only for moraine's options.
+/// DuckLake accepts the same value spelled as a string, so that is how
+/// the parameter is reachable, and it passes through unaltered.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn maintenance_passes_a_list_parameter_spelled_as_a_string() {
+    let store = TempDir::new("maint-versions-store");
+    let data = TempDir::new("maint-versions-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', META_MAINTENANCE_EXPIRE_SNAPSHOTS_VERSIONS '[1,2]'",
+        data.path().display()
+    );
+
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(3) t(i);\
+         INSERT INTO lake.main.t VALUES (9);\
+         INSERT INTO lake.main.t VALUES (10);\
+         SELECT 'STEP' AS marker, status FROM moraine_maintenance('lake') \
+           WHERE step = 'expire_snapshots';\
+         SELECT 'SNAP' AS marker, snapshot_id \
+           FROM __ducklake_metadata_lake.ducklake_snapshot ORDER BY snapshot_id;",
+    ));
+
+    assert!(
+        rows.iter().any(|row| row[0] == "STEP" && row[1] == "ran"),
+        "the step must run with a string-spelled list: {rows:?}"
+    );
+    // Bootstrap plus four mutations gives snapshots 0..4; naming
+    // versions 1 and 2 expires exactly those two and nothing else.
+    let snapshots: Vec<&str> = rows
+        .iter()
+        .filter(|row| row[0] == "SNAP")
+        .map(|row| row[1].as_str())
+        .collect();
+    assert_eq!(snapshots, vec!["0", "3", "4"], "{rows:?}");
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            store.path(),
+            data.path(),
+            &options,
+            "SELECT count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["5".to_string()]]
+    );
+}

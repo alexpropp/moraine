@@ -1,5 +1,6 @@
 #include "maintenance.hpp"
 
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "catalog.hpp"
@@ -154,25 +155,45 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 
 namespace {
 
-// DuckLake's maintenance functions take the *lake* name, while this
-// catalog is attached under the metadata name DuckLake derives from it
-// (`__ducklake_metadata_<lake>`, its default). Recover the lake name so
-// the pass calls the functions with what they expect. A standalone
-// `moraine:` attach carries no such prefix and keeps its own name — it
-// has no DuckLake above it to maintain.
-std::string LakeNameOf(const std::string &attached_name) {
-	const std::string prefix = "__ducklake_metadata_";
-	if (duckdb::StringUtil::StartsWith(attached_name, prefix)) {
-		return attached_name.substr(prefix.size());
-	}
-	return attached_name;
-}
+// The name DuckLake gives its metadata catalog by default. An attach
+// that passes `METADATA_CATALOG` uses its own name instead, which is why
+// this prefix is only ever a fallback.
+constexpr const char *METADATA_PREFIX = "__ducklake_metadata_";
 
 } // namespace
 
-MaintenanceScheduler::MaintenanceScheduler(duckdb::DatabaseInstance &db, std::string lake,
-                                           MoraineCatalogHandle *handle, MaintenanceConfig config)
-    : db_(db), lake_(LakeNameOf(lake)), handle_(handle), config_(std::move(config)) {
+MaintenanceScheduler::MaintenanceScheduler(duckdb::DatabaseInstance &db, std::string attached_name,
+                                           std::string store_path, MoraineCatalogHandle *handle,
+                                           MaintenanceConfig config)
+    : db_(db), attached_name_(std::move(attached_name)), store_path_(std::move(store_path)),
+      handle_(handle), config_(std::move(config)) {
+}
+
+std::string MaintenanceScheduler::ResolveLakeName(duckdb::Connection &connection) {
+	// DuckLake's maintenance functions take the *lake* name, while this
+	// catalog is attached under its metadata name. The two are related by
+	// path — the lake attaches `moraine:<store path>` and this catalog
+	// reports `<store path>` — so match on that rather than assuming the
+	// default `__ducklake_metadata_<lake>` naming, which an attach can
+	// override with `METADATA_CATALOG`.
+	auto result = connection.Query("SELECT database_name, path FROM duckdb_databases() "
+	                               "WHERE type = 'ducklake'");
+	if (!result->HasError()) {
+		for (auto &row : *result) {
+			auto name = row.GetValue<std::string>(0);
+			auto path = row.GetValue<std::string>(1);
+			if (duckdb::StringUtil::EndsWith(path, store_path_)) {
+				return name;
+			}
+		}
+	}
+	// No DuckLake above this catalog (a standalone `moraine:` attach), or
+	// the listing failed. Fall back to the default naming so a lake that
+	// follows it still works.
+	if (duckdb::StringUtil::StartsWith(attached_name_, METADATA_PREFIX)) {
+		return attached_name_.substr(std::string(METADATA_PREFIX).size());
+	}
+	return attached_name_;
 }
 
 MaintenanceScheduler::~MaintenanceScheduler() {
@@ -243,30 +264,41 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	// operator on the caller's own context would deadlock; a separate
 	// connection on the same instance is the supported way in.
 	duckdb::Connection connection(db_);
+	auto lake = ResolveLakeName(connection);
 
+	// A failed step abandons the rest of the *DuckLake* sequence, whose
+	// steps depend on each other — cleanup drains what merge scheduled,
+	// so running it after a failed merge does partial work on a premise
+	// that did not hold. The abandoned steps are still reported, so every
+	// pass emits the same rows and two passes can be compared.
+	std::string aborted_by;
 	for (auto &spec : StepSpecs()) {
+		if (!aborted_by.empty()) {
+			report.push_back(
+			    MaintenanceStep {spec.name, "skipped", "not attempted: " + aborted_by + " failed"});
+			continue;
+		}
 		auto configured = std::find_if(config_.ducklake_steps.begin(), config_.ducklake_steps.end(),
 		                               [&](const DuckLakeStep &step) { return step.name == spec.name; });
 		if (configured == config_.ducklake_steps.end()) {
 			report.push_back(MaintenanceStep {spec.name, "skipped", "not configured at attach"});
 			continue;
 		}
-		auto outcome = RunDuckLakeStep(connection, *configured);
-		bool failed = outcome.status == "failed";
-		report.push_back(std::move(outcome));
-		if (failed) {
-			// A failed step aborts the pass; earlier effects stand, and
-			// every step is idempotent, so the next one re-runs from the
-			// top.
-			break;
+		auto outcome = RunDuckLakeStep(connection, lake, *configured);
+		if (outcome.status == "failed") {
+			aborted_by = spec.name;
 		}
+		report.push_back(std::move(outcome));
 	}
 
-	if (report.empty() || report.back().status != "failed") {
-		report.push_back(config_.sweep_indexes
-		                     ? RunSweep()
-		                     : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
-	}
+	// The sweep runs regardless. It depends on no DuckLake step — it
+	// reclaims moraine's own orphaned index ranges — so letting a failed
+	// expiry suppress it would stop the reclamation this pass exists for
+	// on every future pass too, for as long as the misconfiguration
+	// stands, while the leak it fixes kept growing.
+	report.push_back(config_.sweep_indexes
+	                     ? RunSweep()
+	                     : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
 
 	{
 		std::lock_guard<std::mutex> guard(report_lock_);
@@ -278,8 +310,9 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	return report;
 }
 
-MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connection, const DuckLakeStep &step) {
-	std::string sql = "CALL ducklake_" + step.name + "(" + duckdb::KeywordHelper::WriteQuoted(lake_, '\'');
+MaintenanceStep MaintenanceScheduler::RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
+                                                     const DuckLakeStep &step) {
+	std::string sql = "CALL ducklake_" + step.name + "(" + duckdb::KeywordHelper::WriteQuoted(lake, '\'');
 	for (auto &argument : step.arguments) {
 		sql += ", " + argument;
 	}
@@ -317,26 +350,6 @@ namespace {
 // Resolves the `MoraineCatalog` behind a lake name, accepting either the
 // DuckLake name or moraine's metadata catalog directly — the same pair
 // `moraine_index_*` accepts.
-MoraineCatalog &ResolveCatalog(duckdb::ClientContext &context, const std::string &catalog_name) {
-	auto as_moraine = [&](const std::string &name) -> MoraineCatalog * {
-		auto catalog = duckdb::Catalog::GetCatalogEntry(context, name);
-		if (catalog && catalog->GetCatalogType() == "moraine") {
-			return &catalog->Cast<MoraineCatalog>();
-		}
-		return nullptr;
-	};
-	if (auto *catalog = as_moraine(catalog_name)) {
-		return *catalog;
-	}
-	if (auto *catalog = as_moraine("__ducklake_metadata_" + catalog_name)) {
-		return *catalog;
-	}
-	throw duckdb::InvalidInputException(
-	    "\"%s\" is not a moraine-backed lake; pass the DuckLake lake name, or moraine's "
-	    "\"__ducklake_metadata_<lake>\" metadata catalog",
-	    catalog_name);
-}
-
 struct MaintenanceBindData : public duckdb::FunctionData {
 	std::string catalog_name;
 	// True for the status function, which reports without running.
@@ -402,7 +415,7 @@ duckdb::unique_ptr<duckdb::FunctionData> StatusBind(duckdb::ClientContext &conte
 duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckdb::ClientContext &context,
                                                                            duckdb::TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<MaintenanceBindData>();
-	auto &catalog = ResolveCatalog(context, bind_data.catalog_name);
+	auto &catalog = ResolveMoraineCatalog(context, bind_data.catalog_name);
 	auto state = duckdb::make_uniq<MaintenanceGlobalState>();
 
 	if (bind_data.status_only) {

@@ -68,8 +68,8 @@ MaintenanceConfig ParseMaintenanceOptions(
 // same pass, and never two at once.
 class MaintenanceScheduler {
 public:
-	MaintenanceScheduler(duckdb::DatabaseInstance &db, std::string lake, MoraineCatalogHandle *handle,
-	                     MaintenanceConfig config);
+	MaintenanceScheduler(duckdb::DatabaseInstance &db, std::string attached_name, std::string store_path,
+	                     MoraineCatalogHandle *handle, MaintenanceConfig config);
 	~MaintenanceScheduler();
 
 	MaintenanceScheduler(const MaintenanceScheduler &) = delete;
@@ -102,11 +102,18 @@ private:
 	// yield to a pass already in flight rather than queueing behind it.
 	std::vector<MaintenanceStep> RunPass(bool skip_if_busy, const char *trigger);
 	// Issues one `CALL ducklake_<step>(...)` on `connection`.
-	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const DuckLakeStep &step);
+	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
+	                                const DuckLakeStep &step);
 	MaintenanceStep RunSweep();
+	// The DuckLake catalog sitting above this metadata catalog, found by
+	// matching attached databases on path. DuckLake's own maintenance
+	// functions take that name, not this catalog's.
+	std::string ResolveLakeName(duckdb::Connection &connection);
 
 	duckdb::DatabaseInstance &db_;
-	std::string lake_;
+	// This catalog's own attached name and store path.
+	std::string attached_name_;
+	std::string store_path_;
 	MoraineCatalogHandle *handle_;
 	MaintenanceConfig config_;
 
