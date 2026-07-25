@@ -130,7 +130,22 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			matched = true;
 			// Supplying a parameter enables its step.
 			pending[i].enabled = true;
-			pending[i].arguments.push_back(parameter + " => " + option.second.ToSQLString());
+			// Attach options are evaluated once, at attach. A timestamp
+			// written as `now()` therefore freezes into a literal, and a
+			// schedule would keep expiring against its attach-time
+			// instant forever — retention silently stopping as the lake
+			// moves on. An interval expresses the rolling window that
+			// was meant, rendered so DuckLake evaluates it each pass.
+			if (parameter == "older_than" && option.second.type().id() == duckdb::LogicalTypeId::INTERVAL) {
+				// `now()` is TIMESTAMPTZ, and subtracting an interval from
+				// one needs the `icu` extension. Casting to TIMESTAMP uses
+				// an operator that is always available, and DuckLake
+				// accepts either for this parameter.
+				pending[i].arguments.push_back(parameter + " => now()::TIMESTAMP - " +
+				                               option.second.ToSQLString());
+			} else {
+				pending[i].arguments.push_back(parameter + " => " + option.second.ToSQLString());
+			}
 			break;
 		}
 		if (!matched) {

@@ -1043,3 +1043,54 @@ fn maintenance_passes_a_list_parameter_spelled_as_a_string() {
         vec![vec!["5".to_string()]]
     );
 }
+
+/// `older_than` given an interval becomes a rolling window rather than a
+/// frozen instant. Attach options are evaluated once, so a timestamp
+/// written as `now()` would render as a literal and a schedule would keep
+/// expiring against its attach-time instant forever.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn maintenance_renders_an_interval_older_than_as_a_rolling_window() {
+    let store = TempDir::new("maint-rolling-store");
+    let data = TempDir::new("maint-rolling-data");
+    let options = format!(
+        ", META_DATA_PATH '{}', META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '7 days', \
+         META_MAINTENANCE_CLEANUP_OLD_FILES_OLDER_THAN INTERVAL '1 hour'",
+        data.path().display()
+    );
+
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &options,
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(4) t(i);\
+         SELECT step, status, detail FROM moraine_maintenance('lake') \
+           WHERE step IN ('expire_snapshots', 'cleanup_old_files');",
+    ));
+
+    for step in ["expire_snapshots", "cleanup_old_files"] {
+        let row = rows
+            .iter()
+            .find(|row| row[0] == step)
+            .unwrap_or_else(|| panic!("no row for {step}: {rows:?}"));
+        assert_eq!(row[1], "ran", "{step} failed: {rows:?}");
+        // Re-evaluated per pass rather than baked in as a literal.
+        assert!(
+            row[2].contains("now()") && row[2].contains("INTERVAL"),
+            "{step} must carry a rolling window, got: {}",
+            row[2]
+        );
+    }
+
+    // A rolling window this wide expires nothing, so the lake is intact.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            store.path(),
+            data.path(),
+            &options,
+            "SELECT count(*) FROM lake.main.t;"
+        )),
+        vec![vec!["4".to_string()]]
+    );
+}

@@ -57,10 +57,18 @@
 //! ATTACH 'ducklake:moraine:/lake/catalog' AS lake (
 //!     DATA_PATH '/lake/data', META_DATA_PATH '/lake/data',
 //!     META_MAINTENANCE_INTERVAL INTERVAL '1 hour',
-//!     META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN now() - INTERVAL '7 days',
+//!     META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '7 days',
 //!     META_MAINTENANCE_MERGE_ADJACENT_FILES true,
-//!     META_MAINTENANCE_CLEANUP_OLD_FILES_CLEANUP_ALL true);
+//!     META_MAINTENANCE_CLEANUP_OLD_FILES_OLDER_THAN INTERVAL '1 hour');
 //! ```
+//!
+//! **Give `older_than` an interval, not a timestamp.** Attach options are
+//! evaluated once, so `now()` freezes into a literal and a schedule would
+//! keep expiring against its attach-time instant forever — retention
+//! quietly stopping as the lake moves on. An interval is rendered as a
+//! rolling window that DuckLake evaluates on each pass. A timestamp is
+//! still accepted, and is what you want for a one-off
+//! `moraine_maintenance` call.
 //!
 //! Every step that mutates the lake is opt-in, so an attach naming none of
 //! them reclaims only orphaned index entries — which no query can observe.
