@@ -2014,6 +2014,37 @@ async fn maintain_batches_without_advancing_head() {
     catalog.close().await.unwrap();
 }
 
+/// Batches resume where the previous one stopped rather than restarting
+/// at the range's beginning, so a range reclaims correctly however small
+/// the batch. With `batch_size` 1 every entry is its own commit, which is
+/// the shape that would expose a cursor that failed to advance — it would
+/// re-scan the same tombstones and stall, or skip live entries.
+#[tokio::test]
+async fn maintain_resumes_each_batch_where_the_last_one_stopped() {
+    use crate::catalog::MaintenanceRequest;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+    let index = indexed(&catalog, table, "by_a", 25).await;
+    catalog.commit(|tx| tx.drop_index(index)).await.unwrap();
+
+    let report = catalog
+        .maintain(MaintenanceRequest {
+            batch_size: 1,
+            ..MaintenanceRequest::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(report.indexes_swept, 1);
+    assert_eq!(
+        report.index_entries_reclaimed, 25,
+        "every entry must be reclaimed exactly once across 25 batches"
+    );
+    assert_eq!(index_entry_count(&catalog).await, 0);
+
+    catalog.close().await.unwrap();
+}
+
 /// A zero batch size would loop forever rather than reclaim nothing, so
 /// it is refused.
 #[tokio::test]
@@ -2050,6 +2081,17 @@ async fn maintain_refuses_a_read_only_catalog() {
         .unwrap();
     assert!(matches!(
         reader.maintain(MaintenanceRequest::default()).await,
+        Err(Error::Constraint(_))
+    ));
+    // A request with nothing to do is refused just the same: the answer
+    // depends on the handle, not on what the request happens to ask for.
+    assert!(matches!(
+        reader
+            .maintain(MaintenanceRequest {
+                sweep_orphaned_index_entries: false,
+                ..MaintenanceRequest::default()
+            })
+            .await,
         Err(Error::Constraint(_))
     ));
     reader.close().await.unwrap();

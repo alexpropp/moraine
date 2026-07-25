@@ -138,20 +138,51 @@ pub(crate) async fn reclaim_entries(
         if deleted >= limit {
             break;
         }
-        let mut iter = ReadHandle::Tx(tx)
-            .scan_prefix(index_index_prefix(kind, index_id), ..)
-            .await?;
-        while deleted < limit {
-            match iter.next().await? {
-                Some(entry) => {
-                    tx.delete(entry.key)?;
-                    deleted += 1;
-                }
-                None => break,
-            }
-        }
+        let (batch, _) = reclaim_entries_from(tx, kind, index_id, limit - deleted, None).await?;
+        deleted += batch;
     }
     Ok(deleted)
+}
+
+/// Deletes up to `limit` entries of one dropped index of one kind,
+/// resuming at `start_from` when given, and returns how many were staged
+/// alongside the last key deleted.
+///
+/// Reclaiming a whole range takes one transaction per batch, and a batch
+/// that restarted at the range's beginning would first have to step over
+/// every tombstone the earlier batches left — turning a large range into
+/// quadratic work. Handing the last key back lets the next batch resume
+/// there instead. The resume is inclusive, so it re-reads exactly one
+/// tombstone rather than needing an exclusive bound.
+pub(crate) async fn reclaim_entries_from(
+    tx: &slatedb::DbTransaction,
+    kind: IndexKind,
+    index_id: u64,
+    limit: usize,
+    start_from: Option<&[u8]>,
+) -> Result<(usize, Option<Vec<u8>>)> {
+    let prefix = index_index_prefix(kind, index_id);
+    // `scan_prefix` takes its bounds as a suffix of the prefix.
+    let suffix = match start_from {
+        Some(key) if key.len() >= prefix.len() => key[prefix.len()..].to_vec(),
+        _ => Vec::new(),
+    };
+
+    let mut iter = ReadHandle::Tx(tx).scan_prefix(prefix, suffix..).await?;
+    let mut deleted = 0;
+    let mut last = None;
+    while deleted < limit {
+        match iter.next().await? {
+            Some(entry) => {
+                let key = entry.key.to_vec();
+                tx.delete(entry.key)?;
+                deleted += 1;
+                last = Some(key);
+            }
+            None => break,
+        }
+    }
+    Ok((deleted, last))
 }
 
 /// The row ids holding one indexed value: a point-get for a unique index,

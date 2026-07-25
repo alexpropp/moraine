@@ -235,7 +235,7 @@ semantics and the entities RFC 0002 maps:
 | **Tags** | `set_tag`, `remove_tag` |
 | **Options** | `set_option`, `unset_option` (global / schema / table scopes) |
 | **Inlined data** (RFC 0005) | `inline_insert`, `inline_delete`, `flush_inlined_data` |
-| **Maintenance** (RFC 0021) | `maintain` — reclaims moraine-owned space (orphaned index entries) and runs one substrate collection pass; not a `Transaction` mutator but a `Catalog` verb, since it mints no snapshot |
+| **Maintenance** (RFC 0021) | `maintain` — reclaims the entry ranges of indexes no longer live; not a `Transaction` mutator but a `Catalog` verb, since it mints no snapshot |
 
 Notes:
 
@@ -255,8 +255,9 @@ Notes:
   verbatim. A verb is added if an embedding use case appears (additive).
 - Snapshot expiry / `history` GC has no verb (deferred, per non-goals).
   RFC 0021's `maintain` is not one: it reclaims moraine's own orphaned
-  index entries and asks the substrate to collect its files, and computes
-  no retention policy. RFC 0021 *does* orchestrate DuckLake's expiry and
+  index entries and nothing else — it computes no retention policy, and
+  adds no substrate step, the SlateDB store collecting its own superseded
+  objects unprompted. RFC 0021 *does* orchestrate DuckLake's expiry and
   cleanup functions, but from the DuckDB shim, which can issue SQL — never
   from this surface, which cannot.
 - This table covers the entities the core models today. As the DuckLake v1.0

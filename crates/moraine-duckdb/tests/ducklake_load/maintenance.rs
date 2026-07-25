@@ -1059,29 +1059,36 @@ fn maintenance_renders_an_interval_older_than_as_a_rolling_window() {
         data.path().display()
     );
 
+    // The rendered SQL contains commas, so the match runs in SQL and the
+    // column comes back as a boolean rather than something to re-split.
     let rows = csv_rows(&run_ducklake_sql_with_options(
         store.path(),
         data.path(),
         &options,
         "CREATE TABLE lake.main.t(a BIGINT);\
          INSERT INTO lake.main.t SELECT i FROM range(4) t(i);\
-         SELECT step, status, detail FROM moraine_maintenance('lake') \
-           WHERE step IN ('expire_snapshots', 'cleanup_old_files');",
+         SELECT step, status, \
+                detail LIKE '%now()%' AND detail LIKE '%INTERVAL%' AS rolling \
+           FROM moraine_maintenance('lake') \
+           WHERE step IN ('expire_snapshots', 'cleanup_old_files') ORDER BY step;",
     ));
 
-    for step in ["expire_snapshots", "cleanup_old_files"] {
-        let row = rows
-            .iter()
-            .find(|row| row[0] == step)
-            .unwrap_or_else(|| panic!("no row for {step}: {rows:?}"));
-        assert_eq!(row[1], "ran", "{step} failed: {rows:?}");
-        // Re-evaluated per pass rather than baked in as a literal.
-        assert!(
-            row[2].contains("now()") && row[2].contains("INTERVAL"),
-            "{step} must carry a rolling window, got: {}",
-            row[2]
-        );
-    }
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                "cleanup_old_files".to_string(),
+                "ran".to_string(),
+                "true".to_string()
+            ],
+            vec![
+                "expire_snapshots".to_string(),
+                "ran".to_string(),
+                "true".to_string()
+            ],
+        ],
+        "both steps must run and carry a window re-evaluated per pass"
+    );
 
     // A rolling window this wide expires nothing, so the lake is intact.
     assert_eq!(

@@ -1653,7 +1653,15 @@ pub unsafe extern "C" fn moraine_maintain(
         // through `default()` and field assignment.
         let mut request = moraine::MaintenanceRequest::default();
         if batch_size > 0 {
-            request.batch_size = usize::try_from(batch_size).unwrap_or(usize::MAX);
+            // Refused rather than clamped: saturating to `usize::MAX`
+            // would silently turn a bounded batch into an unbounded one,
+            // and would do so only on targets where the value does not
+            // fit — a behaviour difference between builds.
+            request.batch_size = usize::try_from(batch_size).map_err(|_| {
+                AbiError::invalid_argument(format!(
+                    "batch_size {batch_size} does not fit this platform's pointer width"
+                ))
+            })?;
         }
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.

@@ -830,17 +830,22 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
-        let mut report = MaintenanceReport::default();
-        if !request.sweep_orphaned_index_entries {
-            return Ok(report);
-        }
+        // Refuse before doing anything, including before the
+        // nothing-to-do shortcut: a pass that reclaims nothing is still a
+        // pass, and answering it differently on a read-only catalog would
+        // make the outcome depend on the request rather than the handle.
+        self.writer()?;
         if request.batch_size == 0 {
             return Err(Error::Configuration(
                 "batch_size must be nonzero; zero would reclaim nothing and never terminate"
                     .to_string(),
             ));
         }
-        self.writer()?;
+
+        let mut report = MaintenanceReport::default();
+        if !request.sweep_orphaned_index_entries {
+            return Ok(report);
+        }
 
         // Index ids come from the monotonic catalog-id counter and are
         // never reused, so an id absent from this view can never become
@@ -859,7 +864,7 @@ impl Catalog {
             while let Some(index_id) = self.first_index_id_from(kind, from).await? {
                 if !live.contains(&index_id) {
                     let reclaimed = self
-                        .reclaim_dead_range(index_id, request.batch_size)
+                        .reclaim_dead_range(kind, index_id, request.batch_size)
                         .await?;
                     if reclaimed > 0 {
                         report.indexes_swept += 1;
@@ -917,11 +922,28 @@ impl Catalog {
     /// Deletes every entry of one dead index, `batch_size` per commit,
     /// returning the total. The caller has already established that the
     /// index is not live.
-    async fn reclaim_dead_range(&self, index_id: u64, batch_size: usize) -> Result<u64> {
+    async fn reclaim_dead_range(
+        &self,
+        kind: IndexKind,
+        index_id: u64,
+        batch_size: usize,
+    ) -> Result<u64> {
         let mut total = 0u64;
+        // Each batch resumes where the last one stopped. Restarting at
+        // the range's beginning would make every batch step over the
+        // tombstones its predecessors left, which is quadratic in the
+        // size of the range.
+        let mut cursor: Option<Vec<u8>> = None;
         loop {
             let tx = self.begin_write_tx().await?;
-            let deleted = index_maintenance::reclaim_entries(&tx, index_id, batch_size).await?;
+            let (deleted, last) = index_maintenance::reclaim_entries_from(
+                &tx,
+                kind,
+                index_id,
+                batch_size,
+                cursor.as_deref(),
+            )
+            .await?;
             if deleted == 0 {
                 tx.rollback();
                 return Ok(total);
@@ -930,6 +952,7 @@ impl Catalog {
                 .await
                 .map_err(Error::from)?;
             total += deleted as u64;
+            cursor = last;
         }
     }
 

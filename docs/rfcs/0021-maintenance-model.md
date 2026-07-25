@@ -188,6 +188,18 @@ options — any `META_<name> [1,2]` fails the same way. So
 accepts for that parameter. This is a property of the passthrough, not of
 the derivation rule, and needs no exception in it.
 
+**`older_than` given an interval becomes a rolling window.** This is the
+one place a value does not pass through verbatim, and the alternative is
+broken rather than merely awkward: attach options are evaluated once, so a
+timestamp written as `now()` freezes into a literal and a schedule would
+expire against its attach-time instant for as long as it ran — retention
+quietly ceasing while the lake moved on. An interval is instead rendered
+as `now()::TIMESTAMP - <interval>`, which DuckLake evaluates per pass.
+(The cast is load-bearing: `now()` is `TIMESTAMPTZ`, and subtracting an
+interval from one needs the `icu` extension, while the `TIMESTAMP`
+operator is always available.) A timestamp is still accepted verbatim, and
+is the right thing for a one-off trigger call.
+
 The lake name the steps are called with is **not** derived from this
 catalog's own name. A lake attached with `METADATA_CATALOG` names its
 metadata catalog itself, so the default `__ducklake_metadata_<lake>`
@@ -429,6 +441,8 @@ Live (e2e):
   the lake name rather than the metadata one.
 - **A list parameter spelled as a string** reaches DuckLake unaltered and
   expires exactly the named versions.
+- **An interval `older_than` renders as a rolling window**, re-evaluated
+  per pass rather than frozen at attach.
 - **Detach during a running pass completes**, rather than hanging on the
   join or failing.
 - **Path overlap refused**; sibling locations attach normally.
