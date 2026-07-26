@@ -1328,8 +1328,8 @@ int32_t moraine_dump_schemas(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_schemas`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching [`moraine_dump_schemas`]
+// call wrote, not yet freed.
 void moraine_dump_schemas_free(struct MoraineSchemaRow *items, size_t len);
 
 // Dumps every `ducklake_table` row — current and history — into
@@ -1353,8 +1353,8 @@ int32_t moraine_dump_tables(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_tables`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching [`moraine_dump_tables`]
+// call wrote, not yet freed.
 void moraine_dump_tables_free(struct MoraineTableRow *items, size_t len);
 
 // Dumps every `ducklake_view` row — current and history — into
@@ -1378,8 +1378,8 @@ int32_t moraine_dump_views(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_views`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching [`moraine_dump_views`]
+// call wrote, not yet freed.
 void moraine_dump_views_free(struct MoraineViewRow *items, size_t len);
 
 // Dumps every `ducklake_column` row — current and history — into
@@ -1403,8 +1403,8 @@ int32_t moraine_dump_columns(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_columns`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching [`moraine_dump_columns`]
+// call wrote, not yet freed.
 void moraine_dump_columns_free(struct MoraineColumnRow *items, size_t len);
 
 // Dumps every `ducklake_data_file` row — current and history — into
@@ -1428,8 +1428,8 @@ int32_t moraine_dump_data_files(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_data_files`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_data_files`] call wrote, not yet freed.
 void moraine_dump_data_files_free(struct MoraineDataFileRow *items, size_t len);
 
 // Dumps every `ducklake_delete_file` row — current and history — into
@@ -1453,8 +1453,8 @@ int32_t moraine_dump_delete_files(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_delete_files`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_delete_files`] call wrote, not yet freed.
 void moraine_dump_delete_files_free(struct MoraineDeleteFileRow *items, size_t len);
 
 // Dumps every `ducklake_file_partition_value` row — one per embedded
@@ -1479,8 +1479,8 @@ int32_t moraine_dump_file_partition_values(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_file_partition_values`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_file_partition_values`] call wrote, not yet freed.
 void moraine_dump_file_partition_values_free(struct MoraineFilePartitionValueRow *items,
                                              size_t len);
 
@@ -1505,8 +1505,8 @@ int32_t moraine_dump_scheduled_deletions(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_scheduled_deletions`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_scheduled_deletions`] call wrote, not yet freed.
 void moraine_dump_scheduled_deletions_free(struct MoraineScheduledDeletionRow *items, size_t len);
 
 // Dumps every `ducklake_macro` row — current and history — into
@@ -1530,8 +1530,8 @@ int32_t moraine_dump_macros(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_macros`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching [`moraine_dump_macros`]
+// call wrote, not yet freed.
 void moraine_dump_macros_free(struct MoraineMacroRow *items, size_t len);
 
 // Dumps every `ducklake_macro_impl` row — flattened from the embedded
@@ -1557,8 +1557,8 @@ int32_t moraine_dump_macro_impls(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_macro_impls`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_macro_impls`] call wrote, not yet freed.
 void moraine_dump_macro_impls_free(struct MoraineMacroImplRow *items, size_t len);
 
 // Dumps every `ducklake_macro_parameters` row — flattened from the
@@ -1584,8 +1584,8 @@ int32_t moraine_dump_macro_parameters(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_macro_parameters`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_macro_parameters`] call wrote, not yet freed.
 void moraine_dump_macro_parameters_free(struct MoraineMacroParameterRow *items, size_t len);
 
 // Dumps every `ducklake_column_mapping` row into
@@ -1610,8 +1610,8 @@ int32_t moraine_dump_column_mappings(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_column_mappings`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_column_mappings`] call wrote, not yet freed.
 void moraine_dump_column_mappings_free(struct MoraineColumnMappingRow *items, size_t len);
 
 // Dumps every `ducklake_name_mapping` row — flattened from the embedded
@@ -1636,8 +1636,8 @@ int32_t moraine_dump_name_mappings(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_name_mappings`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_name_mappings`] call wrote, not yet freed.
 void moraine_dump_name_mappings_free(struct MoraineNameMappingRow *items, size_t len);
 
 // Dumps every `ducklake_partition_info` row — current and history — into
@@ -1661,8 +1661,8 @@ int32_t moraine_dump_partition_info(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_partition_info`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_partition_info`] call wrote, not yet freed.
 void moraine_dump_partition_info_free(struct MorainePartitionInfoRow *items, size_t len);
 
 // Dumps every `ducklake_partition_column` row — one per embedded column
@@ -1687,8 +1687,8 @@ int32_t moraine_dump_partition_columns(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_partition_columns`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_partition_columns`] call wrote, not yet freed.
 void moraine_dump_partition_columns_free(struct MorainePartitionColumnRow *items, size_t len);
 
 // Dumps every `ducklake_sort_info` row — current and history — into
@@ -1712,8 +1712,8 @@ int32_t moraine_dump_sort_info(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_info`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_info`]
+// call wrote, not yet freed.
 void moraine_dump_sort_info_free(struct MoraineSortInfoRow *items, size_t len);
 
 // Dumps every `ducklake_sort_expression` row — one per embedded
@@ -1738,8 +1738,8 @@ int32_t moraine_dump_sort_expressions(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_sort_expressions`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_sort_expressions`] call wrote, not yet freed.
 void moraine_dump_sort_expressions_free(struct MoraineSortExpressionRow *items, size_t len);
 
 // Dumps every `ducklake_snapshot` row into `*out_items`/`*out_len`.
@@ -1764,8 +1764,8 @@ int32_t moraine_dump_snapshots(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_snapshots`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching [`moraine_dump_snapshots`]
+// call wrote, not yet freed.
 void moraine_dump_snapshots_free(struct MoraineSnapshotRow *items, size_t len);
 
 // Dumps every `ducklake_schema_versions` row into
@@ -1789,8 +1789,8 @@ int32_t moraine_dump_schema_versions(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_schema_versions`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_schema_versions`] call wrote, not yet freed.
 void moraine_dump_schema_versions_free(struct MoraineSchemaVersionRow *items, size_t len);
 
 // Dumps every `ducklake_table_stats` row into
@@ -1814,8 +1814,8 @@ int32_t moraine_dump_table_stats(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_table_stats`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_table_stats`] call wrote, not yet freed.
 void moraine_dump_table_stats_free(struct MoraineTableStatsRow *items, size_t len);
 
 // Dumps every `ducklake_table_column_stats` row into
@@ -1839,8 +1839,8 @@ int32_t moraine_dump_table_column_stats(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_table_column_stats`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_table_column_stats`] call wrote, not yet freed.
 void moraine_dump_table_column_stats_free(struct MoraineTableColumnStatsRow *items, size_t len);
 
 // Dumps every `ducklake_file_column_stats` row into
@@ -1864,8 +1864,8 @@ int32_t moraine_dump_file_column_stats(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_file_column_stats`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_file_column_stats`] call wrote, not yet freed.
 void moraine_dump_file_column_stats_free(struct MoraineFileColumnStatsRow *items, size_t len);
 
 // Dumps every `ducklake_tag` row into `*out_items`/`*out_len`.
@@ -1912,8 +1912,8 @@ int32_t moraine_dump_column_tags(struct MoraineCatalogHandle *handle,
 //
 // # Safety
 //
-// `items`/`len` must be exactly the pair a matching [`moraine_dump_column_tags`] call
-// wrote, not yet freed.
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_column_tags`] call wrote, not yet freed.
 void moraine_dump_column_tags_free(struct MoraineColumnTagRow *items, size_t len);
 
 // Materializes `table_id`'s inlined rows and selects the `scan_kind`
