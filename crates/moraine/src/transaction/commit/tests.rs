@@ -2281,3 +2281,100 @@ async fn drop_index_ends_definition_and_keeps_format() {
     assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
     catalog.close().await.unwrap();
 }
+
+/// The head view the writer folds forward on every commit stays identical
+/// to a fresh scan of the store, across creates, a rename, an option, a
+/// column drop, and a full table drop — whose child deletes the fold must
+/// apply without over-cascading.
+#[tokio::test]
+async fn folded_head_view_matches_a_fresh_scan() {
+    use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile, OptionScope};
+
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let column = |name: &str| ColumnDef {
+        name: name.into(),
+        column_type: "BIGINT".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+
+    let keep = std::cell::Cell::new(None);
+    let doomed = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            let k = tx.create_table(schema, "keep", &[column("a"), column("b")])?;
+            let d = tx.create_table(schema, "doomed", &[column("x")])?;
+            tx.create_view(schema, "v", "duckdb", "SELECT 1")?;
+            keep.set(Some(k));
+            doomed.set(Some(d));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let keep = keep.get().unwrap();
+    let doomed = doomed.get().unwrap();
+
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(
+                keep,
+                DataFile {
+                    path: "f.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 3,
+                    file_size_bytes: 100,
+                    footer_size: 8,
+                    encryption_key: None,
+                    column_stats: vec![],
+                },
+                &[],
+            )?;
+            tx.set_option(OptionScope::Global, "answer", "42")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .commit(|tx| {
+            tx.rename_table(keep, "keep2")?;
+            let second = tx.columns_of(keep)[1].id;
+            tx.drop_column(keep, second)
+        })
+        .await
+        .unwrap();
+
+    catalog.commit(|tx| tx.drop_table(doomed)).await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let head = read::read_head(ReadHandle::Tx(&tx))
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot_id;
+    let fresh = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
+    tx.rollback();
+
+    let cached = catalog
+        .projections()
+        .read()
+        .unwrap()
+        .head_view(head)
+        .expect("the writer caches its head view");
+
+    assert_eq!(cached.snapshot.snapshot_id, fresh.snapshot.snapshot_id);
+    // An empty diff both directions means identical current state.
+    assert!(
+        diff_writes(&fresh, &cached, head + 1).is_empty(),
+        "folded head view diverged from a fresh scan"
+    );
+    assert!(
+        diff_writes(&cached, &fresh, head + 1).is_empty(),
+        "folded head view diverged from a fresh scan"
+    );
+    catalog.close().await.unwrap();
+}

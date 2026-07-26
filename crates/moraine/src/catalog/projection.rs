@@ -7,6 +7,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
+    catalog::CatalogSnapshot,
     store::{
         key::{CurrentKey, EntityKey, Key},
         proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
@@ -93,6 +94,34 @@ pub(crate) fn fold_committed_batch(
         .apply_batch(writes, new_head);
 }
 
+/// The cached head view iff it is exactly at `expected_head`.
+pub(crate) fn cached_head_view(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    expected_head: u64,
+) -> Option<Arc<CatalogSnapshot>> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .head_view(expected_head)
+}
+
+pub(crate) fn install_head_view(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    view: Arc<CatalogSnapshot>,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_head_view(view);
+}
+
+pub(crate) fn invalidate_head_view(cache: &std::sync::RwLock<ProjectionCache>) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear_head_view();
+}
+
 /// The projections DuckLake re-reads per transaction, maintained on a
 /// read-write catalog so serving them does not rescan the store.
 pub(crate) struct ProjectionCache {
@@ -102,9 +131,15 @@ pub(crate) struct ProjectionCache {
     /// The full current+history entity scan at one head: populating
     /// DuckLake's metadata tables issues ~two dozen per-kind dumps, and
     /// this serves them all from one scan pair. Not folded forward —
+    /// Not folded forward —
     /// entity writes are too varied — so any committed batch drops it
     /// and the next dump re-installs it at the new head.
     entities: Option<(u64, Arc<Vec<EntityRecord>>)>,
+    /// The materialized head view, folded forward on every commit and
+    /// served to the commit path so it stages against known state without
+    /// rescanning. Carries its own head (`snapshot.snapshot_id`); a fold
+    /// that cannot be applied faithfully clears it, degrading to a scan.
+    head_view: Option<Arc<CatalogSnapshot>>,
 }
 
 impl ProjectionCache {
@@ -114,7 +149,24 @@ impl ProjectionCache {
             table_stats: Maintained::empty(),
             table_column_stats: Maintained::empty(),
             entities: None,
+            head_view: None,
         }
+    }
+
+    /// The head view iff it is exactly at `expected_head`.
+    pub(crate) fn head_view(&self, expected_head: u64) -> Option<Arc<CatalogSnapshot>> {
+        self.head_view
+            .as_ref()
+            .filter(|view| view.snapshot.snapshot_id == expected_head)
+            .cloned()
+    }
+
+    pub(crate) fn set_head_view(&mut self, view: Arc<CatalogSnapshot>) {
+        self.head_view = Some(view);
+    }
+
+    pub(crate) fn clear_head_view(&mut self) {
+        self.head_view = None;
     }
 
     pub(crate) fn install_entities(&mut self, head: u64, records: Vec<EntityRecord>) {

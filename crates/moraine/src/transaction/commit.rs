@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +13,10 @@ use uuid::Uuid;
 use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId,
-        projection::{ProjectionCache, fold_committed_batch},
+        projection::{
+            ProjectionCache, cached_head_view, fold_committed_batch, install_head_view,
+            invalidate_head_view,
+        },
     },
     error::{Error, Result},
     store::{
@@ -267,6 +271,7 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
 pub(crate) type StagedWrite = (Vec<u8>, Option<Vec<u8>>);
 
 mod diff;
+mod fold;
 use diff::diff_options;
 pub(crate) use diff::diff_writes;
 
@@ -298,7 +303,15 @@ where
         .await
         .map_err(Error::from)?;
 
-    match prepare_and_stage(&db_tx, f).await {
+    let base = match head_view_for(&db_tx, projections).await {
+        Ok(base) => base,
+        Err(err) => {
+            db_tx.rollback();
+            return Err(err);
+        }
+    };
+
+    match prepare_and_stage(&db_tx, f, &base).await {
         Ok(Prepared::Nothing { head }) => {
             db_tx.rollback();
             Ok(CommitOutcome::Committed(SnapshotId::new(head)))
@@ -308,11 +321,65 @@ where
             head_before,
             commits,
             writes,
-        }) => finish_commit(db_tx, ours, head_before, commits, writes, projections).await,
+        }) => {
+            finish_commit(
+                db_tx,
+                ours,
+                head_before,
+                commits,
+                writes,
+                &base,
+                projections,
+            )
+            .await
+        }
         Err(err) => {
             db_tx.rollback();
             Err(err)
         }
+    }
+}
+
+/// Reads the head through `db_tx` and returns the cached head view when it
+/// matches, else materializes it fresh. Staging against this is what lets a
+/// commit skip the full `current` rescan.
+///
+/// A miss does **not** install: the cache is populated only by a
+/// head-advancing commit's success, whose unique minted id and successful
+/// commit together prove the folded view is the true committed state. A
+/// view materialized here reflects only this transaction's snapshot, which
+/// a racing head-preserving commit (id reused, content changed) could make
+/// stale — installing it under the reused id would let a later commit stage
+/// against diverged state.
+pub(crate) async fn head_view_for(
+    db_tx: &DbTransaction,
+    projections: &std::sync::RwLock<ProjectionCache>,
+) -> Result<Arc<CatalogSnapshot>> {
+    let head = read::read_head(ReadHandle::Tx(db_tx))
+        .await?
+        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
+        .snapshot_id;
+    if let Some(view) = cached_head_view(projections, head) {
+        return Ok(view);
+    }
+    Ok(Arc::new(materialize(ReadHandle::Tx(db_tx), None).await?))
+}
+
+/// Folds a just-committed head-advancing batch into `base` and installs the
+/// result as the new head view, or clears the cache when the fold cannot be
+/// applied faithfully. Only for head-advancing commits: their minted id is
+/// unique, so a concurrent attempt reading the old id never mistakes this
+/// view for its own. Head-preserving commits reuse the id and are handled
+/// by clearing the cache before they commit ([`invalidate_head_view`]).
+pub(crate) fn refresh_head_view(
+    projections: &std::sync::RwLock<ProjectionCache>,
+    base: &CatalogSnapshot,
+    writes: &[StagedWrite],
+) {
+    let mut view = base.clone();
+    match fold::fold_batch(&mut view, writes) {
+        Ok(()) => install_head_view(projections, Arc::new(view)),
+        Err(_) => invalidate_head_view(projections),
     }
 }
 
@@ -361,11 +428,14 @@ fn target_format(state: &CatalogSnapshot) -> u64 {
 
 /// Materializes, runs the closure, and stages the resulting writes.
 /// Options-only commits stage no snapshot record and no head advance.
-async fn prepare_and_stage<F>(db_tx: &DbTransaction, f: &F) -> Result<Prepared>
+async fn prepare_and_stage<F>(
+    db_tx: &DbTransaction,
+    f: &F,
+    base: &CatalogSnapshot,
+) -> Result<Prepared>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
-    let base = materialize(ReadHandle::Tx(db_tx), None).await?;
     let head = base.snapshot.snapshot_id;
     let new_id = head + 1;
 
@@ -381,7 +451,7 @@ where
 
     if operations.is_empty() {
         let mut writes = Vec::new();
-        diff_options(&mut writes, &base, &state);
+        diff_options(&mut writes, base, &state);
         if writes.is_empty() {
             return Ok(Prepared::Nothing { head });
         }
@@ -402,7 +472,7 @@ where
         });
     }
 
-    let mut writes = diff_writes(&base, &state, new_id);
+    let mut writes = diff_writes(base, &state, new_id);
 
     // Stamp the format lazily, in the same batch, and only ever upward — a
     // completed or dropped build never downgrades the stamp.
@@ -485,11 +555,22 @@ async fn finish_commit(
     head_before: u64,
     commits: u64,
     writes: Vec<StagedWrite>,
+    base: &CatalogSnapshot,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<CommitOutcome> {
+    // A head-preserving commit reuses the head id with new content; drop the
+    // cache before the write is visible so no concurrent attempt reads a
+    // stale view that still matches by id.
+    let head_advanced = commits > head_before;
+    if !head_advanced {
+        invalidate_head_view(projections);
+    }
     match db_tx.commit_with_options(&durable()).await {
         Ok(_) => {
             fold_committed_batch(projections, &writes, commits);
+            if head_advanced {
+                refresh_head_view(projections, base, &writes);
+            }
             Ok(CommitOutcome::Committed(SnapshotId::new(commits)))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {

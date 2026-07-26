@@ -47,8 +47,10 @@ impl<'a> StoreBuilder<'a> {
 
     /// Sets the WAL flush cadence. Durable commits wait for the next flush,
     /// so this bounds per-commit latency; smaller values mean more frequent
-    /// (on S3, costlier) object-store PUTs. Must be nonzero. Writer only —
-    /// a reader never flushes.
+    /// (on S3, costlier) object-store PUTs. Zero flushes continuously (no
+    /// timer), so a durable commit waits only on the object-store PUT — the
+    /// lowest latency, at the cost of a busy flush loop. Writer only — a
+    /// reader never flushes.
     pub(crate) fn flush_interval(mut self, flush_interval: Duration) -> Self {
         self.flush_interval = flush_interval;
         self
@@ -65,7 +67,7 @@ impl<'a> StoreBuilder<'a> {
 
     /// Opens (or creates) the store as a read-write [`Db`].
     pub(crate) async fn open_writer(self) -> Result<Db> {
-        let settings = self.settings()?;
+        let settings = self.settings();
         Db::builder(self.path, self.object_store)
             .with_settings(settings)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
@@ -90,22 +92,15 @@ impl<'a> StoreBuilder<'a> {
             .map_err(Error::from)
     }
 
-    /// SlateDB settings for a writer. A zero flush interval is refused: it
-    /// would disable automatic flushing and hang every durable commit.
-    fn settings(&self) -> Result<Settings> {
-        if self.flush_interval.is_zero() {
-            return Err(Error::Configuration(
-                "flush_interval must be nonzero; zero would disable automatic flushing and \
-                 hang every durable commit"
-                    .to_string(),
-            ));
-        }
-
-        Ok(Settings {
+    /// SlateDB settings for a writer. A zero flush interval flushes
+    /// continuously rather than on a timer: durable commits then wait only
+    /// on the object-store PUT, at the cost of a busy flush loop.
+    fn settings(&self) -> Settings {
+        Settings {
             flush_interval: Some(self.flush_interval),
             object_store_cache_options: self.cache_options(),
             ..Default::default()
-        })
+        }
     }
 
     /// SlateDB's on-disk block cache options: a disk-backed cache under
@@ -179,20 +174,21 @@ mod tests {
         db.close().await.unwrap();
     }
 
-    /// A zero flush interval would disable automatic flushing and hang
-    /// every durable commit, so opening with one is refused.
+    /// A zero flush interval is allowed: SlateDB flushes continuously
+    /// rather than on a timer, so the store opens and a durable write lands.
     #[tokio::test]
-    async fn zero_flush_interval_is_refused() {
-        // `unwrap_err` needs `Db: Debug`, which SlateDB does not provide.
-        match StoreBuilder::new("test/store", memory_store())
+    async fn zero_flush_interval_opens_a_working_store() {
+        let db = StoreBuilder::new("test/store", memory_store())
             .flush_interval(Duration::ZERO)
             .open_writer()
             .await
-        {
-            Err(Error::Configuration(_)) => {}
-            Err(err) => panic!("expected a configuration error, got {err:?}"),
-            Ok(_) => panic!("a zero flush interval unexpectedly opened a store"),
-        }
+            .unwrap();
+
+        let head = Key::Sys(SysKey::Head).encode();
+        db.put(&head, b"head").await.unwrap();
+        assert_eq!(db.get(&head).await.unwrap().unwrap().as_ref(), b"head");
+
+        db.close().await.unwrap();
     }
 
     /// An explicit flush interval reaches the SlateDB builder: the store

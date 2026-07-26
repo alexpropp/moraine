@@ -30,7 +30,7 @@ use crate::{
     catalog::{
         CatalogSnapshot, ColumnInfo, IndexInfo, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
-        projection::{ProjectionCache, fold_committed_batch},
+        projection::{ProjectionCache, fold_committed_batch, invalidate_head_view},
         scoped_read::{self, ScopedReadEntry},
     },
     error::{Error, Result},
@@ -462,13 +462,14 @@ impl StagedTransaction {
             data_prefix,
         } = self;
 
-        let base = match commit::materialize(ReadHandle::Tx(&db_tx), None).await {
+        let base = match commit::head_view_for(&db_tx, &projections).await {
             Ok(base) => base,
             Err(err) => {
                 db_tx.rollback();
                 return Err(err);
             }
         };
+        let base_ref: &CatalogSnapshot = &base;
 
         // Read before any write in this commit is staged: `InlineFlushDelete`
         // /`InlineDrop` name a table, not keys, and resolve against
@@ -492,7 +493,7 @@ impl StagedTransaction {
         });
 
         let translated = if mints_snapshot {
-            translate(&base, &ops).map(|(new_id, mut writes, snap)| {
+            translate(base_ref, &ops).map(|(new_id, mut writes, snap)| {
                 writes.push((
                     Key::Snapshot {
                         snapshot_id: new_id,
@@ -509,7 +510,8 @@ impl StagedTransaction {
                 (new_id, writes)
             })
         } else {
-            translate_maintenance(&base, &ops).map(|writes| (base.snapshot.snapshot_id, writes))
+            translate_maintenance(base_ref, &ops)
+                .map(|writes| (base_ref.snapshot.snapshot_id, writes))
         };
 
         match translated {
@@ -523,7 +525,7 @@ impl StagedTransaction {
                 // aborts the commit rather than under-covering the index.
                 if let Err(err) = stage_index_maintenance(
                     &db_tx,
-                    &base,
+                    base_ref,
                     &ops,
                     data_store.as_ref(),
                     &data_prefix,
@@ -538,9 +540,18 @@ impl StagedTransaction {
                     db_tx.rollback();
                     return Err(err);
                 }
+                // A head-preserving (maintenance) commit reuses the head id;
+                // drop the cache before the write is visible so no concurrent
+                // attempt reads a stale view that still matches by id.
+                if !mints_snapshot {
+                    invalidate_head_view(&projections);
+                }
                 match db_tx.commit_with_options(&commit::durable()).await {
                     Ok(_) => {
                         fold_committed_batch(&projections, &writes, result_id);
+                        if mints_snapshot {
+                            commit::refresh_head_view(&projections, base_ref, &writes);
+                        }
                         Ok(SnapshotId::new(result_id))
                     }
                     Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {

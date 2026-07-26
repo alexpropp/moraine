@@ -96,7 +96,9 @@ pub struct CatalogOptions {
     /// How often the store's write-ahead log is flushed to object
     /// storage. Durable commits wait for the next flush, so this bounds
     /// per-commit latency; smaller values mean more frequent (on S3,
-    /// costlier) object-store PUTs. Must be nonzero; defaults to 100ms.
+    /// costlier) object-store PUTs. Zero flushes continuously (no timer),
+    /// so a durable commit waits only on the object-store PUT — the lowest
+    /// latency, at the cost of a busy flush loop. Defaults to 100ms.
     pub flush_interval: Duration,
     /// Local directory backing SlateDB's on-disk block cache. When set,
     /// reads are served from a disk-backed cache that survives process

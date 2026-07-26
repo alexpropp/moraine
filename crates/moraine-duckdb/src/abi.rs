@@ -648,10 +648,13 @@ pub unsafe extern "C" fn moraine_attach(
         let mut options = CatalogOptions::default();
         options.path = prefix;
         options.encrypted = encrypted;
-        // 0 means "not given": the default cadence stands. An explicit zero
-        // never reaches this ABI — the shim refuses it at bind time.
-        if flush_interval_ms > 0 {
-            options.flush_interval = std::time::Duration::from_millis(flush_interval_ms);
+        // 0 means "not given": the default cadence stands. `u64::MAX` is the
+        // shim's sentinel for an explicit zero interval (flush continuously,
+        // no timer); any other value is that many milliseconds.
+        match flush_interval_ms {
+            0 => {}
+            u64::MAX => options.flush_interval = std::time::Duration::ZERO,
+            ms => options.flush_interval = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         // Persist the data root at bootstrap so a later attach reads it back

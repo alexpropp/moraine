@@ -158,7 +158,7 @@ pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<Snapsho
     .await
 }
 
-fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
+pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRecord> {
     match entity {
         EntityKey::Schema { .. } => Ok(EntityRecord::Schema(value::decode_value(bytes)?)),
         EntityKey::Table { .. } => Ok(EntityRecord::Table(value::decode_value(bytes)?)),

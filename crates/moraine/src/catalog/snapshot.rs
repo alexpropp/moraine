@@ -167,31 +167,38 @@ impl CatalogSnapshot {
             {
                 continue;
             }
-            match record {
-                EntityRecord::Schema(s) => view.put_schema(s),
-                EntityRecord::Table(t) => view.put_table(t),
-                EntityRecord::Column(c) => view.put_column(c),
-                EntityRecord::File(f) => view.put_data_file(f),
-                EntityRecord::DeleteFile(d) => view.put_delete_file(d),
-                EntityRecord::View(v) => view.put_view(v),
-                EntityRecord::Partition(p) => view.put_partition(p),
-                EntityRecord::Sort(s) => view.put_sort(s),
-                EntityRecord::Macro(m) => view.put_macro(m),
-                EntityRecord::Index(i) => view.put_index(i),
-                EntityRecord::Mapping(m) => view.put_mapping(m),
-                EntityRecord::FileColumnStats(fcs) => view.put_file_column_stats(fcs),
-                EntityRecord::TableStats(ts) => view.put_table_stats(ts),
-                EntityRecord::TableColumnStats(tcs) => view.put_table_column_stats(tcs),
-                EntityRecord::Option {
-                    scope_kind,
-                    scope_id,
-                    value,
-                } => view.set_option_record((scope_kind, scope_id), value),
-                EntityRecord::Tag(t) => view.put_tag(t),
-                EntityRecord::GcFile(g) => view.put_gc_file(g),
-            }
+            view.put_record(record);
         }
         view
+    }
+
+    /// Inserts one decoded record into the maps it belongs to, keeping the
+    /// name indexes coherent. Shared by [`build`](Self::build) and the
+    /// commit-time fold that folds a batch forward without rescanning.
+    pub(crate) fn put_record(&mut self, record: EntityRecord) {
+        match record {
+            EntityRecord::Schema(s) => self.put_schema(s),
+            EntityRecord::Table(t) => self.put_table(t),
+            EntityRecord::Column(c) => self.put_column(c),
+            EntityRecord::File(f) => self.put_data_file(f),
+            EntityRecord::DeleteFile(d) => self.put_delete_file(d),
+            EntityRecord::View(v) => self.put_view(v),
+            EntityRecord::Partition(p) => self.put_partition(p),
+            EntityRecord::Sort(s) => self.put_sort(s),
+            EntityRecord::Macro(m) => self.put_macro(m),
+            EntityRecord::Index(i) => self.put_index(i),
+            EntityRecord::Mapping(m) => self.put_mapping(m),
+            EntityRecord::FileColumnStats(fcs) => self.put_file_column_stats(fcs),
+            EntityRecord::TableStats(ts) => self.put_table_stats(ts),
+            EntityRecord::TableColumnStats(tcs) => self.put_table_column_stats(tcs),
+            EntityRecord::Option {
+                scope_kind,
+                scope_id,
+                value,
+            } => self.set_option_record((scope_kind, scope_id), value),
+            EntityRecord::Tag(t) => self.put_tag(t),
+            EntityRecord::GcFile(g) => self.put_gc_file(g),
+        }
     }
 
     /// Snapshot identity and metadata of this view.
@@ -678,6 +685,62 @@ impl CatalogSnapshot {
 
     pub(crate) fn remove_option_record(&mut self, components: (u64, u64)) {
         self.options.remove(&components);
+    }
+
+    /// Removes a schema and its name entry, without the option-scope
+    /// cascade [`delete_schema`](Self::delete_schema) applies. The
+    /// commit-time fold mirrors the store key by key, so a cascade would
+    /// drop rows the batch keeps.
+    pub(crate) fn remove_schema_only(&mut self, schema_id: u64) {
+        if let Some(old) = self.schemas.remove(&schema_id) {
+            self.schema_names.remove(&old.schema_name);
+        }
+    }
+
+    /// Removes a table and its name entry, without the child cascade
+    /// [`delete_table`](Self::delete_table) applies.
+    pub(crate) fn remove_table_only(&mut self, table_id: u64) {
+        delete_named(
+            &mut self.tables,
+            &mut self.table_names,
+            table_id,
+            table_identity,
+        );
+    }
+
+    /// Removes one column, without the column-stats cascade
+    /// [`delete_column`](Self::delete_column) applies.
+    pub(crate) fn remove_column_only(&mut self, table_id: u64, column_id: u64) {
+        remove_nested(&mut self.columns, table_id, &column_id);
+    }
+
+    pub(crate) fn remove_table_stats(&mut self, table_id: u64) {
+        self.table_stats.remove(&table_id);
+    }
+
+    pub(crate) fn remove_table_column_stats(&mut self, table_id: u64, column_id: u64) {
+        remove_nested(&mut self.table_column_stats, table_id, &column_id);
+    }
+
+    pub(crate) fn remove_file_column_stats(
+        &mut self,
+        table_id: u64,
+        data_file_id: u64,
+        column_id: u64,
+    ) {
+        remove_nested(
+            &mut self.file_column_stats,
+            table_id,
+            &(data_file_id, column_id),
+        );
+    }
+
+    pub(crate) fn remove_tag(&mut self, object_id: u64) {
+        self.tags.remove(&object_id);
+    }
+
+    pub(crate) fn remove_gc_file(&mut self, data_file_id: u64) {
+        self.gc_files.remove(&data_file_id);
     }
 }
 

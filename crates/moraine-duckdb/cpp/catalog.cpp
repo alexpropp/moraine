@@ -625,7 +625,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// or directly on a standalone `moraine:` attach. `ENCRYPTED` is
 	// creation-time only: the ABI records it when a fresh store bootstraps and
 	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
-	// the ABI means "not given", so an explicit zero is refused here.
+	// the ABI means "not given", so an explicit zero (flush continuously, no
+	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
 	// `CACHE_DIR` is a local directory for SlateDB's on-disk block cache; it
 	// must outlive the moraine_attach call, so it lives in this scope.
 	bool encrypted = false;
@@ -654,10 +655,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 		} else if (name == "data_path") {
 			data_path = option.second.GetValue<std::string>();
 		} else if (name == "flush_interval_ms") {
-			flush_interval_ms = option.second.GetValue<uint64_t>();
-			if (flush_interval_ms == 0) {
-				throw duckdb::BinderException("FLUSH_INTERVAL_MS must be a positive number of milliseconds");
-			}
+			uint64_t requested = option.second.GetValue<uint64_t>();
+			// The ABI reads 0 as "not given"; map an explicit zero (flush
+			// continuously) to its continuous-flush sentinel so it is applied.
+			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
 		}
