@@ -367,55 +367,21 @@ impl Catalog {
                 }
             }
 
-            let bound_len = |bound: &Bound<Vec<IndexKeyValue>>| match bound {
-                Bound::Included(values) | Bound::Excluded(values) => values.len(),
-                Bound::Unbounded => 0,
-            };
-            // A bound naming more columns than the index has would encode
-            // components no stored key carries, silently returning the wrong
-            // rows; refuse it instead.
-            let widest = bound_len(&lower).max(bound_len(&upper));
-            if widest > info.columns.len() {
-                return Err(Error::Constraint(format!(
-                    "index_range: a bound of {widest} values does not fit the {}-column index \
-                     {index}",
-                    info.columns.len()
-                )));
-            }
-            // The range column is the last one the bounds name (leading
-            // columns are pinned to equality); its direction decides whether
-            // value order runs with or against the index's byte order.
-            let range_column = widest.saturating_sub(1);
-            let descending = info.directions.get(range_column).copied()
-                == Some(crate::store::index_encoding::Direction::Descending);
+            let (byte_lower, byte_upper) = encode_range_bounds(&info, index, lower, upper)?;
 
-            let encode_bound = |bound: Bound<Vec<IndexKeyValue>>| -> Result<Bound<_>> {
-                let encode = |values: Vec<IndexKeyValue>| {
-                    encode_ordered_values(
-                        &values.into_iter().map(Some).collect::<Vec<_>>(),
-                        &info.directions,
-                        &info.nulls,
-                    )
-                };
-                Ok(match bound {
-                    Bound::Included(values) => Bound::Included(encode(values)?),
-                    Bound::Excluded(values) => Bound::Excluded(encode(values)?),
-                    Bound::Unbounded => Bound::Unbounded,
-                })
-            };
-
-            // A descending column's byte order reverses value order, so the
-            // value-lower bound is the byte-upper bound and vice versa.
-            let (byte_lower, byte_upper) = if descending {
-                (encode_bound(upper)?, encode_bound(lower)?)
-            } else {
-                (encode_bound(lower)?, encode_bound(upper)?)
-            };
+            // NULL placement is per column, and only the leading column's
+            // flag byte bounds the scan's open sides.
+            let leading_nulls = info
+                .nulls
+                .first()
+                .copied()
+                .unwrap_or(crate::store::index_encoding::NullOrder::Last);
 
             let mut row_ids = index_maintenance::range_row_ids(
                 handle,
                 index.get(),
                 info.unique,
+                leading_nulls,
                 byte_lower,
                 byte_upper,
             )
@@ -1032,6 +998,93 @@ impl Catalog {
         F: Fn(&mut Transaction) -> Result<()>,
     {
         commit::commit_cycle(self.writer()?, &f, &self.projections).await
+    }
+}
+
+/// Maps a value window onto the byte bounds one index scan answers, refusing
+/// the shapes no single scan can.
+///
+/// Each bound names a leading run of the index's columns. The last named is
+/// the range column; its direction decides whether value order runs with or
+/// against byte order.
+fn encode_range_bounds(
+    info: &crate::catalog::IndexInfo,
+    index: IndexId,
+    lower: Bound<Vec<IndexKeyValue>>,
+    upper: Bound<Vec<IndexKeyValue>>,
+) -> Result<(
+    Bound<crate::store::index_encoding::CanonicalKey>,
+    Bound<crate::store::index_encoding::CanonicalKey>,
+)> {
+    // A bound naming no column describes no window: its encoding is the empty
+    // key, whose extension bound spans the whole index.
+    let empty_bound = |bound: &Bound<Vec<IndexKeyValue>>| matches!(bound, Bound::Included(values) | Bound::Excluded(values) if values.is_empty());
+    if empty_bound(&lower) || empty_bound(&upper) {
+        return Err(Error::Constraint(format!(
+            "index_range: a bound of index {index} must name at least one column"
+        )));
+    }
+
+    // A bound naming more columns than the index has would encode components
+    // no stored key carries, silently returning the wrong rows.
+    let bound_len = |bound: &Bound<Vec<IndexKeyValue>>| match bound {
+        Bound::Included(values) | Bound::Excluded(values) => values.len(),
+        Bound::Unbounded => 0,
+    };
+    let widest = bound_len(&lower).max(bound_len(&upper));
+    if widest > info.columns.len() {
+        return Err(Error::Constraint(format!(
+            "index_range: a bound of {widest} values does not fit the {}-column index {index}",
+            info.columns.len()
+        )));
+    }
+
+    // A tuple window needs one byte range. Columns sharing a direction give
+    // one; mixed directions do not, so both bounds must name the same leading
+    // values and differ only in the last.
+    let range_column = widest.saturating_sub(1);
+    let mixed_directions = info
+        .directions
+        .iter()
+        .take(widest)
+        .any(|direction| Some(direction) != info.directions.first());
+    let pinned_prefix = match (&lower, &upper) {
+        (
+            Bound::Included(low) | Bound::Excluded(low),
+            Bound::Included(high) | Bound::Excluded(high),
+        ) => low.len() == high.len() && low[..range_column] == high[..range_column],
+        _ => false,
+    };
+    if mixed_directions && !pinned_prefix {
+        return Err(Error::Constraint(format!(
+            "index_range: index {index} names columns of differing sort directions, so both \
+             bounds must pin the same leading values and compare on the last column"
+        )));
+    }
+
+    let encode_bound = |bound: Bound<Vec<IndexKeyValue>>| -> Result<Bound<_>> {
+        let encode = |values: Vec<IndexKeyValue>| {
+            encode_ordered_values(
+                &values.into_iter().map(Some).collect::<Vec<_>>(),
+                &info.directions,
+                &info.nulls,
+            )
+        };
+        Ok(match bound {
+            Bound::Included(values) => Bound::Included(encode(values)?),
+            Bound::Excluded(values) => Bound::Excluded(encode(values)?),
+            Bound::Unbounded => Bound::Unbounded,
+        })
+    };
+
+    // A descending range column reverses value order, so the value-lower
+    // bound is the byte-upper bound and vice versa.
+    let descending = info.directions.get(range_column).copied()
+        == Some(crate::store::index_encoding::Direction::Descending);
+    if descending {
+        Ok((encode_bound(upper)?, encode_bound(lower)?))
+    } else {
+        Ok((encode_bound(lower)?, encode_bound(upper)?))
     }
 }
 

@@ -499,14 +499,23 @@ DuckLake's writes itself.
 catalog registration forces the C++ shim, RFC 0006), so the extension exposes
 the native index without touching DuckLake's binder:
 
+Every function names its target by four leading positional strings —
+`catalog, schema, table, index` (`moraine_indexes` stops at the table) —
+written `…` below for brevity.
+
 | Function | Effect |
 |---|---|
-| `CALL moraine_create_index('lake.t', 'name', columns := ['c'], unique := b, staged := b, directions := ['asc'\|'desc'], nulls := ['first'\|'last'])` | insert the definition, backfill live rows (Coverage; staged drives the multi-commit protocol, Staged builds). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST |
-| `CALL moraine_drop_index('lake.t', 'name')` | end the definition (Reclamation) |
-| `moraine_index_lookup('lake.t', 'name', v)` | table function: row ids and holders for value `v` |
-| `moraine_index_range('lake.t', 'name', lower, upper, lower_inclusive, upper_inclusive)` | table function: row ids and holders for a value window; a NULL bound is an open side (half-open) |
-| `moraine_index_nulls('lake.t', 'name', prefix…)` | table function: row ids and holders for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
-| `moraine_indexes('lake.t')` | table function: index introspection |
+| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'])` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST |
+| `moraine_index_drop(…)` | end the definition (Reclamation) |
+| `moraine_index_lookup(…, v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
+| `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids and holders for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
+| `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids and holders for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
+| `moraine_indexes(catalog, schema, table)` | table function: index introspection |
+
+A multi-column range bound is a tuple. Tuple windows require every named
+column to sort the same way; one byte range then spans them. With mixed
+directions no such range exists, so both bounds must name the same leading
+values and differ only in the last. Other shapes are refused.
 
 Each resolves the store handle from the attached catalog and the `table_id`
 from `ducklake_table`, then drives the same core verbs as the embedding API.

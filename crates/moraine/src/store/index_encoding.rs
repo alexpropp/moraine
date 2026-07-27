@@ -247,6 +247,23 @@ pub(crate) fn encode_key(values: &[IndexKeyValue]) -> Result<CanonicalKey> {
     encode_ordered_key(&columns)
 }
 
+/// The `(null_flag, non_null_flag)` pair a column with this NULL placement
+/// prefixes its blob with.
+const fn null_flags(nulls: NullOrder) -> (u8, u8) {
+    match nulls {
+        NullOrder::First => (0x00, 0x01),
+        NullOrder::Last => (0x01, 0x00),
+    }
+}
+
+/// The canonical key naming only a leading column's non-null flag: the
+/// prefix every non-null value of that column shares, and so the boundary
+/// separating them from the column's NULL entries.
+pub(crate) fn non_null_flag_key(nulls: NullOrder) -> CanonicalKey {
+    let (_, non_null_flag) = null_flags(nulls);
+    CanonicalKey(vec![non_null_flag])
+}
+
 /// Canonically encode an index's ordered columns into a [`CanonicalKey`].
 ///
 /// Each column contributes a self-delimiting, order-preserving blob: a
@@ -264,10 +281,7 @@ pub(crate) fn encode_ordered_key(columns: &[OrderedColumn]) -> Result<CanonicalK
     let mut total = 0usize;
     let mut out = Vec::new();
     for column in columns {
-        let (null_flag, non_null_flag) = match column.nulls {
-            NullOrder::First => (0x00u8, 0x01u8),
-            NullOrder::Last => (0x01u8, 0x00u8),
-        };
+        let (null_flag, non_null_flag) = null_flags(column.nulls);
         let Some(value) = &column.value else {
             out.push(null_flag);
             continue;
