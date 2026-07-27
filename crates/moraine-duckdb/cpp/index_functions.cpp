@@ -266,15 +266,16 @@ duckdb::unique_ptr<duckdb::FunctionData> DropBind(duckdb::ClientContext &, duckd
 	return std::move(bind_data);
 }
 
-// moraine_index_lookup: resolves a value to the rows holding it.
+// moraine_index_lookup: resolves an equality key to the rows holding it. The
+// variadic values are one per indexed column, in the index's column order.
 
 struct LookupBindData : public duckdb::FunctionData {
 	std::string catalog_name;
 	std::string schema_name;
 	std::string table_name;
 	std::string index_name;
-	// The looked-up value in text form, so `Equals` distinguishes lookups of
-	// different values (the rows they resolve to differ).
+	// The looked-up values in text form, so `Equals` distinguishes lookups of
+	// different keys (the rows they resolve to differ).
 	std::string value_repr;
 	struct Row {
 		int64_t row_id;
@@ -366,6 +367,9 @@ MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueBacki
 	return lookup;
 }
 
+// The variadic args after the index name are the equality key: one value per
+// indexed column, in the index's column order. The count must match the index
+// width — the core refuses a partial key.
 duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &context,
                                                     duckdb::TableFunctionBindInput &input,
                                                     duckdb::vector<duckdb::LogicalType> &return_types,
@@ -375,17 +379,23 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
 	bind_data->table_name = input.inputs[2].GetValue<std::string>();
 	bind_data->index_name = input.inputs[3].GetValue<std::string>();
-	bind_data->value_repr = input.inputs[4].ToString();
 
-	LookupValueBacking backing;
-	MoraineLookupValue lookup_value = BuildLookupValue(input.inputs[4], backing);
+	const idx_t value_count = input.inputs.size() - 4;
+	std::vector<LookupValueBacking> backings(value_count);
+	std::vector<MoraineLookupValue> values;
+	values.reserve(value_count);
+	for (idx_t i = 4; i < input.inputs.size(); i++) {
+		bind_data->value_repr += input.inputs[i].ToString() + ",";
+		values.push_back(BuildLookupValue(input.inputs[i], backings[i - 4]));
+	}
 
 	auto handle = ResolveHandle(context, bind_data->catalog_name);
 	OwnedArray<MoraineRowLocation> locations(moraine_index_lookup_free);
 	MoraineError err {};
 	auto code = moraine_index_lookup(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
-	                                 bind_data->index_name.c_str(), &lookup_value, locations.OutItems(),
-	                                 locations.OutLen(), moraine_shim_is_interrupted, &context, &err);
+	                                 bind_data->index_name.c_str(), values.data(), values.size(),
+	                                 locations.OutItems(), locations.OutLen(), moraine_shim_is_interrupted, &context,
+	                                 &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -456,8 +466,10 @@ struct RangeBindData : public duckdb::FunctionData {
 	}
 };
 
-// A NULL bound argument is an open (unbounded) side; a present one is
-// Included or Excluded per its inclusivity flag.
+// Each bound is a scalar (single-column index) or a STRUCT / `row(...)` of
+// values naming the index's leading columns, in column order; a NULL bound
+// is an open (unbounded) side. A present bound is Included or Excluded per
+// its inclusivity flag.
 duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &context,
                                                    duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
@@ -472,18 +484,33 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	bind_data->bounds_repr = input.inputs[4].ToString() + (lower_inclusive ? "[" : "(") + "," +
 	                         input.inputs[5].ToString() + (upper_inclusive ? "]" : ")");
 
-	LookupValueBacking lower_backing;
-	LookupValueBacking upper_backing;
-	MoraineLookupValue lower_value {};
-	MoraineLookupValue upper_value {};
-	const bool has_lower = !input.inputs[4].IsNull();
-	const bool has_upper = !input.inputs[5].IsNull();
-	if (has_lower) {
-		lower_value = BuildLookupValue(input.inputs[4], lower_backing);
-	}
-	if (has_upper) {
-		upper_value = BuildLookupValue(input.inputs[5], upper_backing);
-	}
+	// A scalar is a one-column bound; a STRUCT/`row(...)` is a composite bound
+	// whose fields are the leading columns in order. The backing must outlive
+	// the call, so the string/bytes each `MoraineLookupValue` borrows stays
+	// valid; it is resized once, before any pointer into it is taken.
+	std::vector<LookupValueBacking> lower_backing;
+	std::vector<LookupValueBacking> upper_backing;
+	std::vector<MoraineLookupValue> lower_values;
+	std::vector<MoraineLookupValue> upper_values;
+	auto build_bound = [](const duckdb::Value &value, std::vector<LookupValueBacking> &backing,
+	                      std::vector<MoraineLookupValue> &out) {
+		if (value.IsNull()) {
+			return;
+		}
+		if (value.type().id() == duckdb::LogicalTypeId::STRUCT) {
+			const auto &children = duckdb::StructValue::GetChildren(value);
+			backing.resize(children.size());
+			out.reserve(children.size());
+			for (idx_t i = 0; i < children.size(); i++) {
+				out.push_back(BuildLookupValue(children[i], backing[i]));
+			}
+		} else {
+			backing.resize(1);
+			out.push_back(BuildLookupValue(value, backing[0]));
+		}
+	};
+	build_bound(input.inputs[4], lower_backing, lower_values);
+	build_bound(input.inputs[5], upper_backing, upper_values);
 
 	// Optional `reverse := true` returns the rows in the opposite of the
 	// index's declared order.
@@ -496,8 +523,8 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	OwnedArray<MoraineRowLocation> locations(moraine_index_range_free);
 	MoraineError err {};
 	auto code = moraine_index_range(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
-	                                bind_data->index_name.c_str(), has_lower ? &lower_value : nullptr,
-	                                lower_inclusive, has_upper ? &upper_value : nullptr, upper_inclusive, reverse,
+	                                bind_data->index_name.c_str(), lower_values.data(), lower_values.size(),
+	                                lower_inclusive, upper_values.data(), upper_values.size(), upper_inclusive, reverse,
 	                                locations.OutItems(), locations.OutLen(), moraine_shim_is_interrupted, &context,
 	                                &err);
 	if (code != MORAINE_OK) {
@@ -673,10 +700,13 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	create.named_parameters["nulls"] = LogicalType::LIST(LogicalType::VARCHAR);
 	loader.RegisterFunction(create);
 
+	// (catalog, schema, table, index, then the equality key as variadic args
+	// — one value per indexed column, in the index's column order.)
 	duckdb::TableFunction lookup("moraine_index_lookup",
 	                             {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                              LogicalType::VARCHAR, LogicalType::ANY},
+	                              LogicalType::VARCHAR},
 	                             LookupImpl, LookupBind, LookupInitGlobal);
+	lookup.varargs = LogicalType::ANY;
 	loader.RegisterFunction(lookup);
 
 	duckdb::TableFunction drop("moraine_index_drop",

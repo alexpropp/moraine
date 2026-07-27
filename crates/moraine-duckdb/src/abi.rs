@@ -1839,21 +1839,26 @@ unsafe fn coerce_lookup_value(
     coerce_lookup_value(&input, ducklake_type).map_err(AbiError::invalid_argument)
 }
 
-/// Resolves an equality lookup on a single-column index to the rows
-/// currently holding `lookup_value` — a [`MoraineLookupValue`] the ABI
-/// coerces to the indexed column's type. v1 resolves a single value.
+/// Resolves an equality lookup to the rows currently holding `values` — one
+/// [`MoraineLookupValue`] per indexed column, in the index's column order,
+/// each coerced to its column's type. The count must equal the index's
+/// column count: a composite equality key names every column (a leading
+/// prefix is not an equality lookup — use [`moraine_index_nulls`] or
+/// [`moraine_index_range`] for that).
 ///
 /// # Safety
 ///
-/// Every pointer must be valid per the ABI contract; `err`, if non-null,
-/// must be writable.
+/// Every pointer must be valid per the ABI contract; `values` points to
+/// `values_len` values; `err`, if non-null, must be writable.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn moraine_index_lookup(
     handle: *mut MoraineCatalogHandle,
     schema_name: *const c_char,
     table_name: *const c_char,
     index_name: *const c_char,
-    lookup_value: *const MoraineLookupValue,
+    values: *const MoraineLookupValue,
+    values_len: usize,
     out_items: *mut *mut MoraineRowLocation,
     out_len: *mut usize,
     probe: MoraineInterruptProbe,
@@ -1861,8 +1866,11 @@ pub unsafe extern "C" fn moraine_index_lookup(
     err: *mut MoraineError,
 ) -> i32 {
     let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowLocation>, AbiError> {
-        if lookup_value.is_null() {
-            return Err(AbiError::invalid_argument("`lookup_value` is null"));
+        if values_len == 0 {
+            return Err(AbiError::invalid_argument("index lookup: no value given"));
+        }
+        if values.is_null() {
+            return Err(AbiError::invalid_argument("`values` is null"));
         }
         // SAFETY: caller contract for the string pointers.
         let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
@@ -1879,29 +1887,35 @@ pub unsafe extern "C" fn moraine_index_lookup(
         let index = snapshot
             .index_by_name(table_id, name)
             .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
-        // v1 resolves a single value, so only a single-column index.
-        let [column_id] = index.columns[..] else {
-            return Err(AbiError::invalid_argument(
-                "index lookup: a single value resolves only a single-column index",
-            ));
-        };
+        if values_len != index.columns.len() {
+            return Err(AbiError::invalid_argument(format!(
+                "index lookup: {values_len} values do not address the {}-column index {name}; an \
+                 equality lookup names every column",
+                index.columns.len()
+            )));
+        }
         let columns = snapshot.columns_of(table_id);
-        let column = columns.iter().find(|c| c.id == column_id).ok_or_else(|| {
-            AbiError::from(moraine::Error::Corruption(format!(
-                "index {name} covers column {column_id} absent from table {table_id}"
-            )))
-        })?;
-        // SAFETY: caller contract — `lookup_value` is a valid pointer whose
-        // string/bytes fields (if its kind uses them) are valid for this call.
-        let value = unsafe { coerce_lookup_value(&*lookup_value, &column.column_type) }?;
+        // SAFETY: non-null checked; caller contract — `values` points to
+        // `values_len` values whose string/bytes fields (if used) are valid.
+        let raw_values = unsafe { std::slice::from_raw_parts(values, values_len) };
+        let mut key = Vec::with_capacity(values_len);
+        for (position, raw) in raw_values.iter().enumerate() {
+            let column_id = index.columns[position];
+            let column = columns.iter().find(|c| c.id == column_id).ok_or_else(|| {
+                AbiError::from(moraine::Error::Corruption(format!(
+                    "index {name} covers column {column_id} absent from table {table_id}"
+                )))
+            })?;
+            // SAFETY: a value's string/bytes fields (if its kind uses them) are
+            // valid for this call per the caller contract.
+            key.push(unsafe { coerce_lookup_value(raw, &column.column_type) }?);
+        }
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let locations = unsafe {
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
-                handle_ref
-                    .catalog
-                    .index_lookup(table_id, index.id, &[value]),
+                handle_ref.catalog.index_lookup(table_id, index.id, &key),
             )
         }?;
         Ok(locations
@@ -1941,14 +1955,18 @@ pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineRowLocatio
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
-/// Resolves a comparison query on a single-column index to the rows whose
-/// value falls between the bounds. A null bound pointer is unbounded (an open
-/// side); a present bound is `Included` when its `*_inclusive` flag is set,
-/// `Excluded` otherwise. Results come back in the index's stored order.
+/// Resolves a comparison query to the rows whose leading indexed values fall
+/// between the bounds. Each bound is a run of `lower_len`/`upper_len`
+/// [`MoraineLookupValue`]s over the index's leading columns — equality on all
+/// but the last named column, a comparison on the last; a null pointer or a
+/// zero length is an open (unbounded) side. A present bound is `Included`
+/// when its `*_inclusive` flag is set, `Excluded` otherwise. Results come
+/// back in the index's stored order, or its opposite when `reverse` is set.
 ///
 /// # Safety
 ///
-/// Every non-null pointer must be valid per the ABI contract; `err`, if
+/// Every non-null pointer must be valid per the ABI contract; `lower_values`
+/// points to `lower_len` values and `upper_values` to `upper_len`; `err`, if
 /// non-null, must be writable.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
@@ -1957,9 +1975,11 @@ pub unsafe extern "C" fn moraine_index_range(
     schema_name: *const c_char,
     table_name: *const c_char,
     index_name: *const c_char,
-    lower_value: *const MoraineLookupValue,
+    lower_values: *const MoraineLookupValue,
+    lower_len: usize,
     lower_inclusive: bool,
-    upper_value: *const MoraineLookupValue,
+    upper_values: *const MoraineLookupValue,
+    upper_len: usize,
     upper_inclusive: bool,
     reverse: bool,
     out_items: *mut *mut MoraineRowLocation,
@@ -1971,7 +1991,9 @@ pub unsafe extern "C" fn moraine_index_range(
     use std::ops::Bound;
 
     let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowLocation>, AbiError> {
-        if lower_value.is_null() && upper_value.is_null() {
+        let lower_empty = lower_values.is_null() || lower_len == 0;
+        let upper_empty = upper_values.is_null() || upper_len == 0;
+        if lower_empty && upper_empty {
             return Err(AbiError::invalid_argument(
                 "index range: at least one bound must be present",
             ));
@@ -1991,37 +2013,44 @@ pub unsafe extern "C" fn moraine_index_range(
         let index = snapshot
             .index_by_name(table_id, name)
             .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
-        // v1 bounds a single value, so only a single-column index.
-        let [column_id] = index.columns[..] else {
-            return Err(AbiError::invalid_argument(
-                "index range: a single value bounds only a single-column index",
-            ));
-        };
         let columns = snapshot.columns_of(table_id);
-        let column = columns.iter().find(|c| c.id == column_id).ok_or_else(|| {
-            AbiError::from(moraine::Error::Corruption(format!(
-                "index {name} covers column {column_id} absent from table {table_id}"
-            )))
-        })?;
 
-        let build_bound = |value: *const MoraineLookupValue,
+        let build_bound = |values: *const MoraineLookupValue,
+                           len: usize,
                            inclusive: bool|
          -> Result<Bound<Vec<moraine::IndexKeyValue>>, AbiError> {
-            if value.is_null() {
+            if values.is_null() || len == 0 {
                 return Ok(Bound::Unbounded);
             }
-            // SAFETY: non-null checked; caller contract — the value's
-            // string/bytes fields (if its kind uses them) are valid for this
-            // call.
-            let coerced = unsafe { coerce_lookup_value(&*value, &column.column_type) }?;
+            if len > index.columns.len() {
+                return Err(AbiError::invalid_argument(format!(
+                    "index range: a bound of {len} values does not fit the {}-column index {name}",
+                    index.columns.len()
+                )));
+            }
+            // SAFETY: non-null checked; caller contract — `values` points to
+            // `len` values whose string/bytes fields (if used) are valid.
+            let raw = unsafe { std::slice::from_raw_parts(values, len) };
+            let mut coerced = Vec::with_capacity(len);
+            for (position, raw_value) in raw.iter().enumerate() {
+                let column_id = index.columns[position];
+                let column = columns.iter().find(|c| c.id == column_id).ok_or_else(|| {
+                    AbiError::from(moraine::Error::Corruption(format!(
+                        "index {name} covers column {column_id} absent from table {table_id}"
+                    )))
+                })?;
+                // SAFETY: a value's string/bytes fields (if its kind uses
+                // them) are valid for this call per the caller contract.
+                coerced.push(unsafe { coerce_lookup_value(raw_value, &column.column_type) }?);
+            }
             Ok(if inclusive {
-                Bound::Included(vec![coerced])
+                Bound::Included(coerced)
             } else {
-                Bound::Excluded(vec![coerced])
+                Bound::Excluded(coerced)
             })
         };
-        let lower = build_bound(lower_value, lower_inclusive)?;
-        let upper = build_bound(upper_value, upper_inclusive)?;
+        let lower = build_bound(lower_values, lower_len, lower_inclusive)?;
+        let upper = build_bound(upper_values, upper_len, upper_inclusive)?;
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let locations = unsafe {
@@ -2269,6 +2298,361 @@ mod tests {
 
             catalog.close().await.expect("test setup: close catalog");
         });
+    }
+
+    /// Seeds a catalog with a two-column table (`a BIGINT`, `b VARCHAR`), a
+    /// three-row data file, and a composite unique index over `(a, b)` with
+    /// one entry per row: `(5, "x")`, `(5, "y")`, `(7, "x")`.
+    fn seed_composite(dir: &Path) {
+        use moraine::{ColumnId, IndexDef, IndexEntry, IndexKeyValue, IntWidth};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test setup: build tokio runtime");
+        rt.block_on(async {
+            let store = Arc::new(
+                LocalFileSystem::new_with_prefix(dir).expect("test setup: open local store"),
+            );
+            let catalog = moraine::Catalog::open(store, moraine::CatalogOptions::default())
+                .await
+                .expect("test setup: open catalog");
+            catalog
+                .commit(|tx| {
+                    let schema = tx.create_schema("sales")?;
+                    let table = tx.create_table(
+                        schema,
+                        "t",
+                        &[
+                            ColumnDef {
+                                name: "a".into(),
+                                column_type: "BIGINT".into(),
+                                nulls_allowed: false,
+                                default_value: None,
+                            },
+                            ColumnDef {
+                                name: "b".into(),
+                                column_type: "VARCHAR".into(),
+                                nulls_allowed: false,
+                                default_value: None,
+                            },
+                        ],
+                    )?;
+                    tx.register_data_file(
+                        table,
+                        DataFile {
+                            path: "t/data-1.parquet".into(),
+                            path_is_relative: true,
+                            file_format: "parquet".into(),
+                            record_count: 3,
+                            file_size_bytes: 1024,
+                            footer_size: 64,
+                            encryption_key: None,
+                            column_stats: vec![],
+                        },
+                        &[],
+                    )?;
+                    let a = |v: i128| {
+                        Some(IndexKeyValue::Int {
+                            value: v,
+                            width: IntWidth::I64,
+                        })
+                    };
+                    let b = |s: &str| Some(IndexKeyValue::Str(s.to_owned()));
+                    tx.create_index(
+                        table,
+                        &IndexDef {
+                            name: "by_ab".into(),
+                            columns: vec![ColumnId::new(1), ColumnId::new(2)],
+                            unique: true,
+                        },
+                        &[
+                            IndexEntry {
+                                row_id: 0,
+                                values: vec![a(5), b("x")],
+                            },
+                            IndexEntry {
+                                row_id: 1,
+                                values: vec![a(5), b("y")],
+                            },
+                            IndexEntry {
+                                row_id: 2,
+                                values: vec![a(7), b("x")],
+                            },
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .expect("test setup: commit composite fixtures");
+            catalog.close().await.expect("test setup: close catalog");
+        });
+    }
+
+    /// Builds an integer lookup value.
+    fn i64_lookup(v: i64) -> MoraineLookupValue {
+        MoraineLookupValue {
+            kind: 1,
+            i64_value: v,
+            u64_value: 0,
+            f64_value: 0.0,
+            bool_value: false,
+            str_value: ptr::null(),
+            bytes_value: ptr::null(),
+            bytes_len: 0,
+        }
+    }
+
+    /// Builds a string lookup value borrowing `text` for the call.
+    fn str_lookup(text: &CStr) -> MoraineLookupValue {
+        MoraineLookupValue {
+            kind: 5,
+            i64_value: 0,
+            u64_value: 0,
+            f64_value: 0.0,
+            bool_value: false,
+            str_value: text.as_ptr(),
+            bytes_value: ptr::null(),
+            bytes_len: 0,
+        }
+    }
+
+    /// Drives `moraine_index_lookup`, returning the resolved row ids on success
+    /// or the error message on failure.
+    fn composite_lookup(
+        handle: *mut MoraineCatalogHandle,
+        schema: &str,
+        table: &str,
+        index: &str,
+        values: &[MoraineLookupValue],
+    ) -> Result<Vec<u64>, String> {
+        let c_schema = CString::new(schema).expect("no NUL");
+        let c_table = CString::new(table).expect("no NUL");
+        let c_index = CString::new(index).expect("no NUL");
+        let mut items: *mut MoraineRowLocation = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; the C strings and `values` slice are
+        // valid for the call; the out-slots are writable locals.
+        let code = unsafe {
+            moraine_index_lookup(
+                handle,
+                c_schema.as_ptr(),
+                c_table.as_ptr(),
+                c_index.as_ptr(),
+                values.as_ptr(),
+                values.len(),
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        if code != codes::OK {
+            // SAFETY: a failed call wrote a non-null message.
+            let message = unsafe { CStr::from_ptr(err.message) }
+                .to_str()
+                .expect("utf-8")
+                .to_owned();
+            // SAFETY: the message was minted by the failed call, freed once.
+            unsafe { moraine_error_free(err.message) };
+            return Err(message);
+        }
+        // SAFETY: on success `items`/`len` describe a valid slice.
+        let rows = unsafe { std::slice::from_raw_parts(items, len) }
+            .iter()
+            .map(|location| location.row_id)
+            .collect();
+        // SAFETY: `items`/`len` are exactly what the call above wrote.
+        unsafe { moraine_index_lookup_free(items, len) };
+        Ok(rows)
+    }
+
+    /// A composite index resolves a full multi-column equality key: the two
+    /// values, in the index's column order, pin the one matching row, and a
+    /// value count that does not match the index's column count is refused.
+    #[test]
+    fn index_lookup_resolves_a_composite_key() {
+        let dir = TempDir::new("composite-lookup");
+        seed_composite(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let y = CString::new("y").expect("no NUL");
+        let hit = composite_lookup(
+            handle,
+            "sales",
+            "t",
+            "by_ab",
+            &[i64_lookup(5), str_lookup(&y)],
+        )
+        .expect("the composite key resolves");
+        assert_eq!(hit, vec![1], "(5, \"y\") pins exactly row 1");
+
+        let x = CString::new("x").expect("no NUL");
+        let miss = composite_lookup(
+            handle,
+            "sales",
+            "t",
+            "by_ab",
+            &[i64_lookup(9), str_lookup(&x)],
+        )
+        .expect("an absent composite key resolves to no rows");
+        assert!(miss.is_empty(), "(9, \"x\") matches no row");
+
+        let short = composite_lookup(handle, "sales", "t", "by_ab", &[i64_lookup(5)])
+            .expect_err("one value cannot address a two-column index");
+        assert!(
+            short.contains("2-column"),
+            "the arity error names the index width, got: {short}"
+        );
+
+        // SAFETY: `handle` was minted by `attach_ok`, detached once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// Drives `moraine_index_range`, returning the resolved row ids (sorted)
+    /// on success or the error message on failure. An empty bound slice is an
+    /// open side.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_range(
+        handle: *mut MoraineCatalogHandle,
+        schema: &str,
+        table: &str,
+        index: &str,
+        lower: &[MoraineLookupValue],
+        lower_inclusive: bool,
+        upper: &[MoraineLookupValue],
+        upper_inclusive: bool,
+    ) -> Result<Vec<u64>, String> {
+        let c_schema = CString::new(schema).expect("no NUL");
+        let c_table = CString::new(table).expect("no NUL");
+        let c_index = CString::new(index).expect("no NUL");
+        let mut items: *mut MoraineRowLocation = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err = MoraineError::default();
+        // SAFETY: `handle` is attached; the C strings and bound slices are
+        // valid for the call; the out-slots are writable locals.
+        let code = unsafe {
+            moraine_index_range(
+                handle,
+                c_schema.as_ptr(),
+                c_table.as_ptr(),
+                c_index.as_ptr(),
+                lower.as_ptr(),
+                lower.len(),
+                lower_inclusive,
+                upper.as_ptr(),
+                upper.len(),
+                upper_inclusive,
+                false,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        if code != codes::OK {
+            // SAFETY: a failed call wrote a non-null message.
+            let message = unsafe { CStr::from_ptr(err.message) }
+                .to_str()
+                .expect("utf-8")
+                .to_owned();
+            // SAFETY: the message was minted by the failed call, freed once.
+            unsafe { moraine_error_free(err.message) };
+            return Err(message);
+        }
+        // SAFETY: on success `items`/`len` describe a valid slice.
+        let mut rows: Vec<u64> = unsafe { std::slice::from_raw_parts(items, len) }
+            .iter()
+            .map(|location| location.row_id)
+            .collect();
+        // SAFETY: `items`/`len` are exactly what the call above wrote.
+        unsafe { moraine_index_range_free(items, len) };
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    /// A composite index answers a range whose bounds run over its leading
+    /// columns: a leading-column equality window, a full-tuple window, and a
+    /// half-open window with one open side.
+    #[test]
+    fn index_range_spans_a_composite_window() {
+        let dir = TempDir::new("composite-range");
+        seed_composite(dir.path());
+        let handle = attach_ok(dir.path());
+
+        // a = 5 (a one-column prefix bound on the two-column index): the two
+        // rows sharing that leading value, whatever their second column.
+        let equal_a = composite_range(
+            handle,
+            "sales",
+            "t",
+            "by_ab",
+            &[i64_lookup(5)],
+            true,
+            &[i64_lookup(5)],
+            true,
+        )
+        .expect("a leading-column equality window resolves");
+        assert_eq!(equal_a, vec![0, 1], "a = 5 spans rows 0 and 1");
+
+        // (5, "y") ..= (7, "x") over the full tuple: excludes (5, "x") below
+        // the lower bound, includes (5, "y") and (7, "x").
+        let y = CString::new("y").expect("no NUL");
+        let x = CString::new("x").expect("no NUL");
+        let window = composite_range(
+            handle,
+            "sales",
+            "t",
+            "by_ab",
+            &[i64_lookup(5), str_lookup(&y)],
+            true,
+            &[i64_lookup(7), str_lookup(&x)],
+            true,
+        )
+        .expect("a full-tuple window resolves");
+        assert_eq!(
+            window,
+            vec![1, 2],
+            "(5, \"y\")..=(7, \"x\") spans rows 1 and 2"
+        );
+
+        // a >= 7 with an open upper side: only the (7, _) row.
+        let high = composite_range(
+            handle,
+            "sales",
+            "t",
+            "by_ab",
+            &[i64_lookup(7)],
+            true,
+            &[],
+            true,
+        )
+        .expect("a half-open window resolves");
+        assert_eq!(high, vec![2], "a >= 7 spans only row 2");
+
+        // A bound wider than the index is refused, naming the index width.
+        let z = CString::new("z").expect("no NUL");
+        let too_wide = composite_range(
+            handle,
+            "sales",
+            "t",
+            "by_ab",
+            &[i64_lookup(5), str_lookup(&z), i64_lookup(1)],
+            true,
+            &[],
+            true,
+        )
+        .expect_err("a three-value bound cannot fit a two-column index");
+        assert!(
+            too_wide.contains("2-column"),
+            "the width error names the index, got: {too_wide}"
+        );
+
+        // SAFETY: `handle` was minted by `attach_ok`, detached once.
+        unsafe { moraine_detach(handle) };
     }
 
     /// Reads the stored `encrypted` flag over the ABI.

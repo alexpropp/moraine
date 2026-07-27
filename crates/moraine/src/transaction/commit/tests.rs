@@ -1078,6 +1078,107 @@ async fn composite_index_nulls_matches_a_leading_prefix() {
 }
 
 #[tokio::test]
+async fn index_range_spans_a_composite_prefix_and_window() {
+    use std::ops::Bound;
+
+    use crate::{
+        catalog::{ColumnId, IndexDef, IndexEntry},
+        store::index_encoding::{IndexKeyValue, IntWidth},
+    };
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let int = |v: i128| {
+        Some(IndexKeyValue::Int {
+            value: v,
+            width: IntWidth::I64,
+        })
+    };
+    let ent = |row_id, a: i128, b: i128| IndexEntry {
+        row_id,
+        values: vec![int(a), int(b)],
+    };
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            // row 0: (5, 10); row 1: (5, 20); row 2: (7, 10).
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_ab".into(),
+                    columns: vec![ColumnId::new(1), ColumnId::new(2)],
+                    unique: true,
+                },
+                &[ent(0, 5, 10), ent(1, 5, 20), ent(2, 7, 10)],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    let val = |v: i128| IndexKeyValue::Int {
+        value: v,
+        width: IntWidth::I64,
+    };
+    let ids = |hits: Vec<crate::catalog::RowLocation>| {
+        let mut ids: Vec<u64> = hits.into_iter().map(|hit| hit.row_id).collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    // A one-column prefix bound pins the leading column: a = 5 spans both
+    // rows sharing it, whatever their second column. This is the case the
+    // outer value-framing's terminator would strand if the extension bound
+    // were computed from the terminated suffix.
+    let equal_a = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![val(5)]),
+            Bound::Included(vec![val(5)]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(equal_a), vec![0, 1], "a = 5 spans rows 0 and 1");
+
+    // A full-tuple window: (5, 20) ..= (7, 10) excludes (5, 10) below the
+    // lower bound and includes (5, 20) and (7, 10).
+    let window = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![val(5), val(20)]),
+            Bound::Included(vec![val(7), val(10)]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(window),
+        vec![1, 2],
+        "(5,20)..=(7,10) spans rows 1 and 2"
+    );
+
+    // A one-column prefix Excluded lower skips every extension of a = 5.
+    let above_a = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Excluded(vec![val(5)]),
+            Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(above_a), vec![2], "a > 5 spans only row 2");
+
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn index_lookup_on_missing_index_is_not_found() {
     use crate::catalog::IndexId;
     let (catalog, table) = catalog_with_two_column_table().await;

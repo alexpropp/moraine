@@ -503,8 +503,8 @@ the native index without touching DuckLake's binder:
 |---|---|
 | `CALL moraine_create_index('lake.t', 'name', columns := ['c'], unique := b, staged := b, directions := ['asc'\|'desc'], nulls := ['first'\|'last'])` | insert the definition, backfill live rows (Coverage; staged drives the multi-commit protocol, Staged builds). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST |
 | `CALL moraine_drop_index('lake.t', 'name')` | end the definition (Reclamation) |
-| `moraine_index_lookup('lake.t', 'name', v)` | table function: row ids and holders for value `v` |
-| `moraine_index_range('lake.t', 'name', lower, upper, lower_inclusive, upper_inclusive)` | table function: row ids and holders for a value window; a NULL bound is an open side (half-open) |
+| `moraine_index_lookup('lake.t', 'name', v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
+| `moraine_index_range('lake.t', 'name', lower, upper, lower_inclusive, upper_inclusive)` | table function: row ids and holders for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns (equality on all but the last named column, a comparison on the last); a NULL bound is an open side (half-open) |
 | `moraine_index_nulls('lake.t', 'name', prefix…)` | table function: row ids and holders for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
 | `moraine_indexes('lake.t')` | table function: index introspection |
 

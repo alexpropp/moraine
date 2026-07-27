@@ -257,10 +257,22 @@ pub(crate) async fn range_row_ids(
         full[prefix_len..].to_vec()
     };
 
+    // The exclusive byte bound just above every entry whose value starts with
+    // `canon`: the value's own entries and, when `canon` names only a leading
+    // prefix of the index's columns, every extension of it. The framed suffix
+    // ends in the value's `0x00` terminator; dropping it leaves the escaped
+    // body, whose increment sorts above every key that extends the body —
+    // a longer value (further columns) or a trailing row id.
+    let above = |canon: &CanonicalKey| -> Option<Vec<u8>> {
+        let mut body = suffix(canon);
+        body.pop();
+        increment_prefix(&body)
+    };
+
     let start = match lower {
         Bound::Included(canon) => Bound::Included(suffix(&canon)),
         // Skip every entry sharing the bound value: start above them all.
-        Bound::Excluded(canon) => match increment_prefix(&suffix(&canon)) {
+        Bound::Excluded(canon) => match above(&canon) {
             Some(above) => Bound::Included(above),
             None => Bound::Excluded(suffix(&canon)),
         },
@@ -268,7 +280,7 @@ pub(crate) async fn range_row_ids(
     };
     let end = match upper {
         // Include every entry sharing the bound value: end above them all.
-        Bound::Included(canon) => match increment_prefix(&suffix(&canon)) {
+        Bound::Included(canon) => match above(&canon) {
             Some(above) => Bound::Excluded(above),
             None => Bound::Unbounded,
         },

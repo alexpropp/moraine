@@ -1148,19 +1148,23 @@ int32_t moraine_indexes(struct MoraineCatalogHandle *handle,
 // matching [`moraine_indexes`] call, not yet freed.
 void moraine_indexes_free(struct MoraineIndexDesc *items, size_t len);
 
-// Resolves an equality lookup on a single-column index to the rows
-// currently holding `lookup_value` — a [`MoraineLookupValue`] the ABI
-// coerces to the indexed column's type. v1 resolves a single value.
+// Resolves an equality lookup to the rows currently holding `values` — one
+// [`MoraineLookupValue`] per indexed column, in the index's column order,
+// each coerced to its column's type. The count must equal the index's
+// column count: a composite equality key names every column (a leading
+// prefix is not an equality lookup — use [`moraine_index_nulls`] or
+// [`moraine_index_range`] for that).
 //
 // # Safety
 //
-// Every pointer must be valid per the ABI contract; `err`, if non-null,
-// must be writable.
+// Every pointer must be valid per the ABI contract; `values` points to
+// `values_len` values; `err`, if non-null, must be writable.
 int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
                              const char *schema_name,
                              const char *table_name,
                              const char *index_name,
-                             const struct MoraineLookupValue *lookup_value,
+                             const struct MoraineLookupValue *values,
+                             size_t values_len,
                              struct MoraineRowLocation **out_items,
                              size_t *out_len,
                              MoraineInterruptProbe probe,
@@ -1175,22 +1179,28 @@ int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
 // matching [`moraine_index_lookup`] call, not yet freed.
 void moraine_index_lookup_free(struct MoraineRowLocation *items, size_t len);
 
-// Resolves a comparison query on a single-column index to the rows whose
-// value falls between the bounds. A null bound pointer is unbounded (an open
-// side); a present bound is `Included` when its `*_inclusive` flag is set,
-// `Excluded` otherwise. Results come back in the index's stored order.
+// Resolves a comparison query to the rows whose leading indexed values fall
+// between the bounds. Each bound is a run of `lower_len`/`upper_len`
+// [`MoraineLookupValue`]s over the index's leading columns — equality on all
+// but the last named column, a comparison on the last; a null pointer or a
+// zero length is an open (unbounded) side. A present bound is `Included`
+// when its `*_inclusive` flag is set, `Excluded` otherwise. Results come
+// back in the index's stored order, or its opposite when `reverse` is set.
 //
 // # Safety
 //
-// Every non-null pointer must be valid per the ABI contract; `err`, if
+// Every non-null pointer must be valid per the ABI contract; `lower_values`
+// points to `lower_len` values and `upper_values` to `upper_len`; `err`, if
 // non-null, must be writable.
 int32_t moraine_index_range(struct MoraineCatalogHandle *handle,
                             const char *schema_name,
                             const char *table_name,
                             const char *index_name,
-                            const struct MoraineLookupValue *lower_value,
+                            const struct MoraineLookupValue *lower_values,
+                            size_t lower_len,
                             bool lower_inclusive,
-                            const struct MoraineLookupValue *upper_value,
+                            const struct MoraineLookupValue *upper_values,
+                            size_t upper_len,
                             bool upper_inclusive,
                             bool reverse,
                             struct MoraineRowLocation **out_items,
