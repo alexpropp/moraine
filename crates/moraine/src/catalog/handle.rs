@@ -13,9 +13,9 @@ use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnId, DataFileInfo, FileIndexEntry, IndexEntry, IndexId, IndexInfo,
-        IndexState, RowHolder, RowLocation, SnapshotId, TableId, projection::ProjectionCache,
-        scoped_read,
+        CatalogSnapshot, ColumnId, DataFileId, DataFileInfo, FileIndexEntry, IndexEntry, IndexId,
+        IndexInfo, IndexState, RowHolder, RowLocation, SnapshotId, TableId,
+        projection::ProjectionCache, scoped_read,
     },
     error::{Error, Result},
     store::{
@@ -308,12 +308,12 @@ impl Catalog {
             )?;
             let row_ids =
                 index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await?;
-            let files = view.data_files_of(table);
+            let holders = RowHolders::of(&view.data_files_of(table));
             Ok(row_ids
                 .into_iter()
                 .map(|row_id| RowLocation {
                     row_id,
-                    holder: resolve_row_holder(&files, row_id),
+                    holder: holders.holder(row_id),
                 })
                 .collect())
         }
@@ -390,12 +390,12 @@ impl Catalog {
             if reverse {
                 row_ids.reverse();
             }
-            let files = view.data_files_of(table);
+            let holders = RowHolders::of(&view.data_files_of(table));
             Ok(row_ids
                 .into_iter()
                 .map(|row_id| RowLocation {
                     row_id,
-                    holder: resolve_row_holder(&files, row_id),
+                    holder: holders.holder(row_id),
                 })
                 .collect())
         }
@@ -471,12 +471,13 @@ impl Catalog {
             if reverse {
                 row_ids.reverse();
             }
-            let files = view.data_files_of(table);
+            let holders = RowHolders::of(&view.data_files_of(table));
+
             Ok(row_ids
                 .into_iter()
                 .map(|row_id| RowLocation {
                     row_id,
-                    holder: resolve_row_holder(&files, row_id),
+                    holder: holders.holder(row_id),
                 })
                 .collect())
         }
@@ -1086,19 +1087,37 @@ fn encode_range_bounds(
     Ok((encode_bound(byte_lower)?, encode_bound(byte_upper)?))
 }
 
-/// Resolves a row id to its current holder among a table's data files: the
-/// file whose live dense row-id range contains it, else `Inline`
-/// (an inlined row, or a file that carries explicit per-row ids rather than
-/// a dense range).
-fn resolve_row_holder(files: &[DataFileInfo], row_id: u64) -> RowHolder {
-    for file in files {
-        if let Some(start) = file.row_id_start
-            && row_id >= start
-            && row_id < start.saturating_add(file.record_count)
-        {
-            return RowHolder::DataFile(file.id);
-        }
+/// A table's dense row-id ranges, ordered for lookup. A query resolves every
+/// hit against the same table, so the ranges are built once and searched per
+/// row rather than rescanned; an index range can return far more rows than a
+/// table has files.
+struct RowHolders {
+    /// `(start, end, file)` per file carrying a dense range, sorted by start
+    /// and disjoint — each row id belongs to at most one file.
+    ranges: Vec<(u64, u64, DataFileId)>,
+}
+
+impl RowHolders {
+    fn of(files: &[DataFileInfo]) -> Self {
+        let mut ranges: Vec<_> = files
+            .iter()
+            .filter_map(|file| {
+                let start = file.row_id_start?;
+                Some((start, start.saturating_add(file.record_count), file.id))
+            })
+            .collect();
+        ranges.sort_unstable();
+        Self { ranges }
     }
 
-    RowHolder::Inline
+    /// The file whose range holds `row_id`, else `Inline` — an inlined row,
+    /// or one in a file carrying explicit per-row ids rather than a range.
+    fn holder(&self, row_id: u64) -> RowHolder {
+        // Only the last range starting at or below `row_id` can contain it.
+        let above = self.ranges.partition_point(|(start, ..)| *start <= row_id);
+        match self.ranges[..above].last() {
+            Some(&(_, end, file)) if row_id < end => RowHolder::DataFile(file),
+            _ => RowHolder::Inline,
+        }
+    }
 }

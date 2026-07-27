@@ -13,6 +13,8 @@
 #include "duckdb/common/types/blob.hpp"
 #include "duckdb/common/types/uuid.hpp"
 
+#include <deque>
+
 namespace moraine_duckdb {
 
 namespace {
@@ -303,6 +305,8 @@ struct LookupValueBacking {
 	std::vector<uint8_t> bytes;
 };
 
+using LookupValueArena = std::deque<LookupValueBacking>;
+
 // A value's text tagged by type and length, so that two different argument
 // lists cannot render alike: without the tag `('a', 'b,c')` and `('a,b', 'c')`
 // share a rendering, as do a NULL bound and the string `'NULL'`.
@@ -318,12 +322,14 @@ std::string ValueRepr(const duckdb::Value &value) {
 // A NULL becomes the `IS NULL` predicate kind; which callers accept one is
 // the core's rule, so it is not judged here. Reading a typed NULL's payload
 // would raise an internal error, so the kind is set before the switch.
-MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueBacking &backing, const char *caller) {
+MoraineLookupValue BuildLookupValue(const duckdb::Value &value, LookupValueArena &arena, const char *caller) {
 	MoraineLookupValue lookup {};
 	if (value.IsNull()) {
 		lookup.kind = 0;
 		return lookup;
 	}
+
+	auto &backing = arena.emplace_back();
 	switch (value.type().id()) {
 	case duckdb::LogicalTypeId::TINYINT:
 	case duckdb::LogicalTypeId::SMALLINT:
@@ -397,12 +403,12 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 	bind_data->index_name = input.inputs[3].GetValue<std::string>();
 
 	const idx_t value_count = input.inputs.size() - 4;
-	std::vector<LookupValueBacking> backings(value_count);
+	LookupValueArena backings;
 	std::vector<MoraineLookupValue> values;
 	values.reserve(value_count);
 	for (idx_t i = 4; i < input.inputs.size(); i++) {
 		bind_data->value_repr += ValueRepr(input.inputs[i]) + ",";
-		values.push_back(BuildLookupValue(input.inputs[i], backings[i - 4], "moraine_index_lookup"));
+		values.push_back(BuildLookupValue(input.inputs[i], backings, "moraine_index_lookup"));
 	}
 
 	auto handle = ResolveHandle(context, bind_data->catalog_name);
@@ -501,14 +507,13 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 	                         ValueRepr(input.inputs[5]) + (upper_inclusive ? "]" : ")");
 
 	// A scalar is a one-column bound; a STRUCT/`row(...)` is a composite bound
-	// whose fields are the leading columns in order. The backing must outlive
-	// the call, so the string/bytes each `MoraineLookupValue` borrows stays
-	// valid; it is resized once, before any pointer into it is taken.
-	std::vector<LookupValueBacking> lower_backing;
-	std::vector<LookupValueBacking> upper_backing;
+	// whose fields are the leading columns in order. Each bound's arena
+	// outlives the call, keeping the string/bytes its values borrow valid.
+	LookupValueArena lower_backing;
+	LookupValueArena upper_backing;
 	std::vector<MoraineLookupValue> lower_values;
 	std::vector<MoraineLookupValue> upper_values;
-	auto build_bound = [](const duckdb::Value &value, std::vector<LookupValueBacking> &backing,
+	auto build_bound = [](const duckdb::Value &value, LookupValueArena &backing,
 	                      std::vector<MoraineLookupValue> &out) {
 		// A whole-bound NULL is an open side, not a value: it names no column.
 		if (value.IsNull()) {
@@ -520,10 +525,9 @@ duckdb::unique_ptr<duckdb::FunctionData> RangeBind(duckdb::ClientContext &contex
 		} else {
 			columns.push_back(value);
 		}
-		backing.resize(columns.size());
 		out.reserve(columns.size());
-		for (idx_t i = 0; i < columns.size(); i++) {
-			out.push_back(BuildLookupValue(columns[i], backing[i], "moraine_index_range"));
+		for (auto &column : columns) {
+			out.push_back(BuildLookupValue(column, backing, "moraine_index_range"));
 		}
 	};
 	build_bound(input.inputs[4], lower_backing, lower_values);
@@ -626,7 +630,7 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 	bind_data->index_name = input.inputs[3].GetValue<std::string>();
 
 	const idx_t prefix_count = input.inputs.size() - 4;
-	std::vector<LookupValueBacking> backings(prefix_count);
+	LookupValueArena backings;
 	std::vector<MoraineLookupValue> prefix;
 	prefix.reserve(prefix_count);
 	for (idx_t i = 4; i < input.inputs.size(); i++) {
@@ -636,7 +640,7 @@ duckdb::unique_ptr<duckdb::FunctionData> NullsBind(duckdb::ClientContext &contex
 			is_null.kind = 0;
 			prefix.push_back(is_null);
 		} else {
-			prefix.push_back(BuildLookupValue(input.inputs[i], backings[i - 4], "moraine_index_nulls"));
+			prefix.push_back(BuildLookupValue(input.inputs[i], backings, "moraine_index_nulls"));
 		}
 	}
 
