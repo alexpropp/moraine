@@ -531,6 +531,9 @@ pub(crate) fn inline_schema_prefix() -> Vec<u8> {
 /// Discriminant bytes preceding an index entry's components: the `index`
 /// subspace byte and the [`IndexKey`] kind byte.
 const INDEX_KIND_PREFIX_LEN: usize = 2;
+/// Bytes preceding an index entry's value: the kind discriminants and the
+/// eight-byte index id.
+const INDEX_ENTRY_PREFIX_LEN: usize = INDEX_KIND_PREFIX_LEN + size_of::<u64>();
 
 /// The two entry kinds inside the `index` subspace. An index is exclusively
 /// one kind, so its entries form one contiguous `(kind, index_id)` range.
@@ -577,7 +580,7 @@ pub(crate) fn index_index_prefix(kind: IndexKind, index_id: u64) -> Vec<u8> {
             row_id: 0,
         }),
     };
-    prefix_of(&key, INDEX_KIND_PREFIX_LEN + size_of::<u64>())
+    prefix_of(&key, INDEX_ENTRY_PREFIX_LEN)
 }
 
 /// Byte prefix of every non-unique entry sharing one `(index_id, value)` —
@@ -593,6 +596,56 @@ pub(crate) fn index_multi_value_prefix(index_id: u64, value: &CanonicalKey) -> V
     .encode();
     bytes.truncate(bytes.len() - size_of::<u64>());
     bytes
+}
+
+/// The framed value bytes as they appear in an entry key of `kind`, after the
+/// `(kind, index_id)` prefix — the suffix a subrange bounds against.
+pub(crate) fn index_value_suffix(kind: IndexKind, index_id: u64, value: &CanonicalKey) -> Vec<u8> {
+    let mut bytes = match kind {
+        IndexKind::Unique => Key::Index(IndexKey::Unique {
+            index_id,
+            key: value.clone(),
+        })
+        .encode(),
+        IndexKind::Multi => index_multi_value_prefix(index_id, value),
+    };
+
+    bytes.drain(..INDEX_ENTRY_PREFIX_LEN);
+    bytes
+}
+
+/// The framed suffix without its trailing terminator: the escaped body that
+/// every key extending the value — further columns, or the row id a
+/// non-unique entry ends with — carries as its own prefix.
+pub(crate) fn index_value_body(kind: IndexKind, index_id: u64, value: &CanonicalKey) -> Vec<u8> {
+    let mut body = index_value_suffix(kind, index_id, value);
+    body.pop();
+    body
+}
+
+/// The exclusive byte bound just above every entry whose value starts with
+/// `value`: the value's own entries and, when it names only a leading prefix
+/// of the index's columns, every extension of it. `None` when the body is all
+/// `0xff` and so has no increment.
+pub(crate) fn index_value_above(
+    kind: IndexKind,
+    index_id: u64,
+    value: &CanonicalKey,
+) -> Option<Vec<u8>> {
+    increment_prefix(index_value_body(kind, index_id, value))
+}
+
+/// The smallest byte string lexicographically greater than every string that
+/// begins with `prefix`, or `None` when `prefix` is all `0xff`.
+pub(crate) fn increment_prefix(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+    while let Some(last) = bytes.last_mut() {
+        if *last != u8::MAX {
+            *last += 1;
+            return Some(bytes);
+        }
+        bytes.pop();
+    }
+    None
 }
 
 /// Byte prefix of every key in a subspace (exactly `TAG_PREFIX_LEN`
@@ -1345,6 +1398,119 @@ mod tests {
             let position = index.index(bytes.len());
             bytes[position] = byte;
             let _ = Key::decode(&bytes);
+        }
+    }
+
+    mod index_value_bounds {
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::store::index_encoding::{
+            Direction, IndexKeyValue, IntWidth, NullOrder, encode_ordered_values,
+        };
+
+        /// Values across the categories whose framing the bound arithmetic has
+        /// to survive: fixed-width integers, and the variable-length
+        /// strings and blobs whose escaped bodies can end in `0xff`.
+        fn arbitrary_value() -> impl Strategy<Value = IndexKeyValue> {
+            prop_oneof![
+                any::<i64>().prop_map(|value| IndexKeyValue::Int {
+                    value: i128::from(value),
+                    width: IntWidth::I64,
+                }),
+                any::<u32>().prop_map(|value| IndexKeyValue::UInt {
+                    value: u128::from(value),
+                    width: IntWidth::I32,
+                }),
+                any::<bool>().prop_map(IndexKeyValue::Bool),
+                ".{0,8}".prop_map(IndexKeyValue::Str),
+                proptest::collection::vec(any::<u8>(), 0..8).prop_map(IndexKeyValue::Bytes),
+            ]
+        }
+
+        /// A two-column key, or its one-column leading prefix, under one shared
+        /// direction. NULLS placement is irrelevant here: every value is
+        /// present.
+        fn encode(values: &[IndexKeyValue], descending: bool) -> CanonicalKey {
+            let direction = if descending {
+                Direction::Descending
+            } else {
+                Direction::Ascending
+            };
+            encode_ordered_values(
+                &values.iter().cloned().map(Some).collect::<Vec<_>>(),
+                &[direction, direction],
+                &[NullOrder::Last, NullOrder::Last],
+            )
+            .expect("values within the key size cap encode")
+        }
+
+        /// The bytes a stored non-unique entry carries after the index prefix:
+        /// the framed value, then the raw row id.
+        fn multi_entry(index_id: u64, canon: &CanonicalKey, row_id: u64) -> Vec<u8> {
+            let full = Key::Index(IndexKey::Multi {
+                index_id,
+                key: canon.clone(),
+                row_id,
+            })
+            .encode();
+            full[INDEX_ENTRY_PREFIX_LEN..].to_vec()
+        }
+
+        proptest! {
+            /// The bound above a one-column prefix outranks every key that
+            /// extends it: the value's own entry, an entry carrying a further
+            /// column, and — on a non-unique index — the trailing row id.
+            #[test]
+            fn above_a_prefix_outranks_every_extension(
+                leading in arbitrary_value(),
+                extension in arbitrary_value(),
+                row_id: u64,
+                descending: bool,
+            ) {
+                let index_id = 7;
+                let prefix = encode(std::slice::from_ref(&leading), descending);
+                let extended = encode(&[leading, extension], descending);
+
+                for kind in [IndexKind::Unique, IndexKind::Multi] {
+                    let bound = index_value_above(kind, index_id, &prefix)
+                        .expect("a framed body is never all 0xff");
+                    prop_assert!(bound > index_value_suffix(kind, index_id, &prefix));
+                    prop_assert!(bound > index_value_suffix(kind, index_id, &extended));
+                }
+                prop_assert!(
+                    index_value_above(IndexKind::Multi, index_id, &prefix)
+                        .expect("a framed body is never all 0xff")
+                        > multi_entry(index_id, &extended, row_id)
+                );
+            }
+
+            /// The bound stops below every value that sorts above the prefix, so
+            /// a range ending there admits no row it should exclude.
+            #[test]
+            fn above_a_prefix_stops_below_a_larger_value(
+                one in arbitrary_value(),
+                two in arbitrary_value(),
+                descending: bool,
+            ) {
+                let index_id = 7;
+                let kind = IndexKind::Unique;
+                let first = encode(&[one], descending);
+                let second = encode(&[two], descending);
+
+                let (lower, higher) = if index_value_suffix(kind, index_id, &first)
+                    < index_value_suffix(kind, index_id, &second)
+                {
+                    (&first, &second)
+                } else {
+                    (&second, &first)
+                };
+                prop_assume!(lower != higher);
+
+                let bound = index_value_above(kind, index_id, lower)
+                    .expect("a framed body is never all 0xff");
+                prop_assert!(bound <= index_value_suffix(kind, index_id, higher));
+            }
         }
     }
 }

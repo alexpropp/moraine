@@ -54,6 +54,87 @@ fn moraine_index_functions_create_list_lookup_and_drop() {
     );
 }
 
+/// A composite index over `(a, b)` resolves a full multi-column equality key
+/// from SQL: the variadic values, in the index's column order, pin the one
+/// matching row, and an absent key resolves to none.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_lookup_resolves_a_composite_key() {
+    let store = TempDir::new("index-composite-store");
+    let data = TempDir::new("index-composite-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    let count = |sql: &str| csv_rows(&run(sql));
+
+    // Rows 0 and 1 share a=5; only (a, b) together are unique.
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+
+    // The full key (5, 'y') pins exactly the second row.
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT row_id FROM moraine_index_lookup('lake', 'main', 't', 'by_ab', 5, 'y');"
+        )),
+        vec![vec!["1".to_string()]],
+        "(5, 'y') resolves to row 1"
+    );
+    // The same leading value with a different second column is a distinct key.
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT row_id FROM moraine_index_lookup('lake', 'main', 't', 'by_ab', 5, 'x');"
+        )),
+        vec![vec!["0".to_string()]],
+        "(5, 'x') resolves to row 0"
+    );
+    // A key present in neither column combination resolves to no rows.
+    assert_eq!(
+        count("SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_ab', 9, 'x');"),
+        vec![vec!["0".to_string()]],
+        "(9, 'x') matches no row"
+    );
+}
+
+/// A composite index answers a range whose bounds are `row(...)` tuples over
+/// its leading columns: a leading-column equality window (a one-field tuple),
+/// a full-tuple window, and a half-open window with a NULL open side.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_range_spans_a_composite_window() {
+    let store = TempDir::new("index-composite-range-store");
+    let data = TempDir::new("index-composite-range-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+
+    // a = 5 as a one-field tuple bound: both rows sharing the leading value.
+    assert_eq!(
+        csv_rows(&run("SELECT row_id FROM \
+             moraine_index_range('lake', 'main', 't', 'by_ab', row(5), row(5), true, true) \
+             ORDER BY row_id;")),
+        vec![vec!["0".to_string()], vec!["1".to_string()]],
+        "a = 5 spans rows 0 and 1"
+    );
+    // (5, 'y') ..= (7, 'x') over the full tuple: excludes (5, 'x').
+    assert_eq!(
+        csv_rows(&run("SELECT row_id FROM \
+             moraine_index_range('lake', 'main', 't', 'by_ab', row(5, 'y'), row(7, 'x'), true, true) \
+             ORDER BY row_id;")),
+        vec![vec!["1".to_string()], vec!["2".to_string()]],
+        "(5, 'y')..=(7, 'x') spans rows 1 and 2"
+    );
+    // a >= 7 with a NULL (open) upper side: only the (7, _) row.
+    assert_eq!(
+        csv_rows(&run("SELECT row_id FROM \
+             moraine_index_range('lake', 'main', 't', 'by_ab', row(7), NULL, true, true);")),
+        vec![vec!["2".to_string()]],
+        "a >= 7 spans only row 2"
+    );
+}
+
 /// The range SQL surface: `moraine_index_range` resolves a comparison
 /// window over the same index the lookup uses — closed, open, and half-open
 /// (a NULL bound is an open side).

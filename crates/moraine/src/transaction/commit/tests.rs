@@ -279,14 +279,39 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
     (catalog, table.get().unwrap())
 }
 
+/// A `BIGINT`-shaped index key value.
+fn int_value(value: i128) -> crate::store::index_encoding::IndexKeyValue {
+    crate::store::index_encoding::IndexKeyValue::Int {
+        value,
+        width: crate::store::index_encoding::IntWidth::I64,
+    }
+}
+
+/// A one-column index key over a single integer value.
+fn int_key(value: i128) -> Vec<crate::store::index_encoding::IndexKeyValue> {
+    vec![int_value(value)]
+}
+
 fn entry(row_id: u64, value: i128) -> crate::catalog::IndexEntry {
     crate::catalog::IndexEntry {
         row_id,
-        values: vec![Some(crate::store::index_encoding::IndexKeyValue::Int {
-            value,
-            width: crate::store::index_encoding::IntWidth::I64,
-        })],
+        values: vec![Some(int_value(value))],
     }
+}
+
+/// An index entry over two integer columns.
+fn pair_entry(row_id: u64, first: i128, second: i128) -> crate::catalog::IndexEntry {
+    crate::catalog::IndexEntry {
+        row_id,
+        values: vec![Some(int_value(first)), Some(int_value(second))],
+    }
+}
+
+/// The row ids a query resolved, sorted — hit order is asserted separately.
+fn sorted_row_ids(hits: Vec<crate::catalog::RowLocation>) -> Vec<u64> {
+    let mut ids: Vec<u64> = hits.into_iter().map(|hit| hit.row_id).collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// An index entry for a row whose single indexed column is NULL.
@@ -498,12 +523,8 @@ async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let value = |v: i128| crate::store::index_encoding::IndexKeyValue::Int {
-        value: v,
-        width: crate::store::index_encoding::IntWidth::I64,
-    };
     let hits = catalog
-        .index_lookup(table, index, &[value(20)])
+        .index_lookup(table, index, &[int_value(20)])
         .await
         .unwrap();
     assert_eq!(
@@ -516,7 +537,7 @@ async fn index_lookup_resolves_unique_value_to_its_data_file_row() {
     // A value no row holds resolves to nothing.
     assert!(
         catalog
-            .index_lookup(table, index, &[value(99)])
+            .index_lookup(table, index, &[int_value(99)])
             .await
             .unwrap()
             .is_empty()
@@ -592,25 +613,13 @@ async fn index_range_selects_unique_values_in_a_bounded_interval() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let value = |v: i128| {
-        vec![crate::store::index_encoding::IndexKeyValue::Int {
-            value: v,
-            width: crate::store::index_encoding::IntWidth::I64,
-        }]
-    };
-    let ids = |hits: Vec<crate::catalog::RowLocation>| {
-        let mut ids: Vec<u64> = hits.into_iter().map(|hit| hit.row_id).collect();
-        ids.sort_unstable();
-        ids
-    };
-
     // BETWEEN 15 AND 25 — only value 20 (row 1).
     let between = catalog
         .index_range(
             table,
             index,
-            Bound::Included(value(15)),
-            Bound::Included(value(25)),
+            Bound::Included(int_key(15)),
+            Bound::Included(int_key(25)),
             false,
         )
         .await
@@ -628,13 +637,13 @@ async fn index_range_selects_unique_values_in_a_bounded_interval() {
         .index_range(
             table,
             index,
-            Bound::Excluded(value(20)),
+            Bound::Excluded(int_key(20)),
             Bound::Unbounded,
             false,
         )
         .await
         .unwrap();
-    assert_eq!(ids(above), vec![2]);
+    assert_eq!(sorted_row_ids(above), vec![2]);
 
     // <= 20 — values 10 and 20 (rows 0, 1).
     let below = catalog
@@ -642,25 +651,25 @@ async fn index_range_selects_unique_values_in_a_bounded_interval() {
             table,
             index,
             Bound::Unbounded,
-            Bound::Included(value(20)),
+            Bound::Included(int_key(20)),
             false,
         )
         .await
         .unwrap();
-    assert_eq!(ids(below), vec![0, 1]);
+    assert_eq!(sorted_row_ids(below), vec![0, 1]);
 
     // Closed [10, 30] covers every row.
     let all = catalog
         .index_range(
             table,
             index,
-            Bound::Included(value(10)),
-            Bound::Included(value(30)),
+            Bound::Included(int_key(10)),
+            Bound::Included(int_key(30)),
             false,
         )
         .await
         .unwrap();
-    assert_eq!(ids(all), vec![0, 1, 2]);
+    assert_eq!(sorted_row_ids(all), vec![0, 1, 2]);
 
     catalog.close().await.unwrap();
 }
@@ -692,12 +701,6 @@ async fn index_range_reverse_serves_the_opposite_order() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let value = |v: i128| {
-        vec![crate::store::index_encoding::IndexKeyValue::Int {
-            value: v,
-            width: crate::store::index_encoding::IntWidth::I64,
-        }]
-    };
     let order = |query: Vec<crate::catalog::RowLocation>| {
         query.into_iter().map(|hit| hit.row_id).collect::<Vec<_>>()
     };
@@ -707,8 +710,8 @@ async fn index_range_reverse_serves_the_opposite_order() {
         .index_range(
             table,
             index,
-            Bound::Included(value(10)),
-            Bound::Included(value(30)),
+            Bound::Included(int_key(10)),
+            Bound::Included(int_key(30)),
             false,
         )
         .await
@@ -718,8 +721,8 @@ async fn index_range_reverse_serves_the_opposite_order() {
         .index_range(
             table,
             index,
-            Bound::Included(value(10)),
-            Bound::Included(value(30)),
+            Bound::Included(int_key(10)),
+            Bound::Included(int_key(30)),
             true,
         )
         .await
@@ -760,16 +763,12 @@ async fn index_range_refuses_a_bound_wider_than_the_index() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let value = |v: i128| crate::store::index_encoding::IndexKeyValue::Int {
-        value: v,
-        width: crate::store::index_encoding::IntWidth::I64,
-    };
     // The index has one column; a two-value bound names a column it lacks.
     let err = catalog
         .index_range(
             table,
             index,
-            Bound::Included(vec![value(10), value(20)]),
+            Bound::Included(vec![int_value(10), int_value(20)]),
             Bound::Unbounded,
             false,
         )
@@ -808,45 +807,100 @@ async fn index_range_over_a_non_unique_index_returns_every_matching_row() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let value = |v: i128| {
-        vec![crate::store::index_encoding::IndexKeyValue::Int {
-            value: v,
-            width: crate::store::index_encoding::IntWidth::I64,
-        }]
-    };
-    let ids = |hits: Vec<crate::catalog::RowLocation>| {
-        let mut ids: Vec<u64> = hits.into_iter().map(|hit| hit.row_id).collect();
-        ids.sort_unstable();
-        ids
-    };
-
     // < 20 — both rows holding value 10.
     let low = catalog
         .index_range(
             table,
             index,
             Bound::Unbounded,
-            Bound::Excluded(value(20)),
+            Bound::Excluded(int_key(20)),
             false,
         )
         .await
         .unwrap();
-    assert_eq!(ids(low), vec![0, 2]);
+    assert_eq!(sorted_row_ids(low), vec![0, 2]);
 
     // >= 20 — only row 1.
     let high = catalog
         .index_range(
             table,
             index,
-            Bound::Included(value(20)),
+            Bound::Included(int_key(20)),
             Bound::Unbounded,
             false,
         )
         .await
         .unwrap();
-    assert_eq!(ids(high), vec![1]);
+    assert_eq!(sorted_row_ids(high), vec![1]);
 
     catalog.close().await.unwrap();
+}
+
+/// A comparison never matches a NULL. A non-unique index holds NULL-bearing
+/// and valued rows in one subrange, so an open side must stop at the NULL
+/// region rather than run into it.
+#[tokio::test]
+async fn index_range_excludes_nulls_from_an_open_side() {
+    use std::ops::Bound;
+
+    use crate::{
+        catalog::{ColumnId, ColumnOrder, IndexDef},
+        store::index_encoding::{Direction, NullOrder},
+    };
+
+    // NULLS LAST puts the NULL above every value, so the unbounded upper side
+    // of `a >= 10` faces it; NULLS FIRST puts it below, exposing the lower
+    // side of `a <= 20` instead. Both must return only the valued rows.
+    for (nulls, lower, upper) in [
+        (
+            NullOrder::Last,
+            Bound::Included(int_key(10)),
+            Bound::Unbounded,
+        ),
+        (
+            NullOrder::First,
+            Bound::Unbounded,
+            Bound::Included(int_key(20)),
+        ),
+    ] {
+        let (catalog, table) = catalog_with_two_column_table().await;
+        register_three_row_file(&catalog, table).await;
+
+        let index = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let id = tx.create_index_ordered(
+                    table,
+                    &IndexDef {
+                        name: "by_a".into(),
+                        columns: vec![ColumnId::new(1)],
+                        unique: false,
+                    },
+                    &[ColumnOrder {
+                        direction: Direction::Ascending,
+                        nulls,
+                    }],
+                    &[entry(0, 10), entry(1, 20), null_entry(2)],
+                )?;
+                index.set(Some(id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let index = index.get().unwrap();
+
+        let hits = catalog
+            .index_range(table, index, lower.clone(), upper.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted_row_ids(hits),
+            vec![0, 1],
+            "{nulls:?} leaked the NULL row"
+        );
+
+        catalog.close().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -883,12 +937,6 @@ async fn descending_index_scans_high_value_first() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let value = |v: i128| {
-        vec![crate::store::index_encoding::IndexKeyValue::Int {
-            value: v,
-            width: crate::store::index_encoding::IntWidth::I64,
-        }]
-    };
     // Results come back in the index's stored order — descending by value.
     let order = |hits: Vec<crate::catalog::RowLocation>| {
         hits.into_iter().map(|hit| hit.row_id).collect::<Vec<u64>>()
@@ -899,8 +947,8 @@ async fn descending_index_scans_high_value_first() {
         .index_range(
             table,
             index,
-            Bound::Included(value(10)),
-            Bound::Included(value(30)),
+            Bound::Included(int_key(10)),
+            Bound::Included(int_key(30)),
             false,
         )
         .await
@@ -916,7 +964,7 @@ async fn descending_index_scans_high_value_first() {
         .index_range(
             table,
             index,
-            Bound::Excluded(value(15)),
+            Bound::Excluded(int_key(15)),
             Bound::Unbounded,
             false,
         )
@@ -930,7 +978,7 @@ async fn descending_index_scans_high_value_first() {
             table,
             index,
             Bound::Unbounded,
-            Bound::Included(value(20)),
+            Bound::Included(int_key(20)),
             false,
         )
         .await
@@ -1010,20 +1058,12 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
 
 #[tokio::test]
 async fn composite_index_nulls_matches_a_leading_prefix() {
-    use crate::{
-        catalog::{ColumnId, IndexDef, IndexEntry},
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::{ColumnId, IndexDef, IndexEntry};
     let (catalog, table) = catalog_with_two_column_table().await;
     register_three_row_file(&catalog, table).await;
 
-    let int = |v: i128| {
-        Some(IndexKeyValue::Int {
-            value: v,
-            width: IntWidth::I64,
-        })
-    };
-    let ent = |row_id, a: Option<IndexKeyValue>, b: Option<IndexKeyValue>| IndexEntry {
+    // This index mixes present and NULL columns, so its entries name both.
+    let entry = |row_id, a, b| IndexEntry {
         row_id,
         values: vec![a, b],
     };
@@ -1039,9 +1079,9 @@ async fn composite_index_nulls_matches_a_leading_prefix() {
                     unique: false,
                 },
                 &[
-                    ent(0, int(5), None),
-                    ent(1, int(5), int(3)),
-                    ent(2, int(7), None),
+                    entry(0, Some(int_value(5)), None),
+                    entry(1, Some(int_value(5)), Some(int_value(3))),
+                    entry(2, Some(int_value(7)), None),
                 ],
             )?;
             index.set(Some(id));
@@ -1051,17 +1091,14 @@ async fn composite_index_nulls_matches_a_leading_prefix() {
         .unwrap();
     let index = index.get().unwrap();
 
-    let ids = |mut v: Vec<crate::catalog::RowLocation>| {
-        v.sort_by_key(|hit| hit.row_id);
-        v.into_iter().map(|hit| hit.row_id).collect::<Vec<_>>()
-    };
-
     // a = 5 AND b IS NULL -> only row 0 (row 1 has b=3, row 2 has a=7).
     assert_eq!(
-        ids(catalog
-            .index_nulls(table, index, vec![int(5), None], false)
-            .await
-            .unwrap()),
+        sorted_row_ids(
+            catalog
+                .index_nulls(table, index, vec![Some(int_value(5)), None], false)
+                .await
+                .unwrap()
+        ),
         vec![0]
     );
     // b IS NULL across all a -> rows 0 and 2 is a gap pattern (leading a
@@ -1073,6 +1110,270 @@ async fn composite_index_nulls_matches_a_leading_prefix() {
             .unwrap()
             .is_empty()
     );
+
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn index_range_spans_a_composite_prefix_and_window() {
+    use std::ops::Bound;
+
+    use crate::catalog::{ColumnId, IndexDef};
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            // row 0: (5, 10); row 1: (5, 20); row 2: (7, 10).
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_ab".into(),
+                    columns: vec![ColumnId::new(1), ColumnId::new(2)],
+                    unique: true,
+                },
+                &[
+                    pair_entry(0, 5, 10),
+                    pair_entry(1, 5, 20),
+                    pair_entry(2, 7, 10),
+                ],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    // A one-column prefix bound pins the leading column: a = 5 spans both
+    // rows sharing it, whatever their second column. This is the case the
+    // outer value-framing's terminator would strand if the extension bound
+    // were computed from the terminated suffix.
+    let equal_a = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![int_value(5)]),
+            Bound::Included(vec![int_value(5)]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted_row_ids(equal_a),
+        vec![0, 1],
+        "a = 5 spans rows 0 and 1"
+    );
+
+    // A full-tuple window: (5, 20) ..= (7, 10) excludes (5, 10) below the
+    // lower bound and includes (5, 20) and (7, 10).
+    let window = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![int_value(5), int_value(20)]),
+            Bound::Included(vec![int_value(7), int_value(10)]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted_row_ids(window),
+        vec![1, 2],
+        "(5,20)..=(7,10) spans rows 1 and 2"
+    );
+
+    // A one-column prefix Excluded lower skips every extension of a = 5.
+    let above_a = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Excluded(vec![int_value(5)]),
+            Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sorted_row_ids(above_a), vec![2], "a > 5 spans only row 2");
+
+    catalog.close().await.unwrap();
+}
+
+/// The bound above a prefix value increments its escaped body, so it must
+/// carry over trailing `0xFF`s. A descending column complements its framed
+/// bytes, making a value that ends in zero bytes end in `0xFF`; a non-unique
+/// entry then appends a row id the increment also has to clear.
+#[tokio::test]
+async fn index_range_prefix_bound_carries_over_a_descending_value() {
+    use std::ops::Bound;
+
+    use crate::{
+        catalog::{ColumnId, ColumnOrder, IndexDef},
+        store::index_encoding::{Direction, NullOrder},
+    };
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let descending = ColumnOrder {
+        direction: Direction::Descending,
+        nulls: NullOrder::Last,
+    };
+
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            // 256 and 512 both end in a zero byte, which frames to `0x01 0x00`
+            // and complements to `0xFE 0xFF` under a descending column.
+            let id = tx.create_index_ordered(
+                table,
+                &IndexDef {
+                    name: "by_ab_desc".into(),
+                    columns: vec![ColumnId::new(1), ColumnId::new(2)],
+                    unique: false,
+                },
+                &[descending, descending],
+                &[
+                    pair_entry(0, 256, 1),
+                    pair_entry(1, 256, 2),
+                    pair_entry(2, 512, 1),
+                ],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    // a = 256 spans both rows holding it, over their differing second column
+    // and their trailing row ids.
+    let equal_a = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![int_value(256)]),
+            Bound::Included(vec![int_value(256)]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted_row_ids(equal_a),
+        vec![0, 1],
+        "a = 256 spans rows 0 and 1"
+    );
+
+    // a > 256 excludes every extension of 256 and keeps the larger value.
+    let above_a = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Excluded(vec![int_value(256)]),
+            Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sorted_row_ids(above_a), vec![2], "a > 256 spans only row 2");
+
+    catalog.close().await.unwrap();
+}
+
+/// No single byte range spans a free tuple window over columns that sort
+/// opposite ways, so such bounds are refused. Pinning the leading column
+/// leaves the last to order the window, which one scan serves.
+#[tokio::test]
+async fn index_range_over_mixed_directions_requires_a_pinned_prefix() {
+    use std::ops::Bound;
+
+    use crate::{
+        catalog::{ColumnId, ColumnOrder, IndexDef},
+        error::Error,
+        store::index_encoding::{Direction, NullOrder},
+    };
+    let (catalog, table) = catalog_with_two_column_table().await;
+    register_three_row_file(&catalog, table).await;
+
+    let ascending = ColumnOrder {
+        direction: Direction::Ascending,
+        nulls: NullOrder::Last,
+    };
+    let descending = ColumnOrder {
+        direction: Direction::Descending,
+        nulls: NullOrder::Last,
+    };
+
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            // row 0: (5, 10); row 1: (5, 20); row 2: (7, 10).
+            let id = tx.create_index_ordered(
+                table,
+                &IndexDef {
+                    name: "by_a_asc_b_desc".into(),
+                    columns: vec![ColumnId::new(1), ColumnId::new(2)],
+                    unique: true,
+                },
+                &[ascending, descending],
+                &[
+                    pair_entry(0, 5, 10),
+                    pair_entry(1, 5, 20),
+                    pair_entry(2, 7, 10),
+                ],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    // A free-floating tuple window names both columns without pinning either.
+    let refused = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![int_value(5), int_value(20)]),
+            Bound::Included(vec![int_value(7), int_value(10)]),
+            false,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(Error::Constraint(_))),
+        "a free tuple window over mixed directions is refused, got {refused:?}"
+    );
+
+    // Pinning a = 5 leaves b to order the window: 10 <= b <= 20 spans both.
+    let pinned = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![int_value(5), int_value(10)]),
+            Bound::Included(vec![int_value(5), int_value(20)]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted_row_ids(pinned),
+        vec![0, 1],
+        "a = 5 and 10 <= b <= 20"
+    );
+
+    // A bound naming only the leading column involves one direction, so it
+    // stays available.
+    let leading = catalog
+        .index_range(
+            table,
+            index,
+            Bound::Included(vec![int_value(7)]),
+            Bound::Unbounded,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sorted_row_ids(leading), vec![2], "a >= 7 spans only row 2");
 
     catalog.close().await.unwrap();
 }
@@ -1095,10 +1396,7 @@ async fn index_lookup_on_missing_index_is_not_found() {
 
 #[tokio::test]
 async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
-    use crate::{
-        catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef},
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     catalog
@@ -1129,10 +1427,6 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
         encryption_key: None,
         column_stats: vec![],
     };
-    let int = |value: i128| IndexKeyValue::Int {
-        value,
-        width: IntWidth::I64,
-    };
 
     // A non-empty file on an indexed table with no entries is refused.
     let refused = catalog
@@ -1150,12 +1444,12 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
                     FileIndexEntry {
                         index,
                         ordinal: 0,
-                        values: vec![Some(int(10))],
+                        values: vec![Some(int_value(10))],
                     },
                     FileIndexEntry {
                         index,
                         ordinal: 1,
-                        values: vec![Some(int(20))],
+                        values: vec![Some(int_value(20))],
                     },
                 ],
             )
@@ -1165,7 +1459,7 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
         .unwrap();
 
     let hits = catalog
-        .index_lookup(table, index, &[int(20)])
+        .index_lookup(table, index, &[int_value(20)])
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
@@ -1181,10 +1475,7 @@ async fn catalog_with_indexed_data_file() -> (
     crate::catalog::IndexId,
     crate::catalog::DataFileId,
 ) {
-    use crate::{
-        catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef},
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     let file = std::cell::Cell::new(None);
@@ -1200,10 +1491,6 @@ async fn catalog_with_indexed_data_file() -> (
                 &[],
             )?;
             index.set(Some(id));
-            let int = |value: i128| IndexKeyValue::Int {
-                value,
-                width: IntWidth::I64,
-            };
             let registered = tx.register_data_file(
                 table,
                 DataFile {
@@ -1220,12 +1507,12 @@ async fn catalog_with_indexed_data_file() -> (
                     FileIndexEntry {
                         index: id,
                         ordinal: 0,
-                        values: vec![Some(int(10))],
+                        values: vec![Some(int_value(10))],
                     },
                     FileIndexEntry {
                         index: id,
                         ordinal: 1,
-                        values: vec![Some(int(20))],
+                        values: vec![Some(int_value(20))],
                     },
                 ],
             )?;
@@ -1254,15 +1541,8 @@ fn delete_file(data_file: crate::catalog::DataFileId) -> crate::catalog::DeleteF
 /// and the value is free to be indexed again.
 #[tokio::test]
 async fn register_delete_file_removes_the_entries_it_names() {
-    use crate::{
-        catalog::FileIndexRemoval,
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::FileIndexRemoval;
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
-    let int = |value: i128| IndexKeyValue::Int {
-        value,
-        width: IntWidth::I64,
-    };
 
     catalog
         .commit(|tx| {
@@ -1272,7 +1552,7 @@ async fn register_delete_file_removes_the_entries_it_names() {
                 &[FileIndexRemoval {
                     index,
                     row_id: 1,
-                    values: vec![Some(int(20))],
+                    values: vec![Some(int_value(20))],
                 }],
             )
             .map(|_| ())
@@ -1282,7 +1562,7 @@ async fn register_delete_file_removes_the_entries_it_names() {
 
     assert!(
         catalog
-            .index_lookup(table, index, &[int(20)])
+            .index_lookup(table, index, &[int_value(20)])
             .await
             .unwrap()
             .is_empty(),
@@ -1290,7 +1570,7 @@ async fn register_delete_file_removes_the_entries_it_names() {
     );
     assert_eq!(
         catalog
-            .index_lookup(table, index, &[int(10)])
+            .index_lookup(table, index, &[int_value(10)])
             .await
             .unwrap()
             .len(),
@@ -1319,10 +1599,7 @@ async fn register_delete_file_must_supply_index_entries() {
 /// still counts as live.
 #[tokio::test]
 async fn register_delete_file_rejects_index_entries_without_deletes() {
-    use crate::{
-        catalog::FileIndexRemoval,
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::FileIndexRemoval;
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
     let refused = catalog
         .commit(|tx| {
@@ -1335,10 +1612,7 @@ async fn register_delete_file_rejects_index_entries_without_deletes() {
                 &[FileIndexRemoval {
                     index,
                     row_id: 1,
-                    values: vec![Some(IndexKeyValue::Int {
-                        value: 20,
-                        width: IntWidth::I64,
-                    })],
+                    values: vec![Some(int_value(20))],
                 }],
             )
             .map(|_| ())
@@ -1351,10 +1625,7 @@ async fn register_delete_file_rejects_index_entries_without_deletes() {
 /// A row id past a dense target's range would name a row it does not hold.
 #[tokio::test]
 async fn register_delete_file_rejects_an_out_of_range_row_id() {
-    use crate::{
-        catalog::FileIndexRemoval,
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::FileIndexRemoval;
     let (catalog, table, index, file) = catalog_with_indexed_data_file().await;
     let refused = catalog
         .commit(|tx| {
@@ -1364,10 +1635,7 @@ async fn register_delete_file_rejects_an_out_of_range_row_id() {
                 &[FileIndexRemoval {
                     index,
                     row_id: 2,
-                    values: vec![Some(IndexKeyValue::Int {
-                        value: 30,
-                        width: IntWidth::I64,
-                    })],
+                    values: vec![Some(int_value(30))],
                 }],
             )
             .map(|_| ())
@@ -1379,10 +1647,7 @@ async fn register_delete_file_rejects_an_out_of_range_row_id() {
 
 #[tokio::test]
 async fn unique_index_rejects_a_duplicate_value_across_commits() {
-    use crate::{
-        catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef},
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;
     let index = std::cell::Cell::new(None);
     catalog
@@ -1419,10 +1684,7 @@ async fn unique_index_rejects_a_duplicate_value_across_commits() {
             FileIndexEntry {
                 index,
                 ordinal: 0,
-                values: vec![Some(IndexKeyValue::Int {
-                    value,
-                    width: IntWidth::I64,
-                })],
+                values: vec![Some(int_value(value))],
             },
         )
     };
@@ -1621,18 +1883,11 @@ async fn scan_index_entries(
 
 #[tokio::test]
 async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
-    use crate::{
-        catalog::{ColumnId, IndexDef, IndexState},
-        store::index_encoding::{IndexKeyValue, IntWidth},
-    };
+    use crate::catalog::{ColumnId, IndexDef, IndexState};
     let def = || IndexDef {
         name: "by_a".into(),
         columns: vec![ColumnId::new(1)],
         unique: true,
-    };
-    let value = |v: i128| IndexKeyValue::Int {
-        value: v,
-        width: IntWidth::I64,
     };
 
     // Reference: a single-commit build over rows 0,1,2.
@@ -1674,7 +1929,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     assert_eq!(read_format_version(&staged).await, FORMAT_WITH_STAGED_INDEX);
     assert!(matches!(
         staged
-            .index_lookup(table_staged, staged_index, &[value(20)])
+            .index_lookup(table_staged, staged_index, &[int_value(20)])
             .await,
         Err(Error::IndexBuilding(_))
     ));
@@ -1701,7 +1956,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     // After the flip: lookups serve, and the index range is byte-identical
     // to the single-commit build over the same rows.
     let hits = staged
-        .index_lookup(table_staged, staged_index, &[value(20)])
+        .index_lookup(table_staged, staged_index, &[int_value(20)])
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);

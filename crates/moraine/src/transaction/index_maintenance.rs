@@ -15,8 +15,11 @@ use crate::{
     error::{Error, Result},
     store::{
         handle::ReadHandle,
-        index_encoding::CanonicalKey,
-        key::{IndexKey, IndexKind, Key, index_index_prefix, index_multi_value_prefix},
+        index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
+        key::{
+            IndexKey, IndexKind, Key, index_index_prefix, index_multi_value_prefix,
+            index_value_above, index_value_body, index_value_suffix,
+        },
     },
     transaction::commit::StagedWrite,
 };
@@ -232,6 +235,7 @@ pub(crate) async fn range_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
     unique: bool,
+    leading_nulls: NullOrder,
     lower: Bound<CanonicalKey>,
     upper: Bound<CanonicalKey>,
 ) -> Result<Vec<u64>> {
@@ -241,39 +245,34 @@ pub(crate) async fn range_row_ids(
         IndexKind::Multi
     };
     let prefix = index_index_prefix(kind, index_id);
-    let prefix_len = prefix.len();
 
-    // The framed value bytes as they appear in an entry key after the
-    // `(kind, index_id)` prefix — the suffix a subrange bounds against.
-    let suffix = |canon: &CanonicalKey| -> Vec<u8> {
-        let full = match kind {
-            IndexKind::Unique => Key::Index(IndexKey::Unique {
-                index_id,
-                key: canon.clone(),
-            })
-            .encode(),
-            IndexKind::Multi => index_multi_value_prefix(index_id, canon),
-        };
-        full[prefix_len..].to_vec()
-    };
+    let suffix = |canon: &CanonicalKey| index_value_suffix(kind, index_id, canon);
+    let above = |canon: &CanonicalKey| index_value_above(kind, index_id, canon);
+
+    // A comparison never matches a NULL, and a non-unique index stores
+    // NULL-bearing entries beside valued ones. An open side stops at the
+    // leading column's non-null region; a bound value is non-null, so a
+    // closed side is already inside it.
+    let non_null = non_null_flag_key(leading_nulls);
+    let past_non_null = above(&non_null).map_or(Bound::Unbounded, Bound::Excluded);
 
     let start = match lower {
         Bound::Included(canon) => Bound::Included(suffix(&canon)),
         // Skip every entry sharing the bound value: start above them all.
-        Bound::Excluded(canon) => match increment_prefix(&suffix(&canon)) {
+        Bound::Excluded(canon) => match above(&canon) {
             Some(above) => Bound::Included(above),
             None => Bound::Excluded(suffix(&canon)),
         },
-        Bound::Unbounded => Bound::Unbounded,
+        Bound::Unbounded => Bound::Included(index_value_body(kind, index_id, &non_null)),
     };
     let end = match upper {
         // Include every entry sharing the bound value: end above them all.
-        Bound::Included(canon) => match increment_prefix(&suffix(&canon)) {
+        Bound::Included(canon) => match above(&canon) {
             Some(above) => Bound::Excluded(above),
-            None => Bound::Unbounded,
+            None => past_non_null,
         },
         Bound::Excluded(canon) => Bound::Excluded(suffix(&canon)),
-        Bound::Unbounded => Bound::Unbounded,
+        Bound::Unbounded => past_non_null,
     };
 
     let mut iter = reader
@@ -328,18 +327,4 @@ pub(crate) async fn null_prefix_row_ids(
         }
     }
     Ok(row_ids)
-}
-
-/// The smallest byte string lexicographically greater than every string that
-/// begins with `prefix`, or `None` when `prefix` is all `0xff`.
-fn increment_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut bytes = prefix.to_vec();
-    while let Some(last) = bytes.last_mut() {
-        if *last != u8::MAX {
-            *last += 1;
-            return Some(bytes);
-        }
-        bytes.pop();
-    }
-    None
 }
