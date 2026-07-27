@@ -1,12 +1,14 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import starlightThemeNova from 'starlight-theme-nova';
 
 export default defineConfig({
 	site: 'https://alexpropp.github.io',
 	base: '/moraine',
 	integrations: [
 		starlight({
+			plugins: [starlightThemeNova()],
 			title: 'moraine',
 			description:
 				'A DuckLake catalog that lives in your bucket — SlateDB-backed, serverless, nothing to operate.',
