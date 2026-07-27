@@ -18,7 +18,8 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+  (DATA_PATH 's3://bucket/prefix-data/',
+   META_DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
 
 CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
 INSERT INTO lake.events VALUES (1, 'hello, bucket');
