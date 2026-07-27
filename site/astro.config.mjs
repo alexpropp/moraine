@@ -9,6 +9,7 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			plugins: [starlightThemeNova()],
+			customCss: ['./src/styles/custom.css'],
 			title: 'moraine',
 			description:
 				'A DuckLake catalog that lives in your bucket — SlateDB-backed, serverless, nothing to operate.',

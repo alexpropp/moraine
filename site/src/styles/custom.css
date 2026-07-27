@@ -1,0 +1,17 @@
+/* Unlayered, so these win over Starlight's and Nova's layered hero rules. */
+
+/* The splash hero carries no image, so it needs neither the display-sized
+   title nor the tall padding both themes scale to at wide viewports. */
+.hero h1 {
+	font-size: clamp(var(--sl-text-2xl), calc(0.25rem + 2.5vw), var(--sl-text-4xl));
+}
+
+.hero .tagline {
+	font-size: clamp(var(--sl-text-sm), calc(0.0625rem + 1.2vw), var(--sl-text-lg));
+}
+
+@media (min-width: 50rem) {
+	.hero {
+		padding-block: clamp(1rem, calc(0.5rem + 3vmin), 3rem);
+	}
+}
