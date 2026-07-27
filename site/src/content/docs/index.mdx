@@ -1,0 +1,49 @@
+---
+title: moraine
+description: A DuckLake catalog that lives in your bucket — SlateDB-backed, serverless, nothing to operate.
+template: splash
+hero:
+  tagline: A DuckLake catalog that lives in your bucket. SlateDB-backed, serverless, nothing to operate.
+  actions:
+    - text: Get started
+      link: guide/getting-started/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/alexpropp/moraine
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+
+CREATE TABLE lake.events (id BIGINT, payload VARCHAR);
+INSERT INTO lake.events VALUES (1, 'hello, bucket');
+```
+
+<CardGrid stagger>
+  <Card title="Nothing to operate" icon="setting">
+    No catalog endpoint to deploy, monitor, or upgrade. A deployment is a
+    bucket and credentials.
+  </Card>
+  <Card title="Durability for free" icon="approve-check">
+    Catalog durability *is* object-store durability. No backup schedule, no
+    WAL shipping — losing the catalog means losing the bucket.
+  </Card>
+  <Card title="The bucket is the whole lake" icon="seti:db">
+    Copying the bucket copies data *and* catalog together. Environments,
+    migration, and disaster recovery become object-storage operations.
+  </Card>
+  <Card title="Scale to zero, embed anywhere" icon="rocket">
+    An idle lake costs storage, not a 24/7 instance. The core is a plain
+    Rust library any tokio host can commit against directly.
+  </Card>
+</CardGrid>
+
+The trade-off is commit latency: a commit is durable once an object-store
+PUT lands (~5–10 ms on S3 Express One Zone, ~50–100 ms on S3 Standard).
+For workloads that write Parquet for seconds before committing, that is
+noise. [The full pitch →](guide/what-is-moraine/)

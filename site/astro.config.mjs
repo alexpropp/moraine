@@ -1,0 +1,34 @@
+// @ts-check
+import { defineConfig } from 'astro/config';
+import starlight from '@astrojs/starlight';
+
+export default defineConfig({
+	site: 'https://alexpropp.github.io',
+	base: '/moraine',
+	integrations: [
+		starlight({
+			title: 'moraine',
+			description:
+				'A DuckLake catalog that lives in your bucket — SlateDB-backed, serverless, nothing to operate.',
+			social: [
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/alexpropp/moraine' },
+			],
+			sidebar: [
+				{
+					label: 'Guide',
+					items: [
+						{ slug: 'guide/what-is-moraine' },
+						{ slug: 'guide/getting-started' },
+						{ slug: 'guide/architecture' },
+						{ slug: 'guide/embedding' },
+					],
+				},
+				{
+					label: 'Design (RFCs)',
+					collapsed: true,
+					items: [{ autogenerate: { directory: 'rfcs' } }],
+				},
+			],
+		}),
+	],
+});
