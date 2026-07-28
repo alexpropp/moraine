@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/alexpropp/moraine/compare/v0.3.3...v0.4.0) - 2026-07-28
+
+### Added
+
+- Drive staged index builds from moraine_index_create
+- Add batch channel for large-scale index building
+- Surface moraine diagnostics in DuckDB's logs
+
 ## [0.3.3](https://github.com/alexpropp/moraine/compare/v0.3.2...v0.3.3) - 2026-07-28
 
 ### Added
