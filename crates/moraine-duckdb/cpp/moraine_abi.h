@@ -1076,8 +1076,10 @@ int32_t moraine_snapshot_data_files_of(struct MoraineSnapshotHandle *snapshot,
 // matching [`moraine_snapshot_data_files_of`] call, not yet freed.
 void moraine_snapshot_data_files_of_free(struct MoraineDataFileDesc *items, size_t len);
 
-// Creates an equality index, committing autonomously. Refuses a table that
-// already holds data (SQL-path backfill is a follow-up).
+// Creates an equality index, committing autonomously. With `staged`, runs
+// the multi-commit build — required when the table's backfill exceeds what
+// one commit may stage — and returns once the index is ready; interrupting
+// it leaves the build resumable by the same call.
 //
 // # Safety
 //
@@ -1092,6 +1094,7 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
                              const uint8_t *column_descending,
                              const uint8_t *column_nulls_first,
                              bool unique,
+                             bool staged,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
                              struct MoraineError *err);

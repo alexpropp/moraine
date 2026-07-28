@@ -2223,6 +2223,200 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     staged.close().await.unwrap();
 }
 
+/// A staged create carries per-column orders exactly as the single-commit
+/// ordered create does: the definition records them, the steps encode with
+/// them, and the finished range is byte-identical to a single-commit
+/// ordered build over the same rows.
+#[tokio::test]
+async fn staged_ordered_create_records_orders_and_matches_single_commit() {
+    use crate::{
+        catalog::{ColumnId, ColumnOrder, IndexDef},
+        store::index_encoding::{Direction, NullOrder},
+    };
+    let def = || IndexDef {
+        name: "by_a_desc".into(),
+        columns: vec![ColumnId::new(1)],
+        unique: true,
+    };
+    let orders = || {
+        vec![ColumnOrder {
+            direction: Direction::Descending,
+            nulls: NullOrder::First,
+        }]
+    };
+
+    let (single, table_single) = catalog_with_two_column_table().await;
+    register_three_row_file(&single, table_single).await;
+    let single_index = std::cell::Cell::new(None);
+    single
+        .commit(|tx| {
+            let id = tx.create_index_ordered(
+                table_single,
+                &def(),
+                &orders(),
+                &[entry(0, 10), entry(1, 20), entry(2, 30)],
+            )?;
+            single_index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (staged, table_staged) = catalog_with_two_column_table().await;
+    register_three_row_file(&staged, table_staged).await;
+    let staged_index = std::cell::Cell::new(None);
+    staged
+        .commit(|tx| {
+            let id = tx.create_index_staged_ordered(table_staged, &def(), &orders())?;
+            staged_index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let staged_index = staged_index.get().unwrap();
+
+    let info = staged
+        .snapshot()
+        .await
+        .unwrap()
+        .indexes_of(table_staged)
+        .remove(0);
+    assert_eq!(info.directions, vec![Direction::Descending]);
+    assert_eq!(info.nulls, vec![NullOrder::First]);
+
+    staged
+        .commit(|tx| {
+            tx.build_index_step(staged_index, &[entry(0, 10), entry(1, 20)], false)
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+    staged
+        .commit(|tx| {
+            tx.build_index_step(staged_index, &[entry(2, 30)], true)
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scan_index_entries(&single, single_index.get().unwrap()).await,
+        scan_index_entries(&staged, staged_index).await
+    );
+    single.close().await.unwrap();
+    staged.close().await.unwrap();
+}
+
+/// A writer inserting a value a live row already holds, while a unique
+/// index is still building, lands its own rows and poisons the build — the
+/// duplicate fails the *index*, never the write. Enforcement during a build
+/// is partial by construction, so failing the writer would make the outcome
+/// depend on how far the backfill happened to have run.
+#[tokio::test]
+async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
+    use crate::catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef, IndexState};
+    let (catalog, table) = catalog_with_two_column_table().await;
+    // Rows 0..2 exist before the index does, so the writer below lands on a
+    // fresh row id rather than re-deriving the entry the build covered.
+    register_three_row_file(&catalog, table).await;
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index_staged(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    // The build covers row 0, which holds value 10.
+    catalog
+        .commit(|tx| {
+            tx.build_index_step(index, &[entry(0, 10)], false)
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // A writer now registers a file whose row claims that same value.
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    path: "w.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 1,
+                    file_size_bytes: 10,
+                    footer_size: 4,
+                    encryption_key: None,
+                    column_stats: vec![],
+                },
+                &[FileIndexEntry {
+                    index,
+                    ordinal: 0,
+                    values: vec![Some(int_value(10))],
+                }],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("the writer's commit lands rather than failing on the building index");
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.indexes_of(table).remove(0).state,
+        IndexState::Poisoned,
+        "the duplicate poisoned the build"
+    );
+    // The writer's file is really there — its rows were not rolled back.
+    assert_eq!(snapshot.data_files_of(table).len(), 2);
+    catalog.close().await.unwrap();
+}
+
+/// The same collision against a **ready** index still fails the writer:
+/// enforcement is total once the build has flipped, so the duplicate is a
+/// genuine constraint violation.
+#[tokio::test]
+async fn a_writer_duplicating_a_value_on_a_ready_index_still_fails() {
+    use crate::catalog::FileIndexEntry;
+    let (catalog, table, index, _) = catalog_with_indexed_data_file().await;
+    let refused = catalog
+        .commit(|tx| {
+            tx.register_data_file(
+                table,
+                crate::catalog::DataFile {
+                    path: "w.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 1,
+                    file_size_bytes: 10,
+                    footer_size: 4,
+                    encryption_key: None,
+                    column_stats: vec![],
+                },
+                &[FileIndexEntry {
+                    index,
+                    ordinal: 0,
+                    values: vec![Some(int_value(20))],
+                }],
+            )
+            .map(|_| ())
+        })
+        .await;
+    assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
+    catalog.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
     use crate::catalog::{ColumnId, IndexDef};
@@ -2246,14 +2440,27 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
         .unwrap();
     let index = index.get().unwrap();
 
-    // A duplicate value within a batch fails the step.
-    let dup = catalog
+    // A duplicate value within a batch poisons the build rather than
+    // failing the step — one rule for every collision found while an index
+    // is building. The build's driver is what turns the poison into the
+    // caller's `Constraint`.
+    catalog
         .commit(|tx| {
             tx.build_index_step(index, &[entry(0, 10), entry(1, 10)], false)
                 .map(|_| ())
         })
-        .await;
-    assert!(matches!(dup, Err(Error::Constraint(_))), "{dup:?}");
+        .await
+        .expect("the step lands; the duplicate poisons the definition");
+    assert_eq!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .indexes_of(table)
+            .remove(0)
+            .state,
+        crate::catalog::IndexState::Poisoned
+    );
 
     // Complete the build, then a further step on the ready index is
     // refused.

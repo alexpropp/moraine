@@ -829,3 +829,67 @@ fn moraine_index_functions_resolve_a_custom_metadata_catalog() {
         "the drop must land through the same resolution"
     );
 }
+
+/// `staged := true` builds an index over a table that already holds bulk
+/// data, across several commits, and lands ready: lookups serve, the
+/// introspection view reports it built, and a later duplicate is refused
+/// exactly as a single-commit build's index would refuse it.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_create_staged_builds_over_existing_data() {
+    let store = TempDir::new("index-staged-store");
+    let data = TempDir::new("index-staged-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(500) t(i);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, staged := true);");
+
+    // The build finished: not building, and the backfilled rows resolve.
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT is_building FROM moraine_indexes('lake','main','t');"
+        )),
+        vec![vec!["false".to_string()]],
+        "the staged build flipped ready"
+    );
+    for value in ["0", "250", "499"] {
+        assert_eq!(
+            csv_rows(&run(&format!(
+                "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', {value});"
+            ))),
+            vec![vec!["1".to_string()]],
+            "backfilled value {value} is indexed"
+        );
+    }
+
+    // Writers maintain the finished index, and a duplicate is refused with
+    // the terminal (non-retryable) constraint message.
+    run("INSERT INTO lake.main.t SELECT i, 'y' FROM range(500, 600) t(i);");
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 550);"
+        )),
+        vec![vec!["1".to_string()]],
+        "a post-build INSERT is maintained"
+    );
+    let out = run_ducklake_sql_output(
+        store.path(),
+        data.path(),
+        &meta,
+        "INSERT INTO lake.main.t SELECT i, 'dup' FROM range(20) t(i);",
+    );
+    assert!(!out.status.success(), "the duplicate INSERT must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("duplicate value violates equality index"),
+        "expected the equality-index constraint error, got: {stderr}"
+    );
+    for retry_word in ["conflict", "concurrent", "unique", "primary key"] {
+        assert!(
+            !stderr.contains(retry_word),
+            "the constraint message must not contain `{retry_word}`: {stderr}"
+        );
+    }
+}

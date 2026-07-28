@@ -94,13 +94,15 @@ pub(super) async fn per_index_scoped_entries(
         .collect())
 }
 
+/// Returns the ids of any building indexes a duplicate poisoned; the caller
+/// records the flag on their definitions.
 pub(super) async fn stage_index_maintenance(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
-) -> Result<()> {
+) -> Result<Vec<u64>> {
     let pending_schemas = pending_inline_schemas(ops);
 
     let mut entries: Vec<StagedIndexEntry> = Vec::new();
@@ -197,7 +199,7 @@ pub(super) async fn stage_index_maintenance(
     }
 
     if entries.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     stage_index_entries(db_tx, &entries).await
 }
@@ -594,6 +596,7 @@ pub(super) fn push_index_entries(
             key: encode_ordered_values(&entry.values, &index.directions, &index.nulls)?,
             row_id: entry.row_id,
             delete,
+            building: index.state != crate::catalog::IndexState::Ready,
         });
     }
     Ok(())

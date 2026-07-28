@@ -14,6 +14,7 @@ use std::{
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use slatedb::DbTransaction;
+use tracing::warn;
 
 use crate::{
     error::{Error, Result},
@@ -41,6 +42,9 @@ pub(crate) struct StagedIndexEntry {
     pub(crate) row_id: u64,
     /// Whether this removes the entry (`true`) or adds it (`false`).
     pub(crate) delete: bool,
+    /// Whether the index is still building, so a collision poisons it
+    /// instead of failing this commit.
+    pub(crate) building: bool,
 }
 
 fn entry_key(entry: &StagedIndexEntry) -> Key {
@@ -111,9 +115,28 @@ const MERGED_PROBE_THRESHOLD: usize = 1024;
 /// At roughly a kilobyte apiece this admits commits needing about 8 GiB.
 const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 8_000_000;
 
-/// One unique put awaiting its probe: the entry's key, the row claiming it,
-/// and the index the claim belongs to.
-type PendingProbe = (Vec<u8>, u64, u64);
+/// One unique put awaiting its probe.
+struct PendingProbe {
+    /// The entry's encoded store key.
+    key: Vec<u8>,
+    /// The row claiming the value.
+    row_id: u64,
+    /// The index the claim belongs to.
+    index_id: u64,
+    /// Whether that index is still building, so a collision poisons it
+    /// rather than failing this commit.
+    building: bool,
+}
+
+/// A collision's verdict: fail the commit, or poison the building index.
+fn collision(probe_index_id: u64, building: bool, poisoned: &mut Vec<u64>) -> Option<Error> {
+    if building {
+        poisoned.push(probe_index_id);
+        None
+    } else {
+        Some(unique_violation(probe_index_id))
+    }
+}
 
 /// Probes one group of unique puts concurrently and stages the survivors,
 /// draining `pending`. Present with a different row id rejects the batch;
@@ -122,11 +145,12 @@ async fn resolve_probes(
     db_tx: &DbTransaction,
     deleted_unique: &HashSet<Vec<u8>>,
     pending: &mut Vec<PendingProbe>,
+    poisoned: &mut Vec<u64>,
 ) -> Result<()> {
     let reader = ReadHandle::Tx(db_tx);
     let held: Vec<Option<Bytes>> = stream::iter(0..pending.len())
         .map(|position| {
-            let key_bytes = pending[position].0.clone();
+            let key_bytes = pending[position].key.clone();
             // A value this same batch deletes is free again, whatever the
             // store still holds, so it needs no read at all.
             let deleted = deleted_unique.contains(&key_bytes);
@@ -145,14 +169,18 @@ async fn resolve_probes(
 
     // Resolved in batch order, so which entry a rejection names does not
     // depend on which probe happened to finish first.
-    for ((key_bytes, row_id, index_id), present) in pending.drain(..).zip(held) {
+    for (probe, present) in pending.drain(..).zip(held) {
         if let Some(bytes) = present {
-            if decode_row_id(&bytes)? != row_id {
-                return Err(unique_violation(index_id));
+            if decode_row_id(&bytes)? != probe.row_id {
+                match collision(probe.index_id, probe.building, poisoned) {
+                    Some(error) => return Err(error),
+                    // Dropping the claim leaves the live holder's entry.
+                    None => continue,
+                }
             }
             continue;
         }
-        db_tx.put(key_bytes, row_id.to_be_bytes())?;
+        db_tx.put(probe.key, probe.row_id.to_be_bytes())?;
     }
     Ok(())
 }
@@ -170,27 +198,31 @@ async fn resolve_probes_merged(
     db_tx: &DbTransaction,
     deleted_unique: &HashSet<Vec<u8>>,
     pending: Vec<PendingProbe>,
+    poisoned: &mut Vec<u64>,
 ) -> Result<()> {
     let mut order: Vec<usize> = (0..pending.len()).collect();
-    order.sort_unstable_by(|&a, &b| pending[a].0.cmp(&pending[b].0));
+    order.sort_unstable_by(|&a, &b| pending[a].key.cmp(&pending[b].key));
 
     let handle = ReadHandle::Tx(db_tx);
     let mut held_elsewhere: Option<usize> = None;
     let mut already_held = vec![false; pending.len()];
+    // Claims that poisoned a building index: staging them would overwrite
+    // the live holder's entry.
+    let mut dropped = vec![false; pending.len()];
 
     let mut run_start = 0;
     while run_start < order.len() {
-        let index_id = pending[order[run_start]].2;
+        let index_id = pending[order[run_start]].index_id;
         let prefix = index_index_prefix(IndexKind::Unique, index_id);
         let run_end = order[run_start..]
             .iter()
-            .position(|&at| pending[at].2 != index_id)
+            .position(|&at| pending[at].index_id != index_id)
             .map_or(order.len(), |offset| run_start + offset);
 
         // One scan bounded to the run's key span; bounds are suffixes of
         // the prefix. Every seek target is a run key, so it stays in range.
-        let first = pending[order[run_start]].0[prefix.len()..].to_vec();
-        let last = pending[order[run_end - 1]].0[prefix.len()..].to_vec();
+        let first = pending[order[run_start]].key[prefix.len()..].to_vec();
+        let last = pending[order[run_end - 1]].key[prefix.len()..].to_vec();
         let mut iter = handle
             .scan_prefix(prefix, first..=last)
             .await
@@ -198,7 +230,8 @@ async fn resolve_probes_merged(
         let mut current = iter.next().await.map_err(Error::from)?;
 
         for &batch_position in &order[run_start..run_end] {
-            let (key_bytes, row_id, _) = &pending[batch_position];
+            let probe = &pending[batch_position];
+            let key_bytes = &probe.key;
             // A value this same batch deletes is free again, whatever the
             // store still holds.
             if deleted_unique.contains(key_bytes) {
@@ -218,8 +251,11 @@ async fn resolve_probes_merged(
             if let Some(entry) = &current
                 && entry.key.as_ref() == key_bytes.as_slice()
             {
-                if decode_row_id(&entry.value)? == *row_id {
+                if decode_row_id(&entry.value)? == probe.row_id {
                     already_held[batch_position] = true;
+                } else if probe.building {
+                    poisoned.push(probe.index_id);
+                    dropped[batch_position] = true;
                 } else {
                     held_elsewhere = Some(
                         held_elsewhere
@@ -233,14 +269,14 @@ async fn resolve_probes_merged(
     }
 
     if let Some(batch_position) = held_elsewhere {
-        return Err(unique_violation(pending[batch_position].2));
+        return Err(unique_violation(pending[batch_position].index_id));
     }
 
-    for (position, (key_bytes, row_id, _)) in pending.into_iter().enumerate() {
-        if already_held[position] {
+    for (position, probe) in pending.into_iter().enumerate() {
+        if already_held[position] || dropped[position] {
             continue;
         }
-        db_tx.put(key_bytes, row_id.to_be_bytes())?;
+        db_tx.put(probe.key, probe.row_id.to_be_bytes())?;
     }
 
     Ok(())
@@ -252,6 +288,12 @@ async fn resolve_probes_merged(
 /// present with a **different** row id → [`Error::Constraint`]; present with
 /// the **same** row id → no-op (a re-derived entry); absent → staged.
 /// Duplicates within the commit are caught in memory.
+///
+/// A collision against an index that is still **building** poisons it
+/// instead: the id is returned, the claim is dropped so the live holder's
+/// entry survives, and the commit proceeds. Coverage is partial until a
+/// build flips ready, so failing the finder would decide by timing which
+/// party a duplicate falls on.
 ///
 /// Entries stage onto the transaction directly rather than through the
 /// caller's write list. The list is retained until the commit lands so the
@@ -266,12 +308,12 @@ async fn resolve_probes_merged(
 pub(crate) async fn stage_index_entries(
     db_tx: &DbTransaction,
     entries: &[StagedIndexEntry],
-) -> Result<()> {
+) -> Result<Vec<u64>> {
     if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
         // Logged as well as returned: the refusal is the guardrail firing,
         // and an operator reading logs after a failed bulk load should see
         // it without having to recover the SQL error text.
-        tracing::warn!(
+        warn!(
             staged = entries.len(),
             limit = MAX_INDEX_ENTRIES_PER_COMMIT,
             "refusing an oversized commit"
@@ -300,6 +342,7 @@ pub(crate) async fn stage_index_entries(
     let merged = unique_puts > MERGED_PROBE_THRESHOLD;
     let mut pending: Vec<PendingProbe> = Vec::new();
     let mut claimed: HashMap<Vec<u8>, u64> = HashMap::new();
+    let mut poisoned: Vec<u64> = Vec::new();
     for entry in entries.iter().filter(|entry| !entry.delete) {
         let key_bytes = entry_key(entry).encode();
         if !entry.unique {
@@ -309,20 +352,45 @@ pub(crate) async fn stage_index_entries(
         }
         match claimed.get(&key_bytes) {
             Some(&holder) if holder != entry.row_id => {
-                return Err(unique_violation(entry.index_id));
+                match collision(entry.index_id, entry.building, &mut poisoned) {
+                    Some(error) => return Err(error),
+                    None => continue,
+                }
             }
             Some(_) => continue,
             None => claimed.insert(key_bytes.clone(), entry.row_id),
         };
-        pending.push((key_bytes, entry.row_id, entry.index_id));
+        pending.push(PendingProbe {
+            key: key_bytes,
+            row_id: entry.row_id,
+            index_id: entry.index_id,
+            building: entry.building,
+        });
         if !merged && pending.len() >= UNIQUENESS_PROBE_GROUP {
-            resolve_probes(db_tx, &deleted_unique, &mut pending).await?;
+            resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
         }
     }
     if merged {
-        resolve_probes_merged(db_tx, &deleted_unique, pending).await
+        resolve_probes_merged(db_tx, &deleted_unique, pending, &mut poisoned).await?;
     } else {
-        resolve_probes(db_tx, &deleted_unique, &mut pending).await
+        resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
+    }
+
+    poisoned.sort_unstable();
+    poisoned.dedup();
+    Ok(poisoned)
+}
+
+/// Records `poisoned` on the working state's definitions, so the commit's
+/// ordinary entity diff stages the flag. It is terminal: a poisoned build
+/// never flips ready, and its driver ends the definition.
+pub(crate) fn apply_poison(state: &mut crate::catalog::CatalogSnapshot, poisoned: &[u64]) {
+    for index_id in poisoned {
+        for per_table in state.indexes.values_mut() {
+            if let Some(value) = per_table.get_mut(index_id) {
+                value.poisoned = Some(true);
+            }
+        }
     }
 }
 

@@ -131,6 +131,8 @@ struct IndexDdlBindData : public duckdb::FunctionData {
 	// Empty leaves the index NULLS LAST.
 	std::vector<uint8_t> nulls_first;
 	bool unique = false;
+	// Run the multi-commit build instead of backfilling in one commit.
+	bool staged = false;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<IndexDdlBindData>();
@@ -142,7 +144,8 @@ struct IndexDdlBindData : public duckdb::FunctionData {
 		return is_create == other.is_create && catalog_name == other.catalog_name &&
 		       schema_name == other.schema_name && table_name == other.table_name &&
 		       index_name == other.index_name && columns == other.columns &&
-		       descending == other.descending && nulls_first == other.nulls_first && unique == other.unique;
+		       descending == other.descending && nulls_first == other.nulls_first &&
+		       unique == other.unique && staged == other.staged;
 	}
 };
 
@@ -173,8 +176,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexDdlInitGlobal(duckdb::
 		const uint8_t *nulls_first = bind_data.nulls_first.empty() ? nullptr : bind_data.nulls_first.data();
 		code = moraine_index_create(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
 		                            bind_data.index_name.c_str(), column_ptrs.data(), column_ptrs.size(),
-		                            directions, nulls_first, bind_data.unique, moraine_shim_is_interrupted,
-		                            &context, &err);
+		                            directions, nulls_first, bind_data.unique, bind_data.staged,
+		                            moraine_shim_is_interrupted, &context, &err);
 	} else {
 		code = moraine_index_drop(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
 		                          bind_data.index_name.c_str(), moraine_shim_is_interrupted, &context, &err);
@@ -248,6 +251,12 @@ duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duc
 			throw duckdb::InvalidInputException(
 			    "moraine_index_create: `nulls` must have one entry per column");
 		}
+	}
+	// Optional `staged := true`: build across several commits, for a table
+	// whose backfill exceeds what one commit may stage.
+	auto staged = input.named_parameters.find("staged");
+	if (staged != input.named_parameters.end() && !staged->second.IsNull()) {
+		bind_data->staged = staged->second.GetValue<bool>();
 	}
 	return_types = {duckdb::LogicalType::VARCHAR};
 	names = {"result"};
@@ -719,6 +728,8 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	// placement ['first'|'last', ...], each parallel to the columns.
 	create.named_parameters["directions"] = LogicalType::LIST(LogicalType::VARCHAR);
 	create.named_parameters["nulls"] = LogicalType::LIST(LogicalType::VARCHAR);
+	// Multi-commit build, for a backfill too large for one commit.
+	create.named_parameters["staged"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(create);
 
 	// (catalog, schema, table, index, then the equality key as variadic args
