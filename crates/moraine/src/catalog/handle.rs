@@ -209,6 +209,7 @@ impl Catalog {
         let store =
             StoreBuilder::new(&options.path, object_store).cache_dir(options.cache_dir.clone());
         let reader = commit::open_reader_initialized(store).await?;
+        tracing::info!(path = options.path, "opened catalog read-only");
         Ok(Self {
             store: Arc::new(Store::Reader(Arc::new(reader))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),

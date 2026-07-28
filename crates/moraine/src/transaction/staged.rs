@@ -454,6 +454,7 @@ impl StagedTransaction {
     /// retried internally** — if a concurrent commit advanced the head
     /// first; the store is left unchanged by the loser.
     pub async fn commit(self) -> Result<SnapshotId> {
+        let started = std::time::Instant::now();
         let Self {
             db_tx,
             ops,
@@ -461,6 +462,7 @@ impl StagedTransaction {
             data_store,
             data_prefix,
         } = self;
+        let staged_rows = ops.len();
 
         let base = match commit::head_view_for(&db_tx, &projections).await {
             Ok(base) => base,
@@ -551,14 +553,11 @@ impl StagedTransaction {
                         if mints_snapshot {
                             commit::refresh_head_view(&projections, base_ref, &writes);
                         }
+                        staged_landed(result_id, staged_rows, started);
                         Ok(SnapshotId::new(result_id))
                     }
                     Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
-                        Err(Error::CommitConflict(format!(
-                            "a concurrent commit changed state this one read or wrote \
-                             (attempted snapshot {result_id}); staged-row commits are never \
-                             retried internally"
-                        )))
+                        Err(staged_lost_race(result_id, staged_rows))
                     }
                     Err(err) => Err(err.into()),
                 }
@@ -569,6 +568,32 @@ impl StagedTransaction {
             }
         }
     }
+}
+
+/// One landed staged commit's summary event.
+fn staged_landed(result_id: u64, staged_rows: usize, started: std::time::Instant) {
+    tracing::debug!(
+        snapshot = result_id,
+        staged_rows,
+        elapsed_ms = started.elapsed().as_millis(),
+        "staged commit landed"
+    );
+}
+
+/// The lost-race error for a staged commit, logged as it is built:
+/// DuckLake's own loop re-drives the loser, so the log line is the only
+/// visible trace of the race.
+fn staged_lost_race(result_id: u64, staged_rows: usize) -> Error {
+    tracing::debug!(
+        attempted_snapshot = result_id,
+        staged_rows,
+        "staged commit lost a write-write race; DuckLake re-drives"
+    );
+    Error::CommitConflict(format!(
+        "a concurrent commit changed state this one read or wrote \
+         (attempted snapshot {result_id}); staged-row commits are never \
+         retried internally"
+    ))
 }
 
 /// Applies every op onto a clone of `base`, then diffs the two exactly as

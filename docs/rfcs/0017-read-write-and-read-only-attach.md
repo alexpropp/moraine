@@ -78,6 +78,16 @@ fences the live writer (`tests/catalog.rs`). Writes on a read-only catalog
 return `Error::Constraint`; the fully typed-out read-only handle is RFC 0003's
 concern (below).
 
+**Losing the store is typed, not opaque.** When the rule above is broken —
+a second process attaches read-write — the incumbent's next operation fails
+`Error::Fenced` (ABI `FENCED`, raised as `IOException`), not a generic
+store error. Classification lives at the one chokepoint every store error
+crosses (`From<slatedb::Error>`, on `ErrorKind::Closed(Fenced)`), logs a
+`warn` as it classifies, and the message — free of DuckLake's retry
+substrings, since re-running a commit on a dead writer cannot revive it —
+tells the operator to re-attach. Pinned by `tests/catalog.rs`'s
+`second_writer_fences_the_first_with_a_typed_error`.
+
 ## Design
 
 ### The selector is `READ_ONLY`

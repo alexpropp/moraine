@@ -855,7 +855,13 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     let attempt = || {
         // SAFETY: caller contract above; dropped exactly once.
         let boxed = unsafe { Box::from_raw(handle) };
-        let _ = boxed.runtime.block_on(boxed.catalog.close());
+        if let Err(err) = boxed.runtime.block_on(boxed.catalog.close()) {
+            // Detach has no error channel, so the failed close (a final
+            // flush that did not land) is logged rather than lost. The
+            // event surfaces through any remaining drain point or a host
+            // subscriber.
+            tracing::warn!(error = %err, "catalog close failed during detach");
+        }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }

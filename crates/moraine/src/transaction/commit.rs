@@ -218,7 +218,11 @@ pub(crate) async fn open_initialized(
     }
 
     match tx.commit_with_options(&durable()).await {
-        Ok(_) => Ok(db),
+        Ok(_) => {
+            // Once per store, ever: the commit that created the catalog.
+            tracing::info!(encrypted, data_path, "bootstrapped a fresh catalog store");
+            Ok(db)
+        }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
             let tx = db
@@ -405,7 +409,14 @@ pub(crate) fn refresh_head_view(
     let mut view = base.clone();
     match fold::fold_batch(&mut view, writes) {
         Ok(()) => install_head_view(projections, Arc::new(view)),
-        Err(_) => invalidate_head_view(projections),
+        Err(err) => {
+            // The committed batch could not be folded into the cached view;
+            // dropping the cache is safe (the next commit rescans and
+            // reinstalls) but the cause is worth a trace — a batch this
+            // writer just built should always fold.
+            tracing::debug!(error = %err, "head view fold failed; clearing the cached view");
+            invalidate_head_view(projections);
+        }
     }
 }
 
@@ -508,6 +519,13 @@ where
             .await?
             .map_or(FORMAT_VERSION, |format| format.format_version);
         if current < target_format {
+            // Rare and consequential: the stamp is forward-only and decides
+            // which binaries can open the store from here on.
+            tracing::info!(
+                from = current,
+                to = target_format,
+                "upgrading the store format stamp"
+            );
             writes.push((
                 Key::Sys(SysKey::Format).encode(),
                 Some(value::encode_value(&proto::FormatValue {
@@ -518,6 +536,12 @@ where
         }
     }
     index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    tracing::debug!(
+        snapshot = new_id,
+        index_entries = index_entries.len(),
+        catalog_writes = writes.len(),
+        "commit staged"
+    );
 
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
@@ -620,6 +644,7 @@ where
 {
     // Kept across attempts so an exhausted budget can report where the
     // premise started and what it kept losing to.
+    let started = std::time::Instant::now();
     let mut first_head = None;
     let mut last_intervening = Vec::new();
 
@@ -630,7 +655,15 @@ where
             tokio::time::sleep(retry_backoff(attempt)).await;
         }
         match attempt_commit(db, f, projections).await? {
-            CommitOutcome::Committed(id) => return Ok(id),
+            CommitOutcome::Committed(id) => {
+                tracing::debug!(
+                    snapshot = id.get(),
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "commit landed"
+                );
+                return Ok(id);
+            }
             CommitOutcome::LostRace { ours, head_before } => {
                 first_head.get_or_insert(head_before);
                 // An options-only loser is last-write-wins: always benign.

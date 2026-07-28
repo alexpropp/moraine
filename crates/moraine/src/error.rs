@@ -51,6 +51,11 @@ pub enum Error {
     #[error("configuration: {0}")]
     Configuration(String),
 
+    /// This writer has been fenced: another process opened the store
+    /// read-write, and the newest writer wins.
+    #[error("writer fenced: {0}")]
+    Fenced(String),
+
     /// The underlying store failed (SlateDB / object-store I/O).
     #[error("store error")]
     Store(#[source] Box<slatedb::Error>),
@@ -58,6 +63,18 @@ pub enum Error {
 
 impl From<slatedb::Error> for Error {
     fn from(err: slatedb::Error) -> Self {
+        // Every store error crosses here, so this is the one place fencing
+        // can be told apart from ordinary I/O failure.
+        if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) {
+            tracing::warn!(
+                "another process attached this catalog read-write; this writer is fenced"
+            );
+            return Self::Fenced(
+                "another process attached this catalog read-write and took over as \
+                 the writer; this handle can no longer commit — re-attach to write"
+                    .to_string(),
+            );
+        }
         Self::Store(Box::new(err))
     }
 }

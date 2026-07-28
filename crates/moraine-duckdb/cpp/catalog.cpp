@@ -129,12 +129,11 @@ namespace {
 // is needed for the records to appear.
 constexpr const char *MORAINE_LOG_TYPE = "moraine";
 
-void WriteMoraineLogRecord(void *ctx, int32_t level, const char *message) {
-	// Crossing back into C++ from Rust: an escaping exception would unwind
-	// through the ABI. Diagnostics are never worth that.
+// Writes one record through `logger`, dropping it on any failure: crossing
+// back into C++ from Rust, an escaping exception would unwind through the
+// ABI, and diagnostics are never worth that.
+void WriteThroughLogger(duckdb::Logger &logger, int32_t level, const char *message) noexcept {
 	try {
-		auto &context = *static_cast<duckdb::ClientContext *>(ctx);
-		auto &logger = duckdb::Logger::Get(context);
 		auto log_level = static_cast<duckdb::LogLevel>(level);
 		if (logger.ShouldLog(MORAINE_LOG_TYPE, log_level)) {
 			logger.WriteLog(MORAINE_LOG_TYPE, log_level, message);
@@ -143,10 +142,37 @@ void WriteMoraineLogRecord(void *ctx, int32_t level, const char *message) {
 	}
 }
 
+void WriteMoraineLogRecord(void *ctx, int32_t level, const char *message) {
+	try {
+		auto &context = *static_cast<duckdb::ClientContext *>(ctx);
+		WriteThroughLogger(duckdb::Logger::Get(context), level, message);
+	} catch (...) {
+	}
+}
+
+void WriteMoraineLogRecordToDatabase(void *ctx, int32_t level, const char *message) {
+	try {
+		auto &db = *static_cast<duckdb::DatabaseInstance *>(ctx);
+		WriteThroughLogger(duckdb::Logger::Get(db), level, message);
+	} catch (...) {
+	}
+}
+
 } // namespace
 
 void DrainMoraineLogs(duckdb::ClientContext &context) noexcept {
 	moraine_drain_logs(WriteMoraineLogRecord, &context);
+}
+
+void DrainMoraineLogs(duckdb::DatabaseInstance &db) noexcept {
+	moraine_drain_logs(WriteMoraineLogRecordToDatabase, &db);
+}
+
+void WriteMoraineLog(duckdb::DatabaseInstance &db, duckdb::LogLevel level, const std::string &message) noexcept {
+	try {
+		WriteThroughLogger(duckdb::Logger::Get(db), static_cast<int32_t>(level), message.c_str());
+	} catch (...) {
+	}
 }
 
 void ThrowMoraineError(MoraineError &err) {
@@ -170,6 +196,7 @@ void ThrowMoraineError(MoraineError &err) {
 		throw duckdb::InterruptException();
 	case MORAINE_CORRUPTION:
 	case MORAINE_STORE:
+	case MORAINE_FENCED:
 		throw duckdb::IOException(message);
 	case MORAINE_INTERNAL:
 	default:
@@ -728,6 +755,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
 	                           data_path.empty() ? nullptr : data_path.c_str(), &handle, &err);
+	// Drained on both exits: the open's own events (and a failed open's)
+	// would otherwise sit buffered until some later commit — or forever, on
+	// a read-only attach that never commits.
+	DrainMoraineLogs(context);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

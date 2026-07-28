@@ -322,6 +322,27 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 			passes_.pop_front();
 		}
 	}
+
+	// The pass ran with no ClientContext (its own connection, its own
+	// thread), so the core's events from the sweep and DuckLake steps sit
+	// buffered; the database-scoped drain is the only one that can reach
+	// them here. The outcome line makes a scheduled pass visible without
+	// querying the report table: `warn` names each failed step, `info`
+	// closes a clean pass.
+	DrainMoraineLogs(db_);
+	std::string failed;
+	for (auto &step : report) {
+		if (step.status == "failed") {
+			failed += (failed.empty() ? "" : ", ") + step.step + ": " + step.detail;
+		}
+	}
+	if (!failed.empty()) {
+		WriteMoraineLog(db_, duckdb::LogLevel::LOG_WARNING,
+		                std::string("maintenance pass (") + trigger + ") had failures — " + failed);
+	} else {
+		WriteMoraineLog(db_, duckdb::LogLevel::LOG_INFO,
+		                std::string("maintenance pass (") + trigger + ") completed");
+	}
 	return report;
 }
 

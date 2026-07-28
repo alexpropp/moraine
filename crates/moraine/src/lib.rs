@@ -91,12 +91,14 @@
 //! # Diagnostics
 //!
 //! The crate emits [`tracing`](https://docs.rs/tracing) events and installs
-//! no subscriber: a commit that loses races logs one `debug` event per
-//! attempt, and one `warn` when it spends its whole retry budget, naming the
-//! head it started from and the commits it lost to. An embedding host sees
-//! them by installing any subscriber. The DuckDB extension consumes its own
-//! — it cannot share the host's — and forwards them to `duckdb_logs`; see
-//! that crate's `logging` module.
+//! no subscriber. Rare, consequential moments log at `info` (an open, the
+//! once-ever bootstrap, a format-stamp upgrade) or `warn` (a spent retry
+//! budget, an oversized commit refused); per-commit summaries and retry
+//! traces log at `debug`. Every event is per-operation — never per row,
+//! entry, or file. An embedding host sees them by installing any
+//! subscriber. The DuckDB extension consumes its own — it cannot share the
+//! host's — and forwards them to `duckdb_logs`; see that crate's `logging`
+//! module.
 //!
 //! # Layering
 //!

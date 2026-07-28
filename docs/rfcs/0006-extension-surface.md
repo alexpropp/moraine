@@ -312,6 +312,7 @@ an unwind into C++. The shim translates codes to DuckDB exceptions:
 | 8 | `INTERNAL` | a panic caught at the FFI boundary | `InternalException` |
 | 9 | `INTERRUPTED` | cancellation — `moraine_interrupt` or the call's interrupt probe — cancelled the read in flight (or about to start) on the handle | `InterruptException` |
 | 10 | `RETRY_EXHAUSTED` | `Error::RetryBudgetExhausted` — the commit spent its whole internal retry budget without settling | `TransactionException` |
+| 11 | `FENCED` | `Error::Fenced` — another process took over as the writer; the handle can no longer commit, and the message says to re-attach | `IOException` |
 
 Wire contract: the `COMMIT_CONFLICT` message always contains the literal
 substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
@@ -355,11 +356,33 @@ storage writes to stdout rather than the table. Under DuckDB's default
 `LEVEL_ONLY` mode the type string is not filtered on, so no log-type
 registration is required.
 
-The drain runs in `CommitTransaction`, on every outcome — success,
-conflict, or exhausted budget. A commit's diagnostics therefore surface
-exactly when the commit returns. The sink never throws: an exception
-escaping into the ABI would unwind across the boundary, and a lost
-diagnostic must not fail the operation that produced it.
+The drain runs wherever events could otherwise strand, each on the thread
+that has the needed handle:
+
+- **`CommitTransaction`**, on every outcome — success, conflict, or
+  exhausted budget. A commit's diagnostics surface when the commit returns.
+- **`StartTransaction`**, after the snapshot resolve — the only drain a
+  read-only workload ever reaches. Events from a read path surface at the
+  next statement instead of never.
+- **`Attach`**, on both exits — the open's own events (and a failed
+  open's) would otherwise wait for a commit that a read-only attach never
+  makes.
+- **The maintenance pass**, which runs on the scheduler's own thread with
+  no `ClientContext` at all, drains through a second, database-scoped sink
+  (`Logger::Get(DatabaseInstance&)`), and closes each pass with one
+  shim-originated outcome line: `warn` naming every failed step, `info`
+  for a clean pass.
+
+The sink never throws: an exception escaping into the ABI would unwind
+across the boundary, and a lost diagnostic must not fail the operation
+that produced it.
+
+**Event frequency is a rule, not a convention.** The buffer holds 512
+records and drops oldest-first, so its capacity is a budget shared by
+everything the core logs between drains. Events are emitted at
+per-operation frequency — per commit, per open, per pass — never per
+entry, per row, or per file. A per-entry event at `debug` would evict the
+very warnings the buffer exists to preserve.
 
 ### Read cancellation seam
 

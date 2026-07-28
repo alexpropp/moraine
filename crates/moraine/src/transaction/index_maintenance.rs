@@ -167,6 +167,14 @@ pub(crate) async fn stage_index_entries(
     entries: &[StagedIndexEntry],
 ) -> Result<()> {
     if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
+        // Logged as well as returned: the refusal is the guardrail firing,
+        // and an operator reading logs after a failed bulk load should see
+        // it without having to recover the SQL error text.
+        tracing::warn!(
+            staged = entries.len(),
+            limit = MAX_INDEX_ENTRIES_PER_COMMIT,
+            "refusing an oversized commit"
+        );
         return Err(oversized_commit(entries.len()));
     }
 
