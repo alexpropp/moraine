@@ -9,6 +9,19 @@ pub enum Error {
     #[error("commit conflict: {0}")]
     CommitConflict(String),
 
+    /// A commit spent its whole internal retry budget on benign races
+    /// without settling; the caller must re-drive the work itself, usually
+    /// as smaller commits.
+    ///
+    /// The text carries none of the four substrings DuckLake's commit loop
+    /// keys its retry decision on (`conflict`, `concurrent`, `unique`,
+    /// `primary key`), so an exhausted budget surfaces at once instead of
+    /// being re-run against a premise that already failed to settle ten
+    /// times. That wording is part of the wire contract, not incidental
+    /// diagnostics.
+    #[error("retry budget exhausted: {0}")]
+    RetryBudgetExhausted(String),
+
     /// Stored bytes failed to decode: corrupt, truncated, wrong-kind, or
     /// written by a newer encoding than this binary understands.
     #[error("corruption: {0}")]

@@ -256,11 +256,32 @@ When the head conflict fires, the committer compares the set of
   verb path it includes re-running the caller's closure, not just
   re-stamping ids). This is bounded internal retry inside `transaction`; no caller
   involvement.
+
+  Retries wait before re-running: the delay starts at 2ms, doubles, and
+  caps at 50ms, with jitter of up to the base delay so two writers that
+  just collided do not back off in lockstep and collide again. The whole
+  budget spans a few hundred milliseconds. A commit that lands on its
+  first attempt never waits, so the backoff costs the uncontended path
+  nothing.
 - **Overlapping table set → true conflict** (subject to the append-append
   refinement below). A concurrent commit mutated a table this commit also
   mutated. The premise may be invalid (the table was dropped, a column
   altered, files this commit references were compacted away). Abort with a
   typed `CommitConflict`.
+- **Budget spent → terminal.** A commit that loses `MAX_COMMIT_ATTEMPTS`
+  benign races in a row aborts with `RetryBudgetExhausted`, not
+  `CommitConflict`. The distinction is a wire contract, not cosmetics:
+  DuckLake's own commit loop re-runs a failed commit whenever the error
+  text contains `conflict`, `concurrent`, `unique`, or `primary key`, and
+  `CommitConflict`'s `Display` carries `conflict` in its prefix. A
+  transient conflict *should* stay retryable and keeps that wording; an
+  exhausted budget must not, or the two bounded loops compose into
+  `ducklake_max_retry_count` × `MAX_COMMIT_ATTEMPTS` re-runs of a commit
+  that already failed to settle ten times. `RetryBudgetExhausted`'s text
+  is therefore free of all four substrings, exactly as the equality-index
+  uniqueness rejection already is. Every exhaustion is logged at `warn`
+  with the head it started from and the commits it lost to — without it
+  the failure is a slow commit with no stated reason.
 
 **Counter advancement is never, by itself, a conflict.** Every commit reads
 and bumps `next_catalog_id`/`next_file_id`; that shared read is precisely

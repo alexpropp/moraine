@@ -311,6 +311,7 @@ an unwind into C++. The shim translates codes to DuckDB exceptions:
 | 7 | `INVALID_ARGUMENT` | ABI-layer validation: null pointer, invalid UTF-8, unsupported store scheme | `InvalidInputException` |
 | 8 | `INTERNAL` | a panic caught at the FFI boundary | `InternalException` |
 | 9 | `INTERRUPTED` | cancellation — `moraine_interrupt` or the call's interrupt probe — cancelled the read in flight (or about to start) on the handle | `InterruptException` |
+| 10 | `RETRY_EXHAUSTED` | `Error::RetryBudgetExhausted` — the commit spent its whole internal retry budget without settling | `TransactionException` |
 
 Wire contract: the `COMMIT_CONFLICT` message always contains the literal
 substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on

@@ -20,6 +20,7 @@ use std::ffi::{CString, c_char};
 /// | [`ALREADY_EXISTS`](codes::ALREADY_EXISTS) | name uniqueness violated | `CatalogException` |
 /// | [`CONSTRAINT`](codes::CONSTRAINT) | structural constraint violated | `CatalogException` |
 /// | [`COMMIT_CONFLICT`](codes::COMMIT_CONFLICT) | concurrent commit conflict; message contains the substring `conflict` | `TransactionException` |
+/// | [`RETRY_EXHAUSTED`](codes::RETRY_EXHAUSTED) | the commit's internal retry budget ran out; message carries none of DuckLake's retry substrings | `TransactionException` |
 /// | [`CORRUPTION`](codes::CORRUPTION) | stored bytes failed to decode, or a catalog string cannot round-trip through a C string | `IOException` |
 /// | [`STORE`](codes::STORE) | the underlying object store / SlateDB failed | `IOException` |
 /// | [`INVALID_ARGUMENT`](codes::INVALID_ARGUMENT) | a null pointer, non-UTF-8 string, or unsupported ABI input | `InvalidInputException` |
@@ -53,6 +54,10 @@ pub mod codes {
     /// flight (or about to start) on this handle. Never produced by the
     /// `moraine` core — an ABI-layer cancellation signal.
     pub const INTERRUPTED: i32 = 9;
+    /// [`moraine::Error::RetryBudgetExhausted`]. Terminal: unlike
+    /// [`COMMIT_CONFLICT`], the message deliberately carries none of the
+    /// substrings DuckLake's commit loop retries on.
+    pub const RETRY_EXHAUSTED: i32 = 10;
 }
 
 /// Fixed message for a caught panic; never derived from the panic
@@ -143,6 +148,7 @@ impl From<moraine::Error> for AbiError {
             // "conflict" in the message; core's `Display` already includes
             // it.
             moraine::Error::CommitConflict(_) => codes::COMMIT_CONFLICT,
+            moraine::Error::RetryBudgetExhausted(_) => codes::RETRY_EXHAUSTED,
             moraine::Error::Corruption(_) => codes::CORRUPTION,
             // Covers `Store` and any future `#[non_exhaustive]` variant.
             _ => codes::STORE,

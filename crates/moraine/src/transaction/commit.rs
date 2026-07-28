@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
@@ -50,6 +50,32 @@ pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
+
+/// Delay before the second commit attempt, in microseconds; each further
+/// retry doubles it, up to [`RETRY_BACKOFF_MAX_MICROS`]. Without a pause the
+/// budget is ten immediate re-runs, which under real contention is a spin
+/// that burns the budget faster than the contention can clear.
+const RETRY_BACKOFF_BASE_MICROS: u64 = 2_000;
+/// Ceiling on one retry's delay. The whole budget then spans a few hundred
+/// milliseconds — enough for a competing commit to land, short enough that a
+/// caller waiting on a conflict is not left hanging.
+const RETRY_BACKOFF_MAX_MICROS: u64 = 50_000;
+
+/// How long to wait before re-running `attempt` (0-based; the first attempt
+/// never waits). Exponential to the cap, plus jitter of up to the base delay
+/// so two writers that just collided do not back off in lockstep and collide
+/// again.
+fn retry_backoff(attempt: usize) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let doublings = u32::try_from(attempt - 1).unwrap_or(u32::MAX).min(31);
+    let step = RETRY_BACKOFF_BASE_MICROS
+        .saturating_mul(1_u64 << doublings)
+        .min(RETRY_BACKOFF_MAX_MICROS);
+    let jitter = now_micros().unsigned_abs() % RETRY_BACKOFF_BASE_MICROS;
+    Duration::from_micros(step.saturating_add(jitter))
+}
 
 /// Current time in microseconds since the Unix epoch. Clamped, never
 /// panicking: a clock before the epoch stamps 0.
@@ -582,8 +608,9 @@ async fn finish_commit(
 
 /// Commits through the closure, retrying benign races with a full re-run
 /// — fresh snapshot, closure, ids — so premises re-validate against the
-/// state that won. True conflicts and an exhausted budget surface as
-/// [`Error::CommitConflict`].
+/// state that won. A true conflict surfaces as [`Error::CommitConflict`],
+/// which the caller may retry; an exhausted budget surfaces as
+/// [`Error::RetryBudgetExhausted`], which it may not.
 pub(crate) async fn commit_cycle<F>(
     db: &Db,
     f: &F,
@@ -592,27 +619,67 @@ pub(crate) async fn commit_cycle<F>(
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
-    for _ in 0..MAX_COMMIT_ATTEMPTS {
+    // Kept across attempts so an exhausted budget can report where the
+    // premise started and what it kept losing to.
+    let mut first_head = None;
+    let mut last_intervening = Vec::new();
+
+    for attempt in 0..MAX_COMMIT_ATTEMPTS {
+        // Every path into this loop past the first is a lost race, so the
+        // wait belongs here rather than at each `continue`.
+        if attempt > 0 {
+            tokio::time::sleep(retry_backoff(attempt)).await;
+        }
         match attempt_commit(db, f, projections).await? {
             CommitOutcome::Committed(id) => return Ok(id),
             CommitOutcome::LostRace { ours, head_before } => {
+                first_head.get_or_insert(head_before);
                 // An options-only loser is last-write-wins: always benign.
                 if ours.is_empty() {
+                    tracing::debug!(
+                        attempt,
+                        head_before,
+                        "commit lost the head race with nothing to conflict over; retrying"
+                    );
                     continue;
                 }
                 let intervening = intervening_changes(db, head_before).await?;
                 for (snapshot_id, theirs) in &intervening {
                     if crate::transaction::operations::conflicts(&ours, theirs) {
+                        tracing::debug!(
+                            attempt,
+                            head_before,
+                            winner = snapshot_id,
+                            "commit conflicts with an intervening commit; surfacing"
+                        );
                         return Err(Error::CommitConflict(format!(
                             "concurrent commit {snapshot_id} touched the same state"
                         )));
                     }
                 }
+                last_intervening = intervening.iter().map(|(id, _)| *id).collect();
+                tracing::debug!(
+                    attempt,
+                    head_before,
+                    intervening = ?last_intervening,
+                    "commit lost the head race to disjoint commits; retrying"
+                );
             }
         }
     }
-    Err(Error::CommitConflict(format!(
-        "retry budget exhausted after {MAX_COMMIT_ATTEMPTS} attempts"
+
+    let head_before = first_head.unwrap_or_default();
+    // The only record of an exhausted budget: without it a caller sees a
+    // slow commit and no reason for it.
+    tracing::warn!(
+        attempts = MAX_COMMIT_ATTEMPTS,
+        head_before,
+        intervening = ?last_intervening,
+        "commit exhausted its retry budget; reporting a terminal error"
+    );
+    Err(Error::RetryBudgetExhausted(format!(
+        "spent {MAX_COMMIT_ATTEMPTS} attempts from head snapshot {head_before} without \
+         settling; commits above it: {last_intervening:?}"
     )))
 }
 

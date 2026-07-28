@@ -961,9 +961,11 @@ impl Catalog {
     /// Returns whatever error the closure returns (the commit is
     /// aborted), or an error from the underlying store. Returns
     /// [`Error::CommitConflict`] when a concurrent commit truly conflicts
-    /// — it touched the same tables or the schema list — or when the
-    /// bounded internal retry budget is exhausted before a benign race
-    /// resolves.
+    /// — it touched the same tables or the schema list. Returns
+    /// [`Error::RetryBudgetExhausted`] when the bounded internal retry
+    /// budget runs out before a benign race resolves; unlike a conflict,
+    /// that is terminal, and the caller re-drives the work itself —
+    /// usually as smaller commits.
     ///
     /// # Examples
     ///

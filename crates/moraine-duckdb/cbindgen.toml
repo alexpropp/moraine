@@ -38,6 +38,7 @@ enum {
 	MORAINE_INVALID_ARGUMENT = 7,
 	MORAINE_INTERNAL = 8,
 	MORAINE_INTERRUPTED = 9,
+	MORAINE_RETRY_EXHAUSTED = 10,
 };
 """
 
@@ -58,6 +59,17 @@ exclude = [
     "INVALID_ARGUMENT",
     "INTERNAL",
     "INTERRUPTED",
+    "RETRY_EXHAUSTED",
+    # `logging::levels` mirrors DuckDB's own `LogLevel` values for the sink
+    # to forward. Exported, these become `#define ERROR 50` and friends in a
+    # header DuckDB's C++ includes — the very collision DuckDB's own logging
+    # header prefixes `LOG_` to avoid. The sink takes an integer level; C
+    # never needs the names.
+    "TRACE",
+    "DEBUG",
+    "INFO",
+    "WARNING",
+    "ERROR",
 ]
 
 [export.rename]

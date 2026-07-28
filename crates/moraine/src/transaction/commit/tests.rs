@@ -2633,3 +2633,56 @@ async fn folded_head_view_matches_a_fresh_scan() {
     );
     catalog.close().await.unwrap();
 }
+
+/// The first attempt never waits, later ones grow to the cap, and every
+/// wait carries jitter — two writers that collided must not re-collide in
+/// lockstep.
+#[test]
+fn retry_backoff_starts_at_zero_grows_and_caps() {
+    use super::{RETRY_BACKOFF_BASE_MICROS, RETRY_BACKOFF_MAX_MICROS, retry_backoff};
+
+    assert_eq!(retry_backoff(0), std::time::Duration::ZERO);
+
+    let ceiling = u128::from(RETRY_BACKOFF_MAX_MICROS + RETRY_BACKOFF_BASE_MICROS);
+    let mut previous = 0_u128;
+    for attempt in 1..MAX_COMMIT_ATTEMPTS {
+        let waited = retry_backoff(attempt).as_micros();
+        assert!(
+            waited >= u128::from(RETRY_BACKOFF_BASE_MICROS),
+            "attempt {attempt} waited {waited}µs, below the base delay"
+        );
+        assert!(
+            waited <= ceiling,
+            "attempt {attempt} waited {waited}µs, above the cap plus jitter"
+        );
+        // Growth holds until the cap absorbs it; jitter never reverses it.
+        if previous > 0 && previous < u128::from(RETRY_BACKOFF_MAX_MICROS) {
+            assert!(
+                waited > previous,
+                "attempt {attempt} waited {waited}µs, not more than {previous}µs"
+            );
+        }
+        previous = waited;
+    }
+    // The last attempts sit at the cap rather than growing without bound.
+    assert!(
+        retry_backoff(MAX_COMMIT_ATTEMPTS - 1).as_micros() >= u128::from(RETRY_BACKOFF_MAX_MICROS)
+    );
+}
+
+/// The whole budget must span enough time for a competing commit to land,
+/// without leaving a caller waiting on a conflict for seconds.
+#[test]
+fn retry_backoff_budget_stays_in_a_sane_band() {
+    use super::retry_backoff;
+
+    let total: std::time::Duration = (0..MAX_COMMIT_ATTEMPTS).map(retry_backoff).sum();
+    assert!(
+        total >= std::time::Duration::from_millis(100),
+        "whole retry budget waits only {total:?}"
+    );
+    assert!(
+        total <= std::time::Duration::from_millis(600),
+        "whole retry budget waits {total:?}"
+    );
+}

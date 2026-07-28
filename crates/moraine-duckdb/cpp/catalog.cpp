@@ -134,6 +134,7 @@ void ThrowMoraineError(MoraineError &err) {
 	case MORAINE_CONSTRAINT:
 		throw duckdb::CatalogException(message);
 	case MORAINE_COMMIT_CONFLICT:
+	case MORAINE_RETRY_EXHAUSTED:
 		throw duckdb::TransactionException(message);
 	case MORAINE_INVALID_ARGUMENT:
 		throw duckdb::InvalidInputException(message);
