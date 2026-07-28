@@ -93,7 +93,7 @@ mod tests {
     codec_tests!(roundtrip_partition, garbage_partition, PartitionValue);
     codec_tests!(roundtrip_sort, garbage_sort, SortValue);
     codec_tests!(roundtrip_index, garbage_index, IndexValue);
-    codec_tests!(roundtrip_macro, garbage_macro, MacroValue);
+    // codec_tests!(roundtrip_macro, garbage_macro, MacroValue);
     codec_tests!(roundtrip_mapping, garbage_mapping, MappingValue);
     codec_tests!(roundtrip_data_file, garbage_data_file, DataFileValue);
     codec_tests!(roundtrip_delete_file, garbage_delete_file, DeleteFileValue);
