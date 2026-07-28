@@ -11,14 +11,18 @@ rust-version.workspace = true
 
 [lib]
 # A static library the DuckDB extension toolchain links into the loadable
-# `.duckdb_extension` (the toolchain, not cargo, owns the final link).
-crate-type = ["staticlib"]
+# `.duckdb_extension` (the toolchain, not cargo, owns the final link). The
+# rlib is for integration tests, which cannot link a staticlib; it adds an
+# artifact and changes nothing the toolchain consumes.
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 arrow = { workspace = true, features = ["ffi", "ipc"] }
 moraine = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 cbindgen = { workspace = true }

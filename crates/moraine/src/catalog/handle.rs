@@ -178,6 +178,11 @@ impl Catalog {
             .cache_dir(options.cache_dir.clone());
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
             .await?;
+        tracing::info!(
+            path = options.path,
+            flush_interval_ms = options.flush_interval.as_millis(),
+            "opened catalog read-write"
+        );
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),

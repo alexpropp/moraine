@@ -44,6 +44,25 @@
 //! fences the live writer, so any number may attach alongside it. See
 //! `README.md` for the pinned build shape.
 //!
+//! # Diagnostics
+//!
+//! The core emits `tracing` events; this crate consumes them and forwards
+//! them to DuckDB's logger, so they appear in `duckdb_logs` under the
+//! `moraine` type. It cannot rely on the host for this — the extension is a
+//! separate dynamically-loaded library with its own statically-linked
+//! `tracing`, so a subscriber installed by an embedding process never sees
+//! them. `MORAINE_LOG` sets the captured level (default `info`). See
+//! [`logging`] for the buffering and drain mechanics.
+//!
+//! `enable_logging` is a table function, and its default storage writes to
+//! stdout; ask for `memory` to query the records back.
+//!
+//! ```sql
+//! CALL enable_logging(level => 'info', storage => 'memory');
+//! -- run the workload, then:
+//! SELECT log_level, message FROM duckdb_logs WHERE type = 'moraine';
+//! ```
+//!
 //! # Maintenance
 //!
 //! A read-write attach can carry a maintenance schedule. When
@@ -103,6 +122,7 @@ pub mod arrow_ipc;
 pub mod dumps;
 pub mod error;
 pub mod inline;
+pub mod logging;
 pub mod runtime;
 pub mod staged;
 #[cfg(test)]

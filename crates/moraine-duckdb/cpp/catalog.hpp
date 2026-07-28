@@ -34,6 +34,14 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type);
 // InternalException) and throws it. Frees `err.message` first if non-null.
 [[noreturn]] void ThrowMoraineError(MoraineError &err);
 
+// Drains the core's buffered `tracing` events into DuckDB's logger under
+// the `moraine` log type, so they surface in `duckdb_logs`. Events are
+// emitted on the core's own worker threads, where no ClientContext is in
+// scope; this runs on the calling thread, which has one. Safe to call when
+// nothing was buffered, and never throws — losing a diagnostic must not
+// fail the operation that produced it.
+void DrainMoraineLogs(duckdb::ClientContext &context) noexcept;
+
 // The shim's MoraineInterruptProbe: reports whether the query driving
 // `client_context` (an opaque duckdb::ClientContext*) has been
 // interrupted. One atomic load — the same flag DuckDB's executor polls —

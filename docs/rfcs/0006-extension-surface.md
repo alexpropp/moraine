@@ -318,6 +318,49 @@ substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
 that substring (see the Transactions bullet above) — so the message text
 is part of the ABI contract, not incidental diagnostics.
 
+The contract runs both ways. `RETRY_EXHAUSTED` is terminal, so its message
+carries **none** of the four substrings DuckLake retries on (`conflict`,
+`concurrent`, `unique`, `primary key`); the same rule governs the
+equality-index uniqueness rejection. DuckLake's loop is itself bounded — by
+`ducklake_max_retry_count`, default 10 — so a retryable terminal error does
+not spin forever, but it does multiply the work by that factor before
+failing, which for a large commit is the difference between an error and an
+apparent hang. Both codes raise `TransactionException`: DuckLake's retry
+decision reads the text, not the exception kind.
+
+### Diagnostics seam
+
+The core emits `tracing` events; a loaded extension consumes none by
+default, and the host cannot consume them for it — the extension is a
+separate dynamically-loaded library with its own statically-linked
+`tracing`, so a subscriber installed by an embedding process never sees
+them. Left there, every diagnostic the core produces is dropped, which is
+how a commit that spends its retry budget can present as a silent stall.
+
+`ATTACH` installs a process-wide buffering subscriber (`logging.rs`), once,
+via `try_init` — a host that already set a global subscriber keeps it. The
+buffer is bounded (oldest-first eviction, with the drop count reported on
+the next drain) so diagnostics never grow without limit behind a caller
+that stops draining. `MORAINE_LOG` sets the captured level, default `info`.
+
+Events fire on the handle's tokio worker threads, where no `ClientContext`
+is in scope, so they are not written through as they happen. The shim
+drains them on the calling thread — which does hold a context — through
+`moraine_drain_logs(sink, ctx)`, and writes each record with
+`Logger::Get(context).WriteLog("moraine", level, message)`. Records carry
+DuckDB's own `LogLevel` values, so the sink forwards them unchanged, and
+appear in `duckdb_logs` under the `moraine` type after
+`CALL enable_logging(level => 'info', storage => 'memory')` — the default
+storage writes to stdout rather than the table. Under DuckDB's default
+`LEVEL_ONLY` mode the type string is not filtered on, so no log-type
+registration is required.
+
+The drain runs in `CommitTransaction`, on every outcome — success,
+conflict, or exhausted budget. A commit's diagnostics therefore surface
+exactly when the commit returns. The sink never throws: an exception
+escaping into the ABI would unwind across the boundary, and a lost
+diagnostic must not fail the operation that produced it.
+
 ### Read cancellation seam
 
 Pinned by the extension-loads slice (`moraine-duckdb/src/{abi,runtime}.rs`).

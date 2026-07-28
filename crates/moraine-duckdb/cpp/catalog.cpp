@@ -12,6 +12,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -119,6 +120,33 @@ MoraineCatalog &ResolveMoraineCatalog(duckdb::ClientContext &context, const std:
 
 extern "C" bool moraine_shim_is_interrupted(void *client_context) {
 	return static_cast<duckdb::ClientContext *>(client_context)->IsInterrupted();
+}
+
+namespace {
+
+// The log type moraine's records carry in `duckdb_logs`. Under DuckDB's
+// default LEVEL_ONLY mode the type is not filtered on, so no registration
+// is needed for the records to appear.
+constexpr const char *MORAINE_LOG_TYPE = "moraine";
+
+void WriteMoraineLogRecord(void *ctx, int32_t level, const char *message) {
+	// Crossing back into C++ from Rust: an escaping exception would unwind
+	// through the ABI. Diagnostics are never worth that.
+	try {
+		auto &context = *static_cast<duckdb::ClientContext *>(ctx);
+		auto &logger = duckdb::Logger::Get(context);
+		auto log_level = static_cast<duckdb::LogLevel>(level);
+		if (logger.ShouldLog(MORAINE_LOG_TYPE, log_level)) {
+			logger.WriteLog(MORAINE_LOG_TYPE, log_level, message);
+		}
+	} catch (...) {
+	}
+}
+
+} // namespace
+
+void DrainMoraineLogs(duckdb::ClientContext &context) noexcept {
+	moraine_drain_logs(WriteMoraineLogRecord, &context);
 }
 
 void ThrowMoraineError(MoraineError &err) {

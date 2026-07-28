@@ -585,6 +585,9 @@ pub unsafe extern "C" fn moraine_attach(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Box<MoraineCatalogHandle>, AbiError> {
+        // Before anything that could emit an event, so an attach failure is
+        // itself drainable.
+        crate::logging::install();
         if out.is_null() {
             return Err(AbiError::invalid_argument("`out` is null"));
         }

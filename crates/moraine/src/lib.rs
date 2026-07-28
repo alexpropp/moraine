@@ -88,6 +88,16 @@
 //! Under the DuckDB extension, all of it is sequenced for you; see that
 //! crate's docs for `moraine_maintenance`.
 //!
+//! # Diagnostics
+//!
+//! The crate emits [`tracing`](https://docs.rs/tracing) events and installs
+//! no subscriber: a commit that loses races logs one `debug` event per
+//! attempt, and one `warn` when it spends its whole retry budget, naming the
+//! head it started from and the commits it lost to. An embedding host sees
+//! them by installing any subscriber. The DuckDB extension consumes its own
+//! — it cannot share the host's — and forwards them to `duckdb_logs`; see
+//! that crate's `logging` module.
+//!
 //! # Layering
 //!
 //! - `catalog` — the DuckLake domain model. Never touches SlateDB directly.

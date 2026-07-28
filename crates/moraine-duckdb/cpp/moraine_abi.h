@@ -808,6 +808,10 @@ typedef struct MoraineInlineFileDeleteRow {
   uint64_t begin_snapshot;
 } MoraineInlineFileDeleteRow;
 
+// Receives one buffered log record: its DuckDB `LogLevel` value and a
+// UTF-8, NUL-terminated message valid only for the duration of the call.
+typedef void (*MoraineLogSink)(void *ctx, int32_t level, const char *message);
+
 // One value in a staged row. Mirrors [`Cell`] as a tagged struct across
 // the C boundary; `str_value` is borrowed, valid only for the duration of
 // the [`moraine_tx_stage`] call that reads it.
@@ -2055,6 +2059,19 @@ int32_t moraine_inline_file_deletes(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_inline_file_deletes`] call, not yet freed.
 void moraine_inline_file_deletes_free(struct MoraineInlineFileDeleteRow *items, size_t len);
+
+// Drains every buffered log record into `sink`, oldest first.
+//
+// Called by the shim on a thread that holds a DuckDB `ClientContext`, so
+// the records can be written through DuckDB's own logger. Never fails and
+// never allocates on the caller's behalf: each message is borrowed for the
+// duration of its `sink` call and freed after it returns.
+//
+// # Safety
+//
+// `sink`, if non-null, must be callable with `sink_ctx` and must not
+// unwind. It must not re-enter any `moraine_*` entry point.
+void moraine_drain_logs(MoraineLogSink sink, void *sink_ctx);
 
 // Opens a staged-row transaction at the current head and writes the
 // resulting handle to `*out`.

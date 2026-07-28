@@ -101,8 +101,11 @@ duckdb::Transaction &MoraineTransactionManager::StartTransaction(duckdb::ClientC
 	return transaction_ref;
 }
 
-duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientContext &,
+duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientContext &context,
                                                                duckdb::Transaction &transaction) {
+	// Whatever the commit below does — succeed, conflict, or spend its
+	// retry budget — its diagnostics reach DuckDB's logger on the way out.
+	auto drain = [&context]() noexcept { DrainMoraineLogs(context); };
 	// A staged tx (opened lazily by the first write this DuckDB
 	// transaction made) is taken out from under the lock and committed
 	// after releasing it — moraine_tx_commit blocks on store I/O, which
@@ -125,11 +128,13 @@ duckdb::ErrorData MoraineTransactionManager::CommitTransaction(duckdb::ClientCon
 		// A read-only transaction (or one whose writes never reached a
 		// writable metadata table) never opened a staged tx: nothing to
 		// commit, always a clean success.
+		drain();
 		return duckdb::ErrorData();
 	}
 	uint64_t new_snapshot_id = 0;
 	MoraineError err {};
 	auto code = moraine_tx_commit(staged, &new_snapshot_id, &err);
+	drain();
 	if (code != MORAINE_OK) {
 		try {
 			ThrowMoraineError(err);
