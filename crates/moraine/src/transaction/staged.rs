@@ -529,7 +529,6 @@ impl StagedTransaction {
                     &ops,
                     data_store.as_ref(),
                     &data_prefix,
-                    &mut writes,
                 )
                 .await
                 {

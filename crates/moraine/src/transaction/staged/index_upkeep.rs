@@ -5,7 +5,7 @@
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
     InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, ScopedReadEntry,
-    StagedIndexEntry, TableId, TableKind, commit,
+    StagedIndexEntry, TableId, TableKind,
     decode::{decode_data_file, decode_delete_file},
     encode_ordered_values, proto, scoped_read, stage_index_entries, store_inline,
 };
@@ -100,7 +100,6 @@ pub(super) async fn stage_index_maintenance(
     ops: &[RowOperation],
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
-    writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
     let pending_schemas = pending_inline_schemas(ops);
 
@@ -200,7 +199,7 @@ pub(super) async fn stage_index_maintenance(
     if entries.is_empty() {
         return Ok(());
     }
-    stage_index_entries(ReadHandle::Tx(db_tx), &entries, writes).await
+    stage_index_entries(db_tx, &entries).await
 }
 
 /// The inline schemas this commit registers, for a chunk whose

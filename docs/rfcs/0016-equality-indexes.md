@@ -296,7 +296,56 @@ delete-then-reinsert behaves as SQL expects, within one commit or across
 commits.
 
 The `Constraint` here is a verb-path error (embedding API) — no DuckLake
-wire contract applies to its text.
+wire contract applies to its text. It is nonetheless worded free of the four
+substrings DuckLake's commit loop retries on, so a rejected bulk INSERT
+surfaces at once rather than being re-run (RFC 0006's wire contract).
+
+**How the probes run.** A bulk load stages one entry per indexed row, so
+this step decides whether a large commit is minutes or hours, and whether it
+fits in memory at all. Three properties are load-bearing:
+
+- **One probe per distinct key, not per entry.** Repeats within a batch
+  collapse in memory; two entries claiming one value for different rows
+  collide there, before any read.
+- **Bounded concurrency, in bounded groups.** Probes are independent point
+  reads, so serializing them makes a batch cost one store round-trip of
+  latency *per entry*. They run with a bounded fan-out, resolved a group at
+  a time — peak memory is one group of keys, not the batch's. Results are
+  applied in batch order, so which entry a rejection names does not depend
+  on which probe finished first.
+- **Entries stage onto the transaction directly.** They never enter the
+  write list the committer retains for the maintained projections. No
+  projection reflects an index entry, so retaining them would hold a second
+  copy of the batch's largest part — plus the clone staging makes of it —
+  in memory for nothing.
+
+### Commit size is bounded, and why it must be
+
+Heap profiling of a staging commit attributes roughly **a kilobyte of peak
+memory to every staged entry**, and almost none of it to moraine: the write
+batch, the WAL buffer's copy of it, the memtable's skiplist node, and the
+transaction's write-key set each hold their own copy or node. Removing
+moraine's own retained copy (above) accounted for about 8% of the total;
+after that there is nothing material left to win on this side. The cost is
+inherent to putting a key into a batch.
+
+A commit's footprint is therefore set by how many entries it stages, and a
+bulk load stages one per indexed row per index — memory proportional to the
+whole table. Tens of millions of rows ask for tens of gigabytes, and the
+failure mode is not an error but a thrash: swapping, no progress, nothing
+logged. So `stage_index_entries` refuses a commit above
+`MAX_INDEX_ENTRIES_PER_COMMIT` before doing any work, with a message naming
+the count, the limit, the memory it would have needed, and the remedy —
+split the load. The limit admits commits needing about 8 GiB.
+
+The refusal's text avoids DuckLake's four retry substrings, as the
+uniqueness rejection does: it is terminal, and re-running it reaches the
+same answer more slowly.
+
+The limit is currently a constant rather than a `CatalogOptions` field.
+Making it configurable means threading it through both commit paths and the
+FFI; that is worth doing if a caller ever has a legitimate reason to raise
+it, and is not yet justified.
 
 ### What data movement costs the index: nothing
 

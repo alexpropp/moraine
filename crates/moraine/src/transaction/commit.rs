@@ -517,8 +517,7 @@ where
             ));
         }
     }
-    index_maintenance::stage_index_entries(ReadHandle::Tx(db_tx), &index_entries, &mut writes)
-        .await?;
+    index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
 
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations

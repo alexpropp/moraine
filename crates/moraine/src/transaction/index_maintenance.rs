@@ -11,6 +11,10 @@ use std::{
     ops::Bound,
 };
 
+use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt, stream};
+use slatedb::DbTransaction;
+
 use crate::{
     error::{Error, Result},
     store::{
@@ -21,7 +25,6 @@ use crate::{
             index_value_above, index_value_body, index_value_suffix,
         },
     },
-    transaction::commit::StagedWrite,
 };
 
 /// One index-entry mutation accumulated during a commit closure, resolved
@@ -66,56 +69,160 @@ fn decode_row_id(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(array))
 }
 
-/// Resolves accumulated entries into `writes`, enforcing uniqueness at
+/// How many uniqueness probes are in flight at once. Each probe is an
+/// independent point read, so running them one after another makes a batch
+/// cost one store round-trip of latency *per entry*. Bounding the fan-out
+/// instead keeps a single commit from monopolizing the store's request
+/// budget.
+const UNIQUENESS_PROBE_CONCURRENCY: usize = 64;
+
+/// How many probes are gathered before they are run and resolved. A batch
+/// can hold millions of entries, so probes are resolved in bounded groups
+/// rather than accumulated: peak memory is this many keys, not the batch's.
+const UNIQUENESS_PROBE_GROUP: usize = 1024;
+
+/// The most entries one commit may stage.
+///
+/// Every staged key costs roughly a kilobyte of memory in the store's write
+/// path — measured, and almost none of it moraine's: the write batch, the
+/// WAL buffer's copy, the memtable's skiplist node, and the transaction's
+/// write-key set each hold their own. That is inherent to putting a key in a
+/// batch, so a commit's footprint is set by how many entries it stages and
+/// cannot be optimized away here.
+///
+/// A bulk load stages one entry per indexed row per index, so an unbounded
+/// load asks for memory proportional to the whole table — tens of gigabytes
+/// at tens of millions of rows. Past that the process does not fail, it
+/// thrashes: swapping, no progress, no error. Refusing up front turns that
+/// into an immediate, actionable message.
+///
+/// At roughly a kilobyte apiece this admits commits needing about 8 GiB.
+const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 8_000_000;
+
+/// One unique put awaiting its probe: the entry's key, the row claiming it,
+/// and the index the claim belongs to.
+type PendingProbe = (Vec<u8>, u64, u64);
+
+/// Probes one group of unique puts concurrently and stages the survivors,
+/// draining `pending`. Present with a different row id rejects the batch;
+/// present with the same row id is a re-derived entry and stages nothing.
+async fn resolve_probes(
+    db_tx: &DbTransaction,
+    deleted_unique: &HashSet<Vec<u8>>,
+    pending: &mut Vec<PendingProbe>,
+) -> Result<()> {
+    let reader = ReadHandle::Tx(db_tx);
+    let held: Vec<Option<Bytes>> = stream::iter(0..pending.len())
+        .map(|position| {
+            let key_bytes = pending[position].0.clone();
+            // A value this same batch deletes is free again, whatever the
+            // store still holds, so it needs no read at all.
+            let deleted = deleted_unique.contains(&key_bytes);
+            async move {
+                if deleted {
+                    Ok(None)
+                } else {
+                    reader.get(key_bytes).await
+                }
+            }
+        })
+        .buffered(UNIQUENESS_PROBE_CONCURRENCY)
+        .try_collect()
+        .await
+        .map_err(Error::from)?;
+
+    // Resolved in batch order, so which entry a rejection names does not
+    // depend on which probe happened to finish first.
+    for ((key_bytes, row_id, index_id), present) in pending.drain(..).zip(held) {
+        if let Some(bytes) = present {
+            if decode_row_id(&bytes)? != row_id {
+                return Err(unique_violation(index_id));
+            }
+            continue;
+        }
+        db_tx.put(key_bytes, row_id.to_be_bytes())?;
+    }
+    Ok(())
+}
+
+/// Resolves accumulated entries onto `db_tx`, enforcing uniqueness at
 /// commit. Deletes are staged first so a delete-then-reinsert of one unique
 /// value within a commit sees the value as absent. For each unique put:
 /// present with a **different** row id → [`Error::Constraint`]; present with
 /// the **same** row id → no-op (a re-derived entry); absent → staged.
 /// Duplicates within the commit are caught in memory.
+///
+/// Entries stage onto the transaction directly rather than through the
+/// caller's write list. The list is retained until the commit lands so the
+/// maintained projections can fold it, and no projection reflects an index
+/// entry — keeping one would hold a second copy of the batch's largest part
+/// in memory for nothing. A bulk load stages one entry per indexed row, so
+/// that copy is what decides whether the commit fits in RAM.
+///
+/// Unique puts stage after non-unique ones rather than in entry order. Every
+/// staged key is distinct — an entry's kind is part of its key — so only the
+/// deletes-before-puts ordering above carries meaning.
 pub(crate) async fn stage_index_entries(
-    reader: ReadHandle<'_>,
+    db_tx: &DbTransaction,
     entries: &[StagedIndexEntry],
-    writes: &mut Vec<StagedWrite>,
 ) -> Result<()> {
+    if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
+        return Err(oversized_commit(entries.len()));
+    }
+
     let mut deleted_unique: HashSet<Vec<u8>> = HashSet::new();
     for entry in entries.iter().filter(|entry| entry.delete) {
         let key_bytes = entry_key(entry).encode();
         if entry.unique {
             deleted_unique.insert(key_bytes.clone());
         }
-        writes.push((key_bytes, None));
+        db_tx.delete(key_bytes)?;
     }
 
-    let mut staged_unique: HashMap<Vec<u8>, u64> = HashMap::new();
+    // Non-unique puts stage straight away; unique puts collapse to one probe
+    // per distinct key, resolved a group at a time. Two entries claiming one
+    // value for different rows collide here, in memory, before any read.
+    let mut pending: Vec<PendingProbe> = Vec::new();
+    let mut claimed: HashMap<Vec<u8>, u64> = HashMap::new();
     for entry in entries.iter().filter(|entry| !entry.delete) {
         let key_bytes = entry_key(entry).encode();
         if !entry.unique {
             // The row id lives in the key; the value is empty.
-            writes.push((key_bytes, Some(Vec::new())));
+            db_tx.put(key_bytes, [])?;
             continue;
         }
-        if let Some(&existing) = staged_unique.get(&key_bytes) {
-            if existing != entry.row_id {
+        match claimed.get(&key_bytes) {
+            Some(&holder) if holder != entry.row_id => {
                 return Err(unique_violation(entry.index_id));
             }
-            continue;
-        }
-        let present = if deleted_unique.contains(&key_bytes) {
-            None
-        } else {
-            reader.get(key_bytes.clone()).await.map_err(Error::from)?
+            Some(_) => continue,
+            None => claimed.insert(key_bytes.clone(), entry.row_id),
         };
-        if let Some(bytes) = present {
-            if decode_row_id(&bytes)? != entry.row_id {
-                return Err(unique_violation(entry.index_id));
-            }
-            // Same row id: a re-derived entry for a rewrite file — no-op.
-            continue;
+        pending.push((key_bytes, entry.row_id, entry.index_id));
+        if pending.len() >= UNIQUENESS_PROBE_GROUP {
+            resolve_probes(db_tx, &deleted_unique, &mut pending).await?;
         }
-        writes.push((key_bytes.clone(), Some(entry.row_id.to_be_bytes().to_vec())));
-        staged_unique.insert(key_bytes, entry.row_id);
     }
-    Ok(())
+    resolve_probes(db_tx, &deleted_unique, &mut pending).await
+}
+
+/// The refusal for a commit staging more entries than
+/// [`MAX_INDEX_ENTRIES_PER_COMMIT`]. Names the count, the limit, and the
+/// remedy, because the caller's only fix is to commit less at a time.
+///
+/// Like the uniqueness rejection, the text avoids DuckLake's four retry
+/// substrings: this is terminal, and re-running it would only spend the
+/// caller's retry budget arriving at the same answer more slowly.
+fn oversized_commit(staged: usize) -> Error {
+    // A kilobyte apiece, rounded to the nearest GiB — an order-of-magnitude
+    // figure for the reader, so integer arithmetic is precise enough.
+    let gib = (staged + 512 * 1024) / (1024 * 1024);
+    Error::Constraint(format!(
+        "commit stages {staged} equality-index entries, above the \
+         {MAX_INDEX_ENTRIES_PER_COMMIT} a single commit allows; at about a kilobyte \
+         apiece in the store's write path it would need roughly {gib} GiB of \
+         memory. Split the work into several smaller commits."
+    ))
 }
 
 /// A uniqueness error. The text is free of DuckLake's four retry substrings
@@ -327,4 +434,34 @@ pub(crate) async fn null_prefix_row_ids(
         }
     }
     Ok(row_ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The oversized-commit refusal must be terminal: DuckLake re-runs a
+    /// commit whose error text carries any of four substrings, and
+    /// re-running this one only reaches the same answer more slowly.
+    #[test]
+    fn oversized_commit_refusal_avoids_ducklake_retry_substrings() {
+        let text = oversized_commit(13_400_000).to_string();
+        for substring in ["conflict", "concurrent", "unique", "primary key"] {
+            assert!(
+                !text.contains(substring),
+                "{text:?} contains DuckLake's retry substring {substring:?}"
+            );
+        }
+    }
+
+    /// It names the count, the limit, the memory it would have needed, and
+    /// the one thing the caller can do about it.
+    #[test]
+    fn oversized_commit_refusal_is_actionable() {
+        let text = oversized_commit(13_400_000).to_string();
+        assert!(text.contains("13400000"), "names the count: {text}");
+        assert!(text.contains("8000000"), "names the limit: {text}");
+        assert!(text.contains("13 GiB"), "names the memory: {text}");
+        assert!(text.contains("smaller commits"), "names the remedy: {text}");
+    }
 }
