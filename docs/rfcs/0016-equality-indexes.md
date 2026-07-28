@@ -469,56 +469,66 @@ to convert later. What `building` withholds is the *outward* surface:
 refusal, the same way it is kept everywhere else — and a unique collision
 does not fail the writer (below).
 
-**Backfill batches.** The builder covers exactly the rows live at the
-definition snapshot `S₀`; everything after `S₀` is writer-covered by the
-paragraph above, so the two sets meet with no gap. It walks the table's
-`S₀` chunk and file list in row-id order, deriving entries per the Coverage
-table (chunks by scanning, external files writer-supplied or scoped-read),
-and commits one bounded batch at a time. Each batch commit atomically
-advances a **cursor** persisted in the definition value — the last covered
-(file, row-id) watermark — so a crashed build resumes from its cursor, and
-re-derived entries land as idempotent puts (multi keys include the row id;
-unique puts hit the same-row-id no-op arm). Two builders racing the same
-build both write the definition key and collide write-write — the cursor
-serializes them mechanically. Batches are classified
-`inserted_into_table:<table_id>`: parseable vocabulary, and the correct
-semantics — benign with concurrent appends (a build must not serialize the
-table's writers), conflicting with alters (a schema change mid-build must
-re-drive the batch; column DDL on indexed columns stays refused outright).
+**Backfill batches.** The builder covers the rows live at its current
+snapshot; everything committed after the definition is writer-covered by
+the paragraph above, so the two sets meet with no gap. Each derivation
+pass assembles the whole live backfill — inline chunks by scanning,
+external files by the scoped read, delete files and inline deletes already
+applied — sorts it by row id, and streams it as bounded step commits of at
+most `BUILD_STEP_ENTRIES` entries, in row-id order. Each step atomically
+advances a **cursor** persisted in the definition value — the highest row
+id covered — so a crashed or cancelled build resumes by re-deriving and
+skipping entries at or below the watermark; re-derived entries land as
+idempotent puts (multi keys include the row id; unique puts hit the
+same-row-id no-op arm). Row-id order is what makes the single watermark
+sufficient, and the global sort is what makes per-row-id rewrite files
+(whose embedded ids interleave with dense ranges) safe to cover. The
+derivation holds the raw entry set in driver memory — two orders of
+magnitude cheaper per entry than the store's write path, so the commit
+bound's rationale does not apply; the cost is recorded rather than capped.
+Two builders racing the same build both write the definition key and
+collide write-write — the cursor serializes them mechanically. Steps carry
+the definition write, so they classify `altered_table:<table_id>` like the
+create: conservative — a step racing any same-table write surfaces a
+conflict rather than interleaving (the benign `inserted_into_table`
+refinement is recorded in Open questions).
 
-**The delete race.** A row live at `S₀` can die before its batch lands, and
-a stale entry for a dead row is corruption — for a unique index it
-manufactures false `Constraint`s. Two mechanisms close it, split by tense:
+**The delete race.** A row live at one derivation pass can die before its
+step lands, and a stale entry for a dead row is corruption — for a unique
+index it manufactures false `Constraint`s. Both tenses resolve into one
+mechanism: derivation from a fresh snapshot.
 
-- *Past deletes* (committed before the batch's snapshot): the batch excludes
-  them. The cursor carries the last snapshot scanned for deletes; each batch
-  enumerates the delete bookkeeping registered since — inline deletes name
-  row ids directly; delete files name positions, resolved to row ids by the
-  same rule the scoped read uses (embedded row-id column, else
-  `row_id_start + ordinal`). Cost is proportional to deletes-during-build,
-  never table size.
-- *Concurrent deletes* (racing the batch): the killing commit stages entry
-  removals for the building index (Coverage, in force since `S₀`) — a
-  tombstone on the same entry key the batch is putting. Same key, two
-  writers: the store's write-write detection fires, the loser re-runs, and
-  the batch's re-run sees the newer bookkeeping and excludes the row. The
-  collision that gives uniqueness its guarantee gives the build its
-  correctness.
+- *Past deletes* (committed before the pass's snapshot): excluded by
+  construction — the scoped read applies the table's delete bookkeeping,
+  so a dead row produces no entry.
+- *Concurrent deletes* (racing a step): the killing commit writes the
+  table the step's `altered_table` classification conflicts with, so the
+  loser surfaces `CommitConflict` — never an internal closure re-run that
+  would re-stage a stale batch. The driver answers a surfaced conflict by
+  re-deriving at a fresh snapshot (which excludes the newly dead rows) and
+  re-committing from the cursor.
 
 **Duplicates poison the build, not the writer.** During `building` the
-entry set is incomplete, so an absent point-get proves nothing and
-enforcement cannot be offered — but violations can still be *detected*,
-because unique keys are value-keyed from day one. Whenever a unique put
-finds an entry for a **different row id** — a backfill batch discovering a
-pre-existing duplicate, or a writer inserting a value another live row
-holds — the commit stages a terminal `poisoned` flag on the definition and
-skips the put; the writer's own rows land normally. SQL semantics for a
-concurrent build: the data's duplicate fails the *index*, not the insert. A
-poisoned build stops at the next cursor step: the driver ends the
-definition into `history` (ordinary drop, Reclamation sweeps the range) and
-surfaces `Constraint` to the `create_index` caller. Poisoning writes the
-definition key, so it conflicts with cursor advances — both re-run; the
-flag is terminal so every interleaving converges.
+entry set is incomplete, so an absent probe proves nothing and enforcement
+cannot be offered — but a violation a put *does* discover is real: the
+colliding entry belongs to a live row, because unique keys are value-keyed
+from day one. Every such collision — a backfill step finding a pre-existing
+duplicate, or a writer inserting a value another live row holds — stages a
+terminal `poisoned` flag on the definition and drops the colliding claim,
+so the live holder's entry survives; the commit that found it lands
+normally, rows and all. One rule covers both discoverers, and it is the
+partial coverage that demands it: enforcement during a build depends on how
+far the backfill has run, so failing the finder would decide which party a
+duplicate falls on by timing. A poisoned build stops at its next step: the
+driver ends the definition into `history` (ordinary drop, Reclamation
+sweeps the range) and surfaces `Constraint` to the `create_index` caller —
+the create fails, exactly as its single-commit form would have.
+
+Poisoning writes the definition key, so it conflicts with cursor advances —
+both re-run, and the flag is terminal, so every interleaving converges.
+Because the flag rides the commit's ordinary entity diff, the current
+record and its history mirror are written together and the maintained
+projections fold it like any other definition change.
 
 **The ready flip.** When the cursor reaches the end of the `S₀` set and the
 definition is not poisoned, one final commit flips `building`→`ready` —
@@ -535,11 +545,14 @@ obligation.
 once the definition commits; the host advances the build with a
 `build_index_step(index)` verb — one bounded batch per call, returning the
 cursor position or terminal state — and loops at its own pace. The
-extension path's `moraine_create_index(…, staged := true)` drives the loop
-internally in the same autonomous-commit style as the other DDL functions;
-`moraine_indexes` exposes state and cursor for progress. `drop_index` on a
-building index is an ordinary drop: the builder's next step re-runs against
-the ended definition and stops.
+extension path's `moraine_index_create(…, staged := true)` drives the loop
+internally in the same autonomous-commit style as the other DDL functions,
+returning once the index is `ready` or the build has failed. A cancelled
+or crashed call leaves the definition `building`: re-issuing the same call
+resumes from the cursor, and `moraine_index_drop` abandons the build.
+`moraine_indexes` exposes the state (`is_building`) for progress.
+`drop_index` on a building index is an ordinary drop: the builder's next
+step re-runs against the ended definition and stops.
 
 **Format.** Staged builds stamp **format 3** at the first staged
 `create_index` — lazily, like format 2. A format-2 binary would ignore the
@@ -568,7 +581,7 @@ written `…` below for brevity.
 
 | Function | Effect |
 |---|---|
-| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'])` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST |
+| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call |
 | `moraine_index_drop(…)` | end the definition (Reclamation) |
 | `moraine_index_lookup(…, v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids and holders for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
@@ -851,8 +864,11 @@ tests against real SlateDB on in-memory `object_store`:
 - **Staged duplicate poisoning.** A pre-existing duplicate discovered
   cross-batch poisons the build: the create surfaces `Constraint`, the
   definition ends, entries are reclaimed. A writer inserting a duplicate
-  during `building` lands its rows, and the build poisons instead of the
-  writer failing.
+  during `building` lands its rows — file and all — and poisons the index
+  instead of failing; the same collision against a **ready** index still
+  fails the writer, so the flip is what turns partial coverage into
+  enforcement. A duplicate within one backfill step poisons it too, rather
+  than failing the step.
 - **Staged resume and racing builders.** A builder killed mid-build resumes
   from the persisted cursor with idempotent re-puts; two builders advancing
   one build serialize on the definition key.
@@ -912,14 +928,12 @@ tests against real SlateDB on in-memory `object_store`:
 - **Oversized-value cap.** The refusal threshold for indexed value size
   (strawman: 1 KiB per composite key). Hash-overflow schemes are the
   recorded escape if a real workload needs large indexed values.
-- **Backfill batch sizing.** The staged build's batch bound and pacing
-  knobs — and whether delete-file position→row-id resolution during the
-  exclusion scan (Staged builds) is cheap enough inline or wants a small
-  per-file cache for files that received deletes mid-build.
-- ~~**Reclamation mechanics.**~~ **Resolved by RFC 0021.** SlateDB 0.14.1
-  exposes no range-delete, so the sweep is a batched scan-and-delete;
-  scheduling is the maintenance pass, configured per attach. If a
-  range-delete appears, the sweep collapses to one call per dead index.
+- **Benign build steps.** Steps classify `altered_table`, so a build
+  serializes against same-table writers (each side re-drives on conflict).
+  The `inserted_into_table` refinement — steps benign with concurrent
+  appends — needs the delete race re-examined before the classification
+  loosens, since surfaced conflicts are what force the stale-batch
+  re-derivation today.
 - **Transparent pushdown.** Whether to carry the DuckLake binder patch
   (Extension path, Future directions) that accepts `CREATE INDEX`/`PRIMARY
   KEY` and routes equality pushdown to the index. Nothing in the layout

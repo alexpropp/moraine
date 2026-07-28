@@ -10,11 +10,12 @@ use std::{
 
 use object_store::{ObjectStore, path::Path};
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
+use tracing::{info, warn};
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnId, DataFileId, DataFileInfo, FileIndexEntry, IndexEntry, IndexId,
-        IndexInfo, IndexState, RowHolder, RowLocation, SnapshotId, TableId,
+        CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo, FileIndexEntry, IndexDef,
+        IndexEntry, IndexId, IndexInfo, IndexState, RowHolder, RowLocation, SnapshotId, TableId,
         projection::ProjectionCache, scoped_read,
     },
     error::{Error, Result},
@@ -29,6 +30,36 @@ use crate::{
     },
     transaction::{Transaction, commit, index_maintenance},
 };
+
+/// How many entries one staged build step commits. At roughly a kilobyte
+/// of write-path memory apiece, a step peaks near a gigabyte.
+const BUILD_STEP_ENTRIES: usize = 1_000_000;
+
+/// How many times a staged build re-derives after losing a race before
+/// giving up.
+const BUILD_DERIVATION_ATTEMPTS: usize = 8;
+
+/// The per-column orders `orders` asks for, as a definition records them.
+/// An empty list means ascending / NULLS LAST throughout.
+fn requested_orders(orders: &[ColumnOrder], columns: usize) -> (Vec<Direction>, Vec<NullOrder>) {
+    (0..columns)
+        .map(|position| {
+            orders
+                .get(position)
+                .map_or((Direction::Ascending, NullOrder::Last), |order| {
+                    (order.direction, order.nulls)
+                })
+        })
+        .unzip()
+}
+
+/// Whether a run of build steps finished the index or lost its race.
+enum BuildProgress {
+    /// A final step flipped the index ready.
+    Ready,
+    /// A step lost its race; the backfill must be re-derived.
+    Conflicted,
+}
 
 /// What a maintenance pass should reclaim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,7 +209,7 @@ impl Catalog {
             .cache_dir(options.cache_dir.clone());
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
             .await?;
-        tracing::info!(
+        info!(
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),
             "opened catalog read-write"
@@ -209,7 +240,7 @@ impl Catalog {
         let store =
             StoreBuilder::new(&options.path, object_store).cache_dir(options.cache_dir.clone());
         let reader = commit::open_reader_initialized(store).await?;
-        tracing::info!(path = options.path, "opened catalog read-only");
+        info!(path = options.path, "opened catalog read-only");
         Ok(Self {
             store: Arc::new(Store::Reader(Arc::new(reader))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
@@ -676,6 +707,212 @@ impl Catalog {
         session.finish();
 
         outcome
+    }
+
+    /// Creates an index by a staged (multi-commit) build, driving it to
+    /// `ready` before returning — for a table whose backfill exceeds what
+    /// one commit may stage.
+    ///
+    /// The definition lands `building` in its own commit; each pass then
+    /// derives the table's live entries (external files through
+    /// `data_store`, inline rows from the catalog store), orders them by row
+    /// id, and commits them in steps of `step_entries`, defaulting to a
+    /// million. Writers maintain entries from the first commit forward.
+    ///
+    /// Interrupting the call leaves the definition `building`: calling again
+    /// with the same `def` resumes from the persisted cursor, and
+    /// [`Transaction::drop_index`](crate::Transaction::drop_index) abandons
+    /// the build. A concurrent write to the table conflicts with a step,
+    /// which re-derives at a fresh snapshot rather than staging entries for
+    /// rows the winner deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AlreadyExists`] if the table already holds a ready
+    /// index of this name, or [`Error::Constraint`] if `step_entries` is
+    /// zero, the resumed definition differs from `def`, or the rows
+    /// duplicate a unique value. A failed build drops its definition.
+    pub async fn create_index_staged(
+        &self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        data_store: Option<Arc<dyn ObjectStore>>,
+        data_prefix: &str,
+        step_entries: Option<usize>,
+    ) -> Result<IndexId> {
+        let step_entries = step_entries.unwrap_or(BUILD_STEP_ENTRIES);
+        if step_entries == 0 {
+            return Err(Error::Constraint(
+                "a staged build's step size must be at least one entry".to_owned(),
+            ));
+        }
+
+        let index = self.begin_staged_index(table, def, orders).await?;
+        let outcome = self
+            .drive_staged_build(table, def, index, data_store, data_prefix, step_entries)
+            .await;
+
+        // A build that cannot finish leaves no half-covered index behind.
+        // A cleanup that itself fails is logged, never substituted for the
+        // failure that caused it.
+        if outcome.is_err()
+            && let Err(cleanup) = self.commit(|tx| tx.drop_index(index)).await
+        {
+            warn!(
+                index = index.get(),
+                error = %cleanup,
+                "could not drop the definition of a failed staged build"
+            );
+        }
+        outcome.map(|()| index)
+    }
+
+    /// Commits the `building` definition, or adopts the one already there.
+    /// A ready definition of the same name belongs to a finished index.
+    async fn begin_staged_index(
+        &self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+    ) -> Result<IndexId> {
+        if let Some(existing) = self.snapshot().await?.index_by_name(table, &def.name) {
+            return match existing.state {
+                IndexState::Ready => Err(Error::AlreadyExists(format!(
+                    "index {} on table {table}",
+                    def.name
+                ))),
+                IndexState::Building | IndexState::Poisoned => {
+                    // Resuming adopts the stored definition, whose entries
+                    // are encoded under its own orders.
+                    let (directions, nulls) = requested_orders(orders, def.columns.len());
+                    if existing.columns != def.columns
+                        || existing.unique != def.unique
+                        || existing.directions != directions
+                        || existing.nulls != nulls
+                    {
+                        return Err(Error::Constraint(format!(
+                            "index {} on table {table} is already building over a different \
+                             definition; drop it to rebuild",
+                            def.name
+                        )));
+                    }
+                    Ok(existing.id)
+                }
+            };
+        }
+
+        let index = std::cell::Cell::new(None);
+        self.commit(|tx| {
+            let id = tx.create_index_staged_ordered(table, def, orders)?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await?;
+
+        index
+            .get()
+            .ok_or_else(|| Error::Corruption("staged create returned no index id".to_owned()))
+    }
+
+    /// Derives the live backfill and commits it in bounded steps until the
+    /// index is ready, re-deriving at a fresh snapshot after a lost race.
+    async fn drive_staged_build(
+        &self,
+        table: TableId,
+        def: &IndexDef,
+        index: IndexId,
+        data_store: Option<Arc<dyn ObjectStore>>,
+        data_prefix: &str,
+        step_entries: usize,
+    ) -> Result<()> {
+        for _ in 0..BUILD_DERIVATION_ATTEMPTS {
+            let mut entries = match &data_store {
+                Some(store) => {
+                    self.scoped_backfill_entries(
+                        Arc::clone(store),
+                        data_prefix,
+                        table,
+                        &def.columns,
+                    )
+                    .await?
+                }
+                None => Vec::new(),
+            };
+            entries.extend(self.inline_backfill_entries(table, &def.columns).await?);
+            // One watermark can describe the covered set only in row-id
+            // order, which per-row-id rewrite files would otherwise break.
+            entries.sort_unstable_by_key(|entry| entry.row_id);
+
+            if let BuildProgress::Ready = self
+                .commit_build_steps(table, index, &entries, step_entries)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(Error::CommitConflict(format!(
+            "staged build of index {index} lost its race {BUILD_DERIVATION_ATTEMPTS} times; \
+             the table is under concurrent write"
+        )))
+    }
+
+    /// Commits `entries` above the persisted cursor in steps, the last one
+    /// flipping the index ready.
+    async fn commit_build_steps(
+        &self,
+        table: TableId,
+        index: IndexId,
+        entries: &[IndexEntry],
+        step_entries: usize,
+    ) -> Result<BuildProgress> {
+        loop {
+            let cursor = self.staged_build_cursor(table, index).await?;
+            // The cursor is the highest row id covered; absent means none
+            // is, so row id 0 is still pending.
+            let pending = match cursor {
+                Some(covered) => entries.partition_point(|entry| entry.row_id <= covered),
+                None => 0,
+            };
+            let remaining = &entries[pending..];
+            let step = &remaining[..remaining.len().min(step_entries)];
+            let is_final = step.len() == remaining.len();
+
+            match self
+                .commit(|tx| tx.build_index_step(index, step, is_final).map(|_| ()))
+                .await
+            {
+                Ok(_) => {
+                    if is_final {
+                        return Ok(BuildProgress::Ready);
+                    }
+                }
+                Err(Error::CommitConflict(_)) => return Ok(BuildProgress::Conflicted),
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    /// The staged build's persisted watermark. An index that is no longer
+    /// building is refused.
+    async fn staged_build_cursor(&self, table: TableId, index: IndexId) -> Result<Option<u64>> {
+        let info = self
+            .snapshot()
+            .await?
+            .indexes_of(table)
+            .into_iter()
+            .find(|info| info.id == index)
+            .ok_or_else(|| Error::NotFound(format!("index {index}")))?;
+
+        match info.state {
+            IndexState::Building => Ok(info.build_cursor),
+            IndexState::Ready => Err(Error::Constraint(format!(
+                "index {index} finished building under this build"
+            ))),
+            IndexState::Poisoned => Err(Error::Constraint(format!(
+                "index {index} was poisoned by a duplicate value"
+            ))),
+        }
     }
 
     /// Backfill entries for a table's live **inline** rows, by scanning its

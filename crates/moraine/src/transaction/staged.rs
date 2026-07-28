@@ -25,6 +25,7 @@ use std::{
 
 use object_store::ObjectStore;
 use slatedb::DbTransaction;
+use tracing::debug;
 
 use crate::{
     catalog::{
@@ -472,7 +473,6 @@ impl StagedTransaction {
             }
         };
         let base_ref: &CatalogSnapshot = &base;
-
         // Read before any write in this commit is staged: `InlineFlushDelete`
         // /`InlineDrop` name a table, not keys, and resolve against
         // `db_tx`'s current state exactly like `base` above.
@@ -493,9 +493,26 @@ impl StagedTransaction {
                 }
             )
         });
+        // Maintain equality-index entries for any data file this commit
+        // registered on an indexed table, by scoped-reading it from
+        // `DATA_PATH`. Gated: a no-op unless a live index covers the file's
+        // table, so non-indexed writes are untouched. A Parquet file on an
+        // indexed table with no store to read it aborts the commit rather
+        // than under-covering the index. Staged before the translation so a
+        // poisoned definition rides the writes it produces.
+        let maintained =
+            stage_index_maintenance(&db_tx, base_ref, &ops, data_store.as_ref(), &data_prefix)
+                .await;
+        let poisoned = match maintained {
+            Ok(poisoned) => poisoned,
+            Err(err) => {
+                db_tx.rollback();
+                return Err(err);
+            }
+        };
 
         let translated = if mints_snapshot {
-            translate(base_ref, &ops).map(|(new_id, mut writes, snap)| {
+            translate(base_ref, &ops, &poisoned).map(|(new_id, mut writes, snap)| {
                 writes.push((
                     Key::Snapshot {
                         snapshot_id: new_id,
@@ -519,24 +536,6 @@ impl StagedTransaction {
         match translated {
             Ok((result_id, mut writes)) => {
                 writes.extend(inline_writes);
-                // Maintain equality-index entries for any data file this
-                // commit registered on an indexed table, by scoped-reading it
-                // from `DATA_PATH`. Gated: a no-op unless a live index covers
-                // the file's table, so non-indexed writes are untouched. A
-                // Parquet file on an indexed table with no store to read it
-                // aborts the commit rather than under-covering the index.
-                if let Err(err) = stage_index_maintenance(
-                    &db_tx,
-                    base_ref,
-                    &ops,
-                    data_store.as_ref(),
-                    &data_prefix,
-                )
-                .await
-                {
-                    db_tx.rollback();
-                    return Err(err);
-                }
                 if let Err(err) = commit::stage_writes(&db_tx, &writes) {
                     db_tx.rollback();
                     return Err(err);
@@ -572,7 +571,7 @@ impl StagedTransaction {
 
 /// One landed staged commit's summary event.
 fn staged_landed(result_id: u64, staged_rows: usize, started: std::time::Instant) {
-    tracing::debug!(
+    debug!(
         snapshot = result_id,
         staged_rows,
         elapsed_ms = started.elapsed().as_millis(),
@@ -584,10 +583,9 @@ fn staged_landed(result_id: u64, staged_rows: usize, started: std::time::Instant
 /// DuckLake's own loop re-drives the loser, so the log line is the only
 /// visible trace of the race.
 fn staged_lost_race(result_id: u64, staged_rows: usize) -> Error {
-    tracing::debug!(
+    debug!(
         attempted_snapshot = result_id,
-        staged_rows,
-        "staged commit lost a write-write race; DuckLake re-drives"
+        staged_rows, "staged commit lost a write-write race; DuckLake re-drives"
     );
     Error::CommitConflict(format!(
         "a concurrent commit changed state this one read or wrote \
@@ -601,6 +599,7 @@ fn staged_lost_race(result_id: u64, staged_rows: usize) -> Error {
 fn translate(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
+    poisoned: &[u64],
 ) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
     let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
@@ -687,6 +686,8 @@ fn translate(
             table.next_column_id = max_id + 1;
         }
     }
+
+    crate::transaction::index_maintenance::apply_poison(&mut state, poisoned);
 
     let mut writes = commit::diff_writes(base, &state, new_id);
     writes.extend(direct);

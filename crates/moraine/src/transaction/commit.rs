@@ -8,6 +8,7 @@ use std::{
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
@@ -220,7 +221,7 @@ pub(crate) async fn open_initialized(
     match tx.commit_with_options(&durable()).await {
         Ok(_) => {
             // Once per store, ever: the commit that created the catalog.
-            tracing::info!(encrypted, data_path, "bootstrapped a fresh catalog store");
+            info!(encrypted, data_path, "bootstrapped a fresh catalog store");
             Ok(db)
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
@@ -414,7 +415,7 @@ pub(crate) fn refresh_head_view(
             // dropping the cache is safe (the next commit rescans and
             // reinstalls) but the cause is worth a trace — a batch this
             // writer just built should always fold.
-            tracing::debug!(error = %err, "head view fold failed; clearing the cached view");
+            debug!(error = %err, "head view fold failed; clearing the cached view");
             invalidate_head_view(projections);
         }
     }
@@ -465,6 +466,39 @@ fn target_format(state: &CatalogSnapshot) -> u64 {
 
 /// Materializes, runs the closure, and stages the resulting writes.
 /// Options-only commits stage no snapshot record and no head advance.
+/// The format-stamp write this commit owes, if any. The stamp is lazy and
+/// forward-only: a completed or dropped build never downgrades it.
+async fn format_stamp(
+    db_tx: &DbTransaction,
+    state: &CatalogSnapshot,
+) -> Result<Option<StagedWrite>> {
+    let target_format = target_format(state);
+    if target_format <= FORMAT_VERSION {
+        return Ok(None);
+    }
+    let current = read::read_format(ReadHandle::Tx(db_tx))
+        .await?
+        .map_or(FORMAT_VERSION, |format| format.format_version);
+    if current >= target_format {
+        return Ok(None);
+    }
+
+    // The stamp decides which binaries can open the store from here on.
+    info!(
+        from = current,
+        to = target_format,
+        "upgrading the store format stamp"
+    );
+
+    Ok(Some((
+        Key::Sys(SysKey::Format).encode(),
+        Some(value::encode_value(&proto::FormatValue {
+            format_version: target_format,
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        })),
+    )))
+}
+
 async fn prepare_and_stage<F>(
     db_tx: &DbTransaction,
     f: &F,
@@ -475,13 +509,12 @@ where
 {
     let head = base.snapshot.snapshot_id;
     let new_id = head + 1;
-
     let mut tx = Transaction::new(base.clone(), new_id);
     f(&mut tx)?;
     let TransactionParts {
         operations,
         index_entries,
-        state,
+        mut state,
         next_catalog_id,
         next_file_id,
     } = tx.into_parts();
@@ -509,37 +542,18 @@ where
         });
     }
 
-    let mut writes = diff_writes(base, &state, new_id);
+    // Entries stage before the entity diff so a poisoned definition rides
+    // that diff rather than needing a write of its own.
+    let poisoned = index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    index_maintenance::apply_poison(&mut state, &poisoned);
 
-    // Stamp the format lazily, in the same batch, and only ever upward — a
-    // completed or dropped build never downgrades the stamp.
-    let target_format = target_format(&state);
-    if target_format > FORMAT_VERSION {
-        let current = read::read_format(ReadHandle::Tx(db_tx))
-            .await?
-            .map_or(FORMAT_VERSION, |format| format.format_version);
-        if current < target_format {
-            // Rare and consequential: the stamp is forward-only and decides
-            // which binaries can open the store from here on.
-            tracing::info!(
-                from = current,
-                to = target_format,
-                "upgrading the store format stamp"
-            );
-            writes.push((
-                Key::Sys(SysKey::Format).encode(),
-                Some(value::encode_value(&proto::FormatValue {
-                    format_version: target_format,
-                    writer_version: env!("CARGO_PKG_VERSION").to_string(),
-                })),
-            ));
-        }
-    }
-    index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    let mut writes = diff_writes(base, &state, new_id);
+    writes.extend(format_stamp(db_tx, &state).await?);
     tracing::debug!(
         snapshot = new_id,
         index_entries = index_entries.len(),
         catalog_writes = writes.len(),
+        poisoned_indexes = poisoned.len(),
         "commit staged"
     );
 
