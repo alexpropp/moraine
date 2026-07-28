@@ -1467,6 +1467,259 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
     catalog.close().await.unwrap();
 }
 
+/// Entries for `count` consecutive integer values starting at `first`,
+/// ordinals `0..count`, one indexed column.
+fn bulk_file_entries(
+    index: crate::catalog::IndexId,
+    first: i128,
+    count: u64,
+) -> Vec<crate::catalog::FileIndexEntry> {
+    (0..count)
+        .map(|ordinal| crate::catalog::FileIndexEntry {
+            index,
+            ordinal,
+            values: vec![Some(int_value(first + i128::from(ordinal)))],
+        })
+        .collect()
+}
+
+/// A data file shaped to carry `count` rows under `path`.
+fn bulk_file(path: &str, count: u64) -> crate::catalog::DataFile {
+    crate::catalog::DataFile {
+        path: path.into(),
+        path_is_relative: true,
+        file_format: "parquet".into(),
+        record_count: count,
+        file_size_bytes: count * 10,
+        footer_size: 4,
+        encryption_key: None,
+        column_stats: vec![],
+    }
+}
+
+/// A commit staging more unique entries than the merged-probe threshold
+/// resolves them in one sorted pass per index; enforcement is unchanged:
+/// fresh values land, a value a committed live row already holds aborts
+/// the whole commit, and nothing of the aborted commit remains visible.
+#[tokio::test]
+async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
+    use crate::catalog::{ColumnId, IndexDef};
+    const COUNT: u64 = 1500;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("a.parquet", COUNT), &{
+                bulk_file_entries(index, 0, COUNT)
+            })
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // A second bulk commit whose entries repeat one committed value (42,
+    // held by a live row of the first file) must abort in full.
+    let mut duplicated = bulk_file_entries(index, i128::from(COUNT), COUNT);
+    duplicated[700].values = vec![Some(int_value(42))];
+    let err = catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("b.parquet", COUNT), &duplicated)
+                .map(|_| ())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+
+    // Value 42 still resolves to the first file's row; none of the aborted
+    // commit's fresh values are visible.
+    let hits = catalog
+        .index_lookup(table, index, &[int_value(42)])
+        .await
+        .unwrap();
+    assert_eq!(sorted_row_ids(hits), vec![42]);
+    assert!(
+        catalog
+            .index_lookup(table, index, &[int_value(i128::from(COUNT) + 10)])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A fresh bulk commit after the abort lands, and both files resolve.
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("c.parquet", COUNT), &{
+                bulk_file_entries(index, i128::from(COUNT), COUNT)
+            })
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+    for probe in [0, 1499, 1500, 2999] {
+        assert_eq!(
+            catalog
+                .index_lookup(table, index, &[int_value(probe)])
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "value {probe} resolves after the fresh bulk commit"
+        );
+    }
+    catalog.close().await.unwrap();
+}
+
+/// Values killed earlier in the same bulk commit are free again for the
+/// commit's own inserts — the delete-then-reinsert contract holds above
+/// the merged-probe threshold too.
+#[tokio::test]
+async fn bulk_unique_commit_frees_values_deleted_in_the_same_commit() {
+    use crate::catalog::{ColumnId, FileIndexRemoval, IndexDef};
+    const COUNT: u64 = 1500;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    let index = std::cell::Cell::new(None);
+    let file = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            index.set(Some(id));
+            let registered = tx.register_data_file(table, bulk_file("a.parquet", COUNT), &{
+                bulk_file_entries(id, 0, COUNT)
+            })?;
+            file.set(Some(registered));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+    let file = file.get().unwrap();
+
+    // One commit: kill every first-file row (freeing its value), and
+    // register a new file re-claiming every one of those values.
+    catalog
+        .commit(|tx| {
+            let removals: Vec<FileIndexRemoval> = (0..COUNT)
+                .map(|row_id| FileIndexRemoval {
+                    index,
+                    row_id,
+                    values: vec![Some(int_value(i128::from(row_id)))],
+                })
+                .collect();
+            let mut killer = delete_file(file);
+            killer.delete_count = COUNT;
+            tx.register_delete_file(table, killer, &removals)?;
+            tx.register_data_file(table, bulk_file("b.parquet", COUNT), &{
+                bulk_file_entries(index, 0, COUNT)
+            })
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // The values resolve to the second file's rows (ids COUNT..2*COUNT).
+    let hits = catalog
+        .index_lookup(table, index, &[int_value(700)])
+        .await
+        .unwrap();
+    assert_eq!(sorted_row_ids(hits), vec![COUNT + 700]);
+    catalog.close().await.unwrap();
+}
+
+/// With two unique indexes maintained in one bulk commit, a duplicate is
+/// detected in whichever index holds it, and the error names that index.
+#[tokio::test]
+async fn bulk_commit_over_two_unique_indexes_names_the_violated_index() {
+    use crate::catalog::{ColumnId, IndexDef};
+    const COUNT: u64 = 1500;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    let by_a = std::cell::Cell::new(None);
+    let by_b = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let a = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            let b = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_b".into(),
+                    columns: vec![ColumnId::new(2)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            by_a.set(Some(a));
+            by_b.set(Some(b));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let by_a = by_a.get().unwrap();
+    let by_b = by_b.get().unwrap();
+
+    let both = |first_a: i128, first_b: i128| {
+        let mut entries = bulk_file_entries(by_a, first_a, COUNT);
+        entries.extend(bulk_file_entries(by_b, first_b, COUNT));
+        entries
+    };
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("a.parquet", COUNT), &both(0, 100_000))
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // Fresh `by_a` values, one committed duplicate among `by_b`'s.
+    let mut entries = both(i128::from(COUNT), 100_000 + i128::from(COUNT));
+    entries[usize::try_from(COUNT).unwrap() + 900].values = vec![Some(int_value(100_042))];
+    let err = catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("b.parquet", COUNT), &entries)
+                .map(|_| ())
+        })
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains(&by_b.get().to_string()) && !text.contains(&by_a.get().to_string()),
+        "the violation names the violated index: {text}"
+    );
+    catalog.close().await.unwrap();
+}
+
 /// Sets up an indexed table holding one two-row data file (values 10 and
 /// 20 at row ids 0 and 1), returning the catalog, table, index and file.
 async fn catalog_with_indexed_data_file() -> (
