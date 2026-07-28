@@ -266,6 +266,25 @@ Bootstrap is the degenerate case: creating a multi-writer store is a
 deliberate attach, and the creator is trivially the first folder,
 mirroring RFC 0004's bootstrap-as-commit.
 
+**The folder runs with the store's WAL disabled.** The slot log is the
+WAL; journaling fold batches a second time through SlateDB's WAL would
+duplicate every logged byte as WAL SSTs — doubled write amplification
+protecting nothing, since no commit ever depends on the folder's WAL:
+commits are durable at the slot PUT, fold state is re-derivable, and the
+one-durable-copy invariant holds unchanged with slots retained until the
+fold is L0-durable. So the folder sets `wal_enabled = false` (the
+`wal_disable` cargo feature, present in 0.14.1): fold batches go
+straight to memtable, durability arrives at L0 flush, and recovery is
+what it always was — a successor replays unfolded slots from the durable
+cursor, idempotently. Two consequences, neither safety-relevant: the
+durably-folded horizon is the L0 flush, so truncation lags further and
+the retained tail grows; and a fenced zombie folder discovers its
+demotion at its next L0 flush or manifest operation rather than its next
+WAL write — later, but detection latency was never load-bearing, because
+folds are idempotent. Leaving the WAL on is a tuning choice that
+shortens the retained tail at the price of double-journaling; it is
+never required.
+
 ### Truncation and GC
 
 Slot deletion is the one operation that can destroy the authoritative
