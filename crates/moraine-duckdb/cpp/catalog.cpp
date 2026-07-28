@@ -641,7 +641,17 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandl
 		if (!db.IsReadOnly()) {
 			scheduler_->Start();
 		}
+		// While this catalog lives, the handle's events push straight
+		// through the database-scoped logger as they fire — a watcher on
+		// another connection sees a running commit's diagnostics while it
+		// runs, instead of one batch (minus evictions) when it returns.
+		// Routed per handle: another attached lake's events go to its own
+		// database, not this one.
+		moraine_register_log_sink(handle_, WriteMoraineLogRecordToDatabase, &db.GetDatabase());
 	} catch (...) {
+		if (handle_ != nullptr) {
+			moraine_unregister_log_sink(handle_);
+		}
 		if (scheduler_) {
 			scheduler_->Stop();
 			scheduler_.reset();
@@ -655,6 +665,12 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandl
 }
 
 MoraineCatalog::~MoraineCatalog() {
+	// First, before the database the sink writes into can start tearing
+	// down: when unregistration returns, no push is in flight and none
+	// will follow.
+	if (handle_ != nullptr) {
+		moraine_unregister_log_sink(handle_);
+	}
 	// The thread issues SQL against this database and calls through
 	// `handle_`, so it must be stopped before either goes away.
 	if (scheduler_) {

@@ -2077,6 +2077,36 @@ void moraine_inline_file_deletes_free(struct MoraineInlineFileDeleteRow *items, 
 // unwind. It must not re-enter any `moraine_*` entry point.
 void moraine_drain_logs(MoraineLogSink sink, void *sink_ctx);
 
+// Registers `sink` as the delivery target for `handle`'s events, first
+// handing it whatever the buffer already holds from that handle so
+// nothing captured before registration is lost.
+//
+// While registered, the handle's events bypass the buffer and the
+// boundary drains — records surface as they happen, which for a long
+// commit is while the commit still runs. Other handles' events are
+// untouched: each routes to its own sink or, without one, to the buffer.
+// Registering again for the same handle replaces its sink.
+//
+// # Safety
+//
+// `handle` must be a live pointer from `moraine_attach`. `sink`, if
+// non-null, must be callable with `ctx` from any thread until
+// unregistration returns, must not unwind, must not emit `tracing`
+// events, and must not re-enter any `moraine_*` entry point.
+void moraine_register_log_sink(const struct MoraineCatalogHandle *handle,
+                               MoraineLogSink sink,
+                               void *ctx);
+
+// Removes `handle`'s sink, if one is registered. When it returns, no call
+// to that sink is in flight and none will follow — its `ctx` may be torn
+// down. The handle's later events fall back to the buffer.
+//
+// # Safety
+//
+// `handle` must be a live pointer from `moraine_attach`. Must not be
+// called from inside a sink.
+void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
+
 // Opens a staged-row transaction at the current head and writes the
 // resulting handle to `*out`.
 //

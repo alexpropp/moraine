@@ -345,33 +345,50 @@ the next drain) so diagnostics never grow without limit behind a caller
 that stops draining. `MORAINE_LOG` sets the captured level, default `info`.
 
 Events fire on the handle's tokio worker threads, where no `ClientContext`
-is in scope, so they are not written through as they happen. The shim
-drains them on the calling thread — which does hold a context — through
-`moraine_drain_logs(sink, ctx)`, and writes each record with
-`Logger::Get(context).WriteLog("moraine", level, message)`. Records carry
-DuckDB's own `LogLevel` values, so the sink forwards them unchanged, and
-appear in `duckdb_logs` under the `moraine` type after
+is in scope. While a catalog is attached, that does not delay them: the
+catalog registers a database-scoped writer
+(`Logger::Get(DatabaseInstance&)`, which is thread-safe) as its handle's
+push sink via `moraine_register_log_sink(handle, sink, ctx)`, and the
+handle's events write through it as they fire. A watcher querying
+`duckdb_logs` from another connection therefore sees a running commit's
+diagnostics while the commit runs — the stalled-commit case the logs exist
+to explain — and nothing is ever evicted while a sink is registered. The
+catalog's destructor unregisters via `moraine_unregister_log_sink(handle)`
+before the handle or the database goes away, and unregistration returning
+guarantees no push is in flight.
+
+Delivery is routed per handle, though `tracing` itself is process-global:
+each attach's runtime tags its worker threads with the handle's identity
+at spawn, the FFI `block_on` wrappers tag the calling thread per call, and
+an event is attributed to whichever handle tagged the thread it fires on.
+One process serving many attached lakes keeps their diagnostics apart —
+each lake's records surface only in its own database's `duckdb_logs`.
+Records carry DuckDB's own `LogLevel` values, so the sink forwards them
+unchanged, and appear under the `moraine` type after
 `CALL enable_logging(level => 'info', storage => 'memory')` — the default
 storage writes to stdout rather than the table. Under DuckDB's default
 `LEVEL_ONLY` mode the type string is not filtered on, so no log-type
 registration is required.
 
-The drain runs wherever events could otherwise strand, each on the thread
-that has the needed handle:
+Events with no routable sink — fired before the handle's sink registers
+(registration flushes that handle's backlog through it), after it
+unregisters, or on a thread no handle tagged — buffer instead, and the
+shim drains the buffer through `moraine_drain_logs(sink, ctx)` on threads
+that hold what each sink needs, wherever events could otherwise strand:
 
 - **`CommitTransaction`**, on every outcome — success, conflict, or
-  exhausted budget. A commit's diagnostics surface when the commit returns.
-- **`StartTransaction`**, after the snapshot resolve — the only drain a
-  read-only workload ever reaches. Events from a read path surface at the
-  next statement instead of never.
-- **`Attach`**, on both exits — the open's own events (and a failed
-  open's) would otherwise wait for a commit that a read-only attach never
-  makes.
-- **The maintenance pass**, which runs on the scheduler's own thread with
-  no `ClientContext` at all, drains through a second, database-scoped sink
-  (`Logger::Get(DatabaseInstance&)`), and closes each pass with one
-  shim-originated outcome line: `warn` naming every failed step, `info`
-  for a clean pass.
+  exhausted budget — and **`StartTransaction`**, after the snapshot
+  resolve, both writing through `Logger::Get(context)`. With push sinks
+  registered these find little to drain; they exist for the gaps around
+  registration and for unattributed events.
+- **`Attach`**, on both exits — a failed open's events would otherwise
+  wait forever, since no catalog (and so no push sink) ever exists. On
+  success, registration itself flushes the handle's backlog through the
+  new sink.
+- **The maintenance pass**, which runs on the scheduler's own thread,
+  drains through the same database-scoped writer and closes each pass with
+  one shim-originated outcome line: `warn` naming every failed step,
+  `info` for a clean pass.
 
 The sink never throws: an exception escaping into the ABI would unwind
 across the boundary, and a lost diagnostic must not fail the operation

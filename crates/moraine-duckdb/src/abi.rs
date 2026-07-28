@@ -626,7 +626,12 @@ pub unsafe extern "C" fn moraine_attach(
         // Open the store first: it is synchronous and fallible, and a bad
         // path must not cost a runtime spun up just to be torn down.
         let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
-        let runtime = new_runtime().map_err(|e| {
+        // Allocated before the runtime so its worker threads are tagged
+        // from their first instant; the guard attributes the open's own
+        // events (run below on this thread) the same way.
+        let log_id = crate::logging::allocate_handle_id();
+        let _log_guard = crate::logging::enter_handle(log_id);
+        let runtime = new_runtime(log_id).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
                 format!("failed to start tokio runtime: {e}"),
@@ -699,7 +704,7 @@ pub unsafe extern "C" fn moraine_attach(
             }
         };
 
-        let mut handle = MoraineCatalogHandle::new(runtime, catalog);
+        let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
         handle.data_store = data_store;
         handle.data_prefix = data_prefix;
         Ok(Box::new(handle))
@@ -856,7 +861,7 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     let attempt = || {
         // SAFETY: caller contract above; dropped exactly once.
         let boxed = unsafe { Box::from_raw(handle) };
-        if let Err(err) = boxed.runtime.block_on(boxed.catalog.close()) {
+        if let Err(err) = boxed.block_on(boxed.catalog.close()) {
             // Detach has no error channel, so the failed close (a final
             // flush that did not land) is logged rather than lost. The
             // event surfaces through any remaining drain point or a host
