@@ -73,13 +73,13 @@ every row below is an instance of one of them.
    dangling reference* (a catalogued path whose bytes are gone).
 
 3. **The slot PUT is the commit point and the durability point at once**
-   (RFC 0022). A commit no longer lands in a `WriteBatch` at all; it lands
-   as a conditional put against the bucket, and once that put is acked, the
-   commit is durable and discoverable by a transaction-id scan independent
-   of any later fold. So every commit-log seam resolves to exactly one of
-   two outcomes — **durable and discoverable**, or **never happened** —
-   never a state in between, and folding adds no durability of its own,
-   only a shorter future replay (E-rows below).
+   (RFC 0022). A commit lands as a conditional put on a commit slot, not in
+   a `WriteBatch`, and once that put is acked, the commit is durable and
+   discoverable by a transaction-id scan independent of any later fold. So
+   every commit-log seam resolves to exactly one of two outcomes —
+   **durable and discoverable**, or **never happened** — never a state in
+   between, and folding adds no durability of its own, only a shorter
+   future replay (E-rows below).
 
 The durability boundary is the WAL flush — or, for the commit log itself
 (RFC 0022), the slot PUT. "Inject a crash" means: stop the process at a
@@ -105,10 +105,10 @@ storage and assert. Concretely, the harness realizes a crash three ways:
   handle. No corruption of SlateDB internals and no `unsafe` is involved.
 
 - **Object-store fault injection** (the commit log, RFC 0022). The commit
-  point moved to a bucket PUT, so a crash boundary can now be a *response*,
-  not just a request: the harness wraps the object store in a decorator
-  that drops, delays, or duplicates the acknowledgement of a chosen PUT
-  while the object itself still lands — reproducing the *ambiguous* PUT the
+  point is a bucket PUT, so a crash boundary can be a *response*, not just
+  a request: the harness wraps the object store in a decorator that drops,
+  delays, or duplicates the acknowledgement of a chosen PUT while the
+  object itself still lands — reproducing the *ambiguous* PUT the
   protocol must resolve by transaction id on demand, rather than as a rare
   race. See "The object-store fault-injection seam" below and rows E1–E9.
 
@@ -166,10 +166,10 @@ and SlateDB's own split-brain guard.
 ### The object-store fault-injection seam
 
 Rows E1–E9 crash at boundaries the two knobs above cannot reach: the
-commit point is no longer a SlateDB flush but a conditional PUT against
-the bucket, so the interesting failures are now object-store
-request/response boundaries, not WAL/manifest ones. The harness adds a
-third knob: a fault-injecting `ObjectStore` decorator wrapping the
+commit point is a conditional PUT against the bucket, not a SlateDB flush,
+so the interesting failures are object-store request/response boundaries,
+not WAL/manifest ones. The harness adds a third knob: a fault-injecting
+`ObjectStore` decorator wrapping the
 in-memory store (the same shape `scoped_read.rs`'s
 `CountingStore`/`LatencyStore` already use — a real `ObjectStore`
 implementation, not a mock of one), configured to drop, delay, or
@@ -238,10 +238,10 @@ has no seam to inject at all.
 
 Under RFC 0022, the single fenced writer these rows exercise is the
 **folder** role — folding, genesis, and migration all take it, never the
-commit path, which arbitrates at the slot instead. C1/C2 remain valid for
-whichever process holds that fenced writer, folder included; row E5 below
-is the log-aware instance of the same takeover race, for the case where
-the crashing writer was also tailing the commit log.
+commit path, which arbitrates at the slot instead. C1/C2 hold for whichever
+process holds that fenced writer, folder included; row E5 below is the
+log-aware instance of the same takeover race, for the case where the
+crashing writer was also tailing the commit log.
 
 | Point | Crash seam | Post-reopen invariant |
 |---|---|---|
@@ -305,8 +305,8 @@ The matrix is exhaustive over the three invariants in Background:
 - **Every fold-side batch operation** (a fold, genesis, migration) reduces
   to A1/A2 atomicity — rows A1, A2, A3, C3, D2 instantiate it across the
   operations that could plausibly be tempted to span batches. (A3's
-  multi-tombstone `DROP` and C3's group commit are now folder-side: they
-  land as one fold batch the same way an ordinary commit's records do.)
+  multi-tombstone `DROP` and C3's group commit are folder-side: they land
+  as one fold batch the same way an ordinary commit's records do.)
 - **Every multi-step (non-batch) operation** in moraine is bytes-before /
   bytes-after a batch: inline flush (B1, B2), GC cleanup (B3, B4). There are
   no other multi-step state-changing paths — compaction (RFC 0008) reduces to
@@ -315,8 +315,8 @@ The matrix is exhaustive over the three invariants in Background:
   row is added only if RFC 0008 introduces a seam the flush rows do not
   already cover (Open questions).
 - **Every writer-lifecycle transition** is C1/C2, and **birth** is D1/D2 —
-  both now folder-role transitions under RFC 0022, with E5/E6 their
-  log-aware instances.
+  both folder-role transitions under RFC 0022, with E5/E6 their log-aware
+  instances.
 - **Every commit-log seam** (RFC 0022) reduces to the third invariant —
   durable-and-discoverable or never-happened — rows E1–E9 instantiate it
   across the commit path, the folder, truncation, and the leader role.

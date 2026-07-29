@@ -13,13 +13,13 @@ participants. The design is optimistic: a commit stages against a head read
 once, races to land, and a lost race is classified benign or true exactly as
 below — disjoint concurrent commits retry internally, and genuine conflicts
 surface as a typed error for the caller — DuckLake or the application — to
-re-drive. **Arbitration itself now lives in RFC 0022**: what was once
-SlateDB's transactional write-write conflict detection on `sys/head` is the
-commit log's conditional put — one process's slot PUT wins a round, every
-other contender re-validates and retries or conflicts. This RFC is
+re-drive. **Arbitration itself lives in RFC 0022**: head arbitration is the
+commit log's conditional put, not SlateDB's transactional write-write
+conflict detection on `sys/head` — one process's slot PUT wins a round,
+every other contender re-validates and retries or conflicts. This RFC is
 authoritative for everything arbitration does not decide: the conflict
 grammar, the benign/true matrix, retry rights per front door, id
-allocation, and schema-version tracking are unchanged by where the race
+allocation, and schema-version tracking are independent of where the race
 runs. The protocol has **two front doors** over one commit core: the
 verb/closure API of RFC 0003 (retryable internally, because moraine authors
 the mutations) and the staged-row path of RFC 0006 (never retried
@@ -86,20 +86,16 @@ transaction whose commit performs **write-write conflict detection** on the
 keys it writes; `Db::snapshot()` gives a pinned consistent read handle
 (RFC 0009); `DbReader` opens a store **read-only** without becoming a
 writer; and writer fencing is a monotonic `writer_epoch` bumped by manifest
-CAS on `Db::open`. Historically — before RFC 0022 — this protocol used that
-transaction's conflict detection on `sys/head` directly as the arbitration
-primitive across every committer: the "head CAS" was `commit()` returning a
-typed `TransactionConflict` whenever a concurrent commit had advanced the
-head first. RFC 0022 replaces that role: the object store's conditional put
-is now the arbitration primitive shared across an arbitrary number of
-committer processes, and SlateDB's transaction conflict detection is left
-doing only what it is still needed for — giving the folder one atomic write
-per folded slot, with no concurrent writer to conflict against, because
-direct store writes are the folder's monopoly. There was never a bespoke
-key-level compare-and-swap API in SlateDB, and none is needed at either
-layer: the slot's conditional put arbitrates across processes; the
-folder's one-writer invariant makes its own transaction's conflict
-detection a formality.
+CAS on `Db::open`. Arbitration comes from none of them: the object store's
+conditional put (RFC 0022) is the primitive that serializes committers, and
+it is the only one an arbitrary number of independent processes share.
+SlateDB's transaction conflict detection serves a narrower purpose — it
+gives the folder one atomic write per folded slot, with no concurrent
+writer to contend against, because direct store writes are the folder's
+monopoly. SlateDB exposes no bespoke key-level compare-and-swap API, and
+none is needed at either layer: the slot's conditional put arbitrates
+across processes; the folder's one-writer invariant makes its own
+transaction's conflict detection a formality.
 
 DuckLake allocates ids from counters: `next_catalog_id` and `next_file_id`
 live in the `ducklake_snapshot` record; `next_row_id` is **per-table** in
@@ -115,25 +111,23 @@ winner is run.
 
 ### Topology
 
-**Commits do not require the read-write `Db` at all.** RFC 0022 moves the
-commit point onto the bucket's commit log: any process can author a commit
-by racing a conditional put against the log, whether or not it holds
-SlateDB's read-write handle. Fleet multi-writer — N independent DuckDB
-processes committing concurrently with nothing beyond the bucket — is
-therefore the one supported commit topology, not an opt-in layered on top
-of a single-writer default.
+**Commits do not require the read-write `Db` at all.** The commit point is
+the bucket's commit log (RFC 0022): any process can author a commit by
+racing a conditional put against the log, whether or not it holds SlateDB's
+read-write handle. Fleet multi-writer — N independent DuckDB processes
+committing concurrently with nothing beyond the bucket — is therefore the
+one supported commit topology.
 
-**The one fenced writer that remains is the folder role, and it is not the
-commit path.** SlateDB's read-write `Db` still exists, still has exactly
-one holder at a time, and is still guarded by the same `writer_epoch`
-fencing described below — but what it does now is *fold*: tail the commit
-log and apply each won slot as one atomic `WriteBatch`, so SlateDB stays a
-faithful, queryable derived index of the log (RFC 0022). A dead folder
-cannot lose a commit — folding happens strictly after a slot is durable —
-its only symptom is a growing unfolded tail that lengthens materialization.
-Opening the folder (`Db::open` read-write) is also how genesis and RFC
-0015's structural migrations happen, for the same reason: they are the
-other operations that must write the store directly.
+**The one fenced writer is the folder role, and it is not the commit
+path.** SlateDB's read-write `Db` has exactly one holder at a time, guarded
+by the `writer_epoch` fencing described below, and its job is to *fold*:
+tail the commit log and apply each won slot as one atomic `WriteBatch`, so
+SlateDB stays a faithful, queryable derived index of the log (RFC 0022). A
+dead folder cannot lose a commit — folding happens strictly after a slot is
+durable — its only symptom is a growing unfolded tail that lengthens
+materialization. Opening the folder (`Db::open` read-write) is also how
+genesis and RFC 0015's structural migrations happen, for the same reason:
+they are the other operations that must write the store directly.
 
 Readers open the store through SlateDB's `DbReader` — a handle that
 follows the manifest, never becomes a writer, and never participates in
@@ -223,7 +217,7 @@ ends, inlined writes) and lands them atomically:
      `schema_version` (bumped or carried forward per the rule below), and
      merged `snapshot_changes`.
 
-   The set now travels as one commit's payload inside a commit-log envelope
+   The set travels as one commit's payload inside a commit-log envelope
    (RFC 0022), not directly into a SlateDB `WriteBatch`. Payload objects
    the writes reference (Parquet files, inline chunks) are durable before
    this step is attempted. `sys/head`'s advance to `N+1` is not staged here
@@ -232,8 +226,8 @@ ends, inlined writes) and lands them atomically:
 4. **Race the slot.** Head arbitration is a conditional put against the
    bucket, not a SlateDB transaction: RFC 0022 conditional-puts the
    envelope at the next log sequence. A win is committed and durable at
-   the ack — the commit is still exactly one atomic unit (RFC 0002), now
-   realized as the slot object rather than a `WriteBatch`; folding that
+   the ack — the commit is exactly one atomic unit (RFC 0002), realized as
+   the slot object rather than a `WriteBatch`; folding that
    payload into SlateDB as one atomic batch happens later, off this path,
    under the folder. A loss (`AlreadyExists`) means a concurrent commit
    took the sequence first: read the winning slot's payload (needed anyway
@@ -518,9 +512,8 @@ verb path:
   verbatim.
 - **Same commit core.** The translated records land through steps 3–4
   above: one payload, one slot race arbitrating who wins. Nothing about
-  atomicity or durability differs between the paths — durability now
-  arrives at the slot's ack rather than a SlateDB WAL flush, but it is
-  still exactly one atomic unit either way.
+  atomicity or durability differs between the paths — durability arrives at
+  the slot's ack, and a commit is exactly one atomic unit, on either path.
 - **No internal benign-race retry.** A retry on the verb path re-runs the
   closure and re-stamps ids moraine allocated. On this path there is
   nothing moraine can safely re-run: the snapshot id, `begin_snapshot`,
@@ -579,25 +572,23 @@ each member locally before racing the slot.
 ### Reader visibility after commit
 
 Step 4 makes a commit **durable** the instant the slot PUT is acked
-(RFC 0022) — durability and visibility are now the same event, unlike the
-SlateDB-manifest-mediated path this section used to describe. Every reader
-resolves the head as `DbReader` state plus tail replay past `sys/fold`
-(RFC 0022), and the tail is read fresh from the bucket on every
-materialization: there is no manifest poll interval standing between an
-acked slot and a reader observing it, because no process's flush timer
-sits in the freshness path. A reader that opened before the commit, or is
-mid-materialization, simply performs its next tail LIST and sees the new
-slot.
+(RFC 0022), and durability and visibility are the same event: nothing
+mediates between them. Every reader resolves the head as `DbReader` state
+plus tail replay past `sys/fold` (RFC 0022), and the tail is read fresh
+from the bucket on every materialization: there is no manifest poll
+interval standing between an acked slot and a reader observing it, because
+no process's flush timer sits in the freshness path. A reader that opened
+before the commit, or is mid-materialization, simply performs its next tail
+LIST and sees the new slot.
 
-Manifest staleness still matters, but for a narrower reason now: it decides
-how many slots have already been *folded* into SlateDB versus how many a
-reader must replay from the tail itself, not whether the commit is visible
-at all. A reader on a stale manifest checkpoint pays a longer replay, never
-a stale answer.
+Manifest staleness matters only narrowly: it decides how many slots have
+already been *folded* into SlateDB versus how many a reader must replay
+from the tail itself, not whether the commit is visible at all. A reader on
+a stale manifest checkpoint pays a longer replay, never a stale answer.
 
-For moraine's own committer this was always a non-issue — it holds the
-advanced head in memory and reads its own writes — and remains one. It
-matters most at the boundary where another process must observe a
+For moraine's own committer this is a non-issue — it holds the advanced
+head in memory and reads its own writes. It matters most at the boundary
+where another process must observe a
 just-returned commit: read-your-writes across processes, and folder
 takeover, where a successor folder resumes tailing from exactly the
 predecessor's `sys/fold` cursor.
@@ -698,12 +689,12 @@ the open questions below.
   and both fresh-open paths — `Db::open` and `DbReader::open` in latest
   mode — replay WALs from object storage past the manifest state. So once
   a fold batch returns, a freshly opened handle resolves the folded
-  snapshot by construction — this remains the mechanism for folded state
-  and for genesis/migration, which still write SlateDB directly. It is no
-  longer the mechanism for ordinary commit visibility, which RFC 0022
-  moved to tail replay off the slot log (see Reader visibility after
-  commit); the store-harness validation test now pins the fold-visibility
-  claim specifically, not general commit visibility.
+  snapshot by construction — the mechanism for folded state and for
+  genesis/migration, the operations that write SlateDB directly. Ordinary
+  commit visibility does not run through it at all: that is tail replay off
+  the slot log (see Reader visibility after commit). The store-harness
+  validation test pins the fold-visibility claim specifically, not general
+  commit visibility.
 
 ## Alternatives considered
 

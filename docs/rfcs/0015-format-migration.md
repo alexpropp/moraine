@@ -257,8 +257,7 @@ reasoning:
 - Migration cost (time, object-store traffic, writer occupancy) is an
   operational decision with a maintenance-window shape; the operator owns it.
 
-**Bounded `system`-only migrations auto-run on read-write attach.** This is
-the boundary the previous revision of this RFC left open, now settled: a
+**Bounded `system`-only migrations auto-run on read-write attach.** A
 migration qualifies when it is a single atomic `WriteBatch` touching only
 `system` records, with no keyspace walk and no cursor — the whole
 start/step/finish machinery above collapses to one step, so there is no
@@ -314,9 +313,9 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   reader that understands both layouts for a window — or is a drain/brief
   unavailability the permanent answer? This RFC assumes the latter and flags
   the former as unsolved.
-- **Auto-vs-explicit trigger boundary — resolved.** Settled in Trigger
-  policy: a migration auto-runs on read-write attach exactly when it is one
-  atomic `WriteBatch` over `system` records only, no keyspace walk, no
+- **Auto-vs-explicit trigger boundary — resolved.** Trigger policy states
+  the rule: a migration auto-runs on read-write attach exactly when it is
+  one atomic `WriteBatch` over `system` records only, no keyspace walk, no
   cursor — RFC 0022's format 4 migration is the first instance. Anything
   that walks the keyspace stays behind the explicit verb, regardless of how
   small it looks in practice; the boundary is about the *hazard shape* (a
