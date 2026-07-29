@@ -77,6 +77,8 @@ pub(crate) enum SysKey {
     Head,
     /// Structural-migration marker. Reserved from format v1.
     Migration,
+    /// The highest commit-slot sequence folded into the store.
+    Fold,
 }
 
 /// A live record: a temporally versioned entity, or the `current`-only
@@ -685,6 +687,7 @@ mod tests {
         assert_eq!(Key::Sys(SysKey::Format).encode(), vec![0x02, 0x02]);
         assert_eq!(Key::Sys(SysKey::Head).encode(), vec![0x02, 0x03]);
         assert_eq!(Key::Sys(SysKey::Migration).encode(), vec![0x02, 0x04]);
+        assert_eq!(Key::Sys(SysKey::Fold).encode(), vec![0x02, 0x05]);
     }
 
     #[test]
@@ -1328,6 +1331,7 @@ mod tests {
             Just(Key::Sys(SysKey::Format)),
             Just(Key::Sys(SysKey::Head)),
             Just(Key::Sys(SysKey::Migration)),
+            Just(Key::Sys(SysKey::Fold)),
             any::<u64>().prop_map(|snapshot_id| Key::Snapshot { snapshot_id }),
             arb_entity().prop_map(Key::current),
             (arb_entity(), any::<u64>()).prop_map(|(entity, end)| Key::history(entity, end)),
