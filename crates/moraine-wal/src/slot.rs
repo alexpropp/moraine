@@ -535,137 +535,126 @@ mod tests {
         assert_eq!(log.find_transaction(1, [1; 16]).await.unwrap(), Some(1));
     }
 
-    /// Forwards every operation to a real [`InMemory`] store, but reports
-    /// the `put_opts` that just landed as a transport failure: the
-    /// genuinely ambiguous outcome that a lost response produces.
-    #[derive(Debug, Default)]
-    struct LosePutResponse {
-        inner: InMemory,
+    /// Where a put fails relative to the object landing. The two cases are
+    /// indistinguishable to the caller and must resolve differently, which
+    /// is the whole reason the ambiguity rule lives in this crate.
+    #[derive(Debug, Clone, Copy)]
+    enum FaultPoint {
+        /// The object lands, then the response is lost: the ambiguous put.
+        AfterPut,
+        /// The put never reaches the store: the slot stays absent.
+        BeforePut,
     }
 
-    /// Fails `put_opts` *before* forwarding, so the slot stays absent: the
-    /// ambiguity resolves to "the put did not land".
-    #[derive(Debug, Default)]
-    struct RefusePut {
+    /// Wraps a real [`InMemory`] store and fails `put_opts` at
+    /// [`FaultPoint`] while the fault is armed; every other operation
+    /// forwards untouched.
+    #[derive(Debug)]
+    struct FaultyPut {
         inner: InMemory,
-        refusing: AtomicBool,
+        fault_point: FaultPoint,
+        armed: AtomicBool,
     }
 
-    impl RefusePut {
-        fn refusing() -> Self {
+    impl FaultyPut {
+        fn armed(fault_point: FaultPoint) -> Self {
             Self {
                 inner: InMemory::new(),
-                refusing: AtomicBool::new(true),
+                fault_point,
+                armed: AtomicBool::new(true),
             }
         }
 
-        fn accept_puts(&self) {
-            self.refusing.store(false, Ordering::Relaxed);
+        fn disarm(&self) {
+            self.armed.store(false, Ordering::Relaxed);
         }
     }
 
-    /// The transport failure both decorators report.
-    fn lost_response() -> object_store::Error {
-        object_store::Error::Generic {
-            store: "fault",
-            source: "the put's outcome is unknown".into(),
+    impl std::fmt::Display for FaultyPut {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultyPut({})", self.inner)
         }
     }
 
-    macro_rules! forwarding_store {
-        ($store:ty, $put:item) => {
-            impl std::fmt::Display for $store {
-                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    write!(f, "{}({})", stringify!($store), self.inner)
-                }
-            }
-
-            #[async_trait::async_trait]
-            impl ObjectStore for $store {
-                $put
-
-                async fn put_multipart_opts(
-                    &self,
-                    location: &Path,
-                    opts: PutMultipartOptions,
-                ) -> object_store::Result<Box<dyn MultipartUpload>> {
-                    self.inner.put_multipart_opts(location, opts).await
-                }
-
-                async fn get_opts(
-                    &self,
-                    location: &Path,
-                    options: GetOptions,
-                ) -> object_store::Result<GetResult> {
-                    self.inner.get_opts(location, options).await
-                }
-
-                fn delete_stream(
-                    &self,
-                    locations: BoxStream<'static, object_store::Result<Path>>,
-                ) -> BoxStream<'static, object_store::Result<Path>> {
-                    self.inner.delete_stream(locations)
-                }
-
-                fn list(
-                    &self,
-                    prefix: Option<&Path>,
-                ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-                    self.inner.list(prefix)
-                }
-
-                async fn list_with_delimiter(
-                    &self,
-                    prefix: Option<&Path>,
-                ) -> object_store::Result<ListResult> {
-                    self.inner.list_with_delimiter(prefix).await
-                }
-
-                async fn copy_opts(
-                    &self,
-                    from: &Path,
-                    to: &Path,
-                    options: CopyOptions,
-                ) -> object_store::Result<()> {
-                    self.inner.copy_opts(from, to, options).await
-                }
-            }
-        };
-    }
-
-    forwarding_store!(
-        LosePutResponse,
+    #[async_trait::async_trait]
+    impl ObjectStore for FaultyPut {
         async fn put_opts(
             &self,
             location: &Path,
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<PutResult> {
-            self.inner.put_opts(location, payload, opts).await?;
-            Err(lost_response())
-        }
-    );
+            if !self.armed.load(Ordering::Relaxed) {
+                return self.inner.put_opts(location, payload, opts).await;
+            }
 
-    forwarding_store!(
-        RefusePut,
-        async fn put_opts(
+            // What a lost response looks like from the caller's side: no
+            // information about whether the object exists.
+            let unknown = object_store::Error::Generic {
+                store: "fault",
+                source: "the put's outcome is unknown".into(),
+            };
+            match self.fault_point {
+                FaultPoint::AfterPut => {
+                    self.inner.put_opts(location, payload, opts).await?;
+                    Err(unknown)
+                }
+                FaultPoint::BeforePut => Err(unknown),
+            }
+        }
+
+        async fn put_multipart_opts(
             &self,
             location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            if self.refusing.load(Ordering::Relaxed) {
-                return Err(lost_response());
-            }
-            self.inner.put_opts(location, payload, opts).await
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
         }
-    );
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
 
     /// The exactly-once mechanic: a put that landed under a lost response
     /// is resolved from the log by transaction id, not guessed.
     #[tokio::test]
     async fn an_ambiguous_put_that_landed_resolves_to_won() {
-        let log = SlotLog::new(Arc::new(LosePutResponse::default()), "cat");
+        let log = SlotLog::new(Arc::new(FaultyPut::armed(FaultPoint::AfterPut)), "cat");
         let envelope = envelope_with_id([3; 16]);
         assert!(matches!(
             log.commit_slot(1, &envelope).await.unwrap(),
@@ -679,7 +668,7 @@ mod tests {
     /// still there to win on the retry.
     #[tokio::test]
     async fn an_ambiguous_put_that_never_landed_surfaces_the_transport_error() {
-        let store = Arc::new(RefusePut::refusing());
+        let store = Arc::new(FaultyPut::armed(FaultPoint::BeforePut));
         let log = SlotLog::new(store.clone(), "cat");
         let envelope = envelope_with_id([4; 16]);
 
@@ -687,7 +676,7 @@ mod tests {
         assert!(matches!(err, Error::Transport(_)), "{err}");
         assert!(log.read_slot(1).await.unwrap().is_none());
 
-        store.accept_puts();
+        store.disarm();
         assert!(matches!(
             log.commit_slot(1, &envelope).await.unwrap(),
             CommitOutcome::Won
