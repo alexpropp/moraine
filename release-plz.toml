@@ -17,13 +17,25 @@ changelog_include = ["moraine-duckdb"]
 name = "moraine-duckdb"
 # Not published to crates.io (it ships as a prebuilt .duckdb_extension), but
 # release-plz still tracks its changes so extension-only work bumps the shared
-# workspace version and opens a release PR. It keeps its own `moraine-duckdb-v*`
-# tag (release-plz uses it to detect the last released version, since there's no
-# crates.io version to compare against), but creates no GitHub release: the
-# crate's `v<version>` release and the separately built `ext-v<version>` release
-# already cover it.
+# workspace version and opens a release PR.
 release = true
 publish = false
+# `git_only` is what makes release-plz consider an unpublishable crate at all:
+# without it the crate is filtered out before any diff runs, and extension-only
+# work never bumps the version. It reads the last released version off a git tag
+# instead of the registry.
+git_only = true
+# Both crates share the workspace version, so moraine's `v<version>` tag already
+# marks the commit this crate was last released at; reuse it rather than carrying
+# a second tag that would always point at the same commit. The `ext-v<version>`
+# tag is deliberately not used here: it is hand-dispatchable for binary rebuilds,
+# so re-cutting one would move the diff baseline.
+git_tag_name = "v{{ version }}"
+# moraine creates that tag; without this release-plz would try to create it twice,
+# once per crate. Reading it for the diff is independent of this setting.
+git_tag_enable = false
+# No GitHub release of its own: the crate's `v<version>` release and the
+# separately built `ext-v<version>` release already cover it.
 git_release_enable = false
 # Its changes are folded into moraine's root changelog (changelog_include above),
 # so it writes no changelog of its own.
