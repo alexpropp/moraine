@@ -1,8 +1,8 @@
 [package]
-name = "moraine"
-description = "A SlateDB-backed catalog for DuckLake"
+name = "moraine-wal"
+description = "The commit-slot log protocol behind moraine's multi-writer catalog"
 readme = "../../README.md"
-keywords = ["duckdb", "ducklake", "slatedb", "catalog", "lakehouse"]
+keywords = ["commit-log", "object-store", "concurrency", "protocol"]
 categories = ["database-implementations"]
 version.workspace = true
 edition.workspace = true
@@ -11,19 +11,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arrow = { workspace = true, features = ["ipc"] }
-bytes = { workspace = true }
 futures = { workspace = true }
-moraine-wal = { workspace = true }
 object_store = { workspace = true }
-parquet = { workspace = true }
 prost = { workspace = true }
-slatedb = { workspace = true }
-storekey = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
-tracing = { workspace = true }
-uuid = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
@@ -31,7 +22,6 @@ protox = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-object_store = { workspace = true, features = ["aws"] }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -134,6 +134,15 @@ pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue
     read_singleton(handle, Key::Sys(SysKey::Head)).await
 }
 
+/// Reads the fold cursor; `None` on a store that has never been
+/// multi-writer.
+// dead_code: written and read by the fold loop, which lands with the
+// slot-backed commit path.
+#[allow(dead_code)]
+pub(crate) async fn read_fold(handle: ReadHandle<'_>) -> Result<Option<moraine_wal::FoldValue>> {
+    read_singleton(handle, Key::Sys(SysKey::Fold)).await
+}
+
 /// One snapshot record.
 pub(crate) async fn read_snapshot(
     handle: ReadHandle<'_>,
@@ -373,6 +382,36 @@ mod tests {
         }));
         let history = scan_history_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(history, vec![EntityRecord::Schema(ended)]);
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// The fold cursor reads back like any other singleton, and a store
+    /// that has never been multi-writer has none.
+    #[tokio::test]
+    async fn fold_cursor_reads_back_and_is_absent_by_default() {
+        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert_eq!(read_fold(ReadHandle::Tx(&tx)).await.unwrap(), None);
+        tx.rollback();
+
+        let fold = moraine_wal::FoldValue { folded_sequence: 9 };
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(Key::Sys(SysKey::Fold).encode(), value::encode_value(&fold))
+            .unwrap();
+        tx.commit_with_options(&WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert_eq!(read_fold(ReadHandle::Tx(&tx)).await.unwrap(), Some(fold));
         tx.rollback();
         db.close().await.unwrap();
     }

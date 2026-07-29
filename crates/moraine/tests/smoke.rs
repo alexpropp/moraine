@@ -34,6 +34,33 @@ fn commit_conflict_keeps_the_retry_substring() {
     );
 }
 
+/// The commit-slot log's failures cross into moraine's error type: an
+/// unreachable log is terminal — not a conflict — so its text carries none
+/// of the four substrings either; a corrupt slot is corruption.
+#[test]
+fn slot_log_errors_map_and_avoid_ducklake_retry_substrings() {
+    let transport = Error::from(moraine_wal::Error::Transport(
+        "slot 4: timed out".to_string(),
+    ));
+    assert_eq!(
+        transport.to_string(),
+        "commit-slot log unavailable: slot 4: timed out"
+    );
+    for substring in ["conflict", "concurrent", "unique", "primary key"] {
+        assert!(
+            !transport.to_string().contains(substring),
+            "{transport} contains DuckLake's retry substring {substring:?}"
+        );
+    }
+
+    assert!(matches!(
+        Error::from(moraine_wal::Error::Corruption(
+            "slot: bad magic".to_string()
+        )),
+        Error::Corruption(_)
+    ));
+}
+
 #[test]
 fn logical_errors_display_context() {
     assert_eq!(

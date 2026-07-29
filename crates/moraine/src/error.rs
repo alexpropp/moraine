@@ -57,9 +57,32 @@ pub enum Error {
     #[error("writer fenced: {0}")]
     Fenced(String),
 
+    /// The commit-slot log could not be reached: a slot put or read failed,
+    /// and a put's outcome may be unknown.
+    ///
+    /// Like [`Error::RetryBudgetExhausted`], the text carries none of the
+    /// four substrings DuckLake's commit loop keys its retry decision on —
+    /// an unreachable bucket is not a conflict, and re-driving the
+    /// transaction against the same unreachable bucket would only fail
+    /// again.
+    #[error("commit-slot log unavailable: {0}")]
+    SlotLog(String),
+
     /// The underlying store failed (SlateDB / object-store I/O).
     #[error("store error")]
     Store(#[source] Box<slatedb::Error>),
+}
+
+impl From<moraine_wal::Error> for Error {
+    fn from(err: moraine_wal::Error) -> Self {
+        match err {
+            moraine_wal::Error::Transport(message) => Self::SlotLog(message),
+            moraine_wal::Error::Corruption(message) => Self::Corruption(message),
+            // The wal error type is `#[non_exhaustive]`: an unrecognized
+            // failure is a log failure, never silently retryable.
+            other => Self::SlotLog(other.to_string()),
+        }
+    }
 }
 
 impl From<slatedb::Error> for Error {

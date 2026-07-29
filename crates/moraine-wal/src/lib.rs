@@ -1,0 +1,113 @@
+//! A commit log that lives in a bucket: totally ordered, immutable slots
+//! under `<root>/commits/`, one object per sequence, each written exactly
+//! once with a create-if-absent conditional put.
+//!
+//! The conditional put is the entire arbitration mechanism. Exactly one
+//! committer can win each sequence, however many race it — no lock, no
+//! lease, no coordinator. Everything above that is optimization.
+//!
+//! This crate owns the *shape* of the protocol: sequence naming, the
+//! envelope wire format, winning and losing a race, resolving a put whose
+//! outcome is unknown, enumerating and truncating the tail. It owns none of
+//! the *meaning*: a payload's keys and values are opaque bytes, and its
+//! [`changes_made`](SlotPayload::changes_made) classification is opaque
+//! text. What they signify belongs to whatever embeds the log.
+//!
+//! # A worked example
+//!
+//! Win a slot, lose the next race to another committer, then replay the
+//! tail into a byte-level view:
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use moraine_wal::{Commit, CommitOutcome, Envelope, Overlay, SlotLog, SlotPayload, SlotWrite};
+//! # use object_store::memory::InMemory;
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+//! let log = SlotLog::new(Arc::new(InMemory::new()), "catalog");
+//!
+//! // One commit: a batch of writes, the head it was validated against, and
+//! // a committer-minted id.
+//! let commit = |id: u8, value: &[u8]| Envelope {
+//!     commits: vec![Commit {
+//!         transaction_id: [id; 16],
+//!         payload: SlotPayload {
+//!             validated_head: 0,
+//!             changes_made: "created_table".to_string(),
+//!             writes: vec![SlotWrite {
+//!                 key: b"orders".to_vec(),
+//!                 value: Some(value.to_vec()),
+//!             }],
+//!         },
+//!     }],
+//! };
+//!
+//! // The first committer to put slot 1 wins it.
+//! let won = log.commit_slot(1, &commit(1, b"first")).await?;
+//! assert_eq!(won, CommitOutcome::Won);
+//!
+//! // A second committer racing the same slot loses, and gets the winner
+//! // back — a loser always needs it, because rebasing is mandatory work.
+//! let lost = log.commit_slot(1, &commit(2, b"second")).await?;
+//! match &lost {
+//!     CommitOutcome::Lost(winner) => assert!(winner.contains_transaction([1; 16])),
+//!     CommitOutcome::Won => panic!("slot 1 was already taken"),
+//! }
+//!
+//! // Rebased onto slot 2, it wins.
+//! log.commit_slot(2, &commit(2, b"second")).await?;
+//!
+//! // Replay: the contiguous run from sequence 1, folded last-writer-wins.
+//! let tail = log.read_tail(1).await?;
+//! assert_eq!(tail.slots.len(), 2);
+//! assert_eq!(tail.gap_at, None);
+//!
+//! let mut overlay = Overlay::default();
+//! for (_, envelope) in &tail.slots {
+//!     overlay.absorb(envelope);
+//! }
+//! assert_eq!(overlay.get(b"orders"), Some(Some(b"second".as_slice())));
+//! # Ok::<(), moraine_wal::Error>(()) }).unwrap();
+//! ```
+//!
+//! # Two mechanics worth knowing before you embed this
+//!
+//! **An ambiguous put resolves from the log, never by guessing.** A
+//! conditional put whose *response* is lost is indistinguishable, from the
+//! caller's side, from one that never landed. [`SlotLog::commit_slot`]
+//! settles it by re-reading the slot: an envelope carrying any of the
+//! attempt's transaction ids means the put landed and this commit won; a
+//! different envelope means it lost; an absent slot means the put genuinely
+//! did not land, and the transport error surfaces. That is why transaction
+//! ids are envelope structure rather than payload — the mechanic needs them,
+//! and interprets nothing else.
+//!
+//! **A hole is damage, not an ending.** [`SlotLog::read_tail`] serves the
+//! contiguous run from the requested sequence, but a sequence absent while
+//! *higher* sequences exist means a slot was destroyed outside the protocol.
+//! It is reported as [`Tail::gap_at`], and an embedder must refuse: serving
+//! the prefix would hide committed state and let the next committer re-win
+//! that sequence, forking history behind every process still replaying.
+//! Sequences *below* the requested one are never inspected, so a
+//! legitimately truncated prefix reads as no hole.
+//!
+//! # Layering
+//!
+//! - `slot` — the log: sequence naming, the race, the tail, truncation.
+//! - `envelope` — a slot's content, its codec, and the overlay a tail folds
+//!   into.
+//! - `frame` — the magic and encoding version every slot object opens with.
+//!
+//! The crate spawns no threads, reads no clock, and schedules nothing: every
+//! call is one bounded piece of work the host drives. Safety here is
+//! sequence-ordinal, never temporal.
+
+mod envelope;
+mod error;
+mod frame;
+mod proto;
+mod slot;
+
+pub use envelope::{Commit, Envelope, Overlay, SlotPayload, SlotWrite};
+pub use error::Error;
+pub use proto::FoldValue;
+pub use slot::{CommitOutcome, SlotLog, SlotRace, Tail};
