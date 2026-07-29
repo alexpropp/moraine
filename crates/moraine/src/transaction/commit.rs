@@ -150,6 +150,7 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
         }),
     )?;
     stage(
@@ -577,6 +578,7 @@ where
         commit_message: None,
         commit_extra_info: None,
         schema_changed_table_ids,
+        transaction_id: None,
     };
     writes.push((
         Key::Snapshot {

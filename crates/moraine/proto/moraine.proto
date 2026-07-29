@@ -330,6 +330,8 @@ message SnapshotValue {
   optional string commit_message = 9;
   optional string commit_extra_info = 10;
   repeated uint64 schema_changed_table_ids = 11;
+  // Committer-minted id of the commit that minted this snapshot; set only on multi-writer stores.
+  optional bytes transaction_id = 12;
 }
 
 // ducklake_files_scheduled_for_deletion.

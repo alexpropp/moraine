@@ -952,5 +952,6 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         commit_message,
         commit_extra_info,
         schema_changed_table_ids,
+        transaction_id: None,
     })
 }
