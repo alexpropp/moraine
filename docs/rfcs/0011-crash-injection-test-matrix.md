@@ -273,7 +273,7 @@ leaves a torn genesis for the loser (or a reader) to observe.
 
 ### E. The commit log and the folder — RFC 0022
 
-The commit point moved to the bucket, so this group's crash seams are PUT
+The commit point is a bucket PUT, so this group's crash seams are PUT
 boundaries rather than SlateDB WAL/manifest boundaries — realized with the
 object-store fault-injection seam above. Every row resolves to exactly one
 of two outcomes, never a state in between: **durable and discoverable** (a
