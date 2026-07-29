@@ -145,12 +145,22 @@ Other subspaces:
 
 | Subspace/kind | Key components | Contents |
 |---|---|---|
-| `sys/format` | — | Layout format version (this RFC = 1), moraine version that wrote it |
-| `sys/head` | — | Latest committed `snapshot_id` |
+| `sys/format` | — | Layout format version (this RFC = 1; the commit log bumps it to 4 — RFC 0022), moraine version that wrote it |
+| `sys/head` | — | Latest committed `snapshot_id`, as folded (RFC 0022: the true head is this plus replay of any commit-log slots past `sys/fold`) |
 | `sys/migration` | — | Structural-migration marker (RFC 0015): `{from_format, to_format, cursor}`, present only mid-migration. **Reserved from format v1**: every materialization checks it and refuses a mid-migration store (RFC 0009) — the check must predate the first migration ever run. |
+| `sys/fold` | — | Highest commit-log sequence folded into this store (RFC 0022). Absent reads as 0. Advanced only by the folder, in the same atomic batch as the slot's records — RFC 0002's one-commit-one-batch invariant extended to a fold. |
 | `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together) |
 | `current/gcfile` | `data_file_id` | `ducklake_files_scheduled_for_deletion` — keyed by the scheduled file's id, the row's identity in DuckLake's own schema (inserts carry it, cleanup deletes by it); unique because a file's catalog rows are removed in the same transaction that schedules it, so no moraine-allocated id or counter exists (RFC 0007) |
 | `inline/*` | `table_id, schema_version, …` | Reserved — RFC 0005 |
+
+**The commit log is not a subspace.** RFC 0022's log lives at the bucket
+prefix `commits/<seq>` — plain objects addressed directly by the object
+store, written once each with a conditional put. It shares the bucket with
+this keyspace but not the keyspace itself: `commits/<seq>` is never a `Key`
+variant, never touches the segment extractor above, and is never read or
+written through SlateDB at all. A reader looking for the log's home in the
+`Key` enum will not find one; `sys/fold` is this keyspace's only trace of
+the log's existence.
 
 Two mapping conventions apply throughout: **1:1 side tables merge** into
 their parent record, and **pure child tables with no independent lifecycle
@@ -201,12 +211,13 @@ correct rows.
 ### Atomicity invariant
 
 One DuckLake catalog commit — snapshot record, head-pointer update, every
-entity insert/end it implies — is **exactly one SlateDB `WriteBatch`**. No
-commit spans batches or depends on read-modify-write across them. Batches
-are atomic, so a crash leaves the whole commit or none; one commit ≈ one
-durable WAL flush. RFC 0004 builds on this invariant; the layout
-guarantees it is *possible* — every mutation a commit needs is puts and
-deletes at statically computable keys.
+entity insert/end it implies — is **exactly one atomic unit**: no commit
+spans units or depends on read-modify-write across them. RFC 0022 realizes
+that unit as one commit-log slot at commit time and, later, one SlateDB
+`WriteBatch` when the folder applies it — atomic either way, so a crash
+leaves the whole commit or none. RFC 0004 builds on this invariant; the
+layout guarantees it is *possible* — every mutation a commit needs is puts
+and deletes at statically computable keys.
 
 ### Property-test obligations
 

@@ -37,7 +37,9 @@ any of this machinery.
   and resumes from a durable cursor, never losing catalog state and never
   exposing a half-migrated store to a reader.
 - A structural rewrite is **operator-triggered**, not a silent side effect of
-  opening a store in production.
+  opening a store in production — except a bounded `system`-only migration
+  (Trigger policy), which auto-runs on read-write attach as a deliberate,
+  narrow exception.
 
 Non-goals:
 
@@ -112,13 +114,16 @@ value encoding, lifted to the structural level.
 ### Single-writer migration
 
 A structural migration is a sequence of writes, so it runs under the **one
-fenced writer** (RFC 0004). This is not new machinery: SlateDB's
-`writer_epoch` CAS-on-open means a second process attempting to migrate the
-same store is fenced — it loses the epoch and writes nothing (RFC 0011, C-rows).
-So **exactly one migrator runs**, by the same guarantee that makes an
-accidental second catalog writer safe. Readers, meanwhile, must never observe
-a half-migrated store; the resume protocol below is structured so the only
-externally visible flip of `sys/format` is atomic and last.
+fenced writer** (RFC 0004; under RFC 0022's commit log, the fenced writer
+performing it is the folder role — migration is folder-role work, like
+fold and genesis, because all three write the store directly). This is not
+new machinery: SlateDB's `writer_epoch` CAS-on-open means a second process
+attempting to migrate the same store is fenced — it loses the epoch and
+writes nothing (RFC 0011, C-rows). So **exactly one migrator runs**, by the
+same guarantee that makes an accidental second catalog writer safe.
+Readers, meanwhile, must never observe a half-migrated store; the resume
+protocol below is structured so the only externally visible flip of
+`sys/format` is atomic and last.
 
 ### Crash-safe resumable migration
 
@@ -234,10 +239,16 @@ Rollback as a first-class, automatic operation is an Open question below.
 
 ### Trigger policy
 
-A structural rewrite is heavyweight — it rewrites the keyspace and takes the
-single writer for its duration. It is therefore gated behind **explicit
-operator opt-in**: a dedicated verb/flag (e.g. a `migrate` operation, distinct
-from ordinary attach), **not** a silent auto-run on open. The reasoning:
+Migrations split into two classes by whether they carry the rolling-fleet
+surprise the previous section warns about, and each class has its own
+trigger.
+
+**Keyspace-walking migrations stay operator-triggered.** A rewrite that
+touches entity keys is heavyweight, unbounded in the size of the catalog,
+and takes the fenced writer for its duration. It is gated behind **explicit
+operator opt-in**: a dedicated verb/flag (e.g. a `migrate` operation,
+distinct from ordinary attach), **not** a silent auto-run on open. The
+reasoning:
 
 - An unbounded rewrite triggered implicitly by "someone opened the store with
   a newer binary" can surprise a rolling fleet — the first upgraded node to
@@ -246,11 +257,26 @@ from ordinary attach), **not** a silent auto-run on open. The reasoning:
 - Migration cost (time, object-store traffic, writer occupancy) is an
   operational decision with a maintenance-window shape; the operator owns it.
 
-The boundary: a **trivial metadata migration** (bounded, O(1)-ish, e.g.
-rewriting only the `system` records with no keyspace walk) *could* auto-run on
-open, because it carries none of the surprise. Where exactly that boundary
-sits — what qualifies as "trivial enough to auto-run" — is an Open question.
-The default is explicit.
+**Bounded `system`-only migrations auto-run on read-write attach.** This is
+the boundary the previous revision of this RFC left open, now settled: a
+migration qualifies when it is a single atomic `WriteBatch` touching only
+`system` records, with no keyspace walk and no cursor — the whole
+start/step/finish machinery above collapses to one step, so there is no
+half-migrated intermediate a rolling reader could ever observe. RFC 0022's
+format 4 migration is the exemplar, and so far the only member: converting
+a format 1–3 store writes `sys/format = 4` and `sys/fold = 0` in one batch
+— the existing store already *is* the folded state and the commit log
+starts empty, so there is nothing else to rewrite. It auto-runs the moment
+any process attaches read-write, exactly as bootstrap (RFC 0004) auto-runs
+on first open: opening the writer to migrate fences any incumbent
+old-binary writer, safe by RFC 0004's fencing and called out in release
+notes. Read-only attaches never trigger it and need not: an absent
+`sys/fold` reads as 0 with an empty tail, so a format 1–3 store served
+read-only is already a valid (empty) slot store. A future bounded
+`system`-only migration gets the same trigger for the same reason; a
+migration that walks the keyspace does not, no matter how small it looks
+in the moment — the rolling-fleet hazard above is what gates it, not row
+count.
 
 ### Test obligations
 
@@ -288,10 +314,14 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   reader that understands both layouts for a window — or is a drain/brief
   unavailability the permanent answer? This RFC assumes the latter and flags
   the former as unsolved.
-- **Auto-vs-explicit trigger boundary.** Precisely which migrations are
-  "trivial" enough to auto-run on open (bounded `system`-only rewrites) versus
-  requiring the explicit verb. Getting this wrong in the permissive direction
-  reintroduces the rolling-fleet surprise.
+- **Auto-vs-explicit trigger boundary — resolved.** Settled in Trigger
+  policy: a migration auto-runs on read-write attach exactly when it is one
+  atomic `WriteBatch` over `system` records only, no keyspace walk, no
+  cursor — RFC 0022's format 4 migration is the first instance. Anything
+  that walks the keyspace stays behind the explicit verb, regardless of how
+  small it looks in practice; the boundary is about the *hazard shape* (a
+  half-migrated intermediate a rolling reader could observe), not row
+  count.
 - **Encrypted stores ([RFC 0014](0014-encryption.md)) pose no constraint.**
   Catalog-at-rest encryption is delegated to object-store SSE, so a migrator
   always sees plaintext values through the store client. RFC 0014 rejected
@@ -316,8 +346,8 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   upgraded node to attach begins rewriting the keyspace under every
   still-running old-binary reader, surprising a rolling fleet and coupling an
   operational decision to an incidental attach. Explicit opt-in makes the
-  cost and timing owned. (Trivial `system`-only migrations are the noted
-  exception — Open questions.)
+  cost and timing owned. (Bounded `system`-only migrations are the settled
+  exception — see Trigger policy.)
 - **Lazy / online per-key migration on read.** Translate old keys to the new
   layout on the fly, forever, the way axis 1 translates old *values*.
   Rejected for key structure specifically: it leaves the store **permanently

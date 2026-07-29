@@ -34,9 +34,9 @@ rather than relying on whichever cases an author happened to imagine.
 Non-goals:
 
 - **New protocol.** This RFC invents no mechanism. It tests the atomicity,
-  fencing, and ordering invariants already specified in RFCs 0002–0008. If a
-  row here cannot be made to pass, the bug is in the referenced RFC's
-  implementation, not in this one.
+  fencing, and ordering invariants already specified in RFCs 0002–0008 and
+  0022. If a row here cannot be made to pass, the bug is in the referenced
+  RFC's implementation, not in this one.
 - **Fuzzing / randomized fault injection.** RFC 0001 reserves `cargo-fuzz`
   for `store` codecs and the read path as future work. This matrix is
   enumerated and deterministic; a randomized fault-injection harness that
@@ -49,13 +49,14 @@ Non-goals:
 
 ## Background: what "crash" means in moraine
 
-Two invariants from earlier RFCs define the entire crash surface, and every
-row below is an instance of one of them.
+Three invariants from earlier RFCs define the entire crash surface, and
+every row below is an instance of one of them.
 
 1. **One commit = one `WriteBatch` = one durable WAL flush** (RFC 0002,
-   "Atomicity invariant"; RFC 0004, step 4). SlateDB batches are atomic: a
-   crash leaves either the whole batch or none of it. So *within* a single
-   commit there is no torn state to test — the only two observable outcomes
+   "Atomicity invariant"; RFC 0004, step 4) — for the folder's own writes:
+   folding, genesis, and migration. SlateDB batches are atomic: a crash
+   leaves either the whole batch or none of it. So *within* a single fold
+   batch there is no torn state to test — the only two observable outcomes
    are "flush landed" and "flush did not." The interesting crash points are
    therefore **not inside a batch** but at the **seams between a batch and
    the non-batch work around it**: the object-store PUTs that precede a flush
@@ -71,9 +72,19 @@ row below is an instance of one of them.
    *resumable* record (reference whose bytes still exist) — never a *live
    dangling reference* (a catalogued path whose bytes are gone).
 
-The durability boundary is the WAL flush. "Inject a crash" means: stop the
-process at a chosen seam without a graceful close, then reopen the store from
-object storage and assert. Concretely, the harness realizes a crash two ways:
+3. **The slot PUT is the commit point and the durability point at once**
+   (RFC 0022). A commit no longer lands in a `WriteBatch` at all; it lands
+   as a conditional put against the bucket, and once that put is acked, the
+   commit is durable and discoverable by a transaction-id scan independent
+   of any later fold. So every commit-log seam resolves to exactly one of
+   two outcomes — **durable and discoverable**, or **never happened** —
+   never a state in between, and folding adds no durability of its own,
+   only a shorter future replay (E-rows below).
+
+The durability boundary is the WAL flush — or, for the commit log itself
+(RFC 0022), the slot PUT. "Inject a crash" means: stop the process at a
+chosen seam without a graceful close, then reopen the store from object
+storage and assert. Concretely, the harness realizes a crash three ways:
 
 - **Seam crash** (multi-step paths). The test drives the operation up to a
   named seam — e.g. issues the Parquet PUTs of a flush but not the commit
@@ -92,6 +103,14 @@ object storage and assert. Concretely, the harness realizes a crash two ways:
   the WAL durable. The in-memory `object_store` is the sole arbiter of
   durability: a batch that never reached it is invisible to a freshly opened
   handle. No corruption of SlateDB internals and no `unsafe` is involved.
+
+- **Object-store fault injection** (the commit log, RFC 0022). The commit
+  point moved to a bucket PUT, so a crash boundary can now be a *response*,
+  not just a request: the harness wraps the object store in a decorator
+  that drops, delays, or duplicates the acknowledgement of a chosen PUT
+  while the object itself still lands — reproducing the *ambiguous* PUT the
+  protocol must resolve by transaction id on demand, rather than as a rare
+  race. See "The object-store fault-injection seam" below and rows E1–E9.
 
 A crash is thus identified by a `CrashPoint` — a stable enum whose variants
 are exactly the rows below. A `#[cfg(any(test, feature = "fault-injection"))]`
@@ -144,6 +163,38 @@ then have the still-live A attempt its flush/commit and assert it fails
 **fenced**, writing nothing (C2). No injected fault — just two real handles
 and SlateDB's own split-brain guard.
 
+### The object-store fault-injection seam
+
+Rows E1–E9 crash at boundaries the two knobs above cannot reach: the
+commit point is no longer a SlateDB flush but a conditional PUT against
+the bucket, so the interesting failures are now object-store
+request/response boundaries, not WAL/manifest ones. The harness adds a
+third knob: a fault-injecting `ObjectStore` decorator wrapping the
+in-memory store (the same shape `scoped_read.rs`'s
+`CountingStore`/`LatencyStore` already use — a real `ObjectStore`
+implementation, not a mock of one), configured to drop, delay, or
+duplicate the *response* to a chosen PUT while still letting the *request*
+land. That is what makes the ambiguous PUT — the slot object is written,
+but the caller never learns it — reproducible on demand rather than a rare
+race: the decorator commits the write and then discards the
+acknowledgement, so the test can assert the recovering committer resolves
+the outcome by re-reading the slot and matching its own transaction id,
+exactly as the protocol requires it to.
+
+The commit-log protocol itself is tested lower still, independent of
+SlateDB entirely: deterministic simulation over `moraine-wal` runs the
+same fault-injecting `ObjectStore` against toy `Committer`/`CursorStore`
+implementations (a `Vec`-backed cursor store, a counter committer — no
+catalog semantics, no DuckLake), driving `commit_slot`, `read_tail`, and
+`truncate_through` through every interleaving a seed selects. A seed fixes
+the schedule and the fault points, so a failure reproduces exactly by
+re-running its seed, and a sweep over many seeds is the practical
+stand-in for exhaustive interleaving coverage. This is where the
+wal-level mechanics behind E1–E9 (the race, ambiguous-put resolution, hole
+detection, truncation's two bounds) are actually discharged; the rows
+below are the moraine-level (catalog-aware) instance of each, exercised
+against real SlateDB on in-memory `object_store` with the same decorator.
+
 ## Design: the matrix
 
 Rows are grouped by path. Each has a stable name, the seam where the process
@@ -185,6 +236,13 @@ has no seam to inject at all.
 
 ### C. Writer lifecycle and fencing — RFC 0004 topology / RFC 0002 fenced writer
 
+Under RFC 0022, the single fenced writer these rows exercise is the
+**folder** role — folding, genesis, and migration all take it, never the
+commit path, which arbitrates at the slot instead. C1/C2 remain valid for
+whichever process holds that fenced writer, folder included; row E5 below
+is the log-aware instance of the same takeover race, for the case where
+the crashing writer was also tailing the commit log.
+
 | Point | Crash seam | Post-reopen invariant |
 |---|---|---|
 | **C1** `TakeoverMidCommit` | Writer A dies mid-commit; writer B opens the store and takes over (SlateDB epoch fence) | B reads a consistent head. If A's flush had not landed, B sees `sys/head` = `N` and A's batch is invisible (⇒ A1 under a second writer). If A's flush *had* landed, B sees `N+1` and continues from there. No split-brain, no partial-A visibility. |
@@ -213,14 +271,42 @@ conflict but a benign "someone beat me to genesis" race.
 D2 forces genesis itself under the one-batch rule so that D1's winner never
 leaves a torn genesis for the loser (or a reader) to observe.
 
+### E. The commit log and the folder — RFC 0022
+
+The commit point moved to the bucket, so this group's crash seams are PUT
+boundaries rather than SlateDB WAL/manifest boundaries — realized with the
+object-store fault-injection seam above. Every row resolves to exactly one
+of two outcomes, never a state in between: **durable and discoverable** (a
+transaction-id scan finds the commit, in the tail or already folded) or
+**never happened** (no trace anywhere, and nothing was ever visible).
+
+| Point | Crash seam | Post-reopen invariant |
+|---|---|---|
+| **E1** `PayloadBeforeSlot` | Payload objects (Parquet files, inline chunks) are durable, the slot PUT is never attempted | Never happened: no committer scan of the tail or the folded state finds a matching transaction id in any slot. The payload is an orphan, reclaimed by RFC 0007's expiry sweep like any unreferenced write. |
+| **E2** `SlotAckLost` (the ambiguous PUT) | The slot object lands at the object store, but the PUT's success response never reaches the committer | Durable and discoverable: a re-read of the slot resolves the outcome by the committer's own transaction id (RFC 0022). A retry that finds its id already landed reports success without a second attempt; a retry that finds nothing there raced and lost cleanly. |
+| **E3** `FolderCrashMidBatch` | The folder crashes after tailing a slot into memory but before its fold `WriteBatch` (which also advances `sys/fold`) lands durably | Never happened, from the fold's perspective: `sys/fold` never advances past a batch that did not durably land. A successor folder resumes tailing from the last durable `sys/fold` and re-applies the slot idempotently — the commit itself is unaffected; it was already durable and discoverable via the tail before folding ever started (RFC 0022: folding adds no durability). |
+| **E4** `FoldThenTruncateRace` | A slot folds (advancing `sys/fold`) concurrently with a truncator computing its deletion bound from a stale view of the cursor or the live-reader checkpoints | Never happened, for the deletion: truncation never deletes past the fold cursor **as durably flushed** or past the oldest live reader's checkpoint (RFC 0022's two bounds), so a slot still needed by either is never removed — the race resolves to "truncation waited," not to a hole. |
+| **E5** `FolderTakeoverFencingRace` | An incumbent folder stalls or crashes; a successor opens read-write mid-fold-sprint, fencing the incumbent (the log-aware instance of C1/C2) | At most one folder's batch lands for any given slot range: the fenced incumbent's late write fails and is never observed, `sys/fold` reflects only the surviving folder's progress, and no slot is folded twice or skipped. |
+| **E6** `ConcurrentMigrations` | Two processes attach read-write concurrently, both eligible to auto-run the bounded format-4 migration | Exactly one lands the migration batch (`sys/format = 4`, `sys/fold = 0`); the fenced loser observes the store already migrated and adopts it — the log-era instance of D1's genesis race, guarded by the same writer-epoch fencing. |
+| **E7** `DestroyedOrSubstitutedSlot` | A slot object below the live tail is deleted or overwritten outside the protocol (a manual delete, a lifecycle rule gone wrong) | `read_tail`'s LIST detects the hole (a sequence absent below a present one); replay refuses with `Corruption` rather than silently serving the truncated prefix — unless a re-read of the fold cursor shows it has legitimately advanced past the hole, in which case it is a benign truncation, not damage. |
+| **E8** `StaleReaderMeetsTruncation` | A reader's manifest checkpoint lags; a concurrent truncator computes its deletion bound from a fresher (but not stale enough) view | Never happened, from the reader's perspective: truncation never deletes past the oldest live checkpoint's fold cursor (RFC 0022), so the stale reader's next tail replay always finds every slot it still needs — not a hole it must tolerate, a slot that was never eligible for deletion. |
+| **E9** `LeaderLossMidSession` | A leader accepts a forwarded transaction, then dies before its slot PUT, or after the PUT but before acknowledging the client | No acknowledgement ever precedes a durable slot PUT (RFC 0022), so the client's outcome is always resolvable by the transaction-id scan: durable and discoverable if the PUT landed, never happened if it did not. The dropped session never leaves a half-applied transaction; DuckLake's retry re-drives, landing directly or on a successor. |
+
+Rows E1, E2, and E9 are catalog-level instances of races the object-store
+fault-injection seam also drives, seed by seed, against `moraine-wal`'s own
+protocol in isolation (deterministic simulation, above); rows E3–E8 are
+folder- and reader-side and have no wal-only analogue, because folding,
+truncation, and migration are all moraine-layer, catalog-aware operations.
+
 ### Coverage argument
 
-The matrix is exhaustive over the two invariants in Background:
+The matrix is exhaustive over the three invariants in Background:
 
-- **Every single-batch operation** (ordinary commit, multi-tombstone `DROP`,
-  group commit, genesis) reduces to A1/A2 atomicity — rows A1, A2, A3, C3,
-  D2 instantiate it across the operations that could plausibly be tempted to
-  span batches.
+- **Every fold-side batch operation** (a fold, genesis, migration) reduces
+  to A1/A2 atomicity — rows A1, A2, A3, C3, D2 instantiate it across the
+  operations that could plausibly be tempted to span batches. (A3's
+  multi-tombstone `DROP` and C3's group commit are now folder-side: they
+  land as one fold batch the same way an ordinary commit's records do.)
 - **Every multi-step (non-batch) operation** in moraine is bytes-before /
   bytes-after a batch: inline flush (B1, B2), GC cleanup (B3, B4). There are
   no other multi-step state-changing paths — compaction (RFC 0008) reduces to
@@ -228,12 +314,18 @@ The matrix is exhaustive over the two invariants in Background:
   the inputs," so it is covered by the B-rows' shape; a compaction-specific
   row is added only if RFC 0008 introduces a seam the flush rows do not
   already cover (Open questions).
-- **Every writer-lifecycle transition** is C1/C2, and **birth** is D1/D2.
+- **Every writer-lifecycle transition** is C1/C2, and **birth** is D1/D2 —
+  both now folder-role transitions under RFC 0022, with E5/E6 their
+  log-aware instances.
+- **Every commit-log seam** (RFC 0022) reduces to the third invariant —
+  durable-and-discoverable or never-happened — rows E1–E9 instantiate it
+  across the commit path, the folder, truncation, and the leader role.
 
 A seam that is not an instance of one of these is, by RFC 0002's atomicity
-invariant, not reachable. The `CrashPoint` enum is the executable form of
-that claim: adding a fault-injection hook in the code without a matching enum
-variant fails to compile the test that iterates all variants.
+invariant or RFC 0022's slot-PUT invariant, not reachable. The `CrashPoint`
+enum is the executable form of that claim: adding a fault-injection hook in
+the code without a matching enum variant fails to compile the test that
+iterates all variants.
 
 ## Test obligations
 
@@ -254,6 +346,13 @@ data-driven test that iterates `CrashPoint`:
 - The absence rows (A3, D2) assert torn intermediate states are
   *unobservable* across **all** WAL boundaries of the operation, not just one
   — the test enumerates the boundaries and checks each.
+- Rows E1–E9 iterate the same way, but inject through the fault-injecting
+  `ObjectStore` decorator instead of the drop-and-reopen or fencing knobs —
+  itself a real `ObjectStore` implementation wrapping in-memory
+  `object_store`, so this stays within RFC 0001's "no mocks of the store"
+  rule. E2 and E9 additionally re-drive after the injected fault and assert
+  the transaction-id scan resolves the same outcome every time it is asked,
+  not just once.
 
 This test **replaces** the generic "crash-shaped sequences (commit, reopen,
 verify)" line in RFC 0001's testing table and **subsumes** the crash bullets
@@ -302,7 +401,7 @@ edit to those three RFCs.
   when RFC 0008 lands as Implemented.
 - **Randomized fault injection as a successor.** Once the enumerated matrix
   is green and the codecs stabilize, a `cargo-fuzz` target that crashes at
-  arbitrary WAL offsets and reopens (asserting the same two invariants) would
+  arbitrary WAL offsets and reopens (asserting the same invariants) would
   catch seams this enumeration missed. Complementary future work under RFC
   0001's fuzzing tier, not a replacement for the named matrix (named rows
   give regressions a stable identity; fuzzing gives coverage breadth).
