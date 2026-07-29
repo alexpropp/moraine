@@ -10,6 +10,12 @@ this file is the operational summary.
   store handle but no key/value knowledge — that lives in `store`
   (keys/codecs, which knows nothing about DuckLake); `transaction` (the commit
   protocol) bridges them. `lib.rs` is docs + re-exports only.
+- `crates/moraine-wal` — the commit-slot log protocol: sequence naming, the
+  envelope wire format, the conditional-put race, tail enumeration and
+  truncation. Sits below `moraine` and knows nothing of DuckLake, SlateDB, or
+  moraine's key layout — payload keys, values, and the classification string
+  are opaque bytes here. The boundary is shape versus meaning; if a change
+  wants to teach this crate what a payload means, it belongs in `moraine`.
 - `crates/moraine-duckdb` — DuckDB extension: a thin C++ shim registering a
   `StorageExtension` over a C ABI to the Rust core (RFC 0006). Thin by policy:
   if logic accumulates here, move it to the core.
@@ -35,14 +41,22 @@ this file is the operational summary.
   Comments carry content, not typography; if a file needs section markers,
   split the module instead.
 - Comments are direct and succinct: state what the item does and any hard
-  constraint, no rationale essays.
+  constraint, no rationale essays. A well-named declaration earns no comment
+  at all — write one only for a constraint a reader cannot infer from the name
+  and type: a permanent tag or discriminant, an invariant the code enforces, a
+  compatibility rule. Never explain why a design choice was made; that is an
+  RFC's job. This binds `.proto` comments as much as Rust doc comments, and
+  where `missing_docs` demands one, a single clause discharges it.
 - Use blank lines to group code into readable stanzas.
 - Names prefer full words, for every symbol; abbreviate only when the word
   is long and the abbreviation is conventional (`tx`, not `tbl`).
 - Code and code comments never cite RFCs by number or name. State the
   constraint itself in the comment; RFCs reference code, not the reverse.
 - Features are additive-only and documented in the crate root.
-- Conventional commits; PRs squash-merge into `main`.
+- Conventional commits; PRs squash-merge into `main`. Stage explicit paths
+  (`git add <path>`) — never `git add -A`, `git add .`, or `git commit -a`:
+  concurrent agents and hand edits share the working tree, and a broad stage
+  swallows them. On `index.lock`, wait and retry; never delete the lock.
 
 ## Design docs
 
@@ -51,6 +65,11 @@ this file is the operational summary.
   binding design; update or replace, never re-label).
   **Do not** create `docs/superpowers/specs/` — the RFC directory overrides
   that default.
+- An RFC never narrates its own revision history: state the present
+  arrangement, not how it changed. No "previously", "no longer", "now
+  settled", "used to", "moved to" — a cold reader must not be able to tell
+  which sentences were amended. Statements about which RFC governs a design
+  are fine, as are runtime uses of old/new about store state.
 - Implementation plans go to `docs/plans/` (not-committed).
 - RFCs are required for: KV key layout, commit protocol, public API shape.
 
