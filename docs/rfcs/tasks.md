@@ -322,8 +322,6 @@ Four things gate disproportionately much of the list:
 
 ## 0012 — Schema evolution and versioning
 
-- **DECISION** — Dense (`0..n`) versus sparse or fractional ordinals for column
-  reorder. Dense stands unless e2e shows DuckLake expects otherwise.
 - **DEFERRED** — Define the exact `column_mapping` and `name_mapping` key
   components in 0002's keyspace map once implementation reaches
   external-Parquet interop. The kinds themselves are built.
