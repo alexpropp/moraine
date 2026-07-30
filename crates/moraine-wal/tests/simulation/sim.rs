@@ -22,7 +22,7 @@
 //! that does not, because the phantom defences look like real ones.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
@@ -40,6 +40,12 @@ use object_store::{
 
 /// The log root every simulated run uses.
 const ROOT: &str = "sim";
+
+/// A count drawn as a `u32`, so the draw — and therefore a run's whole
+/// transcript — does not depend on the target's pointer width.
+fn width(count: u32) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX)
+}
 
 /// The classification a commit that no one may lose to carries.
 pub const EXCLUSIVE: &str = "exclusive";
@@ -123,6 +129,50 @@ impl Knobs {
     }
 }
 
+/// What one run's store actually served. Every oracle rests on some fault
+/// being reachable, so the reachability is counted rather than assumed: an
+/// edit to the knobs or to [`SimState::put_fault`] that removed a fault class
+/// would otherwise leave the oracle that needs it silently vacuous.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FaultCensus {
+    /// Puts that never reached the store.
+    pub fail_before: u32,
+    /// Puts that applied, then reported a transport failure.
+    pub fail_after: u32,
+    /// Puts that applied, then reported the slot already taken.
+    pub landed_then_already_exists: u32,
+    /// Puts refused as already taken with nothing written, which is offered
+    /// only while a competing create is in flight.
+    pub premature_already_exists: u32,
+    /// Gets that failed.
+    pub get_faults: u32,
+    /// List pages that failed.
+    pub list_faults: u32,
+    /// List pages fetched past the first, so a paginated listing was
+    /// genuinely consumed across a page boundary.
+    pub extra_list_pages: u32,
+    /// Puts that applied their object and then reported a failure, whose
+    /// read-back *also* failed. This conjunction is the precondition of the
+    /// one defect the work-level exactly-once oracle exists to catch: neither
+    /// half alone reaches it, since a resolvable read-back settles the
+    /// attempt by transaction id.
+    pub ambiguous_landing_then_failed_read: u32,
+}
+
+impl FaultCensus {
+    /// Accumulates another run's census into this one.
+    pub fn merge(&mut self, other: &Self) {
+        self.fail_before += other.fail_before;
+        self.fail_after += other.fail_after;
+        self.landed_then_already_exists += other.landed_then_already_exists;
+        self.premature_already_exists += other.premature_already_exists;
+        self.get_faults += other.get_faults;
+        self.list_faults += other.list_faults;
+        self.extra_list_pages += other.extra_list_pages;
+        self.ambiguous_landing_then_failed_read += other.ambiguous_landing_then_failed_read;
+    }
+}
+
 /// The seeded state one [`SimStore`] draws from, plus the trace of every
 /// operation it served.
 #[derive(Debug)]
@@ -131,12 +181,21 @@ pub struct SimState {
     knobs: Knobs,
     trace: Vec<String>,
     in_flight: BTreeMap<Path, usize>,
+    census: FaultCensus,
+    /// Paths holding an object a failed put applied, whose outcome no read has
+    /// settled yet.
+    ambiguous_landings: BTreeSet<Path>,
 }
 
 impl SimState {
     /// The trace so far, drained.
     pub fn take_trace(&mut self) -> Vec<String> {
         std::mem::take(&mut self.trace)
+    }
+
+    /// What this store has served so far.
+    pub fn census(&self) -> FaultCensus {
+        self.census
     }
 
     /// Appends a line to the trace, so a run's task outcomes sit in the same
@@ -189,7 +248,16 @@ impl SimState {
             ]
         };
 
-        choices[self.rng.usize(0..choices.len())]
+        let drawn = choices[usize::from(self.rng.u8(0..u8::try_from(choices.len()).unwrap_or(1)))];
+        match drawn {
+            PutFault::None => {}
+            PutFault::FailBefore => self.census.fail_before += 1,
+            PutFault::FailAfter => self.census.fail_after += 1,
+            PutFault::LandedThenAlreadyExists => self.census.landed_then_already_exists += 1,
+            PutFault::PrematureAlreadyExists => self.census.premature_already_exists += 1,
+        }
+
+        drawn
     }
 }
 
@@ -211,6 +279,8 @@ impl SimStore {
                 knobs,
                 trace: Vec::new(),
                 in_flight: BTreeMap::new(),
+                census: FaultCensus::default(),
+                ambiguous_landings: BTreeSet::new(),
             })),
         }
     }
@@ -294,23 +364,28 @@ impl ObjectStore for SimStore {
             fault
         };
 
-        let result = match fault {
-            PutFault::None => self.inner.put_opts(location, payload, opts).await,
-            PutFault::FailBefore => Err(unreadable()),
+        // `landed` is the honest ambiguity: the object is there and the caller
+        // was told otherwise, so only the log can settle what happened.
+        let (result, landed) = match fault {
+            PutFault::None => (self.inner.put_opts(location, payload, opts).await, false),
+            PutFault::FailBefore => (Err(unreadable()), false),
             PutFault::FailAfter => {
-                let _ = self.inner.put_opts(location, payload, opts).await;
-                Err(unreadable())
+                let landed = self.inner.put_opts(location, payload, opts).await.is_ok();
+                (Err(unreadable()), landed)
             }
             PutFault::LandedThenAlreadyExists => {
-                let _ = self.inner.put_opts(location, payload, opts).await;
-                Err(already_exists(location))
+                let landed = self.inner.put_opts(location, payload, opts).await.is_ok();
+                (Err(already_exists(location)), landed)
             }
-            PutFault::PrematureAlreadyExists => Err(already_exists(location)),
+            PutFault::PrematureAlreadyExists => (Err(already_exists(location)), false),
         };
 
         let mut state = self.lock();
         if let Some(count) = state.in_flight.get_mut(location) {
             *count = count.saturating_sub(1);
+        }
+        if landed {
+            state.ambiguous_landings.insert(location.clone());
         }
         state.record(format!(
             "put {} -> {}",
@@ -355,11 +430,20 @@ impl ObjectStore for SimStore {
             let percent = state.knobs.get_fault_percent;
             let faulted = state.hits(percent);
             state.record(format!("get {} fault={faulted}", name(location)));
+            if faulted {
+                state.census.get_faults += 1;
+                if state.ambiguous_landings.contains(location) {
+                    state.census.ambiguous_landing_then_failed_read += 1;
+                }
+            }
             faulted
         };
         if faulted {
             return Err(unreadable());
         }
+
+        // A read that answers settles whatever the failed put left open.
+        self.lock().ambiguous_landings.remove(location);
 
         self.inner.get_opts(location, options).await
     }
@@ -434,6 +518,12 @@ async fn list_page(
         let percent = state.knobs.list_fault_percent;
         let faulted = state.hits(percent);
         let size = state.knobs.list_page.max(1);
+        if faulted {
+            state.census.list_faults += 1;
+        }
+        if after.is_some() {
+            state.census.extra_list_pages += 1;
+        }
         state.record(format!(
             "list after={} latency={}ms fault={faulted}",
             after.as_ref().map_or_else(String::new, name),
@@ -536,17 +626,20 @@ pub fn ids(envelope: &Envelope) -> Vec<[u8; 16]> {
 pub struct SimCommitter {
     work: Work,
     exclusive: bool,
+    barren: bool,
     head: u64,
     attempts: u8,
     minted: Vec<[u8; 16]>,
 }
 
 impl SimCommitter {
-    /// A committer for `work`, starting from `head`.
-    pub fn new(work: Work, exclusive: bool, head: u64) -> Self {
+    /// A committer for `work`, starting from `head`. A barren one has nothing
+    /// to commit, which is how the round reaches `CommitDrive::Nothing`.
+    pub fn new(work: Work, exclusive: bool, barren: bool, head: u64) -> Self {
         Self {
             work,
             exclusive,
+            barren,
             head,
             attempts: 0,
             minted: Vec::new(),
@@ -558,6 +651,10 @@ impl Committer for SimCommitter {
     type Error = Error;
 
     async fn assemble(&mut self) -> Result<Option<Envelope>, Error> {
+        if self.barren {
+            return Ok(None);
+        }
+
         self.attempts += 1;
         // A fresh id per attempt: the shape that hides a double-applied round
         // from an id-level oracle, so the harness runs against the hostile
@@ -655,6 +752,8 @@ pub struct WorkerPlan {
     pub rounds: u8,
     /// Whether its commits are ones no one may rebase onto.
     pub exclusive: bool,
+    /// Whether it has nothing to commit.
+    pub barren: bool,
     /// Its retry shape. Always built from `RetryPolicy::seeded`.
     pub retry: RetryPolicy,
 }
@@ -700,8 +799,15 @@ impl Scenario {
             } else {
                 rng.u32(0..=15)
             },
-            list_fault_percent: rng.u32(0..=10),
-            list_page: rng.usize(1..=3),
+            // A harsh run also fails listings often enough that a round can
+            // spend its whole head-read budget, which is the only way this
+            // model reaches a round that never races.
+            list_fault_percent: if harsh {
+                rng.u32(20..=50)
+            } else {
+                rng.u32(0..=10)
+            },
+            list_page: width(rng.u32(1..=3)),
         };
 
         let workers = (1..=rng.u8(2..=4))
@@ -709,12 +815,13 @@ impl Scenario {
                 worker,
                 rounds: rng.u8(1..=3),
                 exclusive: rng.u32(0..100) < 25,
+                barren: rng.u32(0..100) < 10,
                 retry: RetryPolicy {
-                    max_attempts: if harsh {
-                        rng.usize(2..=5)
+                    max_attempts: width(if harsh {
+                        rng.u32(2..=5)
                     } else {
-                        rng.usize(4..=12)
-                    },
+                        rng.u32(4..=12)
+                    }),
                     base_delay: Duration::from_millis(rng.u64(0..=8)),
                     max_delay: Duration::from_millis(rng.u64(2..=50)),
                     ..RetryPolicy::seeded(
@@ -728,9 +835,46 @@ impl Scenario {
             seed,
             knobs,
             workers,
-            folders: rng.usize(0..=2),
-            fold_rounds: rng.usize(1..=3),
+            folders: width(rng.u32(0..=2)),
+            fold_rounds: width(rng.u32(1..=3)),
             fold_limit: rng.u64(1..=4),
+        }
+    }
+
+    /// A scenario whose *shape* is fixed and whose only seed-dependent input is
+    /// the store's latency: no faults, no folders, and backoff pinned to zero
+    /// so the jitter streams contribute nothing. Interleaving diversity across
+    /// seeds can then only come from latency draws, which is what makes the
+    /// schedule-diversity oracle a tripwire on the timer's resolution.
+    pub fn fixed_shape(seed: u64) -> Self {
+        let workers = (1..=3)
+            .map(|worker| WorkerPlan {
+                worker,
+                rounds: 3,
+                exclusive: false,
+                barren: false,
+                retry: RetryPolicy {
+                    max_attempts: 32,
+                    base_delay: Duration::ZERO,
+                    max_delay: Duration::ZERO,
+                    ..RetryPolicy::seeded(worker.into())
+                },
+            })
+            .collect();
+
+        Self {
+            seed,
+            knobs: Knobs {
+                latency_millis: (1, 12),
+                put_fault_percent: 0,
+                get_fault_percent: 0,
+                list_fault_percent: 0,
+                list_page: 2,
+            },
+            workers,
+            folders: 0,
+            fold_rounds: 0,
+            fold_limit: u64::MAX,
         }
     }
 
@@ -764,7 +908,11 @@ pub enum RoundOutcome {
     Exhausted,
     /// The budget went to a log that never answered, so the last put's
     /// outcome may be unknown.
-    Unavailable,
+    Unavailable {
+        /// The failure the last attempt reported, which an embedder renders
+        /// into the error a SQL retry loop greps.
+        last_error: String,
+    },
     /// The driver returned an error.
     Failed(String),
     /// The head could not be read, so the round never raced.
@@ -774,7 +922,7 @@ pub enum RoundOutcome {
 impl RoundOutcome {
     /// Whether this round may have landed a slot it did not report.
     pub fn outcome_may_be_unknown(&self) -> bool {
-        matches!(self, Self::Unavailable | Self::Failed(_))
+        matches!(self, Self::Unavailable { .. } | Self::Failed(_))
     }
 
     /// The trace label.
@@ -784,7 +932,7 @@ impl RoundOutcome {
             Self::Nothing => "nothing".to_string(),
             Self::Conflict { sequence } => format!("conflict@{sequence}"),
             Self::Exhausted => "exhausted".to_string(),
-            Self::Unavailable => "unavailable".to_string(),
+            Self::Unavailable { last_error } => format!("unavailable({last_error})"),
             Self::Failed(text) => format!("failed({text})"),
             Self::Unstarted(text) => format!("unstarted({text})"),
         }
@@ -798,7 +946,9 @@ impl From<Result<CommitDrive, Error>> for RoundOutcome {
             Ok(CommitDrive::Nothing) => Self::Nothing,
             Ok(CommitDrive::Conflict { sequence, .. }) => Self::Conflict { sequence },
             Ok(CommitDrive::Exhausted { .. }) => Self::Exhausted,
-            Ok(CommitDrive::Unavailable { .. }) => Self::Unavailable,
+            Ok(CommitDrive::Unavailable { last_error, .. }) => Self::Unavailable {
+                last_error: last_error.to_string(),
+            },
             Err(err) => Self::Failed(err.to_string()),
         }
     }
@@ -850,6 +1000,9 @@ pub struct Run {
     pub gap_at: Option<u64>,
     /// The quiesced log, so an oracle can re-read it.
     pub log: SlotLog,
+    /// What the store actually served, so every oracle's precondition is
+    /// counted rather than assumed.
+    pub census: FaultCensus,
 }
 
 impl Run {
@@ -859,6 +1012,24 @@ impl Run {
             .iter()
             .filter(|(_, envelope)| works(envelope).contains(&work))
             .map(|(sequence, _)| *sequence)
+            .collect()
+    }
+
+    /// Which worker won each sequence, ascending: one run's interleaving,
+    /// reduced to the only part of it the protocol decides.
+    pub fn win_order(&self) -> Vec<u8> {
+        self.slots
+            .iter()
+            .flat_map(|(_, envelope)| works(envelope))
+            .map(|work| work.worker)
+            .collect()
+    }
+
+    /// Every work unit the log holds, in slot order.
+    pub fn work_order(&self) -> Vec<Work> {
+        self.slots
+            .iter()
+            .flat_map(|(_, envelope)| works(envelope))
             .collect()
     }
 
@@ -914,7 +1085,7 @@ async fn run_worker(log: SlotLog, plan: WorkerPlan) -> Vec<RoundRecord> {
         };
 
         let start = head.saturating_add(1);
-        let mut committer = SimCommitter::new(work, plan.exclusive, head);
+        let mut committer = SimCommitter::new(work, plan.exclusive, plan.barren, head);
         let outcome = drive_commit(&log, &mut committer, start, &plan.retry).await;
 
         records.push(RoundRecord {
@@ -1023,6 +1194,7 @@ pub async fn simulate(scenario: Scenario) -> Run {
         ));
     }
 
+    let census = lock(&state).census();
     lock(&state).quiesce();
     let tail = log.read_tail(1).await.expect("a quiesced log reads back");
 
@@ -1035,6 +1207,7 @@ pub async fn simulate(scenario: Scenario) -> Run {
         slots: tail.slots,
         gap_at: tail.gap_at,
         log,
+        census,
     }
 }
 
@@ -1048,8 +1221,6 @@ pub struct DuelRound {
     pub hot: Option<u64>,
     /// The sequence the steady committer's work landed at.
     pub steady: Option<u64>,
-    /// Whether either side failed to commit at all.
-    pub settled: bool,
 }
 
 /// Two committers racing the same sequences over one log, one retrying with a
@@ -1071,6 +1242,7 @@ pub async fn duel(seed: u64) -> Vec<DuelRound> {
         worker: 1,
         rounds: DUEL_ROUNDS,
         exclusive: false,
+        barren: false,
         retry: RetryPolicy {
             max_attempts: 24,
             base_delay: Duration::ZERO,
@@ -1082,6 +1254,7 @@ pub async fn duel(seed: u64) -> Vec<DuelRound> {
         worker: 2,
         rounds: DUEL_ROUNDS,
         exclusive: false,
+        barren: false,
         retry: RetryPolicy {
             max_attempts: 24,
             ..RetryPolicy::seeded(seed.wrapping_mul(0x1000_0001).wrapping_add(2))
@@ -1101,7 +1274,6 @@ pub async fn duel(seed: u64) -> Vec<DuelRound> {
         .map(|(hot, steady)| DuelRound {
             hot: committed_at(hot),
             steady: committed_at(steady),
-            settled: committed_at(hot).is_some() && committed_at(steady).is_some(),
         })
         .collect()
 }

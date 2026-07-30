@@ -3,12 +3,17 @@
 //! races hit the happy interleaving nearly every time and cannot reproduce a
 //! failure they do find, whereas every schedule here comes from a seed.
 //!
-//! Each oracle below is one test over a seed sweep. A failure reproduces
-//! exactly from the seed the assertion prints:
+//! Each oracle below is one test over a seed sweep. Every per-run oracle, the
+//! long sweep included, narrows to a single seed from the one the assertion
+//! prints:
 //!
 //! ```text
 //! MORAINE_WAL_SEED=1234 cargo test -p moraine-wal --test simulation
 //! ```
+//!
+//! Two claims are aggregate — the backoff bias and the sweep's own coverage —
+//! and deliberately ignore that override, since a distributional property over
+//! one seed is not the property.
 //!
 //! The long sweep is `#[ignore]`d, as `moraine`'s `object_storage.rs` suite is:
 //!
@@ -26,10 +31,10 @@
 #[path = "simulation/sim.rs"]
 mod sim;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use moraine_wal::{CursorStore, Envelope, SlotLog, drive_fold};
-use sim::{FoldState, RoundOutcome, Run, Scenario, Work, duel, ids, simulate, works};
+use sim::{FaultCensus, FoldState, RoundOutcome, Run, Scenario, Work, duel, ids, simulate, works};
 
 /// Seeds the inline sweep covers, kept to CI-affordable time.
 const SWEEP: u64 = 512;
@@ -39,6 +44,16 @@ const LONG_SWEEP: u64 = 32_768;
 
 /// Seeds the aggregate backoff-bias claim is measured over.
 const DUEL_SWEEP: u64 = 128;
+
+/// Seeds the schedule-diversity tripwire measures one fixed scenario over.
+const DIVERSITY_SEEDS: u64 = 64;
+
+/// Distinct interleavings those seeds must produce.
+const DIVERSITY_FLOOR: usize = 16;
+
+/// Slots a log must exceed for reading it to have crossed a page boundary,
+/// given the largest `list_page` a scenario draws.
+const MULTI_PAGE: usize = 3;
 
 /// The environment override that pins a sweep to one seed.
 const SEED_OVERRIDE: &str = "MORAINE_WAL_SEED";
@@ -61,6 +76,12 @@ fn seeds(width: u64) -> Vec<u64> {
 /// it per seed is exactly the flakiness a seed sweep exists to remove.
 fn aggregate_seeds(width: u64) -> std::ops::Range<u64> {
     0..width
+}
+
+/// The seeds the long sweep visits, narrowed by [`SEED_OVERRIDE`] like any
+/// per-run oracle: a failure it reports must reproduce on its own.
+fn long_seeds() -> Vec<u64> {
+    seeds(LONG_SWEEP)
 }
 
 /// Runs `check` over every seed a per-run oracle visits.
@@ -122,18 +143,18 @@ async fn one_seed_replays_byte_identically() {
     }
 }
 
-/// The determinism self-check, across processes. `RandomState` is per-process,
-/// so a `HashMap` iterated anywhere in the harness or the crate would keep an
-/// in-process replay byte-identical while diverging between runs. Two
-/// invocations of this test must print the same digest:
+/// The determinism self-check, across processes, against a pinned digest.
+/// `RandomState` is per-process, so a `HashMap` iterated anywhere in the
+/// harness or the crate would keep an in-process replay byte-identical while
+/// diverging between runs — which only a value fixed outside any one process
+/// can catch.
 ///
-/// ```text
-/// cargo test -p moraine-wal --test simulation the_sweep_digest \
-///   -- --ignored --nocapture
-/// ```
+/// The digest covers every store operation and task outcome of the whole
+/// sweep, so it also gives the sweep's own churn a visible signal: any edit to
+/// `Scenario::for_seed` renumbers every scenario, and this constant is where
+/// that shows up. Update it deliberately, never to make a test pass.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "prints a digest to compare between processes"]
-async fn the_sweep_digest_is_stable_between_processes() {
+async fn the_sweep_replays_identically_between_processes() {
     let mut digest = FNV_OFFSET;
     let mut lines = 0_u64;
     whole_sweep(|run| {
@@ -144,8 +165,19 @@ async fn the_sweep_digest_is_stable_between_processes() {
     })
     .await;
 
-    println!("sweep digest: {digest:016x} over {lines} trace lines");
+    assert_eq!(
+        (digest, lines),
+        (SWEEP_DIGEST, SWEEP_TRACE_LINES),
+        "the sweep no longer replays the transcript this digest was taken from"
+    );
 }
+
+/// The transcript digest of the whole inline sweep, pinned so determinism is
+/// checked between processes and not only within one.
+const SWEEP_DIGEST: u64 = 0x176B_258E_9028_0FAB;
+
+/// Trace lines that digest covers.
+const SWEEP_TRACE_LINES: u64 = 37_357;
 
 /// FNV-1a's offset basis.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -157,26 +189,44 @@ fn fnv1a(digest: u64, bytes: &[u8]) -> u64 {
     })
 }
 
-/// A run that draws faults and multi-page listings is only worth trusting if
-/// it actually drew them, so the sweep's coverage is asserted rather than
-/// assumed.
+/// Every oracle below rests on some fault or outcome being reachable, so the
+/// sweep's own coverage is asserted rather than assumed. An edit to
+/// `Scenario::for_seed` or to the fault draw that removed a class would
+/// otherwise leave the oracle that needs it silently vacuous while every test
+/// stayed green.
+///
+/// The load-bearing count is `ambiguous_landing_then_failed_read`: a put that
+/// applied its object and then reported failure, whose read-back *also*
+/// failed. That conjunction is the precondition of the one defect the
+/// work-level exactly-once oracle exists to catch — neither half alone reaches
+/// it, because a read-back that answers settles the attempt by transaction id.
+/// A count of unknown outcomes cannot stand in for it: those are reachable from
+/// a put that never landed, from a premature refusal, or from a failed
+/// listing.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn the_sweep_reaches_every_outcome_the_oracles_are_about() {
+async fn the_sweep_reaches_every_fault_and_outcome_the_oracles_need() {
+    let mut census = FaultCensus::default();
     let mut committed = 0;
     let mut conflicts = 0;
     let mut exhausted = 0;
     let mut unknown = 0;
+    let mut nothing = 0;
+    let mut unstarted = 0;
+    let mut failed = 0;
     let mut multi_slot_runs = 0;
     let mut folded = 0;
 
     whole_sweep(|run| {
+        census.merge(&run.census);
         for record in &run.rounds {
             match &record.outcome {
                 RoundOutcome::Committed { .. } => committed += 1,
                 RoundOutcome::Conflict { .. } => conflicts += 1,
                 RoundOutcome::Exhausted => exhausted += 1,
-                RoundOutcome::Unavailable | RoundOutcome::Failed(_) => unknown += 1,
-                RoundOutcome::Nothing | RoundOutcome::Unstarted(_) => {}
+                RoundOutcome::Unavailable { .. } => unknown += 1,
+                RoundOutcome::Nothing => nothing += 1,
+                RoundOutcome::Unstarted(_) => unstarted += 1,
+                RoundOutcome::Failed(_) => failed += 1,
             }
         }
         if run.slots.len() > 2 {
@@ -190,17 +240,72 @@ async fn the_sweep_reaches_every_outcome_the_oracles_are_about() {
     })
     .await;
 
-    // A sweep that stopped exercising one of these would keep passing every
-    // oracle below while proving less.
+    assert!(
+        census.ambiguous_landing_then_failed_read > 5,
+        "a put that landed under a failure and then read back badly happened {} \
+         times; the work-level exactly-once oracle is vacuous below this: {census:?}",
+        census.ambiguous_landing_then_failed_read
+    );
+    assert!(census.fail_after > 20, "{census:?}");
+    assert!(census.fail_before > 20, "{census:?}");
+    assert!(census.landed_then_already_exists > 20, "{census:?}");
+    // Offered only while a competing create is in flight, so this is the one
+    // fault whose reachability depends on the schedule rather than the rates.
+    assert!(census.premature_already_exists > 0, "{census:?}");
+    assert!(census.get_faults > 50, "{census:?}");
+    assert!(census.list_faults > 20, "{census:?}");
+    assert!(census.extra_list_pages > 50, "{census:?}");
+
     assert!(committed > 100, "committed rounds: {committed}");
     assert!(conflicts > 5, "conflicting rounds: {conflicts}");
     assert!(exhausted > 0, "exhausted rounds: {exhausted}");
     assert!(unknown > 5, "rounds with an unknown outcome: {unknown}");
+    assert!(nothing > 0, "rounds with nothing to commit: {nothing}");
+    assert!(unstarted > 0, "rounds that never read a head: {unstarted}");
+    // A driver error needs `Corruption`, which this model cannot produce: the
+    // store writes atomically, and a single-commit envelope cannot land in
+    // part. The unit tests own that path, so a nonzero count here means the
+    // model changed under this claim.
+    assert_eq!(failed, 0, "rounds the driver failed: {failed}");
     assert!(
         multi_slot_runs > 20,
         "runs past two slots: {multi_slot_runs}"
     );
     assert!(folded > 20, "fold tasks that applied a slot: {folded}");
+}
+
+/// The tripwire on the harness's own schedule. Randomising per-operation
+/// latency randomises the interleaving *only above the timer's resolution*:
+/// tokio's wheel has millisecond granularity, so every sub-millisecond sleep
+/// expires on the same tick and the schedule collapses to task poll order. A
+/// regression to microsecond or zero latencies would reduce the whole sweep to
+/// one interleaving while every other test stayed green, because they key on
+/// outcome classes that the fault draws alone can supply.
+///
+/// So it is asserted: one fixed scenario shape — no faults, no folders, backoff
+/// pinned to zero so the jitter streams contribute nothing — run over many
+/// store seeds. The only seed-dependent input left is latency, and the recorded
+/// signature is which worker won each sequence. If latency stops varying the
+/// schedule, the distinct signatures collapse toward one.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn latency_draws_actually_vary_the_schedule() {
+    let mut signatures = BTreeSet::new();
+    for seed in aggregate_seeds(DIVERSITY_SEEDS) {
+        let run = simulate(Scenario::fixed_shape(seed)).await;
+        assert_eq!(
+            run.slots.len(),
+            run.planned_rounds,
+            "seed {seed}: the fixed shape must commit every round"
+        );
+        signatures.insert(run.win_order());
+    }
+
+    assert!(
+        signatures.len() >= DIVERSITY_FLOOR,
+        "{} distinct interleavings over {DIVERSITY_SEEDS} seeds of one fixed \
+         scenario; latency has stopped randomising the schedule",
+        signatures.len()
+    );
 }
 
 /// One winner per sequence: no sequence holds two envelopes, no two rounds
@@ -244,6 +349,60 @@ async fn every_sequence_has_exactly_one_winner() {
             assert_eq!(&reread, envelope, "seed {seed}: slot {sequence} re-read");
         }
     }
+}
+
+/// The readers that matter are the fold tasks: they are the only ones that read
+/// the log *while it grows*, through the deliberately paginated LIST and a GET
+/// per slot. What each applied must be a prefix of the log's final work order,
+/// with its cursor standing at that prefix's length.
+///
+/// This is what makes pagination oracle-visible. The quiesced read-back every
+/// other oracle sees is a single page, so a page-boundary bug that dropped one
+/// object per page would shorten only the in-run reads: a worker would start
+/// lower, lose a race, and leave a log that is still dense with no hole to
+/// report.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_folder_reading_a_growing_log_always_sees_a_prefix_of_it() {
+    let mut complete = 0;
+
+    sweep(|run| {
+        let truth = run.work_order();
+        for (index, fold) in run.folds.iter().enumerate() {
+            let applied = &fold.state.applied;
+            assert!(
+                applied.len() <= truth.len(),
+                "seed {}: fold {index} applied {} slots of {}",
+                run.seed,
+                applied.len(),
+                truth.len()
+            );
+            assert_eq!(
+                applied.as_slice(),
+                &truth[..applied.len()],
+                "seed {}: fold {index} applied {applied:?}, which is not a prefix of {truth:?}",
+                run.seed
+            );
+            assert_eq!(
+                fold.state.cursor,
+                applied.len() as u64,
+                "seed {}: fold {index} advanced its cursor past what it applied",
+                run.seed
+            );
+            if applied.len() == truth.len() && truth.len() > MULTI_PAGE {
+                complete += 1;
+            }
+        }
+    })
+    .await;
+
+    // A prefix claim alone would pass a listing that silently stopped at a page
+    // boundary, since a short read is a legitimate prefix. Some folder must
+    // therefore reach the end of a log longer than one page can hold.
+    assert!(
+        complete > 0,
+        "no fold task ever consumed a log past {MULTI_PAGE} slots, so a listing \
+         that truncated at a page boundary would go unnoticed"
+    );
 }
 
 /// Exactly-once, stated over the committer's *work* and not only its ids.
@@ -335,7 +494,7 @@ async fn every_outcome_matches_the_log() {
                 }
                 // The one honest unknown: the last put may have landed, and
                 // the client resolves it from the log rather than guessing.
-                RoundOutcome::Unavailable | RoundOutcome::Failed(_) => {}
+                RoundOutcome::Unavailable { .. } | RoundOutcome::Failed(_) => {}
             }
 
             assert_resolvable(&run.log, &run, record).await;
@@ -379,10 +538,15 @@ async fn assert_resolvable(log: &SlotLog, run: &Run, record: &sim::RoundRecord) 
 }
 
 /// A terminal error's text reaches an embedder's retry loop, so none of the
-/// store text the fault model injects may survive the wrapping.
+/// store text the fault model injects may survive the wrapping. `Unavailable`
+/// is the case that matters: it is the common faulted terminal outcome, and its
+/// last error is what an embedder renders into the message a SQL retry loop
+/// greps.
 fn assert_no_retry_substrings(seed: u64, outcome: &RoundOutcome) {
     let text = match outcome {
-        RoundOutcome::Failed(text) | RoundOutcome::Unstarted(text) => text.to_ascii_lowercase(),
+        RoundOutcome::Unavailable { last_error: text }
+        | RoundOutcome::Failed(text)
+        | RoundOutcome::Unstarted(text) => text.to_ascii_lowercase(),
         _ => return,
     };
 
@@ -543,44 +707,52 @@ async fn a_fault_free_run_commits_exactly_as_many_slots_as_it_reports() {
     }
 }
 
-/// Backoff bias: biased, never starved. A committer retrying with a near-zero
-/// base delay wins a decisively larger share of contested rounds than one on
-/// the standard backoff — which is what makes a sustained process recruit
-/// itself as leader — *and* the slow committer still wins rounds and never
-/// spends its budget.
+/// Backoff bias: biased, never starved. Two committers drive the same number of
+/// rounds over one log, one retrying with a near-zero base delay and one on the
+/// standard backoff. The metric is **progress share**, not a head-to-head win:
+/// the two sides' round `i` are not contemporaneous, because the hot side runs
+/// ahead, so what is counted is whose round `i` reached the *lower* sequence —
+/// which is throughput under contention, and is the property the design
+/// actually needs (a sustained process gets the slots, which is what makes the
+/// forwarding trigger recruit itself).
+///
+/// Both halves are required. A test proving only that the hot policy is ahead
+/// would pass a design that starves slow clients, which the design forbids:
+/// delayed, never starved. So the steady side must also take a real share of
+/// the sequences, and every one of its rounds must commit — never exhausted,
+/// never unavailable.
 ///
 /// Asserted over the aggregate of every seed, never per seed: a single seed may
-/// legitimately favour the slow committer, and asserting per seed would be the
+/// legitimately favour the steady side, and asserting per seed would be the
 /// flakiness a distributional claim on a live scheduler always is.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_hot_retry_policy_is_biased_but_starves_no_one() {
-    let mut hot_wins = 0_u32;
-    let mut steady_wins = 0_u32;
+    let mut hot_ahead = 0_u32;
+    let mut steady_ahead = 0_u32;
 
     for seed in aggregate_seeds(DUEL_SWEEP) {
         for (index, round) in duel(seed).await.iter().enumerate() {
-            assert!(
-                round.settled,
-                "seed {seed} round {index}: a duel round did not commit: {round:?}"
-            );
-            match (round.hot, round.steady) {
-                (Some(hot), Some(steady)) if hot < steady => hot_wins += 1,
-                (Some(_), Some(_)) => steady_wins += 1,
-                _ => {}
+            let (Some(hot), Some(steady)) = (round.hot, round.steady) else {
+                panic!("seed {seed} round {index}: a duel round did not commit: {round:?}");
+            };
+            if hot < steady {
+                hot_ahead += 1;
+            } else {
+                steady_ahead += 1;
             }
         }
     }
 
-    let rounds = hot_wins + steady_wins;
-    assert!(rounds > 0, "the duel produced no contested rounds");
+    let rounds = hot_ahead + steady_ahead;
+    assert!(rounds > 0, "the duel produced no rounds");
     assert!(
-        u64::from(hot_wins) * 5 > u64::from(rounds) * 3,
-        "the hot policy won {hot_wins} of {rounds} contested rounds, which is not \
-         decisively more than half"
+        u64::from(hot_ahead) * 5 > u64::from(rounds) * 3,
+        "the hot policy led {hot_ahead} of {rounds} rounds, which is not decisively \
+         more than half"
     );
     assert!(
-        u64::from(steady_wins) * 10 > u64::from(rounds),
-        "the steady policy won {steady_wins} of {rounds} contested rounds, which is \
+        u64::from(steady_ahead) * 10 > u64::from(rounds),
+        "the steady policy led {steady_ahead} of {rounds} rounds, which is \
          starvation, not delay"
     );
 }
@@ -590,7 +762,7 @@ async fn a_hot_retry_policy_is_biased_but_starves_no_one() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[ignore = "long sweep; run with --ignored"]
 async fn the_long_sweep_holds_every_oracle() {
-    for seed in 0..LONG_SWEEP {
+    for seed in long_seeds() {
         let run = simulate(Scenario::for_seed(seed)).await;
         assert_long_sweep_oracles(&run).await;
     }
@@ -624,15 +796,20 @@ async fn assert_long_sweep_oracles(run: &Run) {
         assert!(landed.len() <= 1, "seed {seed}");
         match &record.outcome {
             RoundOutcome::Committed { sequence } => assert_eq!(landed, vec![*sequence]),
-            RoundOutcome::Unavailable | RoundOutcome::Failed(_) => {}
+            RoundOutcome::Unavailable { .. } | RoundOutcome::Failed(_) => {}
             _ => assert!(landed.is_empty(), "seed {seed}: {}", record.outcome.label()),
         }
         assert_resolvable(&run.log, run, record).await;
         assert_no_retry_substrings(seed, &record.outcome);
     }
 
+    let truth = run.work_order();
     for fold in &run.folds {
         assert!(fold.corruptions.is_empty(), "seed {seed}");
+        let applied = &fold.state.applied;
+        assert!(applied.len() <= truth.len(), "seed {seed}");
+        assert_eq!(applied.as_slice(), &truth[..applied.len()], "seed {seed}");
+        assert_eq!(fold.state.cursor, applied.len() as u64, "seed {seed}");
     }
 
     let replayed = replay(&run.log, 0).await;
@@ -645,7 +822,7 @@ async fn assert_long_sweep_oracles(run: &Run) {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[ignore = "long sweep; run with --ignored"]
 async fn the_long_sweep_replays_byte_identically() {
-    for seed in 0..LONG_SWEEP {
+    for seed in long_seeds() {
         let first = simulate(Scenario::for_seed(seed)).await;
         let second = simulate(Scenario::for_seed(seed)).await;
         assert_eq!(first.trace, second.trace, "seed {seed}: traces diverge");
