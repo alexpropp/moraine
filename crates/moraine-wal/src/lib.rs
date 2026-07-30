@@ -118,19 +118,41 @@
 //! - `envelope` — a slot's content, its codec, and the overlay a tail folds
 //!   into.
 //! - `frame` — the magic and encoding version every slot object opens with.
+//! - `driver` — the loops over the log: the retry/rebase commit round, the fold
+//!   round, and the folder appointment rule, each generic over the embedder's
+//!   semantics.
 //!
-//! The crate spawns no threads, reads no clock, and schedules nothing: every
-//! call is one bounded piece of work the host drives. Safety here is
-//! sequence-ordinal, never temporal.
+//! The crate spawns no threads and schedules nothing: every call is one
+//! bounded piece of work the host drives. The log's own safety is
+//! sequence-ordinal, never temporal — it reads no clock. The drivers do wait
+//! between attempts, and they draw the jitter in those waits from an
+//! explicitly seeded [`Jitter`], so a run reproduces from its seed.
+//!
+//! # The loops, and what an embedder plugs into them
+//!
+//! [`drive_commit`] assembles, races, and rebases under a
+//! [`RetryPolicy`] budget over a [`Committer`]; [`drive_fold`] applies
+//! unapplied slots into a [`CursorStore`], resuming from its cursor; and
+//! [`drive_fold_if_stalled`] decides *when* a would-be folder should acquire
+//! its [`FolderRole`] at all. The embedder supplies commit semantics and
+//! derived state; the loops supply sequencing, backoff, budgets, resume, and
+//! the stand-down rule.
 
 #![forbid(unsafe_code)]
 
+mod driver;
 mod envelope;
 mod error;
+#[cfg(test)]
+mod fault;
 mod frame;
 mod proto;
 mod slot;
 
+pub use driver::{
+    CommitDrive, Committer, CursorStore, FoldReport, FolderRole, Jitter, Race, RetryPolicy,
+    drive_commit, drive_fold, drive_fold_if_stalled,
+};
 pub use envelope::{Commit, Envelope, Overlay, SlotPayload, SlotWrite};
 pub use error::Error;
 pub use proto::FoldValue;

@@ -432,19 +432,15 @@ fn parse_sequence(location: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::Arc;
 
-    use futures::stream::BoxStream;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
-    };
+    use object_store::memory::InMemory;
 
     use super::*;
-    use crate::envelope::{Commit, Envelope, SlotPayload, SlotWrite};
+    use crate::{
+        envelope::{Commit, Envelope, SlotPayload, SlotWrite},
+        fault::{FaultyPut, PutFault},
+    };
 
     fn commit_with_id(transaction_id: [u8; 16]) -> Commit {
         Commit {
@@ -610,143 +606,6 @@ mod tests {
         assert!(matches!(err, Error::Corruption(_)), "{err}");
         // The slots below the hole still answer.
         assert_eq!(log.find_transaction(1, [1; 16]).await.unwrap(), Some(1));
-    }
-
-    /// How a put fails, relative to the object landing.
-    #[derive(Debug, Clone, Copy)]
-    enum PutFault {
-        /// The object lands, then the response is lost.
-        LostResponse,
-        /// The put never reaches the store, so the slot stays absent.
-        Unreachable,
-        /// The store answers `AlreadyExists` with nothing written. Real S3
-        /// returns 409 while a competing conditional create is in flight, and
-        /// `object_store` maps every 409 to `AlreadyExists`.
-        PrematureAlreadyExists,
-    }
-
-    /// Wraps a real [`InMemory`] store and fails `put_opts` at
-    /// [`PutFault`] while the fault is armed; every other operation
-    /// forwards untouched.
-    #[derive(Debug)]
-    struct FaultyPut {
-        inner: InMemory,
-        fault: PutFault,
-        armed: AtomicBool,
-    }
-
-    impl FaultyPut {
-        fn armed(fault: PutFault) -> Self {
-            Self {
-                inner: InMemory::new(),
-                fault,
-                armed: AtomicBool::new(true),
-            }
-        }
-
-        fn disarmed(fault: PutFault) -> Self {
-            let store = Self::armed(fault);
-            store.disarm();
-
-            store
-        }
-
-        fn arm(&self) {
-            self.armed.store(true, Ordering::Relaxed);
-        }
-
-        fn disarm(&self) {
-            self.armed.store(false, Ordering::Relaxed);
-        }
-    }
-
-    impl std::fmt::Display for FaultyPut {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "FaultyPut({})", self.inner)
-        }
-    }
-
-    /// What a lost response looks like from the caller's side: no information
-    /// about whether the object exists. Its text carries every substring a
-    /// retry loop keys on, so the wrapping is exercised too.
-    fn unknown_outcome() -> object_store::Error {
-        object_store::Error::Generic {
-            store: "fault",
-            source: "the put's outcome is unknown: conflict, concurrent, unique, primary key"
-                .into(),
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for FaultyPut {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            if !self.armed.load(Ordering::Relaxed) {
-                return self.inner.put_opts(location, payload, opts).await;
-            }
-
-            match self.fault {
-                PutFault::LostResponse => {
-                    self.inner.put_opts(location, payload, opts).await?;
-                    Err(unknown_outcome())
-                }
-                PutFault::Unreachable => Err(unknown_outcome()),
-                PutFault::PrematureAlreadyExists => Err(object_store::Error::AlreadyExists {
-                    path: location.to_string(),
-                    source: "409 while a competing conditional create is in flight".into(),
-                }),
-            }
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> object_store::Result<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, object_store::Result<Path>>,
-        ) -> BoxStream<'static, object_store::Result<Path>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
     }
 
     /// The exactly-once mechanic: a put that landed under a lost response
