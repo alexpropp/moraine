@@ -123,7 +123,7 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
 /// Transitional: a later task replaces the multi-writer-flagged-false-below-
 /// [`FORMAT_MULTI_WRITER`] case with an automatic migration and removes this
 /// check entirely.
-fn validate_mode(format_version: u64, multi_writer: bool) -> Result<()> {
+pub(crate) fn validate_mode(format_version: u64, multi_writer: bool) -> Result<()> {
     match (format_version >= FORMAT_MULTI_WRITER, multi_writer) {
         (true, false) => Err(Error::Configuration(
             "store is multi-writer; attach with the multi_writer option".to_string(),
@@ -290,17 +290,15 @@ pub(crate) async fn open_initialized(
 
 /// Opens the store read-only as a [`DbReader`], validating the format it
 /// finds. Never opens a `Db`, so it never fences a live writer, and never
-/// bootstraps — a read-only attach against an uninitialized store is refused
-/// (there is nothing committed to read).
-pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<DbReader> {
+/// bootstraps. Returns `None` when the reader opens onto a store that
+/// carries no format stamp yet (a writer began creating it but has not
+/// finished); a store with no manifest at all fails to open at all, and
+/// that failure propagates as an error rather than `None`.
+pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<Option<DbReader>> {
     let reader = store.open_reader().await?;
     match validate_format(ReadHandle::Reader(&reader)).await? {
-        Some(_) => Ok(reader),
-        None => Err(Error::Corruption(
-            "store is not an initialized moraine catalog; a read-only attach \
-             needs a writer to have created it first"
-                .to_string(),
-        )),
+        Some(_) => Ok(Some(reader)),
+        None => Ok(None),
     }
 }
 

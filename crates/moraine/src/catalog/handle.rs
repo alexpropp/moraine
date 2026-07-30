@@ -20,13 +20,14 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        handle::ReadSession,
+        handle::{ReadHandle, ReadSession},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
         inline as store_inline,
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
+        read,
     },
     transaction::{Transaction, commit, index_maintenance},
 };
@@ -94,14 +95,30 @@ pub struct MaintenanceReport {
     pub index_entries_reclaimed: u64,
 }
 
-/// The open store behind a catalog: the read-write `Db` writer, or a
-/// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
-/// fences a live writer.
+/// The open store behind a catalog: the read-write `Db` writer, a
+/// read-only `DbReader`, or a commit-log-backed attach. A read-only catalog
+/// never opens a `Db`, so it never fences a live writer.
 enum Store {
     /// The single read-write writer.
     Writer(Db),
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
+    /// A commit-log-backed attach: a reader plus the slot log. Transitional
+    /// — removed once the log is the only topology.
+    MultiWriter(MultiWriterStore),
+}
+
+/// The store behind a [`Store::MultiWriter`] attach.
+// dead_code: `slots`, `object_store`, `options`, and `read_only` are read
+// starting with tail replay and fold sprints, landing in later tasks.
+#[allow(dead_code)]
+pub(crate) struct MultiWriterStore {
+    pub(crate) reader: Arc<DbReader>,
+    pub(crate) slots: moraine_wal::SlotLog,
+    /// Retained for fold sprints (reopening the fenced writer) and reads.
+    pub(crate) object_store: Arc<dyn ObjectStore>,
+    pub(crate) options: CatalogOptions,
+    pub(crate) read_only: bool,
 }
 
 /// Options for opening a catalog.
@@ -146,6 +163,9 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
+    /// Opt into the slot-log topology at store creation. Transitional:
+    /// removed once the slot log is the only topology.
+    pub multi_writer: bool,
 }
 
 impl Default for CatalogOptions {
@@ -156,6 +176,7 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
             data_path: None,
+            multi_writer: false,
         }
     }
 }
@@ -204,6 +225,10 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
+        if options.multi_writer {
+            return Self::open_multi_writer(object_store, options).await;
+        }
+
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone());
@@ -225,6 +250,75 @@ impl Catalog {
         })
     }
 
+    /// The `multi_writer: true` open path: attaches directly when the store
+    /// is already initialized, else bootstraps it through the writer
+    /// (stamping [`commit::FORMAT_MULTI_WRITER`]) and reopens as a reader.
+    /// The reader-first order means an already-initialized store is never
+    /// fenced by this open.
+    async fn open_multi_writer(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<Self> {
+        let reader_store = StoreBuilder::new(&options.path, object_store.clone())
+            .cache_dir(options.cache_dir.clone());
+        let reader = match commit::open_reader_initialized(reader_store).await {
+            Ok(Some(reader)) => {
+                let format_version = read::read_format(ReadHandle::Reader(&reader))
+                    .await?
+                    .map_or(commit::FORMAT_VERSION, |format| format.format_version);
+                commit::validate_mode(format_version, true)?;
+                reader
+            }
+            Ok(None) => Self::bootstrap_multi_writer(&object_store, &options).await?,
+            Err(Error::Store(err)) if err.kind() == slatedb::ErrorKind::Data => {
+                Self::bootstrap_multi_writer(&object_store, &options).await?
+            }
+            Err(err) => return Err(err),
+        };
+
+        info!(path = options.path, "opened catalog multi-writer");
+        let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
+        Ok(Self {
+            store: Arc::new(Store::MultiWriter(MultiWriterStore {
+                reader: Arc::new(reader),
+                slots,
+                object_store,
+                options,
+                read_only: false,
+            })),
+            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+        })
+    }
+
+    /// Bootstraps an uninitialized store through the writer, fencing any
+    /// incumbent old-binary writer, then closes it and reopens read-only.
+    async fn bootstrap_multi_writer(
+        object_store: &Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+    ) -> Result<DbReader> {
+        let writer_store = StoreBuilder::new(&options.path, object_store.clone())
+            .flush_interval(options.flush_interval)
+            .cache_dir(options.cache_dir.clone());
+        let db = commit::open_initialized(
+            writer_store,
+            options.encrypted,
+            options.data_path.as_deref(),
+            true,
+        )
+        .await?;
+        db.close().await.map_err(Error::from)?;
+
+        let reader_store = StoreBuilder::new(&options.path, object_store.clone())
+            .cache_dir(options.cache_dir.clone());
+        commit::open_reader_initialized(reader_store)
+            .await?
+            .ok_or_else(|| {
+                Error::Corruption(
+                    "store still uninitialized immediately after bootstrap".to_string(),
+                )
+            })
+    }
+
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
     /// as a `DbReader` following the latest manifest.
     ///
@@ -242,12 +336,39 @@ impl Catalog {
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<Self> {
-        let store =
-            StoreBuilder::new(&options.path, object_store).cache_dir(options.cache_dir.clone());
-        let reader = commit::open_reader_initialized(store).await?;
+        let store = StoreBuilder::new(&options.path, object_store.clone())
+            .cache_dir(options.cache_dir.clone());
+        let reader = commit::open_reader_initialized(store)
+            .await?
+            .ok_or_else(|| {
+                Error::Corruption(
+                    "store is not an initialized moraine catalog; a read-only attach \
+                 needs a writer to have created it first"
+                        .to_string(),
+                )
+            })?;
         info!(path = options.path, "opened catalog read-only");
+
+        // The format dispatch belongs here, not inside the open helper: only
+        // a format-4 store rides the slot-log topology.
+        let format_version = read::read_format(ReadHandle::Reader(&reader))
+            .await?
+            .map_or(commit::FORMAT_VERSION, |format| format.format_version);
+        let store = if format_version == commit::FORMAT_MULTI_WRITER {
+            let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
+            Store::MultiWriter(MultiWriterStore {
+                reader: Arc::new(reader),
+                slots,
+                object_store,
+                options,
+                read_only: true,
+            })
+        } else {
+            Store::Reader(Arc::new(reader))
+        };
+
         Ok(Self {
-            store: Arc::new(Store::Reader(Arc::new(reader))),
+            store: Arc::new(store),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
     }
@@ -271,6 +392,9 @@ impl Catalog {
             Store::Writer(db) => Ok(db),
             Store::Reader(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+            Store::MultiWriter(_) => Err(Error::Constraint(
+                "catalog attached over the slot log; commits are not available yet".to_string(),
             )),
         }
     }
@@ -542,6 +666,7 @@ impl Catalog {
                     .map_err(Error::from)?,
             )),
             Store::Reader(reader) => Ok(ReadSession::Reader(reader.clone())),
+            Store::MultiWriter(multi) => Ok(ReadSession::Reader(multi.reader.clone())),
         }
     }
 
@@ -1192,6 +1317,7 @@ impl Catalog {
         match self.store.as_ref() {
             Store::Writer(db) => db.close().await.map_err(Error::from),
             Store::Reader(reader) => reader.close().await.map_err(Error::from),
+            Store::MultiWriter(multi) => multi.reader.close().await.map_err(Error::from),
         }
     }
 
