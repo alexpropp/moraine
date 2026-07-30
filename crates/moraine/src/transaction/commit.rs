@@ -27,7 +27,7 @@ use crate::{
         proto, read, value,
     },
     transaction::{
-        index_maintenance,
+        index_maintenance::{self, ProbeHandle},
         operations::{ChangeSet, Operation},
         verbs::{Transaction, TransactionParts},
     },
@@ -386,17 +386,31 @@ where
         }
     };
 
-    match prepare_and_stage(&db_tx, f, &base).await {
+    let format_current = match read::read_format(ReadHandle::Tx(&db_tx)).await {
+        Ok(format) => format.map_or(FORMAT_VERSION, |format| format.format_version),
+        Err(err) => {
+            db_tx.rollback();
+            return Err(err);
+        }
+    };
+    let probe = ProbeHandle::Store(ReadHandle::Tx(&db_tx));
+
+    match assemble_commit(probe, f, &base, Some(format_current)).await {
         Ok(Prepared::Nothing { head }) => {
             db_tx.rollback();
             Ok(CommitOutcome::Committed(SnapshotId::new(head)))
         }
-        Ok(Prepared::Staged {
+        Ok(Prepared::Staged(Assembled {
             ours,
             head_before,
             commits,
             writes,
-        }) => {
+            schema_changed: _,
+        })) => {
+            if let Err(err) = stage_writes(&db_tx, &writes) {
+                db_tx.rollback();
+                return Err(err);
+            }
             finish_commit(
                 db_tx,
                 ours,
@@ -465,25 +479,34 @@ pub(crate) fn refresh_head_view(
     }
 }
 
-/// What one attempt staged onto its transaction.
-enum Prepared {
+/// Everything one commit attempt assembles, independent of where the batch is
+/// arbitrated.
+pub(crate) struct Assembled {
+    /// This attempt's change set, empty for an options-only commit.
+    pub(crate) ours: Box<ChangeSet>,
+    /// The head snapshot id the attempt's premise was read at.
+    pub(crate) head_before: u64,
+    /// The snapshot id a successful commit reports.
+    pub(crate) commits: u64,
+    /// The full batch to stage: index entries, entity diff, the format stamp
+    /// this commit owes, the minted snapshot, and the head advance. A
+    /// successful commit also folds it into the maintained projections.
+    pub(crate) writes: Vec<StagedWrite>,
+    /// Whether the commit advances the schema version.
+    // dead_code: read by the slot commit cycle, landing in a later task.
+    #[allow(dead_code)]
+    pub(crate) schema_changed: bool,
+}
+
+/// What one commit attempt computes, independent of where it is arbitrated.
+pub(crate) enum Prepared {
     /// The closure changed nothing; the head is unchanged.
     Nothing {
         /// The head snapshot id the attempt read.
         head: u64,
     },
-    /// Writes are staged and ready to commit.
-    Staged {
-        /// This attempt's change set, empty for an options-only commit.
-        ours: Box<ChangeSet>,
-        /// The head snapshot id the attempt's premise was read at.
-        head_before: u64,
-        /// The snapshot id a successful commit reports.
-        commits: u64,
-        /// The staged batch, kept so a successful commit can fold it into
-        /// the maintained projections.
-        writes: Vec<StagedWrite>,
-    },
+    /// A staged batch ready to commit.
+    Staged(Assembled),
 }
 
 /// The store format the staged state requires: a `building` index implies
@@ -508,23 +531,18 @@ fn target_format(state: &CatalogSnapshot) -> u64 {
     }
 }
 
-/// Materializes, runs the closure, and stages the resulting writes.
-/// Options-only commits stage no snapshot record and no head advance.
 /// The format-stamp write this commit owes, if any. The stamp is lazy and
 /// forward-only: a completed or dropped build never downgrades it.
-async fn format_stamp(
-    db_tx: &DbTransaction,
-    state: &CatalogSnapshot,
-) -> Result<Option<StagedWrite>> {
+/// `format_current` is the store's current stamp; `None` skips the stamp,
+/// for a topology whose format never advances lazily.
+fn format_stamp(format_current: Option<u64>, state: &CatalogSnapshot) -> Option<StagedWrite> {
     let target_format = target_format(state);
     if target_format <= FORMAT_VERSION {
-        return Ok(None);
+        return None;
     }
-    let current = read::read_format(ReadHandle::Tx(db_tx))
-        .await?
-        .map_or(FORMAT_VERSION, |format| format.format_version);
+    let current = format_current?;
     if current >= target_format {
-        return Ok(None);
+        return None;
     }
 
     // The stamp decides which binaries can open the store from here on.
@@ -534,19 +552,24 @@ async fn format_stamp(
         "upgrading the store format stamp"
     );
 
-    Ok(Some((
+    Some((
         Key::Sys(SysKey::Format).encode(),
         Some(value::encode_value(&proto::FormatValue {
             format_version: target_format,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
         })),
-    )))
+    ))
 }
 
-async fn prepare_and_stage<F>(
-    db_tx: &DbTransaction,
+/// Materializes the closure against `base` and assembles the full write batch,
+/// reading uniqueness probes through `probe`. Options-only commits assemble no
+/// snapshot record and no head advance. `format_current` feeds the lazy format
+/// stamp.
+pub(crate) async fn assemble_commit<F>(
+    probe: ProbeHandle<'_>,
     f: &F,
     base: &CatalogSnapshot,
+    format_current: Option<u64>,
 ) -> Result<Prepared>
 where
     F: Fn(&mut Transaction) -> Result<()>,
@@ -577,28 +600,29 @@ where
             Key::Sys(SysKey::Head).encode(),
             Some(value::encode_value(&proto::HeadValue { snapshot_id: head })),
         ));
-        stage_writes(db_tx, &writes)?;
-        return Ok(Prepared::Staged {
+        return Ok(Prepared::Staged(Assembled {
             ours: Box::default(),
             head_before: head,
             commits: head,
             writes,
-        });
+            schema_changed: false,
+        }));
     }
 
-    // Entries stage before the entity diff so a poisoned definition rides
-    // that diff rather than needing a write of its own.
-    let poisoned = index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    // Entries plan before the entity diff so a poisoned definition rides that
+    // diff rather than needing a write of its own.
+    let (poisoned, mut writes) =
+        index_maintenance::plan_index_entries(probe, &index_entries).await?;
     index_maintenance::apply_poison(&mut state, &poisoned);
 
-    let mut writes = diff_writes(base, &state, new_id);
-    writes.extend(format_stamp(db_tx, &state).await?);
+    writes.extend(diff_writes(base, &state, new_id));
+    writes.extend(format_stamp(format_current, &state));
     tracing::debug!(
         snapshot = new_id,
         index_entries = index_entries.len(),
-        catalog_writes = writes.len(),
+        batch_writes = writes.len(),
         poisoned_indexes = poisoned.len(),
-        "commit staged"
+        "commit assembled"
     );
 
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
@@ -636,14 +660,14 @@ where
             snapshot_id: new_id,
         })),
     ));
-    stage_writes(db_tx, &writes)?;
 
-    Ok(Prepared::Staged {
+    Ok(Prepared::Staged(Assembled {
         ours: Box::new(ours),
         head_before: head,
         commits: new_id,
         writes,
-    })
+        schema_changed,
+    }))
 }
 
 pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Result<()> {

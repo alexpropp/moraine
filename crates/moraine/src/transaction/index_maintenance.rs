@@ -28,7 +28,50 @@ use crate::{
             index_value_above, index_value_body, index_value_suffix,
         },
     },
+    transaction::commit::{StagedWrite, stage_writes},
 };
+
+/// Read-side dispatch for uniqueness probes: the store view alone
+/// (single-writer transactions read their own writes), or the store overlaid
+/// with unfolded tail writes (multi-writer).
+pub(crate) enum ProbeHandle<'a> {
+    /// A store view read directly.
+    Store(ReadHandle<'a>),
+    /// A store view overlaid with an unfolded tail: a tail write shadows the
+    /// stored value, a tail delete hides it.
+    // dead_code: constructed by the slot commit cycle, landing in a later task.
+    #[allow(dead_code)]
+    Overlaid {
+        /// The folded store view.
+        store: ReadHandle<'a>,
+        /// The writes of slots no folder has applied yet.
+        overlay: &'a moraine_wal::Overlay,
+    },
+}
+
+impl<'a> ProbeHandle<'a> {
+    /// Point read of one key, an overlaid tail's write for it taking
+    /// precedence over the store's.
+    pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        match self {
+            Self::Store(store) => store.get(key).await.map_err(Error::from),
+            Self::Overlaid { store, overlay } => match overlay.get(key) {
+                Some(write) => Ok(write.map(Bytes::copy_from_slice)),
+                None => store.get(key).await.map_err(Error::from),
+            },
+        }
+    }
+
+    /// The directly scannable store view, present only when no tail overlays
+    /// it — the bulk-load merged probe needs a store scan an overlay cannot
+    /// join into a `DbIterator`.
+    fn scan_view(&self) -> Option<ReadHandle<'a>> {
+        match self {
+            Self::Store(store) => Some(*store),
+            Self::Overlaid { .. } => None,
+        }
+    }
+}
 
 /// One index-entry mutation accumulated during a commit closure, resolved
 /// against the store when the batch is staged.
@@ -140,16 +183,17 @@ fn collision(probe_index_id: u64, building: bool, poisoned: &mut Vec<u64>) -> Op
     }
 }
 
-/// Probes one group of unique puts concurrently and stages the survivors,
-/// draining `pending`. Present with a different row id rejects the batch;
-/// present with the same row id is a re-derived entry and stages nothing.
+/// Probes one group of unique puts concurrently and plans the survivors'
+/// puts into `writes`, draining `pending`. Present with a different row id
+/// rejects the batch; present with the same row id is a re-derived entry and
+/// plans nothing.
 async fn resolve_probes(
-    db_tx: &DbTransaction,
+    probe: &ProbeHandle<'_>,
     deleted_unique: &HashSet<Vec<u8>>,
     pending: &mut Vec<PendingProbe>,
     poisoned: &mut Vec<u64>,
+    writes: &mut Vec<StagedWrite>,
 ) -> Result<()> {
-    let reader = ReadHandle::Tx(db_tx);
     let held: Vec<Option<Bytes>> = stream::iter(0..pending.len())
         .map(|position| {
             let key_bytes = pending[position].key.clone();
@@ -160,14 +204,13 @@ async fn resolve_probes(
                 if deleted {
                     Ok(None)
                 } else {
-                    reader.get(key_bytes).await
+                    probe.get(&key_bytes).await
                 }
             }
         })
         .buffered(UNIQUENESS_PROBE_CONCURRENCY)
         .try_collect()
-        .await
-        .map_err(Error::from)?;
+        .await?;
 
     // Resolved in batch order, so which entry a rejection names does not
     // depend on which probe happened to finish first.
@@ -182,7 +225,7 @@ async fn resolve_probes(
             }
             continue;
         }
-        db_tx.put(probe.key, probe.row_id.to_be_bytes())?;
+        writes.push((probe.key, Some(probe.row_id.to_be_bytes().to_vec())));
     }
     Ok(())
 }
@@ -197,15 +240,15 @@ async fn resolve_probes(
 /// which index the rejection names), present with the same row id stages
 /// nothing, absent stages the put.
 async fn resolve_probes_merged(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     deleted_unique: &HashSet<Vec<u8>>,
     pending: Vec<PendingProbe>,
     poisoned: &mut Vec<u64>,
+    writes: &mut Vec<StagedWrite>,
 ) -> Result<()> {
     let mut order: Vec<usize> = (0..pending.len()).collect();
     order.sort_unstable_by(|&a, &b| pending[a].key.cmp(&pending[b].key));
 
-    let handle = ReadHandle::Tx(db_tx);
     let mut held_elsewhere: Option<usize> = None;
     let mut already_held = vec![false; pending.len()];
     // Claims that poisoned a building index: staging them would overwrite
@@ -278,18 +321,20 @@ async fn resolve_probes_merged(
         if already_held[position] || dropped[position] {
             continue;
         }
-        db_tx.put(probe.key, probe.row_id.to_be_bytes())?;
+        writes.push((probe.key, Some(probe.row_id.to_be_bytes().to_vec())));
     }
 
     Ok(())
 }
 
-/// Resolves accumulated entries onto `db_tx`, enforcing uniqueness at
-/// commit. Deletes are staged first so a delete-then-reinsert of one unique
-/// value within a commit sees the value as absent. For each unique put:
-/// present with a **different** row id → [`Error::Constraint`]; present with
-/// the **same** row id → no-op (a re-derived entry); absent → staged.
-/// Duplicates within the commit are caught in memory.
+/// Resolves accumulated entries into planned writes, enforcing uniqueness at
+/// commit against `probe`. Returns the ids of poisoned building indexes and
+/// the writes to stage — deletes first, then puts, so staging them in order
+/// makes a delete-then-reinsert of one unique value within a commit see the
+/// value as absent. For each unique put: present with a **different** row id →
+/// [`Error::Constraint`]; present with the **same** row id → no-op (a
+/// re-derived entry); absent → planned. Duplicates within the commit are
+/// caught in memory.
 ///
 /// A collision against an index that is still **building** poisons it
 /// instead: the id is returned, the claim is dropped so the live holder's
@@ -297,20 +342,13 @@ async fn resolve_probes_merged(
 /// build flips ready, so failing the finder would decide by timing which
 /// party a duplicate falls on.
 ///
-/// Entries stage onto the transaction directly rather than through the
-/// caller's write list. The list is retained until the commit lands so the
-/// maintained projections can fold it, and no projection reflects an index
-/// entry — keeping one would hold a second copy of the batch's largest part
-/// in memory for nothing. A bulk load stages one entry per indexed row, so
-/// that copy is what decides whether the commit fits in RAM.
-///
-/// Unique puts stage after non-unique ones rather than in entry order. Every
-/// staged key is distinct — an entry's kind is part of its key — so only the
+/// Unique puts plan after non-unique ones rather than in entry order. Every
+/// key is distinct — an entry's kind is part of its key — so only the
 /// deletes-before-puts ordering above carries meaning.
-pub(crate) async fn stage_index_entries(
-    db_tx: &DbTransaction,
+pub(crate) async fn plan_index_entries(
+    probe: ProbeHandle<'_>,
     entries: &[StagedIndexEntry],
-) -> Result<Vec<u64>> {
+) -> Result<(Vec<u64>, Vec<StagedWrite>)> {
     if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
         // Logged as well as returned: the refusal is the guardrail firing,
         // and an operator reading logs after a failed bulk load should see
@@ -323,25 +361,27 @@ pub(crate) async fn stage_index_entries(
         return Err(oversized_commit(entries.len()));
     }
 
+    let mut writes: Vec<StagedWrite> = Vec::new();
     let mut deleted_unique: HashSet<Vec<u8>> = HashSet::new();
     for entry in entries.iter().filter(|entry| entry.delete) {
         let key_bytes = entry_key(entry).encode();
         if entry.unique {
             deleted_unique.insert(key_bytes.clone());
         }
-        db_tx.delete(key_bytes)?;
+        writes.push((key_bytes, None));
     }
 
-    // Non-unique puts stage straight away; unique puts collapse to one probe
+    // Non-unique puts plan straight away; unique puts collapse to one probe
     // per distinct key. Two entries claiming one value for different rows
     // collide here, in memory, before any read. Presence is then resolved a
-    // group of point reads at a time — or, past the threshold, by one
-    // sorted pass per index over the whole batch.
+    // group of point reads at a time — or, past the threshold and when the
+    // probe scans directly, by one sorted pass per index over the whole batch.
     let unique_puts = entries
         .iter()
         .filter(|entry| !entry.delete && entry.unique)
         .count();
-    let merged = unique_puts > MERGED_PROBE_THRESHOLD;
+    let scan_view = probe.scan_view();
+    let merged = scan_view.is_some() && unique_puts > MERGED_PROBE_THRESHOLD;
     let mut pending: Vec<PendingProbe> = Vec::new();
     let mut claimed: HashMap<Vec<u8>, u64> = HashMap::new();
     let mut poisoned: Vec<u64> = Vec::new();
@@ -349,7 +389,7 @@ pub(crate) async fn stage_index_entries(
         let key_bytes = entry_key(entry).encode();
         if !entry.unique {
             // The row id lives in the key; the value is empty.
-            db_tx.put(key_bytes, [])?;
+            writes.push((key_bytes, Some(Vec::new())));
             continue;
         }
         match claimed.get(&key_bytes) {
@@ -369,17 +409,48 @@ pub(crate) async fn stage_index_entries(
             building: entry.building,
         });
         if !merged && pending.len() >= UNIQUENESS_PROBE_GROUP {
-            resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
+            resolve_probes(
+                &probe,
+                &deleted_unique,
+                &mut pending,
+                &mut poisoned,
+                &mut writes,
+            )
+            .await?;
         }
     }
-    if merged {
-        resolve_probes_merged(db_tx, &deleted_unique, pending, &mut poisoned).await?;
-    } else {
-        resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
+    match scan_view.filter(|_| merged) {
+        Some(handle) => {
+            resolve_probes_merged(handle, &deleted_unique, pending, &mut poisoned, &mut writes)
+                .await?;
+        }
+        None => {
+            resolve_probes(
+                &probe,
+                &deleted_unique,
+                &mut pending,
+                &mut poisoned,
+                &mut writes,
+            )
+            .await?;
+        }
     }
 
     poisoned.sort_unstable();
     poisoned.dedup();
+    Ok((poisoned, writes))
+}
+
+/// Plans the entries over the transaction's own reads and stages the writes
+/// onto it, returning the poisoned building-index ids. Unique keys land in the
+/// transaction's write set, so two commits inserting one value collide there.
+pub(crate) async fn stage_index_entries(
+    db_tx: &DbTransaction,
+    entries: &[StagedIndexEntry],
+) -> Result<Vec<u64>> {
+    let (poisoned, writes) =
+        plan_index_entries(ProbeHandle::Store(ReadHandle::Tx(db_tx)), entries).await?;
+    stage_writes(db_tx, &writes)?;
     Ok(poisoned)
 }
 
