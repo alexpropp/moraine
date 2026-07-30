@@ -43,6 +43,26 @@ async fn multi_writer_open_bootstraps_and_serves_the_empty_catalog() {
     catalog.snapshot().await.unwrap();
 }
 
+/// Time travel over a slot-backed attach: the bootstrap snapshot resolves
+/// from the folded store, and a snapshot no slot has minted does not.
+#[tokio::test]
+async fn multi_writer_time_travel_spans_the_folded_head() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+
+    let bootstrapped = catalog
+        .snapshot_at(moraine::SnapshotId::new(0))
+        .await
+        .unwrap();
+    assert_eq!(bootstrapped.schemas().len(), 1);
+
+    let err = catalog
+        .snapshot_at(moraine::SnapshotId::new(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+}
+
 /// A prefix holding objects but no readable manifest is a damaged store, not
 /// a fresh one: the attach refuses instead of stamping a new catalog over
 /// whatever is there.

@@ -3,7 +3,7 @@
 //! This layer never performs store I/O itself; the commit protocol in
 //! [`crate::transaction`] drives it.
 
-mod handle;
+pub(crate) mod handle;
 pub(crate) mod index_policy;
 pub(crate) mod inline;
 pub(crate) mod projection;

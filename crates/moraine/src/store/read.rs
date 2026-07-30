@@ -136,9 +136,6 @@ pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue
 
 /// Reads the fold cursor; `None` on a store that has never been
 /// multi-writer.
-// dead_code: written and read by the fold loop, which lands with the
-// slot-backed commit path.
-#[allow(dead_code)]
 pub(crate) async fn read_fold(handle: ReadHandle<'_>) -> Result<Option<moraine_wal::FoldValue>> {
     read_singleton(handle, Key::Sys(SysKey::Fold)).await
 }

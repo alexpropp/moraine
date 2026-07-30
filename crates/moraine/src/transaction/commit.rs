@@ -346,7 +346,7 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
 pub(crate) type StagedWrite = (Vec<u8>, Option<Vec<u8>>);
 
 mod diff;
-mod fold;
+pub(crate) mod fold;
 use diff::diff_options;
 pub(crate) use diff::diff_writes;
 

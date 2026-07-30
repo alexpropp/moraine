@@ -187,6 +187,19 @@ impl Overlay {
     pub fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
         self.writes.get(key).map(Option::as_deref)
     }
+
+    /// Every write whose key starts with `prefix`, ascending by key, each
+    /// three-state as in [`get`](Self::get). Ascending order is what lets a
+    /// caller merge the tail into a scan of its own ordered store in one pass.
+    pub fn prefixed<'a>(
+        &'a self,
+        prefix: &'a [u8],
+    ) -> impl Iterator<Item = (&'a [u8], Option<&'a [u8]>)> {
+        self.writes
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.as_slice(), value.as_deref()))
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +237,31 @@ mod tests {
         assert_eq!(overlay.get(b"k"), Some(Some(b"new".as_slice())));
         assert_eq!(overlay.get(b"gone"), Some(None));
         assert_eq!(overlay.get(b"untouched"), None);
+    }
+
+    /// A prefix walk yields the tail's writes in key order, deletes included,
+    /// and stops at the prefix — an embedder merges it into an ordered scan of
+    /// its own store in one pass.
+    #[test]
+    fn a_prefix_walk_is_ordered_and_bounded_to_the_prefix() {
+        let mut overlay = Overlay::default();
+        overlay.absorb(&envelope_writing(&[
+            (b"index/b", Some(b"2")),
+            (b"index/a", Some(b"1")),
+            (b"index/c", None),
+            (b"other", Some(b"x")),
+        ]));
+
+        assert_eq!(
+            overlay.prefixed(b"index/").collect::<Vec<_>>(),
+            vec![
+                (b"index/a".as_slice(), Some(b"1".as_slice())),
+                (b"index/b".as_slice(), Some(b"2".as_slice())),
+                (b"index/c".as_slice(), None),
+            ]
+        );
+        assert_eq!(overlay.prefixed(b"absent").count(), 0);
+        assert_eq!(overlay.prefixed(b"").count(), 4);
     }
 
     /// Transaction ids are fixed-width envelope structure: a slot whose id

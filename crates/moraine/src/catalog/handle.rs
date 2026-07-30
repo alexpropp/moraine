@@ -21,7 +21,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        handle::ReadSession,
+        handle::{ReadHandle, ReadSession},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
@@ -29,7 +29,7 @@ use crate::{
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
     },
-    transaction::{Transaction, commit, index_maintenance},
+    transaction::{Transaction, commit, index_maintenance, slot_commit},
 };
 
 /// How many entries one staged build step commits. At roughly a kilobyte
@@ -136,8 +136,7 @@ enum Store {
 }
 
 /// The store behind a [`Store::MultiWriter`] attach.
-// dead_code: `slots`, `object_store`, `options`, and `read_only` are read
-// starting with tail replay and fold sprints, landing in later tasks.
+// dead_code: `read_only` is read by the fold sprints, landing in a later task.
 #[allow(dead_code)]
 pub(crate) struct MultiWriterStore {
     pub(crate) reader: Arc<DbReader>,
@@ -448,11 +447,36 @@ impl Catalog {
     }
 
     async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
+        if let Store::MultiWriter(multi) = self.store.as_ref() {
+            return match at {
+                None => Ok(slot_commit::materialize_slot_head(multi).await?.view),
+                Some(snapshot) => slot_commit::materialize_slot_view_at(multi, snapshot).await,
+            };
+        }
+
         let session = self.begin_read().await?;
         let view = commit::materialize(session.handle(), at).await;
         session.finish();
 
         view
+    }
+
+    /// The head view and, on a slot-backed attach, the byte-level overlay of
+    /// the slots no folder has applied — what a probe the projection does not
+    /// model must read over the store.
+    async fn head_view(
+        &self,
+        handle: ReadHandle<'_>,
+    ) -> Result<(CatalogSnapshot, Option<moraine_wal::Overlay>)> {
+        match self.store.as_ref() {
+            Store::MultiWriter(multi) => {
+                let head = slot_commit::materialize_slot_head(multi).await?;
+                Ok((head.view, Some(head.overlay)))
+            }
+            Store::Writer(_) | Store::Reader(_) => {
+                Ok((commit::materialize(handle, None).await?, None))
+            }
+        }
     }
 
     /// Resolves an equality lookup to the rows currently holding `values`.
@@ -480,7 +504,7 @@ impl Catalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            let (view, tail) = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -501,8 +525,14 @@ impl Catalog {
                 &info.directions,
                 &info.nulls,
             )?;
-            let row_ids =
-                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await?;
+            let row_ids = index_maintenance::lookup_row_ids(
+                handle,
+                tail.as_ref(),
+                index.get(),
+                info.unique,
+                &key,
+            )
+            .await?;
             let holders = RowHolders::of(&view.data_files_of(table));
             Ok(row_ids
                 .into_iter()
@@ -548,7 +578,7 @@ impl Catalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            let (view, tail) = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -573,6 +603,7 @@ impl Catalog {
 
             let mut row_ids = index_maintenance::range_row_ids(
                 handle,
+                tail.as_ref(),
                 index.get(),
                 info.unique,
                 leading_nulls,
@@ -628,7 +659,7 @@ impl Catalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            let (view, tail) = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -662,7 +693,8 @@ impl Catalog {
 
             let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
             let mut row_ids =
-                index_maintenance::null_prefix_row_ids(handle, index.get(), &key).await?;
+                index_maintenance::null_prefix_row_ids(handle, tail.as_ref(), index.get(), &key)
+                    .await?;
             if reverse {
                 row_ids.reverse();
             }
@@ -780,7 +812,7 @@ impl Catalog {
         let session = self.begin_read().await?;
 
         let outcome = async {
-            let snapshot = commit::materialize(session.handle(), None).await?;
+            let (snapshot, _) = self.head_view(session.handle()).await?;
             // `columns_of` is ordered by the column's ordinal, so a column's
             // 0-based index here is its physical position in a file written
             // under this schema — the mapping the scoped read needs. (Ordinals
@@ -1093,7 +1125,7 @@ impl Catalog {
         let session = self.begin_read().await?;
 
         let outcome = async {
-            let snapshot = commit::materialize(session.handle(), None).await?;
+            let (snapshot, _) = self.head_view(session.handle()).await?;
             let live_columns = snapshot.columns_of(table);
             let positions = columns
                 .iter()
