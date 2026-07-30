@@ -96,6 +96,13 @@ partition values" is exactly one contiguous `current` range — no join against 
 second subspace, no scatter. That is the shape a planner needs, and it costs no
 new keyspace.
 
+Embedding also costs nothing on writes — partition values are written once
+when the file is registered and never updated, so carrying them in the `file`
+value provokes no rewrite. Nothing reads them selectively, and both placements
+would be read by full scan in any case, so the choice is not contingent on
+observed access patterns; it reopens only with server-side pruning, on the
+terms RFC 0009 sets.
+
 ### The partition spec record
 
 The `partition` value carries the spec's `begin_snapshot`, its ordered
@@ -166,9 +173,10 @@ planner decides which files to read.
 
 A future **server-side partition-pruning pushdown** is deferred, and it is the
 **same unresolved question** as RFC 0002's stats-pruning pushdown and RFC 0006's
-pushdown surface — moraine serves filter/projection pushdown where it maps
-cleanly onto the key layout, and partition pruning is not such a case today. If
-it is ever added it must be both **transform-aware** and **type-aware**:
+pushdown surface. No row filter is pushed into moraine at all today, so there
+is no predicate here to prune with, and RFC 0009 sets the condition under which
+one would be worth accepting. If it is ever added it must be both
+**transform-aware** and **type-aware**:
 correctly pruning a `bucket(16)` or `year(...)` partition means reproducing
 DuckLake's transform semantics, and comparing a value means DuckLake's typed
 comparison, never a lexicographic compare over stored strings. Doing it wrong
