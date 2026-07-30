@@ -151,14 +151,6 @@ Live, via `cargo xtask e2e`:
   delete file; survivors keep their row ids; time travel to the
   pre-rewrite snapshot still shows the deleted rows.
 
-## Open questions
-
-- **Compaction of disjoint file sets of the same table.** Two compactions
-  of one `table_id` are a true conflict even on disjoint files. Finer
-  (file-set) grain would let them run concurrently; deferred —
-  maintenance is throughput-insensitive and table grain matches the
-  conflict model.
-
 ## Alternatives considered
 
 - **A moraine-side compaction engine** (the prior revision: moraine plans

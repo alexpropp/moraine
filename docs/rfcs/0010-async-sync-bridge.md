@@ -170,7 +170,7 @@ moraine catalog** (per `slatedb::Db` / `Catalog` instance, RFC 0003), at
   moraine catalogs get independent runtimes; this keeps `DETACH` teardown local
   and avoids a process-global whose worker count must serve an unknown number
   of catalogs. (Revisit if many-catalog processes make a shared runtime worth
-  the coupling — see Open questions.)
+  the coupling.)
 
 ### `block_on` discipline
 
@@ -303,33 +303,6 @@ paths are exercised by the `cargo xtask e2e` DuckDB harness (RFC 0006):
   runtime remains usable for the next call.
 - **Teardown.** `DETACH` drops the runtime and flushes SlateDB with no
   outstanding-task leak.
-
-## Open questions
-
-- **Interrupt delivery mechanism.** Exactly how DuckDB hands an interrupt to a
-  C-ABI extension (a pollable flag on the client context, a callback, a
-  cancellation handle) — pinned against DuckDB's extension API in RFC 0006
-  work; determines whether the cancellation token is polled or signal-driven.
-- **Worker-thread count.** The runtime's worker count default — likely derived
-  from DuckDB's own thread setting so the two do not oversubscribe cores;
-  settled with a perf pass.
-- **Per-instance vs. shared runtime.** For a process attaching many moraine
-  catalogs, one shared runtime saves threads at the cost of coupling teardown.
-  Deferred; per-instance is the safe default and is revisited only if
-  many-catalog processes prove common.
-- **Blocking-call latency under load.** Whether a separate IO-dedicated runtime
-  (or `spawn_blocking` discipline) is needed if SlateDB IO latency starves the
-  shared worker pool under heavy parallel scans — measured before adding
-  complexity.
-- **A future async DuckDB contract.** If DuckDB gains an async catalog/operator
-  contract, the completion-callback mechanism (B) becomes viable — but only if
-  bridge overhead ever rises above the object-store-latency floor, which for
-  catalog workloads it does not. Track DuckDB's extension API; do not pre-build
-  for it.
-- **A commit-funnel dispatcher.** Option C's one real use — serializing a
-  many-connection process through a single committer — is an RFC 0004 topology
-  decision layered *above* the bridge, not a change to mechanism A. Revisit
-  there if a many-committer process appears.
 
 ## Alternatives considered
 

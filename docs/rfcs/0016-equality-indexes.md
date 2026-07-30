@@ -1,15 +1,6 @@
 # RFC 0016: Equality and range indexes
 
 - **Date:** 2026-07-10
-- **Revised:** 2026-07-19 — staged (multi-commit) builds designed in;
-  previously deferred to Open questions.
-- **Revised:** 2026-07-21 — rewrite-file row-id resolution designed in
-  (Rewrite files); previously an implementation follow-up behind a typed
-  refusal.
-- **Revised:** 2026-07-22 — the index becomes **ordered**: order-preserving
-  encoding, per-column direction and NULL placement, and comparison
-  accessors (Range and comparison queries). `=` is now the degenerate closed
-  `[v, v]` range over the same storage.
 
 ## Summary
 
@@ -232,7 +223,7 @@ questions).
 **Oversized values are refused.** Indexed values beyond a fixed cap fail
 with `Constraint` at insert/registration — huge keys degrade the whole
 segment, and equality over megabyte values is not this feature's job.
-Hash-overflow is rejected for v1 (Open questions records the threshold).
+Hash-overflow is rejected for v1.
 
 ### Coverage — who writes entries, and when
 
@@ -490,8 +481,8 @@ Two builders racing the same build both write the definition key and
 collide write-write — the cursor serializes them mechanically. Steps carry
 the definition write, so they classify `altered_table:<table_id>` like the
 create: conservative — a step racing any same-table write surfaces a
-conflict rather than interleaving (the benign `inserted_into_table`
-refinement is recorded in Open questions).
+conflict rather than interleaving (a benign `inserted_into_table`
+refinement is unsettled).
 
 **The delete race.** A row live at one derivation pass can die before its
 step lands, and a stale entry for a dead row is corruption — for a unique
@@ -660,8 +651,7 @@ written to a file collide as they must. Two further guarantees are
 load-bearing:
 
 - **A unique index's scoped read is synchronous at commit.** Deferring it
-  (the non-unique option in Open questions) would let a duplicate commit
-  unchecked.
+  would let a duplicate commit unchecked.
 - **A failed read aborts the commit.** If the registered file cannot be read,
   the commit fails with a store error; the check is never skipped.
 
@@ -923,42 +913,6 @@ tests against real SlateDB on in-memory `object_store`:
   entries; `moraine_create_index` on a table already holding rewrite
   files backfills them.
 
-## Open questions
-
-- **Oversized-value cap.** The refusal threshold for indexed value size
-  (strawman: 1 KiB per composite key). Hash-overflow schemes are the
-  recorded escape if a real workload needs large indexed values.
-- **Benign build steps.** Steps classify `altered_table`, so a build
-  serializes against same-table writers (each side re-drives on conflict).
-  The `inserted_into_table` refinement — steps benign with concurrent
-  appends — needs the delete race re-examined before the classification
-  loosens, since surfaced conflicts are what force the stale-batch
-  re-derivation today.
-- **Transparent pushdown.** Whether to carry the DuckLake binder patch
-  (Extension path, Future directions) that accepts `CREATE INDEX`/`PRIMARY
-  KEY` and routes equality pushdown to the index. Nothing in the layout
-  precludes it; nothing here promises it.
-- **Deferred maintenance under SQL writes.** The same-commit scoped read adds
-  latency proportional to the registered file's indexed columns. A deferred
-  (post-commit) mode could shed it for non-unique indexes at the cost of an
-  under-coverage window. Unique indexes cannot defer: enforcement *is* the
-  commit.
-- **Ordered NULL *emission*.** NULL rows are now stored (multi-shaped,
-  collision-exempt) and reachable by `IS NULL`, but the placement's *ordering*
-  effect — emitting NULL rows at the declared `FIRST`/`LAST` end of an
-  ordered scan — is only meaningful for `ORDER BY`, which is not yet routed to
-  the index (see pushdown, below). Until then `NULLS FIRST`/`LAST` governs the
-  stored flag byte and nothing a reader observes about order.
-- **Reverse-direction scans.** The store scans forward only, so one index
-  serves one declared order. Whether to grow a store-level reverse iterator
-  (letting one index serve both directions, and a composite its exact-opposite
-  order) versus the current "declare the direction, or build a second index"
-  is open.
-- **Transparent range/`ORDER BY` pushdown.** The ordered encoding removes the
-  encoding blocker; routing comparison and `ORDER BY` pushdown into DuckLake's
-  optimizer still waits on a DuckLake binder change (Extension path, Future
-  directions).
-
 ## Alternatives considered
 
 - **Temporally versioned entries (`begin`/`end`, current/history-style).**
@@ -983,8 +937,8 @@ tests against real SlateDB on in-memory `object_store`:
   index to a `stale` flag). A stale unique index enforces nothing and says so
   only to callers who ask — silent degradation of the exact guarantee the
   feature exists to give. Rejected for the scoped read, which keeps DuckLake
-  flows working *and* the index honest; stale-mode survives only as the
-  deferred-non-unique open question, where correctness is not at stake.
+  flows working *and* the index honest; stale-mode survives only as an
+  unsettled option for non-unique indexes, where correctness is not at stake.
 - **Refusing the extension write path outright** (this RFC's first stance).
   Reading a registered file's indexed columns is a bounded, merge-free
   projection — not the scan path the non-goal guards — so blanket refusal
@@ -1029,7 +983,7 @@ commits over upstream (reader snapshots, a multi-get batching point-gets) —
 no index primitives: no range-delete, no merge operator. The whole index
 family, uniqueness included, rides the same `get` / `WriteBatch` /
 prefix-scan surface this RFC assumes. A production index engine living
-without range-delete answers Reclamation's open question: the batched sweep
+without range-delete settles the Reclamation question: the batched sweep
 is a legitimate permanent design, not a workaround awaiting a SlateDB
 feature.
 

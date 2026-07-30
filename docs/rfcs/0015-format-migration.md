@@ -46,11 +46,10 @@ Non-goals:
   this RFC does not touch the value codec.
 - **Online migration across mixed binary versions.** A structural rewrite
   changes key structure, so an old binary cannot read the new layout. Rolling a
-  fleet across a structural bump is called out as an Open question, not
-  solved here.
+  fleet across a structural bump is unresolved, not solved here.
 - **Automatic rollback / downgrade.** Migrations are one-way; recovery is
   manual and rests on old objects surviving until new ones are durable
-  (below). Rollback strategy is an Open question.
+  (below). Rollback strategy is unresolved.
 - **Inventing new atomicity or fencing primitives.** This RFC composes the
   existing ones exactly as [RFC 0011](0011-crash-injection-test-matrix.md)
   composes them for genesis.
@@ -210,8 +209,8 @@ merely migrator bookkeeping:
 Consequently **structural migration is _not_ online across mixed binary
 versions.** A rolling deployment that spans a structural bump either drains
 readers across the flip or tolerates a brief unavailability window. Making
-structural migration truly online across mixed binaries is an Open question,
-not a delivered feature — and saying so is the point of this section.
+structural migration truly online across mixed binaries is unresolved, not a
+delivered feature — and saying so is the point of this section.
 
 ### One-way, composable migrations
 
@@ -228,9 +227,9 @@ elsewhere in the design, are:
   durable (the step-loop ordering), so a failed migration can be reasoned
   about against surviving old state.
 - SlateDB's object history and/or an **optional pre-migration snapshot**
-  (Open question) give a manual recovery point.
+  give a manual recovery point.
 
-Rollback as a first-class, automatic operation is an Open question below.
+Rollback as a first-class, automatic operation is unresolved.
 
 ### Trigger policy
 
@@ -249,8 +248,8 @@ from ordinary attach), **not** a silent auto-run on open. The reasoning:
 The boundary: a **trivial metadata migration** (bounded, O(1)-ish, e.g.
 rewriting only the `system` records with no keyspace walk) *could* auto-run on
 open, because it carries none of the surprise. Where exactly that boundary
-sits — what qualifies as "trivial enough to auto-run" — is an Open question.
-The default is explicit.
+sits — what qualifies as "trivial enough to auto-run" — is unresolved. The
+default is explicit.
 
 ### Test obligations
 
@@ -277,38 +276,6 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   historical state — the rewrite preserves temporal semantics, it does not
   flatten history.
 
-## Open questions
-
-- **Rollback strategy.** Migrations are one-way. Is a pre-migration snapshot
-  (below) the sanctioned recovery, or should paired `v_{n+1} → v_n` inverse
-  migrations be written and tested? The latter doubles the test surface and
-  is not always expressible (a lossy structural change has no inverse).
-- **Online / mixed-binary migration for rolling deploys.** Can a structural
-  bump ever be served across two binary versions simultaneously — e.g. a
-  reader that understands both layouts for a window — or is a drain/brief
-  unavailability the permanent answer? This RFC assumes the latter and flags
-  the former as unsolved.
-- **Auto-vs-explicit trigger boundary.** Precisely which migrations are
-  "trivial" enough to auto-run on open (bounded `system`-only rewrites) versus
-  requiring the explicit verb. Getting this wrong in the permissive direction
-  reintroduces the rolling-fleet surprise.
-- **Encrypted stores ([RFC 0014](0014-encryption.md)) pose no constraint.**
-  Catalog-at-rest encryption is delegated to object-store SSE, so a migrator
-  always sees plaintext values through the store client. RFC 0014 rejected
-  value-payload envelope encryption partly *because* it would make values
-  opaque to field-touching structural migrations; any future
-  bucket-independent encryption goes below the value format (SlateDB block
-  layer), where migrations remain unaffected.
-- **Whole-store pre-migration snapshot.** Should the `migrate` verb snapshot
-  the entire store before starting, for guaranteed manual rollback? SlateDB
-  (pinned 0.14.x) provides the mechanism nearly for free:
-  `Db::create_checkpoint()` produces a durable, named manifest-level
-  checkpoint that pins the store's current objects without copying them —
-  no transient size doubling, no bulk traffic; the cost is retained objects
-  for the checkpoint's lifetime. The open part is policy, not mechanism:
-  checkpoint by default or behind an operator flag, and when the checkpoint
-  is released after a successful migration.
-
 ## Alternatives considered
 
 - **Silent auto-migrate on open.** Rejected. A heavyweight, unbounded rewrite
@@ -317,7 +284,7 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   still-running old-binary reader, surprising a rolling fleet and coupling an
   operational decision to an incidental attach. Explicit opt-in makes the
   cost and timing owned. (Trivial `system`-only migrations are the noted
-  exception — Open questions.)
+  exception.)
 - **Lazy / online per-key migration on read.** Translate old keys to the new
   layout on the fly, forever, the way axis 1 translates old *values*.
   Rejected for key structure specifically: it leaves the store **permanently

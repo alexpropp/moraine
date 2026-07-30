@@ -19,7 +19,8 @@ table's files and their partition values are one contiguous scan. Sorting:
 exactly: moraine stores specs, transforms, expressions, and values
 **verbatim** and serves them efficiently; DuckLake's planner does the pruning
 and DuckLake's writer does the sorting. Server-side partition pruning is
-deferred, and is the same open question as RFC 0002's stats-pruning pushdown.
+deferred, and is the same unresolved question as RFC 0002's stats-pruning
+pushdown.
 
 ## Goals
 
@@ -35,8 +36,8 @@ deferred, and is the same open question as RFC 0002's stats-pruning pushdown.
 
 Non-goals:
 
-- Server-side partition pruning — deferred (see Open questions), the same
-  posture RFC 0002 takes on stats pruning.
+- Server-side partition pruning — deferred, the same posture RFC 0002 takes
+  on stats pruning.
 - Evaluating transforms or sort expressions. moraine stores transform
   definitions and sort expressions verbatim and never applies them (RFC 0006
   row-faithfulness).
@@ -164,7 +165,7 @@ transforms it already understands, and prunes. moraine returns rows; the
 planner decides which files to read.
 
 A future **server-side partition-pruning pushdown** is deferred, and it is the
-**same open question** as RFC 0002's stats-pruning pushdown and RFC 0006's
+**same unresolved question** as RFC 0002's stats-pruning pushdown and RFC 0006's
 pushdown surface — moraine serves filter/projection pushdown where it maps
 cleanly onto the key layout, and partition pruning is not such a case today. If
 it is ever added it must be both **transform-aware** and **type-aware**:
@@ -243,31 +244,6 @@ partitioning and sorting tables extend it:
   DuckLake SQL and to settle the file-partition-value placement (below) against
   observed reads.
 
-## Open questions
-
-- **Server-side partition-pruning pushdown.** Deferred. The same open question
-  as RFC 0002's stats-pruning pushdown and RFC 0006's pushdown surface. If ever
-  built, it must be transform-aware **and** type-aware, never a naive compare.
-- **Embedded vs. own kind for `file_partition_value`.** This is the same
-  access-pattern question as RFC 0002's `fstat` file-major-vs-column-major
-  ordering: embedding keeps a file's values in the same contiguous per-file
-  scan (the write unit and the per-file predicate unit), whereas a value-major
-  layout would favor "all files' values for one partition column." Settled
-  against the captured DuckLake partition queries in the e2e suite before the
-  collection grows large enough that reversing it means a migration. Embedded
-  stands until then.
-- **Drop/alter of a partitioned or sorted column.** Where exactly DuckLake
-  draws the line (for sort specs the column reference is a verbatim expression
-  string, so the question includes what DuckLake does with a stale
-  expression), and whether moraine must enforce any part of it at the
-  catalog-constraint layer (RFC 0006) or purely follows DuckLake's committed
-  state.
-- **Hidden/implicit partitioning.** Whether DuckLake grows partitioning schemes
-  beyond the explicit spec (e.g. derived or hidden partitions) that would need
-  their own representation.
-- **Compaction across partition boundaries.** The precise merge-eligibility
-  rule, owned by RFC 0008.
-
 ## Alternatives considered
 
 - **A separate `pval` subspace/kind for `file_partition_value`.** Rejected: the
@@ -278,8 +254,8 @@ partitioning and sorting tables extend it:
 - **moraine evaluating transforms and pruning server-side now.** Rejected for
   the same reason RFC 0002 rejects server-side stats pruning: row-faithfulness,
   and correctness would demand full transform-awareness plus type-aware
-  comparison. A wrong compare silently drops rows. Deferred to an open question,
-  gated on e2e evidence.
+  comparison. A wrong compare silently drops rows. Deferred, gated on e2e
+  evidence.
 - **Keying partition columns by name instead of field id.** Rejected: it breaks
   under column rename and reorder. Field-id references (RFC 0012) keep a spec
   valid across schema evolution.
