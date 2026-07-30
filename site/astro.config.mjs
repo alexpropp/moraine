@@ -4,8 +4,7 @@ import starlight from '@astrojs/starlight';
 import starlightThemeNova from 'starlight-theme-nova';
 
 export default defineConfig({
-	site: 'https://alexpropp.github.io',
-	base: '/moraine',
+	site: 'https://morainedb.github.io',
 	integrations: [
 		starlight({
 			plugins: [starlightThemeNova()],
@@ -13,8 +12,12 @@ export default defineConfig({
 			title: 'moraine',
 			description:
 				'A DuckLake catalog that lives in your bucket — SlateDB-backed, serverless, nothing to operate.',
+			logo: {
+				light: './src/assets/moraine.svg',
+				dark: './src/assets/moraine-dark.svg',
+			},
 			social: [
-				{ icon: 'github', label: 'GitHub', href: 'https://github.com/alexpropp/moraine' },
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/morainedb/moraine' },
 			],
 			sidebar: [
 				{

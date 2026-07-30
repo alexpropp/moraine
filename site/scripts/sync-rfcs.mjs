@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const sourceDir = path.resolve(scriptDir, '../../docs/rfcs');
 const outputDir = path.resolve(scriptDir, '../src/content/docs/rfcs');
-const githubBlobBase = 'https://github.com/alexpropp/moraine/blob/main';
+const githubBlobBase = 'https://github.com/morainedb/moraine/blob/main';
 
 const excluded = new Set(['0000-template.md', 'README.md']);
 

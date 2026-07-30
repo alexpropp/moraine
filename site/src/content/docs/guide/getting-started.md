@@ -10,7 +10,7 @@ sidebar:
 Moraine is not yet in the DuckDB community extension repository, so the
 extension loads unsigned. Grab `moraine.<platform>.duckdb_extension` (e.g.
 `moraine.osx_arm64.duckdb_extension`) from the latest `ext-v*` entry on the
-[releases page](https://github.com/alexpropp/moraine/releases), then start
+[releases page](https://github.com/morainedb/moraine/releases), then start
 DuckDB with `-unsigned` (the setting cannot be changed on a running
 database):
 

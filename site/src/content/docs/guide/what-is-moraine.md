@@ -42,5 +42,5 @@ end-to-end: DuckLake SQL — `CREATE`/`INSERT`/`UPDATE`/`DELETE`, time travel,
 maintenance — runs against moraine as its catalog, validated against real
 DuckDB in CI. Released on [crates.io](https://crates.io/crates/moraine);
 APIs may still change before 1.0. The
-[roadmap](https://github.com/alexpropp/moraine/blob/main/ROADMAP.md) tracks
+[roadmap](https://github.com/morainedb/moraine/blob/main/ROADMAP.md) tracks
 each feature.

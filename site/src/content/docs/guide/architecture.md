@@ -33,7 +33,7 @@ catalog state, not a re-modeled projection — out of SlateDB.
 ## Going deeper
 
 The full map — storage model, commit protocol, layering — is in
-[ARCHITECTURE.md](https://github.com/alexpropp/moraine/blob/main/ARCHITECTURE.md);
+[ARCHITECTURE.md](https://github.com/morainedb/moraine/blob/main/ARCHITECTURE.md);
 every design decision is recorded as an RFC in the
 [Design section](../../rfcs/0001-repository-structure-and-conventions/) of
 this site.

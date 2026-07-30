@@ -4,12 +4,16 @@ description: A DuckLake catalog that lives in your bucket — SlateDB-backed, se
 template: splash
 hero:
   tagline: A DuckLake catalog that lives in your bucket. SlateDB-backed, serverless, nothing to operate.
+  image:
+    alt: Three stacked strata forming a ridge — the moraine mark
+    light: ../../assets/moraine.svg
+    dark: ../../assets/moraine-dark.svg
   actions:
     - text: Get started
       link: guide/getting-started/
       icon: right-arrow
     - text: View on GitHub
-      link: https://github.com/alexpropp/moraine
+      link: https://github.com/morainedb/moraine
       icon: external
       variant: minimal
 ---
@@ -32,7 +36,8 @@ INSERT INTO lake.events VALUES (1, 'hello, bucket');
   </Card>
   <Card title="Durability for free" icon="approve-check">
     Catalog durability *is* object-store durability. No backup schedule, no
-    WAL shipping — losing the catalog means losing the bucket.
+    WAL shipping — the only way to lose the catalog is to lose the bucket
+    itself.
   </Card>
   <Card title="The bucket is the whole lake" icon="seti:db">
     Copying the bucket copies data *and* catalog together. Environments,

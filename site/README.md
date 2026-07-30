@@ -2,7 +2,9 @@
 
 The project website — [Astro](https://astro.build) +
 [Starlight](https://starlight.astro.build), deployed to GitHub Pages at
-<https://alexpropp.github.io/moraine/> by `.github/workflows/site.yml`.
+<https://morainedb.github.io/> by `.github/workflows/site.yml`, which
+pushes the built site to the `morainedb/morainedb.github.io` repository
+(deploy key in the `SITE_DEPLOY_KEY` secret).
 
 Content lives in `src/content/docs/`. The RFCs under the site's Design
 section are **not** authored here: `scripts/sync-rfcs.mjs` copies them from

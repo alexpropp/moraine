@@ -40,11 +40,11 @@ test('sibling RFC links become relative page links, anchors preserved', () => {
 test('excluded and out-of-dir targets fall back to GitHub URLs', () => {
   assert.ok(
     result.includes(
-      '](https://github.com/alexpropp/moraine/blob/main/docs/rfcs/0000-template.md)',
+      '](https://github.com/morainedb/moraine/blob/main/docs/rfcs/0000-template.md)',
     ),
   );
   assert.ok(
-    result.includes('](https://github.com/alexpropp/moraine/blob/main/crates/moraine)'),
+    result.includes('](https://github.com/morainedb/moraine/blob/main/crates/moraine)'),
   );
 });
 
