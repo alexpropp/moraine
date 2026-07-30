@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { transformRfc } from './sync-rfcs.mjs';
+import { isRfcFile, transformRfc } from './sync-rfcs.mjs';
 
 const source = [
   '# RFC 0016: Equality and range indexes',
@@ -55,4 +55,11 @@ test('external links and pure anchors are untouched', () => {
 
 test('a source with no H1 is an error', () => {
   assert.throws(() => transformRfc('0099-broken.md', 'no title here'), /no H1/);
+});
+
+test('only numbered RFC files are synced', () => {
+  assert.ok(isRfcFile('0022-commit-log-and-leader-role.md'));
+  assert.ok(!isRfcFile('tasks.md'));
+  assert.ok(!isRfcFile('README.md'));
+  assert.ok(!isRfcFile('0000-template.md'));
 });

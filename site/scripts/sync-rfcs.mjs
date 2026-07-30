@@ -1,6 +1,7 @@
-// Copies docs/rfcs/*.md into the Starlight content tree, deriving frontmatter
-// from each RFC's H1 and rewriting links: sibling RFCs become relative page
-// links; anything else relative falls back to the file on GitHub.
+// Copies the numbered RFCs from docs/rfcs into the Starlight content tree,
+// deriving frontmatter from each RFC's H1 and rewriting links: sibling RFCs
+// become relative page links; anything else relative falls back to the file
+// on GitHub.
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -11,7 +12,11 @@ const sourceDir = path.resolve(scriptDir, '../../docs/rfcs');
 const outputDir = path.resolve(scriptDir, '../src/content/docs/rfcs');
 const githubBlobBase = 'https://github.com/morainedb/moraine/blob/main';
 
-const excluded = new Set(['0000-template.md', 'README.md']);
+// An RFC is a numbered kebab-title file; everything else in the directory
+// (template, README, task lists) stays out of the site.
+export function isRfcFile(name) {
+  return /^\d{4}-[a-z0-9-]+\.md$/.test(name) && name !== '0000-template.md';
+}
 
 export function transformRfc(filename, source) {
   const lines = source.split('\n');
@@ -29,8 +34,7 @@ export function transformRfc(filename, source) {
 
     const [file, fragment] = target.split('#');
     const anchor = fragment === undefined ? '' : `#${fragment}`;
-    const isSibling = /^\d{4}-[a-z0-9-]+\.md$/.test(file) && !excluded.has(file);
-    if (isSibling) return `](../${file.slice(0, -3)}/${anchor})`;
+    if (isRfcFile(file)) return `](../${file.slice(0, -3)}/${anchor})`;
 
     const resolved = path.posix.normalize(path.posix.join('docs/rfcs', file));
     return `](${githubBlobBase}/${resolved}${anchor})`;
@@ -51,9 +55,7 @@ export function transformRfc(filename, source) {
 
 export async function syncRfcs() {
   const entries = await readdir(sourceDir);
-  const rfcs = entries
-    .filter((name) => name.endsWith('.md') && !excluded.has(name))
-    .sort();
+  const rfcs = entries.filter(isRfcFile).sort();
 
   await rm(outputDir, { recursive: true, force: true });
   await mkdir(outputDir, { recursive: true });
