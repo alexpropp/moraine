@@ -113,7 +113,7 @@ transaction (`DeleteSnapshots`):
    step 6's own deletes).
 
 **No new snapshot row is inserted anywhere in the cascade** — expiry does
-not advance head. (This resolves the prior revision's open question.)
+not advance head.
 
 **`ducklake_cleanup_old_files(older_than / cleanup_all)`** reads the
 schedule, calls `fs.RemoveFiles(paths)` — DuckDB's filesystem, not
@@ -231,17 +231,6 @@ Per RFC 0001, core tests run against real SlateDB on in-memory
 - **Racing verb commits stay sound.** A verb-path retry whose base
   predates a concurrent expiry treats a missing intervening snapshot
   record as a conflict-and-refresh, never as corruption.
-
-## Open questions
-
-- **Interior (non-tail) expiry.** DuckLake's `versions => […]` may expire
-  arbitrary interior snapshots; the dead-row rule (`NOT EXISTS` over
-  surviving snapshots) already handles it on DuckLake's side, and
-  moraine's translation is id-driven either way. Pin with e2e when the
-  case matters; nothing in the translation is tail-specific.
-- **Reader-pin visibility.** Whether the extension layer (RFC 0006) can
-  expose live reader snapshots so operators can size retention windows
-  from observed reader durations. Deferred; policy-only for now.
 
 ## Alternatives considered
 

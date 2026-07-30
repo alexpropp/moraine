@@ -466,38 +466,6 @@ writes its counts through the out-parameters and accepts null slots for
 either, and the overlap guard is exercised across store kinds, buckets,
 and sibling-versus-nested prefixes without needing a lake.
 
-## Open questions
-
-- **Scheduler thread lifetime against DuckDB shutdown.** Detaching
-  *during* a running pass is pinned by a test and completes: `Stop()`
-  blocks until the pass finishes — the property that keeps a pass from
-  ever touching a detached database — without deadlocking against what
-  detach itself holds. What remains is a process torn down without
-  detaching at all, which has no defined outcome, since DuckDB's
-  extension teardown ordering is not something this design can assert.
-- **Trigger-under-transaction.** Resolved for the autocommit case: the
-  trigger runs the pass through a second connection and works against a
-  real lake, including a full seven-step pass. The explicit-transaction
-  refusal remains a guard rather than a proof — whether a blocked
-  autocommit caller can still hold something the pass's connection needs
-  under heavier concurrency is untested.
-- **Range delete.** SlateDB 0.14.1 exposes none, so the sweep is a batched
-  scan-and-delete — this RFC's answer to RFC 0016's open question, for the
-  pinned version. If one appears, the sweep collapses to a call per dead
-  index and this design is the fallback.
-- **Batch size default.** 1024 is a strawman, to be set from measurement.
-- **Status durability.** The retained window is in memory, so it starts
-  empty at every attach and a schedule that failed overnight in a process
-  since restarted leaves no trace. Persisting it — and whether that
-  belongs in the catalog or outside it — is open. The window size (16) is
-  a strawman.
-- **DuckLake version coupling.** The shim names DuckLake's function
-  signatures and, through the derivation rule, its parameter names. A
-  signature change breaks the pass where it previously broke only the
-  operator's script, and a new DuckLake parameter stays invisible until
-  moraine exposes it. The e2e suite pins the tracked version; whether to
-  detect and degrade rather than fail is open.
-
 ## Alternatives considered
 
 - **A documented ordering, with no orchestration and no schedule** (this

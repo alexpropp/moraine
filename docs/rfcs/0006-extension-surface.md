@@ -663,55 +663,6 @@ attach closes the race deterministically (see
 tests that drive DuckLake's own write path pin it for exactly that reason,
 not as a production recommendation.
 
-## Open questions
-
-- **The exact SQL/access pattern DuckLake issues.** Which reads, writes, and
-  filter pushdowns DuckLake relies on against `ducklake_*` determines which
-  scan pushdowns moraine must implement for acceptable performance. This is
-  the standing E2E validation (RFC 0001/0004), not a blocking
-  prerequisite — the design serves any pattern; the question is which to
-  optimize.
-- **ATTACH ergonomics — resolved (source-verified, DuckLake main
-  2026-07).** The metadata connection is a literal nested `ATTACH` of the
-  path after `ducklake:`; `ducklake:moraine:<uri>` reaches moraine through
-  DuckDB's own prefix dispatch (see Front door). The e2e suite
-  regression-pins the exact string against the tracked DuckLake version.
-- **Conflict propagation — resolved (source-verified, DuckLake main
-  2026-07).** DuckLake re-drives internally: benign races are retried by
-  its `RunCommitLoop` (bounded, backoff), true conflicts per its own matrix
-  throw `TransactionException` to the application (RFC 0004, "Staged-row
-  commits"). The shim's obligations are the two wire-contract points in
-  the Transactions bullet above; e2e regression-pins them against the
-  tracked DuckLake version.
-- **Constraint responsibility — resolved (source-verified, DuckLake main
-  2026-07).** The constraint surface is smaller than the spec's
-  "transactional SQL store with primary-key constraints" phrasing
-  suggests. Exactly **five** metadata tables carry a `PRIMARY KEY` —
-  `ducklake_snapshot(snapshot_id)`,
-  `ducklake_snapshot_changes(snapshot_id)`, `ducklake_schema(schema_id)`,
-  `ducklake_data_file(data_file_id)`,
-  `ducklake_delete_file(delete_file_id)` — and there are **no**
-  name-uniqueness constraints anywhere (duplicate names are prevented by
-  DuckLake's own conflict matrix, not by the catalog; `ducklake_metadata`
-  is entirely unconstrained). All five PKs are id-collision guards, and
-  their one load-bearing role is the commit-race signal: racing commits
-  collide on the snapshot-row `INSERT` (and, downstream of the same shared
-  counters, on schema/file ids). In moraine that role is subsumed by RFC
-  0004's head conflict detection — a racing staged-row commit fails
-  wholesale before any per-row collision could matter. What moraine
-  enforces is the equivalent backstop: an insert whose id already exists
-  as a live record of the same kind (the five keyed kinds above) fails
-  with a typed `Constraint` error rather than silently overwriting the
-  `current` key — one existence check per translated insert, no general
-  constraint machinery, and no name-uniqueness enforcement (DuckLake owns
-  that).
-- **DuckDB version cadence.** How often the pin must move, and the support
-  window for older DuckDB releases. The initial pin is recorded above
-  (DuckDB v1.5.4 / DuckLake `v1.5-variegata` / catalog format 1.0); what
-  remains open is the bump policy — whether moraine tracks each DuckDB
-  minor as DuckLake cuts its matching branch, and how many past series
-  (v1.4-andium, …) get builds.
-
 ## Alternatives considered
 
 - **A2 — a standalone moraine `ATTACH` DuckDB catalog** in addition to

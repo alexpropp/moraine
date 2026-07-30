@@ -12,6 +12,8 @@ record *why* the project is the way it is.
    design and is binding: if implementation reveals a better design, update
    the RFC (or replace it with a successor that points back) — don't
    silently diverge.
+3. An RFC states the design, not what is left to do about it. Undecided
+   questions and deferred work are tracked outside the RFC.
 
 Design documents produced in brainstorming/design sessions are written
 directly here as RFCs; there is no separate specs directory.

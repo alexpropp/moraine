@@ -76,7 +76,7 @@ transaction (read-write) or the reader (read-only). The shim reads DuckDB's
 write-rejection (typed `Constraint`, not a fence), and that a reader never
 fences the live writer (`tests/catalog.rs`). Writes on a read-only catalog
 return `Error::Constraint`; the fully typed-out read-only handle is RFC 0003's
-concern (below).
+concern.
 
 **Losing the store is typed, not opaque.** When the rule above is broken —
 a second process attaches read-write — the incumbent's next operation fails
@@ -150,25 +150,7 @@ selector this RFC decides and is not re-specified here.
   opened a `Db`.
 - **DuckLake forwarding (e2e).** Attach `ducklake:moraine:` with outer
   `READ_ONLY` and assert the moraine metadata attach opened read-only —
-  pinned against the tracked DuckLake version (Open questions).
-
-## Open questions
-
-- **Does DuckLake forward `READ_ONLY` to the nested metadata attach?**
-  Still not directly confirmable single-process: a read-only DuckLake chain
-  reads correctly and DuckDB rejects writes at the outer `lake` database, but
-  whether moraine's *nested* metadata attach opened a `DbReader` (forwarded)
-  or a `Db` (not forwarded) reads identically, so the e2e cannot isolate it —
-  it only pins that the read-only chain works. The **standalone** `moraine:
-  (READ_ONLY)` path *is* directly confirmed to open a `DbReader`, and it is
-  the fallback below, so the read-only role is always reachable regardless of
-  forwarding. Isolating the nested-attach mode would need the two-process
-  no-fence probe (RFC 0011's territory), not a single-CLI e2e.
-  **Fallback if it does not forward:** expose `READ_ONLY` as a moraine attach
-  option on the `moraine:` attach itself, so the read-only role is selectable
-  from the string moraine parses regardless of DuckLake forwarding. This is a
-  documented escape hatch, not the primary surface — adding it does not
-  change steps 1–2, only where the bit originates.
+  pinned against the tracked DuckLake version.
 
 ## Alternatives considered
 

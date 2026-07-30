@@ -86,11 +86,16 @@ All three are append-only on the commit path.
 An insert below the row limit becomes one `inline/insert` **chunk record**:
 the commit's rows for that table, Arrow-IPC-encoded, with row ids
 allocated from the table's row-id counter exactly as a Parquet write would
-allocate them. Chunk-per-commit (not row-per-key) because the read unit is
-"all live inlined rows of table T", and because one key per commit rides
-the `WriteBatch` with negligible overhead. `chunk_seq` disambiguates
+allocate them — the per-table row-id high-water mark in `tstat`, as
+DuckLake allocates it. Chunk-per-commit (not row-per-key) because the read
+unit is "all live inlined rows of table T", and because one key per commit
+rides the `WriteBatch` with negligible overhead. `chunk_seq` disambiguates
 multiple chunks in one commit (how rows are batched within a commit is an
 implementation detail).
+
+Type eligibility is DuckLake's: `CanInlineColumns` excludes only
+`GEOMETRY`, and an unsupported column type makes the whole table fall back
+to the non-inlined Parquet path, which is always correct.
 
 Arrow IPC is the value format because inlined data is *row data*, not
 metadata: it carries the table's actual types — including nested
@@ -237,6 +242,16 @@ same `conflict` wire contract. Values DuckLake authors (`row_id`,
 `begin_snapshot`, `end_snapshot`, user cells) are stored verbatim per the
 keyspace; nothing is re-derived on write.
 
+A nested column reaches the catalog as DuckLake represents it: a top-level
+marker row (`list`/`struct`/`map`) plus child `ducklake_column` rows linked
+by `parent_column`. moraine stores those rows verbatim, passes the marker
+through its `ducklake_column` projection, and reconstructs the nested
+`LogicalType` from the child hierarchy for its own catalog entries
+(`catalog.cpp`'s `BuildColumnType`); the Arrow IPC inline path carries the
+values themselves natively. `LIST`, `STRUCT`, and `MAP` are verified live
+through inline and flush by the e2e test
+`ducklake_inline_nested_types_round_trip_through_flush`.
+
 Three reconciliations with the surrounding RFCs, recorded here because they
 governed the implementation:
 
@@ -272,29 +287,6 @@ governed the implementation:
   re-encodes to Parquet. A future column-oriented decode path could hand
   the imported `DataChunk` to the flush writer directly, but the row
   materialization is not on the tiny-commit hot path inlining optimizes.
-
-## Open questions
-
-- **Nested-column tables** (`LIST`/`STRUCT`/`MAP`) create, inline, and
-  round-trip end to end. DuckLake stores a nested column as a top-level
-  marker row (`list`/`struct`/`map`) plus child `ducklake_column` rows
-  linked by `parent_column`; moraine stores those verbatim, passes the
-  marker through its `ducklake_column` projection, and reconstructs the
-  nested `LogicalType` from the child hierarchy for its own catalog entries
-  (`catalog.cpp`'s `BuildColumnType`). The Arrow IPC inline path carries the
-  values natively. `LIST`, `STRUCT`, and `MAP` are all verified live through
-  inline and flush (e2e `ducklake_inline_nested_types_round_trip_through_flush`).
-- **VARIANT/GEOMETRY inlining.** DuckLake's `CanInlineColumns` excludes
-  only `GEOMETRY`; VARIANT is inlinable there. An unsupported column type
-  makes the whole table fall back to the non-inlined (Parquet) path, which
-  is always correct. The exact inlinable-type set is pinned in the e2e
-  suite (scalar `BIGINT`/`VARCHAR`/`DOUBLE`/`BOOLEAN` with `NULL`s, plus
-  nested `LIST`/`STRUCT`/`MAP`, today).
-- **Row-id counter placement — settled by RFC 0004.** The per-table row-id
-  high-water mark lives in `tstat`, matching DuckLake, which also aligns
-  row-id allocation with conflict granularity (and, via RFC 0004's
-  append-append refinement, lets concurrent inlined inserts to one table
-  both land on the verb path).
 
 ## Alternatives considered
 
