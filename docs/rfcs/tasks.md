@@ -125,9 +125,12 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — Regression-pin the schema-mutating classification boundary
   cases: comments and tags bump, column and name-mapping registration does
   not, `set_option` neither bumps nor mints a snapshot.
-- **MEASURE** — Post-commit fresh-reader latency, per object-store backend. The
-  behavioural pin already exists (`fresh_reader_sees_committed_head`); what is
-  missing is the cost figure it was also meant to yield.
+- **MEASURE** — Post-commit fresh-reader latency against a *real* object store.
+  The in-memory figure is measured (`BENCHMARK.md` → Core measurements): a
+  durable commit costs `flush_interval + ~2 ms`, so at the 100 ms default the
+  latency floor is the flush cadence, not compute. What remains is the real-S3
+  write-RTT term, which localhost MinIO understates; the per-backend latency is
+  `max(flush cadence, write RTT) + ~2 ms`.
 - **DOC** — The single-read-write-process, many-readers limitation belongs in
   the root README. It currently appears only in `ARCHITECTURE.md`. Shared with
   0006.
@@ -257,8 +260,13 @@ Four things gate disproportionately much of the list:
   Whichever is taken first pulls the other with it.
 - **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
   re-resolve per statement? This sets how tight the retention window must be.
-- **MEASURE** — Materialization duration on large catalogs. Also the input the
-  churn-ratio decision above is waiting on.
+- **MEASURE** — Materialization duration is measured (`BENCHMARK.md` → Core
+  measurements): ~5–7 µs per live entity, linear, ~150 ms at 20 000 entities —
+  and `snapshot()` rematerializes every call, so this is paid on every read,
+  not just a cold start. That is the quantitative case for the two items above
+  (serve readers from the cache; lazy materialization). What is still open is
+  the churn-ratio crossover, which needs incremental refresh built to compare
+  against.
 - **VALIDATE** — The refresh test suite: a commit landing mid-materialization
   yields an entirely pre- or entirely post-commit view, never torn; a view
   built at `S` still returns the `S` view after `k` commits; an incremental
@@ -500,8 +508,16 @@ Four things gate disproportionately much of the list:
   primitive, the residual want after rejecting in-pass forced compaction.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
-- **MEASURE** — A defensible maintenance batch size, replacing the strawman
-  default of 1024.
+- **IMPL** — Stop the reclaim sweep awaiting durability on every batch. Measured
+  (`BENCHMARK.md` → Core measurements): the sweep's wall-clock is `commits ×
+  flush_interval` almost exactly, because `reclaim_dead_range` commits each
+  batch `await_durable`. The tombstones are idempotent and the dead index id is
+  never reused, so a crash mid-sweep is safe to redrive — only the final batch
+  needs to be durable. Making intermediate batches non-durable would make the
+  sweep near-instant and the batch size almost irrelevant. This subsumes the
+  question of a defensible batch-size default: the strawman 1024 spends ~4.9 s
+  of a 5.08 s / 50 000-entry sweep waiting on flush ticks; a larger default
+  (~16k) is a stopgap, this is the fix.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.
