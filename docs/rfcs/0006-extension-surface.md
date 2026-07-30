@@ -199,11 +199,14 @@ moraine's catalog exposes the fixed set of `ducklake_*` tables (and the
 per-schema-version inlined-data tables) as catalog entries with the DuckLake
 schema, and implements:
 
-- **Scan** — given a table, a projection, and pushed-down filters, produce
-  rows from SlateDB. moraine serves filter/projection pushdown where it maps
-  cleanly onto the RFC 0002 key layout (e.g. snapshot-range and id-prefix
-  scans); DuckDB's executor handles anything not pushed down over the
-  returned rows.
+- **Scan** — given a table and the columns DuckDB asks for, produce rows from
+  SlateDB. Row filters are **not** pushed down, so a scan materializes the
+  addressed kind in full and DuckDB's executor filters over the returned rows.
+  Projection is pushed down, but it selects output columns from an
+  already-materialized row set rather than narrowing the read. What narrowing
+  exists comes from the address, not from a predicate: the RFC 0002 key layout
+  puts each kind — and each table's inlined data — under its own prefix, so
+  serving one table reads only that table's range.
 - **Insert / Update / Delete** — apply row mutations to the store.
 - **Transactions** — `begin`/`commit`/`rollback` mapped onto RFC 0004's
   **staged-row commit path**: a transaction stages row mutations; commit
