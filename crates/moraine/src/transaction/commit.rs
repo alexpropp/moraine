@@ -395,7 +395,7 @@ where
     };
     let probe = ProbeHandle::Store(ReadHandle::Tx(&db_tx));
 
-    match assemble_commit(probe, f, &base, Some(format_current)).await {
+    match assemble_commit(probe, f, &base, Some(format_current), None).await {
         Ok(Prepared::Nothing { head }) => {
             db_tx.rollback();
             Ok(CommitOutcome::Committed(SnapshotId::new(head)))
@@ -564,12 +564,15 @@ fn format_stamp(format_current: Option<u64>, state: &CatalogSnapshot) -> Option<
 /// Materializes the closure against `base` and assembles the full write batch,
 /// reading uniqueness probes through `probe`. Options-only commits assemble no
 /// snapshot record and no head advance. `format_current` feeds the lazy format
-/// stamp.
+/// stamp. `transaction_id`, when set, is stamped into the minted snapshot
+/// record so a slot-backed commit's id survives folding and the tail scan can
+/// find it; the single-writer path passes `None`.
 pub(crate) async fn assemble_commit<F>(
     probe: ProbeHandle<'_>,
     f: &F,
     base: &CatalogSnapshot,
     format_current: Option<u64>,
+    transaction_id: Option<[u8; 16]>,
 ) -> Result<Prepared>
 where
     F: Fn(&mut Transaction) -> Result<()>,
@@ -645,7 +648,7 @@ where
         commit_message: None,
         commit_extra_info: None,
         schema_changed_table_ids,
-        transaction_id: None,
+        transaction_id: transaction_id.map(|id| id.to_vec()),
     };
     writes.push((
         Key::Snapshot {

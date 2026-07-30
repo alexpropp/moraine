@@ -3,15 +3,24 @@
 
 use std::{cmp::Ordering, sync::Arc};
 
-use moraine_wal::{Commit, Overlay, SlotLog};
+use moraine_wal::{
+    Commit, CommitDrive, Committer, Envelope, Overlay, Race, RetryPolicy, SlotLog, SlotPayload,
+    SlotWrite, drive_commit,
+};
 use slatedb::DbReader;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::{
-    catalog::{CatalogSnapshot, MultiWriterStore},
+    catalog::{CatalogSnapshot, MultiWriterStore, SnapshotId},
     error::{Error, Result},
     store::{handle::ReadHandle, open::StoreBuilder, read},
-    transaction::commit::{self, StagedWrite, fold},
+    transaction::{
+        commit::{self, Assembled, Prepared, StagedWrite, assemble_commit, fold},
+        index_maintenance::ProbeHandle,
+        operations::{ChangeSet, conflicts},
+        verbs::Transaction,
+    },
 };
 
 /// The multi-writer head: folded store state plus replay of every slot
@@ -22,8 +31,6 @@ pub(crate) struct SlotHead {
     /// probes the projection does not model (index entries above all).
     pub(crate) overlay: Overlay,
     /// The next unwritten slot sequence — the one a commit races for.
-    // dead_code: read by the slot commit cycle, landing in a later task.
-    #[allow(dead_code)]
     pub(crate) next_sequence: u64,
     /// Set when the view came from a reader this materialization opened rather
     /// than the handle's. Any read that must match the view — an index entry
@@ -249,6 +256,191 @@ fn apply(view: &mut CatalogSnapshot, commit: &Commit, sequence: u64) -> Result<(
 
     fold::fold_batch(view, &writes)
         .map_err(|err| Error::Corruption(format!("slot {sequence} could not be replayed: {err}")))
+}
+
+/// Races a commit through the slot log: assemble against the head, PUT the
+/// next slot, and on a lost race rebase onto the winner or surface a typed
+/// conflict. Reuses the existing assembly and conflict model — only the
+/// arbitration moves from a store transaction to the log.
+///
+/// The returned id is the snapshot the commit minted, or the unchanged head
+/// when the closure staged nothing.
+pub(crate) async fn slot_commit_cycle<F>(store: &MultiWriterStore, f: &F) -> Result<SnapshotId>
+where
+    F: Fn(&mut Transaction) -> Result<()>,
+{
+    if store.read_only {
+        return Err(Error::Constraint(
+            "catalog attached read-only; writes are unavailable".to_string(),
+        ));
+    }
+
+    let head = materialize_slot_head(store).await?;
+    let head_id = head.view.snapshot.snapshot_id;
+    let start_sequence = head.next_sequence;
+
+    let mut committer = CatalogCommitter {
+        store,
+        f,
+        transaction_id: Uuid::new_v4(),
+        head,
+        ours: None,
+        committed: 0,
+    };
+    let outcome = drive_commit(
+        &store.slots,
+        &mut committer,
+        start_sequence,
+        &RetryPolicy::default(),
+    )
+    .await;
+
+    // A hole retry may have opened a reader the head carried; it is done once
+    // the round is.
+    release_reader(committer.head.reader.as_ref()).await;
+
+    match outcome? {
+        CommitDrive::Committed { .. } => Ok(SnapshotId::new(committer.committed)),
+        CommitDrive::Nothing => Ok(SnapshotId::new(head_id)),
+        // The one retryable exit: the `conflict` substring is what DuckLake's
+        // commit loop scans for to re-drive against fresh state.
+        CommitDrive::Conflict { sequence, .. } => Err(Error::CommitConflict(format!(
+            "a concurrent commit won slot {sequence} from head snapshot {head_id} and \
+             conflicts with this transaction"
+        ))),
+        // Terminal: the budget went to benign rebases without settling. The
+        // text carries none of DuckLake's retry substrings.
+        CommitDrive::Exhausted {
+            attempts,
+            last_sequence,
+        } => Err(Error::RetryBudgetExhausted(format!(
+            "spent {attempts} attempts from head snapshot {head_id} without settling; \
+             last raced slot {last_sequence}"
+        ))),
+        // Terminal: the log never answered. The text carries none of
+        // DuckLake's retry substrings — an unreachable bucket is not a race.
+        CommitDrive::Unavailable {
+            attempts,
+            last_sequence,
+            last_error,
+        } => Err(Error::SlotLog(format!(
+            "commit-slot log unreachable after {attempts} attempts from head snapshot \
+             {head_id} (last raced slot {last_sequence}): {last_error}"
+        ))),
+    }
+}
+
+/// The catalog's commit semantics plugged into the log driver: assembly,
+/// judgment, and absorption. The driver owns racing, backoff, the attempt
+/// budget, and the sequence cursor.
+struct CatalogCommitter<'a, F> {
+    store: &'a MultiWriterStore,
+    f: &'a F,
+    /// This attempt's minted id, stamped into both the envelope's commit and
+    /// the snapshot record inside its writes, so the tail scan can find it
+    /// after folding.
+    transaction_id: Uuid,
+    head: SlotHead,
+    ours: Option<Box<ChangeSet>>,
+    committed: u64,
+}
+
+impl<F> Committer for CatalogCommitter<'_, F>
+where
+    F: Fn(&mut Transaction) -> Result<()>,
+{
+    type Error = Error;
+
+    async fn assemble(&mut self) -> Result<Option<Envelope>> {
+        let probe = ProbeHandle::Overlaid {
+            store: self.head.handle(ReadHandle::Reader(&self.store.reader)),
+            overlay: &self.head.overlay,
+        };
+        // The slot-backed topology never advances the format lazily, so no
+        // stamp is owed; the id is stamped into the minted snapshot record.
+        match assemble_commit(
+            probe,
+            self.f,
+            &self.head.view,
+            None,
+            Some(self.transaction_id.into_bytes()),
+        )
+        .await?
+        {
+            Prepared::Nothing { .. } => Ok(None),
+            Prepared::Staged(assembled) => {
+                self.ours = Some(assembled.ours.clone());
+                self.committed = assembled.commits;
+                Ok(Some(envelope_for(self.transaction_id, &assembled)))
+            }
+        }
+    }
+
+    fn classify(&self, winner: &Envelope) -> Race {
+        // Absent `ours` cannot happen after a staged assembly; an unparseable
+        // or unknown-kind winner classifies as a conflict, never benign.
+        classify_lost_race(self.ours.as_deref(), winner)
+    }
+
+    fn absorb(&mut self, sequence: u64, winner: Envelope) -> Result<()> {
+        apply_envelope(&mut self.head, sequence, &winner)
+    }
+}
+
+/// Builds the one-commit envelope a direct commit races: the minted id, the
+/// head it was validated against, its classification string, and its writes
+/// — no moraine-side encoding, the envelope codec is the log's.
+fn envelope_for(transaction_id: Uuid, assembled: &Assembled) -> Envelope {
+    Envelope {
+        commits: vec![Commit {
+            transaction_id: transaction_id.into_bytes(),
+            payload: SlotPayload {
+                validated_head: assembled.head_before,
+                changes_made: assembled.ours.to_changes_made(),
+                writes: assembled
+                    .writes
+                    .iter()
+                    .map(|(key, value)| SlotWrite {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+            },
+        }],
+    }
+}
+
+/// Judges a lost race by comparing this commit's change set against every
+/// commit the winner carries. A parse yielding an unknown kind classifies as a
+/// conflict through [`conflicts`], so an unparseable winner is never benign.
+fn classify_lost_race(ours: Option<&ChangeSet>, winner: &Envelope) -> Race {
+    let Some(ours) = ours else {
+        return Race::Conflict;
+    };
+    for commit in &winner.commits {
+        let theirs = ChangeSet::parse(&commit.payload.changes_made);
+        if conflicts(ours, &theirs) {
+            return Race::Conflict;
+        }
+    }
+
+    Race::Benign
+}
+
+/// Folds a benign winner into the head before the next attempt, reusing the
+/// replay admission path rather than a second fold engine. Updates the head's
+/// view and overlay only; the sequence cursor is the driver's.
+fn apply_envelope(head: &mut SlotHead, sequence: u64, winner: &Envelope) -> Result<()> {
+    for commit in &winner.commits {
+        match admit(&head.view, commit, sequence)? {
+            Admission::Apply => apply(&mut head.view, commit, sequence)?,
+            Admission::Skip => {}
+        }
+    }
+    head.overlay.absorb(winner);
+    head.next_sequence = sequence.saturating_add(1);
+
+    Ok(())
 }
 
 /// The fold cursor; absent reads as 0, since a store with no cursor has no

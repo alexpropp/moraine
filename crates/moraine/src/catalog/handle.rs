@@ -1501,7 +1501,10 @@ impl Catalog {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        commit::commit_cycle(self.writer()?, &f, &self.projections).await
+        match self.store.as_ref() {
+            Store::MultiWriter(multi) => slot_commit::slot_commit_cycle(multi, &f).await,
+            _ => commit::commit_cycle(self.writer()?, &f, &self.projections).await,
+        }
     }
 }
 
