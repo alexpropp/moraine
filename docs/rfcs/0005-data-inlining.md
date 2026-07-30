@@ -33,8 +33,9 @@ Non-goals:
 
 - Auto-flush policy (when to flush is an operational/maintenance concern;
   this RFC defines only the mechanism).
-- Inlining `VARIANT` columns (DuckLake excludes them for third-party
-  catalogs; moraine matches until the e2e suite proves more is possible).
+- Inlining `VARIANT` columns. DuckLake declines to inline them against any
+  third-party catalog and writes Parquet instead, so the case never reaches
+  moraine to implement.
 
 ## Background
 
@@ -93,9 +94,17 @@ rides the `WriteBatch` with negligible overhead. `chunk_seq` disambiguates
 multiple chunks in one commit (how rows are batched within a commit is an
 implementation detail).
 
-Type eligibility is DuckLake's: `CanInlineColumns` excludes only
-`GEOMETRY`, and an unsupported column type makes the whole table fall back
-to the non-inlined Parquet path, which is always correct.
+Type eligibility is DuckLake's, and it turns on the metadata catalog.
+`GEOMETRY` is never inlined. `VARIANT` is inlined only when the metadata
+catalog is DuckDB's own; against a third-party catalog — which moraine
+always is — DuckLake writes Parquet instead. Everything else inlines,
+`BLOB`, `UUID`, `DECIMAL` and nested `LIST`/`STRUCT`/`MAP` included. An
+ineligible column type makes the whole table fall back to the non-inlined
+Parquet path, which is always correct.
+
+moraine enforces no type restriction of its own. The columns it is asked to
+inline are already the eligible ones, so a `VARIANT` table reaches it as an
+ordinary data-file registration.
 
 Arrow IPC is the value format because inlined data is *row data*, not
 metadata: it carries the table's actual types — including nested
