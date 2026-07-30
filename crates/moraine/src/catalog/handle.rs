@@ -207,8 +207,13 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone());
-        let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
-            .await?;
+        let db = commit::open_initialized(
+            store,
+            options.encrypted,
+            options.data_path.as_deref(),
+            false,
+        )
+        .await?;
         info!(
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),

@@ -26,7 +26,7 @@ async fn unknown_format_is_refused() {
 
     // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
     // `Debug` impl; `err().unwrap()` only needs it on the error side.
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
         .await
         .err()
         .unwrap();
@@ -53,7 +53,7 @@ async fn migration_marker_is_refused() {
     .unwrap();
     db.close().await.unwrap();
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
         .await
         .err()
         .unwrap();
@@ -3146,4 +3146,65 @@ fn retry_backoff_budget_stays_in_a_sane_band() {
         total <= std::time::Duration::from_millis(600),
         "whole retry budget waits {total:?}"
     );
+}
+
+#[tokio::test]
+async fn multi_writer_bootstrap_stamps_format_four_and_fold_zero() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = open_initialized(
+        StoreBuilder::new("", object_store.clone()),
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let format = read::read_format(ReadHandle::Tx(&tx))
+        .await
+        .unwrap()
+        .unwrap();
+    let fold = read::read_fold(ReadHandle::Tx(&tx)).await.unwrap().unwrap();
+    assert_eq!(format.format_version, 4);
+    assert_eq!(fold.folded_sequence, 0);
+    tx.rollback();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn single_writer_open_refuses_a_multi_writer_store() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = open_initialized(
+        StoreBuilder::new("", object_store.clone()),
+        false,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Configuration(_)));
+}
+
+#[tokio::test]
+async fn multi_writer_flag_refuses_an_existing_single_writer_store() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = open_initialized(
+        StoreBuilder::new("", object_store.clone()),
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None, true)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Configuration(_)));
 }

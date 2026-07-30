@@ -45,9 +45,14 @@ pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
 /// exists. A format-2 binary would read a `building` definition as a ready
 /// index and serve from an under-covered entry set, so it must refuse this.
 pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
+/// Format stamped only at bootstrap, for a store whose commits ride the
+/// commit-slot log rather than direct writer transactions. Never reached by
+/// the lazy format-advance path — a store does not drift into this
+/// topology.
+pub(crate) const FORMAT_MULTI_WRITER: u64 = 4;
 /// The highest format this binary understands. It opens any store in
 /// `FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_MULTI_WRITER;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
@@ -114,6 +119,22 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
     }
 }
 
+/// Refuses opening a store whose mode disagrees with `multi_writer`.
+/// Transitional: a later task replaces the multi-writer-flagged-false-below-
+/// [`FORMAT_MULTI_WRITER`] case with an automatic migration and removes this
+/// check entirely.
+fn validate_mode(format_version: u64, multi_writer: bool) -> Result<()> {
+    match (format_version >= FORMAT_MULTI_WRITER, multi_writer) {
+        (true, false) => Err(Error::Configuration(
+            "store is multi-writer; attach with the multi_writer option".to_string(),
+        )),
+        (false, true) => Err(Error::Configuration(
+            "store is single-writer; mode migration is not supported".to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Stages the initial state of an empty store into `tx`: format stamp,
 /// snapshot 0 (carrying the default `main` schema, counters advanced past
 /// its id), the `main` schema record itself, the global `encrypted`
@@ -124,15 +145,34 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
 /// here: whether data files are encrypted is fixed when the catalog is
 /// created, exactly as DuckLake fixes it when initializing a metadata
 /// store.
-fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>) -> Result<()> {
+///
+/// `multi_writer` is transitional scaffolding: when true this also stamps
+/// [`FORMAT_MULTI_WRITER`] and a zero fold cursor, bootstrap being the
+/// degenerate first fold.
+fn stage_bootstrap(
+    tx: &DbTransaction,
+    encrypted: bool,
+    data_path: Option<&str>,
+    multi_writer: bool,
+) -> Result<()> {
     let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     stage(
         Key::Sys(SysKey::Format),
         value::encode_value(&proto::FormatValue {
-            format_version: FORMAT_VERSION,
+            format_version: if multi_writer {
+                FORMAT_MULTI_WRITER
+            } else {
+                FORMAT_VERSION
+            },
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
         }),
     )?;
+    if multi_writer {
+        stage(
+            Key::Sys(SysKey::Fold),
+            value::encode_value(&moraine_wal::FoldValue { folded_sequence: 0 }),
+        )?;
+    }
     // Bootstrap's snapshot records minting `main`, byte-identical to the
     // `created_schema:"main"` DuckLake's own initialization writes.
     let mut bootstrap_changes = ChangeSet::default();
@@ -191,10 +231,14 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
 /// Opens the store, bootstrapping an empty one in one atomic batch under
 /// conflict detection — a lost bootstrap race re-validates instead of
 /// double-initializing. Every exit that does not commit rolls back.
+///
+/// `multi_writer` selects which topology this open expects; it refuses an
+/// existing store whose stamped mode disagrees (see [`validate_mode`]).
 pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
+    multi_writer: bool,
 ) -> Result<Db> {
     let db = store.open_writer().await?;
     let tx = db
@@ -203,9 +247,9 @@ pub(crate) async fn open_initialized(
         .map_err(Error::from)?;
 
     match validate_format(ReadHandle::Tx(&tx)).await {
-        Ok(Some(_)) => {
+        Ok(Some(format)) => {
             tx.rollback();
-            return Ok(db);
+            return validate_mode(format.format_version, multi_writer).map(|()| db);
         }
         Ok(None) => {}
         Err(err) => {
@@ -214,7 +258,7 @@ pub(crate) async fn open_initialized(
         }
     }
 
-    if let Err(err) = stage_bootstrap(&tx, encrypted, data_path) {
+    if let Err(err) = stage_bootstrap(&tx, encrypted, data_path, multi_writer) {
         tx.rollback();
         return Err(err);
     }
@@ -233,12 +277,11 @@ pub(crate) async fn open_initialized(
                 .map_err(Error::from)?;
             let validated = validate_format(ReadHandle::Tx(&tx)).await;
             tx.rollback();
-            if validated?.is_some() {
-                Ok(db)
-            } else {
-                Err(Error::Corruption(
+            match validated? {
+                Some(format) => validate_mode(format.format_version, multi_writer).map(|()| db),
+                None => Err(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
-                ))
+                )),
             }
         }
         Err(err) => Err(err.into()),
