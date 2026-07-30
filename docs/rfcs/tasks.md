@@ -296,10 +296,13 @@ Four things gate disproportionately much of the list:
   operator contract, without pre-building for it.
 - **DEFERRED** — A commit-funnel dispatcher serializing a many-connection
   process through a single committer, if a many-committer process appears.
-- **MEASURE** — Whether SlateDB IO latency starves the shared worker pool under
-  heavy parallel scans, which decides if a separate IO-dedicated runtime or a
-  `spawn_blocking` discipline is needed. Also the input the worker-count
-  decision above is waiting on.
+- **MEASURE** — IO latency does not starve the pool (`BENCHMARK.md` → Core
+  measurements): under 10 ms/read, 32 concurrent materializations on a 4-worker
+  runtime overlap into ~64 ms — the awaits yield, so per-op cost falls ~1/K and
+  a separate IO-dedicated runtime is unnecessary on the IO-latency axis. What is
+  unprobed is CPU-bound SST decode monopolizing a worker, the only remaining
+  case a `spawn_blocking` discipline would address; open until a decode-heavy
+  workload shows it matters.
 - **VALIDATE** — Interrupt coverage: before the commit write, head unchanged
   with no partial records; during the shielded write, prompt return while the
   write completes untorn and head is exactly `N` or `N+1`; after the durable

@@ -27,7 +27,10 @@ use moraine::{
     Catalog, CatalogOptions, ColumnId, IndexDef, IndexEntry, IndexKeyValue, IntWidth,
     MaintenanceRequest,
 };
-use object_store::memory::InMemory;
+use object_store::{
+    memory::InMemory,
+    throttle::{ThrottleConfig, ThrottledStore},
+};
 
 use crate::fixtures::{col, datafile};
 
@@ -292,5 +295,92 @@ async fn measure_reclaim_by_batch_size() {
             stats.median_ms, stats.min_ms, stats.max_ms
         );
     }
+    println!();
+}
+
+/// 0010 — does object-store read latency starve the shared worker pool?
+///
+/// The concern is a multi-threaded runtime whose worker threads all block
+/// on slow object-store reads, so concurrent scans serialize instead of
+/// overlapping their waits. This wraps the in-memory store in a
+/// `ThrottledStore` that adds a fixed latency to every GET/LIST, seeds a
+/// small catalog *unthrottled*, then runs K concurrent `snapshot()`
+/// materializations on a fixed 4-worker runtime and times the batch.
+///
+/// If the IO awaits yield the worker back to the pool, K concurrent
+/// materializations overlap their latency and the batch stays near the
+/// time of one — flat as K grows past the worker count. If SlateDB blocked
+/// a worker for the duration of each read, the batch would grow with K once
+/// the workers are exhausted. This isolates the IO-latency axis only;
+/// CPU-bound decode monopolizing a worker is a separate question this does
+/// not probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_read_concurrency_under_io_latency() {
+    const READ_LATENCY_MS: u64 = 10;
+    const TABLES: usize = 20;
+    const REPEATS: usize = 5;
+    let concurrency = [1usize, 2, 4, 8, 16, 32];
+
+    // Seed unthrottled: writes are not the axis under test.
+    let raw = Arc::new(InMemory::new());
+    {
+        let catalog = open_with(raw.clone(), SEED_FLUSH_MS).await;
+        for t in 0..TABLES {
+            catalog
+                .commit(move |tx| {
+                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                    let table = tx.create_table(schema, &format!("t{t}"), &[col("a")])?;
+                    for _ in 0..8 {
+                        tx.register_data_file(table, datafile(100), &[])?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        catalog.close().await.unwrap();
+    }
+
+    let config = ThrottleConfig {
+        wait_get_per_call: Duration::from_millis(READ_LATENCY_MS),
+        wait_list_per_call: Duration::from_millis(READ_LATENCY_MS),
+        ..ThrottleConfig::default()
+    };
+    // A derived `InMemory` clone shares the backing store (only `fork`
+    // copies), so the throttled handle sees the seeded data.
+    let throttled = Arc::new(ThrottledStore::new((*raw).clone(), config));
+    let mut options = CatalogOptions::default();
+    options.flush_interval = Duration::from_millis(DEFAULT_FLUSH_MS);
+    let catalog = Catalog::open(throttled, options).await.unwrap();
+
+    println!("\n# 0010 read concurrency under {READ_LATENCY_MS} ms IO latency");
+    println!("# {TABLES}-table catalog, 4-worker runtime, median of {REPEATS} batches\n");
+    println!(
+        "{:>12}  {:>11}  {:>13}",
+        "concurrency", "batch_ms", "per_op_ms"
+    );
+
+    for &k in &concurrency {
+        let mut samples = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            let handles: Vec<_> = (0..k)
+                .map(|_| {
+                    let catalog = catalog.clone();
+                    tokio::spawn(async move { catalog.snapshot().await.map(|_| ()) })
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+            samples.push(start.elapsed());
+        }
+        let stats = Stats::of(samples);
+        let per_op = stats.median_ms / k as f64;
+        println!("{k:>12}  {:>11.3}  {per_op:>13.3}", stats.median_ms);
+    }
+    catalog.close().await.unwrap();
     println!();
 }
