@@ -148,3 +148,28 @@ every `snapshot()`. That is the quantitative case for the two open 0009 items:
 serving readers from the maintained cache instead of rematerializing, and,
 further out, lazy materialization to bound the per-read cost on a large
 catalog.
+
+### Read concurrency under IO latency
+
+Does slow object-store IO starve the worker pool, so concurrent scans
+serialize instead of overlapping? The in-memory store is wrapped in a
+`ThrottledStore` adding 10 ms to every GET/LIST, seeded unthrottled, then K
+concurrent `snapshot()` materializations run on a fixed 4-worker runtime:
+
+| concurrency | batch | per op |
+|---|---|---|
+| 1 | 50.5 ms | 50.5 ms |
+| 2 | 51.9 ms | 26.0 ms |
+| 4 | 53.4 ms | 13.3 ms |
+| 8 | 54.9 ms | 6.9 ms |
+| 16 | 55.0 ms | 3.4 ms |
+| 32 | 63.8 ms | 2.0 ms |
+
+The batch stays flat as concurrency grows to 32 — ~8× the worker count — while
+the per-op cost falls almost exactly 1/K. The IO awaits yield the worker back
+to the pool, so the latency of 32 reads overlaps into the time of roughly one;
+serialization would have made the batch grow to ~1.6 s. So object-store read
+latency does not starve the pool, and a separate IO-dedicated runtime is
+unnecessary on that axis. This isolates IO latency only: CPU-bound SST decode
+monopolizing a worker is a separate axis this does not probe, and is where a
+`spawn_blocking` discipline would matter if anywhere.
