@@ -78,6 +78,12 @@ transaction per batch:
 5. A source carrying live delete files is not plainly merged; its deletes
    are materialized into the output (the rewrite shape below) — a delete
    file must never outlive its data file.
+6. Merge groups by partition and never crosses a boundary. Four files
+   across two partition values merge to two — one per value, as two
+   independent merges — so a merged file always carries exactly one
+   partition value and the governing spec stays satisfied by construction.
+   The eligibility rule is DuckLake's, applied before moraine sees the
+   batch; moraine records the merge it is handed and enforces nothing.
 
 **Rewrite (`rewrite_data_files`)** — also snapshot-minting:
 

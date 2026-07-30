@@ -113,6 +113,11 @@ stored **verbatim** as DuckLake defines them (the transform name and its
 parameter, e.g. `bucket(16)` or `truncate(10)`); moraine never parses or
 applies them.
 
+The spec is wholly explicit — there is no implicit or derived partitioning
+alongside it. A bare partition column is written out with the transform
+`identity` rather than left blank, so every partition key is one stored row
+with a named transform and nothing has to be inferred.
+
 ### The sort spec record
 
 The `sort` value carries the spec's `begin_snapshot` and its ordered sort
@@ -205,10 +210,18 @@ sits. This is why keying by name would be wrong (see Alternatives).
 
 Sort specs sit on the other side of that contrast: a sort key names its
 column **inside a verbatim SQL expression string**, and no field-id
-indirection can protect a string from a rename. Whether a rename or drop
-invalidates a live sort expression — and what DuckLake does about it — is
-DuckLake's rule; moraine stores the expression untouched and records whatever
-committed state results.
+indirection can protect a string from a rename. DuckLake resolves that by
+rewriting the expression: renaming a sorted column commits a new sort-spec
+version carrying the new name, leaving the old text in `history` where it
+belongs to the snapshots that were written under it. A stale live expression
+therefore never arises.
+
+Dropping a partitioned or sorted column is refused outright, by DuckLake's
+own binder, before anything reaches the catalog — *"Cannot drop column … the
+table is partitioned by this column"*, and the matching message for sorted.
+Rename and type change are allowed. So moraine enforces none of this: it
+stores the expression untouched, records the new sort-spec version a rename
+produces, and never sees the drops that are refused upstream.
 
 Whether a column that a live spec partitions or sorts on **may be dropped or
 altered** is a DuckLake rule, not moraine's. moraine follows DuckLake

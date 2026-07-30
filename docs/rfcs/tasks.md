@@ -131,9 +131,10 @@ Four things gate disproportionately much of the list:
 - **IMPL** — A column-oriented flush decode path handing the imported
   `DataChunk` straight to the writer, eliminating the row-by-row
   `duckdb::Value` materialization and making flush closer to transcode-free.
-- **DECISION** — Pin the exact inlinable-type set. DuckLake's
-  `CanInlineColumns` excludes only `GEOMETRY`, so `VARIANT` may in fact be
-  inlinable; the current e2e pin covers scalars plus `LIST`, `STRUCT`, `MAP`.
+- **VALIDATE** — Extend the e2e type pin past scalars plus `LIST`, `STRUCT`,
+  `MAP` to cover `BLOB`, `UUID` and `DECIMAL` as inlined, and `GEOMETRY` and
+  `VARIANT` as falling back to Parquet. The set itself is settled and recorded
+  in the RFC; what is missing is the regression pin.
 - **DEFERRED** — Auto-flush policy: when to trigger an inline flush. This RFC
   specifies only the mechanism; the policy is an operational concern.
 
@@ -207,9 +208,10 @@ Four things gate disproportionately much of the list:
 
 - **DEFERRED** — Finer file-set-grain conflict detection, so two compactions of
   disjoint file sets in one table can run concurrently. Table grain today.
-- **DECISION** — The precise merge-eligibility rule across partition
-  boundaries: a merge must not cross partitions whose values differ under the
-  governing spec. Raised by 0013, owned here.
+- **VALIDATE** — Pin that a merge never crosses a partition boundary: files
+  spread over two partition values merge to one file per value, never one
+  combined file. The rule is DuckLake's and recorded in the RFC; the pin
+  guards moraine against a future DuckLake that batches differently.
 
 ## 0009 — Reader consistency and snapshot caching
 
@@ -342,13 +344,11 @@ Four things gate disproportionately much of the list:
 
 ## 0013 — Partitioning, sorting, and pruning
 
-- **DECISION** — Where DuckLake draws the line on dropping or altering a
-  partitioned or sorted column, including what it does with a stale verbatim
-  sort expression, and whether moraine must enforce any part of it at the
-  catalog-constraint layer.
-- **DECISION** — Whether DuckLake grows hidden, implicit, or derived
-  partitioning schemes beyond the explicit spec, which would need their own
-  representation.
+- **VALIDATE** — Pin the schema-evolution boundary the RFC now records:
+  dropping a partitioned or sorted column is refused by DuckLake, rename and
+  type change are allowed, a partition spec survives a rename by field id, and
+  renaming a sorted column commits a new sort-spec version carrying the new
+  expression text.
 - **DEFERRED** — Server-side partition-pruning pushdown. One deferral with
   0002's stats pushdown, 0006's pushdown surface, and 0009's partial
   materialization — not four. Nothing pushes a predicate into moraine today, and
