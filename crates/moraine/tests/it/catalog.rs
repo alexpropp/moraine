@@ -174,6 +174,64 @@ async fn ddl_commits_are_visible_and_time_travelable() {
     catalog.close().await.unwrap();
 }
 
+/// A widening type promotion is a version transition like any other, so a
+/// snapshot taken before it still reports the narrower type. Asserting the
+/// promotion at head alone would pass even if the old version were
+/// overwritten in place rather than ended into `history`.
+#[tokio::test]
+async fn type_promotion_is_time_travel_correct() {
+    let catalog = open_memory().await;
+
+    let narrow = moraine::ColumnDef {
+        name: "amount".into(),
+        column_type: "INTEGER".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+    let before = catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            tx.create_table(schema, "t", std::slice::from_ref(&narrow))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("s").expect("committed above");
+            let table = tx.table_by_name(schema.id, "t").expect("committed above");
+            let column = tx.columns_of(table.id)[0].id;
+            tx.alter_column(
+                table.id,
+                column,
+                moraine::ColumnAlteration {
+                    column_type: Some("BIGINT".into()),
+                    nulls_allowed: None,
+                    default_value: None,
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let column_type_at = |view: &moraine::CatalogSnapshot| {
+        let schema = view.schema_by_name("s").expect("schema");
+        let table = view.table_by_name(schema.id, "t").expect("table");
+        view.columns_of(table.id)[0].column_type.clone()
+    };
+
+    assert_eq!(column_type_at(&catalog.snapshot().await.unwrap()), "BIGINT");
+    assert_eq!(
+        column_type_at(&catalog.snapshot_at(before).await.unwrap()),
+        "INTEGER",
+        "the pre-promotion snapshot must still report the narrower type"
+    );
+
+    catalog.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn drop_ends_versions_and_schema_version_tracks_ddl() {
     let catalog = open_memory().await;
