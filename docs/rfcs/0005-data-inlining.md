@@ -33,9 +33,9 @@ Non-goals:
 
 - Auto-flush policy (when to flush is an operational/maintenance concern;
   this RFC defines only the mechanism).
-- Inlining `VARIANT` columns. DuckLake declines to inline them against any
-  third-party catalog and writes Parquet instead, so the case never reaches
-  moraine to implement.
+- Inlining `VARIANT` columns. Arrow cannot represent the type, so a
+  `VARIANT` column is refused rather than inlined; carrying it would mean a
+  second, non-Arrow value format.
 
 ## Background
 
@@ -94,17 +94,19 @@ rides the `WriteBatch` with negligible overhead. `chunk_seq` disambiguates
 multiple chunks in one commit (how rows are batched within a commit is an
 implementation detail).
 
-Type eligibility is DuckLake's, and it turns on the metadata catalog.
-`GEOMETRY` is never inlined. `VARIANT` is inlined only when the metadata
-catalog is DuckDB's own; against a third-party catalog — which moraine
-always is — DuckLake writes Parquet instead. Everything else inlines,
-`BLOB`, `UUID`, `DECIMAL` and nested `LIST`/`STRUCT`/`MAP` included. An
-ineligible column type makes the whole table fall back to the non-inlined
-Parquet path, which is always correct.
+Type eligibility here is **moraine's**, not DuckLake's, and it is set by the
+value format below: an inline chunk is Arrow IPC, so a column is inlinable
+exactly when DuckDB's Arrow encoding can carry it. That is a different and
+narrower rule than DuckLake's own — stock DuckLake stores inline data as SQL
+values and inlines types moraine cannot.
 
-moraine enforces no type restriction of its own. The columns it is asked to
-inline are already the eligible ones, so a `VARIANT` table reaches it as an
-ordinary data-file registration.
+`GEOMETRY` is inlinable when `spatial` is loaded, because spatial registers
+the Arrow extension type; values survive both the inline keyspace and the
+flush. `VARIANT` has no Arrow representation at all, so moraine refuses the
+column at `CREATE TABLE` with an error naming moraine, the type, and Arrow
+as the cause — a refusal, not a silent Parquet fallback, because the table
+would otherwise appear to work until its first insert. Scalars, `BLOB`,
+`UUID`, `DECIMAL` and nested `LIST`/`STRUCT`/`MAP` all inline.
 
 Arrow IPC is the value format because inlined data is *row data*, not
 metadata: it carries the table's actual types — including nested

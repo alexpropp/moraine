@@ -137,10 +137,9 @@ Four things gate disproportionately much of the list:
 - **IMPL** — A column-oriented flush decode path handing the imported
   `DataChunk` straight to the writer, eliminating the row-by-row
   `duckdb::Value` materialization and making flush closer to transcode-free.
-- **VALIDATE** — Extend the e2e type pin past scalars plus `LIST`, `STRUCT`,
-  `MAP` to cover `BLOB`, `UUID` and `DECIMAL` as inlined, and `GEOMETRY` and
-  `VARIANT` as falling back to Parquet. The set itself is settled and recorded
-  in the RFC; what is missing is the regression pin.
+- **VALIDATE** — Extend the e2e type pin to cover `BLOB`, `UUID` and `DECIMAL`
+  as inlined. `GEOMETRY` (inlinable with `spatial`) and `VARIANT` (refused,
+  no Arrow representation) are already pinned in `types.rs`.
 - **DEFERRED** — Auto-flush policy: when to trigger an inline flush. This RFC
   specifies only the mechanism; the policy is an operational concern.
 
