@@ -19,7 +19,7 @@ use std::{
 use crate::{
     envelope::Envelope,
     error::Error,
-    slot::{CommitOutcome, SlotLog},
+    slot::{CommitOutcome, Resolution, SlotLog, resolve},
 };
 
 /// Attempts [`RetryPolicy::default`] allows one commit round.
@@ -28,16 +28,14 @@ const DEFAULT_MAX_ATTEMPTS: usize = 10;
 /// [`RetryPolicy::default`]'s delay before a second attempt.
 const DEFAULT_BASE_DELAY: Duration = Duration::from_millis(2);
 
-/// [`RetryPolicy::default`]'s ceiling on one attempt's delay, which keeps a
-/// whole exhausted budget inside a few hundred milliseconds.
+/// [`RetryPolicy::default`]'s ceiling on one attempt's delay.
 const DEFAULT_MAX_DELAY: Duration = Duration::from_millis(50);
 
 /// The odd increment one draw advances a [`Jitter`] stream by.
 const POSITION_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// A source of backoff jitter over an explicit stream position, never a
-/// thread-local generator: equal seeds draw equal sequences, which is what
-/// lets a seeded run reproduce.
+/// thread-local generator: equal seeds draw equal sequences.
 #[derive(Debug)]
 pub struct Jitter {
     position: AtomicU64,
@@ -52,8 +50,7 @@ impl Jitter {
         }
     }
 
-    /// A stream seeded from system entropy, so two processes that just
-    /// collided decorrelate instead of colliding again.
+    /// A stream seeded from system entropy; its draws do not reproduce.
     #[must_use]
     pub fn from_entropy() -> Self {
         Self::seeded(fastrand::u64(..))
@@ -67,20 +64,20 @@ impl Jitter {
             return Duration::ZERO;
         }
 
-        Duration::from_micros(fastrand::Rng::with_seed(self.advance()).u64(0..=micros))
+        Duration::from_micros(self.rng().u64(0..=micros))
     }
 
-    /// Claims the next stream position.
-    fn advance(&self) -> u64 {
-        self.position.fetch_add(POSITION_STEP, Ordering::Relaxed)
+    /// A generator over the next stream position, which it claims.
+    fn rng(&self) -> fastrand::Rng {
+        fastrand::Rng::with_seed(self.position.fetch_add(POSITION_STEP, Ordering::Relaxed))
     }
 }
 
 impl Clone for Jitter {
-    /// Forks a position out of this stream rather than duplicating it, so two
-    /// clones never draw the same delays.
+    /// Seeds the clone from a value drawn out of this stream, which advances
+    /// it: the clone continues no part of the parent's sequence.
     fn clone(&self) -> Self {
-        Self::seeded(self.advance())
+        Self::seeded(self.rng().u64(..))
     }
 }
 
@@ -168,6 +165,11 @@ pub trait Committer {
     async fn assemble(&mut self) -> Result<Option<Envelope>, Self::Error>;
 
     /// Judges the winner of a lost race against the last assembly.
+    ///
+    /// The winner is another committer's envelope. One that a previous attempt
+    /// of this same commit landed — which a re-raced sequence can turn up — is
+    /// resolved by transaction id before this is called, so an implementation
+    /// never has to recognize its own work here.
     fn classify(&self, winner: &Envelope) -> Race;
 
     /// Folds a winner into the head before the next attempt.
@@ -202,17 +204,14 @@ pub enum CommitDrive {
         /// The envelope that won it.
         winner: Envelope,
     },
-    /// The budget went to lost races without settling. The caller re-drives
-    /// the work itself, usually as smaller commits.
+    /// The budget went to lost races without settling.
     Exhausted {
         /// Attempts made.
         attempts: usize,
         /// The sequence the last attempt raced.
         last_sequence: u64,
     },
-    /// The budget went to a log that never answered. Distinct from
-    /// [`CommitDrive::Exhausted`]: nothing was contended, and re-driving the
-    /// work against the same unreachable log would only fail again.
+    /// The budget went to a log that never answered, nothing contended.
     Unavailable {
         /// Attempts made.
         attempts: usize,
@@ -230,16 +229,22 @@ pub enum CommitDrive {
 /// embedder to judge the winner: a conflict stops the round with that winner,
 /// a benign loss absorbs it, backs off, and races the next sequence. A log
 /// failure is retried at the *same* sequence, which the loser of a contended
-/// race can legitimately see — a slot reported taken while the winner's
-/// object is not yet readable — and which leaves that sequence still to be
-/// won. Corruption is terminal and never retried.
+/// race can legitimately see — a slot reported taken while the winner's object
+/// is not yet readable. Corruption is terminal and never retried.
+///
+/// A log failure can also leave a put's outcome unknown, so the round keeps
+/// the transaction ids of every attempt it could not attribute and matches
+/// them against later winners: a sequence that turns out to hold one of those
+/// attempts is reported as committed, never handed to
+/// [`Committer::classify`] as a rival's work.
 ///
 /// # Errors
 ///
-/// Returns the embedder's error if assembly or absorption failed, or if the
-/// log reported corruption. A spent budget is an outcome, not an error:
-/// [`CommitDrive::Exhausted`] for races lost, [`CommitDrive::Unavailable`]
-/// for a log that never answered.
+/// Returns the embedder's error if assembly or absorption failed, if the log
+/// reported corruption, or if a winner holds only part of one attempt's
+/// transaction ids — an id reached two committers. A spent budget is an
+/// outcome, not an error: [`CommitDrive::Exhausted`] for races lost,
+/// [`CommitDrive::Unavailable`] for a log that never answered.
 pub async fn drive_commit<C: Committer>(
     log: &SlotLog,
     committer: &mut C,
@@ -251,6 +256,9 @@ pub async fn drive_commit<C: Committer>(
     let mut attempts = 0;
     let mut races_lost = 0;
     let mut last_error = None;
+    // The ids of attempts at `sequence` whose put could not be attributed,
+    // one set per attempt: at most one of them can hold the sequence.
+    let mut unattributed: Vec<Vec<[u8; 16]>> = Vec::new();
 
     while attempts < retry.max_attempts {
         let backoff = retry.backoff(attempts);
@@ -273,6 +281,27 @@ pub async fn drive_commit<C: Committer>(
                 });
             }
             Ok(CommitOutcome::Lost(winner)) => {
+                for attempt_ids in &unattributed {
+                    match resolve(&winner, attempt_ids.iter().copied()) {
+                        Resolution::ThisAttempt => {
+                            return Ok(CommitDrive::Committed {
+                                sequence,
+                                attempts,
+                                races_lost,
+                            });
+                        }
+                        Resolution::PartlyLanded => {
+                            return Err(Error::corruption(format!(
+                                "slot {sequence} carries some but not all of an earlier \
+                                 attempt's transaction ids; an id reached more than one \
+                                 committer"
+                            ))
+                            .into());
+                        }
+                        Resolution::NoIdentity | Resolution::OtherEnvelope => {}
+                    }
+                }
+
                 races_lost += 1;
                 last_error = None;
                 match committer.classify(&winner) {
@@ -280,13 +309,20 @@ pub async fn drive_commit<C: Committer>(
                     Race::Benign => {
                         committer.absorb(sequence, winner)?;
                         sequence = sequence.saturating_add(1);
+                        // The winner at the sequence just left is another
+                        // committer's, so no earlier attempt of this commit
+                        // landed there.
+                        unattributed.clear();
                     }
                 }
             }
-            // A log failure leaves this sequence unwon, so the next attempt
-            // races it again. Anything else is damage the round cannot work
-            // through.
-            Err(failure) if matches!(failure, Error::Transport(_)) => last_error = Some(failure),
+            // A log failure leaves the sequence to be raced again, and may
+            // leave this attempt's put unattributed. Anything else is damage
+            // the round cannot work through.
+            Err(failure) if matches!(failure, Error::Transport(_)) => {
+                unattributed.push(envelope.transaction_ids().collect());
+                last_error = Some(failure);
+            }
             Err(damage) => return Err(damage.into()),
         }
     }
@@ -775,6 +811,38 @@ mod tests {
         }
     }
 
+    /// A put that landed under a lost response, whose read-back then failed,
+    /// leaves the sequence held by this commit with nobody yet aware of it.
+    /// The retry must recognize its own envelope: absorbing it as a rival's
+    /// and committing again at the next sequence applies the same work twice.
+    #[tokio::test]
+    async fn a_retry_recognizes_the_envelope_an_unattributed_put_landed() {
+        let store = Arc::new(FaultyPut::failing(PutFault::LostResponse, 1).failing_gets(1));
+        let log = SlotLog::new(store, "toy");
+        let mut committer = CounterCommitter::new(1, 7, false);
+
+        let outcome = drive_commit(&log, &mut committer, 1, &RetryPolicy::seeded(1))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                CommitDrive::Committed {
+                    sequence: 1,
+                    attempts: 2,
+                    races_lost: 0
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            log.read_slot(2).await.unwrap().is_none(),
+            "the work must not be committed a second time"
+        );
+        assert_eq!(committer.head, 0, "nothing foreign was absorbed");
+    }
+
     /// Corruption is terminal by definition: the round propagates it without
     /// spending another attempt.
     #[tokio::test]
@@ -866,6 +934,11 @@ mod tests {
         let stream = draws(&first);
         assert_eq!(stream, draws(&second));
         assert_eq!(draws(&forked), draws(&also_forked));
+        // A clone's sequence is its own, not the parent's shifted by one.
+        let parent = draws(&Jitter::seeded(7));
+        let child = draws(&Jitter::seeded(7).clone());
+        assert_ne!(parent, child);
+        assert_ne!(parent[1..], child[..child.len() - 1]);
         assert!(stream.iter().all(|drawn| *drawn <= bound));
         assert!(stream.iter().any(|drawn| *drawn != stream[0]));
         assert_eq!(Jitter::seeded(7).draw(Duration::ZERO), Duration::ZERO);

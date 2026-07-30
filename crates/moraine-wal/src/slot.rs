@@ -144,33 +144,44 @@ impl SlotLog {
         Ok(())
     }
 
-    /// Races `sequence`, resolving both ways a put's outcome can be
+    /// Races `sequence`, resolving every way a put's outcome can be
     /// unreadable.
     ///
-    /// A landed put is `Won`. A put the store reports already taken reads the
-    /// winner back and returns `Lost`. A put whose outcome is unknown — a
-    /// transport failure that may or may not have landed — is resolved from
-    /// the log rather than guessed: re-read the slot, and an envelope carrying
-    /// `envelope`'s transaction ids is this attempt (`Won`); an envelope
-    /// carrying none of them is `Lost`; an absent slot means the put did not
-    /// land, and the transport error surfaces.
+    /// A landed put is `Won`. Anything else leaves one question — the slot is
+    /// taken, or may be; is it taken by *this* attempt? — and the answer comes
+    /// from the log rather than from the store's verdict: re-read the slot, and
+    /// an envelope carrying `envelope`'s transaction ids is this attempt
+    /// (`Won`); an envelope carrying none of them is `Lost`; an absent slot
+    /// means the put did not land, and the transport error surfaces.
+    ///
+    /// A store reporting the sequence already taken is not proof this attempt's
+    /// put failed to land: the retries below this call re-issue a
+    /// create-if-absent whose predecessor may already have landed, and stores
+    /// answer that with the same code they use for an ordinary lost race. So
+    /// both cases run the identity check, and a retry of an attempt whose
+    /// earlier put went unattributed is told it holds the sequence instead of
+    /// being handed its own envelope as a rival's.
     ///
     /// Resolution matches on identity, so it rests on two caller invariants.
     /// Every transaction id must be unique across the log, and an id must be
     /// offered to one committer only. An `envelope` with no commits has no
-    /// identity at all: the put is accepted, but if its outcome goes unknown
-    /// nothing in the log can settle it, and this call says so rather than
+    /// identity at all: the put is accepted, but nothing in the log can then
+    /// settle a taken slot either way, and this call says so rather than
     /// guessing.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] when the outcome could not be read back,
-    /// all of which leave the sequence to be raced again:
+    /// Returns [`Error::Transport`] when the outcome could not be read back:
     /// - the put failed and the slot reads absent, so the commit did not land;
     /// - the slot was reported taken but its object is not yet readable, which
     ///   is an ordinary contended round, not damage;
-    /// - the put failed, the slot holds an envelope, and `envelope` carries no
-    ///   transaction id to tell whose it is.
+    /// - the slot is taken and `envelope` carries no transaction id to tell
+    ///   whose it is.
+    ///
+    /// A read-back that itself fails surfaces too, and that one leaves the
+    /// put's outcome unknown: this attempt may already hold the sequence.
+    /// Racing it again under the same transaction ids resolves it, and
+    /// [`SlotLog::find_transaction`] answers it outright.
     ///
     /// Returns [`Error::Corruption`] if a slot's bytes are not a valid
     /// envelope, or if the landed envelope carries only *some* of `envelope`'s
@@ -181,31 +192,32 @@ impl SlotLog {
         sequence: u64,
         envelope: &Envelope,
     ) -> Result<CommitOutcome, Error> {
-        match self.put_slot(sequence, envelope).await {
-            Ok(SlotRace::Won) => Ok(CommitOutcome::Won),
-            Ok(SlotRace::Lost) => match self.read_slot(sequence).await? {
-                Some(winner) => Ok(CommitOutcome::Lost(winner)),
-                None => Err(Error::transport(format!(
-                    "slot {sequence} was reported taken but reads absent; a competing \
-                     put may still be in flight"
+        let unknown = match self.put_slot(sequence, envelope).await {
+            Ok(SlotRace::Won) => return Ok(CommitOutcome::Won),
+            Ok(SlotRace::Lost) => None,
+            Err(unknown) => Some(unknown),
+        };
+
+        match self.read_slot(sequence).await? {
+            Some(landed) => match resolve(&landed, envelope.transaction_ids()) {
+                Resolution::ThisAttempt => Ok(CommitOutcome::Won),
+                Resolution::OtherEnvelope => Ok(CommitOutcome::Lost(landed)),
+                Resolution::NoIdentity => Err(Error::transport(format!(
+                    "slot {sequence} holds an envelope and this attempt carries no \
+                     transaction id to match against it, so the put's outcome cannot \
+                     be determined"
+                ))),
+                Resolution::PartlyLanded => Err(Error::corruption(format!(
+                    "slot {sequence} carries some but not all of this attempt's \
+                     transaction ids; an id reached more than one committer"
                 ))),
             },
-            Err(unknown) => match self.read_slot(sequence).await? {
-                None => Err(unknown),
-                Some(landed) => match resolve(&landed, envelope) {
-                    Resolution::ThisAttempt => Ok(CommitOutcome::Won),
-                    Resolution::OtherEnvelope => Ok(CommitOutcome::Lost(landed)),
-                    Resolution::NoIdentity => Err(Error::transport(format!(
-                        "slot {sequence} holds an envelope and this attempt carries no \
-                         transaction id to match against it, so the put's outcome cannot \
-                         be determined"
-                    ))),
-                    Resolution::PartlyLanded => Err(Error::corruption(format!(
-                        "slot {sequence} carries some but not all of this attempt's \
-                         transaction ids; an id reached more than one committer"
-                    ))),
-                },
-            },
+            None => Err(unknown.unwrap_or_else(|| {
+                Error::transport(format!(
+                    "slot {sequence} was reported taken but reads absent; a competing \
+                     put may still be in flight"
+                ))
+            })),
         }
     }
 
@@ -380,10 +392,10 @@ impl SlotLog {
     }
 }
 
-/// What a slot's landed envelope says about an attempt whose put outcome is
+/// What a slot's landed envelope says about an attempt whose outcome is
 /// unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Resolution {
+pub(crate) enum Resolution {
     /// Every one of the attempt's transaction ids is present: the attempt
     /// landed, whether alone or coalesced into a larger envelope.
     ThisAttempt,
@@ -398,21 +410,26 @@ enum Resolution {
     PartlyLanded,
 }
 
-/// Compares a slot's landed envelope with an attempt's, by transaction id.
-fn resolve(landed: &Envelope, attempt: &Envelope) -> Resolution {
-    if attempt.commits.is_empty() {
-        return Resolution::NoIdentity;
+/// Compares a slot's landed envelope with the transaction ids one attempt
+/// offered.
+pub(crate) fn resolve<I>(landed: &Envelope, attempt_ids: I) -> Resolution
+where
+    I: IntoIterator<Item = [u8; 16]>,
+{
+    let mut offered = 0_usize;
+    let mut present = 0_usize;
+    for transaction_id in attempt_ids {
+        offered += 1;
+        if landed.contains_transaction(transaction_id) {
+            present += 1;
+        }
     }
 
-    let present = attempt
-        .commits
-        .iter()
-        .filter(|commit| landed.contains_transaction(commit.transaction_id))
-        .count();
-
-    if present == 0 {
+    if offered == 0 {
+        Resolution::NoIdentity
+    } else if present == 0 {
         Resolution::OtherEnvelope
-    } else if present < attempt.commits.len() {
+    } else if present < offered {
         Resolution::PartlyLanded
     } else {
         Resolution::ThisAttempt
@@ -606,6 +623,48 @@ mod tests {
         assert!(matches!(err, Error::Corruption(_)), "{err}");
         // The slots below the hole still answer.
         assert_eq!(log.find_transaction(1, [1; 16]).await.unwrap(), Some(1));
+    }
+
+    /// A store reporting a slot taken is not proof this attempt's put failed:
+    /// a retry below this crate can land a create and then hear the store call
+    /// the object already present. An attempt re-racing a sequence its own
+    /// earlier put may have won is told it holds it, not handed its own
+    /// envelope as a rival's.
+    #[tokio::test]
+    async fn a_re_raced_slot_resolves_to_this_attempts_own_envelope() {
+        let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
+        let envelope = envelope_with_id([9; 16]);
+        log.put_slot(1, &envelope).await.unwrap();
+
+        assert_eq!(
+            log.commit_slot(1, &envelope).await.unwrap(),
+            CommitOutcome::Won
+        );
+        // A coalescing winner that carries the attempt is the same answer.
+        let coalesced = Envelope {
+            commits: vec![commit_with_id([8; 16]), commit_with_id([9; 16])],
+        };
+        let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
+        log.put_slot(1, &coalesced).await.unwrap();
+        assert_eq!(
+            log.commit_slot(1, &envelope).await.unwrap(),
+            CommitOutcome::Won
+        );
+    }
+
+    /// An id-less envelope cannot be told from another committer's in either
+    /// direction, so a taken slot is retryable rather than a loss. Retrying
+    /// costs nothing: such an envelope carries no writes.
+    #[tokio::test]
+    async fn a_taken_slot_cannot_be_attributed_for_an_id_less_attempt() {
+        let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
+        log.put_slot(1, &envelope_with_id([1; 16])).await.unwrap();
+
+        let err = log
+            .commit_slot(1, &Envelope { commits: vec![] })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err}");
     }
 
     /// The exactly-once mechanic: a put that landed under a lost response

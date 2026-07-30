@@ -22,13 +22,15 @@ pub(crate) enum PutFault {
     PrematureAlreadyExists,
 }
 
-/// Wraps a real [`InMemory`] store and fails `put_opts` at [`PutFault`] while
-/// faults remain; every other operation forwards untouched.
+/// Wraps a real [`InMemory`] store and fails `put_opts` at [`PutFault`], and
+/// optionally `get_opts`, while faults remain; every other operation forwards
+/// untouched.
 #[derive(Debug)]
 pub(crate) struct FaultyPut {
     inner: InMemory,
     fault: PutFault,
-    remaining: AtomicU64,
+    puts: AtomicU64,
+    gets: AtomicU64,
 }
 
 impl FaultyPut {
@@ -47,29 +49,40 @@ impl FaultyPut {
         Self {
             inner: InMemory::new(),
             fault,
-            remaining: AtomicU64::new(puts),
+            puts: AtomicU64::new(puts),
+            gets: AtomicU64::new(0),
         }
     }
 
+    /// Also fails the next `gets` gets, as a response that cannot be read.
+    pub(crate) fn failing_gets(self, gets: u64) -> Self {
+        self.gets.store(gets, Ordering::Relaxed);
+
+        self
+    }
+
     pub(crate) fn arm(&self) {
-        self.remaining.store(u64::MAX, Ordering::Relaxed);
+        self.puts.store(u64::MAX, Ordering::Relaxed);
     }
 
     pub(crate) fn disarm(&self) {
-        self.remaining.store(0, Ordering::Relaxed);
+        self.puts.store(0, Ordering::Relaxed);
     }
 
-    /// Claims one fault, if any remain. `u64::MAX` saturates, so an armed
-    /// store stays armed.
-    fn claim_fault(&self) -> Option<PutFault> {
-        let previous = self
-            .remaining
+    /// Claims one fault out of `budget`, if any remain. `u64::MAX` is sticky,
+    /// so an armed store faults every operation.
+    fn claim(budget: &AtomicU64) -> bool {
+        let previous = budget
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                Some(remaining.saturating_sub(1))
+                Some(if remaining == u64::MAX {
+                    u64::MAX
+                } else {
+                    remaining.saturating_sub(1)
+                })
             })
             .unwrap_or(0);
 
-        (previous > 0).then_some(self.fault)
+        previous > 0
     }
 }
 
@@ -97,14 +110,17 @@ impl ObjectStore for FaultyPut {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        match self.claim_fault() {
-            None => self.inner.put_opts(location, payload, opts).await,
-            Some(PutFault::LostResponse) => {
+        if !Self::claim(&self.puts) {
+            return self.inner.put_opts(location, payload, opts).await;
+        }
+
+        match self.fault {
+            PutFault::LostResponse => {
                 self.inner.put_opts(location, payload, opts).await?;
                 Err(unknown_outcome())
             }
-            Some(PutFault::Unreachable) => Err(unknown_outcome()),
-            Some(PutFault::PrematureAlreadyExists) => Err(object_store::Error::AlreadyExists {
+            PutFault::Unreachable => Err(unknown_outcome()),
+            PutFault::PrematureAlreadyExists => Err(object_store::Error::AlreadyExists {
                 path: location.to_string(),
                 source: "409 while a competing conditional create is in flight".into(),
             }),
@@ -124,6 +140,10 @@ impl ObjectStore for FaultyPut {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if Self::claim(&self.gets) {
+            return Err(unknown_outcome());
+        }
+
         self.inner.get_opts(location, options).await
     }
 

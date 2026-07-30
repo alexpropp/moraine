@@ -71,13 +71,17 @@
 //!
 //! # Two mechanics worth knowing before you embed this
 //!
-//! **An ambiguous put resolves from the log, never by guessing.** A
-//! conditional put whose *response* is lost is indistinguishable, from the
-//! caller's side, from one that never landed. [`SlotLog::commit_slot`]
-//! settles it by re-reading the slot: an envelope carrying the attempt's
-//! transaction ids means the put landed and this commit won; an envelope
-//! carrying none of them means it lost; an absent slot means the put genuinely
-//! did not land, and the transport error surfaces.
+//! **A put that did not plainly win resolves from the log, never by
+//! guessing.** A conditional put whose *response* is lost is
+//! indistinguishable, from the caller's side, from one that never landed — and
+//! a store reporting the sequence already taken is no proof of a loss either,
+//! since the retries below a put can land a create and then hear the object
+//! called present. Both pose one question, and [`SlotLog::commit_slot`] answers
+//! it by re-reading the slot: an envelope carrying the attempt's transaction
+//! ids means this commit holds the sequence; an envelope carrying none of them
+//! means it lost; an absent slot means the put did not land, and the transport
+//! error surfaces. A retry that re-offers its transaction ids is therefore told
+//! it already won, rather than handed its own envelope as a rival's.
 //!
 //! **A hole is damage, not an ending.** [`SlotLog::read_tail`] serves the
 //! contiguous run from the requested sequence, but a sequence absent while
@@ -98,12 +102,13 @@
 //! corruption rather than report as a win over transactions that never
 //! committed.
 //!
-//! **An envelope with no commits has no identity, so its ambiguous outcome is
-//! not resolvable.** Such envelopes are accepted — they carry no writes, and a
-//! reserved advert field will ride them — but if the response to their put is
-//! lost, nothing in the log distinguishes this attempt's landed envelope from
-//! an identical one another committer put. [`SlotLog::commit_slot`] reports
-//! that as a retryable failure rather than guessing. Retrying is safe: the
+//! **An envelope with no commits has no identity, so a taken slot is not
+//! resolvable for it.** Such envelopes are accepted — they carry no writes, and
+//! a reserved advert field will ride them — but nothing in the log
+//! distinguishes this attempt's landed envelope from an identical one another
+//! committer put, in either direction. [`SlotLog::commit_slot`] reports that as
+//! a retryable failure rather than guessing, so a caller that wants the winner
+//! of a contended sequence reads the slot itself. Retrying is safe: the
 //! envelope carries no writes, so a duplicate changes no state.
 //!
 //! **`from` must sit at or above the truncation horizon**, which only the

@@ -64,6 +64,11 @@ impl Envelope {
             .any(|commit| commit.transaction_id == transaction_id)
     }
 
+    /// The transaction ids this envelope carries, in commit order.
+    pub(crate) fn transaction_ids(&self) -> impl Iterator<Item = [u8; TRANSACTION_ID_LEN]> + '_ {
+        self.commits.iter().map(|commit| commit.transaction_id)
+    }
+
     /// This envelope's framed wire bytes: the exact object body a slot put
     /// writes.
     pub(crate) fn encode(&self) -> Vec<u8> {
