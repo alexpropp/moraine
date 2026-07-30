@@ -16,14 +16,17 @@ const COMMITS: &str = "commits";
 /// lexicographic order over names is numeric order over sequences.
 const SEQUENCE_WIDTH: usize = 20;
 
+/// The lowest sequence a log ever holds. Slot 0 does not exist, so every
+/// `from` argument must be at least this.
+const FIRST_SEQUENCE: u64 = 1;
+
 /// A commit-slot log: totally ordered, immutable slots under
 /// `<root>/commits/`, each written exactly once with a create-if-absent
 /// conditional put.
 ///
 /// The conditional put is the whole arbitration mechanism: exactly one
-/// committer can win each sequence, however many race it, and nothing above
-/// this layer needs a lock. What a slot's payload *means* is the embedder's
-/// business — this type only owns the shape.
+/// committer can win each sequence, however many race it. What a slot's
+/// payload means is the embedder's business; this type owns only the shape.
 #[derive(Debug, Clone)]
 pub struct SlotLog {
     store: Arc<dyn ObjectStore>,
@@ -33,19 +36,19 @@ pub struct SlotLog {
 /// The outcome of racing one slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotRace {
-    /// The put landed: this committer owns the sequence.
+    /// The put landed.
     Won,
-    /// The sequence was already taken.
+    /// The store reported the sequence already taken.
     Lost,
 }
 
-/// The resolved outcome of racing one slot: a loss carries the winning
-/// envelope, because a loser always needs it (rebase is mandatory work).
+/// The resolved outcome of racing one slot; a loss carries the winning
+/// envelope to rebase onto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitOutcome {
-    /// This committer owns the sequence.
+    /// This attempt's transaction is committed at this sequence.
     Won,
-    /// Another committer owns the sequence; here is what it wrote.
+    /// Another envelope holds this sequence; here it is.
     Lost(Envelope),
 }
 
@@ -55,12 +58,13 @@ pub enum CommitOutcome {
 pub struct Tail {
     /// The contiguous run from the requested sequence, ascending.
     pub slots: Vec<(u64, Envelope)>,
-    /// A sequence absent while higher sequences exist. The log is damaged —
-    /// a slot was destroyed out from under the protocol (an external
-    /// delete, a lifecycle rule) — and it is never an end of log: replaying
-    /// past it is impossible, and a committer that raced it would fork
-    /// history behind everyone still replaying. Callers must fail loudly,
-    /// never serve the prefix as if it were the head.
+    /// A sequence absent while higher sequences exist: a slot was destroyed
+    /// out from under the protocol. Never an end of log — callers must fail
+    /// loudly, never serve `slots` as if it were the head.
+    ///
+    /// Set relative to the requested `from`, which must therefore sit at or
+    /// above the truncation horizon; below it a deleted prefix is
+    /// indistinguishable from destroyed slots and reports here.
     pub gap_at: Option<u64>,
 }
 
@@ -102,7 +106,7 @@ impl SlotLog {
         {
             Ok(_) => Ok(SlotRace::Won),
             Err(object_store::Error::AlreadyExists { .. }) => Ok(SlotRace::Lost),
-            Err(err) => Err(Error::Transport(format!("slot {sequence}: {err}"))),
+            Err(err) => Err(Error::transport(format!("slot {sequence}: {err}"))),
         }
     }
 
@@ -118,12 +122,12 @@ impl SlotLog {
                 let bytes = result
                     .bytes()
                     .await
-                    .map_err(|err| Error::Transport(format!("slot {sequence}: {err}")))?;
+                    .map_err(|err| Error::transport(format!("slot {sequence}: {err}")))?;
 
                 Ok(Some(Envelope::decode(&bytes)?))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(err) => Err(Error::Transport(format!("slot {sequence}: {err}"))),
+            Err(err) => Err(Error::transport(format!("slot {sequence}: {err}"))),
         }
     }
 
@@ -139,23 +143,30 @@ impl SlotLog {
         Ok(())
     }
 
-    /// Races `sequence`: `Won` on a landed put; on an already-taken slot,
-    /// reads the winner back and returns `Lost`.
+    /// Races `sequence`, resolving both ways a put's outcome can be
+    /// unreadable.
     ///
-    /// A put whose outcome is unknown (a transport failure that may have
-    /// landed) is resolved from the log itself rather than guessed: re-read
-    /// the slot — an envelope carrying any of `envelope`'s transaction ids
-    /// is this commit (`Won`); a different envelope is `Lost`; an absent
-    /// slot means the put did not land, and the transport error surfaces.
-    /// This is the exactly-once mechanic.
+    /// A landed put is `Won`. A put the store reports already taken reads the
+    /// winner back and returns `Lost`. A put whose outcome is unknown — a
+    /// transport failure that may or may not have landed — is resolved from
+    /// the log rather than guessed: re-read the slot, and an envelope
+    /// carrying any of `envelope`'s transaction ids is this attempt (`Won`);
+    /// a different envelope is `Lost`; an absent slot means the put did not
+    /// land, and the transport error surfaces.
+    ///
+    /// Every transaction id in `envelope` must be unique across the log. An
+    /// envelope with no commits carries no id and resolves by whole-envelope
+    /// equality instead.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] if the put's outcome stayed unknown —
-    /// the slot is absent on read-back, so the commit did not land and the
-    /// same sequence is still there to race again. Returns
-    /// [`Error::Corruption`] if a slot's bytes are not a valid envelope, or
-    /// if a slot reported as taken reads absent.
+    /// Returns [`Error::Transport`] when the outcome could not be read back:
+    /// either the put's own failure, when the slot is absent and the commit
+    /// therefore did not land, or a slot reported taken whose object is not
+    /// yet readable. Both leave the sequence available to race again — a
+    /// conditional put can report a slot taken before the winner's object is
+    /// readable, which is an ordinary contended round, not damage. Returns
+    /// [`Error::Corruption`] if a slot's bytes are not a valid envelope.
     pub async fn commit_slot(
         &self,
         sequence: u64,
@@ -163,8 +174,13 @@ impl SlotLog {
     ) -> Result<CommitOutcome, Error> {
         match self.put_slot(sequence, envelope).await {
             Ok(SlotRace::Won) => Ok(CommitOutcome::Won),
-            Ok(SlotRace::Lost) => Ok(CommitOutcome::Lost(self.winner_of(sequence).await?)),
-            Err(corruption @ Error::Corruption(_)) => Err(corruption),
+            Ok(SlotRace::Lost) => match self.read_slot(sequence).await? {
+                Some(winner) => Ok(CommitOutcome::Lost(winner)),
+                None => Err(Error::transport(format!(
+                    "slot {sequence} was reported taken but reads absent; a competing \
+                     put may still be in flight"
+                ))),
+            },
             Err(unknown) => match self.read_slot(sequence).await? {
                 Some(landed) if is_this_attempt(&landed, envelope) => Ok(CommitOutcome::Won),
                 Some(winner) => Ok(CommitOutcome::Lost(winner)),
@@ -176,15 +192,21 @@ impl SlotLog {
     /// The tail from `from`: one LIST of the prefix (fixed-width names make
     /// lexicographic order numeric), then a GET per listed slot.
     ///
-    /// Returns the contiguous run starting at `from`, and reports a hole
-    /// when the listing shows slots *above* an absent one. Slots below
-    /// `from` are never inspected, so a legitimately truncated prefix reads
-    /// as no hole.
+    /// Returns the contiguous run starting at `from`, and reports a hole in
+    /// [`Tail::gap_at`] when the listing shows slots *above* an absent one.
+    /// Slots below `from` are never inspected, so a truncated prefix reads as
+    /// no hole.
+    ///
+    /// `from` must be at least 1 — sequence 0 never exists, so `read_tail(0)`
+    /// reports a hole at 0 on any non-empty log — and at or above the
+    /// truncation horizon, since below it a deleted prefix and a destroyed
+    /// slot are the same observation.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the listing or a get failed, or
-    /// [`Error::Corruption`] if a slot's bytes are not a valid envelope.
+    /// [`Error::Corruption`] if a slot's bytes are not a valid envelope, or if
+    /// a slot the listing showed reads absent.
     pub async fn read_tail(&self, from: u64) -> Result<Tail, Error> {
         let mut slots = Vec::new();
         let mut gap_at = None;
@@ -197,7 +219,7 @@ impl SlotLog {
             }
 
             let envelope = self.read_slot(sequence).await?.ok_or_else(|| {
-                Error::Corruption(format!(
+                Error::corruption(format!(
                     "slot {sequence} was listed but reads absent; it was destroyed \
                      outside the protocol"
                 ))
@@ -219,7 +241,7 @@ impl SlotLog {
     /// slots already deleted stay deleted, so a retry resumes.
     pub async fn truncate_through(&self, through: u64) -> Result<u64, Error> {
         let mut removed = 0;
-        for sequence in self.list_sequences(0).await? {
+        for sequence in self.list_sequences(FIRST_SEQUENCE).await? {
             if sequence > through {
                 break;
             }
@@ -233,6 +255,11 @@ impl SlotLog {
 
     /// How many contiguous slots are present from `from` — one LIST, no
     /// bodies fetched. The staleness signal.
+    ///
+    /// Counts the contiguous run only, so a hole ends the count and a damaged
+    /// log reports a short tail: a caller that acts on staleness alone will
+    /// see less work than exists, and only [`SlotLog::read_tail`] detects the
+    /// hole. `from` carries the same preconditions as [`SlotLog::read_tail`].
     ///
     /// # Errors
     ///
@@ -255,10 +282,9 @@ impl SlotLog {
     /// Scans the tail from `from` for a transaction id; the sequence of the
     /// slot that carries it, if any.
     ///
-    /// A hole in the tail refuses as [`Error::Corruption`] unless the id was
-    /// found below it: past a destroyed slot the scan cannot rule the
-    /// transaction out, and reporting "absent" for a transaction that may
-    /// have committed is the one wrong answer.
+    /// A hole below the id refuses rather than answering: past a destroyed
+    /// slot the scan cannot rule the transaction out. `from` carries the same
+    /// preconditions as [`SlotLog::read_tail`].
     ///
     /// # Errors
     ///
@@ -279,7 +305,7 @@ impl SlotLog {
 
         match (found, tail.gap_at) {
             (Some(sequence), _) => Ok(Some(sequence)),
-            (None, Some(gap)) => Err(Error::Corruption(format!(
+            (None, Some(gap)) => Err(Error::corruption(format!(
                 "the tail from {from} has a hole at {gap}; a transaction cannot be \
                  ruled out past a destroyed slot"
             ))),
@@ -287,28 +313,18 @@ impl SlotLog {
         }
     }
 
-    /// The envelope of a slot known to be taken.
-    async fn winner_of(&self, sequence: u64) -> Result<Envelope, Error> {
-        self.read_slot(sequence).await?.ok_or_else(|| {
-            Error::Corruption(format!(
-                "slot {sequence} is taken but reads absent; it was destroyed outside \
-                 the protocol"
-            ))
-        })
-    }
-
     /// Deletes one slot, reporting whether an object was actually removed.
     async fn delete_if_present(&self, sequence: u64) -> Result<bool, Error> {
         match self.store.delete(&self.slot_path(sequence)).await {
             Ok(()) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(err) => Err(Error::Transport(format!("slot {sequence}: {err}"))),
+            Err(err) => Err(Error::transport(format!("slot {sequence}: {err}"))),
         }
     }
 
     /// Every sequence present at or above `from`, ascending, from one LIST.
-    /// Objects under the prefix whose name is not a sequence are not slots
-    /// and are skipped; a slot that went missing still shows as a hole.
+    /// Only objects at a sequence's exact path count as slots, so anything
+    /// else under the prefix — a nested key, a directory marker — is skipped.
     async fn list_sequences(&self, from: u64) -> Result<Vec<u64>, Error> {
         // `list_with_offset` is exclusive, so offset by the predecessor's
         // name; below sequence 1 the prefix itself sorts before every slot.
@@ -322,12 +338,14 @@ impl SlotLog {
             .list_with_offset(Some(&self.prefix), &offset)
             .try_collect()
             .await
-            .map_err(|err| Error::Transport(format!("listing slots from {from}: {err}")))?;
+            .map_err(|err| Error::transport(format!("listing slots from {from}: {err}")))?;
 
         let mut sequences: Vec<u64> = listing
             .iter()
-            .filter_map(|meta| parse_sequence(&meta.location))
-            .filter(|sequence| *sequence >= from)
+            .filter_map(|meta| {
+                let sequence = parse_sequence(&meta.location)?;
+                (sequence >= from && meta.location == self.slot_path(sequence)).then_some(sequence)
+            })
             .collect();
         sequences.sort_unstable();
 
@@ -335,11 +353,14 @@ impl SlotLog {
     }
 }
 
-/// Whether `landed` is the envelope this attempt put: any of the attempt's
-/// transaction ids appearing in it settles an ambiguous put. Transaction ids
-/// are envelope structure, not payload, which is what lets this layer own
-/// the question.
+/// Whether `landed` is the envelope this attempt put. An attempt with no
+/// commits carries no transaction id to match, so it compares whole
+/// envelopes instead.
 fn is_this_attempt(landed: &Envelope, attempt: &Envelope) -> bool {
+    if attempt.commits.is_empty() {
+        return landed == attempt;
+    }
+
     attempt
         .commits
         .iter()
@@ -373,16 +394,20 @@ mod tests {
     use super::*;
     use crate::envelope::{Commit, Envelope, SlotPayload, SlotWrite};
 
+    fn commit_with_id(transaction_id: [u8; 16]) -> Commit {
+        Commit {
+            transaction_id,
+            payload: SlotPayload {
+                validated_head: 0,
+                changes_made: String::new(),
+                writes: vec![],
+            },
+        }
+    }
+
     fn envelope_with_id(transaction_id: [u8; 16]) -> Envelope {
         Envelope {
-            commits: vec![Commit {
-                transaction_id,
-                payload: SlotPayload {
-                    validated_head: 0,
-                    changes_made: String::new(),
-                    writes: vec![],
-                },
-            }],
+            commits: vec![commit_with_id(transaction_id)],
         }
     }
 
@@ -535,34 +560,47 @@ mod tests {
         assert_eq!(log.find_transaction(1, [1; 16]).await.unwrap(), Some(1));
     }
 
-    /// Where a put fails relative to the object landing. The two cases are
-    /// indistinguishable to the caller and must resolve differently, which
-    /// is the whole reason the ambiguity rule lives in this crate.
+    /// How a put fails, relative to the object landing.
     #[derive(Debug, Clone, Copy)]
-    enum FaultPoint {
-        /// The object lands, then the response is lost: the ambiguous put.
-        AfterPut,
-        /// The put never reaches the store: the slot stays absent.
-        BeforePut,
+    enum PutFault {
+        /// The object lands, then the response is lost.
+        LostResponse,
+        /// The put never reaches the store, so the slot stays absent.
+        Unreachable,
+        /// The store answers `AlreadyExists` with nothing written. Real S3
+        /// returns 409 while a competing conditional create is in flight, and
+        /// `object_store` maps every 409 to `AlreadyExists`.
+        PrematureAlreadyExists,
     }
 
     /// Wraps a real [`InMemory`] store and fails `put_opts` at
-    /// [`FaultPoint`] while the fault is armed; every other operation
+    /// [`PutFault`] while the fault is armed; every other operation
     /// forwards untouched.
     #[derive(Debug)]
     struct FaultyPut {
         inner: InMemory,
-        fault_point: FaultPoint,
+        fault: PutFault,
         armed: AtomicBool,
     }
 
     impl FaultyPut {
-        fn armed(fault_point: FaultPoint) -> Self {
+        fn armed(fault: PutFault) -> Self {
             Self {
                 inner: InMemory::new(),
-                fault_point,
+                fault,
                 armed: AtomicBool::new(true),
             }
+        }
+
+        fn disarmed(fault: PutFault) -> Self {
+            let store = Self::armed(fault);
+            store.disarm();
+
+            store
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::Relaxed);
         }
 
         fn disarm(&self) {
@@ -573,6 +611,17 @@ mod tests {
     impl std::fmt::Display for FaultyPut {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "FaultyPut({})", self.inner)
+        }
+    }
+
+    /// What a lost response looks like from the caller's side: no information
+    /// about whether the object exists. Its text carries every substring a
+    /// retry loop keys on, so the wrapping is exercised too.
+    fn unknown_outcome() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "fault",
+            source: "the put's outcome is unknown: conflict, concurrent, unique, primary key"
+                .into(),
         }
     }
 
@@ -588,18 +637,16 @@ mod tests {
                 return self.inner.put_opts(location, payload, opts).await;
             }
 
-            // What a lost response looks like from the caller's side: no
-            // information about whether the object exists.
-            let unknown = object_store::Error::Generic {
-                store: "fault",
-                source: "the put's outcome is unknown".into(),
-            };
-            match self.fault_point {
-                FaultPoint::AfterPut => {
+            match self.fault {
+                PutFault::LostResponse => {
                     self.inner.put_opts(location, payload, opts).await?;
-                    Err(unknown)
+                    Err(unknown_outcome())
                 }
-                FaultPoint::BeforePut => Err(unknown),
+                PutFault::Unreachable => Err(unknown_outcome()),
+                PutFault::PrematureAlreadyExists => Err(object_store::Error::AlreadyExists {
+                    path: location.to_string(),
+                    source: "409 while a competing conditional create is in flight".into(),
+                }),
             }
         }
 
@@ -654,7 +701,7 @@ mod tests {
     /// is resolved from the log by transaction id, not guessed.
     #[tokio::test]
     async fn an_ambiguous_put_that_landed_resolves_to_won() {
-        let log = SlotLog::new(Arc::new(FaultyPut::armed(FaultPoint::AfterPut)), "cat");
+        let log = SlotLog::new(Arc::new(FaultyPut::armed(PutFault::LostResponse)), "cat");
         let envelope = envelope_with_id([3; 16]);
         assert!(matches!(
             log.commit_slot(1, &envelope).await.unwrap(),
@@ -668,7 +715,7 @@ mod tests {
     /// still there to win on the retry.
     #[tokio::test]
     async fn an_ambiguous_put_that_never_landed_surfaces_the_transport_error() {
-        let store = Arc::new(FaultyPut::armed(FaultPoint::BeforePut));
+        let store = Arc::new(FaultyPut::armed(PutFault::Unreachable));
         let log = SlotLog::new(store.clone(), "cat");
         let envelope = envelope_with_id([4; 16]);
 
@@ -681,5 +728,137 @@ mod tests {
             log.commit_slot(1, &envelope).await.unwrap(),
             CommitOutcome::Won
         ));
+    }
+
+    /// A store may report a slot taken before the winner's object is
+    /// readable — real S3 answers 409 to a create whose competitor is still
+    /// in flight. That is an ordinary contended round on a healthy log, so it
+    /// must be retryable, never [`Error::Corruption`].
+    #[tokio::test]
+    async fn a_slot_reported_taken_but_absent_is_retryable_not_corrupt() {
+        let store = Arc::new(FaultyPut::armed(PutFault::PrematureAlreadyExists));
+        let log = SlotLog::new(store.clone(), "cat");
+        let envelope = envelope_with_id([5; 16]);
+
+        let err = log.commit_slot(1, &envelope).await.unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err}");
+        assert!(log.read_slot(1).await.unwrap().is_none());
+
+        store.disarm();
+        assert!(matches!(
+            log.commit_slot(1, &envelope).await.unwrap(),
+            CommitOutcome::Won
+        ));
+    }
+
+    /// An empty envelope carries no transaction id, so resolution falls back
+    /// to whole-envelope equality rather than handing the caller its own
+    /// write back as another committer's win.
+    #[tokio::test]
+    async fn an_ambiguous_put_of_an_empty_envelope_resolves_to_won() {
+        let log = SlotLog::new(Arc::new(FaultyPut::armed(PutFault::LostResponse)), "cat");
+        let envelope = Envelope { commits: vec![] };
+        assert_eq!(
+            log.commit_slot(1, &envelope).await.unwrap(),
+            CommitOutcome::Won
+        );
+    }
+
+    /// A put that failed with an unknown outcome onto a slot another envelope
+    /// already holds resolves to `Lost` carrying that envelope — the same
+    /// answer the `AlreadyExists` path gives, reached the other way.
+    #[tokio::test]
+    async fn an_unknown_put_onto_a_taken_slot_resolves_to_lost() {
+        let store = Arc::new(FaultyPut::disarmed(PutFault::Unreachable));
+        let log = SlotLog::new(store.clone(), "cat");
+
+        let winner = envelope_with_id([1; 16]);
+        log.commit_slot(1, &winner).await.unwrap();
+
+        store.arm();
+        let outcome = log
+            .commit_slot(1, &envelope_with_id([2; 16]))
+            .await
+            .unwrap();
+        assert_eq!(outcome, CommitOutcome::Lost(winner));
+    }
+
+    /// Resolution matches *any* of the attempt's ids, so a multi-commit
+    /// envelope resolves on whichever it finds.
+    #[tokio::test]
+    async fn an_ambiguous_put_matches_any_of_a_multi_commit_envelopes_ids() {
+        let log = SlotLog::new(Arc::new(FaultyPut::armed(PutFault::LostResponse)), "cat");
+        let envelope = Envelope {
+            commits: vec![commit_with_id([6; 16]), commit_with_id([7; 16])],
+        };
+
+        assert_eq!(
+            log.commit_slot(1, &envelope).await.unwrap(),
+            CommitOutcome::Won
+        );
+        let landed = log.read_slot(1).await.unwrap().unwrap();
+        assert!(landed.contains_transaction([6; 16]));
+        assert!(landed.contains_transaction([7; 16]));
+    }
+
+    /// Store text reaches an embedder's retry loop through this crate's
+    /// error, so the substrings that loop keys on never survive the wrapping.
+    #[tokio::test]
+    async fn transport_errors_carry_no_retry_substrings_from_the_store() {
+        let log = SlotLog::new(Arc::new(FaultyPut::armed(PutFault::Unreachable)), "cat");
+        let err = log
+            .put_slot(1, &envelope_with_id([8; 16]))
+            .await
+            .unwrap_err();
+
+        let text = err.to_string().to_ascii_lowercase();
+        for substring in ["conflict", "concurrent", "unique", "primary key"] {
+            assert!(!text.contains(substring), "{text:?} contains {substring:?}");
+        }
+    }
+
+    /// `from` is a documented precondition, not a guess: sequence 0 never
+    /// exists, and a `from` below the truncation horizon cannot be told from
+    /// a destroyed slot.
+    #[tokio::test]
+    async fn a_from_below_the_first_live_slot_reports_a_hole() {
+        let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
+        let envelope = Envelope { commits: vec![] };
+        for sequence in 1..=4 {
+            log.put_slot(sequence, &envelope).await.unwrap();
+        }
+
+        // Slot 0 never exists, so reading from it reports a hole at 0.
+        let tail = log.read_tail(0).await.unwrap();
+        assert!(tail.slots.is_empty());
+        assert_eq!(tail.gap_at, Some(0));
+
+        // Below the truncation horizon, a deleted prefix reads the same way.
+        log.truncate_through(2).await.unwrap();
+        assert_eq!(log.read_tail(1).await.unwrap().gap_at, Some(1));
+        assert_eq!(log.tail_length(1).await.unwrap(), 0);
+    }
+
+    /// `list` is recursive, so an object nested under a sequence-shaped
+    /// prefix must not be mistaken for a slot.
+    #[tokio::test]
+    async fn a_nested_object_is_not_a_slot() {
+        let store = Arc::new(InMemory::new());
+        let log = SlotLog::new(store.clone(), "cat");
+        log.put_slot(1, &Envelope { commits: vec![] })
+            .await
+            .unwrap();
+        store
+            .put(
+                &Path::from("cat/commits/00000000000000000002/nested"),
+                "not a slot".into(),
+            )
+            .await
+            .unwrap();
+
+        let tail = log.read_tail(1).await.unwrap();
+        assert_eq!(tail.slots.len(), 1);
+        assert_eq!(tail.gap_at, None);
+        assert_eq!(log.tail_length(1).await.unwrap(), 1);
     }
 }

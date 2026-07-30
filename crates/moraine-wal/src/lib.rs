@@ -45,8 +45,8 @@
 //! let won = log.commit_slot(1, &commit(1, b"first")).await?;
 //! assert_eq!(won, CommitOutcome::Won);
 //!
-//! // A second committer racing the same slot loses, and gets the winner
-//! // back — a loser always needs it, because rebasing is mandatory work.
+//! // A second committer racing the same slot loses, and gets the winning
+//! // envelope back to rebase onto.
 //! let lost = log.commit_slot(1, &commit(2, b"second")).await?;
 //! match &lost {
 //!     CommitOutcome::Lost(winner) => assert!(winner.contains_transaction([1; 16])),
@@ -90,6 +90,18 @@
 //! Sequences *below* the requested one are never inspected, so a
 //! legitimately truncated prefix reads as no hole.
 //!
+//! # Two preconditions the caller owns
+//!
+//! Transaction ids must be unique across every committer sharing a log:
+//! resolution matches on them, so a reused id resolves someone else's
+//! envelope as this attempt's.
+//!
+//! Every `from` argument must be at least 1 — sequence 0 never exists — and
+//! at or above the truncation horizon. Below the horizon a deleted prefix
+//! and a destroyed slot are the same observation, and the tail reads as
+//! holed. A fold cursor of `n` means slots `1..=n` are applied, so the next
+//! tail starts at `n + 1`.
+//!
 //! # Layering
 //!
 //! - `slot` — the log: sequence naming, the race, the tail, truncation.
@@ -100,6 +112,8 @@
 //! The crate spawns no threads, reads no clock, and schedules nothing: every
 //! call is one bounded piece of work the host drives. Safety here is
 //! sequence-ordinal, never temporal.
+
+#![forbid(unsafe_code)]
 
 mod envelope;
 mod error;

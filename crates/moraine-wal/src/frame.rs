@@ -36,14 +36,14 @@ pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
 pub(crate) fn unframe(bytes: &[u8]) -> Result<&[u8], Error> {
     let (header, payload) = bytes
         .split_at_checked(HEADER_LEN)
-        .ok_or_else(|| Error::Corruption("slot: truncated framing header".to_string()))?;
+        .ok_or_else(|| Error::corruption("slot: truncated framing header".to_string()))?;
     if header[..MAGIC.len()] != MAGIC {
-        return Err(Error::Corruption("slot: bad magic".to_string()));
+        return Err(Error::corruption("slot: bad magic".to_string()));
     }
 
     let version = header[MAGIC.len()];
     if version > ENCODING_VERSION {
-        return Err(Error::Corruption(format!(
+        return Err(Error::corruption(format!(
             "slot: encoding version {version} is newer than supported {ENCODING_VERSION}"
         )));
     }

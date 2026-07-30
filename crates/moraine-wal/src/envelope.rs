@@ -25,7 +25,9 @@ pub struct Envelope {
 /// One committed unit under a committer-minted id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
-    /// The committer-minted id that identifies this commit in the log.
+    /// The committer-minted id of this commit. Must be unique across every
+    /// committer sharing the log: an ambiguous put is resolved by matching
+    /// it, so a reused id resolves another committer's envelope as this one.
     pub transaction_id: [u8; TRANSACTION_ID_LEN],
     /// What this commit writes, and what it was validated against.
     pub payload: SlotPayload,
@@ -54,8 +56,7 @@ pub struct SlotWrite {
 }
 
 impl Envelope {
-    /// Whether any commit in this envelope carries `transaction_id` — how
-    /// an ambiguous put outcome is resolved.
+    /// Whether any commit in this envelope carries `transaction_id`.
     #[must_use]
     pub fn contains_transaction(&self, transaction_id: [u8; TRANSACTION_ID_LEN]) -> bool {
         self.commits
@@ -86,7 +87,7 @@ impl Envelope {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let payload = frame::unframe(bytes)?;
         let wire = EnvelopeValue::decode(payload)
-            .map_err(|err| Error::Corruption(format!("slot: {err}")))?;
+            .map_err(|err| Error::corruption(format!("slot: {err}")))?;
 
         Ok(Self {
             commits: wire
@@ -109,14 +110,14 @@ impl Commit {
     fn from_wire(wire: CommitValue) -> Result<Self, Error> {
         let transaction_id = <[u8; TRANSACTION_ID_LEN]>::try_from(wire.transaction_id.as_slice())
             .map_err(|_| {
-            Error::Corruption(format!(
+            Error::corruption(format!(
                 "slot: transaction id is {} bytes, expected {TRANSACTION_ID_LEN}",
                 wire.transaction_id.len()
             ))
         })?;
         let payload = wire
             .payload
-            .ok_or_else(|| Error::Corruption("slot: commit carries no payload".to_string()))?;
+            .ok_or_else(|| Error::corruption("slot: commit carries no payload".to_string()))?;
 
         Ok(Self {
             transaction_id,

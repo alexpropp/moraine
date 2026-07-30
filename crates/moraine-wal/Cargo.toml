@@ -23,7 +23,6 @@ protox = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 proptest = { workspace = true }
-proptest-derive = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

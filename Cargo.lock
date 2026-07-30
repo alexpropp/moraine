@@ -1886,7 +1886,6 @@ dependencies = [
  "futures",
  "object_store",
  "proptest",
- "proptest-derive",
  "prost",
  "prost-build",
  "protox",

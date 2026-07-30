@@ -10,9 +10,7 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/moraine.wal.rs"));
 }
 
-// `FoldValue` is the one message that crosses the crate boundary: a cursor
-// store persists it under its own framing, so it must be a public
-// `prost::Message`. Every other message is an implementation detail of the
-// envelope codec.
+// `FoldValue` is public so a cursor store can persist it under its own
+// framing; every other message stays internal to the envelope codec.
 pub use generated::FoldValue;
 pub(crate) use generated::{CommitValue, EnvelopeValue, SlotPayloadValue, SlotWriteValue};
