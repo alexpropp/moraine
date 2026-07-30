@@ -189,8 +189,7 @@ impl Overlay {
     }
 
     /// Every write whose key starts with `prefix`, ascending by key, each
-    /// three-state as in [`get`](Self::get). Ascending order is what lets a
-    /// caller merge the tail into a scan of its own ordered store in one pass.
+    /// three-state as in [`get`](Self::get).
     pub fn prefixed<'a>(
         &'a self,
         prefix: &'a [u8],

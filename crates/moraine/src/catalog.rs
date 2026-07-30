@@ -3,7 +3,7 @@
 //! This layer never performs store I/O itself; the commit protocol in
 //! [`crate::transaction`] drives it.
 
-pub(crate) mod handle;
+mod handle;
 pub(crate) mod index_policy;
 pub(crate) mod inline;
 pub(crate) mod projection;
@@ -11,6 +11,7 @@ pub(crate) mod scoped_read;
 mod snapshot;
 mod types;
 
+pub(crate) use handle::MultiWriterStore;
 pub use handle::{Catalog, CatalogOptions, MaintenanceReport, MaintenanceRequest};
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;

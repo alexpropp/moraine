@@ -174,9 +174,15 @@ checks, both free:
 - **Continuity.** Each commit records the head it validated against.
   Before applying, replay compares it with the view's snapshot id:
   **greater** → slots are missing, refuse; **equal** → apply; **less** →
-  already folded, skip. This catches a substituted or reordered slot, and
-  it walks multi-commit envelopes commit by commit, so an envelope whose
-  commits do not chain fails its own replay.
+  already folded, skip. The **greater** case catches a substituted or
+  reordered slot. The **less** case is sound only ahead of the first apply:
+  folding advances in log order under a prefix cursor, so a legitimately
+  already-folded commit is a leading prefix of the tail. A latch enforces
+  that — once any commit in the replay has applied, a following **less** is
+  a broken chain and refuses, not a lagging cursor. This is what makes a
+  multi-commit envelope safe: its commits must chain (each staged against
+  the previous one's result), and one that does not fails replay rather
+  than applying a prefix and dropping the rest.
 
 Both are detection. Prevention stays with bucket guard rails (versioning
 on `commits/`, lifecycle exclusions).

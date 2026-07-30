@@ -81,6 +81,48 @@ fn requested_orders(orders: &[ColumnOrder], columns: usize) -> (Vec<Direction>, 
         .unzip()
 }
 
+/// One materialized head, with what a slot-backed attach adds.
+struct HeadRead {
+    view: CatalogSnapshot,
+    /// The unfolded tail's writes; `None` on a single-topology store.
+    tail: Option<moraine_wal::Overlay>,
+    /// Set when the view came from a reader the materialization opened for
+    /// itself rather than the session's.
+    reader: Option<DbReader>,
+}
+
+/// A probe's read: the session it scans through and the head it resolves
+/// against.
+struct ProbeRead {
+    session: ReadSession,
+    head: HeadRead,
+}
+
+impl ProbeRead {
+    /// The handle to scan entries through: the reader the head's view came
+    /// from, which after a hole retry is not the session's.
+    fn handle(&self) -> ReadHandle<'_> {
+        match &self.head.reader {
+            Some(reader) => ReadHandle::Reader(reader),
+            None => self.session.handle(),
+        }
+    }
+
+    fn view(&self) -> &CatalogSnapshot {
+        &self.head.view
+    }
+
+    fn tail(&self) -> Option<&moraine_wal::Overlay> {
+        self.head.tail.as_ref()
+    }
+
+    /// Releases both the session and any reader the head opened.
+    async fn finish(self) {
+        slot_commit::release_reader(self.head.reader.as_ref()).await;
+        self.session.finish();
+    }
+}
+
 /// Whether a run of build steps finished the index or lost its race.
 enum BuildProgress {
     /// A final step flipped the index ready.
@@ -449,7 +491,11 @@ impl Catalog {
     async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
         if let Store::MultiWriter(multi) = self.store.as_ref() {
             return match at {
-                None => Ok(slot_commit::materialize_slot_head(multi).await?.view),
+                None => {
+                    let head = slot_commit::materialize_slot_head(multi).await?;
+                    slot_commit::release_reader(head.reader.as_ref()).await;
+                    Ok(head.view)
+                }
                 Some(snapshot) => slot_commit::materialize_slot_view_at(multi, snapshot).await,
             };
         }
@@ -461,20 +507,37 @@ impl Catalog {
         view
     }
 
-    /// The head view and, on a slot-backed attach, the byte-level overlay of
-    /// the slots no folder has applied — what a probe the projection does not
-    /// model must read over the store.
-    async fn head_view(
-        &self,
-        handle: ReadHandle<'_>,
-    ) -> Result<(CatalogSnapshot, Option<moraine_wal::Overlay>)> {
+    /// One head read: the view, and on a slot-backed attach the byte-level
+    /// overlay of the slots no folder has applied — what a probe the projection
+    /// does not model must read over the store.
+    async fn head_view(&self, handle: ReadHandle<'_>) -> Result<HeadRead> {
         match self.store.as_ref() {
             Store::MultiWriter(multi) => {
                 let head = slot_commit::materialize_slot_head(multi).await?;
-                Ok((head.view, Some(head.overlay)))
+                Ok(HeadRead {
+                    view: head.view,
+                    tail: Some(head.overlay),
+                    reader: head.reader,
+                })
             }
-            Store::Writer(_) | Store::Reader(_) => {
-                Ok((commit::materialize(handle, None).await?, None))
+            Store::Writer(_) | Store::Reader(_) => Ok(HeadRead {
+                view: commit::materialize(handle, None).await?,
+                tail: None,
+                reader: None,
+            }),
+        }
+    }
+
+    /// Opens a read session and materializes the head through it, so a probe's
+    /// entry scans and the catalog they resolve against are one cut. Released
+    /// by [`ProbeRead::finish`].
+    async fn begin_probe(&self) -> Result<ProbeRead> {
+        let session = self.begin_read().await?;
+        match self.head_view(session.handle()).await {
+            Ok(head) => Ok(ProbeRead { session, head }),
+            Err(err) => {
+                session.finish();
+                Err(err)
             }
         }
     }
@@ -500,12 +563,12 @@ impl Catalog {
         index: IndexId,
         values: &[IndexKeyValue],
     ) -> Result<Vec<RowLocation>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = self.begin_probe().await?;
+        let handle = read.handle();
 
         let outcome = async {
-            let (view, tail) = self.head_view(handle).await?;
-            let info = view
+            let info = read
+                .view()
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
 
@@ -527,13 +590,13 @@ impl Catalog {
             )?;
             let row_ids = index_maintenance::lookup_row_ids(
                 handle,
-                tail.as_ref(),
+                read.tail(),
                 index.get(),
                 info.unique,
                 &key,
             )
             .await?;
-            let holders = RowHolders::of(&view.data_files_of(table));
+            let holders = RowHolders::of(&read.view().data_files_of(table));
             Ok(row_ids
                 .into_iter()
                 .map(|row_id| RowLocation {
@@ -543,7 +606,7 @@ impl Catalog {
                 .collect())
         }
         .await;
-        session.finish();
+        read.finish().await;
 
         outcome
     }
@@ -574,12 +637,12 @@ impl Catalog {
         upper: Bound<Vec<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<RowLocation>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = self.begin_probe().await?;
+        let handle = read.handle();
 
         let outcome = async {
-            let (view, tail) = self.head_view(handle).await?;
-            let info = view
+            let info = read
+                .view()
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
 
@@ -603,7 +666,7 @@ impl Catalog {
 
             let mut row_ids = index_maintenance::range_row_ids(
                 handle,
-                tail.as_ref(),
+                read.tail(),
                 index.get(),
                 info.unique,
                 leading_nulls,
@@ -616,7 +679,7 @@ impl Catalog {
             if reverse {
                 row_ids.reverse();
             }
-            let holders = RowHolders::of(&view.data_files_of(table));
+            let holders = RowHolders::of(&read.view().data_files_of(table));
             Ok(row_ids
                 .into_iter()
                 .map(|row_id| RowLocation {
@@ -626,7 +689,7 @@ impl Catalog {
                 .collect())
         }
         .await;
-        session.finish();
+        read.finish().await;
 
         outcome
     }
@@ -655,12 +718,12 @@ impl Catalog {
         prefix: Vec<Option<IndexKeyValue>>,
         reverse: bool,
     ) -> Result<Vec<RowLocation>> {
-        let session = self.begin_read().await?;
-        let handle = session.handle();
+        let read = self.begin_probe().await?;
+        let handle = read.handle();
 
         let outcome = async {
-            let (view, tail) = self.head_view(handle).await?;
-            let info = view
+            let info = read
+                .view()
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
 
@@ -693,12 +756,12 @@ impl Catalog {
 
             let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
             let mut row_ids =
-                index_maintenance::null_prefix_row_ids(handle, tail.as_ref(), index.get(), &key)
+                index_maintenance::null_prefix_row_ids(handle, read.tail(), index.get(), &key)
                     .await?;
             if reverse {
                 row_ids.reverse();
             }
-            let holders = RowHolders::of(&view.data_files_of(table));
+            let holders = RowHolders::of(&read.view().data_files_of(table));
 
             Ok(row_ids
                 .into_iter()
@@ -709,7 +772,7 @@ impl Catalog {
                 .collect())
         }
         .await;
-        session.finish();
+        read.finish().await;
 
         outcome
     }
@@ -812,7 +875,9 @@ impl Catalog {
         let session = self.begin_read().await?;
 
         let outcome = async {
-            let (snapshot, _) = self.head_view(session.handle()).await?;
+            let head = self.head_view(session.handle()).await?;
+            slot_commit::release_reader(head.reader.as_ref()).await;
+            let snapshot = head.view;
             // `columns_of` is ordered by the column's ordinal, so a column's
             // 0-based index here is its physical position in a file written
             // under this schema — the mapping the scoped read needs. (Ordinals
@@ -1125,7 +1190,9 @@ impl Catalog {
         let session = self.begin_read().await?;
 
         let outcome = async {
-            let (snapshot, _) = self.head_view(session.handle()).await?;
+            let head = self.head_view(session.handle()).await?;
+            slot_commit::release_reader(head.reader.as_ref()).await;
+            let snapshot = head.view;
             let live_columns = snapshot.columns_of(table);
             let positions = columns
                 .iter()
