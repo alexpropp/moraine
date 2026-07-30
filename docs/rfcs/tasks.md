@@ -137,9 +137,6 @@ Four things gate disproportionately much of the list:
 - **IMPL** — A column-oriented flush decode path handing the imported
   `DataChunk` straight to the writer, eliminating the row-by-row
   `duckdb::Value` materialization and making flush closer to transcode-free.
-- **VALIDATE** — Extend the e2e type pin to cover `BLOB`, `UUID` and `DECIMAL`
-  as inlined. `GEOMETRY` (inlinable with `spatial`) and `VARIANT` (refused,
-  no Arrow representation) are already pinned in `types.rs`.
 - **DEFERRED** — Auto-flush policy: when to trigger an inline flush. This RFC
   specifies only the mechanism; the policy is an operational concern.
 
@@ -340,22 +337,17 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — After a widening type promotion, reconstruction at a
   **pre-promotion** snapshot yields the old type. Current coverage asserts
   promotion at head only.
-- **VALIDATE** — A rename of one column, or a reorder moving `k` columns,
-  writes no `history` record and no `current` change for any other column.
-- **VALIDATE** — Pin that verb-path `add_column` allocates ids identically to
-  DuckLake (per-table MAX-over-history plus one, nested fields in pre-order),
-  and that drop-then-add always yields a strictly larger id.
+- **VALIDATE** — Pin that verb-path `add_column` allocates **nested** field ids
+  as DuckLake does, in pre-order. The flat case is pinned on both paths now —
+  `column_order_numbers_from_one_and_keeps_gaps` for the verb path and
+  `ducklake_column_ids_and_positions_match_stock_ducklake` differentially for
+  the staged one — but nothing covers a nested `STRUCT`'s field ids.
 - **DOC** — Give `ducklake_schema_versions` a named home in 0002's keyspace
   map. It is implemented as a fold into the snapshot record, but the map's
   `snapshot` row never mentions it.
 
 ## 0013 — Partitioning, sorting, and pruning
 
-- **VALIDATE** — Pin the schema-evolution boundary the RFC now records:
-  dropping a partitioned or sorted column is refused by DuckLake, rename and
-  type change are allowed, a partition spec survives a rename by field id, and
-  renaming a sorted column commits a new sort-spec version carrying the new
-  expression text.
 - **DEFERRED** — Server-side partition-pruning pushdown. One deferral with
   0002's stats pushdown, 0006's pushdown surface, and 0009's partial
   materialization — not four. Nothing pushes a predicate into moraine today, and

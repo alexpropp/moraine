@@ -363,6 +363,81 @@ fn ducklake_macros_round_trip_through_staged_writes() {
     );
 }
 
+/// Column ids and positions match stock DuckLake exactly, differential
+/// against a reference catalog fed the identical DDL. Existing coverage
+/// asserts names and types ordered *by* `column_order` and so would pass
+/// under any monotonic numbering; this pins the values themselves — ids
+/// allocated per-table and never reused, positions numbered from 1 with
+/// the gap a drop leaves preserved rather than renumbered.
+///
+/// This exercises the staged path, where moraine carries DuckLake's own
+/// values verbatim. The verb path allocates them itself and is pinned by
+/// the core unit tests instead; a divergence there is invisible here.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_column_ids_and_positions_match_stock_ducklake() {
+    let store = TempDir::new("colid-store");
+    let data = TempDir::new("colid-data");
+    let reference_meta = TempDir::new("colid-ref-meta");
+    let reference_data = TempDir::new("colid-ref-data");
+
+    let apply = |sql: &str| {
+        run_ducklake_sql(store.path(), data.path(), sql);
+        run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+    };
+    let probe = |sql: &str| -> Vec<Vec<String>> {
+        let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+        let reference_rows = csv_rows(&run_reference_ducklake_sql(
+            reference_meta.path(),
+            reference_data.path(),
+            sql,
+        ));
+        assert_eq!(
+            moraine_rows, reference_rows,
+            "moraine diverges from stock DuckLake for `{sql}`"
+        );
+        moraine_rows
+    };
+
+    let live = "SELECT column_name, column_id, column_order \
+                FROM __ducklake_metadata_lake.ducklake_column \
+                WHERE end_snapshot IS NULL ORDER BY column_order;";
+
+    apply("CREATE TABLE lake.main.t (a BIGINT, b VARCHAR, c DOUBLE);");
+    assert_eq!(
+        probe(live),
+        vec![
+            vec!["a".to_string(), "1".to_string(), "1".to_string()],
+            vec!["b".to_string(), "2".to_string(), "2".to_string()],
+            vec!["c".to_string(), "3".to_string(), "3".to_string()],
+        ],
+        "positions are numbered from 1, matching field ids on a fresh table"
+    );
+
+    apply("ALTER TABLE lake.main.t ADD COLUMN d INTEGER;");
+    apply("ALTER TABLE lake.main.t DROP COLUMN b;");
+
+    // The drop leaves a gap at 2 in both id and position: survivors keep
+    // what they had, and nothing is renumbered to close it.
+    assert_eq!(
+        probe(live),
+        vec![
+            vec!["a".to_string(), "1".to_string(), "1".to_string()],
+            vec!["c".to_string(), "3".to_string(), "3".to_string()],
+            vec!["d".to_string(), "4".to_string(), "4".to_string()],
+        ],
+        "a drop must leave a gap rather than renumber the survivors"
+    );
+
+    // A later add continues past the highest, never reusing the dropped id.
+    apply("ALTER TABLE lake.main.t ADD COLUMN e INTEGER;");
+    assert_eq!(
+        probe(live).last().expect("at least one column"),
+        &vec!["e".to_string(), "5".to_string(), "5".to_string()],
+        "the re-add must allocate above the maximum, not fill the gap"
+    );
+}
+
 /// Column-level schema evolution through DuckLake's own `ALTER TABLE`:
 /// ADD / RENAME / DROP COLUMN. DuckLake expresses each as
 /// `ducklake_column` version transitions over the staged-write path,
