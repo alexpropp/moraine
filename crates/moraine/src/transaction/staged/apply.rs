@@ -3,8 +3,8 @@
 //! record.
 
 use super::{
-    CatalogSnapshot, Cell, EntityKey, Error, HashMap, Key, Result, RowOperation, TableKind, commit,
-    corrupt_row,
+    BTreeSet, CatalogSnapshot, Cell, EntityKey, Error, HashMap, Key, Result, RowOperation,
+    TableKind, commit, corrupt_row,
     decode::{
         Cursor, StatsKey, decode_column, decode_column_mapping, decode_column_tag_row,
         decode_data_file, decode_delete_file, decode_delete_key, decode_end,
@@ -29,6 +29,37 @@ pub(super) struct ChildRows {
     pub(super) macro_implementations: HashMap<u64, Vec<proto::MacroImplementation>>,
     pub(super) macro_parameters: HashMap<(u64, u64), Vec<proto::MacroParameter>>,
     pub(super) name_mappings: HashMap<u64, Vec<proto::NameMapping>>,
+}
+
+/// The entities this batch hard-deletes, gathered before anything is
+/// applied. A hard delete emits a raw key delete and deliberately leaves
+/// the working state untouched, so an embedded child's parent still reads
+/// as live there however the deletes are ordered. Compaction deletes a
+/// parent and its embedded children in one batch, so the check needs the
+/// batch's intent rather than its progress.
+pub(super) fn collect_hard_deletes(ops: &[RowOperation]) -> Result<BTreeSet<EntityKey>> {
+    let mut deleted = BTreeSet::new();
+    for op in ops {
+        if let RowOperation::Delete { table, cells } = op {
+            if matches!(
+                table,
+                TableKind::Schema
+                    | TableKind::Table
+                    | TableKind::View
+                    | TableKind::Column
+                    | TableKind::DataFile
+                    | TableKind::DeleteFile
+                    | TableKind::PartitionInfo
+                    | TableKind::SortInfo
+                    | TableKind::Macro
+                    | TableKind::ColumnMapping
+            ) {
+                let (entity, _) = decode_hard_delete(*table, cells)?;
+                deleted.insert(entity);
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
@@ -120,6 +151,7 @@ pub(super) fn apply_op(
     new_id: u64,
     children: &mut ChildRows,
     direct: &mut Vec<commit::StagedWrite>,
+    hard_deleted: &BTreeSet<EntityKey>,
 ) -> Result<()> {
     match op {
         RowOperation::Insert { table, cells } => apply_insert(base, state, *table, cells, children),
@@ -129,7 +161,9 @@ pub(super) fn apply_op(
         RowOperation::UpdateSetBegin { table, cells } => {
             apply_update_set_begin(base, state, *table, cells, new_id)
         }
-        RowOperation::Delete { table, cells } => apply_delete(state, *table, cells, direct),
+        RowOperation::Delete { table, cells } => {
+            apply_delete(state, *table, cells, direct, hard_deleted)
+        }
         // Inline ops contribute no snapshot diff — their writes come from
         // `translate_inline` — so both `translate` and
         // `translate_maintenance` pass them through here as no-ops.
@@ -613,6 +647,7 @@ pub(super) fn apply_delete(
     table: TableKind,
     cells: &[Cell],
     direct: &mut Vec<commit::StagedWrite>,
+    hard_deleted: &BTreeSet<EntityKey>,
 ) -> Result<()> {
     match table {
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
@@ -688,8 +723,11 @@ pub(super) fn apply_delete(
             // state is deliberately left alone: removing a live row from
             // it would make the diff stage an end-transition — minting a
             // history mirror DuckLake never authored — on top of this
-            // delete. The cascade never re-touches a row it deleted, so
-            // the stale working-state entry is unread.
+            // delete. The row therefore still reads as live in the working
+            // state, so anything that asks whether a deleted row survived
+            // must consult `collect_hard_deletes` rather than the state —
+            // compaction deletes a parent and its embedded children in one
+            // batch and would otherwise see its own parent as surviving.
             direct.push((key.encode(), None));
             Ok(())
         }
@@ -723,7 +761,7 @@ pub(super) fn apply_delete(
         | TableKind::FilePartitionValue
         | TableKind::MacroImpl
         | TableKind::MacroParameters
-        | TableKind::NameMapping => apply_embedded_delete(state, table, cells),
+        | TableKind::NameMapping => apply_embedded_delete(state, table, cells, hard_deleted),
         TableKind::SchemaVersions => {
             // Schema-version rows fold into snapshot records; the rows a
             // dead-table cleanup deletes are visible only through
@@ -772,55 +810,84 @@ pub(super) fn apply_tag_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> R
 }
 
 /// A spec-column / partition-value delete: only ever issued alongside its
-/// parent record's own deletion, so a still-current parent means the
-/// cascade named a row this model says cannot die alone.
+/// parent record's own deletion, so a parent that is neither already dead
+/// nor dying in this batch means the cascade named a row this model says
+/// cannot die alone.
 pub(super) fn apply_embedded_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
     cells: &[Cell],
+    hard_deleted: &BTreeSet<EntityKey>,
 ) -> Result<()> {
     let mut c = Cursor::new(table, cells);
-    let parent_is_current = match table {
+    let parent = match table {
         TableKind::PartitionColumn => {
             let partition_id = c.u64()?;
             let table_id = c.u64()?;
-            state
+            let live = state
                 .partitions
                 .get(&table_id)
-                .is_some_and(|specs| specs.contains_key(&partition_id))
+                .is_some_and(|specs| specs.contains_key(&partition_id));
+            (
+                live,
+                EntityKey::Partition {
+                    table_id,
+                    partition_id,
+                },
+            )
         }
         TableKind::SortExpression => {
             let sort_id = c.u64()?;
             let table_id = c.u64()?;
-            state
+            let live = state
                 .sorts
                 .get(&table_id)
-                .is_some_and(|specs| specs.contains_key(&sort_id))
+                .is_some_and(|specs| specs.contains_key(&sort_id));
+            (live, EntityKey::Sort { table_id, sort_id })
         }
         TableKind::FilePartitionValue => {
             let data_file_id = c.u64()?;
             let table_id = c.u64()?;
-            state
+            let live = state
                 .data_files
                 .get(&table_id)
-                .is_some_and(|files| files.contains_key(&data_file_id))
+                .is_some_and(|files| files.contains_key(&data_file_id));
+            (
+                live,
+                EntityKey::File {
+                    table_id,
+                    data_file_id,
+                },
+            )
         }
         TableKind::MacroImpl | TableKind::MacroParameters => {
             let macro_id = c.u64()?;
-            state.macros.contains_key(&macro_id)
+            (
+                state.macros.contains_key(&macro_id),
+                EntityKey::Macro { macro_id },
+            )
         }
         TableKind::NameMapping => {
             let mapping_id = c.u64()?;
-            state
+            let owner = state
                 .mappings
-                .values()
-                .any(|per_table| per_table.contains_key(&mapping_id))
+                .iter()
+                .find(|(_, per_table)| per_table.contains_key(&mapping_id))
+                .map(|(table_id, _)| *table_id);
+            (
+                owner.is_some(),
+                EntityKey::Mapping {
+                    table_id: owner.unwrap_or_default(),
+                    mapping_id,
+                },
+            )
         }
         _ => return Err(corrupt_row(table, "not an embedded kind")),
     };
     // Remaining identity cells vary by kind and are not needed: the row
     // dies with its parent.
-    if parent_is_current {
+    let (parent_is_current, parent_key) = parent;
+    if parent_is_current && !hard_deleted.contains(&parent_key) {
         return Err(corrupt_row(
             table,
             "embedded row deleted while its parent record is still live",

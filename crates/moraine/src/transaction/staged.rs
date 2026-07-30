@@ -19,7 +19,7 @@
 //! stamps on its own — so a mismatch is drift caught loudly.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -55,7 +55,10 @@ mod inline;
 #[cfg(test)]
 mod tests;
 
-use apply::{ChildRows, apply_op, build_snapshot_value, collect_child_rows, is_inline_op};
+use apply::{
+    ChildRows, apply_op, build_snapshot_value, collect_child_rows, collect_hard_deletes,
+    is_inline_op,
+};
 use decode::Cursor;
 use index_upkeep::stage_index_maintenance;
 use inline::translate_inline;
@@ -419,7 +422,7 @@ impl StagedTransaction {
     pub async fn visible_snapshots(&self) -> Result<Vec<proto::SnapshotValue>> {
         let committed = read::scan_snapshots(ReadHandle::Tx(&self.db_tx)).await?;
 
-        let mut deleted = std::collections::BTreeSet::new();
+        let mut deleted = BTreeSet::new();
         for op in &self.ops {
             if let RowOperation::Delete {
                 table: TableKind::Snapshot,
@@ -615,6 +618,7 @@ fn translate(
     let mut state = base.clone();
     let mut children = collect_child_rows(ops)?;
     let mut direct = Vec::new();
+    let hard_deleted = collect_hard_deletes(ops)?;
     for op in ops {
         if !is_inline_op(op)
             && !matches!(
@@ -622,17 +626,41 @@ fn translate(
                 RowOperation::Insert { .. } | RowOperation::UpdateSetBegin { .. }
             )
         {
-            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
+            apply_op(
+                base,
+                &mut state,
+                op,
+                new_id,
+                &mut children,
+                &mut direct,
+                &hard_deleted,
+            )?;
         }
     }
     for op in ops {
         if matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
+            apply_op(
+                base,
+                &mut state,
+                op,
+                new_id,
+                &mut children,
+                &mut direct,
+                &hard_deleted,
+            )?;
         }
     }
     for op in ops {
         if matches!(op, RowOperation::UpdateSetBegin { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
+            apply_op(
+                base,
+                &mut state,
+                op,
+                new_id,
+                &mut children,
+                &mut direct,
+                &hard_deleted,
+            )?;
         }
     }
 
@@ -711,6 +739,7 @@ fn translate_maintenance(
     let mut state = base.clone();
     let mut children = ChildRows::default();
     let mut direct = Vec::new();
+    let hard_deleted = collect_hard_deletes(ops)?;
     for op in ops {
         let allowed = matches!(
             op,
@@ -727,7 +756,15 @@ fn translate_maintenance(
                     .to_string(),
             ));
         }
-        apply_op(base, &mut state, op, head, &mut children, &mut direct)?;
+        apply_op(
+            base,
+            &mut state,
+            op,
+            head,
+            &mut children,
+            &mut direct,
+            &hard_deleted,
+        )?;
     }
 
     let mut writes = commit::diff_writes(base, &state, head);

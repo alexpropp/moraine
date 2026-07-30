@@ -2710,6 +2710,110 @@ async fn merge_shaped_commit_replaces_files_and_schedules_sources() {
     catalog.close().await.unwrap();
 }
 
+/// Merging a *partitioned* table: the sources carry
+/// `ducklake_file_partition_value` rows that die with them, so the batch
+/// hard-deletes a parent and its embedded child together. A hard delete
+/// deliberately leaves the working state alone, so the embedded-delete
+/// check cannot ask whether the parent survived by reading state alone —
+/// it has to know the batch is deleting it. Staged in both delete orders,
+/// since DuckLake's emission order is not part of the contract.
+#[tokio::test]
+async fn merge_of_a_partitioned_table_deletes_parent_and_partition_values() {
+    // Seeds one partitioned table with file 9 carrying a partition value,
+    // then stages a merge whose deletes are emitted in `child_first` order.
+    async fn merge_with(child_first: bool) -> Result<()> {
+        let catalog = open().await;
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: column_row(1, 1, "part_key", 0),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::PartitionInfo,
+            cells: partition_info_row(10, 1, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::PartitionColumn,
+            cells: partition_column_row(10, 1, 0, 1),
+        });
+        let mut file = data_file_row(9, 1, 1);
+        file[12] = Cell::U64(10);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: file,
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilePartitionValue,
+            cells: file_partition_value_row(9, 1, 0, "7"),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        // The merge: a backdated replacement, then the source's rows
+        // hard-deleted — parent and embedded child.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut merged = data_file_row(11, 1, 1);
+        merged[12] = Cell::U64(10);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: merged,
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::FilePartitionValue,
+            cells: file_partition_value_row(11, 1, 0, "7"),
+        });
+
+        let child = RowOperation::Delete {
+            table: TableKind::FilePartitionValue,
+            cells: vec![Cell::U64(9), Cell::U64(1), Cell::U64(0)],
+        };
+        let parent = RowOperation::Delete {
+            table: TableKind::DataFile,
+            cells: vec![Cell::U64(1), Cell::U64(9), Cell::Null],
+        };
+        if child_first {
+            tx.stage(child);
+            tx.stage(parent);
+        } else {
+            tx.stage(parent);
+            tx.stage(child);
+        }
+
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(2, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(2, r#"compacted_table:"main"."t""#),
+        });
+        let result = tx.commit().await.map(|_| ());
+        catalog.close().await.unwrap();
+        result
+    }
+
+    merge_with(false)
+        .await
+        .expect("merge with the parent deleted before its partition value");
+    merge_with(true)
+        .await
+        .expect("merge with the partition value deleted before its parent");
+}
+
 /// A rewrite-shaped commit ends the source file and its delete file
 /// into history and rebases the replacement's `begin_snapshot` in
 /// place; nothing is scheduled.
