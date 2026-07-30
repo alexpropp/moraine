@@ -12,7 +12,9 @@ this file is the operational summary.
   protocol) bridges them. `lib.rs` is docs + re-exports only.
 - `crates/moraine-wal` — the commit-slot log protocol: sequence naming, the
   envelope wire format, the conditional-put race, tail enumeration and
-  truncation. Sits below `moraine` and knows nothing of DuckLake, SlateDB, or
+  truncation, plus the protocol's loops behind embedder traits (retry-and-
+  rebase commit, resumable fold, and the folder appointment rule).
+  Sits below `moraine` and knows nothing of DuckLake, SlateDB, or
   moraine's key layout — payload keys, values, and the classification string
   are opaque bytes here. The boundary is shape versus meaning; if a change
   wants to teach this crate what a payload means, it belongs in `moraine`.
