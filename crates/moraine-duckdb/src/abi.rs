@@ -23,6 +23,7 @@ use std::{
 
 use moraine::CatalogOptions;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
+use tracing::warn;
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
@@ -585,6 +586,9 @@ pub unsafe extern "C" fn moraine_attach(
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<Box<MoraineCatalogHandle>, AbiError> {
+        // Before anything that could emit an event, so an attach failure is
+        // itself drainable.
+        crate::logging::install();
         if out.is_null() {
             return Err(AbiError::invalid_argument("`out` is null"));
         }
@@ -622,7 +626,12 @@ pub unsafe extern "C" fn moraine_attach(
         // Open the store first: it is synchronous and fallible, and a bad
         // path must not cost a runtime spun up just to be torn down.
         let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
-        let runtime = new_runtime().map_err(|e| {
+        // Allocated before the runtime so its worker threads are tagged
+        // from their first instant; the guard attributes the open's own
+        // events (run below on this thread) the same way.
+        let log_id = crate::logging::allocate_handle_id();
+        let _log_guard = crate::logging::enter_handle(log_id);
+        let runtime = new_runtime(log_id).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
                 format!("failed to start tokio runtime: {e}"),
@@ -695,7 +704,7 @@ pub unsafe extern "C" fn moraine_attach(
             }
         };
 
-        let mut handle = MoraineCatalogHandle::new(runtime, catalog);
+        let mut handle = MoraineCatalogHandle::new(runtime, catalog, log_id);
         handle.data_store = data_store;
         handle.data_prefix = data_prefix;
         Ok(Box::new(handle))
@@ -852,7 +861,13 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     let attempt = || {
         // SAFETY: caller contract above; dropped exactly once.
         let boxed = unsafe { Box::from_raw(handle) };
-        let _ = boxed.runtime.block_on(boxed.catalog.close());
+        if let Err(err) = boxed.block_on(boxed.catalog.close()) {
+            // Detach has no error channel, so the failed close (a final
+            // flush that did not land) is logged rather than lost. The
+            // event surfaces through any remaining drain point or a host
+            // subscriber.
+            warn!(error = %err, "catalog close failed during detach");
+        }
     };
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
@@ -1435,8 +1450,75 @@ unsafe fn column_orders(
         .collect()
 }
 
-/// Creates an equality index, committing autonomously. Refuses a table that
-/// already holds data (SQL-path backfill is a follow-up).
+/// Derives the whole backfill and creates the index in one commit — the
+/// single-commit build, for a table small enough that its entries fit one
+/// batch. `data_store` is the `DATA_PATH` store when the table holds files
+/// to scoped-read, `None` when it holds only inline rows.
+///
+/// # Safety
+///
+/// `probe`/`probe_ctx` must satisfy the ABI's cancellation contract.
+unsafe fn create_index_in_one_commit(
+    handle: &MoraineCatalogHandle,
+    table_id: moraine::TableId,
+    def: &moraine::IndexDef,
+    orders: &[moraine::ColumnOrder],
+    data_store: Option<std::sync::Arc<dyn object_store::ObjectStore>>,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+) -> Result<(), AbiError> {
+    let mut backfill = match data_store {
+        Some(store) => {
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            unsafe {
+                handle.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle.catalog.scoped_backfill_entries(
+                        store,
+                        &handle.data_prefix,
+                        table_id,
+                        &def.columns,
+                    ),
+                )
+            }?
+        }
+        None => Vec::new(),
+    };
+    // SAFETY: caller contract for `probe`/`probe_ctx`.
+    let inline = unsafe {
+        handle.block_on_cancellable(
+            probe,
+            probe_ctx,
+            handle
+                .catalog
+                .inline_backfill_entries(table_id, &def.columns),
+        )
+    }?;
+    backfill.extend(inline);
+
+    // SAFETY: caller contract for `probe`/`probe_ctx`.
+    unsafe {
+        handle.block_on_cancellable(
+            probe,
+            probe_ctx,
+            handle.catalog.commit(|tx| {
+                if orders.is_empty() {
+                    tx.create_index(table_id, def, &backfill)?;
+                } else {
+                    tx.create_index_ordered(table_id, def, orders, &backfill)?;
+                }
+                Ok(())
+            }),
+        )
+    }?;
+    Ok(())
+}
+
+/// Creates an equality index, committing autonomously. With `staged`, runs
+/// the multi-commit build — required when the table's backfill exceeds what
+/// one commit may stage — and returns once the index is ready; interrupting
+/// it leaves the build resumable by the same call.
 ///
 /// # Safety
 ///
@@ -1453,6 +1535,7 @@ pub unsafe extern "C" fn moraine_index_create(
     column_descending: *const u8,
     column_nulls_first: *const u8,
     unique: bool,
+    staged: bool,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -1491,46 +1574,19 @@ pub unsafe extern "C" fn moraine_index_create(
             column_ids.push(found.id);
         }
 
-        // A table that already holds data must be backfilled: external files
-        // by scoped-reading them from the DATA_PATH store (resolved at attach
-        // from `META_DATA_PATH`) — without it, refuse rather than under-cover —
-        // and inline rows by scanning the catalog store, which is always
-        // reachable.
-        let mut backfill = if snapshot.data_files_of(table_id).is_empty() {
-            Vec::new()
-        } else {
-            let store = handle_ref.data_store.clone().ok_or_else(|| {
-                AbiError::from(moraine::Error::Constraint(
-                    "the table already holds data; attach with META_DATA_PATH so its files can be \
-                     scoped-read"
-                        .to_owned(),
-                ))
-            })?;
-            // SAFETY: caller contract for `probe`/`probe_ctx`.
-            unsafe {
-                handle_ref.block_on_cancellable(
-                    probe,
-                    probe_ctx,
-                    handle_ref.catalog.scoped_backfill_entries(
-                        store,
-                        &handle_ref.data_prefix,
-                        table_id,
-                        &column_ids,
-                    ),
-                )
-            }?
-        };
-        // SAFETY: caller contract for `probe`/`probe_ctx`.
-        let inline = unsafe {
-            handle_ref.block_on_cancellable(
-                probe,
-                probe_ctx,
-                handle_ref
-                    .catalog
-                    .inline_backfill_entries(table_id, &column_ids),
-            )
-        }?;
-        backfill.extend(inline);
+        // A table that already holds data must be backfilled from the
+        // DATA_PATH store (resolved at attach from `META_DATA_PATH`) —
+        // without it, refuse rather than under-cover. Inline rows come from
+        // the catalog store, which is always reachable.
+        let holds_files = !snapshot.data_files_of(table_id).is_empty();
+        let data_store = handle_ref.data_store.clone();
+        if holds_files && data_store.is_none() {
+            return Err(AbiError::from(moraine::Error::Constraint(
+                "the table already holds data; attach with META_DATA_PATH so its files can be \
+                 scoped-read"
+                    .to_owned(),
+            )));
+        }
 
         // SAFETY: each non-null orders pointer points to `column_count` bools,
         // per the caller contract.
@@ -1541,22 +1597,40 @@ pub unsafe extern "C" fn moraine_index_create(
             columns: column_ids,
             unique,
         };
+
+        // The staged build derives its own backfill, one bounded step at a
+        // time; the single-commit path derives it all up front.
+        if staged {
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.create_index_staged(
+                        table_id,
+                        &def,
+                        &orders,
+                        data_store,
+                        &handle_ref.data_prefix,
+                        None,
+                    ),
+                )
+            }?;
+            return Ok(());
+        }
+
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         unsafe {
-            handle_ref.block_on_cancellable(
+            create_index_in_one_commit(
+                handle_ref,
+                table_id,
+                &def,
+                &orders,
+                data_store.filter(|_| holds_files),
                 probe,
                 probe_ctx,
-                handle_ref.catalog.commit(|tx| {
-                    if orders.is_empty() {
-                        tx.create_index(table_id, &def, &backfill)?;
-                    } else {
-                        tx.create_index_ordered(table_id, &def, &orders, &backfill)?;
-                    }
-                    Ok(())
-                }),
             )
-        }?;
-        Ok(())
+        }
     };
 
     // SAFETY: `err` validity is this function's own safety contract.

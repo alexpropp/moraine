@@ -12,6 +12,8 @@ record *why* the project is the way it is.
    design and is binding: if implementation reveals a better design, update
    the RFC (or replace it with a successor that points back) — don't
    silently diverge.
+3. An RFC states the design, not what is left to do about it. Undecided
+   questions and deferred work are tracked outside the RFC.
 
 Design documents produced in brainstorming/design sessions are written
 directly here as RFCs; there is no separate specs directory.
@@ -41,3 +43,4 @@ directly here as RFCs; there is no separate specs directory.
 | [0019](0019-macros.md) | Scalar and table macros |
 | [0020](0020-change-data-feed.md) | Change data feed |
 | [0021](0021-maintenance-model.md) | Maintenance orchestration |
+| [0022](0022-commit-log-and-leader-role.md) | The commit log and the leader role |

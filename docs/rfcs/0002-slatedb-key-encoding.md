@@ -221,18 +221,6 @@ Per RFC 0001:
   rejection — corrupt magic, truncated header, unknown encoding version —
   fails as `Corruption`, never a partial decode.
 
-## Open questions
-
-- **`fstat` key ordering.** File-major (`table_id, data_file_id,
-  column_id`) makes "all stats for one file" contiguous — the write unit
-  and the per-file predicate shape. DuckLake's own stats query filters by
-  `(table_id, column_id)` across files, which file-major serves via a
-  table-range scan filtered in memory; column-major would invert the
-  trade. The wrong choice costs a factor of the column count on wide
-  tables, so the ordering is settled against captured DuckLake stats
-  queries in e2e before the table grows migration-sized. File-major stands
-  until then.
-
 ## Alternatives considered
 
 - **Single subspace, begin/end in values:** every current read filters

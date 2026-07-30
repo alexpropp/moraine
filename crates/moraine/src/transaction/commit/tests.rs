@@ -1467,6 +1467,259 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
     catalog.close().await.unwrap();
 }
 
+/// Entries for `count` consecutive integer values starting at `first`,
+/// ordinals `0..count`, one indexed column.
+fn bulk_file_entries(
+    index: crate::catalog::IndexId,
+    first: i128,
+    count: u64,
+) -> Vec<crate::catalog::FileIndexEntry> {
+    (0..count)
+        .map(|ordinal| crate::catalog::FileIndexEntry {
+            index,
+            ordinal,
+            values: vec![Some(int_value(first + i128::from(ordinal)))],
+        })
+        .collect()
+}
+
+/// A data file shaped to carry `count` rows under `path`.
+fn bulk_file(path: &str, count: u64) -> crate::catalog::DataFile {
+    crate::catalog::DataFile {
+        path: path.into(),
+        path_is_relative: true,
+        file_format: "parquet".into(),
+        record_count: count,
+        file_size_bytes: count * 10,
+        footer_size: 4,
+        encryption_key: None,
+        column_stats: vec![],
+    }
+}
+
+/// A commit staging more unique entries than the merged-probe threshold
+/// resolves them in one sorted pass per index; enforcement is unchanged:
+/// fresh values land, a value a committed live row already holds aborts
+/// the whole commit, and nothing of the aborted commit remains visible.
+#[tokio::test]
+async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
+    use crate::catalog::{ColumnId, IndexDef};
+    const COUNT: u64 = 1500;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("a.parquet", COUNT), &{
+                bulk_file_entries(index, 0, COUNT)
+            })
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // A second bulk commit whose entries repeat one committed value (42,
+    // held by a live row of the first file) must abort in full.
+    let mut duplicated = bulk_file_entries(index, i128::from(COUNT), COUNT);
+    duplicated[700].values = vec![Some(int_value(42))];
+    let err = catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("b.parquet", COUNT), &duplicated)
+                .map(|_| ())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+
+    // Value 42 still resolves to the first file's row; none of the aborted
+    // commit's fresh values are visible.
+    let hits = catalog
+        .index_lookup(table, index, &[int_value(42)])
+        .await
+        .unwrap();
+    assert_eq!(sorted_row_ids(hits), vec![42]);
+    assert!(
+        catalog
+            .index_lookup(table, index, &[int_value(i128::from(COUNT) + 10)])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A fresh bulk commit after the abort lands, and both files resolve.
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("c.parquet", COUNT), &{
+                bulk_file_entries(index, i128::from(COUNT), COUNT)
+            })
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+    for probe in [0, 1499, 1500, 2999] {
+        assert_eq!(
+            catalog
+                .index_lookup(table, index, &[int_value(probe)])
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "value {probe} resolves after the fresh bulk commit"
+        );
+    }
+    catalog.close().await.unwrap();
+}
+
+/// Values killed earlier in the same bulk commit are free again for the
+/// commit's own inserts — the delete-then-reinsert contract holds above
+/// the merged-probe threshold too.
+#[tokio::test]
+async fn bulk_unique_commit_frees_values_deleted_in_the_same_commit() {
+    use crate::catalog::{ColumnId, FileIndexRemoval, IndexDef};
+    const COUNT: u64 = 1500;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    let index = std::cell::Cell::new(None);
+    let file = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            index.set(Some(id));
+            let registered = tx.register_data_file(table, bulk_file("a.parquet", COUNT), &{
+                bulk_file_entries(id, 0, COUNT)
+            })?;
+            file.set(Some(registered));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+    let file = file.get().unwrap();
+
+    // One commit: kill every first-file row (freeing its value), and
+    // register a new file re-claiming every one of those values.
+    catalog
+        .commit(|tx| {
+            let removals: Vec<FileIndexRemoval> = (0..COUNT)
+                .map(|row_id| FileIndexRemoval {
+                    index,
+                    row_id,
+                    values: vec![Some(int_value(i128::from(row_id)))],
+                })
+                .collect();
+            let mut killer = delete_file(file);
+            killer.delete_count = COUNT;
+            tx.register_delete_file(table, killer, &removals)?;
+            tx.register_data_file(table, bulk_file("b.parquet", COUNT), &{
+                bulk_file_entries(index, 0, COUNT)
+            })
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // The values resolve to the second file's rows (ids COUNT..2*COUNT).
+    let hits = catalog
+        .index_lookup(table, index, &[int_value(700)])
+        .await
+        .unwrap();
+    assert_eq!(sorted_row_ids(hits), vec![COUNT + 700]);
+    catalog.close().await.unwrap();
+}
+
+/// With two unique indexes maintained in one bulk commit, a duplicate is
+/// detected in whichever index holds it, and the error names that index.
+#[tokio::test]
+async fn bulk_commit_over_two_unique_indexes_names_the_violated_index() {
+    use crate::catalog::{ColumnId, IndexDef};
+    const COUNT: u64 = 1500;
+    let (catalog, table) = catalog_with_two_column_table().await;
+    let by_a = std::cell::Cell::new(None);
+    let by_b = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let a = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            let b = tx.create_index(
+                table,
+                &IndexDef {
+                    name: "by_b".into(),
+                    columns: vec![ColumnId::new(2)],
+                    unique: true,
+                },
+                &[],
+            )?;
+            by_a.set(Some(a));
+            by_b.set(Some(b));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let by_a = by_a.get().unwrap();
+    let by_b = by_b.get().unwrap();
+
+    let both = |first_a: i128, first_b: i128| {
+        let mut entries = bulk_file_entries(by_a, first_a, COUNT);
+        entries.extend(bulk_file_entries(by_b, first_b, COUNT));
+        entries
+    };
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("a.parquet", COUNT), &both(0, 100_000))
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // Fresh `by_a` values, one committed duplicate among `by_b`'s.
+    let mut entries = both(i128::from(COUNT), 100_000 + i128::from(COUNT));
+    entries[usize::try_from(COUNT).unwrap() + 900].values = vec![Some(int_value(100_042))];
+    let err = catalog
+        .commit(|tx| {
+            tx.register_data_file(table, bulk_file("b.parquet", COUNT), &entries)
+                .map(|_| ())
+        })
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains(&by_b.get().to_string()) && !text.contains(&by_a.get().to_string()),
+        "the violation names the violated index: {text}"
+    );
+    catalog.close().await.unwrap();
+}
+
 /// Sets up an indexed table holding one two-row data file (values 10 and
 /// 20 at row ids 0 and 1), returning the catalog, table, index and file.
 async fn catalog_with_indexed_data_file() -> (
@@ -1970,6 +2223,200 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     staged.close().await.unwrap();
 }
 
+/// A staged create carries per-column orders exactly as the single-commit
+/// ordered create does: the definition records them, the steps encode with
+/// them, and the finished range is byte-identical to a single-commit
+/// ordered build over the same rows.
+#[tokio::test]
+async fn staged_ordered_create_records_orders_and_matches_single_commit() {
+    use crate::{
+        catalog::{ColumnId, ColumnOrder, IndexDef},
+        store::index_encoding::{Direction, NullOrder},
+    };
+    let def = || IndexDef {
+        name: "by_a_desc".into(),
+        columns: vec![ColumnId::new(1)],
+        unique: true,
+    };
+    let orders = || {
+        vec![ColumnOrder {
+            direction: Direction::Descending,
+            nulls: NullOrder::First,
+        }]
+    };
+
+    let (single, table_single) = catalog_with_two_column_table().await;
+    register_three_row_file(&single, table_single).await;
+    let single_index = std::cell::Cell::new(None);
+    single
+        .commit(|tx| {
+            let id = tx.create_index_ordered(
+                table_single,
+                &def(),
+                &orders(),
+                &[entry(0, 10), entry(1, 20), entry(2, 30)],
+            )?;
+            single_index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (staged, table_staged) = catalog_with_two_column_table().await;
+    register_three_row_file(&staged, table_staged).await;
+    let staged_index = std::cell::Cell::new(None);
+    staged
+        .commit(|tx| {
+            let id = tx.create_index_staged_ordered(table_staged, &def(), &orders())?;
+            staged_index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let staged_index = staged_index.get().unwrap();
+
+    let info = staged
+        .snapshot()
+        .await
+        .unwrap()
+        .indexes_of(table_staged)
+        .remove(0);
+    assert_eq!(info.directions, vec![Direction::Descending]);
+    assert_eq!(info.nulls, vec![NullOrder::First]);
+
+    staged
+        .commit(|tx| {
+            tx.build_index_step(staged_index, &[entry(0, 10), entry(1, 20)], false)
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+    staged
+        .commit(|tx| {
+            tx.build_index_step(staged_index, &[entry(2, 30)], true)
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scan_index_entries(&single, single_index.get().unwrap()).await,
+        scan_index_entries(&staged, staged_index).await
+    );
+    single.close().await.unwrap();
+    staged.close().await.unwrap();
+}
+
+/// A writer inserting a value a live row already holds, while a unique
+/// index is still building, lands its own rows and poisons the build — the
+/// duplicate fails the *index*, never the write. Enforcement during a build
+/// is partial by construction, so failing the writer would make the outcome
+/// depend on how far the backfill happened to have run.
+#[tokio::test]
+async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
+    use crate::catalog::{ColumnId, DataFile, FileIndexEntry, IndexDef, IndexState};
+    let (catalog, table) = catalog_with_two_column_table().await;
+    // Rows 0..2 exist before the index does, so the writer below lands on a
+    // fresh row id rather than re-deriving the entry the build covered.
+    register_three_row_file(&catalog, table).await;
+    let index = std::cell::Cell::new(None);
+    catalog
+        .commit(|tx| {
+            let id = tx.create_index_staged(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                },
+            )?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let index = index.get().unwrap();
+
+    // The build covers row 0, which holds value 10.
+    catalog
+        .commit(|tx| {
+            tx.build_index_step(index, &[entry(0, 10)], false)
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    // A writer now registers a file whose row claims that same value.
+    catalog
+        .commit(|tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    path: "w.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 1,
+                    file_size_bytes: 10,
+                    footer_size: 4,
+                    encryption_key: None,
+                    column_stats: vec![],
+                },
+                &[FileIndexEntry {
+                    index,
+                    ordinal: 0,
+                    values: vec![Some(int_value(10))],
+                }],
+            )
+            .map(|_| ())
+        })
+        .await
+        .expect("the writer's commit lands rather than failing on the building index");
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.indexes_of(table).remove(0).state,
+        IndexState::Poisoned,
+        "the duplicate poisoned the build"
+    );
+    // The writer's file is really there — its rows were not rolled back.
+    assert_eq!(snapshot.data_files_of(table).len(), 2);
+    catalog.close().await.unwrap();
+}
+
+/// The same collision against a **ready** index still fails the writer:
+/// enforcement is total once the build has flipped, so the duplicate is a
+/// genuine constraint violation.
+#[tokio::test]
+async fn a_writer_duplicating_a_value_on_a_ready_index_still_fails() {
+    use crate::catalog::FileIndexEntry;
+    let (catalog, table, index, _) = catalog_with_indexed_data_file().await;
+    let refused = catalog
+        .commit(|tx| {
+            tx.register_data_file(
+                table,
+                crate::catalog::DataFile {
+                    path: "w.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 1,
+                    file_size_bytes: 10,
+                    footer_size: 4,
+                    encryption_key: None,
+                    column_stats: vec![],
+                },
+                &[FileIndexEntry {
+                    index,
+                    ordinal: 0,
+                    values: vec![Some(int_value(20))],
+                }],
+            )
+            .map(|_| ())
+        })
+        .await;
+    assert!(matches!(refused, Err(Error::Constraint(_))), "{refused:?}");
+    catalog.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
     use crate::catalog::{ColumnId, IndexDef};
@@ -1993,14 +2440,27 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
         .unwrap();
     let index = index.get().unwrap();
 
-    // A duplicate value within a batch fails the step.
-    let dup = catalog
+    // A duplicate value within a batch poisons the build rather than
+    // failing the step — one rule for every collision found while an index
+    // is building. The build's driver is what turns the poison into the
+    // caller's `Constraint`.
+    catalog
         .commit(|tx| {
             tx.build_index_step(index, &[entry(0, 10), entry(1, 10)], false)
                 .map(|_| ())
         })
-        .await;
-    assert!(matches!(dup, Err(Error::Constraint(_))), "{dup:?}");
+        .await
+        .expect("the step lands; the duplicate poisons the definition");
+    assert_eq!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .indexes_of(table)
+            .remove(0)
+            .state,
+        crate::catalog::IndexState::Poisoned
+    );
 
     // Complete the build, then a further step on the ready index is
     // refused.
@@ -2632,4 +3092,57 @@ async fn folded_head_view_matches_a_fresh_scan() {
         "folded head view diverged from a fresh scan"
     );
     catalog.close().await.unwrap();
+}
+
+/// The first attempt never waits, later ones grow to the cap, and every
+/// wait carries jitter — two writers that collided must not re-collide in
+/// lockstep.
+#[test]
+fn retry_backoff_starts_at_zero_grows_and_caps() {
+    use super::{RETRY_BACKOFF_BASE_MICROS, RETRY_BACKOFF_MAX_MICROS, retry_backoff};
+
+    assert_eq!(retry_backoff(0), std::time::Duration::ZERO);
+
+    let ceiling = u128::from(RETRY_BACKOFF_MAX_MICROS + RETRY_BACKOFF_BASE_MICROS);
+    let mut previous = 0_u128;
+    for attempt in 1..MAX_COMMIT_ATTEMPTS {
+        let waited = retry_backoff(attempt).as_micros();
+        assert!(
+            waited >= u128::from(RETRY_BACKOFF_BASE_MICROS),
+            "attempt {attempt} waited {waited}µs, below the base delay"
+        );
+        assert!(
+            waited <= ceiling,
+            "attempt {attempt} waited {waited}µs, above the cap plus jitter"
+        );
+        // Growth holds until the cap absorbs it; jitter never reverses it.
+        if previous > 0 && previous < u128::from(RETRY_BACKOFF_MAX_MICROS) {
+            assert!(
+                waited > previous,
+                "attempt {attempt} waited {waited}µs, not more than {previous}µs"
+            );
+        }
+        previous = waited;
+    }
+    // The last attempts sit at the cap rather than growing without bound.
+    assert!(
+        retry_backoff(MAX_COMMIT_ATTEMPTS - 1).as_micros() >= u128::from(RETRY_BACKOFF_MAX_MICROS)
+    );
+}
+
+/// The whole budget must span enough time for a competing commit to land,
+/// without leaving a caller waiting on a conflict for seconds.
+#[test]
+fn retry_backoff_budget_stays_in_a_sane_band() {
+    use super::retry_backoff;
+
+    let total: std::time::Duration = (0..MAX_COMMIT_ATTEMPTS).map(retry_backoff).sum();
+    assert!(
+        total >= std::time::Duration::from_millis(100),
+        "whole retry budget waits only {total:?}"
+    );
+    assert!(
+        total <= std::time::Duration::from_millis(600),
+        "whole retry budget waits {total:?}"
+    );
 }

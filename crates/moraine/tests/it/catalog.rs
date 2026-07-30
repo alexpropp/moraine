@@ -402,3 +402,46 @@ async fn set_table_schema_moves_a_table_between_schemas() {
     assert!(past.tables_in(target).is_empty());
     catalog.close().await.unwrap();
 }
+
+/// SlateDB's newest-writer-wins fencing, surfaced typed: after a second
+/// read-write open of the same store, the first writer's next commit fails
+/// as [`Error::Fenced`] — not an opaque store error — and the message
+/// carries none of DuckLake's four retry substrings, because a fenced
+/// writer is dead for writes and re-running the commit cannot revive it.
+#[tokio::test]
+async fn second_writer_fences_the_first_with_a_typed_error() {
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+
+    let first = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    first
+        .commit(|tx| tx.create_schema("before").map(|_| ()))
+        .await
+        .unwrap();
+
+    // The second read-write open fences the first (newest writer wins).
+    let second = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+
+    let err = first
+        .commit(|tx| tx.create_schema("after").map(|_| ()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Fenced(_)), "got {err:?}");
+    let text = err.to_string();
+    for substring in ["conflict", "concurrent", "unique", "primary key"] {
+        assert!(
+            !text.contains(substring),
+            "{text:?} contains DuckLake's retry substring {substring:?}"
+        );
+    }
+
+    // The winner is unaffected.
+    second
+        .commit(|tx| tx.create_schema("after").map(|_| ()))
+        .await
+        .unwrap();
+    second.close().await.unwrap();
+}

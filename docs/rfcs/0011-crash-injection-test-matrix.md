@@ -40,8 +40,8 @@ Non-goals:
 - **Fuzzing / randomized fault injection.** RFC 0001 reserves `cargo-fuzz`
   for `store` codecs and the read path as future work. This matrix is
   enumerated and deterministic; a randomized fault-injection harness that
-  crashes at arbitrary WAL offsets is a complementary future layer, noted in
-  Open questions, not built here.
+  crashes at arbitrary WAL offsets is a complementary future layer, not built
+  here.
 - **Real-object-storage crash behavior** (MinIO/localstack, torn multipart
   uploads). RFC 0001 lists real-object-storage tests as a later tier; this
   matrix runs on in-memory `object_store` where the crash seam is the store
@@ -79,7 +79,7 @@ object storage and assert. Concretely, the harness realizes a crash two ways:
   named seam — e.g. issues the Parquet PUTs of a flush but not the commit
   batch — then drops the writer handle and reopens. This requires the `transaction`,
   flush, and GC code to be decomposable at those seams (a testing surface,
-  not a production API; see Open questions).
+  not a production API).
 
 - **Unflushed-batch crash** (single-batch atomicity). To observe the "flush
   did not land" outcome, the harness reopens a store whose last `WriteBatch`
@@ -118,10 +118,20 @@ corruption, no `unsafe`. Three facts about SlateDB combine:
   not a race against a 100 ms timer.
 - **`Db::flush()` and `Db::close()` both force durability** (the `flush_interval`
   doc explicitly notes the app can flush "by closing the database"). So the
-  harness simulates a crash by doing *neither*: it drops/leaks the writer
-  handle and constructs a fresh `Db::open` over the same in-memory
-  `object_store`. Because the WAL never reached the object store, the new
-  handle's manifest and WAL replay simply do not contain the abandoned batch.
+  harness simulates a crash by doing *neither*: it drops the writer handle
+  and constructs a fresh `Db::open` over the same in-memory `object_store`. A
+  plain drop suffices — `Db` has no `Drop` impl at all (only `DbTransaction`
+  and `DbSnapshot` implement `Drop`, for rollback and deregistration
+  bookkeeping), so releasing the handle flushes nothing and no `mem::forget`
+  is needed to hold the batch back. Because the WAL never reached the object
+  store, the new handle's manifest and WAL replay simply do not contain the
+  abandoned batch.
+
+The set of durability triggers is closed, which is what makes the crash
+instant hold: the background timer (`flush_interval`, disabled by `None`),
+the `max_wal_size` threshold (unreachable for the small batches a test
+writes), and an explicit `flush()`/`close()`. Withhold all three and the
+staged batch stays in memory until the test drops it.
 
 So A1 is: open with `flush_interval: None`, drive to head `N` durably (an
 explicit `flush()`), stage the next commit with `await_durable: false`, then
@@ -136,8 +146,15 @@ Rows C1 and C2 need no simulation either — SlateDB's writer fencing *is* the
 behavior under test. Per SlateDB's manifest design, `writer_epoch` is a
 monotonic `u64` a writer increments transactionally (manifest CAS) on
 `Db::open`; a writer whose epoch is below the manifest's current
-`writer_epoch` is a **zombie** and is fenced on its next SST/WAL write. The
-harness drives the real protocol: open writer A, stage an
+`writer_epoch` is a **zombie** and is fenced on its next SST/WAL write.
+
+The increment is `FenceableManifest::init_writer`, which every `Db::open`
+runs unconditionally. It reads and CASes the manifest through the same
+object-store interface as any other write, so the fence is store-agnostic by
+construction and holds on in-memory `object_store` exactly as on real
+storage; a probe test regression-pins that.
+
+The harness drives the real protocol: open writer A, stage an
 `await_durable: false` commit (C1's crash seam), open writer B over the same
 `object_store` (B bumps the epoch — the takeover), assert B sees head `N`;
 then have the still-live A attempt its flush/commit and assert it fails
@@ -156,7 +173,7 @@ same object store, with no in-memory carryover from the crashed process.
 | Point | Crash seam | Post-reopen invariant |
 |---|---|---|
 | **A1** `CommitBatchUnflushed` | Batch staged (step 3), WAL flush withheld (step 4 not durable) | `sys/head` still `N`; snapshot `N+1` absent; no `current`/`history`/`inline`/`tstat` record from the commit is visible. All-or-none: none. |
-| **A2** `CommitBatchLandedNoAck` | Flush landed, process dies before returning to caller | Commit durable: `sys/head` = `N+1`, snapshot `N+1` resolves fully. A caller re-drive of the same logical operation runs against the advanced head and never corrupts: ids never collide (counters advanced with the landed commit) and logically-guarded operations surface their guard (`AlreadyExists` for a re-driven create, `CommitConflict`/`NotFound` where the premise moved). The invariant's scope is deliberate: a re-driven *data-only* operation — `register_data_file` of the same file, an identical inline insert — is a fresh commit and lands a second time; nothing in the protocol dedups it, absent the idempotence machinery the `seqnum` open question defers. A2 asserts consistency of the landed commit and guard-surfacing on re-drive, not universal exactly-once. |
+| **A2** `CommitBatchLandedNoAck` | Flush landed, process dies before returning to caller | Commit durable: `sys/head` = `N+1`, snapshot `N+1` resolves fully. A caller re-drive of the same logical operation runs against the advanced head and never corrupts: ids never collide (counters advanced with the landed commit) and logically-guarded operations surface their guard (`AlreadyExists` for a re-driven create, `CommitConflict`/`NotFound` where the premise moved). The invariant's scope is deliberate: a re-driven *data-only* operation — `register_data_file` of the same file, an identical inline insert — is a fresh commit and lands a second time; nothing in the protocol dedups it, absent the idempotence machinery a `seqnum` pinning decision would enable. A2 asserts consistency of the landed commit and guard-surfacing on re-drive, not universal exactly-once. |
 | **A3** `DropAtomicity` | A `DROP TABLE`/`DROP SCHEMA` that ends *many* records (the table row, every column, every `file`/`delfile` → `history`; every live `inline` chunk deleted), crashed at every reachable WAL boundary | Reopen shows the table **fully present** or **fully dropped** — never a torn table missing some columns or files. There is **no** reachable seam "after the first tombstone, before the last," because the entire multi-tombstone `DROP` is one `WriteBatch` (RFC 0002). This row's job is to *prove that absence*: it fails if any code path splits a `DROP` across batches. |
 
 A3 gives the user-requested "after first tombstone of a multi-tombstone
@@ -227,7 +244,7 @@ The matrix is exhaustive over the two invariants in Background:
   a flush-shaped "PUT the rewritten Parquet, then one commit batch that ends
   the inputs," so it is covered by the B-rows' shape; a compaction-specific
   row is added only if RFC 0008 introduces a seam the flush rows do not
-  already cover (Open questions).
+  already cover.
 - **Every writer-lifecycle transition** is C1/C2, and **birth** is D1/D2.
 
 A seam that is not an instance of one of these is, by RFC 0002's atomicity
@@ -262,51 +279,6 @@ idempotence"); those RFCs cite the corresponding rows (A1/A2, B3) rather than
 carrying their own crash prose. A `docs/plans/` entry tracks that mechanical
 edit to those three RFCs.
 
-## Open questions
-
-- **SlateDB crash-simulation surface — resolved (source-verified).**
-  Rows A1/C1/C3/D2 (reopen a store whose last batch was not durably flushed)
-  and C2 (fence a stale writer) are all reachable through SlateDB's *public*
-  API, so the "unflushed" arm does **not** fall back to the fuzzing tier. The
-  mechanism is the `flush_interval: None` + `await_durable: false` +
-  abandon-the-handle recipe in "The unflushed-WAL knob," and the real
-  `writer_epoch` CAS-on-open for takeover/zombie fencing. Both knobs are
-  confirmed present in the pinned 0.14.x source
-  (`Settings { flush_interval: Option<Duration> }`,
-  `WriteOptions { await_durable: bool }`). The residual confirmations are
-  also source-settled: (a) a *plain drop* of the abandoned handle performs
-  no flush — there is **no `Drop` impl on `Db` at all** (only
-  `DbTransaction` and `DbSnapshot` implement `Drop`, for rollback and
-  deregistration bookkeeping), so no `mem::forget` gymnastics are needed;
-  the WAL's only durability triggers are the background timer
-  (`flush_interval`, disabled by `None`), the `max_wal_size` threshold
-  (unreachable for small test batches), and explicit `flush()`/`close()`;
-  (b) writer fencing is `FenceableManifest::init_writer` bumping
-  `writer_epoch` via manifest CAS on every `Db::open` — store-agnostic by
-  construction, so it holds on in-memory `object_store`; the probe test
-  regression-pins it.
-- **`seqnum` and idempotent re-drive (rows A2/B1/B3/B4).** `WriteOptions` also
-  carries a user `seqnum`. Whether moraine pins sequence numbers itself or
-  lets SlateDB generate them affects how an A2 re-drive is detected as a
-  duplicate versus a fresh commit. Settle with RFC 0004's implementation; the
-  invariant (no duplicate snapshot/id) holds either way, but the assertion's
-  shape depends on it.
-- **Where the seam hooks live.** The `CrashPoint` injection points are a
-  test-only surface on `transaction`/flush/GC. Confirm they can be `#[cfg(...)]`-gated
-  with zero production footprint and no `unsafe`, rather than leaking a fault-injection parameter into public
-  signatures.
-- **Compaction seams (RFC 0008).** Does compaction introduce any state-change
-  seam not already shaped like an inline flush (PUT-then-batch)? If it writes
-  multiple output files across multiple commits, it needs its own B-style
-  rows; if it is one flush-shaped commit, the existing rows cover it. Settle
-  when RFC 0008 lands as Implemented.
-- **Randomized fault injection as a successor.** Once the enumerated matrix
-  is green and the codecs stabilize, a `cargo-fuzz` target that crashes at
-  arbitrary WAL offsets and reopens (asserting the same two invariants) would
-  catch seams this enumeration missed. Complementary future work under RFC
-  0001's fuzzing tier, not a replacement for the named matrix (named rows
-  give regressions a stable identity; fuzzing gives coverage breadth).
-
 ## Alternatives considered
 
 - **Keep the generic "crash-shaped sequences" prose (RFC 0001 status quo).**
@@ -318,7 +290,7 @@ edit to those three RFCs.
   mechanism: a fuzzer that crashes at random offsets gives breadth but no
   stable per-scenario identity, so a regression cannot be named, pinned, or
   guaranteed to re-run. The named matrix is the floor; fuzzing is a future
-  ceiling (Open questions).
+  ceiling.
 - **One crash test per RFC, owned by that RFC.** Rejected: the crash
   invariants are cross-cutting (atomicity and data-before-metadata recur in
   commit, flush, cleanup, takeover, init), so per-RFC ownership re-derives

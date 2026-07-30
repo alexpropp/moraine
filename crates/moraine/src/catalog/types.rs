@@ -414,6 +414,9 @@ pub struct IndexInfo {
     pub unique: bool,
     /// The build lifecycle state.
     pub state: IndexState,
+    /// A staged build's watermark: the highest row id covered so far, or
+    /// `None` before its first step. Always `None` on a single-commit index.
+    pub build_cursor: Option<u64>,
 }
 
 /// The definition of an equality index to create.

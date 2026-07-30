@@ -7,6 +7,7 @@
 #include "duckdb.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/logging/logging.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -33,6 +34,23 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type);
 // TransactionException, Corruption/Store/internal -> IOException/
 // InternalException) and throws it. Frees `err.message` first if non-null.
 [[noreturn]] void ThrowMoraineError(MoraineError &err);
+
+// Drains the core's buffered `tracing` events into DuckDB's logger under
+// the `moraine` log type, so they surface in `duckdb_logs`. Events are
+// emitted on the core's own worker threads, where no ClientContext is in
+// scope; this runs on the calling thread, which has one. Safe to call when
+// nothing was buffered, and never throws — losing a diagnostic must not
+// fail the operation that produced it.
+void DrainMoraineLogs(duckdb::ClientContext &context) noexcept;
+
+// The same drain through a database-scoped logger, for callers with no
+// ClientContext — the maintenance scheduler runs on a thread of its own.
+void DrainMoraineLogs(duckdb::DatabaseInstance &db) noexcept;
+
+// Writes one shim-originated record under the `moraine` log type through a
+// database-scoped logger. For the shim's own diagnostics (e.g. a failed
+// maintenance step); core diagnostics arrive via DrainMoraineLogs instead.
+void WriteMoraineLog(duckdb::DatabaseInstance &db, duckdb::LogLevel level, const std::string &message) noexcept;
 
 // The shim's MoraineInterruptProbe: reports whether the query driving
 // `client_context` (an opaque duckdb::ClientContext*) has been

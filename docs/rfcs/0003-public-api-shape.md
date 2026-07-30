@@ -261,9 +261,8 @@ Notes:
   cleanup functions, but from the DuckDB shim, which can issue SQL — never
   from this surface, which cannot.
 - This table covers the entities the core models today. As the DuckLake v1.0
-  spec's remaining tables and the extension contract (RFC 0005 open question)
-  are reached in e2e, operations are added here — this RFC is updated, not
-  diverged from.
+  spec's remaining tables and the extension contract (RFC 0005) are reached in
+  e2e, operations are added here — this RFC is updated, not diverged from.
 
 ### Testing obligations
 

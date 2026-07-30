@@ -12,6 +12,7 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -121,6 +122,59 @@ extern "C" bool moraine_shim_is_interrupted(void *client_context) {
 	return static_cast<duckdb::ClientContext *>(client_context)->IsInterrupted();
 }
 
+namespace {
+
+// The log type moraine's records carry in `duckdb_logs`. Under DuckDB's
+// default LEVEL_ONLY mode the type is not filtered on, so no registration
+// is needed for the records to appear.
+constexpr const char *MORAINE_LOG_TYPE = "moraine";
+
+// Writes one record through `logger`, dropping it on any failure: crossing
+// back into C++ from Rust, an escaping exception would unwind through the
+// ABI, and diagnostics are never worth that.
+void WriteThroughLogger(duckdb::Logger &logger, int32_t level, const char *message) noexcept {
+	try {
+		auto log_level = static_cast<duckdb::LogLevel>(level);
+		if (logger.ShouldLog(MORAINE_LOG_TYPE, log_level)) {
+			logger.WriteLog(MORAINE_LOG_TYPE, log_level, message);
+		}
+	} catch (...) {
+	}
+}
+
+void WriteMoraineLogRecord(void *ctx, int32_t level, const char *message) {
+	try {
+		auto &context = *static_cast<duckdb::ClientContext *>(ctx);
+		WriteThroughLogger(duckdb::Logger::Get(context), level, message);
+	} catch (...) {
+	}
+}
+
+void WriteMoraineLogRecordToDatabase(void *ctx, int32_t level, const char *message) {
+	try {
+		auto &db = *static_cast<duckdb::DatabaseInstance *>(ctx);
+		WriteThroughLogger(duckdb::Logger::Get(db), level, message);
+	} catch (...) {
+	}
+}
+
+} // namespace
+
+void DrainMoraineLogs(duckdb::ClientContext &context) noexcept {
+	moraine_drain_logs(WriteMoraineLogRecord, &context);
+}
+
+void DrainMoraineLogs(duckdb::DatabaseInstance &db) noexcept {
+	moraine_drain_logs(WriteMoraineLogRecordToDatabase, &db);
+}
+
+void WriteMoraineLog(duckdb::DatabaseInstance &db, duckdb::LogLevel level, const std::string &message) noexcept {
+	try {
+		WriteThroughLogger(duckdb::Logger::Get(db), static_cast<int32_t>(level), message.c_str());
+	} catch (...) {
+	}
+}
+
 void ThrowMoraineError(MoraineError &err) {
 	std::string message = err.message ? std::string(err.message) : std::string("moraine: unknown error");
 	int32_t code = err.code;
@@ -134,6 +188,7 @@ void ThrowMoraineError(MoraineError &err) {
 	case MORAINE_CONSTRAINT:
 		throw duckdb::CatalogException(message);
 	case MORAINE_COMMIT_CONFLICT:
+	case MORAINE_RETRY_EXHAUSTED:
 		throw duckdb::TransactionException(message);
 	case MORAINE_INVALID_ARGUMENT:
 		throw duckdb::InvalidInputException(message);
@@ -141,6 +196,7 @@ void ThrowMoraineError(MoraineError &err) {
 		throw duckdb::InterruptException();
 	case MORAINE_CORRUPTION:
 	case MORAINE_STORE:
+	case MORAINE_FENCED:
 		throw duckdb::IOException(message);
 	case MORAINE_INTERNAL:
 	default:
@@ -585,7 +641,17 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandl
 		if (!db.IsReadOnly()) {
 			scheduler_->Start();
 		}
+		// While this catalog lives, the handle's events push straight
+		// through the database-scoped logger as they fire — a watcher on
+		// another connection sees a running commit's diagnostics while it
+		// runs, instead of one batch (minus evictions) when it returns.
+		// Routed per handle: another attached lake's events go to its own
+		// database, not this one.
+		moraine_register_log_sink(handle_, WriteMoraineLogRecordToDatabase, &db.GetDatabase());
 	} catch (...) {
+		if (handle_ != nullptr) {
+			moraine_unregister_log_sink(handle_);
+		}
 		if (scheduler_) {
 			scheduler_->Stop();
 			scheduler_.reset();
@@ -599,6 +665,12 @@ MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandl
 }
 
 MoraineCatalog::~MoraineCatalog() {
+	// First, before the database the sink writes into can start tearing
+	// down: when unregistration returns, no push is in flight and none
+	// will follow.
+	if (handle_ != nullptr) {
+		moraine_unregister_log_sink(handle_);
+	}
 	// The thread issues SQL against this database and calls through
 	// `handle_`, so it must be stopped before either goes away.
 	if (scheduler_) {
@@ -699,6 +771,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
 	                           data_path.empty() ? nullptr : data_path.c_str(), &handle, &err);
+	// Drained on both exits: the open's own events (and a failed open's)
+	// would otherwise sit buffered until some later commit — or forever, on
+	// a read-only attach that never commits.
+	DrainMoraineLogs(context);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

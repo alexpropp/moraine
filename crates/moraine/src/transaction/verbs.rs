@@ -26,6 +26,19 @@ use crate::{
     transaction::{index_maintenance::StagedIndexEntry, operations::Operation},
 };
 
+/// What staging an entry against a live index needs to know about it.
+struct IndexShape {
+    /// Whether the index enforces uniqueness.
+    unique: bool,
+    /// How many values an entry must carry.
+    column_count: usize,
+    /// The declared per-column sort orders.
+    orders: Vec<ColumnOrder>,
+    /// Whether a staged build is still running, so a duplicate poisons
+    /// the index instead of failing the commit.
+    building: bool,
+}
+
 /// The mutation handle a commit closure receives.
 ///
 /// Dereferences to [`CatalogSnapshot`]; reads observe the transaction's
@@ -522,6 +535,7 @@ impl Transaction {
     /// indexed column is stored multi-shaped and exempt from the value
     /// collision, so `IS NULL` finds it and a unique index still admits any
     /// number of NULL rows.
+    #[allow(clippy::too_many_arguments)]
     fn stage_index_entry(
         &mut self,
         index_id: u64,
@@ -530,6 +544,7 @@ impl Transaction {
         orders: &[ColumnOrder],
         entry: &IndexEntry,
         delete: bool,
+        building: bool,
     ) -> Result<()> {
         if entry.values.len() != column_count {
             return Err(Error::Constraint(format!(
@@ -551,6 +566,7 @@ impl Transaction {
             key,
             row_id: entry.row_id,
             delete,
+            building,
         });
         Ok(())
     }
@@ -595,7 +611,15 @@ impl Transaction {
     ) -> Result<IndexId> {
         let index_id = self.insert_index_definition(table, def, None, &[])?;
         for entry in backfill {
-            self.stage_index_entry(index_id, def.unique, def.columns.len(), &[], entry, false)?;
+            self.stage_index_entry(
+                index_id,
+                def.unique,
+                def.columns.len(),
+                &[],
+                entry,
+                false,
+                false,
+            )?;
         }
         self.mark_altered(table.get());
         Ok(IndexId::new(index_id))
@@ -625,6 +649,7 @@ impl Transaction {
                 def.columns.len(),
                 orders,
                 entry,
+                false,
                 false,
             )?;
         }
@@ -741,9 +766,28 @@ impl Transaction {
     /// not live, [`Error::AlreadyExists`] if the name is taken, or
     /// [`Error::Constraint`] if the column list is empty.
     pub fn create_index_staged(&mut self, table: TableId, def: &IndexDef) -> Result<IndexId> {
+        self.create_index_staged_ordered(table, def, &[])
+    }
+
+    /// Begins a staged build with explicit per-column sort orders — the
+    /// staged counterpart to [`Self::create_index_ordered`]. The definition
+    /// records the orders, and every subsequent [`Self::build_index_step`]
+    /// encodes with them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_index_staged`], plus [`Error::Constraint`] if
+    /// `orders` is non-empty and its length differs from the column list's.
+    pub fn create_index_staged_ordered(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+    ) -> Result<IndexId> {
         let index_id =
-            self.insert_index_definition(table, def, Some("building".to_owned()), &[])?;
+            self.insert_index_definition(table, def, Some("building".to_owned()), orders)?;
         self.mark_altered(table.get());
+
         Ok(IndexId::new(index_id))
     }
 
@@ -776,7 +820,17 @@ impl Transaction {
         let mut cursor = value.build_cursor_row_id.unwrap_or(0);
         for entry in batch {
             cursor = cursor.max(entry.row_id);
-            self.stage_index_entry(index.get(), unique, column_count, &orders, entry, false)?;
+            // A duplicate the backfill discovers poisons the build, as a
+            // writer's would.
+            self.stage_index_entry(
+                index.get(),
+                unique,
+                column_count,
+                &orders,
+                entry,
+                false,
+                true,
+            )?;
         }
 
         value.begin_snapshot = self.new_snapshot_id;
@@ -911,7 +965,7 @@ impl Transaction {
         row_id_start: u64,
         file_entry: &FileIndexEntry,
     ) -> Result<()> {
-        let (unique, column_count, orders) = self.live_index_shape(table, file_entry.index)?;
+        let shape = self.live_index_shape(table, file_entry.index)?;
         let row_id = row_id_start
             .checked_add(file_entry.ordinal)
             .ok_or_else(|| {
@@ -922,14 +976,15 @@ impl Transaction {
             })?;
         self.stage_index_entry(
             file_entry.index.get(),
-            unique,
-            column_count,
-            &orders,
+            shape.unique,
+            shape.column_count,
+            &shape.orders,
             &IndexEntry {
                 row_id,
                 values: file_entry.values.clone(),
             },
             false,
+            shape.building,
         )
     }
 
@@ -1112,39 +1167,37 @@ impl Transaction {
         index_entries: &[FileIndexRemoval],
     ) -> Result<()> {
         for entry in index_entries {
-            let (unique, column_count, orders) = self.live_index_shape(table, entry.index)?;
+            let shape = self.live_index_shape(table, entry.index)?;
             self.stage_index_entry(
                 entry.index.get(),
-                unique,
-                column_count,
-                &orders,
+                shape.unique,
+                shape.column_count,
+                &shape.orders,
                 &IndexEntry {
                     row_id: entry.row_id,
                     values: entry.values.clone(),
                 },
                 true,
+                shape.building,
             )?;
         }
         Ok(())
     }
 
     /// A live index's uniqueness flag, column count, and per-column orders.
-    fn live_index_shape(
-        &self,
-        table: TableId,
-        index: IndexId,
-    ) -> Result<(bool, usize, Vec<ColumnOrder>)> {
+    fn live_index_shape(&self, table: TableId, index: IndexId) -> Result<IndexShape> {
         let value = self
             .state
             .indexes
             .get(&table.get())
             .and_then(|per_table| per_table.get(&index.get()))
             .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
-        Ok((
-            value.unique,
-            value.column_ids.len(),
-            Self::column_orders(value),
-        ))
+        Ok(IndexShape {
+            unique: value.unique,
+            column_count: value.column_ids.len(),
+            orders: Self::column_orders(value),
+            building: value.build_state.is_some(),
+        })
     }
 
     /// Expires a delete file, removing it.

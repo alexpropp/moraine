@@ -832,6 +832,7 @@ fn index_info(value: &IndexValue) -> IndexInfo {
         nulls,
         unique: value.unique,
         state,
+        build_cursor: value.build_cursor_row_id,
     }
 }
 

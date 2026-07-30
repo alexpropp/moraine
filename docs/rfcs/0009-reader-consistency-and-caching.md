@@ -97,6 +97,16 @@ not re-implemented. The handle is released once the in-memory view is
 built; per RFC 0003 the finished `CatalogSnapshot` touches the store never
 again.
 
+Holding a read-snapshot is cheap: a `DbSnapshot` is a `(uuid, started_seq)`
+pair registered with an in-process snapshot manager, so open and drop are
+O(1) with no store I/O and no manifest write. The one holding cost is
+version retention — the manager's `min_active_seq` feeds SlateDB's flush
+and compaction paths, so a live snapshot keeps pre-snapshot versions from
+being reclaimed in-process for as long as it is held. moraine holds one
+only for the duration of a single materialization and releases it before
+the `CatalogSnapshot` is returned, so the retention window is one
+materialization long.
+
 Materialization also reads the **`sys/migration` marker** (RFC 0002 /
 RFC 0015) under the same handle. If the marker is present, a structural
 migration is rewriting the keyspace and any scan of it may be missing
@@ -283,32 +293,6 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   sequence (creates, file registrations, stats updates, renames, expiry), each
   maintained projection equals a fresh scan of the same subspaces at the same
   head.
-
-## Open questions
-
-- **Read-snapshot hold cost — resolved in shape (source-verified, SlateDB
-  0.14.x), residual is quantitative.** A `DbSnapshot` is a
-  `(uuid, started_seq)` pair registered with an in-process snapshot
-  manager — open and drop are O(1), no store I/O, no manifest writes. The
-  one holding cost is version retention: the snapshot manager's
-  `min_active_seq` feeds SlateDB's flush/compaction paths, so a held
-  snapshot pins pre-snapshot versions from being garbage-collected
-  in-process while it lives. For moraine's usage — held only for the
-  duration of one materialization, released before the `CatalogSnapshot`
-  is returned (Design) — that window is milliseconds and the retention
-  effect is negligible; only a pathologically long-held handle would
-  matter, and moraine's design never holds one. What remains is measuring
-  materialization duration itself on large catalogs during bring-up.
-- **Incremental-vs-full threshold.** The churn ratio at which full rescan wins;
-  a tuning parameter, defaulted after perf on realistic churn shapes.
-- **Snapshot lifetime under DuckLake.** Whether DuckLake holds one catalog
-  snapshot per `BEGIN…COMMIT` transaction or re-resolves per statement
-  determines how long a `CatalogSnapshot` is held and thus how tight the
-  retention window must be. Resolved via RFC 0006 / e2e.
-- **Memory bound.** For an unusually large live catalog the materialized view's
-  footprint may matter; whether a partial/lazy materialization is ever needed
-  is deferred until profiling shows the full in-memory view is a problem (RFC
-  0002 bets it is not).
 
 ## Alternatives considered
 

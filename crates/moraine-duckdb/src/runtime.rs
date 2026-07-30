@@ -5,8 +5,12 @@ use std::{ffi::c_void, future::Future, sync::Arc, time::Duration};
 
 use moraine::{Catalog, CatalogSnapshot};
 use object_store::ObjectStore;
+use tokio::runtime::{Builder, Runtime};
 
-use crate::error::AbiError;
+use crate::{
+    error::AbiError,
+    logging::{HandleId, enter_handle, tag_thread_for_handle},
+};
 
 /// A C-side cancellation probe polled while a cancellable call's core
 /// future is pending; returning `true` cancels the call. `None` disables
@@ -29,8 +33,12 @@ const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Every FFI entry point `block_on`s through `runtime`; nothing in
 /// `moraine` core ever blocks on itself.
 pub struct MoraineCatalogHandle {
-    pub(crate) runtime: tokio::runtime::Runtime,
+    pub(crate) runtime: Runtime,
     pub(crate) catalog: Catalog,
+    /// Routes this handle's `tracing` events to its registered log sink:
+    /// the runtime's worker threads carry it for life, and the `block_on`
+    /// wrappers below tag the calling thread with it per call.
+    pub(crate) log_id: HandleId,
     /// The `DATA_PATH` object store, resolved at attach from `META_DATA_PATH`.
     /// Present only when that option was given; index maintenance and
     /// scoped-read backfill need it, and are skipped when it is absent.
@@ -41,13 +49,21 @@ pub struct MoraineCatalogHandle {
 }
 
 impl MoraineCatalogHandle {
-    pub(crate) fn new(runtime: tokio::runtime::Runtime, catalog: Catalog) -> Self {
+    pub(crate) fn new(runtime: Runtime, catalog: Catalog, log_id: HandleId) -> Self {
         Self {
             runtime,
             catalog,
+            log_id,
             data_store: None,
             data_prefix: String::new(),
         }
+    }
+
+    /// Runs `future` on the handle's runtime, attributing events the
+    /// calling thread emits to this handle.
+    pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
+        let _guard = enter_handle(self.log_id);
+        self.runtime.block_on(future)
     }
 
     /// Runs `future` on the handle's runtime unless cancelled first by
@@ -80,6 +96,7 @@ impl MoraineCatalogHandle {
             }
         }
 
+        let _guard = enter_handle(self.log_id);
         self.runtime.block_on(async {
             let probe_fired = async {
                 let Some(probe) = probe else {
@@ -124,9 +141,12 @@ impl MoraineSnapshotHandle {
 }
 
 /// Builds the one multi-threaded tokio runtime an attached catalog owns
-/// for the lifetime of its handle.
-pub(crate) fn new_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
+/// for the lifetime of its handle. Worker threads exist only to run that
+/// handle's work, so each is tagged with `log_id` at spawn — every event
+/// they emit routes to the handle's log sink.
+pub(crate) fn new_runtime(log_id: HandleId) -> std::io::Result<Runtime> {
+    Builder::new_multi_thread()
         .enable_all()
+        .on_thread_start(move || tag_thread_for_handle(log_id))
         .build()
 }

@@ -4,10 +4,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::{
@@ -50,6 +51,32 @@ pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
+
+/// Delay before the second commit attempt, in microseconds; each further
+/// retry doubles it, up to [`RETRY_BACKOFF_MAX_MICROS`]. Without a pause the
+/// budget is ten immediate re-runs, which under real contention is a spin
+/// that burns the budget faster than the contention can clear.
+const RETRY_BACKOFF_BASE_MICROS: u64 = 2_000;
+/// Ceiling on one retry's delay. The whole budget then spans a few hundred
+/// milliseconds — enough for a competing commit to land, short enough that a
+/// caller waiting on a conflict is not left hanging.
+const RETRY_BACKOFF_MAX_MICROS: u64 = 50_000;
+
+/// How long to wait before re-running `attempt` (0-based; the first attempt
+/// never waits). Exponential to the cap, plus jitter of up to the base delay
+/// so two writers that just collided do not back off in lockstep and collide
+/// again.
+fn retry_backoff(attempt: usize) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let doublings = u32::try_from(attempt - 1).unwrap_or(u32::MAX).min(31);
+    let step = RETRY_BACKOFF_BASE_MICROS
+        .saturating_mul(1_u64 << doublings)
+        .min(RETRY_BACKOFF_MAX_MICROS);
+    let jitter = now_micros().unsigned_abs() % RETRY_BACKOFF_BASE_MICROS;
+    Duration::from_micros(step.saturating_add(jitter))
+}
 
 /// Current time in microseconds since the Unix epoch. Clamped, never
 /// panicking: a clock before the epoch stamps 0.
@@ -192,7 +219,11 @@ pub(crate) async fn open_initialized(
     }
 
     match tx.commit_with_options(&durable()).await {
-        Ok(_) => Ok(db),
+        Ok(_) => {
+            // Once per store, ever: the commit that created the catalog.
+            info!(encrypted, data_path, "bootstrapped a fresh catalog store");
+            Ok(db)
+        }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
             let tx = db
@@ -379,7 +410,14 @@ pub(crate) fn refresh_head_view(
     let mut view = base.clone();
     match fold::fold_batch(&mut view, writes) {
         Ok(()) => install_head_view(projections, Arc::new(view)),
-        Err(_) => invalidate_head_view(projections),
+        Err(err) => {
+            // The committed batch could not be folded into the cached view;
+            // dropping the cache is safe (the next commit rescans and
+            // reinstalls) but the cause is worth a trace — a batch this
+            // writer just built should always fold.
+            debug!(error = %err, "head view fold failed; clearing the cached view");
+            invalidate_head_view(projections);
+        }
     }
 }
 
@@ -428,6 +466,39 @@ fn target_format(state: &CatalogSnapshot) -> u64 {
 
 /// Materializes, runs the closure, and stages the resulting writes.
 /// Options-only commits stage no snapshot record and no head advance.
+/// The format-stamp write this commit owes, if any. The stamp is lazy and
+/// forward-only: a completed or dropped build never downgrades it.
+async fn format_stamp(
+    db_tx: &DbTransaction,
+    state: &CatalogSnapshot,
+) -> Result<Option<StagedWrite>> {
+    let target_format = target_format(state);
+    if target_format <= FORMAT_VERSION {
+        return Ok(None);
+    }
+    let current = read::read_format(ReadHandle::Tx(db_tx))
+        .await?
+        .map_or(FORMAT_VERSION, |format| format.format_version);
+    if current >= target_format {
+        return Ok(None);
+    }
+
+    // The stamp decides which binaries can open the store from here on.
+    info!(
+        from = current,
+        to = target_format,
+        "upgrading the store format stamp"
+    );
+
+    Ok(Some((
+        Key::Sys(SysKey::Format).encode(),
+        Some(value::encode_value(&proto::FormatValue {
+            format_version: target_format,
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        })),
+    )))
+}
+
 async fn prepare_and_stage<F>(
     db_tx: &DbTransaction,
     f: &F,
@@ -438,13 +509,12 @@ where
 {
     let head = base.snapshot.snapshot_id;
     let new_id = head + 1;
-
     let mut tx = Transaction::new(base.clone(), new_id);
     f(&mut tx)?;
     let TransactionParts {
         operations,
         index_entries,
-        state,
+        mut state,
         next_catalog_id,
         next_file_id,
     } = tx.into_parts();
@@ -472,27 +542,20 @@ where
         });
     }
 
-    let mut writes = diff_writes(base, &state, new_id);
+    // Entries stage before the entity diff so a poisoned definition rides
+    // that diff rather than needing a write of its own.
+    let poisoned = index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    index_maintenance::apply_poison(&mut state, &poisoned);
 
-    // Stamp the format lazily, in the same batch, and only ever upward — a
-    // completed or dropped build never downgrades the stamp.
-    let target_format = target_format(&state);
-    if target_format > FORMAT_VERSION {
-        let current = read::read_format(ReadHandle::Tx(db_tx))
-            .await?
-            .map_or(FORMAT_VERSION, |format| format.format_version);
-        if current < target_format {
-            writes.push((
-                Key::Sys(SysKey::Format).encode(),
-                Some(value::encode_value(&proto::FormatValue {
-                    format_version: target_format,
-                    writer_version: env!("CARGO_PKG_VERSION").to_string(),
-                })),
-            ));
-        }
-    }
-    index_maintenance::stage_index_entries(ReadHandle::Tx(db_tx), &index_entries, &mut writes)
-        .await?;
+    let mut writes = diff_writes(base, &state, new_id);
+    writes.extend(format_stamp(db_tx, &state).await?);
+    tracing::debug!(
+        snapshot = new_id,
+        index_entries = index_entries.len(),
+        catalog_writes = writes.len(),
+        poisoned_indexes = poisoned.len(),
+        "commit staged"
+    );
 
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
@@ -582,8 +645,9 @@ async fn finish_commit(
 
 /// Commits through the closure, retrying benign races with a full re-run
 /// — fresh snapshot, closure, ids — so premises re-validate against the
-/// state that won. True conflicts and an exhausted budget surface as
-/// [`Error::CommitConflict`].
+/// state that won. A true conflict surfaces as [`Error::CommitConflict`],
+/// which the caller may retry; an exhausted budget surfaces as
+/// [`Error::RetryBudgetExhausted`], which it may not.
 pub(crate) async fn commit_cycle<F>(
     db: &Db,
     f: &F,
@@ -592,27 +656,76 @@ pub(crate) async fn commit_cycle<F>(
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
-    for _ in 0..MAX_COMMIT_ATTEMPTS {
+    // Kept across attempts so an exhausted budget can report where the
+    // premise started and what it kept losing to.
+    let started = std::time::Instant::now();
+    let mut first_head = None;
+    let mut last_intervening = Vec::new();
+
+    for attempt in 0..MAX_COMMIT_ATTEMPTS {
+        // Every path into this loop past the first is a lost race, so the
+        // wait belongs here rather than at each `continue`.
+        if attempt > 0 {
+            tokio::time::sleep(retry_backoff(attempt)).await;
+        }
         match attempt_commit(db, f, projections).await? {
-            CommitOutcome::Committed(id) => return Ok(id),
+            CommitOutcome::Committed(id) => {
+                tracing::debug!(
+                    snapshot = id.get(),
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "commit landed"
+                );
+                return Ok(id);
+            }
             CommitOutcome::LostRace { ours, head_before } => {
+                first_head.get_or_insert(head_before);
                 // An options-only loser is last-write-wins: always benign.
                 if ours.is_empty() {
+                    tracing::debug!(
+                        attempt,
+                        head_before,
+                        "commit lost the head race with nothing to conflict over; retrying"
+                    );
                     continue;
                 }
                 let intervening = intervening_changes(db, head_before).await?;
                 for (snapshot_id, theirs) in &intervening {
                     if crate::transaction::operations::conflicts(&ours, theirs) {
+                        tracing::debug!(
+                            attempt,
+                            head_before,
+                            winner = snapshot_id,
+                            "commit conflicts with an intervening commit; surfacing"
+                        );
                         return Err(Error::CommitConflict(format!(
                             "concurrent commit {snapshot_id} touched the same state"
                         )));
                     }
                 }
+                last_intervening = intervening.iter().map(|(id, _)| *id).collect();
+                tracing::debug!(
+                    attempt,
+                    head_before,
+                    intervening = ?last_intervening,
+                    "commit lost the head race to disjoint commits; retrying"
+                );
             }
         }
     }
-    Err(Error::CommitConflict(format!(
-        "retry budget exhausted after {MAX_COMMIT_ATTEMPTS} attempts"
+
+    let head_before = first_head.unwrap_or_default();
+    // The only record of an exhausted budget: without it a caller sees a
+    // slow commit and no reason for it.
+    tracing::warn!(
+        attempts = MAX_COMMIT_ATTEMPTS,
+        head_before,
+        intervening = ?last_intervening,
+        "commit exhausted its retry budget; reporting a terminal error"
+    );
+    Err(Error::RetryBudgetExhausted(format!(
+        "spent {MAX_COMMIT_ATTEMPTS} attempts from head snapshot {head_before} without \
+         settling; commits above it: {last_intervening:?}"
     )))
 }
 

@@ -133,9 +133,10 @@ support it: there is no funnel component in the DuckLake deployment model,
 so "run one long-lived committer process and route commits through it" is
 an escape hatch for embedding hosts, not something a fleet of independent
 DuckDB clients gets for free. This constraint is stated here once,
-surfaced in README-level documentation, and revisited only if a
-multi-writer coordination design (out of scope, per Non-goals) is ever
-taken up.
+surfaced in README-level documentation, and holds for the default
+topology. RFC 0022 takes up the multi-writer coordination design as an
+opt-in topology layered above this protocol; the semantics specified
+here are unchanged by it.
 
 ### Bootstrap — the commit that creates the store
 
@@ -256,11 +257,35 @@ When the head conflict fires, the committer compares the set of
   verb path it includes re-running the caller's closure, not just
   re-stamping ids). This is bounded internal retry inside `transaction`; no caller
   involvement.
+
+  Retries wait before re-running: the delay starts at 2ms, doubles, and
+  caps at 50ms, with jitter of up to the base delay so two writers that
+  just collided do not back off in lockstep and collide again. The whole
+  budget spans a few hundred milliseconds. A commit that lands on its
+  first attempt never waits, so the backoff costs the uncontended path
+  nothing.
 - **Overlapping table set → true conflict** (subject to the append-append
   refinement below). A concurrent commit mutated a table this commit also
   mutated. The premise may be invalid (the table was dropped, a column
   altered, files this commit references were compacted away). Abort with a
   typed `CommitConflict`.
+- **Budget spent → terminal.** A commit that loses `MAX_COMMIT_ATTEMPTS`
+  benign races in a row aborts with `RetryBudgetExhausted`, not
+  `CommitConflict`. The distinction is a wire contract, not cosmetics:
+  DuckLake decides retryability in `DuckLakeTransaction::RetryOnError`, a
+  **substring match on the error message** — it re-runs a failed commit
+  iff the lowercased text contains `primary key`, `unique`, `conflict`, or
+  `concurrent` — and `CommitConflict`'s `Display` carries `conflict` in
+  its prefix. The text moraine surfaces for a lost commit is part of the
+  interface, not wording. A transient conflict *should* stay retryable and
+  keeps that wording; an exhausted budget must not, or the two bounded
+  loops compose into `ducklake_max_retry_count` × `MAX_COMMIT_ATTEMPTS`
+  re-runs of a commit that already failed to settle ten times.
+  `RetryBudgetExhausted`'s text is therefore free of all four substrings,
+  exactly as the equality-index uniqueness rejection already is. Every
+  exhaustion is logged at `warn` with the head it started from and the
+  commits it lost to — without it the failure is a slow commit with no
+  stated reason.
 
 **Counter advancement is never, by itself, a conflict.** Every commit reads
 and bumps `next_catalog_id`/`next_file_id`; that shared read is precisely
@@ -282,15 +307,23 @@ This mirrors DuckLake's own conflict matrix, verified in its source
 (`DuckLakeTransactionState::CheckForConflicts`,
 `src/storage/ducklake_transaction_state.cpp`): an insert conflicts with a
 concurrent **drop**, **alter**, or **delete** on the same table — and with
-nothing else. Two inserts never conflict, and an insert is also compatible
-with a concurrent inline **flush** or **compaction** of the same table
-(their file sets are disjoint: the insert's new files are not the
+nothing else. Its `tables_inserted_into` and `tables_inserted_inlined` sets
+are checked against the dropped, altered, and deleted-from tables only,
+never against another transaction's inserts, and an insert is likewise
+compatible with a concurrent inline **flush** or **compaction** of the same
+table (their file sets are disjoint: the insert's new files are not the
 maintenance operation's inputs). moraine's verb path adopts the same
 classification: an append is benign against other appends, flushes, and
 compactions of its table; drop/alter/delete on that table are true
-conflicts, in both directions. DuckLake is finer-grained in exactly one
-place — two transactions *deleting* from the same table conflict only if
-they touched the same **data files** (its `CheckForConflicts` fetches the
+conflicts, in both directions.
+
+The refinement is required for verb-path fidelity, not an optimization:
+plain table-grain overlap would call a same-table append pair a true
+conflict and make moraine strictly stricter than the catalog it serves.
+
+DuckLake is finer-grained in exactly one place — two transactions
+*deleting* from the same table conflict only if they touched the same
+**data files** (its `CheckForConflicts` fetches the
 files deleted after the transaction's snapshot and conflict-checks at
 `data_file_id` grain). moraine keeps delete-delete at table grain on the
 verb path: stricter is safe there, because the verb path is moraine's own
@@ -352,7 +385,7 @@ true conflict belongs to whoever authored the operation:
 
 - **DuckLake**, whose commit loop retries retryable conflict signals
   internally and re-checks its own conflict matrix (source-verified; see
-  Staged-row commits and Open questions), or
+  Staged-row commits), or
 - **the application**, re-running its statement when DuckLake classifies
   the conflict as true and throws — as a PostgreSQL `SERIALIZABLE`
   transaction retries on a `40001` serialization failure.
@@ -406,12 +439,14 @@ data (RFC 0003 verb names):
 - **Schema-changing** (`schema_version` bumps): create/drop schema;
   create/rename/drop table and move-to-schema; create/alter/rename/drop
   view; add/remove/rename column, column type change, default and
-  null-constraint changes; set partition key; create/drop macros.
-- **Altered but not schema-versioned**: set sort key; table and column
-  comments. DuckLake marks the table altered — conflict detection sees the
-  alter — but does not bump `schema_version` (a sort or comment change
-  never invalidates cross-file compaction, so the
-  `ducklake_schema_versions` grouping is unaffected).
+  null-constraint changes; set partition key; create/drop macros;
+  comments and tags on tables and columns. The last of these bump despite
+  changing no column: DuckLake models them as `AlterEntry` variants, and
+  the rewritten entry enters `new_tables`.
+- **Altered but not schema-versioned**: set sort key. DuckLake marks the
+  table altered — conflict detection sees the alter — but does not bump
+  `schema_version` (a sort change never invalidates cross-file
+  compaction, so the `ducklake_schema_versions` grouping is unaffected).
 - **Data-only** (`schema_version` carried forward): `register_data_file` /
   `expire_data_file`, `register_delete_file` / `expire_delete_file`,
   statistics updates, column/name-mapping registration, and the RFC 0005
@@ -427,14 +462,14 @@ This classification is source-verified against DuckLake
 (`DuckLakeTransactionState::SchemaChangesMade`, which tests exactly the
 new/dropped table, schema, view, and macro sets; per-table alters route
 through `GetTransactionTableChanges`, which decides per change type
-whether the alter also bumps `schema_version` — `SET_SORT_KEY` and the
-comment changes land in `altered_tables` only).
+whether the alter also bumps `schema_version` — `SET_SORT_KEY` lands in
+`altered_tables` only).
 
 The flag is an explicit property of the mutation set, not something
 inferred from the batch's key set after the fact — an inference would
 misclassify (e.g. a stats-only touch of a table's state) and silently
 re-introduce one of the two failure modes. The exact schema-mutating set is
-pinned against DuckLake's own behaviour in the e2e suite (Open questions).
+pinned against DuckLake's own behaviour in the e2e suite.
 
 The flag machinery above belongs to the **verb path only**. On the
 staged-row path (next section) DuckLake computes `schema_version` itself
@@ -479,8 +514,12 @@ verb path:
   `ducklake_max_retry_count = 10`, jittered exponential backoff from
   `ducklake_retry_wait_ms = 100` × `ducklake_retry_backoff = 1.5`),
   re-checking its own conflict matrix against `ducklake_snapshot_changes`
-  before each re-attempt and re-staging with freshly derived ids. Benign
-  races are absorbed by *DuckLake's* loop; true conflicts throw its
+  before each re-attempt and re-staging with freshly derived ids. Those
+  re-checks are catalog reads moraine must serve *between* attempts —
+  DuckLake queries the snapshot list and `ducklake_snapshot_changes` for
+  everything committed after its transaction snapshot, so the read surface
+  stays live while a commit of its own is in flight. Benign races are
+  absorbed by *DuckLake's* loop; true conflicts throw its
   `TransactionException` to the application. The "disjoint concurrent
   commits both succeed without caller involvement" goal is thus a
   **verb-path** property; on the extension path the equivalent behavior
@@ -533,12 +572,19 @@ The contract: `commit` does not return success until the new snapshot is
 both durable and reflected in the manifest that readers follow, so a reader
 opened *after* `commit` returns resolves `N+1`. (A reader opened *before*
 may still lag by its manifest poll interval — that is ordinary snapshot
-isolation, not a violation.) The exact SlateDB call that provides this — a
-WAL/manifest flush versus relying on the commit's own durability step, and
-its per-backend latency cost — is not assumed from prose; it is pinned by a
-validation test in the store harness (open `object_store`, commit, open a
-*fresh* reader, assert `N+1` is visible) before the commit path is built on
-it.
+isolation, not a violation.)
+
+No extra flush call is needed to hold that contract; step 4's own
+durability does it. A commit with `await_durable: true` blocks on a
+durability watcher that fires only once the WAL object has been PUT to
+object storage (`WalBufferManager::do_flush_one_wal` → `notify_durable`),
+and both fresh-open paths — `Db::open` and `DbReader::open` in latest
+mode — replay WALs from object storage past the manifest state. So a
+handle opened after `commit` returns resolves `N+1` by construction.
+
+A validation test in the store harness (open `object_store`, commit, open a
+*fresh* reader, assert `N+1` is visible) pins that behavior against real
+SlateDB and measures its per-backend latency.
 
 ### Test obligations
 
@@ -576,65 +622,7 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   resolves the new snapshot (the store-harness validation above, run
   against real SlateDB on in-memory `object_store`).
 
-E2E testing validates the protocol against real DuckLake SQL — especially
-the open questions below.
-
-## Open questions
-
-- **Does DuckLake retry conflicts internally, or propagate to the user? —
-  resolved (source-verified, DuckLake main 2026-07).** Both, split exactly
-  as this RFC's benign/true distinction: DuckLake's client-side
-  `RunCommitLoop` retries a failed metadata commit internally (bounded,
-  defaults above), but before each retry runs
-  `DuckLakeTransactionState::CheckForConflicts` over the intervening
-  `ducklake_snapshot_changes` — a true conflict per its matrix throws
-  `TransactionException` to the application; only benign races are
-  re-driven. Two load-bearing details for moraine: (a) retryability is
-  decided by `DuckLakeTransaction::RetryOnError`, a **substring match on
-  the error message** — it retries iff the lowercased message contains
-  `"primary key"`, `"unique"`, `"conflict"`, or `"concurrent"` — so the
-  error text moraine surfaces for a lost commit is a wire contract, not
-  cosmetics (RFC 0006); (b) between attempts DuckLake queries the catalog
-  for snapshots and `ducklake_snapshot_changes` after its transaction
-  snapshot, which moraine must serve mid-retry. What remains for e2e is
-  regression-pinning this behavior against the DuckLake version the e2e
-  suite tracks, not discovering it.
-- **Row-id increment mechanics.** Spec says `next_row_id += record_count`;
-  e2e confirms moraine's allocation matches DuckLake's expectation exactly,
-  including under UPDATE/compaction row-id preservation.
-- **DuckLake's concurrent same-table-append semantics — resolved
-  (source-verified, DuckLake main 2026-07).** Concurrent inserts into one
-  table do not conflict: in `CheckForConflicts`, `tables_inserted_into`
-  and `tables_inserted_inlined` are checked against drops, alters, and
-  deletes only — never against other transactions' inserts — and inserts
-  are likewise compatible with concurrent flushes and compactions. The
-  append-append refinement is therefore required for verb-path fidelity,
-  not optional; the strict table-grain fallback would have been strictly
-  stricter than DuckLake. E2e regression-pins the matrix against the
-  tracked DuckLake version.
-- **Benign-race retry bound.** The fixed attempt count is a tuning
-  parameter; DuckLake's own loop defaults (10 retries, 100 ms base wait,
-  1.5× backoff with jitter) are the natural starting point for the verb
-  path — confirm once e2e shows realistic contention shapes.
-- **Exact schema-mutating operation set — resolved (source-verified,
-  DuckLake main 2026-07).** The boundary cases land as follows:
-  comments/tags on tables and columns **bump** (they are `AlterEntry`
-  variants and enter `new_tables`); column/name-mapping registration does
-  **not** bump (it rides data-file registration, outside
-  `SchemaChangesMade`); option changes neither bump nor mint a snapshot at
-  all (`set_option` writes `ducklake_metadata` directly). The full
-  classification is in Schema-version tracking. E2e regression-pins it
-  against the tracked DuckLake version.
-- **Fresh-reader visibility call — resolved (source-verified, SlateDB
-  0.14.x).** No extra flush call is needed: a commit with
-  `await_durable: true` blocks on a durability watcher that fires only
-  after the WAL object is PUT to object storage
-  (`WalBufferManager::do_flush_one_wal` → `notify_durable`), and both
-  fresh-open paths — `Db::open` and `DbReader::open` in latest mode —
-  replay WALs from object storage past the manifest state. So once
-  `commit` returns, a freshly opened handle resolves the new snapshot by
-  construction. The store-harness validation test remains as the
-  regression pin (and measures the per-backend latency), not as discovery.
+E2E testing validates the protocol against real DuckLake SQL.
 
 ## Alternatives considered
 

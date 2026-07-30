@@ -31,6 +31,8 @@ enum {
 	MORAINE_INVALID_ARGUMENT = 7,
 	MORAINE_INTERNAL = 8,
 	MORAINE_INTERRUPTED = 9,
+	MORAINE_RETRY_EXHAUSTED = 10,
+	MORAINE_FENCED = 11,
 };
 
 
@@ -807,6 +809,10 @@ typedef struct MoraineInlineFileDeleteRow {
   uint64_t begin_snapshot;
 } MoraineInlineFileDeleteRow;
 
+// Receives one buffered log record: its DuckDB `LogLevel` value and a
+// UTF-8, NUL-terminated message valid only for the duration of the call.
+typedef void (*MoraineLogSink)(void *ctx, int32_t level, const char *message);
+
 // One value in a staged row. Mirrors [`Cell`] as a tagged struct across
 // the C boundary; `str_value` is borrowed, valid only for the duration of
 // the [`moraine_tx_stage`] call that reads it.
@@ -1070,8 +1076,10 @@ int32_t moraine_snapshot_data_files_of(struct MoraineSnapshotHandle *snapshot,
 // matching [`moraine_snapshot_data_files_of`] call, not yet freed.
 void moraine_snapshot_data_files_of_free(struct MoraineDataFileDesc *items, size_t len);
 
-// Creates an equality index, committing autonomously. Refuses a table that
-// already holds data (SQL-path backfill is a follow-up).
+// Creates an equality index, committing autonomously. With `staged`, runs
+// the multi-commit build — required when the table's backfill exceeds what
+// one commit may stage — and returns once the index is ready; interrupting
+// it leaves the build resumable by the same call.
 //
 // # Safety
 //
@@ -1086,6 +1094,7 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
                              const uint8_t *column_descending,
                              const uint8_t *column_nulls_first,
                              bool unique,
+                             bool staged,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
                              struct MoraineError *err);
@@ -2054,6 +2063,49 @@ int32_t moraine_inline_file_deletes(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_inline_file_deletes`] call, not yet freed.
 void moraine_inline_file_deletes_free(struct MoraineInlineFileDeleteRow *items, size_t len);
+
+// Drains every buffered log record into `sink`, oldest first.
+//
+// Called by the shim on a thread that holds a DuckDB `ClientContext`, so
+// the records can be written through DuckDB's own logger. Never fails and
+// never allocates on the caller's behalf: each message is borrowed for the
+// duration of its `sink` call and freed after it returns.
+//
+// # Safety
+//
+// `sink`, if non-null, must be callable with `sink_ctx` and must not
+// unwind. It must not re-enter any `moraine_*` entry point.
+void moraine_drain_logs(MoraineLogSink sink, void *sink_ctx);
+
+// Registers `sink` as the delivery target for `handle`'s events, first
+// handing it whatever the buffer already holds from that handle so
+// nothing captured before registration is lost.
+//
+// While registered, the handle's events bypass the buffer and the
+// boundary drains — records surface as they happen, which for a long
+// commit is while the commit still runs. Other handles' events are
+// untouched: each routes to its own sink or, without one, to the buffer.
+// Registering again for the same handle replaces its sink.
+//
+// # Safety
+//
+// `handle` must be a live pointer from `moraine_attach`. `sink`, if
+// non-null, must be callable with `ctx` from any thread until
+// unregistration returns, must not unwind, must not emit `tracing`
+// events, and must not re-enter any `moraine_*` entry point.
+void moraine_register_log_sink(const struct MoraineCatalogHandle *handle,
+                               MoraineLogSink sink,
+                               void *ctx);
+
+// Removes `handle`'s sink, if one is registered. When it returns, no call
+// to that sink is in flight and none will follow — its `ctx` may be torn
+// down. The handle's later events fall back to the buffer.
+//
+// # Safety
+//
+// `handle` must be a live pointer from `moraine_attach`. Must not be
+// called from inside a sink.
+void moraine_unregister_log_sink(const struct MoraineCatalogHandle *handle);
 
 // Opens a staged-row transaction at the current head and writes the
 // resulting handle to `*out`.

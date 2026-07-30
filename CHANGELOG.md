@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/alexpropp/moraine/compare/v0.3.3...v0.4.0) - 2026-07-28
+
+### Added
+
+- Drive staged index builds from moraine_index_create
+- Add batch channel for large-scale index building
+- Surface moraine diagnostics in DuckDB's logs
+
+## [0.3.3](https://github.com/alexpropp/moraine/compare/v0.3.2...v0.3.3) - 2026-07-28
+
+### Added
+
+- Forward moraine's tracing events to DuckDB's logger
+
+### Fixed
+
+- Disable expensive codec test
+- Report an exhausted commit retry budget as a terminal error
+
+### Other
+
+- Stage index entries onto the transaction and bound commit size
+- Move index bound arithmetic into store and cut duplicatio
+
 ## [0.3.2](https://github.com/alexpropp/moraine/compare/v0.3.1...v0.3.2) - 2026-07-27
 
 ### Added

@@ -311,11 +311,95 @@ an unwind into C++. The shim translates codes to DuckDB exceptions:
 | 7 | `INVALID_ARGUMENT` | ABI-layer validation: null pointer, invalid UTF-8, unsupported store scheme | `InvalidInputException` |
 | 8 | `INTERNAL` | a panic caught at the FFI boundary | `InternalException` |
 | 9 | `INTERRUPTED` | cancellation — `moraine_interrupt` or the call's interrupt probe — cancelled the read in flight (or about to start) on the handle | `InterruptException` |
+| 10 | `RETRY_EXHAUSTED` | `Error::RetryBudgetExhausted` — the commit spent its whole internal retry budget without settling | `TransactionException` |
+| 11 | `FENCED` | `Error::Fenced` — another process took over as the writer; the handle can no longer commit, and the message says to re-attach | `IOException` |
 
 Wire contract: the `COMMIT_CONFLICT` message always contains the literal
 substring `conflict` — DuckLake's `RetryOnError` keys its retry decision on
 that substring (see the Transactions bullet above) — so the message text
 is part of the ABI contract, not incidental diagnostics.
+
+The contract runs both ways. `RETRY_EXHAUSTED` is terminal, so its message
+carries **none** of the four substrings DuckLake retries on (`conflict`,
+`concurrent`, `unique`, `primary key`); the same rule governs the
+equality-index uniqueness rejection. DuckLake's loop is itself bounded — by
+`ducklake_max_retry_count`, default 10 — so a retryable terminal error does
+not spin forever, but it does multiply the work by that factor before
+failing, which for a large commit is the difference between an error and an
+apparent hang. Both codes raise `TransactionException`: DuckLake's retry
+decision reads the text, not the exception kind.
+
+### Diagnostics seam
+
+The core emits `tracing` events; a loaded extension consumes none by
+default, and the host cannot consume them for it — the extension is a
+separate dynamically-loaded library with its own statically-linked
+`tracing`, so a subscriber installed by an embedding process never sees
+them. Left there, every diagnostic the core produces is dropped, which is
+how a commit that spends its retry budget can present as a silent stall.
+
+`ATTACH` installs a process-wide buffering subscriber (`logging.rs`), once,
+via `try_init` — a host that already set a global subscriber keeps it. The
+buffer is bounded (oldest-first eviction, with the drop count reported on
+the next drain) so diagnostics never grow without limit behind a caller
+that stops draining. `MORAINE_LOG` sets the captured level, default `info`.
+
+Events fire on the handle's tokio worker threads, where no `ClientContext`
+is in scope. While a catalog is attached, that does not delay them: the
+catalog registers a database-scoped writer
+(`Logger::Get(DatabaseInstance&)`, which is thread-safe) as its handle's
+push sink via `moraine_register_log_sink(handle, sink, ctx)`, and the
+handle's events write through it as they fire. A watcher querying
+`duckdb_logs` from another connection therefore sees a running commit's
+diagnostics while the commit runs — the stalled-commit case the logs exist
+to explain — and nothing is ever evicted while a sink is registered. The
+catalog's destructor unregisters via `moraine_unregister_log_sink(handle)`
+before the handle or the database goes away, and unregistration returning
+guarantees no push is in flight.
+
+Delivery is routed per handle, though `tracing` itself is process-global:
+each attach's runtime tags its worker threads with the handle's identity
+at spawn, the FFI `block_on` wrappers tag the calling thread per call, and
+an event is attributed to whichever handle tagged the thread it fires on.
+One process serving many attached lakes keeps their diagnostics apart —
+each lake's records surface only in its own database's `duckdb_logs`.
+Records carry DuckDB's own `LogLevel` values, so the sink forwards them
+unchanged, and appear under the `moraine` type after
+`CALL enable_logging(level => 'info', storage => 'memory')` — the default
+storage writes to stdout rather than the table. Under DuckDB's default
+`LEVEL_ONLY` mode the type string is not filtered on, so no log-type
+registration is required.
+
+Events with no routable sink — fired before the handle's sink registers
+(registration flushes that handle's backlog through it), after it
+unregisters, or on a thread no handle tagged — buffer instead, and the
+shim drains the buffer through `moraine_drain_logs(sink, ctx)` on threads
+that hold what each sink needs, wherever events could otherwise strand:
+
+- **`CommitTransaction`**, on every outcome — success, conflict, or
+  exhausted budget — and **`StartTransaction`**, after the snapshot
+  resolve, both writing through `Logger::Get(context)`. With push sinks
+  registered these find little to drain; they exist for the gaps around
+  registration and for unattributed events.
+- **`Attach`**, on both exits — a failed open's events would otherwise
+  wait forever, since no catalog (and so no push sink) ever exists. On
+  success, registration itself flushes the handle's backlog through the
+  new sink.
+- **The maintenance pass**, which runs on the scheduler's own thread,
+  drains through the same database-scoped writer and closes each pass with
+  one shim-originated outcome line: `warn` naming every failed step,
+  `info` for a clean pass.
+
+The sink never throws: an exception escaping into the ABI would unwind
+across the boundary, and a lost diagnostic must not fail the operation
+that produced it.
+
+**Event frequency is a rule, not a convention.** The buffer holds 512
+records and drops oldest-first, so its capacity is a budget shared by
+everything the core logs between drains. Events are emitted at
+per-operation frequency — per commit, per open, per pass — never per
+entry, per row, or per file. A per-entry event at `debug` would evict the
+very warnings the buffer exists to preserve.
 
 ### Read cancellation seam
 
@@ -578,55 +662,6 @@ attach closes the race deterministically (see
 `crates/moraine-duckdb/tests/ducklake_load.rs`'s `run_ducklake_sql`); the
 tests that drive DuckLake's own write path pin it for exactly that reason,
 not as a production recommendation.
-
-## Open questions
-
-- **The exact SQL/access pattern DuckLake issues.** Which reads, writes, and
-  filter pushdowns DuckLake relies on against `ducklake_*` determines which
-  scan pushdowns moraine must implement for acceptable performance. This is
-  the standing E2E validation (RFC 0001/0004), not a blocking
-  prerequisite — the design serves any pattern; the question is which to
-  optimize.
-- **ATTACH ergonomics — resolved (source-verified, DuckLake main
-  2026-07).** The metadata connection is a literal nested `ATTACH` of the
-  path after `ducklake:`; `ducklake:moraine:<uri>` reaches moraine through
-  DuckDB's own prefix dispatch (see Front door). The e2e suite
-  regression-pins the exact string against the tracked DuckLake version.
-- **Conflict propagation — resolved (source-verified, DuckLake main
-  2026-07).** DuckLake re-drives internally: benign races are retried by
-  its `RunCommitLoop` (bounded, backoff), true conflicts per its own matrix
-  throw `TransactionException` to the application (RFC 0004, "Staged-row
-  commits"). The shim's obligations are the two wire-contract points in
-  the Transactions bullet above; e2e regression-pins them against the
-  tracked DuckLake version.
-- **Constraint responsibility — resolved (source-verified, DuckLake main
-  2026-07).** The constraint surface is smaller than the spec's
-  "transactional SQL store with primary-key constraints" phrasing
-  suggests. Exactly **five** metadata tables carry a `PRIMARY KEY` —
-  `ducklake_snapshot(snapshot_id)`,
-  `ducklake_snapshot_changes(snapshot_id)`, `ducklake_schema(schema_id)`,
-  `ducklake_data_file(data_file_id)`,
-  `ducklake_delete_file(delete_file_id)` — and there are **no**
-  name-uniqueness constraints anywhere (duplicate names are prevented by
-  DuckLake's own conflict matrix, not by the catalog; `ducklake_metadata`
-  is entirely unconstrained). All five PKs are id-collision guards, and
-  their one load-bearing role is the commit-race signal: racing commits
-  collide on the snapshot-row `INSERT` (and, downstream of the same shared
-  counters, on schema/file ids). In moraine that role is subsumed by RFC
-  0004's head conflict detection — a racing staged-row commit fails
-  wholesale before any per-row collision could matter. What moraine
-  enforces is the equivalent backstop: an insert whose id already exists
-  as a live record of the same kind (the five keyed kinds above) fails
-  with a typed `Constraint` error rather than silently overwriting the
-  `current` key — one existence check per translated insert, no general
-  constraint machinery, and no name-uniqueness enforcement (DuckLake owns
-  that).
-- **DuckDB version cadence.** How often the pin must move, and the support
-  window for older DuckDB releases. The initial pin is recorded above
-  (DuckDB v1.5.4 / DuckLake `v1.5-variegata` / catalog format 1.0); what
-  remains open is the bump policy — whether moraine tracks each DuckDB
-  minor as DuckLake cuts its matching branch, and how many past series
-  (v1.4-andium, …) get builds.
 
 ## Alternatives considered
 
