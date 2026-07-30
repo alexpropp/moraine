@@ -173,6 +173,91 @@ fn ducklake_delete_orphaned_files_ignores_catalogued_paths() {
     );
 }
 
+/// Merge never crosses a partition boundary: files spread over two
+/// partition values compact to one file per value, never one combined
+/// file, so a merged file still carries exactly one partition value and
+/// the governing spec stays satisfied. The eligibility rule is
+/// DuckLake's, applied before moraine sees the batch — this pins that
+/// moraine's served projections do not mislead it into merging across.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_merge_does_not_cross_partition_boundaries() {
+    let store = TempDir::new("merge-part-store");
+    let data = TempDir::new("merge-part-data");
+    let (store, data) = (store.path(), data.path());
+
+    run_ducklake_sql(
+        store,
+        data,
+        "CREATE TABLE lake.main.p (region VARCHAR, v INTEGER);",
+    );
+    run_ducklake_sql(
+        store,
+        data,
+        "ALTER TABLE lake.main.p SET PARTITIONED BY (region);",
+    );
+
+    // Four separate statements, so four files: two per partition value.
+    // Each exceeds the inlining limit so they land as real Parquet.
+    for region in ["EU", "US"] {
+        for batch in 0..2 {
+            run_ducklake_sql(
+                store,
+                data,
+                &format!(
+                    "INSERT INTO lake.main.p \
+                     SELECT '{region}', i FROM range({start}, {end}) t(i);",
+                    start = batch * 100,
+                    end = batch * 100 + 100,
+                ),
+            );
+        }
+    }
+
+    let live_files = "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;";
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["4".to_string()]],
+        "expected one file per insert before merging"
+    );
+
+    run_ducklake_sql(store, data, "CALL ducklake_merge_adjacent_files('lake');");
+
+    // Two partition values in, two files out — not one.
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["2".to_string()]],
+        "merge must compact within each partition and not across them"
+    );
+
+    // And each surviving file carries exactly one partition value.
+    let values_per_file = run_standalone_sql(
+        store,
+        "SELECT count(DISTINCT pv.partition_value) \
+         FROM m.ducklake_data_file f \
+         JOIN m.ducklake_file_partition_value pv ON pv.data_file_id = f.data_file_id \
+         WHERE f.end_snapshot IS NULL GROUP BY f.data_file_id ORDER BY 1;",
+    );
+    assert_eq!(
+        csv_rows(&values_per_file),
+        vec![vec!["1".to_string()], vec!["1".to_string()]],
+        "a merged file spanning two partition values would break pruning"
+    );
+
+    // The rows themselves survive the merge intact.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data,
+            "SELECT region, count(*) FROM lake.main.p GROUP BY region ORDER BY region;",
+        )),
+        vec![
+            vec!["EU".to_string(), "200".to_string()],
+            vec!["US".to_string(), "200".to_string()]
+        ]
+    );
+}
+
 /// Merge compaction, differential against a stock DuckLake catalog
 /// fed the identical statements: three small files merge into one,
 /// rows and row ids are identical to the reference before and after,

@@ -125,6 +125,106 @@ fn ducklake_partitioning_specs_values_and_pruning() {
     assert_eq!(travel, vec![vec!["100".to_string()]]);
 }
 
+/// The schema-evolution boundary around a partitioned or sorted column.
+/// Dropping one is refused by DuckLake's own binder, before anything
+/// reaches the catalog. Rename is allowed, and a partition spec survives
+/// it untouched because it references its column by field id, never by
+/// name. A sort spec names its column inside a verbatim expression
+/// string, so a rename commits a *new* sort-spec version carrying the
+/// rewritten text and leaves the old one in history — which is why a
+/// stale live sort expression never arises for moraine to serve.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_partitioned_and_sorted_columns_resist_drop_but_allow_rename() {
+    let dir = TempDir::new("evolve-store");
+    let data_dir = TempDir::new("evolve-data");
+    let (store, data) = (dir.path(), data_dir.path());
+
+    run_ducklake_sql(
+        store,
+        data,
+        "CREATE TABLE lake.main.p (region VARCHAR, v INTEGER);",
+    );
+    run_ducklake_sql(
+        store,
+        data,
+        "ALTER TABLE lake.main.p SET PARTITIONED BY (region);",
+    );
+    run_ducklake_sql(store, data, "INSERT INTO lake.main.p VALUES ('EU', 1);");
+
+    // Dropping the partitioned column is refused, and the message says why.
+    let err =
+        run_ducklake_sql_expect_err(store, data, "ALTER TABLE lake.main.p DROP COLUMN region;");
+    assert!(
+        err.contains("partitioned by this column"),
+        "expected DuckLake's partitioned-column drop refusal, got:\n{err}"
+    );
+
+    // Rename is allowed, and the spec still resolves to the same field id.
+    run_ducklake_sql(
+        store,
+        data,
+        "ALTER TABLE lake.main.p RENAME COLUMN region TO reg;",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT pc.column_id, c.column_name \
+             FROM m.ducklake_partition_column pc \
+             JOIN m.ducklake_column c ON c.column_id = pc.column_id \
+             WHERE c.end_snapshot IS NULL AND c.table_id = pc.table_id;",
+        )),
+        vec![vec!["1".to_string(), "reg".to_string()]],
+        "a partition spec must survive a rename by field id"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data,
+            "SELECT count(*) FROM lake.main.p;",
+        )),
+        vec![vec!["1".to_string()]]
+    );
+
+    // A type change on the partitioned column is allowed too — only the
+    // drop is refused.
+    run_ducklake_sql(
+        store,
+        data,
+        "ALTER TABLE lake.main.p ALTER COLUMN reg SET DATA TYPE VARCHAR;",
+    );
+
+    // The sorted case: drop refused likewise, rename rewrites the
+    // expression into a new spec version rather than leaving a stale one.
+    run_ducklake_sql(
+        store,
+        data,
+        "CREATE TABLE lake.main.s (a VARCHAR, b INTEGER);",
+    );
+    run_ducklake_sql(store, data, "ALTER TABLE lake.main.s SET SORTED BY (a);");
+    run_ducklake_sql(store, data, "INSERT INTO lake.main.s VALUES ('x', 1);");
+
+    let err = run_ducklake_sql_expect_err(store, data, "ALTER TABLE lake.main.s DROP COLUMN a;");
+    assert!(
+        err.contains("sorted by this column"),
+        "expected DuckLake's sorted-column drop refusal, got:\n{err}"
+    );
+
+    run_ducklake_sql(
+        store,
+        data,
+        "ALTER TABLE lake.main.s RENAME COLUMN a TO a2;",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT expression FROM m.ducklake_sort_expression ORDER BY expression;",
+        )),
+        vec![vec!["a".to_string()], vec!["a2".to_string()]],
+        "the rename must add a rewritten expression, keeping the old in history"
+    );
+}
+
 /// Sorting end to end: `SET SORTED BY` lands a spec whose expression,
 /// direction, and null order are stored verbatim; inserts under a
 /// live spec succeed (DuckLake's writer sorts — moraine only serves
