@@ -16,8 +16,9 @@ const COMMITS: &str = "commits";
 /// lexicographic order over names is numeric order over sequences.
 const SEQUENCE_WIDTH: usize = 20;
 
-/// The lowest sequence a log ever holds. Slot 0 does not exist, so every
-/// `from` argument must be at least this.
+/// The lowest sequence a log holds. Reads start here: a `from` below it is
+/// raised to it, since "from 0" can only mean "from the beginning".
+/// Truncation deliberately reaches below it.
 const FIRST_SEQUENCE: u64 = 1;
 
 /// A commit-slot log: totally ordered, immutable slots under
@@ -149,24 +150,32 @@ impl SlotLog {
     /// A landed put is `Won`. A put the store reports already taken reads the
     /// winner back and returns `Lost`. A put whose outcome is unknown — a
     /// transport failure that may or may not have landed — is resolved from
-    /// the log rather than guessed: re-read the slot, and an envelope
-    /// carrying any of `envelope`'s transaction ids is this attempt (`Won`);
-    /// a different envelope is `Lost`; an absent slot means the put did not
+    /// the log rather than guessed: re-read the slot, and an envelope carrying
+    /// `envelope`'s transaction ids is this attempt (`Won`); an envelope
+    /// carrying none of them is `Lost`; an absent slot means the put did not
     /// land, and the transport error surfaces.
     ///
-    /// Every transaction id in `envelope` must be unique across the log. An
-    /// envelope with no commits carries no id and resolves by whole-envelope
-    /// equality instead.
+    /// Resolution matches on identity, so it rests on two caller invariants.
+    /// Every transaction id must be unique across the log, and an id must be
+    /// offered to one committer only. An `envelope` with no commits has no
+    /// identity at all: the put is accepted, but if its outcome goes unknown
+    /// nothing in the log can settle it, and this call says so rather than
+    /// guessing.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Transport`] when the outcome could not be read back:
-    /// either the put's own failure, when the slot is absent and the commit
-    /// therefore did not land, or a slot reported taken whose object is not
-    /// yet readable. Both leave the sequence available to race again — a
-    /// conditional put can report a slot taken before the winner's object is
-    /// readable, which is an ordinary contended round, not damage. Returns
-    /// [`Error::Corruption`] if a slot's bytes are not a valid envelope.
+    /// Returns [`Error::Transport`] when the outcome could not be read back,
+    /// all of which leave the sequence to be raced again:
+    /// - the put failed and the slot reads absent, so the commit did not land;
+    /// - the slot was reported taken but its object is not yet readable, which
+    ///   is an ordinary contended round, not damage;
+    /// - the put failed, the slot holds an envelope, and `envelope` carries no
+    ///   transaction id to tell whose it is.
+    ///
+    /// Returns [`Error::Corruption`] if a slot's bytes are not a valid
+    /// envelope, or if the landed envelope carries only *some* of `envelope`'s
+    /// transaction ids — one id reached two committers, which the caller
+    /// invariants forbid.
     pub async fn commit_slot(
         &self,
         sequence: u64,
@@ -182,9 +191,20 @@ impl SlotLog {
                 ))),
             },
             Err(unknown) => match self.read_slot(sequence).await? {
-                Some(landed) if is_this_attempt(&landed, envelope) => Ok(CommitOutcome::Won),
-                Some(winner) => Ok(CommitOutcome::Lost(winner)),
                 None => Err(unknown),
+                Some(landed) => match resolve(&landed, envelope) {
+                    Resolution::ThisAttempt => Ok(CommitOutcome::Won),
+                    Resolution::OtherEnvelope => Ok(CommitOutcome::Lost(landed)),
+                    Resolution::NoIdentity => Err(Error::transport(format!(
+                        "slot {sequence} holds an envelope and this attempt carries no \
+                         transaction id to match against it, so the put's outcome cannot \
+                         be determined"
+                    ))),
+                    Resolution::PartlyLanded => Err(Error::corruption(format!(
+                        "slot {sequence} carries some but not all of this attempt's \
+                         transaction ids; an id reached more than one committer"
+                    ))),
+                },
             },
         }
     }
@@ -197,10 +217,11 @@ impl SlotLog {
     /// Slots below `from` are never inspected, so a truncated prefix reads as
     /// no hole.
     ///
-    /// `from` must be at least 1 — sequence 0 never exists, so `read_tail(0)`
-    /// reports a hole at 0 on any non-empty log — and at or above the
-    /// truncation horizon, since below it a deleted prefix and a destroyed
-    /// slot are the same observation.
+    /// A `from` below 1 reads as 1: slot 0 never exists, so "from 0" can only
+    /// mean "from the beginning". `from` must still sit at or above the
+    /// truncation horizon, which only the caller knows — below it a deleted
+    /// prefix and a destroyed slot are the same observation, and the tail reads
+    /// as holed.
     ///
     /// # Errors
     ///
@@ -208,6 +229,7 @@ impl SlotLog {
     /// [`Error::Corruption`] if a slot's bytes are not a valid envelope, or if
     /// a slot the listing showed reads absent.
     pub async fn read_tail(&self, from: u64) -> Result<Tail, Error> {
+        let from = from.max(FIRST_SEQUENCE);
         let mut slots = Vec::new();
         let mut gap_at = None;
 
@@ -235,13 +257,16 @@ impl SlotLog {
     /// as deleted. Returns how many objects were removed. Choosing a safe
     /// `through` is the caller's policy, not this crate's.
     ///
+    /// Enumerates from sequence 0, below the range the readers serve, so an
+    /// object a writer never should have created is still reclaimable.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the listing or a delete failed; the
     /// slots already deleted stay deleted, so a retry resumes.
     pub async fn truncate_through(&self, through: u64) -> Result<u64, Error> {
         let mut removed = 0;
-        for sequence in self.list_sequences(FIRST_SEQUENCE).await? {
+        for sequence in self.list_sequences(0).await? {
             if sequence > through {
                 break;
             }
@@ -259,12 +284,13 @@ impl SlotLog {
     /// Counts the contiguous run only, so a hole ends the count and a damaged
     /// log reports a short tail: a caller that acts on staleness alone will
     /// see less work than exists, and only [`SlotLog::read_tail`] detects the
-    /// hole. `from` carries the same preconditions as [`SlotLog::read_tail`].
+    /// hole. `from` is treated as in [`SlotLog::read_tail`].
     ///
     /// # Errors
     ///
     /// Returns [`Error::Transport`] if the listing failed.
     pub async fn tail_length(&self, from: u64) -> Result<u64, Error> {
+        let from = from.max(FIRST_SEQUENCE);
         let mut length = 0;
 
         let mut expected = from;
@@ -283,8 +309,8 @@ impl SlotLog {
     /// slot that carries it, if any.
     ///
     /// A hole below the id refuses rather than answering: past a destroyed
-    /// slot the scan cannot rule the transaction out. `from` carries the same
-    /// preconditions as [`SlotLog::read_tail`].
+    /// slot the scan cannot rule the transaction out. `from` is treated as in
+    /// [`SlotLog::read_tail`].
     ///
     /// # Errors
     ///
@@ -296,6 +322,7 @@ impl SlotLog {
         from: u64,
         transaction_id: [u8; 16],
     ) -> Result<Option<u64>, Error> {
+        let from = from.max(FIRST_SEQUENCE);
         let tail = self.read_tail(from).await?;
         let found = tail
             .slots
@@ -353,18 +380,43 @@ impl SlotLog {
     }
 }
 
-/// Whether `landed` is the envelope this attempt put. An attempt with no
-/// commits carries no transaction id to match, so it compares whole
-/// envelopes instead.
-fn is_this_attempt(landed: &Envelope, attempt: &Envelope) -> bool {
+/// What a slot's landed envelope says about an attempt whose put outcome is
+/// unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// Every one of the attempt's transaction ids is present: the attempt
+    /// landed, whether alone or coalesced into a larger envelope.
+    ThisAttempt,
+    /// None of them is present: another committer holds the slot.
+    OtherEnvelope,
+    /// The attempt carries no transaction id, so nothing in the log
+    /// distinguishes its own landed envelope from any other.
+    NoIdentity,
+    /// Some but not all are present, which takes one id reaching two
+    /// committers. Forbidden by the caller invariants, so it is refused rather
+    /// than reported as a win over transactions that never committed.
+    PartlyLanded,
+}
+
+/// Compares a slot's landed envelope with an attempt's, by transaction id.
+fn resolve(landed: &Envelope, attempt: &Envelope) -> Resolution {
     if attempt.commits.is_empty() {
-        return landed == attempt;
+        return Resolution::NoIdentity;
     }
 
-    attempt
+    let present = attempt
         .commits
         .iter()
-        .any(|commit| landed.contains_transaction(commit.transaction_id))
+        .filter(|commit| landed.contains_transaction(commit.transaction_id))
+        .count();
+
+    if present == 0 {
+        Resolution::OtherEnvelope
+    } else if present < attempt.commits.len() {
+        Resolution::PartlyLanded
+    } else {
+        Resolution::ThisAttempt
+    }
 }
 
 /// The sequence a slot object's path names, or `None` if it names no slot.
@@ -751,15 +803,90 @@ mod tests {
         ));
     }
 
-    /// An empty envelope carries no transaction id, so resolution falls back
-    /// to whole-envelope equality rather than handing the caller its own
-    /// write back as another committer's win.
+    /// An envelope with no commits has no identity, so an ambiguous put of one
+    /// is unresolvable however the slot reads back. Reporting `Won` would tell
+    /// a committer it owns a sequence another committer may own.
     #[tokio::test]
-    async fn an_ambiguous_put_of_an_empty_envelope_resolves_to_won() {
+    async fn an_ambiguous_put_with_no_transaction_id_is_unresolvable() {
         let log = SlotLog::new(Arc::new(FaultyPut::armed(PutFault::LostResponse)), "cat");
-        let envelope = Envelope { commits: vec![] };
+        let err = log
+            .commit_slot(1, &Envelope { commits: vec![] })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err}");
+    }
+
+    /// Two committers put structurally identical id-less envelopes: A's lands,
+    /// B's never reaches the store. B must not be told it won the slot A owns —
+    /// byte equality cannot tell the two envelopes apart.
+    #[tokio::test]
+    async fn a_loser_with_no_transaction_id_is_never_told_it_won() {
+        let store = Arc::new(FaultyPut::disarmed(PutFault::Unreachable));
+        let log = SlotLog::new(store.clone(), "cat");
+        let advert = Envelope { commits: vec![] };
+
+        // Committer A wins slot 1.
         assert_eq!(
-            log.commit_slot(1, &envelope).await.unwrap(),
+            log.commit_slot(1, &advert).await.unwrap(),
+            CommitOutcome::Won
+        );
+
+        // Committer B's put never reaches the store, so it wrote nothing.
+        store.arm();
+        let outcome = log.commit_slot(1, &advert).await;
+        assert!(
+            matches!(outcome, Err(Error::Transport(_))),
+            "an id-less loser must not hear Won: {outcome:?}"
+        );
+
+        // A's envelope is untouched and still the only one at slot 1.
+        assert_eq!(log.read_slot(1).await.unwrap().unwrap(), advert);
+    }
+
+    /// A landed envelope holding only *some* of an attempt's ids takes one id
+    /// reaching two committers, which the caller invariants forbid. Refused,
+    /// rather than reported as a win over the transactions that never landed.
+    #[tokio::test]
+    async fn a_partly_landed_attempt_is_refused() {
+        let store = Arc::new(FaultyPut::disarmed(PutFault::Unreachable));
+        let log = SlotLog::new(store.clone(), "cat");
+
+        // Slot 1 ends up holding transaction 6 alone.
+        log.commit_slot(1, &envelope_with_id([6; 16]))
+            .await
+            .unwrap();
+
+        // An attempt over {6, 7} whose put fails finds only 6 present.
+        store.arm();
+        let attempt = Envelope {
+            commits: vec![commit_with_id([6; 16]), commit_with_id([7; 16])],
+        };
+        let err = log.commit_slot(1, &attempt).await.unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "{err}");
+    }
+
+    /// A superset is a win: a leader that coalesced this commit into a larger
+    /// envelope did commit this attempt's transaction.
+    #[tokio::test]
+    async fn a_coalesced_superset_still_resolves_to_won() {
+        let store = Arc::new(FaultyPut::disarmed(PutFault::Unreachable));
+        let log = SlotLog::new(store.clone(), "cat");
+
+        let coalesced = Envelope {
+            commits: vec![
+                commit_with_id([6; 16]),
+                commit_with_id([7; 16]),
+                commit_with_id([8; 16]),
+            ],
+        };
+        log.commit_slot(1, &coalesced).await.unwrap();
+
+        store.arm();
+        let attempt = Envelope {
+            commits: vec![commit_with_id([7; 16]), commit_with_id([8; 16])],
+        };
+        assert_eq!(
+            log.commit_slot(1, &attempt).await.unwrap(),
             CommitOutcome::Won
         );
     }
@@ -817,48 +944,72 @@ mod tests {
         }
     }
 
-    /// `from` is a documented precondition, not a guess: sequence 0 never
-    /// exists, and a `from` below the truncation horizon cannot be told from
-    /// a destroyed slot.
+    /// Slot 0 never exists, so a `from` below the first sequence means "from
+    /// the beginning" rather than a hole at 0. A `from` below the truncation
+    /// horizon still reads as holed — only the caller knows that horizon.
     #[tokio::test]
-    async fn a_from_below_the_first_live_slot_reports_a_hole() {
+    async fn a_from_below_the_first_sequence_reads_from_the_beginning() {
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
         let envelope = Envelope { commits: vec![] };
         for sequence in 1..=4 {
             log.put_slot(sequence, &envelope).await.unwrap();
         }
 
-        // Slot 0 never exists, so reading from it reports a hole at 0.
         let tail = log.read_tail(0).await.unwrap();
-        assert!(tail.slots.is_empty());
-        assert_eq!(tail.gap_at, Some(0));
+        assert_eq!(
+            tail.slots.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(tail.gap_at, None);
+        assert_eq!(log.tail_length(0).await.unwrap(), 4);
+        assert_eq!(log.find_transaction(0, [1; 16]).await.unwrap(), None);
 
-        // Below the truncation horizon, a deleted prefix reads the same way.
+        // Below the truncation horizon, a deleted prefix reads as holed.
         log.truncate_through(2).await.unwrap();
         assert_eq!(log.read_tail(1).await.unwrap().gap_at, Some(1));
         assert_eq!(log.tail_length(1).await.unwrap(), 0);
     }
 
-    /// `list` is recursive, so an object nested under a sequence-shaped
-    /// prefix must not be mistaken for a slot.
+    /// Truncation reaches below the range reads serve, so an object a writer
+    /// never should have created at sequence 0 is still reclaimable.
     #[tokio::test]
-    async fn a_nested_object_is_not_a_slot() {
+    async fn truncation_reclaims_a_slot_at_sequence_zero() {
+        let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
+        let envelope = Envelope { commits: vec![] };
+        for sequence in [0, 1, 2] {
+            log.put_slot(sequence, &envelope).await.unwrap();
+        }
+
+        assert_eq!(log.truncate_through(1).await.unwrap(), 2);
+        assert!(log.read_slot(0).await.unwrap().is_none());
+        assert!(log.read_slot(1).await.unwrap().is_none());
+        assert!(log.read_slot(2).await.unwrap().is_some());
+    }
+
+    /// `list` is recursive, so an object *nested under* a slot's name must not
+    /// be mistaken for a slot — including when its own final segment is a
+    /// well-formed sequence name.
+    #[tokio::test]
+    async fn a_nested_sequence_shaped_object_is_not_a_slot() {
         let store = Arc::new(InMemory::new());
         let log = SlotLog::new(store.clone(), "cat");
-        log.put_slot(1, &Envelope { commits: vec![] })
-            .await
-            .unwrap();
-        store
-            .put(
-                &Path::from("cat/commits/00000000000000000002/nested"),
-                "not a slot".into(),
-            )
-            .await
-            .unwrap();
+        let envelope = Envelope { commits: vec![] };
+        for sequence in [1, 2] {
+            log.put_slot(sequence, &envelope).await.unwrap();
+        }
 
+        // Final segment parses as sequence 5, but the object does not live at
+        // slot 5's path.
+        let nested = log.slot_path(2).join(format!("{:020}", 5));
+        store.put(&nested, "not a slot".into()).await.unwrap();
+
+        // Counted as a slot, 5 would break the run after 2 and report a hole.
         let tail = log.read_tail(1).await.unwrap();
-        assert_eq!(tail.slots.len(), 1);
+        assert_eq!(
+            tail.slots.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert_eq!(tail.gap_at, None);
-        assert_eq!(log.tail_length(1).await.unwrap(), 1);
+        assert_eq!(log.tail_length(1).await.unwrap(), 2);
     }
 }

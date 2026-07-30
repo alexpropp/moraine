@@ -74,12 +74,10 @@
 //! **An ambiguous put resolves from the log, never by guessing.** A
 //! conditional put whose *response* is lost is indistinguishable, from the
 //! caller's side, from one that never landed. [`SlotLog::commit_slot`]
-//! settles it by re-reading the slot: an envelope carrying any of the
-//! attempt's transaction ids means the put landed and this commit won; a
-//! different envelope means it lost; an absent slot means the put genuinely
-//! did not land, and the transport error surfaces. That is why transaction
-//! ids are envelope structure rather than payload — the mechanic needs them,
-//! and interprets nothing else.
+//! settles it by re-reading the slot: an envelope carrying the attempt's
+//! transaction ids means the put landed and this commit won; an envelope
+//! carrying none of them means it lost; an absent slot means the put genuinely
+//! did not land, and the transport error surfaces.
 //!
 //! **A hole is damage, not an ending.** [`SlotLog::read_tail`] serves the
 //! contiguous run from the requested sequence, but a sequence absent while
@@ -90,17 +88,29 @@
 //! Sequences *below* the requested one are never inspected, so a
 //! legitimately truncated prefix reads as no hole.
 //!
-//! # Two preconditions the caller owns
+//! # What the caller owns
 //!
-//! Transaction ids must be unique across every committer sharing a log:
-//! resolution matches on them, so a reused id resolves someone else's
-//! envelope as this attempt's.
+//! **Transaction ids are the identity resolution runs on.** Each must be
+//! unique across every committer sharing a log, and each must be offered to
+//! one committer only. Break the first and a reused id resolves another
+//! committer's envelope as this attempt's; break the second and a slot can
+//! carry part of an attempt, which [`SlotLog::commit_slot`] refuses as
+//! corruption rather than report as a win over transactions that never
+//! committed.
 //!
-//! Every `from` argument must be at least 1 — sequence 0 never exists — and
-//! at or above the truncation horizon. Below the horizon a deleted prefix
-//! and a destroyed slot are the same observation, and the tail reads as
-//! holed. A fold cursor of `n` means slots `1..=n` are applied, so the next
-//! tail starts at `n + 1`.
+//! **An envelope with no commits has no identity, so its ambiguous outcome is
+//! not resolvable.** Such envelopes are accepted — they carry no writes, and a
+//! reserved advert field will ride them — but if the response to their put is
+//! lost, nothing in the log distinguishes this attempt's landed envelope from
+//! an identical one another committer put. [`SlotLog::commit_slot`] reports
+//! that as a retryable failure rather than guessing. Retrying is safe: the
+//! envelope carries no writes, so a duplicate changes no state.
+//!
+//! **`from` must sit at or above the truncation horizon**, which only the
+//! caller knows. Below it a deleted prefix and a destroyed slot are the same
+//! observation, and the tail reads as holed. A fold cursor of `n` means slots
+//! `1..=n` are applied, so the next tail starts at `n + 1`. A `from` below 1
+//! is raised to 1, since slot 0 never exists.
 //!
 //! # Layering
 //!
