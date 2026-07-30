@@ -10,8 +10,14 @@ Each item is tagged:
 - **DECISION** — a design question with no answer yet.
 - **DEFERRED** — agreed work, postponed on purpose.
 - **IMPL** — specified in an RFC, not built.
-- **VALIDATE** — a test, pin, or measurement the design depends on.
+- **VALIDATE** — a test the design depends on, closed by writing it.
+- **MEASURE** — a number the design wants from a benchmark or profile. No
+  assertion closes one of these; running something and recording the result
+  does.
 - **DOC** — an operator- or user-facing gap.
+
+A VALIDATE whose subject does not exist yet is blocked on the IMPL item above
+it, not independently actionable: writing that test *is* building the feature.
 
 Resolving an item means updating the owning RFC and deleting the entry.
 
@@ -119,9 +125,9 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — Regression-pin the schema-mutating classification boundary
   cases: comments and tags bump, column and name-mapping registration does
   not, `set_option` neither bumps nor mints a snapshot.
-- **VALIDATE** — Keep the fresh-reader visibility test as a pin on SlateDB's
-  `await_durable` and WAL-replay behavior, and as the per-backend latency
-  measurement.
+- **MEASURE** — Post-commit fresh-reader latency, per object-store backend. The
+  behavioural pin already exists (`fresh_reader_sees_committed_head`); what is
+  missing is the cost figure it was also meant to yield.
 - **DOC** — The single-read-write-process, many-readers limitation belongs in
   the root README. It currently appears only in `ARCHITECTURE.md`. Shared with
   0006.
@@ -255,7 +261,8 @@ Four things gate disproportionately much of the list:
   Whichever is taken first pulls the other with it.
 - **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
   re-resolve per statement? This sets how tight the retention window must be.
-- **VALIDATE** — Measure materialization duration on large catalogs.
+- **MEASURE** — Materialization duration on large catalogs. Also the input the
+  churn-ratio decision above is waiting on.
 - **VALIDATE** — The refresh test suite: a commit landing mid-materialization
   yields an entirely pre- or entirely post-commit view, never torn; a view
   built at `S` still returns the `S` view after `k` commits; an incremental
@@ -285,9 +292,10 @@ Four things gate disproportionately much of the list:
   operator contract, without pre-building for it.
 - **DEFERRED** — A commit-funnel dispatcher serializing a many-connection
   process through a single committer, if a many-committer process appears.
-- **VALIDATE** — Measure whether a separate IO-dedicated runtime or a
-  `spawn_blocking` discipline is needed if SlateDB IO latency starves the
-  shared worker pool under heavy parallel scans.
+- **MEASURE** — Whether SlateDB IO latency starves the shared worker pool under
+  heavy parallel scans, which decides if a separate IO-dedicated runtime or a
+  `spawn_blocking` discipline is needed. Also the input the worker-count
+  decision above is waiting on.
 - **VALIDATE** — Interrupt coverage: before the commit write, head unchanged
   with no partial records; during the shielded write, prompt return while the
   write completes untorn and head is exactly `N` or `N+1`; after the durable
@@ -408,8 +416,6 @@ Four things gate disproportionately much of the list:
   each step's new-key write and old-key delete, each cursor advance, the finish
   flip — asserting reopen always yields a coherent store and never
   new-format-with-marker. Depends on 0011.
-- **VALIDATE** — A store whose `sys/format` exceeds the binary errors typed and
-  writes nothing.
 - **VALIDATE** — With the marker present, materialization and refresh on either
   binary version return the typed error and never a partial view.
 - **VALIDATE** — Running the migrate verb against an already-migrated store is
@@ -503,8 +509,8 @@ Four things gate disproportionately much of the list:
   primitive, the residual want after rejecting in-pass forced compaction.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
-- **VALIDATE** — Replace the strawman maintenance batch-size default of 1024
-  with a measured value.
+- **MEASURE** — A defensible maintenance batch size, replacing the strawman
+  default of 1024.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.
