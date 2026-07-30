@@ -108,8 +108,9 @@ to either.
 ### Identity in the key, everything mutable in the value
 
 The `column` key is `(table_id, column_id)` (RFC 0002). The column's
-**ordinal** — DuckLake's `column_order`, a dense position within the
-table — is a **value field**, not a key component. This split is half the
+**ordinal** — DuckLake's `column_order`, a position numbered from 1 that is
+never renumbered, so a drop leaves a gap the survivors keep — is a **value
+field**, not a key component. This split is half the
 design. The other half: **every change to a column record is a version
 transition** — end the current version into `history` (preserving its value
 verbatim), write the new version at the *same* `current` key. Each column
@@ -135,8 +136,8 @@ the "harmless" mutations is real and is rejected in Alternatives.
 The `current` **key** never changes across any of these — identity is the field
 id, and the field id is eternal. What churns is bounded and proportional to
 the change: one `history` record per column actually touched. A rename touches
-one column. A reorder touches the columns whose position changed — under
-dense ordinals that can be most of the table, but it is
+one column. A reorder touches the columns whose position changed — with
+positional ordinals that can be most of the table, but it is
 one small `history` record per moved column in one batch, O(columns), never
 O(data). Untouched siblings produce nothing. `add` allocates the table's
 next per-table `column_id` from the table record's persisted
