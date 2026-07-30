@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use futures::StreamExt;
 use object_store::{ObjectStore, path::Path};
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 use tracing::{info, warn};
@@ -20,14 +21,13 @@ use crate::{
     },
     error::{Error, Result},
     store::{
-        handle::{ReadHandle, ReadSession},
+        handle::ReadSession,
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
         inline as store_inline,
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
-        read,
     },
     transaction::{Transaction, commit, index_maintenance},
 };
@@ -39,6 +39,33 @@ const BUILD_STEP_ENTRIES: usize = 1_000_000;
 /// How many times a staged build re-derives after losing a race before
 /// giving up.
 const BUILD_DERIVATION_ATTEMPTS: usize = 8;
+
+/// Whether `path` provably holds no objects. A listing that fails answers
+/// `false`: this licenses creating a store, so anything short of proof that
+/// there is nothing to destroy must deny.
+async fn prefix_is_known_empty(object_store: &Arc<dyn ObjectStore>, path: &str) -> bool {
+    let prefix: Path = path.split('/').filter(|part| !part.is_empty()).collect();
+    let mut listing = object_store.list(Some(&prefix));
+    match listing.next().await {
+        None => true,
+        Some(Ok(object)) => {
+            warn!(
+                path,
+                found = %object.location,
+                "refusing to create a store: the prefix already holds objects"
+            );
+            false
+        }
+        Some(Err(err)) => {
+            warn!(
+                path,
+                error = %err,
+                "refusing to create a store: the prefix could not be listed"
+            );
+            false
+        }
+    }
+}
 
 /// The per-column orders `orders` asks for, as a definition records them.
 /// An empty list means ascending / NULLS LAST throughout.
@@ -262,18 +289,23 @@ impl Catalog {
         let reader_store = StoreBuilder::new(&options.path, object_store.clone())
             .cache_dir(options.cache_dir.clone());
         let reader = match commit::open_reader_initialized(reader_store).await {
-            Ok(Some(reader)) => {
-                let format_version = read::read_format(ReadHandle::Reader(&reader))
-                    .await?
-                    .map_or(commit::FORMAT_VERSION, |format| format.format_version);
+            Ok(Some((reader, format_version))) => {
                 commit::validate_mode(format_version, true)?;
                 reader
             }
+            // The store is readable but carries no format stamp: a bootstrap
+            // that did not finish, which `open_initialized` completes
+            // idempotently under conflict detection.
             Ok(None) => Self::bootstrap_multi_writer(&object_store, &options).await?,
-            Err(Error::Store(err)) if err.kind() == slatedb::ErrorKind::Data => {
+            // Only a prefix holding no objects licenses a bootstrap. A prefix
+            // holding objects whose manifest will not open is a damaged store,
+            // and stamping a fresh catalog over it would destroy it.
+            Err(err) => {
+                if !prefix_is_known_empty(&object_store, &options.path).await {
+                    return Err(err);
+                }
                 Self::bootstrap_multi_writer(&object_store, &options).await?
             }
-            Err(err) => return Err(err),
         };
 
         info!(path = options.path, "opened catalog multi-writer");
@@ -310,13 +342,15 @@ impl Catalog {
 
         let reader_store = StoreBuilder::new(&options.path, object_store.clone())
             .cache_dir(options.cache_dir.clone());
-        commit::open_reader_initialized(reader_store)
+        let (reader, _) = commit::open_reader_initialized(reader_store)
             .await?
             .ok_or_else(|| {
                 Error::Corruption(
                     "store still uninitialized immediately after bootstrap".to_string(),
                 )
-            })
+            })?;
+
+        Ok(reader)
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
@@ -338,22 +372,17 @@ impl Catalog {
     ) -> Result<Self> {
         let store = StoreBuilder::new(&options.path, object_store.clone())
             .cache_dir(options.cache_dir.clone());
-        let reader = commit::open_reader_initialized(store)
-            .await?
-            .ok_or_else(|| {
-                Error::Corruption(
-                    "store is not an initialized moraine catalog; a read-only attach \
+        let opened = commit::open_reader_initialized(store).await?;
+        let (reader, format_version) = opened.ok_or_else(|| {
+            Error::Corruption(
+                "store is not an initialized moraine catalog; a read-only attach \
                  needs a writer to have created it first"
-                        .to_string(),
-                )
-            })?;
+                    .to_string(),
+            )
+        })?;
         info!(path = options.path, "opened catalog read-only");
 
-        // The format dispatch belongs here, not inside the open helper: only
-        // a format-4 store rides the slot-log topology.
-        let format_version = read::read_format(ReadHandle::Reader(&reader))
-            .await?
-            .map_or(commit::FORMAT_VERSION, |format| format.format_version);
+        // Only a format-4 store rides the slot-log topology.
         let store = if format_version == commit::FORMAT_MULTI_WRITER {
             let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
             Store::MultiWriter(MultiWriterStore {

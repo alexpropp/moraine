@@ -288,16 +288,18 @@ pub(crate) async fn open_initialized(
     }
 }
 
-/// Opens the store read-only as a [`DbReader`], validating the format it
-/// finds. Never opens a `Db`, so it never fences a live writer, and never
-/// bootstraps. Returns `None` when the reader opens onto a store that
-/// carries no format stamp yet (a writer began creating it but has not
-/// finished); a store with no manifest at all fails to open at all, and
-/// that failure propagates as an error rather than `None`.
-pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<Option<DbReader>> {
+/// Opens the store read-only as a [`DbReader`], returning it with the
+/// structural format it is stamped with. Never opens a `Db`, so it never
+/// fences a live writer, and never bootstraps. Returns `None` when the reader
+/// opens onto a store carrying no format stamp yet (a writer began creating it
+/// but has not finished); a store with no manifest at all fails to open at all,
+/// and that failure propagates as an error rather than `None`.
+pub(crate) async fn open_reader_initialized(
+    store: StoreBuilder<'_>,
+) -> Result<Option<(DbReader, u64)>> {
     let reader = store.open_reader().await?;
     match validate_format(ReadHandle::Reader(&reader)).await? {
-        Some(_) => Ok(Some(reader)),
+        Some(format) => Ok(Some((reader, format.format_version))),
         None => Ok(None),
     }
 }
