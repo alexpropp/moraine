@@ -339,3 +339,142 @@ async fn a_failing_batch_member_does_not_poison_its_batch() {
     assert!(snapshot.schema_by_name("dup").is_some());
     assert!(snapshot.schema_by_name("other").is_some());
 }
+
+/// A cancelled participant — a caller whose `commit` future is dropped
+/// mid-batch (an ordinary `timeout` or a lost `select!` branch) — must not
+/// wedge the handle. The cancelled commit does not land, every other member of
+/// the batch still commits, and a *subsequent* commit on the same handle
+/// completes. That last assertion is the anti-wedge one: without the fix the
+/// leader admits the cancelled member, awaits its reply forever, never clears
+/// `driving`, and every later commit parks behind it. `start_paused` makes the
+/// drop land while the leader still holds the batch open in its window; the
+/// 5-second timeouts turn a wedge into a failure rather than a hung test.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_cancelled_participant_does_not_wedge_the_handle() {
+    let store = Arc::new(InMemory::new());
+    let mut options = multi_writer_options();
+    options.commit_batch_window = Duration::from_millis(100);
+    let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
+
+    // The leader holds the batch open for its window, so the others queue.
+    let leader = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move {
+            catalog
+                .commit(|tx| tx.create_schema("leader").map(|_| ()))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+
+    let victim = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move {
+            catalog
+                .commit(|tx| tx.create_schema("victim").map(|_| ()))
+                .await
+        })
+    };
+    let survivor = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move {
+            catalog
+                .commit(|tx| tx.create_schema("survivor").map(|_| ()))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+
+    // Cancel the victim while it is queued in the batch.
+    victim.abort();
+    tokio::task::yield_now().await;
+    assert!(victim.await.unwrap_err().is_cancelled());
+
+    let leader_out = tokio::time::timeout(Duration::from_secs(5), leader)
+        .await
+        .expect("the leader must not wedge behind the cancelled participant")
+        .expect("the leader task must not panic");
+    let survivor_out = tokio::time::timeout(Duration::from_secs(5), survivor)
+        .await
+        .expect("the survivor must not wedge behind the cancelled participant")
+        .expect("the survivor task must not panic");
+    assert!(leader_out.is_ok(), "{leader_out:?}");
+    assert!(survivor_out.is_ok(), "{survivor_out:?}");
+
+    // The anti-wedge assertion: a fresh commit on the same handle still lands.
+    let after = tokio::time::timeout(
+        Duration::from_secs(5),
+        catalog.commit(|tx| tx.create_schema("after").map(|_| ())),
+    )
+    .await
+    .expect("the handle must not be wedged behind the cancelled commit")
+    .expect("the follow-up commit must succeed");
+    assert!(after > SnapshotId::new(0));
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert!(snapshot.schema_by_name("leader").is_some());
+    assert!(snapshot.schema_by_name("survivor").is_some());
+    assert!(snapshot.schema_by_name("after").is_some());
+    assert!(snapshot.schema_by_name("victim").is_none());
+}
+
+/// The leader-drop case: if the *leader's* own `commit` future is dropped
+/// mid-batch, its followers must not be stranded and the handle must stay live.
+/// The drop guard hands the baton to a waiting follower (promotes it to lead)
+/// rather than leaving `driving` set behind a vanished leader. Without the fix
+/// the follower parks on a `resume` that never comes and every later commit
+/// parks behind a leaked `driving`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_cancelled_leader_hands_off_and_keeps_the_handle_live() {
+    let store = Arc::new(InMemory::new());
+    let mut options = multi_writer_options();
+    options.commit_batch_window = Duration::from_millis(100);
+    let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
+
+    let leader = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move {
+            catalog
+                .commit(|tx| tx.create_schema("leader").map(|_| ()))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+
+    let follower = {
+        let catalog = catalog.clone();
+        tokio::spawn(async move {
+            catalog
+                .commit(|tx| tx.create_schema("follower").map(|_| ()))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+
+    // Cancel the leader while it holds the batch open in its window.
+    leader.abort();
+    tokio::task::yield_now().await;
+    assert!(leader.await.unwrap_err().is_cancelled());
+
+    // The follower is promoted rather than stranded.
+    let follower_out = tokio::time::timeout(Duration::from_secs(5), follower)
+        .await
+        .expect("the follower must not be stranded behind the cancelled leader")
+        .expect("the follower task must not panic");
+    assert!(follower_out.is_ok(), "{follower_out:?}");
+
+    // And the handle stays live for new commits.
+    let after = tokio::time::timeout(
+        Duration::from_secs(5),
+        catalog.commit(|tx| tx.create_schema("after").map(|_| ())),
+    )
+    .await
+    .expect("the handle must not be wedged behind the cancelled leader")
+    .expect("the follow-up commit must succeed");
+    assert!(after > SnapshotId::new(0));
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert!(snapshot.schema_by_name("follower").is_some());
+    assert!(snapshot.schema_by_name("after").is_some());
+    assert!(snapshot.schema_by_name("leader").is_none());
+}

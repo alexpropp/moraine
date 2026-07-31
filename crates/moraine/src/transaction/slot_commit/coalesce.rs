@@ -9,7 +9,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -87,15 +90,42 @@ impl CommitCoalescer {
                 false
             } else {
                 shared.driving = true;
+                member.leading.store(true, Ordering::SeqCst);
                 true
             }
         };
 
-        if lead_now {
+        // The guard turns a cancelled caller into a dropped batch member rather
+        // than a wedged handle: on an early drop it abandons the member, and if
+        // the member was leading it hands the baton on.
+        let mut guard = Participation {
+            coalescer: self,
+            member: Arc::clone(&member),
+            armed: true,
+        };
+        let outcome = if lead_now {
             self.lead(store, f, member).await
         } else {
             self.participate(store, f, member).await
+        };
+        guard.disarm();
+
+        outcome
+    }
+
+    /// Hands the baton to the next live waiter, else closes the batch. Shared
+    /// by the leader's own end-of-batch handoff and the drop guard's.
+    fn hand_off(shared: &mut Shared) {
+        while let Some(next) = shared.waiting.pop_front() {
+            if next.is_abandoned() {
+                continue;
+            }
+            next.leading.store(true, Ordering::SeqCst);
+            next.direct(Directive::Lead);
+            next.resume.notify_one();
+            return;
         }
+        shared.driving = false;
     }
 
     /// Drives one batch to its slot, then hands the baton on. The leader
@@ -127,16 +157,7 @@ impl CommitCoalescer {
         let outcome = self.drive_batch(store, f, leader).await;
 
         // Hand the baton to the next waiter, else close the batch.
-        {
-            let mut shared = self.lock();
-            match shared.waiting.pop_front() {
-                Some(next) => {
-                    next.direct(Directive::Lead);
-                    next.resume.notify_one();
-                }
-                None => shared.driving = false,
-            }
-        }
+        Self::hand_off(&mut self.lock());
 
         outcome
     }
@@ -166,6 +187,7 @@ impl CommitCoalescer {
             base,
             original_head,
             last_changes: Vec::new(),
+            settled: false,
         };
 
         let drive = drive_commit(
@@ -209,6 +231,50 @@ impl CommitCoalescer {
                 Directive::Settle => return member.take_outcome(),
             }
         }
+    }
+}
+
+/// Held across a caller's `commit` await. On a normal return it is disarmed and
+/// does nothing; on an early drop — a cancelled caller, e.g. a `timeout` that
+/// fired — it keeps the handle live: it abandons the member (so a leader
+/// awaiting it stops waiting and drops it from the batch), unqueues it, wakes a
+/// leader parked on its reply, and, if the member was leading, hands the baton
+/// on so `driving` is never left set behind a vanished leader.
+///
+/// The remaining bounded case: a leader cancelled *during its winning slot PUT*
+/// (the one await where the put's fate is unknown) treats the batch as
+/// abandoned, so its co-batched members re-lead and re-run against the new
+/// head; if the PUT did land, their re-run sees their own committed work and
+/// returns `AlreadyExists` rather than success. That is rare (cancellation must
+/// coincide with the winning put), never a wedge, and never corruption.
+struct Participation<'a> {
+    coalescer: &'a CommitCoalescer,
+    member: Arc<Member>,
+    armed: bool,
+}
+
+impl Participation<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Participation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.member.abandoned.store(true, Ordering::SeqCst);
+        {
+            let mut shared = self.coalescer.lock();
+            shared.waiting.retain(|m| !Arc::ptr_eq(m, &self.member));
+            if self.member.leading.load(Ordering::SeqCst) {
+                CommitCoalescer::hand_off(&mut shared);
+            }
+        }
+        // A leader may be parked on this member's reply; wake it to re-check and
+        // find it abandoned.
+        self.member.reply.notify_one();
     }
 }
 
@@ -291,32 +357,65 @@ struct CoalescingCommitter<'a, F> {
     // The change set of every member that staged this round, for judging a
     // lost race.
     last_changes: Vec<ChangeSet>,
+    /// Set once [`settle`](Self::settle) has delivered outcomes. Its drop guard
+    /// re-queues live followers only when this is unset — i.e. when the
+    /// leader's own future was dropped mid-batch before it could settle
+    /// them.
+    settled: bool,
 }
 
 impl<F> CoalescingCommitter<'_, F> {
     /// Admits every commit that queued since the last round, so a joiner
-    /// inherits the batch's attempt count rather than resetting it.
+    /// inherits the batch's attempt count rather than resetting it. A member
+    /// cancelled while queued is let go here rather than admitted.
     fn admit_joiners(&mut self) {
         let mut shared = self.coalescer.lock();
         while let Some(member) = shared.waiting.pop_front() {
+            if member.is_abandoned() {
+                continue;
+            }
             let slot = Slot::new(member.txid);
             self.followers.push(Follower { member, slot });
         }
     }
 
     /// Distributes the batch's outcome to every follower and returns the
-    /// leader's own.
+    /// leader's own. A cancelled follower has no caller to serve and is
+    /// skipped.
     fn settle(&mut self, drive: &Result<CommitDrive>) -> Result<SnapshotId> {
+        self.settled = true;
         let verdict = Verdict::of(drive);
-        let leader = outcome_for(&self.leader_slot, &verdict, self.original_head);
+        let leader = outcome_for(&mut self.leader_slot, &verdict, self.original_head);
 
         for follower in &mut self.followers {
-            let outcome = outcome_for(&follower.slot, &verdict, self.original_head);
+            if follower.member.is_abandoned() {
+                continue;
+            }
+            let outcome = outcome_for(&mut follower.slot, &verdict, self.original_head);
             follower.member.settle(outcome);
             follower.member.resume.notify_one();
         }
 
         leader
+    }
+}
+
+impl<F> Drop for CoalescingCommitter<'_, F> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // The leader's own commit future was dropped mid-batch. Return its live
+        // followers to the queue so a promoted leader drives them; each is
+        // parked awaiting `resume` and re-reads its directive on the next wake
+        // (the promoted leader's `admit_joiners`/`request_assemble`, or the
+        // baton the drop guard hands on). Cancelled followers are let go.
+        let mut shared = self.coalescer.lock();
+        for follower in self.followers.drain(..) {
+            if !follower.member.is_abandoned() {
+                shared.waiting.push_back(follower.member);
+            }
+        }
     }
 }
 
@@ -348,17 +447,23 @@ where
         }
 
         for index in 0..self.followers.len() {
-            if self.followers[index].slot.terminal.is_some() {
+            if self.followers[index].slot.terminal.is_some()
+                || self.followers[index].member.is_abandoned()
+            {
                 continue;
             }
             let member = Arc::clone(&self.followers[index].member);
-            let product = request_assemble(&member, Arc::clone(&accum)).await;
-            record(
-                &mut self.followers[index].slot,
-                product,
-                &mut self.last_changes,
-                self.original_head,
-            );
+            // A follower cancelled mid-assembly returns `None`: it leaves the
+            // batch without folding into the accum, so the survivors stay
+            // contiguous — the same isolation a failing member gets.
+            if let Some(product) = request_assemble(&member, Arc::clone(&accum)).await {
+                record(
+                    &mut self.followers[index].slot,
+                    product,
+                    &mut self.last_changes,
+                    self.original_head,
+                );
+            }
         }
 
         let commits = accum.lock().await.commits.clone();
@@ -459,13 +564,12 @@ impl Verdict {
 }
 
 /// One member's outcome: its own terminal result if it left the envelope, else
-/// whatever the batch as a whole settled to.
-fn outcome_for(slot: &Slot, verdict: &Verdict, original_head: u64) -> Result<SnapshotId> {
-    if let Some(terminal) = &slot.terminal {
-        return match terminal {
-            Ok(id) => Ok(*id),
-            Err(err) => Err(clone_error(err)),
-        };
+/// whatever the batch as a whole settled to. Consumes the slot's terminal —
+/// each member is settled exactly once, so its own error moves to it verbatim
+/// rather than being cloned and reclassified.
+fn outcome_for(slot: &mut Slot, verdict: &Verdict, original_head: u64) -> Result<SnapshotId> {
+    if let Some(terminal) = slot.terminal.take() {
+        return terminal;
     }
 
     match verdict {
@@ -491,21 +595,6 @@ fn outcome_for(slot: &Slot, verdict: &Verdict, original_head: u64) -> Result<Sna
              {original_head} (last raced slot {last_sequence}): {last_error}"
         ))),
         Verdict::Failed(text) => Err(Error::Corruption(text.clone())),
-    }
-}
-
-/// Reconstructs a terminal error to hand a second member; the batch's members
-/// each get their own value of the shared outcome.
-fn clone_error(err: &Error) -> Error {
-    match err {
-        Error::CommitConflict(text) => Error::CommitConflict(text.clone()),
-        Error::RetryBudgetExhausted(text) => Error::RetryBudgetExhausted(text.clone()),
-        Error::NotFound(text) => Error::NotFound(text.clone()),
-        Error::AlreadyExists(text) => Error::AlreadyExists(text.clone()),
-        Error::Constraint(text) => Error::Constraint(text.clone()),
-        Error::IndexBuilding(text) => Error::IndexBuilding(text.clone()),
-        Error::SlotLog(text) => Error::SlotLog(text.clone()),
-        other => Error::Corruption(other.to_string()),
     }
 }
 
@@ -588,13 +677,19 @@ fn commit_from(txid: Uuid, assembled: &Assembled) -> Commit {
     }
 }
 
-/// Asks one follower to assemble against `accum` and waits for its product.
-async fn request_assemble(member: &Arc<Member>, accum: Arc<AsyncMutex<Accum>>) -> Product {
+/// Asks one follower to assemble against `accum` and waits for its product, or
+/// `None` if the follower's caller was cancelled before it produced one — its
+/// drop guard sets `abandoned` and wakes this `reply`, so the wait never hangs
+/// on a gone future.
+async fn request_assemble(member: &Arc<Member>, accum: Arc<AsyncMutex<Accum>>) -> Option<Product> {
     member.direct(Directive::Assemble { accum });
     member.resume.notify_one();
     loop {
         if let Some(product) = member.take_product() {
-            return product;
+            return Some(product);
+        }
+        if member.is_abandoned() {
+            return None;
         }
         member.reply.notified().await;
     }
@@ -607,6 +702,15 @@ struct Member {
     cell: Mutex<Cell>,
     resume: Notify,
     reply: Notify,
+    /// Set when the member's own `commit` future was dropped before it
+    /// completed — a cancelled caller. A cancelled member is dropped from the
+    /// batch exactly like one whose closure failed: the leader stops waiting on
+    /// it and the survivors commit.
+    abandoned: AtomicBool,
+    /// Whether this member currently holds the baton. Read by the drop guard to
+    /// decide, on cancellation, whether it must hand the baton on rather than
+    /// leave the handle wedged behind a dropped leader.
+    leading: AtomicBool,
 }
 
 /// The mutable half of a member, always locked without an await held.
@@ -639,7 +743,13 @@ impl Member {
             }),
             resume: Notify::new(),
             reply: Notify::new(),
+            abandoned: AtomicBool::new(false),
+            leading: AtomicBool::new(false),
         }
+    }
+
+    fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
     }
 
     fn cell(&self) -> MutexGuard<'_, Cell> {
