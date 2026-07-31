@@ -125,11 +125,9 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — Regression-pin the schema-mutating classification boundary
   cases: comments and tags bump, column and name-mapping registration does
   not, `set_option` neither bumps nor mints a snapshot.
-- **MEASURE** — Post-commit fresh-reader latency against a *real* object store.
-  The in-memory figure is measured (`BENCHMARK.md` → Core measurements): a
-  durable commit costs `flush_interval + ~2 ms`, so at the 100 ms default the
-  latency floor is the flush cadence, not compute. What remains is the real-S3
-  write-RTT term, which localhost MinIO understates; the per-backend latency is
+- **MEASURE** — Commit latency against a *real* object store. In-memory is
+  settled (`BENCHMARK.md` → Core measurements: `flush_interval + ~2 ms`); what
+  remains is the S3 write-RTT term that localhost MinIO understates, giving
   `max(flush cadence, write RTT) + ~2 ms`.
 - **DOC** — The single-read-write-process, many-readers limitation belongs in
   the root README. It currently appears only in `ARCHITECTURE.md`. Shared with
@@ -228,8 +226,10 @@ Four things gate disproportionately much of the list:
   horizon `H` and the gap's `snapshot` records may have been reclaimed.
 - **IMPL** — A churn-versus-catalog-size threshold that falls back to a full
   `current` rescan when replaying the changelog would cost more.
-- **DECISION** — The churn ratio for that threshold, defaulted after perf work
-  on realistic churn shapes.
+- **DECISION** — The churn ratio for that threshold. Full-materialization cost
+  is measured (`BENCHMARK.md` → Core measurements: ~5–7 µs per live entity,
+  linear); the crossover it trades against needs incremental refresh built to
+  measure the other side.
 - **IMPL** — Pin an explicit read-snapshot on the read-only path. The
   `DbReader` follows the manifest with no pinned checkpoint, so a read-only
   materialization is not snapshot-isolated the way the read-write path is.
@@ -260,13 +260,6 @@ Four things gate disproportionately much of the list:
   Whichever is taken first pulls the other with it.
 - **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
   re-resolve per statement? This sets how tight the retention window must be.
-- **MEASURE** — Materialization duration is measured (`BENCHMARK.md` → Core
-  measurements): ~5–7 µs per live entity, linear, ~150 ms at 20 000 entities —
-  and `snapshot()` rematerializes every call, so this is paid on every read,
-  not just a cold start. That is the quantitative case for the two items above
-  (serve readers from the cache; lazy materialization). What is still open is
-  the churn-ratio crossover, which needs incremental refresh built to compare
-  against.
 - **VALIDATE** — The refresh test suite: a commit landing mid-materialization
   yields an entirely pre- or entirely post-commit view, never torn; a view
   built at `S` still returns the `S` view after `k` commits; an incremental
@@ -296,13 +289,10 @@ Four things gate disproportionately much of the list:
   operator contract, without pre-building for it.
 - **DEFERRED** — A commit-funnel dispatcher serializing a many-connection
   process through a single committer, if a many-committer process appears.
-- **MEASURE** — IO latency does not starve the pool (`BENCHMARK.md` → Core
-  measurements): under 10 ms/read, 32 concurrent materializations on a 4-worker
-  runtime overlap into ~64 ms — the awaits yield, so per-op cost falls ~1/K and
-  a separate IO-dedicated runtime is unnecessary on the IO-latency axis. What is
-  unprobed is CPU-bound SST decode monopolizing a worker, the only remaining
-  case a `spawn_blocking` discipline would address; open until a decode-heavy
-  workload shows it matters.
+- **MEASURE** — Whether CPU-bound SST decode monopolizes a worker under a
+  decode-heavy scan — the one axis where a `spawn_blocking` discipline might
+  help. IO latency is settled: it does not starve the pool (`BENCHMARK.md` →
+  Core measurements), so this is the only remaining part of the question.
 - **VALIDATE** — Interrupt coverage: before the commit write, head unchanged
   with no partial records; during the shielded write, prompt return while the
   write completes untorn and head is exactly `N` or `N+1`; after the durable
