@@ -28,6 +28,8 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/maintenance.cpp
     ${CPP_DIR}/metadata_tables.cpp
+    ${CPP_DIR}/migrate.cpp
+    ${CPP_DIR}/s3_secret.cpp
     ${CPP_DIR}/scan.cpp
     ${CPP_DIR}/staged_write.cpp
     ${CPP_DIR}/transaction_manager.cpp

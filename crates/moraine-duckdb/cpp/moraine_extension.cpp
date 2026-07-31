@@ -12,6 +12,7 @@ void RegisterMoraineStorageExtension(duckdb::DBConfig &config);
 // Defined in index_functions.cpp.
 void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader);
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
+void RegisterMoraineMigrateFunction(duckdb::ExtensionLoader &loader);
 } // namespace moraine_duckdb
 
 namespace duckdb {
@@ -21,6 +22,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	moraine_duckdb::RegisterMoraineStorageExtension(loader.GetDatabaseInstance().config);
 	moraine_duckdb::RegisterMoraineIndexFunctions(loader);
 	moraine_duckdb::RegisterMoraineMaintenanceFunctions(loader);
+	moraine_duckdb::RegisterMoraineMigrateFunction(loader);
 }
 
 class MoraineExtension : public Extension {
