@@ -702,6 +702,107 @@ fn nullable_bigint_batch(
     (schema, batch)
 }
 
+/// A staged index built over inline rows that live only in unfolded slots
+/// backfills through the tail overlay. `inline_backfill_entries` must read the
+/// store overlaid with the tail: against a folded-only read the slot-resident
+/// chunk is invisible, the backfill derives nothing, and the index would flip
+/// ready covering zero rows — a silent wrong answer.
+#[tokio::test]
+async fn staged_index_over_unfolded_inline_rows_backfills_through_the_overlay() {
+    use crate::{
+        catalog::{IndexDef, TableId},
+        store::index_encoding::{IndexKeyValue, IntWidth},
+    };
+
+    let catalog = open_multi_writer_staged().await;
+
+    // Table 1 with one BIGINT column plus three inline rows [10, 20, 30], all in
+    // one staged commit — landed in a slot no folder ever applies.
+    let (schema, batch) = bigint_batch(&[10, 20, 30]);
+    let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+        .await
+        .unwrap();
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 0),
+    });
+    tx.stage(RowOperation::InlineSchema {
+        table_id: 1,
+        schema_version: 0,
+        arrow_schema: inline_schema_ipc(&schema),
+    });
+    tx.stage(RowOperation::InlineInsert {
+        table_id: 1,
+        schema_version: 0,
+        begin_snapshot: 1,
+        row_id_start: 0,
+        row_count: 3,
+        arrow_body: inline_body(&batch),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "created_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    // The backfill derives the slot-resident inline rows through the overlay.
+    let entries = catalog
+        .inline_backfill_entries(TableId::new(1), &[crate::catalog::ColumnId::new(1)])
+        .await
+        .unwrap();
+    let mut values: Vec<i128> = entries
+        .iter()
+        .map(|entry| match entry.values.first() {
+            Some(Some(IndexKeyValue::Int { value, .. })) => *value,
+            other => panic!("unexpected backfilled value {other:?}"),
+        })
+        .collect();
+    values.sort_unstable();
+    assert_eq!(
+        values,
+        vec![10, 20, 30],
+        "inline rows in unfolded slots must be backfilled through the overlay"
+    );
+
+    // A staged index built over them (inline only, no data store) lands ready
+    // and resolves the value.
+    let index = catalog
+        .create_index_staged(
+            TableId::new(1),
+            &IndexDef {
+                name: "by_a".into(),
+                columns: vec![crate::catalog::ColumnId::new(1)],
+                unique: true,
+            },
+            &[],
+            None,
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+    let hits = catalog
+        .index_lookup(
+            TableId::new(1),
+            index,
+            &[IndexKeyValue::Int {
+                value: 20,
+                width: IntWidth::I64,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "the built index resolves the inline value");
+}
+
 /// Creates table 1 with one `BIGINT` column and an equality index over
 /// it, returning the catalog and the index id.
 async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {

@@ -113,6 +113,67 @@ fn build_staged_entries(
         .collect()
 }
 
+/// Derives index-backfill entries for a table's live inline rows, scanning the
+/// inline chunk bodies through `handle` overlaid with `overlay` — the unfolded
+/// tail on a slot-backed store — so rows in slots no folder has applied are
+/// covered. Inline-tombstoned rows are excluded.
+async fn inline_backfill_from(
+    handle: ReadHandle<'_>,
+    overlay: Option<&moraine_wal::Overlay>,
+    snapshot: &CatalogSnapshot,
+    table: TableId,
+    columns: &[ColumnId],
+) -> Result<Vec<IndexEntry>> {
+    let live_columns = snapshot.columns_of(table);
+    let positions = columns
+        .iter()
+        .map(|column| {
+            live_columns
+                .iter()
+                .position(|c| c.id == *column)
+                .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Rows tombstoned out of their chunk by an inline delete are dead and must
+    // not be indexed.
+    let dead: HashSet<u64> = store_inline::scan_inline_inline_deletes(handle, overlay, table.get())
+        .await?
+        .into_iter()
+        .map(|(row_id, _)| row_id)
+        .collect();
+
+    let mut entries = Vec::new();
+    for (op, chunk) in store_inline::scan_inline_chunks(handle, overlay, table.get()).await? {
+        let InlineOperation::Insert { schema_version, .. } = op else {
+            continue;
+        };
+        let schema = store_inline::read_inline_schema(handle, overlay, table.get(), schema_version)
+            .await?
+            .ok_or_else(|| {
+                Error::Corruption(format!(
+                    "no inline schema for table {table} version {schema_version}"
+                ))
+            })?;
+        let scoped = scoped_read::inline_batch_entries(
+            &schema.arrow_schema,
+            &chunk.body,
+            &positions,
+            chunk.row_id_start,
+        )?;
+        entries.extend(
+            scoped
+                .into_iter()
+                .filter(|entry| !dead.contains(&entry.row_id))
+                .map(|entry| IndexEntry {
+                    row_id: entry.row_id,
+                    values: entry.values,
+                }),
+        );
+    }
+    Ok(entries)
+}
+
 /// The per-column orders `orders` asks for, as a definition records them.
 /// An empty list means ascending / NULLS LAST throughout.
 fn requested_orders(orders: &[ColumnOrder], columns: usize) -> (Vec<Direction>, Vec<NullOrder>) {
@@ -581,14 +642,35 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store.clone())
             .refresh_interval(options.refresh_interval)
             .cache_dir(options.cache_dir.clone());
-        let opened = commit::open_reader_initialized(store).await?;
-        let (reader, _format_version) = opened.ok_or_else(|| {
-            Error::Corruption(
-                "store is not an initialized moraine catalog; a read-only attach \
-                 needs a writer to have created it first"
-                    .to_string(),
-            )
-        })?;
+        // A store with no manifest fails to open at all; the failure propagates
+        // (a read-only attach never bootstraps).
+        let reader = store.open_reader().await?;
+        match Self::classify_format(&reader).await {
+            // Format 1–4 all serve read-only.
+            Ok(FormatClass::SlotLog | FormatClass::Legacy) => {}
+            Ok(FormatClass::Empty) => {
+                slot_commit::release_reader(Some(&reader)).await;
+                return Err(Error::Corruption(
+                    "store is not an initialized moraine catalog; a read-only attach \
+                     needs a writer to have created it first"
+                        .to_string(),
+                ));
+            }
+            // A too-new format is a compatibility problem, not corruption — the
+            // same kind the read-write path refuses it with.
+            Ok(FormatClass::TooNew(version)) => {
+                slot_commit::release_reader(Some(&reader)).await;
+                return Err(Error::Configuration(format!(
+                    "store format {version} is newer than this binary understands \
+                     (up to {}); upgrade moraine to attach it",
+                    commit::MAX_FORMAT_VERSION
+                )));
+            }
+            Err(err) => {
+                slot_commit::release_reader(Some(&reader)).await;
+                return Err(err);
+            }
+        }
         info!(path = options.path, "opened catalog read-only");
 
         // Every readable store serves read-only through the slot topology: a
@@ -1531,71 +1613,28 @@ impl Catalog {
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
         let session = self.begin_read().await?;
-
-        let outcome = async {
-            let head = self.head_view(session.handle()).await?;
-            slot_commit::release_reader(head.reader.as_ref()).await;
-            let snapshot = head.view;
-            let live_columns = snapshot.columns_of(table);
-            let positions = columns
-                .iter()
-                .map(|column| {
-                    live_columns
-                        .iter()
-                        .position(|c| c.id == *column)
-                        .ok_or_else(|| Error::NotFound(format!("column {column} of table {table}")))
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            // Rows tombstoned out of their chunk by an inline delete are dead
-            // and must not be indexed.
-            let dead: std::collections::HashSet<u64> =
-                store_inline::scan_inline_inline_deletes(session.handle(), None, table.get())
-                    .await?
-                    .into_iter()
-                    .map(|(row_id, _)| row_id)
-                    .collect();
-
-            let mut entries = Vec::new();
-            for (op, chunk) in
-                store_inline::scan_inline_chunks(session.handle(), None, table.get()).await?
-            {
-                let InlineOperation::Insert { schema_version, .. } = op else {
-                    continue;
-                };
-                let schema = store_inline::read_inline_schema(
-                    session.handle(),
-                    None,
-                    table.get(),
-                    schema_version,
-                )
-                .await?
-                .ok_or_else(|| {
-                    Error::Corruption(format!(
-                        "no inline schema for table {table} version {schema_version}"
-                    ))
-                })?;
-                let scoped = scoped_read::inline_batch_entries(
-                    &schema.arrow_schema,
-                    &chunk.body,
-                    &positions,
-                    chunk.row_id_start,
-                )?;
-                entries.extend(
-                    scoped
-                        .into_iter()
-                        .filter(|entry| !dead.contains(&entry.row_id))
-                        .map(|entry| IndexEntry {
-                            row_id: entry.row_id,
-                            values: entry.values,
-                        }),
-                );
+        let head = match self.head_view(session.handle()).await {
+            Ok(head) => head,
+            Err(err) => {
+                session.finish();
+                return Err(err);
             }
-            Ok(entries)
-        }
-        .await;
-        session.finish();
+        };
 
+        // Scan the inline chunk bodies through the head's reader (fresh on a
+        // slot-backed store) overlaid with the unfolded tail, so inline rows
+        // committed to slots no folder has applied are backfilled rather than
+        // silently skipped — an index built over them would otherwise flip
+        // ready covering nothing.
+        let scan_handle = head
+            .reader
+            .as_ref()
+            .map_or(session.handle(), ReadHandle::Reader);
+        let outcome =
+            inline_backfill_from(scan_handle, head.tail.as_ref(), &head.view, table, columns).await;
+
+        slot_commit::release_reader(head.reader.as_ref()).await;
+        session.finish();
         outcome
     }
 
