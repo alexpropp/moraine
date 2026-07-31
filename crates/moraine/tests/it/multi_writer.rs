@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use moraine::{
@@ -7,7 +7,7 @@ use moraine::{
 };
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 
-use crate::fixtures::{col, datafile};
+use crate::fixtures::{CountingStore, col, datafile};
 
 fn multi_writer_options() -> CatalogOptions {
     let mut options = CatalogOptions::default();
@@ -23,6 +23,11 @@ async fn open_multi_writer(store: &Arc<InMemory>) -> Catalog {
     )
     .await
     .unwrap()
+}
+
+#[allow(clippy::unwrap_used)]
+async fn open_multi_writer_over(store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Catalog {
+    Catalog::open(store, options).await.unwrap()
 }
 
 /// How many objects sit under `prefix`.
@@ -227,4 +232,110 @@ async fn racing_unique_inserts_reject_the_duplicate_through_the_overlay() {
 
     let loser = if ra.is_err() { ra } else { rb };
     assert!(matches!(loser, Err(Error::Constraint(_))), "{loser:?}");
+}
+
+/// The task's reason to exist: many commits through one handle coalesce into
+/// a handful of envelopes, so the slot PUTs stay far below the commit count.
+/// Without the coalescer this is O(n^2) — each loser retries the next
+/// sequence, and N commits cost ~N^2/2 PUTs.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_commits_coalesce_into_few_slots() {
+    let store = Arc::new(CountingStore::new());
+    let catalog = open_multi_writer_over(
+        store.clone() as Arc<dyn ObjectStore>,
+        multi_writer_options(),
+    )
+    .await;
+
+    // Every PUT the open itself cost is already counted; the commits' cost is
+    // the delta from here.
+    let before = store.put_count();
+    let commits = 50;
+    let results = futures::future::join_all(
+        (0..commits)
+            .map(|i| catalog.commit(move |tx| tx.create_schema(&format!("s{i}")).map(|_| ()))),
+    )
+    .await;
+    let commit_puts = store.put_count() - before;
+
+    assert!(results.iter().all(Result::is_ok), "every commit lands");
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.schemas().len(),
+        commits + 1,
+        "all visible, plus main"
+    );
+
+    // One envelope per batch, one PUT per envelope: a handful, never one per
+    // commit and never the quadratic blow-up.
+    assert!(
+        commit_puts < commits as u64,
+        "coalesced {commits} commits into {commit_puts} slot PUTs"
+    );
+}
+
+/// The default (ZERO) window declines to *wait*: a lone commit issues its PUT
+/// without sleeping for a batching window. Under a paused clock a fixed
+/// batching delay would advance virtual time; an opportunistic batch does not.
+#[tokio::test(start_paused = true)]
+async fn an_uncontended_commit_waits_for_nothing() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+
+    let started = tokio::time::Instant::now();
+    catalog
+        .commit(|tx| tx.create_schema("solo").map(|_| ()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "the default window pays no batching delay"
+    );
+}
+
+/// A member whose closure fails when re-run against the accumulating head is
+/// dropped from the envelope with its own error; the rest of the batch
+/// commits. Two callers create the same schema and a third creates a distinct
+/// one: exactly one of the colliding pair succeeds, the unrelated member is
+/// untouched, and both surviving schemas land. A window forces the three into
+/// one batch so the intra-batch drop is what is exercised.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_batch_member_does_not_poison_its_batch() {
+    let store = Arc::new(InMemory::new());
+    let mut options = multi_writer_options();
+    options.commit_batch_window = Duration::from_millis(80);
+    let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
+
+    let (dup_a, dup_b, other) = tokio::join!(
+        catalog.commit(|tx| tx.create_schema("dup").map(|_| ())),
+        catalog.commit(|tx| tx.create_schema("dup").map(|_| ())),
+        catalog.commit(|tx| tx.create_schema("other").map(|_| ())),
+    );
+
+    // Exactly one of the colliding pair commits; the other gets its own error
+    // (the closure's `AlreadyExists`, or a `CommitConflict` if the collision
+    // landed as a lost slot race) — never a poisoned neighbour.
+    assert_eq!(
+        u8::from(dup_a.is_ok()) + u8::from(dup_b.is_ok()),
+        1,
+        "{dup_a:?} / {dup_b:?}"
+    );
+    let loser = if dup_a.is_err() { dup_a } else { dup_b };
+    assert!(
+        matches!(
+            loser,
+            Err(Error::AlreadyExists(_) | Error::CommitConflict(_))
+        ),
+        "{loser:?}"
+    );
+    assert!(
+        other.is_ok(),
+        "the unrelated member is untouched: {other:?}"
+    );
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert!(snapshot.schema_by_name("dup").is_some());
+    assert!(snapshot.schema_by_name("other").is_some());
 }

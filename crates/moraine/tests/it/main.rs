@@ -5,6 +5,7 @@
 mod fixtures;
 
 mod catalog;
+mod coalescer_bench;
 mod commit_concurrency;
 mod data_files;
 mod index_backfill;

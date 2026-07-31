@@ -34,7 +34,10 @@ mod sim;
 use std::collections::{BTreeMap, BTreeSet};
 
 use moraine_wal::{CursorStore, Envelope, SlotLog, drive_fold};
-use sim::{FaultCensus, FoldState, RoundOutcome, Run, Scenario, Work, duel, ids, simulate, works};
+use sim::{
+    CoalescingRun, FaultCensus, FoldState, RoundOutcome, Run, Scenario, Work, duel, ids, simulate,
+    simulate_coalescing, works,
+};
 
 /// Seeds the inline sweep covers, kept to CI-affordable time.
 const SWEEP: u64 = 512;
@@ -629,6 +632,118 @@ async fn folding_to_any_prefix_is_invisible() {
             .await
             .expect("re-folding a folded log");
         assert_eq!(before, state, "seed {seed}: re-folding changed the state");
+    }
+}
+
+/// The multi-commit envelope shape the leader-side coalescer produces, first
+/// reachable in simulation here: a batch of members lands as one envelope in
+/// one slot. Every member of a committed batch shares that slot, no member
+/// lands twice, and a task told it did not commit left no member behind. A
+/// coverage floor keeps the oracle from passing vacuously on runs that never
+/// coalesced.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_coalesced_batch_lands_as_one_multi_commit_slot() {
+    let mut multi_commit_slots = 0;
+    let mut census = FaultCensus::default();
+
+    for seed in seeds(SWEEP) {
+        let run = simulate_coalescing(seed).await;
+        assert_eq!(run.gap_at, None, "seed {seed}: a healthy log has no hole");
+        census.merge(&run.census);
+
+        let mut work_slots: BTreeMap<Work, u64> = BTreeMap::new();
+        for (sequence, envelope) in &run.slots {
+            if envelope.commits.len() > 1 {
+                multi_commit_slots += 1;
+            }
+            for work in works(envelope) {
+                assert!(
+                    work_slots.insert(work, *sequence).is_none(),
+                    "seed {seed}: work {work} committed in two slots"
+                );
+            }
+        }
+
+        for record in &run.records {
+            match &record.outcome {
+                RoundOutcome::Committed { sequence } => {
+                    for work in &record.batch {
+                        assert_eq!(
+                            work_slots.get(work),
+                            Some(sequence),
+                            "seed {seed}: batched work {work} did not land in its \
+                             reported slot {sequence}",
+                        );
+                    }
+                    // The whole batch is resolvable by any of its ids — the
+                    // exactly-once client contract over a multi-commit slot.
+                    for id in &record.minted {
+                        let found = run
+                            .log
+                            .find_transaction(1, *id)
+                            .await
+                            .expect("a quiesced scan answers");
+                        assert!(
+                            found.is_none() || found == Some(*sequence),
+                            "seed {seed}: id {id:?} of a committed batch resolves to \
+                             {found:?}, not its slot {sequence}"
+                        );
+                    }
+                }
+                // A terminal non-commit leaves no member behind; an unknown
+                // outcome (the last put's fate) may or may not have landed, so
+                // it is not held to this.
+                RoundOutcome::Conflict { .. }
+                | RoundOutcome::Exhausted
+                | RoundOutcome::Nothing
+                | RoundOutcome::Unstarted(_) => {
+                    for work in &record.batch {
+                        assert!(
+                            !work_slots.contains_key(work),
+                            "seed {seed}: work {work} reported no commit yet holds a slot"
+                        );
+                    }
+                }
+                RoundOutcome::Unavailable { .. } | RoundOutcome::Failed(_) => {}
+            }
+        }
+    }
+
+    assert!(
+        multi_commit_slots > 0,
+        "no coalescing run produced a multi-commit envelope, so the multi-commit \
+         shape stayed unreached"
+    );
+    // The ambiguous-put mechanic — a landed put whose acknowledgement was lost
+    // — must actually fire over these multi-commit envelopes, or the
+    // exactly-once resolution above is proven only on the easy path. Skipped
+    // when the sweep is pinned to one seed, which may draw a gentle run.
+    if std::env::var(SEED_OVERRIDE).is_err() {
+        assert!(
+            census.fail_after + census.landed_then_already_exists > 0,
+            "no coalescing run produced an ambiguous landing, so multi-commit \
+             exactly-once resolution stayed on the easy path"
+        );
+    }
+}
+
+/// Fold invisibility over multi-commit envelopes: folding a coalesced log to
+/// any prefix and replaying the rest yields what pure replay does. The
+/// single-commit sweep proves this for one commit per slot; here each slot
+/// carries a whole batch.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_coalesced_log_folds_as_it_replays() {
+    for seed in seeds(SWEEP) {
+        let run: CoalescingRun = simulate_coalescing(seed).await;
+        let replayed = replay(&run.log, 0).await;
+
+        for prefix in 0..=run.slots.len() as u64 {
+            let folded = replay(&run.log, prefix).await;
+            assert_eq!(
+                folded, replayed,
+                "seed {seed}: folding a coalesced log through {prefix} diverged"
+            );
+        }
     }
 }
 

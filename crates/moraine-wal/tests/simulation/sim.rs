@@ -1285,3 +1285,183 @@ fn committed_at(record: &RoundRecord) -> Option<u64> {
         _ => None,
     }
 }
+
+/// The number of logical members one coalescing task batches into a single
+/// envelope; the shape a leader produces when it drains its queue.
+const COALESCED_MEMBERS: u8 = 3;
+
+/// Coalescing tasks a run drives, each racing the others.
+const COALESCING_TASKS: u8 = 2;
+
+/// A committer that offers one envelope carrying several members at once — the
+/// multi-commit shape the leader-side coalescer produces. It re-offers the
+/// whole batch on every attempt, so a lost race rebases the batch as a unit,
+/// and mints a fresh id per member per attempt so an id-level oracle cannot be
+/// fooled by a re-raced round.
+pub struct CoalescingSimCommitter {
+    batch: Vec<Work>,
+    head: u64,
+    attempts: u8,
+    minted: Vec<[u8; 16]>,
+}
+
+impl CoalescingSimCommitter {
+    /// A committer that batches `batch` from `head`.
+    pub fn new(batch: Vec<Work>, head: u64) -> Self {
+        Self {
+            batch,
+            head,
+            attempts: 0,
+            minted: Vec::new(),
+        }
+    }
+}
+
+impl Committer for CoalescingSimCommitter {
+    type Error = Error;
+
+    async fn assemble(&mut self) -> Result<Option<Envelope>, Error> {
+        if self.batch.is_empty() {
+            return Ok(None);
+        }
+
+        self.attempts += 1;
+        let commits = self
+            .batch
+            .iter()
+            .enumerate()
+            .map(|(member, work)| {
+                let mut transaction_id = [0; 16];
+                transaction_id[0] = work.worker;
+                transaction_id[1] = work.round;
+                transaction_id[2] = self.attempts;
+                transaction_id[3] = u8::try_from(member).unwrap_or(u8::MAX);
+                self.minted.push(transaction_id);
+
+                Commit {
+                    transaction_id,
+                    payload: SlotPayload {
+                        validated_head: self.head,
+                        changes_made: SHARED.to_string(),
+                        writes: vec![SlotWrite {
+                            key: work.key(),
+                            value: Some(work.value()),
+                        }],
+                    },
+                }
+            })
+            .collect();
+
+        Ok(Some(Envelope { commits }))
+    }
+
+    fn classify(&self, _winner: &Envelope) -> Race {
+        Race::Benign
+    }
+
+    fn absorb(&mut self, sequence: u64, _winner: Envelope) -> Result<(), Error> {
+        self.head = sequence;
+
+        Ok(())
+    }
+}
+
+/// One coalescing task's result: the batch it offered and how the round ended.
+#[derive(Debug, Clone)]
+pub struct CoalescingRecord {
+    /// The members the task batched into one envelope.
+    pub batch: Vec<Work>,
+    /// Every transaction id the task offered the log.
+    pub minted: Vec<[u8; 16]>,
+    /// How the round ended.
+    pub outcome: RoundOutcome,
+}
+
+/// One coalescing run: the log it left behind and each task's result.
+#[derive(Debug)]
+pub struct CoalescingRun {
+    /// The log's final content, quiesced.
+    pub slots: Vec<(u64, Envelope)>,
+    /// A hole in the final tail. Always `None` on a healthy log.
+    pub gap_at: Option<u64>,
+    /// Each coalescing task's result.
+    pub records: Vec<CoalescingRecord>,
+    /// The quiesced log, so an oracle can re-fold it.
+    pub log: SlotLog,
+    /// What the store served, so a coverage assertion is counted not assumed.
+    pub census: FaultCensus,
+}
+
+/// Drives one coalescing task's single batched round from the head it reads.
+async fn run_coalescing_task(
+    log: SlotLog,
+    batch: Vec<Work>,
+    retry: RetryPolicy,
+) -> CoalescingRecord {
+    let head = match read_head(&log).await {
+        Ok(head) => head,
+        Err(err) => {
+            return CoalescingRecord {
+                batch,
+                minted: Vec::new(),
+                outcome: RoundOutcome::Unstarted(err.to_string()),
+            };
+        }
+    };
+
+    let start = head.saturating_add(1);
+    let mut committer = CoalescingSimCommitter::new(batch.clone(), head);
+    let outcome = drive_commit(&log, &mut committer, start, &retry).await;
+
+    CoalescingRecord {
+        batch,
+        minted: committer.minted,
+        outcome: outcome.into(),
+    }
+}
+
+/// Runs a run of coalescing tasks: each batches a distinct block of members
+/// into one multi-commit envelope and races the others, all under the seed's
+/// fault and timing knobs.
+pub async fn simulate_coalescing(seed: u64) -> CoalescingRun {
+    let knobs = Scenario::for_seed(seed).knobs;
+    let store = Arc::new(SimStore::new(seed, knobs));
+    let state = store.state();
+    let log = SlotLog::new(store, ROOT);
+
+    let tasks: Vec<_> = (0..COALESCING_TASKS)
+        .map(|task| {
+            let first = task * COALESCED_MEMBERS + 1;
+            let batch = (first..first + COALESCED_MEMBERS)
+                .map(|worker| Work { worker, round: 1 })
+                .collect();
+            let retry = RetryPolicy {
+                max_attempts: 24,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(20),
+                ..RetryPolicy::seeded(
+                    seed.wrapping_mul(0x9E37_79B9)
+                        .wrapping_add(u64::from(task) + 1),
+                )
+            };
+            tokio::spawn(run_coalescing_task(log.clone(), batch, retry))
+        })
+        .collect();
+
+    let mut records = Vec::new();
+    for handle in tasks {
+        records.push(handle.await.expect("a coalescing task must not panic"));
+    }
+
+    let census = lock(&state).census();
+    lock(&state).quiesce();
+    let tail = log.read_tail(1).await.expect("a quiesced log reads back");
+
+    CoalescingRun {
+        slots: tail.slots,
+        gap_at: tail.gap_at,
+        records,
+        log,
+        census,
+    }
+}

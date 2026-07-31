@@ -173,8 +173,9 @@ enum Store {
     /// A read-only reader following the manifest, shared into read sessions.
     Reader(Arc<DbReader>),
     /// A commit-log-backed attach: a reader plus the slot log. Transitional
-    /// — removed once the log is the only topology.
-    MultiWriter(MultiWriterStore),
+    /// — removed once the log is the only topology. Boxed: it dwarfs the other
+    /// variants, the coalescer's queue included.
+    MultiWriter(Box<MultiWriterStore>),
 }
 
 /// The store behind a [`Store::MultiWriter`] attach.
@@ -187,6 +188,9 @@ pub(crate) struct MultiWriterStore {
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) options: CatalogOptions,
     pub(crate) read_only: bool,
+    /// Serializes and coalesces this process's slot commits. Shared by every
+    /// clone of the handle.
+    pub(crate) coalescer: slot_commit::CommitCoalescer,
 }
 
 /// Options for opening a catalog.
@@ -234,6 +238,13 @@ pub struct CatalogOptions {
     /// Opt into the slot-log topology at store creation. Transitional:
     /// removed once the slot log is the only topology.
     pub multi_writer: bool,
+    /// How long a slot-backed commit may wait to be batched with others of
+    /// this process before racing the log. Zero (the default) still coalesces
+    /// whatever is already queued into one envelope — it only declines to
+    /// *wait* — so an uncontended commit adds no latency. A non-zero window
+    /// trades latency for fewer object-store PUTs under load. Only the
+    /// multi-writer path reads it.
+    pub commit_batch_window: Duration,
 }
 
 impl Default for CatalogOptions {
@@ -245,6 +256,7 @@ impl Default for CatalogOptions {
             cache_dir: None,
             data_path: None,
             multi_writer: false,
+            commit_batch_window: Duration::ZERO,
         }
     }
 }
@@ -351,14 +363,16 @@ impl Catalog {
 
         info!(path = options.path, "opened catalog multi-writer");
         let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
+        let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
         Ok(Self {
-            store: Arc::new(Store::MultiWriter(MultiWriterStore {
+            store: Arc::new(Store::MultiWriter(Box::new(MultiWriterStore {
                 reader: Arc::new(reader),
                 slots,
                 object_store,
                 options,
                 read_only: false,
-            })),
+                coalescer,
+            }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
     }
@@ -426,13 +440,15 @@ impl Catalog {
         // Only a format-4 store rides the slot-log topology.
         let store = if format_version == commit::FORMAT_MULTI_WRITER {
             let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
-            Store::MultiWriter(MultiWriterStore {
+            let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
+            Store::MultiWriter(Box::new(MultiWriterStore {
                 reader: Arc::new(reader),
                 slots,
                 object_store,
                 options,
                 read_only: true,
-            })
+                coalescer,
+            }))
         } else {
             Store::Reader(Arc::new(reader))
         };
@@ -1502,7 +1518,7 @@ impl Catalog {
         F: Fn(&mut Transaction) -> Result<()>,
     {
         match self.store.as_ref() {
-            Store::MultiWriter(multi) => slot_commit::slot_commit_cycle(multi, &f).await,
+            Store::MultiWriter(multi) => multi.coalescer.commit(multi, &f).await,
             _ => commit::commit_cycle(self.writer()?, &f, &self.projections).await,
         }
     }
