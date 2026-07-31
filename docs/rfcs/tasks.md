@@ -511,16 +511,6 @@ Four things gate disproportionately much of the list:
   primitive, the residual want after rejecting in-pass forced compaction.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
-- **IMPL** — Stop the reclaim sweep awaiting durability on every batch. Measured
-  (`BENCHMARK.md` → Core measurements): the sweep's wall-clock is `commits ×
-  flush_interval` almost exactly, because `reclaim_dead_range` commits each
-  batch `await_durable`. The tombstones are idempotent and the dead index id is
-  never reused, so a crash mid-sweep is safe to redrive — only the final batch
-  needs to be durable. Making intermediate batches non-durable would make the
-  sweep near-instant and the batch size almost irrelevant. This subsumes the
-  question of a defensible batch-size default: the strawman 1024 spends ~4.9 s
-  of a 5.08 s / 50 000-entry sweep waiting on flush ticks; a larger default
-  (~16k) is a stopgap, this is the fix.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.
