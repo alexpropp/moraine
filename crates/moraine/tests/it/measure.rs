@@ -24,8 +24,8 @@ use std::{
 };
 
 use moraine::{
-    Catalog, CatalogOptions, ColumnId, IndexDef, IndexEntry, IndexKeyValue, IntWidth,
-    MaintenanceRequest,
+    Catalog, CatalogOptions, ColumnId, DataFile, FileIndexEntry, IndexDef, IndexEntry,
+    IndexKeyValue, IntWidth, MaintenanceRequest,
 };
 use object_store::{
     memory::InMemory,
@@ -386,5 +386,125 @@ async fn measure_read_concurrency_under_io_latency() {
         println!("{k:>12}  {:>11.3}  {per_op:>13.3}", stats.median_ms);
     }
     catalog.close().await.unwrap();
+    println!();
+}
+
+/// 0016 — unique-index maintenance cost per commit as the store grows,
+/// scattered versus clustered indexed values.
+///
+/// Uniqueness is resolved by bounded-concurrency point reads at every batch
+/// size. Each probe is bloom-filtered, so its cost does not grow with the
+/// index, and the fan-out overlaps latency — so per-commit cost should stay
+/// flat as the store grows, and stay the same whether a commit's values
+/// scatter across the whole index or cluster in a contiguous new range. This
+/// runs the same successive-commit load under both distributions over an
+/// identical value set and prints per-commit time against cumulative store
+/// size. A ratio near one, flat across the sweep, is the expected result; a
+/// scattered curve that climbed with store size would signal a regression
+/// toward store-proportional resolution.
+///
+/// Timed at the fast seed interval, so each commit's durable wait is ~1 ms
+/// and the reported time is index-maintenance compute plus store reads, not
+/// the flush poll.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_index_maintenance_by_store_size() {
+    // Well above one probe group (1024), so each commit resolves across
+    // several bounded-concurrency point-read groups.
+    const BATCH: u64 = 8_192;
+    const COMMITS: usize = 32;
+
+    // Both distributions index the same value set — a permutation of
+    // `0..COMMITS * BATCH` — and differ only in which commit carries which
+    // value. Clustered gives commit `k` the contiguous block
+    // `[k * BATCH, (k + 1) * BATCH)`; scattered gives it the residue class
+    // `{ k + COMMITS * j : j in 0..BATCH }`, spread evenly across the whole
+    // range every commit. Same total work, opposite stored layout.
+    async fn run(scattered: bool) -> Vec<Duration> {
+        let store = Arc::new(InMemory::new());
+        let catalog = open_with(store, SEED_FLUSH_MS).await;
+
+        let created = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, "t", &[col("a")])?;
+                let def = IndexDef {
+                    name: "idx".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                };
+                created.set(Some((table, tx.create_index(table, &def, &[])?)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (table, index) = created.get().expect("index created");
+
+        let mut samples = Vec::with_capacity(COMMITS);
+        for k in 0..COMMITS {
+            let k = k as u64;
+            let entries: Vec<FileIndexEntry> = (0..BATCH)
+                .map(|ordinal| {
+                    let value = if scattered {
+                        k + COMMITS as u64 * ordinal
+                    } else {
+                        k * BATCH + ordinal
+                    };
+                    FileIndexEntry {
+                        index,
+                        ordinal,
+                        values: vec![Some(IndexKeyValue::Int {
+                            value: i128::from(value),
+                            width: IntWidth::I64,
+                        })],
+                    }
+                })
+                .collect();
+
+            let start = Instant::now();
+            catalog
+                .commit(move |tx| {
+                    let file = DataFile {
+                        path: format!("f{k}.parquet"),
+                        ..datafile(BATCH)
+                    };
+                    tx.register_data_file(table, file, &entries)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            samples.push(start.elapsed());
+        }
+        catalog.close().await.unwrap();
+        samples
+    }
+
+    let clustered = run(false).await;
+    let scattered = run(true).await;
+
+    println!("\n# 0016 unique-index maintenance per commit by store size (in-memory object_store)");
+    println!(
+        "# {BATCH} rows per commit (> merged-probe threshold), {COMMITS} commits, fast flush\n"
+    );
+    println!(
+        "{:>7}  {:>10}  {:>13}  {:>13}  {:>7}",
+        "commit", "cum_rows", "clustered_ms", "scattered_ms", "ratio"
+    );
+    let ms = |d: Duration| d.as_secs_f64() * 1_000.0;
+    for k in 0..COMMITS {
+        let cum_rows = (k as u64 + 1) * BATCH;
+        let (clustered_ms, scattered_ms) = (ms(clustered[k]), ms(scattered[k]));
+        let ratio = if clustered_ms > 0.0 {
+            scattered_ms / clustered_ms
+        } else {
+            0.0
+        };
+        println!(
+            "{:>7}  {cum_rows:>10}  {clustered_ms:>13.3}  {scattered_ms:>13.3}  {ratio:>7.2}",
+            k + 1
+        );
+    }
     println!();
 }

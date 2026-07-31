@@ -298,26 +298,19 @@ fits in memory at all. Three properties are load-bearing:
 - **One probe per distinct key, not per entry.** Repeats within a batch
   collapse in memory; two entries claiming one value for different rows
   collide there, before any read.
-- **Bounded concurrency, in bounded groups — up to a threshold batch
-  size.** Probes are independent point reads, so serializing them makes a
-  batch cost one store round-trip of latency *per entry*. They run with a
-  bounded fan-out, resolved a group at a time — peak memory is one group of
-  keys, not the batch's. Results are applied in batch order, so which entry
-  a rejection names does not depend on which probe finished first.
-- **Past the threshold, one sorted pass per index.** A bulk load probes
-  nearly every key it stages, and a random point read per key against an
-  index that grows with the load makes loading quadratic in rows — measured
-  as the difference between minutes and hours at ten million rows. Above a
-  threshold of unique puts, the batch's keys are sorted (the index id leads
-  the encoded key, so each index's keys form a contiguous run) and each run
-  is resolved by one scan bounded to the run's key span, advanced in step
-  with the sorted keys and seeking over gaps: sequential reads proportional
-  to the overlapping range instead of a random read per key. Outcomes match
-  the point-read mode exactly, and the earliest staged entry still decides
-  which index a rejection names. Peak memory grows by the batch's probe
-  keys — a small share of the commit bound's kilobyte-per-entry budget.
-  Below the threshold — the small-commit shape, probing a large committed
-  index — point reads win, so both modes stay.
+- **Bounded concurrency, in bounded groups, at every batch size.** Probes
+  are independent point reads, so serializing them makes a batch cost one
+  store round-trip of latency *per entry*. They run with a bounded fan-out,
+  resolved a group at a time — peak memory is one group of keys, not the
+  batch's, whatever the batch size. Results are applied in batch order, so
+  which entry a rejection names does not depend on which probe finished
+  first. A bulk load probes nearly every key it stages, but each probe is a
+  bloom-filtered point read whose cost does not grow with the index, and the
+  bounded fan-out overlaps the object store's per-read latency — so the batch
+  stays linear in rows without a second resolution mode. A sorted range scan
+  would be worse for the common case: a bulk load's indexed values are not
+  store-ordered, so one scan sweeps the whole index serially where the
+  concurrent point reads touch only the blocks they need, in parallel.
 - **Entries stage onto the transaction directly.** They never enter the
   write list the committer retains for the maintained projections. No
   projection reflects an index entry, so retaining them would hold a second
