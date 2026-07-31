@@ -387,17 +387,10 @@ Three things gate disproportionately much of the list:
   from ordinary attach.
 - **IMPL** — Named, individually tested `v_n → v_{n+1}` units that compose for
   multi-version jumps, each with its own start, step, finish, and cursor.
-- **DECISION** — The rollback strategy for one-way structural migrations: a
-  pre-migration snapshot as sanctioned recovery, versus writing and testing
-  paired inverse migrations.
-- **DECISION** — Whether a structural bump can ever be served online across two
-  binary versions simultaneously, or whether drain and brief unavailability is
-  the permanent answer.
-- **DECISION** — Precisely which migrations are trivial enough to auto-run on
-  open (bounded `system`-only rewrites) versus requiring the explicit verb.
-- **DECISION** — Policy for a whole-store pre-migration
-  `Db::create_checkpoint()`: on by default or behind an operator flag, and when
-  it is released after success.
+- **DEFERRED** — Allowing a trivial, bounded `system`-only migration to
+  auto-run on open. The shipping behavior is explicit-verb-only for every
+  migration regardless of size; auto-run is a later refinement, not the first
+  cut.
 - **DEFERRED** — Rolling a fleet across a structural bump with mixed binary
   versions online.
 - **VALIDATE** — Crash injection at every migration seam — the start batch,
