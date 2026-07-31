@@ -207,10 +207,12 @@ merely migrator bookkeeping:
   half-migrated intermediate to anyone.
 
 Consequently **structural migration is _not_ online across mixed binary
-versions.** A rolling deployment that spans a structural bump either drains
-readers across the flip or tolerates a brief unavailability window. Making
-structural migration truly online across mixed binaries is unresolved, not a
-delivered feature — and saying so is the point of this section.
+versions**, and that is the permanent answer, not an open gap. A rolling
+deployment that spans a structural bump either drains readers across the flip
+or tolerates a brief unavailability window. Serving one structural bump across
+two binary versions at once is not offered: the key layout differs, so an old
+binary cannot read the new store, and no scheme reconciles that without keeping
+a second layout live alongside the first.
 
 ### One-way, composable migrations
 
@@ -220,16 +222,21 @@ v1→v2 then v2→v3, run in sequence, each with its own start/step/finish and i
 own cursor. There is no bespoke v1→v3 path to write or test; correctness of
 the composition follows from correctness of each link.
 
-There is **no automatic rollback.** The mitigations, all already load-bearing
-elsewhere in the design, are:
+There is **no automatic rollback**, by decision. Recovery from a failed
+migration is manual, resting on two mitigations already load-bearing elsewhere
+in the design:
 
 - Old objects are not deleted until the new ones that supersede them are
   durable (the step-loop ordering), so a failed migration can be reasoned
   about against surviving old state.
-- SlateDB's object history and/or an **optional pre-migration snapshot**
-  give a manual recovery point.
+- An **optional pre-migration checkpoint** gives a manual recovery point,
+  alongside SlateDB's object history. It is a whole-store
+  `Db::create_checkpoint()` behind an operator flag on the `migrate` verb, off
+  by default; when taken, it is released after the finish batch is durable.
 
-Rollback as a first-class, automatic operation is unresolved.
+Paired inverse migrations are deliberately not written or tested: the
+sanctioned recovery path is the pre-migration checkpoint, not a reverse
+rewrite.
 
 ### Trigger policy
 
@@ -245,11 +252,11 @@ from ordinary attach), **not** a silent auto-run on open. The reasoning:
 - Migration cost (time, object-store traffic, writer occupancy) is an
   operational decision with a maintenance-window shape; the operator owns it.
 
-The boundary: a **trivial metadata migration** (bounded, O(1)-ish, e.g.
-rewriting only the `system` records with no keyspace walk) *could* auto-run on
-open, because it carries none of the surprise. Where exactly that boundary
-sits — what qualifies as "trivial enough to auto-run" — is unresolved. The
-default is explicit.
+Every migration is triggered by the explicit verb; nothing auto-runs on open.
+A **trivial metadata migration** (bounded, O(1)-ish, e.g. rewriting only the
+`system` records with no keyspace walk) carries none of the surprise and could
+later be allowed to auto-run, but that is deferred — the shipping behavior is
+explicit for every migration regardless of size.
 
 ### Test obligations
 
