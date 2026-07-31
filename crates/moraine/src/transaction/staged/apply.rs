@@ -642,6 +642,31 @@ pub(super) fn apply_update_set_begin(
 /// snapshot records are pruned with direct key deletes (`history` keys
 /// exist only in the store, never in the working state); embedded rows
 /// (tag entries, spec columns) rewrite or ride their parent.
+/// Expires one snapshot: the merged record and the changed-key record it
+/// wrote. The delta must go with it — one outliving the entity versions it
+/// names would let a refresh replay a gap the store can no longer resolve.
+/// The paired `ducklake_snapshot_changes` delete names the same id and
+/// stages nothing.
+fn apply_snapshot_delete(
+    state: &CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+    direct: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    let mut c = Cursor::new(table, cells);
+    let snapshot_id = c.u64()?;
+    c.finish()?;
+    if snapshot_id == state.snapshot.snapshot_id {
+        return Err(Error::Constraint(format!(
+            "snapshot {snapshot_id} is the head and cannot be expired"
+        )));
+    }
+
+    direct.push((Key::Snapshot { snapshot_id }.encode(), None));
+    direct.push((Key::CommitDelta { snapshot_id }.encode(), None));
+    Ok(())
+}
+
 pub(super) fn apply_delete(
     state: &mut CatalogSnapshot,
     table: TableKind,
@@ -665,21 +690,7 @@ pub(super) fn apply_delete(
             }
             Ok(())
         }
-        // The merged snapshot record dies with the `ducklake_snapshot`
-        // delete; the paired `ducklake_snapshot_changes` delete names the
-        // same id and stages nothing.
-        TableKind::Snapshot => {
-            let mut c = Cursor::new(table, cells);
-            let snapshot_id = c.u64()?;
-            c.finish()?;
-            if snapshot_id == state.snapshot.snapshot_id {
-                return Err(Error::Constraint(format!(
-                    "snapshot {snapshot_id} is the head and cannot be expired"
-                )));
-            }
-            direct.push((Key::Snapshot { snapshot_id }.encode(), None));
-            Ok(())
-        }
+        TableKind::Snapshot => apply_snapshot_delete(state, table, cells, direct),
         TableKind::SnapshotChanges => {
             let mut c = Cursor::new(table, cells);
             let _snapshot_id = c.u64()?;

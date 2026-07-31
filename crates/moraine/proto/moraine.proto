@@ -340,6 +340,13 @@ message GcFileValue {
   int64 schedule_start_micros = 4;
 }
 
+// commitdelta: the encoded current keys one commit put or deleted.
+// Keys carry no values — a refresh re-reads each key's state at its own
+// pinned cut, so a stored value could only restate or contradict it.
+message CommitDeltaValue {
+  repeated bytes current_keys = 1;
+}
+
 // sys/format: structural layout version (currently 1) and the moraine
 // version that wrote the store.
 message FormatValue {

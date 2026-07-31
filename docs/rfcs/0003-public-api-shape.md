@@ -112,9 +112,9 @@ let past = catalog.snapshot_at(snapshot_id).await?;   // time travel
 ```
 
 Both return `Arc<CatalogSnapshot>`. `snapshot()` serves the handle's cached
-view when it already stands at head (RFC 0009) and scans `current` when it
-does not; `snapshot_at(S)` always scans, additionally reading the relevant
-`history` ranges and filtering by begin/end per RFC 0002.
+view, refreshed to head per RFC 0009, and scans `current` only when it has no
+usable cached view; `snapshot_at(S)` always scans, additionally reading the
+relevant `history` ranges and filtering by begin/end per RFC 0002.
 
 The `Arc` is what makes a warm read genuinely cheap. The view is immutable
 and often large, so handing back a shared pointer lets the handle and every

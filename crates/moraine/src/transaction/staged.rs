@@ -516,6 +516,11 @@ impl StagedTransaction {
 
         let translated = if mints_snapshot {
             translate(base_ref, &ops, &poisoned).map(|(new_id, mut writes, snap)| {
+                // Recorded from the entity writes alone, before the snapshot
+                // and head writes join them, so the delta never names its own
+                // commit's metadata.
+                let commit_delta = commit::delta_write_for(new_id, &writes);
+                writes.extend(commit_delta);
                 writes.push((
                     Key::Snapshot {
                         snapshot_id: new_id,

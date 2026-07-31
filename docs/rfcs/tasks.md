@@ -26,13 +26,8 @@ deliberately not itemized here.
 
 ## Where the weight is
 
-Three things gate disproportionately much of the list:
+Two things gate disproportionately much of the list:
 
-- **Reader refresh** (RFC 0009). Reads now serve from the cache, so a warm
-  read costs one point read. What is missing is *incremental* refresh: a
-  cache that has fallen behind head rematerializes wholesale rather than
-  replaying the gap. Its main beneficiary would be read-only catalogs, which
-  cache nothing at all pending the read-snapshot pin below.
 - **Format migration** (RFC 0015). The `sys/migration` marker is reserved and
   refused-on-open, and nothing else. The reader gate must ship in format
   version 1 — before any migration exists — or fielded readers are unsafe
@@ -213,18 +208,20 @@ Three things gate disproportionately much of the list:
 
 ## 0009 — Reader consistency and snapshot caching
 
-- **IMPL** — Incremental refresh: pin a fresh read-snapshot, check `sys/head`
-  and the migration marker, scan `snap/{S+1..head}` under the same handle, and
-  re-read or drop just the entities each record's `snapshot_changes` names.
-  Nothing exists; the only forward-folding applies the committer's own batch.
-- **IMPL** — Fall back to full rematerialization when `S` has fallen below the
-  horizon `H` and the gap's `snapshot` records may have been reclaimed.
-- **IMPL** — A churn-versus-catalog-size threshold that falls back to a full
-  `current` rescan when replaying the changelog would cost more.
-- **DECISION** — The churn ratio for that threshold. Full-materialization cost
-  is measured (`BENCHMARK.md` → Core measurements: ~5–7 µs per live entity,
-  linear); the crossover it trades against needs incremental refresh built to
-  measure the other side.
+- **MEASURE** — The churn ratio against a *real* object store. The shipped
+  ratio (two fifths) comes from the in-memory measurement in `BENCHMARK.md`
+  → Refresh vs. rematerialization, where a point read and a sequential scan
+  cost far more alike than they do over a network. The true crossover on a
+  remote store is lower; how much lower is unmeasured.
+- **MEASURE** — The `MAX_DELTA_KEYS` cap (4096): it bounds one commit's delta
+  record, and nothing has yet checked what fraction of real commits it
+  suppresses.
+- **MEASURE** — Whether the advanced refresh path is reachable in practice on
+  a single writer. Its own commits fold forward into the cache, so a
+  same-process reader lands on the unchanged path instead; the replay only
+  fires in the race window between a concurrent commit's head write and its
+  fold, and would become the main path if caching is extended to read-only
+  catalogs.
 - **DECISION** — How a read-only handle gets a cut that is both live and
   consistent. `DbReader` exposes no `snapshot()`, and SlateDB offers only two
   modes: an explicit `checkpoint_id`, which is consistent but stops polling
@@ -264,14 +261,13 @@ Three things gate disproportionately much of the list:
   Whichever is taken first pulls the other with it.
 - **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
   re-resolve per statement? This sets how tight the retention window must be.
-- **VALIDATE** — The refresh test suite: a commit landing mid-materialization
-  yields an entirely pre- or entirely post-commit view, never torn; a view
-  built at `S` still returns the `S` view after `k` commits; an incremental
-  refresh to head is byte-identical to a full rematerialization; a reader below
-  the horizon rematerializes while an expired request errors; a
-  materialization under `sys/migration` returns the typed error and never a
-  partial view; a commit landing between a commit attempt's materialization
-  and its batch write is always detected.
+- **VALIDATE** — The refresh cases that need concurrency the suite cannot yet
+  stage: a commit landing mid-materialization yields an entirely pre- or
+  entirely post-commit view, never torn; a view built at `S` still returns the
+  `S` view after `k` commits; a commit landing between a commit attempt's
+  materialization and its batch write is always detected. The single-writer
+  cases — refresh equals rematerialization, the three fallbacks, the migration
+  refusal, and the install compare-and-set — are covered.
 
 ## 0010 — Async↔sync bridge
 

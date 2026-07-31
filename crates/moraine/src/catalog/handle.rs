@@ -16,7 +16,7 @@ use crate::{
     catalog::{
         CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo, FileIndexEntry, IndexDef,
         IndexEntry, IndexId, IndexInfo, IndexState, RowHolder, RowLocation, SnapshotId, TableId,
-        projection::{ProjectionCache, cache_epoch, cached_head_view, install_head_view_at},
+        projection::{ProjectionCache, cache_epoch, cached_head_view_any, install_head_view_at},
         scoped_read,
     },
     error::{Error, Result},
@@ -29,7 +29,7 @@ use crate::{
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
     },
-    transaction::{Transaction, commit, index_maintenance},
+    transaction::{Refreshed, Transaction, commit, index_maintenance},
 };
 
 /// How many entries one staged build step commits. At roughly a kilobyte
@@ -311,7 +311,7 @@ impl Catalog {
         // this read cannot be overwritten by what it invalidated.
         let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
-        let view = self.head_view(session.handle()).await;
+        let view = self.refreshed_head_view(session.handle()).await;
         session.finish();
 
         let view = view?;
@@ -320,14 +320,16 @@ impl Catalog {
         Ok(view)
     }
 
-    /// The cached view when it already stands at head, else a fresh one. A
-    /// reader polling a quiet catalog pays one point read and no copy: the
-    /// committer folds each batch forward, so the cache is normally current.
-    async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
-        commit::refuse_mid_migration(handle).await?;
-        let head = commit::read_head_id(handle).await?;
-        if let Some(cached) = cached_head_view(&self.projections, head) {
-            return Ok(cached);
+    /// Refreshes the cached view forward when there is one, else builds it.
+    /// An unmoved head hands back the very same view, so a reader that polls
+    /// a quiet catalog pays one point read and no copy at all.
+    async fn refreshed_head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
+        if let Some(cached) = cached_head_view_any(&self.projections) {
+            match commit::refresh(handle, &cached).await? {
+                Refreshed::Unchanged => return Ok(cached),
+                Refreshed::Advanced(view) => return Ok(view),
+                Refreshed::Rescan => {}
+            }
         }
 
         Ok(Arc::new(commit::materialize(handle, None).await?))

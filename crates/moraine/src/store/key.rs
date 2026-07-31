@@ -41,6 +41,12 @@ pub(crate) enum Key {
     /// Equality-index entries. Live-only; keyed by index and canonical
     /// value.
     Index(IndexKey),
+    /// The `current` keys one commit wrote, replayed by an incremental
+    /// refresh. Append-only; removed with its snapshot record.
+    CommitDelta {
+        /// Snapshot the commit minted.
+        snapshot_id: u64,
+    },
 }
 
 /// An equality-index entry key. The unique kind keys on the value alone —
@@ -340,6 +346,10 @@ pub(crate) enum Subspace {
     // whole-subspace scan yet.
     #[allow(dead_code)]
     Index,
+    /// Per-commit changed-key records.
+    // Refresh point-reads each id in its gap; nothing scans the subspace.
+    #[allow(dead_code)]
+    CommitDelta,
 }
 
 impl Subspace {
@@ -358,6 +368,7 @@ impl Subspace {
                 index_id: 0,
                 key: CanonicalKey::empty(),
             }),
+            Self::CommitDelta => Key::CommitDelta { snapshot_id: 0 },
         }
     }
 }
@@ -692,6 +703,13 @@ mod tests {
         let mut expect = vec![0x03];
         expect.extend(be(42));
         assert_eq!(Key::Snapshot { snapshot_id: 42 }.encode(), expect);
+    }
+
+    #[test]
+    fn golden_commit_delta_key() {
+        let mut expect = vec![0x08];
+        expect.extend(be(42));
+        assert_eq!(Key::CommitDelta { snapshot_id: 42 }.encode(), expect);
     }
 
     #[test]
@@ -1341,6 +1359,7 @@ mod tests {
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
             arb_index().prop_map(Key::Index),
+            any::<u64>().prop_map(|snapshot_id| Key::CommitDelta { snapshot_id }),
         ]
     }
 

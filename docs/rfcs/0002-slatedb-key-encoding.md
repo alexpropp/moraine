@@ -61,6 +61,7 @@ below the leading byte is moraine convention, opaque to SlateDB.
 | `history` | Ended entity versions | Append-only |
 | `inline` | Inlined data — reserved for RFC 0005 | Per RFC 0005 |
 | `index` | Equality-index entries (RFC 0016) | Live-only; insert + delete |
+| `commitdelta` | The `current` keys one commit wrote, for reader refresh (RFC 0009) | Append-only, immutable |
 
 (Subspace declaration order — and therefore each subspace's discriminant
 byte — is fixed by the `Key` type and pinned by golden vectors; see Keys.)
@@ -150,6 +151,7 @@ Other subspaces:
 | `sys/head` | — | Latest committed `snapshot_id` |
 | `sys/migration` | — | Structural-migration marker (RFC 0015): `{from_format, to_format, cursor}`, present only mid-migration. **Reserved from format v1**: every materialization checks it and refuses a mid-migration store (RFC 0009) — the check must predate the first migration ever run. |
 | `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together) |
+| `commitdelta` | `snapshot_id` | The encoded `current` keys the commit at `snapshot_id` put or deleted — the changelog a reader replays to refresh incrementally (RFC 0009). Written in the commit's own batch, expired with its snapshot record (RFC 0007). A separate subspace rather than a field on the `snapshot` record because the snapshots projection is re-read per transaction and decoding it must not drag every commit's key list with it; refresh point-reads only the ids in its gap. Absent — never written, expired, or suppressed because the commit exceeded the size cap — means "not replayable", and the reader rematerializes in full. |
 | `current/gcfile` | `data_file_id` | `ducklake_files_scheduled_for_deletion` — keyed by the scheduled file's id, the row's identity in DuckLake's own schema (inserts carry it, cleanup deletes by it); unique because a file's catalog rows are removed in the same transaction that schedules it, so no moraine-allocated id or counter exists (RFC 0007) |
 | `inline/*` | `table_id, schema_version, …` | Reserved — RFC 0005 |
 

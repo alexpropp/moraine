@@ -3266,14 +3266,180 @@ async fn seeded_catalog(tables: usize) -> (crate::catalog::Catalog, Vec<crate::c
     (catalog, ids)
 }
 
-/// A migration may be moving keys mid-scan, so a read refuses rather than
-/// return a view that is silently missing records — and a warm cache is no
-/// exception. The first read below installs a view; the marker must still
-/// win over it, or a cached reader would sail through a migration.
+/// The whole contract in one assertion: advancing a held view through the
+/// changelog and rebuilding it from scratch must produce the same view, or
+/// the cache is a liability rather than an optimization.
 #[tokio::test]
-async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
+async fn a_refreshed_view_matches_a_full_rematerialization() {
+    use crate::catalog::{DataFile, OptionScope};
+
+    let (catalog, tables) = seeded_catalog(12).await;
+    let base = catalog.snapshot().await.unwrap();
+
+    // Churn of every shape the fold distinguishes: a create, a file
+    // registration, a rename, a column drop, an option, a table drop.
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("s").unwrap().id;
+            tx.create_table(
+                schema,
+                "late",
+                &[crate::catalog::ColumnDef {
+                    name: "a".into(),
+                    column_type: "BIGINT".into(),
+                    nulls_allowed: true,
+                    default_value: None,
+                }],
+            )?;
+            tx.register_data_file(
+                tables[0],
+                DataFile {
+                    path: "f.parquet".into(),
+                    path_is_relative: true,
+                    file_format: "parquet".into(),
+                    record_count: 3,
+                    file_size_bytes: 100,
+                    footer_size: 8,
+                    encryption_key: None,
+                    column_stats: vec![],
+                },
+                &[],
+            )?;
+            tx.set_option(OptionScope::Global, "answer", "42")
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .commit(|tx| {
+            tx.rename_table(tables[1], "renamed")?;
+            let second = tx.columns_of(tables[1])[1].id;
+            tx.drop_column(tables[1], second)
+        })
+        .await
+        .unwrap();
+
+    catalog.commit(|tx| tx.drop_table(tables[2])).await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let handle = ReadHandle::Tx(&tx);
+    let head = read::read_head(handle).await.unwrap().unwrap().snapshot_id;
+    let fresh = materialize(handle, None).await.unwrap();
+    let Refreshed::Advanced(refreshed) = refresh(handle, &base).await.unwrap() else {
+        panic!("a three-commit gap over a twelve-table catalog is replayable")
+    };
+    tx.rollback();
+
+    assert_eq!(refreshed.snapshot.snapshot_id, head);
+    assert!(
+        diff_writes(&fresh, &refreshed, head + 1).is_empty(),
+        "refreshed view diverged from a fresh scan"
+    );
+    assert!(
+        diff_writes(&refreshed, &fresh, head + 1).is_empty(),
+        "refreshed view diverged from a fresh scan"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// An unmoved head must cost nothing beyond the head read and must return
+/// the same view, not a rebuilt one.
+#[tokio::test]
+async fn refreshing_an_unchanged_head_returns_the_same_view() {
     let (catalog, _) = seeded_catalog(3).await;
-    catalog.snapshot().await.unwrap();
+    let base = catalog.snapshot().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let outcome = refresh(ReadHandle::Tx(&tx), &base).await.unwrap();
+    tx.rollback();
+
+    assert!(
+        matches!(outcome, Refreshed::Unchanged),
+        "an unchanged head must reuse the held view, not rebuild it"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A gap whose delta records have expired is not replayable: the reader
+/// must fall back rather than serve a view missing those commits.
+#[tokio::test]
+async fn a_gap_with_expired_deltas_falls_back() {
+    let (catalog, tables) = seeded_catalog(6).await;
+    let base = catalog.snapshot().await.unwrap();
+    catalog
+        .commit(|tx| tx.rename_table(tables[0], "r"))
+        .await
+        .unwrap();
+
+    // Expiry removes a delta with its snapshot; deleting it directly is the
+    // same input to the reader without driving a full expiry.
+    let gap = base.snapshot.snapshot_id + 1;
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.delete(Key::CommitDelta { snapshot_id: gap }.encode())
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let outcome = refresh(ReadHandle::Tx(&tx), &base).await.unwrap();
+    tx.rollback();
+
+    assert!(
+        matches!(outcome, Refreshed::Rescan),
+        "an unreplayable gap must fall back"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// Once the changed keys outnumber the records the view holds, re-reading
+/// them one by one can no longer beat a single scan.
+#[tokio::test]
+async fn a_union_larger_than_the_view_falls_back() {
+    // The bootstrap view holds only schema `main`, so any real commit's
+    // key set immediately outgrows it.
+    let catalog = crate::catalog::Catalog::open(
+        Arc::new(InMemory::new()),
+        crate::catalog::CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    let base = catalog.snapshot().await.unwrap();
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            for index in 0..8 {
+                tx.create_table(
+                    schema,
+                    &format!("t{index}"),
+                    &[crate::catalog::ColumnDef {
+                        name: "a".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: true,
+                        default_value: None,
+                    }],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let outcome = refresh(ReadHandle::Tx(&tx), &base).await.unwrap();
+    tx.rollback();
+
+    assert!(
+        matches!(outcome, Refreshed::Rescan),
+        "churn past the view's size must fall back to a scan"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A migration may be moving keys mid-scan, so both read paths refuse
+/// rather than return a view that is silently missing records.
+#[tokio::test]
+async fn the_migration_marker_refuses_both_read_paths() {
+    let (catalog, _) = seeded_catalog(3).await;
+    let base = catalog.snapshot().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
     tx.put(
@@ -3288,16 +3454,16 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
     tx.commit().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let materialized = materialize(ReadHandle::Tx(&tx), None).await.err().unwrap();
+    let handle = ReadHandle::Tx(&tx);
+    let materialized = materialize(handle, None).await.err().unwrap();
+    let refreshed = refresh(handle, &base).await.err().unwrap();
     tx.rollback();
-
-    let served = catalog.snapshot().await.err().unwrap();
 
     assert!(
         matches!(materialized, Error::Migration(_)),
         "{materialized:?}"
     );
-    assert!(matches!(served, Error::Migration(_)), "{served:?}");
+    assert!(matches!(refreshed, Error::Migration(_)), "{refreshed:?}");
     catalog.close().await.unwrap();
 }
 
@@ -3352,4 +3518,132 @@ fn retry_backoff_budget_stays_in_a_sane_band() {
         total <= std::time::Duration::from_millis(600),
         "whole retry budget waits {total:?}"
     );
+}
+
+/// 0009 — refresh versus full rematerialization, by churn.
+///
+/// Lives here rather than in the `measure` integration module because
+/// `refresh` and `materialize` are crate-internal; the reader-facing
+/// `snapshot()` cannot reach the advanced path on a single writer, whose
+/// own commits keep the cache current by folding.
+///
+/// Prints three costs per churn level: a full materialization, a refresh
+/// replaying that churn, and the bare view copy a refresh must pay before
+/// applying anything. The copy column is the one that decides whether
+/// refresh is churn-shaped or catalog-shaped.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::cast_precision_loss)]
+async fn measure_refresh_by_churn() {
+    use crate::catalog::DataFile;
+
+    const TABLES: usize = 200;
+    const FILES_PER_TABLE: usize = 16;
+    const REPEATS: usize = 25;
+    let ladder = [1usize, 10, 100, 300, 1_000];
+
+    // Min alongside median: these are CPU-bound over an in-memory store, so
+    // noise only ever adds time and the floor is the more stable signal.
+    let summarize = |mut samples: Vec<std::time::Duration>| -> (f64, f64) {
+        samples.sort();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1_000.0;
+        (ms(samples[samples.len() / 2]), ms(samples[0]))
+    };
+    let file = |n: usize| DataFile {
+        path: format!("f{n}.parquet"),
+        path_is_relative: true,
+        file_format: "parquet".into(),
+        record_count: 3,
+        file_size_bytes: 100,
+        footer_size: 8,
+        encryption_key: None,
+        column_stats: vec![],
+    };
+
+    println!("\n# 0009 refresh vs rematerialization (in-memory object_store)");
+    println!("# {TABLES} tables, {FILES_PER_TABLE} files each, median of {REPEATS}\n");
+    println!(
+        "{:>7}  {:>9}  {:>9}  {:>9}  {:>11}  {:>11}  {:>9}  {:>8}",
+        "churn",
+        "entities",
+        "remat_med",
+        "remat_min",
+        "refresh_med",
+        "refresh_min",
+        "copy_min",
+        "speedup"
+    );
+
+    for &churn in &ladder {
+        let (catalog, tables) = seeded_catalog(TABLES).await;
+        for &table in &tables {
+            catalog
+                .commit(|tx| {
+                    for n in 0..FILES_PER_TABLE {
+                        tx.register_data_file(table, file(n), &[])?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let base = catalog.snapshot().await.unwrap();
+
+        // One commit whose delta names `churn` distinct file keys.
+        catalog
+            .commit(|tx| {
+                for n in 0..churn {
+                    tx.register_data_file(tables[n % tables.len()], file(1_000 + n), &[])?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Counted at head, which is what a rematerialization actually walks.
+        let head_view = catalog.snapshot().await.unwrap();
+        let entities: usize = head_view
+            .schemas()
+            .iter()
+            .flat_map(|s| head_view.tables_in(s.id))
+            .map(|t| 1 + head_view.columns_of(t.id).len() + head_view.data_files_of(t.id).len())
+            .sum();
+
+        let tx = catalog.begin_write_tx().await.unwrap();
+        let handle = ReadHandle::Tx(&tx);
+
+        let mut remat = Vec::with_capacity(REPEATS);
+        let mut refreshed = Vec::with_capacity(REPEATS);
+        let mut copied = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = std::time::Instant::now();
+            let view = materialize(handle, None).await.unwrap();
+            remat.push(start.elapsed());
+            std::hint::black_box(&view);
+
+            let start = std::time::Instant::now();
+            let view = refresh(handle, &base).await.unwrap();
+            refreshed.push(start.elapsed());
+            assert!(matches!(view, Refreshed::Advanced(_)), "expected a replay");
+
+            // Deref first: `base` is an `Arc`, so `base.clone()` would time
+            // a refcount bump rather than the view copy refresh pays for.
+            let start = std::time::Instant::now();
+            let copy: CatalogSnapshot = (*base).clone();
+            copied.push(start.elapsed());
+            std::hint::black_box(&copy);
+        }
+        tx.rollback();
+
+        let ((remat_med, remat_min), (refresh_med, refresh_min), (_, copy_min)) =
+            (summarize(remat), summarize(refreshed), summarize(copied));
+        println!(
+            "{churn:>7}  {entities:>9}  {remat_med:>9.3}  {remat_min:>9.3}  \
+             {refresh_med:>11.3}  {refresh_min:>11.3}  {copy_min:>9.3}  {:>8.2}",
+            remat_min / refresh_min
+        );
+        catalog.close().await.unwrap();
+    }
+    println!();
 }

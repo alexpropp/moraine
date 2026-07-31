@@ -115,6 +115,17 @@ pub(crate) fn install_head_view(
         .set_head_view(view);
 }
 
+/// The cached view whatever head it sits at, for a reader that means to
+/// refresh it forward rather than match it.
+pub(crate) fn cached_head_view_any(
+    cache: &std::sync::RwLock<ProjectionCache>,
+) -> Option<Arc<CatalogSnapshot>> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .head_view_any()
+}
+
 /// The install epoch to capture before reading the store.
 pub(crate) fn cache_epoch(cache: &std::sync::RwLock<ProjectionCache>) -> u64 {
     cache
@@ -186,6 +197,11 @@ impl ProjectionCache {
             .as_ref()
             .filter(|view| view.snapshot.snapshot_id == expected_head)
             .cloned()
+    }
+
+    /// The head view at whatever head it holds.
+    pub(crate) fn head_view_any(&self) -> Option<Arc<CatalogSnapshot>> {
+        self.head_view.clone()
     }
 
     pub(crate) fn epoch(&self) -> u64 {
