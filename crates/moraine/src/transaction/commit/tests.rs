@@ -60,6 +60,36 @@ async fn migration_marker_is_refused() {
     assert!(matches!(err, Error::Migration(_)), "{err:?}");
 }
 
+/// A format below this binary's floor refuses toward the migrate path,
+/// distinct from the newer-than-binary message.
+#[tokio::test]
+async fn older_format_refuses_toward_migrate() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = StoreBuilder::new("", object_store.clone())
+        .open_writer()
+        .await
+        .unwrap();
+    db.put(
+        &Key::Sys(SysKey::Format).encode(),
+        &value::encode_value(&proto::FormatValue {
+            format_version: 0,
+            writer_version: "t".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+        .await
+        .err()
+        .unwrap();
+    match err {
+        Error::Migration(msg) => assert!(msg.contains("migrate"), "older-store message: {msg}"),
+        other => panic!("expected Migration, got {other:?}"),
+    }
+}
+
 /// Renaming one column touches that column and nothing else: churn is
 /// proportional to the change, not to the table's width.
 #[test]

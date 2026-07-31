@@ -46,8 +46,11 @@ pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
 /// index and serve from an under-covered entry set, so it must refuse this.
 pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
 /// The highest format this binary understands. It opens any store in
-/// `FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
+/// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
 pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
+/// The lowest structural format this binary reads directly. A store below
+/// this floor must be migrated up before an ordinary attach can use it.
+pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_VERSION;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
@@ -115,13 +118,21 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
         ));
     }
     match read::read_format(tx).await? {
-        Some(format) if (FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&format.format_version) => {
-            Ok(Some(format))
+        Some(format) if format.format_version > MAX_FORMAT_VERSION => {
+            Err(Error::Migration(format!(
+                "store format {} is newer than this binary understands (max {MAX_FORMAT_VERSION}); \
+             upgrade the binary",
+                format.format_version
+            )))
         }
-        Some(format) => Err(Error::Migration(format!(
-            "store format {} is outside the supported range {FORMAT_VERSION}..={MAX_FORMAT_VERSION}",
-            format.format_version
-        ))),
+        Some(format) if format.format_version < MIN_FORMAT_VERSION => {
+            Err(Error::Migration(format!(
+                "store format {} predates this binary's minimum ({MIN_FORMAT_VERSION}); \
+             run the migrate verb to upgrade it",
+                format.format_version
+            )))
+        }
+        Some(format) => Ok(Some(format)),
         None => Ok(None),
     }
 }
