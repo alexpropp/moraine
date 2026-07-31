@@ -61,7 +61,9 @@ async fn migration_marker_is_refused() {
 }
 
 /// A format below this binary's floor refuses toward the migrate path,
-/// distinct from the newer-than-binary message.
+/// distinct from the newer-than-binary message. The floor sits at the base
+/// format while every format is additive, so only a synthetic store reaches
+/// this arm; the test holds it correct for the first format that raises it.
 #[tokio::test]
 async fn older_format_refuses_toward_migrate() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
@@ -3298,6 +3300,39 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
         "{materialized:?}"
     );
     assert!(matches!(served, Error::Migration(_)), "{served:?}");
+    catalog.close().await.unwrap();
+}
+
+/// A commit resolves its base view from the same warm cache a read serves
+/// from, so the gate belongs at that read too. Without it the one path
+/// that writes would plan against a view of a keyspace being rewritten.
+#[tokio::test]
+async fn the_migration_marker_refuses_a_commit_with_a_warm_cache() {
+    let (catalog, _) = seeded_catalog(3).await;
+    catalog.snapshot().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let err = catalog
+        .commit(|tx| {
+            tx.create_schema("late")?;
+            Ok(())
+        })
+        .await
+        .err()
+        .unwrap();
+
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
     catalog.close().await.unwrap();
 }
 

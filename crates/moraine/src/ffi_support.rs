@@ -11,7 +11,10 @@
 //!
 //! Every function opens one fresh read-only transaction, scans, and rolls
 //! back. Views spanning several `dump_*` calls are not snapshot-consistent:
-//! each call reads at whatever the current head is when it runs.
+//! each call reads at whatever the current head is when it runs. Opening
+//! that transaction refuses a store undergoing a structural migration, so
+//! every function here can return [`crate::Error::Migration`] however it
+//! would otherwise have succeeded.
 
 use std::sync::Arc;
 
@@ -857,6 +860,76 @@ mod tests {
 
         let deletions = dump_scheduled_deletions(&catalog).await.unwrap();
         assert!(deletions.is_empty());
+    }
+
+    /// Plants a `sys/migration` marker under a live catalog handle: the
+    /// shape a reader meets when a migrator starts after it attached and
+    /// its open-time format check has already passed.
+    async fn plant_migration_marker(catalog: &Catalog) {
+        use crate::store::{
+            key::{Key, SysKey},
+            proto::MigrationValue,
+            value::encode_value,
+        };
+
+        let tx = catalog.begin_write_tx().await.unwrap();
+        tx.put(
+            Key::Sys(SysKey::Migration).encode(),
+            encode_value(&MigrationValue {
+                from_format: 1,
+                to_format: 2,
+                cursor: Vec::new(),
+            }),
+        )
+        .unwrap();
+        tx.commit_with_options(&crate::transaction::commit::durable())
+            .await
+            .unwrap();
+    }
+
+    fn refuses<T>(outcome: &Result<T>) -> bool {
+        matches!(outcome, Err(crate::error::Error::Migration(_)))
+    }
+
+    /// A migration is moving keys as these functions scan, so each must be
+    /// unavailable rather than serve a catalog with a hole in it. The
+    /// `dump_*` and inline seams scan the store directly instead of
+    /// through a materialization, so the read-session gate is the only
+    /// thing standing between them and a silently shrinking view.
+    #[tokio::test]
+    async fn a_planted_marker_refuses_every_read_seam() {
+        let catalog = seed().await;
+        plant_migration_marker(&catalog).await;
+
+        assert!(refuses(&catalog.snapshot().await), "snapshot");
+        assert!(refuses(&dump_schemas(&catalog).await), "dump_schemas");
+        assert!(refuses(&dump_mappings(&catalog).await), "dump_mappings");
+        assert!(
+            refuses(&dump_table_stats(&catalog).await),
+            "dump_table_stats"
+        );
+        assert!(refuses(&dump_snapshots(&catalog).await), "dump_snapshots");
+
+        assert!(
+            refuses(&inline::scan_inline(&catalog, 1, inline::InlineScanKind::Table, 1, 0).await),
+            "scan_inline"
+        );
+        assert!(
+            refuses(&inline::inline_schemas(&catalog, 1).await),
+            "inline_schemas"
+        );
+        assert!(
+            refuses(&inline::inline_registered_tables(&catalog).await),
+            "inline_registered_tables"
+        );
+        assert!(
+            refuses(&inline::inline_file_delete_table_exists(&catalog, 1).await),
+            "inline_file_delete_table_exists"
+        );
+        assert!(
+            refuses(&inline::inline_file_deletes(&catalog, 1).await),
+            "inline_file_deletes"
+        );
     }
 
     #[tokio::test]
