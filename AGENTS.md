@@ -66,4 +66,6 @@ cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warni
 The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`,
 and a commit-msg hook there rejects non-conventional commit subjects (the
 changelog is generated from them; CI validates PR titles the same way).
-One-time setup per clone: `git config core.hooksPath .githooks`.
+Conductor workspaces enable those hooks from `.conductor/settings.toml`,
+which also installs the toolchain a cloud workspace starts without. A plain
+clone needs it once: `git config core.hooksPath .githooks`.
