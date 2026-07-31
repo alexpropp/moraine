@@ -1,5 +1,5 @@
-//! Crash-injection seams for the migration and crash test matrix. Compiled
-//! only under `test` or the `fault-injection` feature, so production builds
+//! Crash-injection seams for the format-migration driver. Compiled only
+//! under `test` or the `fault-injection` feature, so production builds
 //! carry no seam code and no fault surface.
 
 use std::cell::Cell;
@@ -7,7 +7,8 @@ use std::cell::Cell;
 use crate::error::{Error, Result};
 
 /// A named seam the migration driver consults between durable batches.
-/// Each variant is one row of the crash matrix.
+/// These are that driver's own batch boundaries; the enumerated crash
+/// matrix is a separate set of rows, driven by the integration suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CrashPoint {
     /// After the start batch (marker + initial cursor) is durable.
