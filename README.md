@@ -1,6 +1,6 @@
 # moraine
 
-[![CI](https://github.com/alexpropp/moraine/actions/workflows/ci.yml/badge.svg)](https://github.com/alexpropp/moraine/actions/workflows/ci.yml)
+[![CI](https://github.com/morainedb/moraine/actions/workflows/ci.yml/badge.svg)](https://github.com/morainedb/moraine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![crates.io](https://img.shields.io/crates/v/moraine.svg)](https://crates.io/crates/moraine)
 [![docs.rs](https://docs.rs/moraine/badge.svg)](https://docs.rs/moraine)
@@ -8,7 +8,8 @@
 Moraine brings a [SlateDB](https://slatedb.io) backend to
 [DuckLake](https://ducklake.select): a DuckLake catalog implemented on a
 transactional KV store over object storage, instead of the usual relational
-catalog database.
+catalog database. Guides and design docs live on the project site:
+<https://morainedb.github.io/>.
 
 > **Status: pre-1.0, actively developed.** The catalog core and DuckDB
 > extension work end-to-end: DuckLake SQL — `CREATE`/`INSERT`/`UPDATE`/
