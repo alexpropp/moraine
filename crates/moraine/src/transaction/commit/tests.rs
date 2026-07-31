@@ -30,7 +30,7 @@ async fn unknown_format_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Corruption(_)));
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
 }
 
 /// A mid-migration marker refuses the open outright.
@@ -57,7 +57,144 @@ async fn migration_marker_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Corruption(_)));
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+}
+
+/// A format below this binary's floor refuses toward the migrate path,
+/// distinct from the newer-than-binary message.
+#[tokio::test]
+async fn older_format_refuses_toward_migrate() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = StoreBuilder::new("", object_store.clone())
+        .open_writer()
+        .await
+        .unwrap();
+    db.put(
+        &Key::Sys(SysKey::Format).encode(),
+        &value::encode_value(&proto::FormatValue {
+            format_version: 0,
+            writer_version: "t".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+        .await
+        .err()
+        .unwrap();
+    match err {
+        Error::Migration(msg) => assert!(msg.contains("migrate"), "older-store message: {msg}"),
+        other => panic!("expected Migration, got {other:?}"),
+    }
+}
+
+/// A migration marker present under a live head makes every materialization
+/// unavailable, not partial — the reader-side gate, not only the open gate.
+#[tokio::test]
+async fn materialize_gate_refuses_on_marker() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = StoreBuilder::new("", object_store)
+        .open_writer()
+        .await
+        .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Head).encode(),
+        value::encode_value(&proto::HeadValue { snapshot_id: 0 }),
+    )
+    .unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: vec![],
+        }),
+    )
+    .unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
+
+    let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let err = materialize(ReadHandle::Tx(&read), None)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+    read.rollback();
+}
+
+/// Renaming one column touches that column and nothing else: churn is
+/// proportional to the change, not to the table's width.
+#[test]
+fn renaming_one_column_stages_no_write_for_any_sibling() {
+    use crate::{
+        catalog::ColumnDef,
+        store::key::{CurrentKey, HistoryKey},
+    };
+
+    let column_def = |name: &str| ColumnDef {
+        name: name.into(),
+        column_type: "BIGINT".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+
+    let snap0 = proto::SnapshotValue {
+        snapshot_id: 0,
+        snapshot_time_micros: 0,
+        schema_version: 0,
+        next_catalog_id: 1,
+        next_file_id: 0,
+        changes_made: String::new(),
+        author: None,
+        commit_message: None,
+        commit_extra_info: None,
+        schema_changed_table_ids: Vec::new(),
+    };
+    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, vec![], vec![], None), 1);
+    let schema = setup.create_schema("s").unwrap();
+    let table = setup
+        .create_table(
+            schema,
+            "t",
+            &[
+                column_def("a"),
+                column_def("b"),
+                column_def("c"),
+                column_def("d"),
+            ],
+        )
+        .unwrap();
+    let renamed = setup.columns_of(table)[1].id;
+    let base = setup.into_parts().state;
+
+    let mut tx = Transaction::new(base.clone(), 2);
+    tx.rename_column(table, renamed, "b2").unwrap();
+    let state = tx.into_parts().state;
+
+    let touched: Vec<u64> = diff_writes(&base, &state, 2)
+        .iter()
+        .filter_map(|(key_bytes, _)| match Key::decode(key_bytes).unwrap() {
+            Key::Current(CurrentKey::Entity(EntityKey::Column { column_id, .. }))
+            | Key::History(HistoryKey {
+                entity: EntityKey::Column { column_id, .. },
+                ..
+            }) => Some(column_id),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        touched.iter().all(|id| *id == renamed.get()),
+        "a rename of column {} staged writes for siblings: {touched:?}",
+        renamed.get()
+    );
+    assert!(
+        !touched.is_empty(),
+        "the renamed column itself must be written"
+    );
 }
 
 /// A file registered and expired within one commit exists in neither
@@ -3091,6 +3228,76 @@ async fn folded_head_view_matches_a_fresh_scan() {
         diff_writes(&cached, &fresh, head + 1).is_empty(),
         "folded head view diverged from a fresh scan"
     );
+    catalog.close().await.unwrap();
+}
+
+/// Seeds a catalog with `tables` tables of two columns each, so a base view
+/// holds enough live records that a small gap stays under the refresh's
+/// size backstop.
+#[allow(clippy::unwrap_used)]
+async fn seeded_catalog(tables: usize) -> (crate::catalog::Catalog, Vec<crate::catalog::TableId>) {
+    use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
+
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let column = |name: &str| ColumnDef {
+        name: name.into(),
+        column_type: "BIGINT".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+
+    let ids = std::cell::RefCell::new(Vec::new());
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            for index in 0..tables {
+                let id =
+                    tx.create_table(schema, &format!("t{index}"), &[column("a"), column("b")])?;
+                ids.borrow_mut().push(id);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let ids = ids.into_inner();
+    (catalog, ids)
+}
+
+/// A migration may be moving keys mid-scan, so a read refuses rather than
+/// return a view that is silently missing records — and a warm cache is no
+/// exception. The first read below installs a view; the marker must still
+/// win over it, or a cached reader would sail through a migration.
+#[tokio::test]
+async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
+    let (catalog, _) = seeded_catalog(3).await;
+    catalog.snapshot().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let materialized = materialize(ReadHandle::Tx(&tx), None).await.err().unwrap();
+    tx.rollback();
+
+    let served = catalog.snapshot().await.err().unwrap();
+
+    assert!(
+        matches!(materialized, Error::Migration(_)),
+        "{materialized:?}"
+    );
+    assert!(matches!(served, Error::Migration(_)), "{served:?}");
     catalog.close().await.unwrap();
 }
 

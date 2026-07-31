@@ -63,6 +63,17 @@ pub mod codes {
     /// writer; this handle can no longer commit. Terminal for the handle,
     /// and the message likewise avoids DuckLake's retry substrings.
     pub const FENCED: i32 = 11;
+    /// [`moraine::Error::Migration`] — the store needs, is undergoing, or
+    /// is newer than a structural format this binary supports. The C++
+    /// shim raises it as an `IOException`: fatal at attach, never retried.
+    pub const MIGRATION: i32 = 12;
+    /// [`moraine::Error::SnapshotExpired`] — a time-travel target fell
+    /// below the retention horizon. Raised as a `CatalogException`, like a
+    /// missing entity: the caller re-resolves rather than retries.
+    pub const SNAPSHOT_EXPIRED: i32 = 13;
+    /// [`moraine::Error::Unsupported`] — a DuckLake feature moraine does
+    /// not implement. Raised as a `NotImplementedException`; terminal.
+    pub const UNSUPPORTED: i32 = 14;
 }
 
 /// Fixed message for a caught panic; never derived from the panic
@@ -156,7 +167,15 @@ impl From<moraine::Error> for AbiError {
             moraine::Error::RetryBudgetExhausted(_) => codes::RETRY_EXHAUSTED,
             moraine::Error::Fenced(_) => codes::FENCED,
             moraine::Error::Corruption(_) => codes::CORRUPTION,
-            // Covers `Store` and any future `#[non_exhaustive]` variant.
+            // The four below carry none of the shim's retry substrings, so
+            // none is re-driven; their codes map to non-`TransactionException`
+            // DuckDB errors in the C++ shim (catalog.cpp) for the same reason.
+            moraine::Error::Unsupported(_) => codes::UNSUPPORTED,
+            moraine::Error::SnapshotExpired(_) => codes::SNAPSHOT_EXPIRED,
+            moraine::Error::Interrupted(_) => codes::INTERRUPTED,
+            moraine::Error::Migration(_) => codes::MIGRATION,
+            // Covers `Store`, `IndexBuilding`, `Configuration`, and any
+            // future `#[non_exhaustive]` variant.
             _ => codes::STORE,
         };
         Self::new(code, error_chain(&err))

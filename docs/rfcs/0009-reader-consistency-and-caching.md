@@ -223,8 +223,32 @@ still retained (files present) or materialization/refresh fails loudly with
 ### Caching is per-handle, in-memory, logical
 
 The materialized in-memory catalog *is* the cache. A `Catalog` handle (RFC
-0003, an `Arc`-backed clone-cheap handle over `slatedb::Db`) may hold the
-latest `CatalogSnapshot` and hand out clones; a refresh replaces it. There is:
+0003, an `Arc`-backed clone-cheap handle over `slatedb::Db`) holds the
+latest `CatalogSnapshot` and shares it; a refresh replaces it. Every head
+read — the public `snapshot()` and a commit attempt's planning view alike —
+serves from it when its head matches, and rematerializes when it does not.
+The view is shared, never copied out: a warm read costs one point read on
+`sys/head` and nothing else.
+
+The cached view is keyed by the head snapshot id it was built at, and a
+head-preserving maintenance commit (RFC 0007 expiry, RFC 0008 compaction)
+reuses that id with different content. Such a commit therefore invalidates
+the cache before its write becomes visible. That alone would not make
+installing safe from a read path: a reader that read head and then
+installed could land its now-stale view *after* an invalidation,
+resurrecting content the invalidation existed to discard. So the cache
+carries an **install epoch**, bumped on every invalidation. A reader
+captures the epoch before its first store read and installs only if the
+epoch still matches; any interleaved invalidation makes the install a
+no-op and the reader simply keeps the view it computed. Installation is
+thus compare-and-set, and no path needs to discard a view it has already
+paid for.
+
+The migration marker is checked before the cache is consulted, so a warm
+handle refuses a mid-migration store exactly as a cold one does — a cached
+view must never be the reason a reader sails through a keyspace move.
+
+There is:
 
 - **No cross-process cache.** RFC 0004's "many readers" are independent
   processes/handles; each materializes its own view. Coordinating a shared
@@ -234,6 +258,16 @@ latest `CatalogSnapshot` and hand out clones; a refresh replaces it. There is:
   catalog, cheap to rebuild from `current` because RFC 0002 keeps the live catalog
   small. A cold reader pays one `current` scan; a warm reader pays incremental
   refresh.
+
+The view is whole-catalog, and that fixes where filtering can usefully
+happen. DuckDB pushes projection into the `ducklake_*` scans but never a row
+filter, so no predicate reaches the store on the serve path; every metadata
+read is a full range scan of its entity kind, and DuckDB filters over the
+returned rows. Server-side filter pushdown therefore cannot reduce work while
+the whole view is resident — there is nothing left to avoid fetching. Pushdown
+becomes worth building only if moraine stops materializing the whole catalog,
+because lazy materialization needs predicates to know what to fetch. The two
+are one decision, and neither is taken here.
 
 ### Maintained served projections
 
@@ -275,6 +309,14 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   byte-identical to a full rematerialization at head.
 - **Committer read-your-writes.** After `commit`, the committer's folded view
   reflects the just-committed entities without a store re-read.
+- **A warm read equals a cold one.** A handle that has served reads across a
+  sequence of commits answers exactly as a freshly opened handle does.
+- **Install is compare-and-set.** An invalidation interleaved between a
+  reader's first store read and its install voids that install; the cache
+  never serves the resurrected view.
+- **The marker outranks the cache.** A read against a mid-migration store
+  returns the typed `Migration` error even when the handle holds a valid
+  cached view.
 - **Fallback.** A reader whose `S` fell below the horizon rematerializes at
   head; a reader asking for an expired `S` gets `SnapshotExpired`.
 - **No dangling file.** A view within the retention window resolves every file

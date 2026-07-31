@@ -15,8 +15,8 @@ use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId,
         projection::{
-            ProjectionCache, cached_head_view, fold_committed_batch, install_head_view,
-            invalidate_head_view,
+            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch,
+            install_head_view, install_head_view_at, invalidate_head_view,
         },
     },
     error::{Error, Result},
@@ -46,8 +46,11 @@ pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
 /// index and serve from an under-covered entry set, so it must refuse this.
 pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
 /// The highest format this binary understands. It opens any store in
-/// `FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
+/// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
 pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
+/// The lowest structural format this binary reads directly. A store below
+/// this floor must be migrated up before an ordinary attach can use it.
+pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_VERSION;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
 pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
@@ -93,23 +96,43 @@ pub(crate) fn durable() -> WriteOptions {
     }
 }
 
+/// A commit that returns without waiting for the write to reach object
+/// storage. The write is still atomic and visible to this handle at once;
+/// only the durability wait — a flush-cadence tick — is skipped. Use it
+/// where a lost write is self-correcting, never where a caller treats the
+/// return as a durable fact.
+pub(crate) fn non_durable() -> WriteOptions {
+    WriteOptions {
+        await_durable: false,
+        ..Default::default()
+    }
+}
+
 /// Refuses a store this binary must not touch: mid-migration, or a
 /// format newer/older than it understands. `None` format means the store
 /// is empty and needs bootstrap.
 async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
     if read::read_migration(tx).await?.is_some() {
-        return Err(Error::Corruption(
+        return Err(Error::Migration(
             "store is mid-migration; refusing to open".to_string(),
         ));
     }
     match read::read_format(tx).await? {
-        Some(format) if (FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&format.format_version) => {
-            Ok(Some(format))
+        Some(format) if format.format_version > MAX_FORMAT_VERSION => {
+            Err(Error::Migration(format!(
+                "store format {} is newer than this binary understands (max {MAX_FORMAT_VERSION}); \
+             upgrade the binary",
+                format.format_version
+            )))
         }
-        Some(format) => Err(Error::Corruption(format!(
-            "store format {} is outside the supported range {FORMAT_VERSION}..={MAX_FORMAT_VERSION}",
-            format.format_version
-        ))),
+        Some(format) if format.format_version < MIN_FORMAT_VERSION => {
+            Err(Error::Migration(format!(
+                "store format {} predates this binary's minimum ({MIN_FORMAT_VERSION}); \
+             run the migrate verb to upgrade it",
+                format.format_version
+            )))
+        }
+        Some(format) => Ok(Some(format)),
         None => Ok(None),
     }
 }
@@ -260,15 +283,36 @@ pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<D
     }
 }
 
+/// Refuses a store whose keyspace is mid-move. A structural migration
+/// rewrites keys in place, so any scan of it may be missing records that
+/// have not arrived yet; failing is the only way to avoid returning a
+/// silently partial catalog.
+pub(crate) async fn refuse_mid_migration(tx: ReadHandle<'_>) -> Result<()> {
+    match read::read_migration(tx).await? {
+        Some(marker) => Err(Error::Migration(format!(
+            "store is migrating from format {} to {}; reads are unavailable until it completes",
+            marker.from_format, marker.to_format
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The latest committed snapshot id. An initialized store always has one,
+/// so its absence is corruption rather than an empty catalog.
+pub(crate) async fn read_head_id(tx: ReadHandle<'_>) -> Result<u64> {
+    Ok(read::read_head(tx)
+        .await?
+        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
+        .snapshot_id)
+}
+
 /// Materializes a catalog view through an open transaction, so the view
 /// and any staged writes share one read point. `at: None` reads the head
 /// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
 /// entities live at `s`.
 pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
-    let head = read::read_head(tx)
-        .await?
-        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
-        .snapshot_id;
+    refuse_mid_migration(tx).await?;
+    let head = read_head_id(tx).await?;
     let target = match at {
         Some(requested) if requested > head => {
             return Err(Error::NotFound(format!(
@@ -278,12 +322,16 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         Some(requested) => requested,
         None => head,
     };
-    // A missing record at or below head is an expired snapshot, not
-    // corruption: expiry deletes snapshot records without renumbering.
-    // The caller re-resolves from head.
-    let snapshot = read::read_snapshot(tx, target)
-        .await?
-        .ok_or_else(|| Error::NotFound(format!("snapshot {target} (expired or never minted)")))?;
+    // A missing record at or below head is an expired snapshot, not a
+    // missing one: ids are sequential to head, so `target` was minted, and
+    // expiry deletes snapshot records without renumbering. The reader
+    // re-resolves from head rather than dereference reclaimed files.
+    let snapshot = read::read_snapshot(tx, target).await?.ok_or_else(|| {
+        Error::SnapshotExpired(format!(
+            "snapshot {target} is below the retention horizon (head is {head}); \
+             re-resolve from head"
+        ))
+    })?;
     let current = read::scan_current_entities(tx).await?;
     let history = match at {
         Some(_) => read::scan_history_entities(tx).await?,
@@ -371,29 +419,30 @@ where
     }
 }
 
-/// Reads the head through `db_tx` and returns the cached head view when it
-/// matches, else materializes it fresh. Staging against this is what lets a
-/// commit skip the full `current` rescan.
+/// The view a commit attempt stages against: the cached one when it already
+/// matches head, else a fresh materialization. Staging against this is what
+/// lets a commit skip the full `current` rescan.
 ///
-/// A miss does **not** install: the cache is populated only by a
-/// head-advancing commit's success, whose unique minted id and successful
-/// commit together prove the folded view is the true committed state. A
-/// view materialized here reflects only this transaction's snapshot, which
-/// a racing head-preserving commit (id reused, content changed) could make
-/// stale — installing it under the reused id would let a later commit stage
-/// against diverged state.
+/// Every read runs through `db_tx`, so the premise view and the
+/// conflict-detection window share one start sequence and no commit can land
+/// between them unnoticed. The install is compare-and-set against an epoch
+/// captured first, so a head-preserving commit (id reused, content changed)
+/// that invalidates mid-read cannot have its invalidation undone here.
 pub(crate) async fn head_view_for(
     db_tx: &DbTransaction,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<Arc<CatalogSnapshot>> {
-    let head = read::read_head(ReadHandle::Tx(db_tx))
-        .await?
-        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
-        .snapshot_id;
+    let epoch = cache_epoch(projections);
+    let handle = ReadHandle::Tx(db_tx);
+    let head = read_head_id(handle).await?;
     if let Some(view) = cached_head_view(projections, head) {
         return Ok(view);
     }
-    Ok(Arc::new(materialize(ReadHandle::Tx(db_tx), None).await?))
+
+    let view = Arc::new(materialize(handle, None).await?);
+    install_head_view_at(projections, epoch, Arc::clone(&view));
+
+    Ok(view)
 }
 
 /// Folds a just-committed head-advancing batch into `base` and installs the

@@ -4,10 +4,12 @@
 
 mod fixtures;
 
+mod cache;
 mod catalog;
 mod commit_concurrency;
 mod data_files;
 mod index_backfill;
 mod macros;
+mod measure;
 mod staged_index_build;
 mod views_options;

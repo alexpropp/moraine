@@ -173,6 +173,91 @@ fn ducklake_delete_orphaned_files_ignores_catalogued_paths() {
     );
 }
 
+/// Merge never crosses a partition boundary: files spread over two
+/// partition values compact to one file per value, never one combined
+/// file, so a merged file still carries exactly one partition value and
+/// the governing spec stays satisfied. The eligibility rule is
+/// DuckLake's, applied before moraine sees the batch — this pins that
+/// moraine's served projections do not mislead it into merging across.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_merge_does_not_cross_partition_boundaries() {
+    let store = TempDir::new("merge-part-store");
+    let data = TempDir::new("merge-part-data");
+    let (store, data) = (store.path(), data.path());
+
+    run_ducklake_sql(
+        store,
+        data,
+        "CREATE TABLE lake.main.p (region VARCHAR, v INTEGER);",
+    );
+    run_ducklake_sql(
+        store,
+        data,
+        "ALTER TABLE lake.main.p SET PARTITIONED BY (region);",
+    );
+
+    // Four separate statements, so four files: two per partition value.
+    // Each exceeds the inlining limit so they land as real Parquet.
+    for region in ["EU", "US"] {
+        for batch in 0..2 {
+            run_ducklake_sql(
+                store,
+                data,
+                &format!(
+                    "INSERT INTO lake.main.p \
+                     SELECT '{region}', i FROM range({start}, {end}) t(i);",
+                    start = batch * 100,
+                    end = batch * 100 + 100,
+                ),
+            );
+        }
+    }
+
+    let live_files = "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;";
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["4".to_string()]],
+        "expected one file per insert before merging"
+    );
+
+    run_ducklake_sql(store, data, "CALL ducklake_merge_adjacent_files('lake');");
+
+    // Two partition values in, two files out — not one.
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["2".to_string()]],
+        "merge must compact within each partition and not across them"
+    );
+
+    // And each surviving file carries exactly one partition value.
+    let values_per_file = run_standalone_sql(
+        store,
+        "SELECT count(DISTINCT pv.partition_value) \
+         FROM m.ducklake_data_file f \
+         JOIN m.ducklake_file_partition_value pv ON pv.data_file_id = f.data_file_id \
+         WHERE f.end_snapshot IS NULL GROUP BY f.data_file_id ORDER BY 1;",
+    );
+    assert_eq!(
+        csv_rows(&values_per_file),
+        vec![vec!["1".to_string()], vec!["1".to_string()]],
+        "a merged file spanning two partition values would break pruning"
+    );
+
+    // The rows themselves survive the merge intact.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data,
+            "SELECT region, count(*) FROM lake.main.p GROUP BY region ORDER BY region;",
+        )),
+        vec![
+            vec!["EU".to_string(), "200".to_string()],
+            vec!["US".to_string(), "200".to_string()]
+        ]
+    );
+}
+
 /// Merge compaction, differential against a stock DuckLake catalog
 /// fed the identical statements: three small files merge into one,
 /// rows and row ids are identical to the reference before and after,
@@ -819,10 +904,11 @@ fn scheduler_runs_a_pass_unattended() {
 /// Orphans `entries` index entries in a session of its own, so a later
 /// session's scheduler has something slow to reclaim.
 ///
-/// A pass over them with `MAINTENANCE_BATCH_SIZE 1` takes one durable
-/// commit per entry — each waiting out the WAL flush cadence — so the
-/// pass reliably outruns a sub-second interval. That is the only way to
-/// provoke tick contention without a test-only knob.
+/// A pass over them with `MAINTENANCE_BATCH_SIZE 1` takes one commit per
+/// entry, so its wall-clock is the entry count times per-commit compute
+/// (sub-millisecond, since reclaim batches do not await durability).
+/// Enough entries and the pass outruns a sub-second interval, which is
+/// the only way to provoke tick contention without a test-only knob.
 fn orphaned_range(store: &TempDir, data: &TempDir, entries: u64) {
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
     run_ducklake_sql_with_options(
@@ -858,15 +944,18 @@ fn marked_passes(output: &str) -> Vec<Vec<String>> {
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn scheduler_ticks_skip_a_pass_already_running() {
-    const ENTRIES: u64 = 20;
+    const ENTRIES: u64 = 1_500;
     let store = TempDir::new("maint-single-store");
     let data = TempDir::new("maint-single-data");
     orphaned_range(&store, &data, ENTRIES);
 
-    // The pass takes ~20 durable commits; ticks fire every 100ms, so
-    // many of them land while it is still running.
+    // The pass takes 1 500 commits — about a second, several ticks — so
+    // ticks land while it is still running. The window holds 14 ticks,
+    // fewer than the report retains passes, so the pass that claims the
+    // range cannot be pushed out of the report by the empty ones after
+    // it however fast the machine is.
     let options = format!(
-        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '300 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
@@ -875,7 +964,7 @@ fn scheduler_ticks_skip_a_pass_already_running() {
         data.path(),
         &options,
         "SELECT 1;\n",
-        std::time::Duration::from_millis(3_500),
+        std::time::Duration::from_millis(4_200),
         "SELECT 'PASS' AS marker, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
     );
@@ -915,15 +1004,15 @@ fn scheduler_ticks_skip_a_pass_already_running() {
 fn detach_during_a_running_pass_completes() {
     let store = TempDir::new("maint-detach-store");
     let data = TempDir::new("maint-detach-data");
-    orphaned_range(&store, &data, 20);
+    orphaned_range(&store, &data, 1_500);
 
     let options = format!(
         ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
-    // The first tick fires at ~100ms and the pass then runs for well over
-    // a second, so detaching at 500ms lands squarely inside it.
+    // The first tick fires at ~100ms and the pass then runs for about a
+    // second, so detaching at 500ms lands squarely inside it.
     let output = run_ducklake_sql_with_pause(
         store.path(),
         data.path(),

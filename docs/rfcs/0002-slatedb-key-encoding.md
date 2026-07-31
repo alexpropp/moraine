@@ -60,6 +60,7 @@ below the leading byte is moraine convention, opaque to SlateDB.
 | `current` | Live catalog entities (no `end_snapshot`) | Insert + delete |
 | `history` | Ended entity versions | Append-only |
 | `inline` | Inlined data — reserved for RFC 0005 | Per RFC 0005 |
+| `index` | Equality-index entries (RFC 0016) | Live-only; insert + delete |
 
 (Subspace declaration order — and therefore each subspace's discriminant
 byte — is fixed by the `Key` type and pinned by golden vectors; see Keys.)
@@ -165,6 +166,16 @@ conventions — this RFC is updated, not diverged from.
 Per-table collections (`column`, `file`, `fstat`, …) are keyed
 `table_id`-first so "everything about table T" — the unit DuckLake reads
 and invalidates — is one contiguous range per subspace.
+
+Within `fstat` the remaining components are file-major: `data_file_id`
+before `column_id`, so a file's columns sit together. Column-major would win
+only for a read that wants one column across many files, and no such read
+exists — DuckDB pushes no row filter into the served projections (RFC 0009)
+and nothing inside moraine reads statistics selectively, so the only
+operation on `fstat` is a full scan, costing the same either way. The
+ordering reopens only with server-side pruning, on the terms RFC 0009 sets;
+reversing it once the collection is large needs a migration, so that is the
+moment to weigh it.
 
 ### Value codec
 
