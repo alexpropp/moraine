@@ -206,10 +206,14 @@ failure mode is silent corruption. Tiers, per
 | **E2E** | `crates/moraine-duckdb/tests/`, via `cargo xtask e2e` | Build the cdylib, load into real DuckDB, run actual DuckLake SQL — validating assumptions about what DuckLake demands, not just that the code does what we think. |
 | **Fuzzing** (future) | `fuzz/` | `cargo-fuzz` on `store` codecs and the commit read-path once codecs stabilize. |
 
-Crash coverage is not left to prose: the reachable failure seams (commit, flush,
-cleanup, takeover, init) are an enumerated matrix in
-[RFC 0011](docs/rfcs/0011-crash-injection-test-matrix.md), each pinned to the
-post-recovery invariant it verifies, iterated mechanically by the suite.
+Crash coverage is not left to prose: [RFC 0011](docs/rfcs/0011-crash-recovery.md)
+names every place a process can die during a state-changing operation — commit,
+flush, cleanup, takeover, genesis — and pins each to what must hold after
+reopen. Each case is survivable for one of two reasons, and which one follows
+from the path: a single-batch path is safe by *atomicity* (one commit is one
+batch, so there is no torn intermediate to find), a multi-step path by
+*ordering* (bytes before the record that references them, bytes after the
+record that referenced them). The suite drives the cases as data.
 
 Process is **TDD** — test first, watch it fail, implement — and every bugfix
 lands with a regression test. The full local gate (fmt, clippy, test, doc, deny,
