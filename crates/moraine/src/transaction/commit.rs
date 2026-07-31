@@ -3,22 +3,15 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
-use tracing::{debug, info};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
-    catalog::{
-        CatalogSnapshot, SnapshotId,
-        projection::{
-            ProjectionCache, cached_head_view, fold_committed_batch, install_head_view,
-            invalidate_head_view,
-        },
-    },
+    catalog::CatalogSnapshot,
     error::{Error, Result},
     store::{
         handle::ReadHandle,
@@ -53,35 +46,6 @@ pub(crate) const FORMAT_MULTI_WRITER: u64 = 4;
 /// The highest format this binary understands. It opens any store in
 /// `FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
 pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_MULTI_WRITER;
-/// Bounded internal retries before a benign race is reported as a
-/// conflict.
-pub(crate) const MAX_COMMIT_ATTEMPTS: usize = 10;
-
-/// Delay before the second commit attempt, in microseconds; each further
-/// retry doubles it, up to [`RETRY_BACKOFF_MAX_MICROS`]. Without a pause the
-/// budget is ten immediate re-runs, which under real contention is a spin
-/// that burns the budget faster than the contention can clear.
-const RETRY_BACKOFF_BASE_MICROS: u64 = 2_000;
-/// Ceiling on one retry's delay. The whole budget then spans a few hundred
-/// milliseconds — enough for a competing commit to land, short enough that a
-/// caller waiting on a conflict is not left hanging.
-const RETRY_BACKOFF_MAX_MICROS: u64 = 50_000;
-
-/// How long to wait before re-running `attempt` (0-based; the first attempt
-/// never waits). Exponential to the cap, plus jitter of up to the base delay
-/// so two writers that just collided do not back off in lockstep and collide
-/// again.
-fn retry_backoff(attempt: usize) -> Duration {
-    if attempt == 0 {
-        return Duration::ZERO;
-    }
-    let doublings = u32::try_from(attempt - 1).unwrap_or(u32::MAX).min(31);
-    let step = RETRY_BACKOFF_BASE_MICROS
-        .saturating_mul(1_u64 << doublings)
-        .min(RETRY_BACKOFF_MAX_MICROS);
-    let jitter = now_micros().unsigned_abs() % RETRY_BACKOFF_BASE_MICROS;
-    Duration::from_micros(step.saturating_add(jitter))
-}
 
 /// Current time in microseconds since the Unix epoch. Clamped, never
 /// panicking: a clock before the epoch stamps 0.
@@ -119,22 +83,6 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
     }
 }
 
-/// Refuses opening a store whose mode disagrees with `multi_writer`.
-/// Transitional: a later task replaces the multi-writer-flagged-false-below-
-/// [`FORMAT_MULTI_WRITER`] case with an automatic migration and removes this
-/// check entirely.
-pub(crate) fn validate_mode(format_version: u64, multi_writer: bool) -> Result<()> {
-    match (format_version >= FORMAT_MULTI_WRITER, multi_writer) {
-        (true, false) => Err(Error::Configuration(
-            "store is multi-writer; attach with the multi_writer option".to_string(),
-        )),
-        (false, true) => Err(Error::Configuration(
-            "store is single-writer; mode migration is not supported".to_string(),
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// Stages the initial state of an empty store into `tx`: format stamp,
 /// snapshot 0 (carrying the default `main` schema, counters advanced past
 /// its id), the `main` schema record itself, the global `encrypted`
@@ -146,33 +94,21 @@ pub(crate) fn validate_mode(format_version: u64, multi_writer: bool) -> Result<(
 /// created, exactly as DuckLake fixes it when initializing a metadata
 /// store.
 ///
-/// `multi_writer` is transitional scaffolding: when true this also stamps
-/// [`FORMAT_MULTI_WRITER`] and a zero fold cursor, bootstrap being the
+/// Stamps [`FORMAT_MULTI_WRITER`] and a zero fold cursor, bootstrap being the
 /// degenerate first fold.
-fn stage_bootstrap(
-    tx: &DbTransaction,
-    encrypted: bool,
-    data_path: Option<&str>,
-    multi_writer: bool,
-) -> Result<()> {
+fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>) -> Result<()> {
     let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     stage(
         Key::Sys(SysKey::Format),
         value::encode_value(&proto::FormatValue {
-            format_version: if multi_writer {
-                FORMAT_MULTI_WRITER
-            } else {
-                FORMAT_VERSION
-            },
+            format_version: FORMAT_MULTI_WRITER,
             writer_version: env!("CARGO_PKG_VERSION").to_string(),
         }),
     )?;
-    if multi_writer {
-        stage(
-            Key::Sys(SysKey::Fold),
-            value::encode_value(&moraine_wal::FoldValue { folded_sequence: 0 }),
-        )?;
-    }
+    stage(
+        Key::Sys(SysKey::Fold),
+        value::encode_value(&moraine_wal::FoldValue { folded_sequence: 0 }),
+    )?;
     // Bootstrap's snapshot records minting `main`, byte-identical to the
     // `created_schema:"main"` DuckLake's own initialization writes.
     let mut bootstrap_changes = ChangeSet::default();
@@ -231,14 +167,10 @@ fn stage_bootstrap(
 /// Opens the store, bootstrapping an empty one in one atomic batch under
 /// conflict detection — a lost bootstrap race re-validates instead of
 /// double-initializing. Every exit that does not commit rolls back.
-///
-/// `multi_writer` selects which topology this open expects; it refuses an
-/// existing store whose stamped mode disagrees (see [`validate_mode`]).
 pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
-    multi_writer: bool,
 ) -> Result<Db> {
     let db = store.open_writer().await?;
     let tx = db
@@ -247,9 +179,9 @@ pub(crate) async fn open_initialized(
         .map_err(Error::from)?;
 
     match validate_format(ReadHandle::Tx(&tx)).await {
-        Ok(Some(format)) => {
+        Ok(Some(_)) => {
             tx.rollback();
-            return validate_mode(format.format_version, multi_writer).map(|()| db);
+            return Ok(db);
         }
         Ok(None) => {}
         Err(err) => {
@@ -258,7 +190,7 @@ pub(crate) async fn open_initialized(
         }
     }
 
-    if let Err(err) = stage_bootstrap(&tx, encrypted, data_path, multi_writer) {
+    if let Err(err) = stage_bootstrap(&tx, encrypted, data_path) {
         tx.rollback();
         return Err(err);
     }
@@ -278,7 +210,7 @@ pub(crate) async fn open_initialized(
             let validated = validate_format(ReadHandle::Tx(&tx)).await;
             tx.rollback();
             match validated? {
-                Some(format) => validate_mode(format.format_version, multi_writer).map(|()| db),
+                Some(_) => Ok(db),
                 None => Err(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
                 )),
@@ -426,135 +358,6 @@ pub(crate) mod fold;
 use diff::diff_options;
 pub(crate) use diff::diff_writes;
 
-/// The result of one commit attempt.
-enum CommitOutcome {
-    /// The attempt committed; carries the resulting snapshot id.
-    Committed(SnapshotId),
-    /// Lost the head race: what we tried to change, and the head our
-    /// premise was read at — classification reads the commits above it.
-    LostRace {
-        ours: Box<ChangeSet>,
-        head_before: u64,
-    },
-}
-
-/// Runs one commit attempt: materialize, run the closure, stage, commit.
-/// An empty op set commits nothing and returns the unchanged head. Every
-/// exit that does not reach the final commit rolls the transaction back.
-async fn attempt_commit<F>(
-    db: &Db,
-    f: &F,
-    projections: &std::sync::RwLock<ProjectionCache>,
-) -> Result<CommitOutcome>
-where
-    F: Fn(&mut Transaction) -> Result<()>,
-{
-    let db_tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
-
-    let base = match head_view_for(&db_tx, projections).await {
-        Ok(base) => base,
-        Err(err) => {
-            db_tx.rollback();
-            return Err(err);
-        }
-    };
-
-    let format_current = match read::read_format(ReadHandle::Tx(&db_tx)).await {
-        Ok(format) => format.map_or(FORMAT_VERSION, |format| format.format_version),
-        Err(err) => {
-            db_tx.rollback();
-            return Err(err);
-        }
-    };
-    let probe = ProbeHandle::Store(ReadHandle::Tx(&db_tx));
-
-    match assemble_commit(probe, f, &base, Some(format_current), None).await {
-        Ok(Prepared::Nothing { head }) => {
-            db_tx.rollback();
-            Ok(CommitOutcome::Committed(SnapshotId::new(head)))
-        }
-        Ok(Prepared::Staged(Assembled {
-            ours,
-            head_before,
-            commits,
-            writes,
-            schema_changed: _,
-        })) => {
-            if let Err(err) = stage_writes(&db_tx, &writes) {
-                db_tx.rollback();
-                return Err(err);
-            }
-            finish_commit(
-                db_tx,
-                ours,
-                head_before,
-                commits,
-                writes,
-                &base,
-                projections,
-            )
-            .await
-        }
-        Err(err) => {
-            db_tx.rollback();
-            Err(err)
-        }
-    }
-}
-
-/// Reads the head through `db_tx` and returns the cached head view when it
-/// matches, else materializes it fresh. Staging against this is what lets a
-/// commit skip the full `current` rescan.
-///
-/// A miss does **not** install: the cache is populated only by a
-/// head-advancing commit's success, whose unique minted id and successful
-/// commit together prove the folded view is the true committed state. A
-/// view materialized here reflects only this transaction's snapshot, which
-/// a racing head-preserving commit (id reused, content changed) could make
-/// stale — installing it under the reused id would let a later commit stage
-/// against diverged state.
-pub(crate) async fn head_view_for(
-    db_tx: &DbTransaction,
-    projections: &std::sync::RwLock<ProjectionCache>,
-) -> Result<Arc<CatalogSnapshot>> {
-    let head = read::read_head(ReadHandle::Tx(db_tx))
-        .await?
-        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
-        .snapshot_id;
-    if let Some(view) = cached_head_view(projections, head) {
-        return Ok(view);
-    }
-    Ok(Arc::new(materialize(ReadHandle::Tx(db_tx), None).await?))
-}
-
-/// Folds a just-committed head-advancing batch into `base` and installs the
-/// result as the new head view, or clears the cache when the fold cannot be
-/// applied faithfully. Only for head-advancing commits: their minted id is
-/// unique, so a concurrent attempt reading the old id never mistakes this
-/// view for its own. Head-preserving commits reuse the id and are handled
-/// by clearing the cache before they commit ([`invalidate_head_view`]).
-pub(crate) fn refresh_head_view(
-    projections: &std::sync::RwLock<ProjectionCache>,
-    base: &CatalogSnapshot,
-    writes: &[StagedWrite],
-) {
-    let mut view = base.clone();
-    match fold::fold_batch(&mut view, writes) {
-        Ok(()) => install_head_view(projections, Arc::new(view)),
-        Err(err) => {
-            // The committed batch could not be folded into the cached view;
-            // dropping the cache is safe (the next commit rescans and
-            // reinstalls) but the cause is worth a trace — a batch this
-            // writer just built should always fold.
-            debug!(error = %err, "head view fold failed; clearing the cached view");
-            invalidate_head_view(projections);
-        }
-    }
-}
-
 /// Everything one commit attempt assembles, independent of where the batch is
 /// arbitrated.
 pub(crate) struct Assembled {
@@ -568,19 +371,12 @@ pub(crate) struct Assembled {
     /// this commit owes, the minted snapshot, and the head advance. A
     /// successful commit also folds it into the maintained projections.
     pub(crate) writes: Vec<StagedWrite>,
-    /// Whether the commit advances the schema version.
-    // dead_code: read by the slot commit cycle, landing in a later task.
-    #[allow(dead_code)]
-    pub(crate) schema_changed: bool,
 }
 
 /// What one commit attempt computes, independent of where it is arbitrated.
 pub(crate) enum Prepared {
     /// The closure changed nothing; the head is unchanged.
-    Nothing {
-        /// The head snapshot id the attempt read.
-        head: u64,
-    },
+    Nothing,
     /// A staged batch ready to commit.
     Staged(Assembled),
 }
@@ -669,7 +465,7 @@ where
         let mut writes = Vec::new();
         diff_options(&mut writes, base, &state);
         if writes.is_empty() {
-            return Ok(Prepared::Nothing { head });
+            return Ok(Prepared::Nothing);
         }
         // Re-put the unchanged head as a conflict anchor: every
         // snapshot-minting commit writes it, so a racing drop of this
@@ -684,7 +480,6 @@ where
             head_before: head,
             commits: head,
             writes,
-            schema_changed: false,
         }));
     }
 
@@ -745,7 +540,6 @@ where
         head_before: head,
         commits: new_id,
         writes,
-        schema_changed,
     }))
 }
 
@@ -758,158 +552,6 @@ pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Res
         .map_err(Error::from)?;
     }
     Ok(())
-}
-
-async fn finish_commit(
-    db_tx: DbTransaction,
-    ours: Box<ChangeSet>,
-    head_before: u64,
-    commits: u64,
-    writes: Vec<StagedWrite>,
-    base: &CatalogSnapshot,
-    projections: &std::sync::RwLock<ProjectionCache>,
-) -> Result<CommitOutcome> {
-    // A head-preserving commit reuses the head id with new content; drop the
-    // cache before the write is visible so no concurrent attempt reads a
-    // stale view that still matches by id.
-    let head_advanced = commits > head_before;
-    if !head_advanced {
-        invalidate_head_view(projections);
-    }
-    match db_tx.commit_with_options(&durable()).await {
-        Ok(_) => {
-            fold_committed_batch(projections, &writes, commits);
-            if head_advanced {
-                refresh_head_view(projections, base, &writes);
-            }
-            Ok(CommitOutcome::Committed(SnapshotId::new(commits)))
-        }
-        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
-            Ok(CommitOutcome::LostRace { ours, head_before })
-        }
-        Err(err) => Err(err.into()),
-    }
-}
-
-/// Commits through the closure, retrying benign races with a full re-run
-/// — fresh snapshot, closure, ids — so premises re-validate against the
-/// state that won. A true conflict surfaces as [`Error::CommitConflict`],
-/// which the caller may retry; an exhausted budget surfaces as
-/// [`Error::RetryBudgetExhausted`], which it may not.
-pub(crate) async fn commit_cycle<F>(
-    db: &Db,
-    f: &F,
-    projections: &std::sync::RwLock<ProjectionCache>,
-) -> Result<SnapshotId>
-where
-    F: Fn(&mut Transaction) -> Result<()>,
-{
-    // Kept across attempts so an exhausted budget can report where the
-    // premise started and what it kept losing to.
-    let started = std::time::Instant::now();
-    let mut first_head = None;
-    let mut last_intervening = Vec::new();
-
-    for attempt in 0..MAX_COMMIT_ATTEMPTS {
-        // Every path into this loop past the first is a lost race, so the
-        // wait belongs here rather than at each `continue`.
-        if attempt > 0 {
-            tokio::time::sleep(retry_backoff(attempt)).await;
-        }
-        match attempt_commit(db, f, projections).await? {
-            CommitOutcome::Committed(id) => {
-                tracing::debug!(
-                    snapshot = id.get(),
-                    attempt,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "commit landed"
-                );
-                return Ok(id);
-            }
-            CommitOutcome::LostRace { ours, head_before } => {
-                first_head.get_or_insert(head_before);
-                // An options-only loser is last-write-wins: always benign.
-                if ours.is_empty() {
-                    tracing::debug!(
-                        attempt,
-                        head_before,
-                        "commit lost the head race with nothing to conflict over; retrying"
-                    );
-                    continue;
-                }
-                let intervening = intervening_changes(db, head_before).await?;
-                for (snapshot_id, theirs) in &intervening {
-                    if crate::transaction::operations::conflicts(&ours, theirs) {
-                        tracing::debug!(
-                            attempt,
-                            head_before,
-                            winner = snapshot_id,
-                            "commit conflicts with an intervening commit; surfacing"
-                        );
-                        return Err(Error::CommitConflict(format!(
-                            "concurrent commit {snapshot_id} touched the same state"
-                        )));
-                    }
-                }
-                last_intervening = intervening.iter().map(|(id, _)| *id).collect();
-                tracing::debug!(
-                    attempt,
-                    head_before,
-                    intervening = ?last_intervening,
-                    "commit lost the head race to disjoint commits; retrying"
-                );
-            }
-        }
-    }
-
-    let head_before = first_head.unwrap_or_default();
-    // The only record of an exhausted budget: without it a caller sees a
-    // slow commit and no reason for it.
-    tracing::warn!(
-        attempts = MAX_COMMIT_ATTEMPTS,
-        head_before,
-        intervening = ?last_intervening,
-        "commit exhausted its retry budget; reporting a terminal error"
-    );
-    Err(Error::RetryBudgetExhausted(format!(
-        "spent {MAX_COMMIT_ATTEMPTS} attempts from head snapshot {head_before} without \
-         settling; commits above it: {last_intervening:?}"
-    )))
-}
-
-/// The change sets of every commit above `head_before`, read outside any
-/// transaction (the loser's is dead). A record that has already been
-/// expired by a racing maintenance commit classifies as an unknowable
-/// change (forcing the conflict path), never as corruption — the caller
-/// re-drives against the new head.
-async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, ChangeSet)>> {
-    let head_bytes = db
-        .get(Key::Sys(SysKey::Head).encode())
-        .await
-        .map_err(Error::from)?
-        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?;
-    let head: proto::HeadValue = value::decode_value(&head_bytes)?;
-    let mut changes = Vec::new();
-
-    for snapshot_id in (head_before + 1)..=head.snapshot_id {
-        let change_set = match db
-            .get(Key::Snapshot { snapshot_id }.encode())
-            .await
-            .map_err(Error::from)?
-        {
-            Some(bytes) => {
-                let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
-                ChangeSet::parse(&snapshot.changes_made)
-            }
-            None => ChangeSet {
-                has_unknown: true,
-                ..ChangeSet::default()
-            },
-        };
-        changes.push((snapshot_id, change_set));
-    }
-
-    Ok(changes)
 }
 
 #[cfg(test)]

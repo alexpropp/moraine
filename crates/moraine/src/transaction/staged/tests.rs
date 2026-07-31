@@ -69,10 +69,7 @@ fn snapshot_changes_row(id: u64, changes_made: &str) -> Vec<Cell> {
 }
 
 async fn open() -> Catalog {
-    // These tests drive the single-writer staged path directly through
-    // `begin_write_tx`, so they open the single-writer store the flip no
-    // longer builds by attach.
-    Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
+    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap()
 }
@@ -84,8 +81,7 @@ async fn open() -> Catalog {
 #[tokio::test]
 async fn stages_table_create_and_snapshot_bump() {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
@@ -124,8 +120,7 @@ async fn staged_columns_advance_the_field_id_counter() {
     use crate::catalog::{ColumnDef, ColumnId, SchemaId, TableId};
 
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -188,8 +183,7 @@ async fn staged_columns_advance_the_field_id_counter() {
 #[tokio::test]
 async fn ending_an_absent_row_is_rejected() {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
     // No table 7 exists; end it at this commit's snapshot id (1).
     tx.stage(RowOperation::UpdateSetEnd {
@@ -215,8 +209,7 @@ async fn ending_an_absent_row_is_rejected() {
 #[tokio::test]
 async fn encryption_keys_round_trip_through_staged_rows() {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
@@ -295,8 +288,7 @@ async fn update_set_end_moves_the_old_version_to_history() {
     let catalog = open().await;
 
     // Seed schema `s` (id 1) and table `t` (id 1) via a plain insert.
-    let db_tx1 = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::Insert {
         table: TableKind::Schema,
         cells: schema_row(1, "s", 1),
@@ -316,8 +308,7 @@ async fn update_set_end_moves_the_old_version_to_history() {
     setup.commit().await.unwrap();
 
     // Rename: end the old table version, insert the renamed one.
-    let db_tx2 = catalog.begin_write_tx().await.unwrap();
-    let mut rename = StagedTransaction::begin_detached(db_tx2);
+    let mut rename = catalog.begin_staged(None, String::new()).await.unwrap();
     rename.stage(RowOperation::UpdateSetEnd {
         table: TableKind::Table,
         cells: vec![Cell::U64(1), Cell::U64(2)],
@@ -360,8 +351,7 @@ async fn update_set_end_moves_the_old_version_to_history() {
 async fn rename_survives_insert_before_end_order() {
     let catalog = open().await;
 
-    let db_tx1 = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::Insert {
         table: TableKind::Schema,
         cells: schema_row(1, "s", 1),
@@ -382,8 +372,7 @@ async fn rename_survives_insert_before_end_order() {
 
     // Insert the renamed version first, then end the old one — the
     // reverse of the safe order, matching what DuckLake emits.
-    let db_tx2 = catalog.begin_write_tx().await.unwrap();
-    let mut rename = StagedTransaction::begin_detached(db_tx2);
+    let mut rename = catalog.begin_staged(None, String::new()).await.unwrap();
     rename.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 1, "t_new", 2, None),
@@ -415,10 +404,8 @@ async fn rename_survives_insert_before_end_order() {
 async fn lost_race_is_not_retried_and_carries_conflict_text() {
     let catalog = open().await;
 
-    let tx_a = catalog.begin_write_tx().await.unwrap();
-    let tx_b = catalog.begin_write_tx().await.unwrap();
-    let mut a = StagedTransaction::begin_detached(tx_a);
-    let mut b = StagedTransaction::begin_detached(tx_b);
+    let mut a = catalog.begin_staged(None, String::new()).await.unwrap();
+    let mut b = catalog.begin_staged(None, String::new()).await.unwrap();
 
     for (tx, name) in [(&mut a, "a"), (&mut b, "b")] {
         tx.stage(RowOperation::Insert {
@@ -453,8 +440,7 @@ async fn lost_race_is_not_retried_and_carries_conflict_text() {
 #[tokio::test]
 async fn malformed_row_is_corruption_not_a_panic() {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Schema,
         cells: vec![Cell::U64(1)], // far too few cells
@@ -478,8 +464,7 @@ async fn malformed_row_is_corruption_not_a_panic() {
 #[tokio::test]
 async fn stages_inline_schema_and_sequential_inserts() {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
     tx.stage(RowOperation::InlineSchema {
         table_id: 1,
@@ -512,8 +497,8 @@ async fn stages_inline_schema_and_sequential_inserts() {
     });
     tx.commit().await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
+    let dump = catalog.begin_dump().await.unwrap();
+    let chunks = store_inline::scan_inline_chunks(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
     assert_eq!(chunks.len(), 2);
@@ -540,7 +525,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
     );
     assert_eq!(chunks[1].1.body, b"chunk-b");
 
-    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), None, 1)
+    let schemas = store_inline::scan_inline_schemas(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
     assert_eq!(
@@ -552,7 +537,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
             }
         )]
     );
-    tx.rollback();
+    dump.finish().await;
 }
 
 /// An `InlineIdel` tombstones a row: the row is absent from a
@@ -561,8 +546,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
 async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
     let catalog = open().await;
 
-    let db_tx1 = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::InlineInsert {
         table_id: 1,
         schema_version: 0,
@@ -581,8 +565,7 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
     });
     setup.commit().await.unwrap();
 
-    let db_tx2 = catalog.begin_write_tx().await.unwrap();
-    let mut inline_delete = StagedTransaction::begin_detached(db_tx2);
+    let mut inline_delete = catalog.begin_staged(None, String::new()).await.unwrap();
     inline_delete.stage(RowOperation::InlineInlineDelete {
         table_id: 1,
         row_id: 0,
@@ -598,14 +581,14 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
     });
     inline_delete.commit().await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
+    let dump = catalog.begin_dump().await.unwrap();
+    let chunks = store_inline::scan_inline_chunks(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), None, 1)
+    let inline_deletes = store_inline::scan_inline_inline_deletes(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    tx.rollback();
+    dump.finish().await;
     assert_eq!(
         inline_deletes,
         vec![(0, proto::InlineInlineDeleteValue { end_snapshot: 2 })]
@@ -810,8 +793,7 @@ async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {
 
     let catalog = open().await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -851,8 +833,13 @@ async fn catalog_with_indexed_inline_table(unique: bool) -> (Catalog, u64) {
     (catalog, index.get().unwrap().get())
 }
 
-/// Every stored entry key of one index, in scan order.
-async fn index_entry_keys(catalog: &Catalog, unique: bool, index_id: u64) -> Vec<Vec<u8>> {
+/// Every stored entry (key, value) of one index, folded store overlaid with
+/// the unfolded tail, in key order.
+async fn index_entries_overlaid(
+    catalog: &Catalog,
+    unique: bool,
+    index_id: u64,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     use crate::store::key::{IndexKind, index_index_prefix};
 
     let kind = if unique {
@@ -860,17 +847,37 @@ async fn index_entry_keys(catalog: &Catalog, unique: bool, index_id: u64) -> Vec
     } else {
         IndexKind::Multi
     };
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(kind, index_id), ..)
-        .await
-        .unwrap();
-    let mut keys = Vec::new();
+    let prefix = index_index_prefix(kind, index_id);
+    let dump = catalog.begin_dump().await.unwrap();
+    let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    let mut iter = dump.handle().scan_prefix(prefix.clone(), ..).await.unwrap();
     while let Some(entry) = iter.next().await.unwrap() {
-        keys.push(entry.key.to_vec());
+        merged.insert(entry.key.to_vec(), entry.value.to_vec());
     }
-    tx.rollback();
-    keys
+    if let Some(overlay) = dump.overlay() {
+        for (key, value) in overlay.prefixed(&prefix) {
+            match value {
+                Some(bytes) => {
+                    merged.insert(key.to_vec(), bytes.to_vec());
+                }
+                None => {
+                    merged.remove(key);
+                }
+            }
+        }
+    }
+    dump.finish().await;
+    merged.into_iter().collect()
+}
+
+/// Every stored entry key of one index, in key order.
+async fn index_entry_keys(catalog: &Catalog, unique: bool, index_id: u64) -> Vec<Vec<u8>> {
+    index_entries_overlaid(catalog, unique, index_id)
+        .await
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// The stored entry count for one index.
@@ -888,8 +895,7 @@ async fn inline_insert(
     with_schema: bool,
 ) {
     let (schema, batch) = bigint_batch(values);
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     if with_schema {
         tx.stage(RowOperation::InlineSchema {
             table_id: 1,
@@ -918,8 +924,7 @@ async fn inline_insert(
 
 /// Tombstones one inlined row in its own commit.
 async fn inline_row_delete(catalog: &Catalog, snapshot_id: u64, row_id: u64) -> Result<()> {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::InlineInlineDelete {
         table_id: 1,
         row_id,
@@ -983,8 +988,7 @@ async fn inline_delete_and_reinsert_in_one_commit_admits_the_same_unique_value()
     inline_insert(&catalog, 3, 0, &[7], true).await;
 
     let (_, batch) = bigint_batch(&[7]);
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::InlineInlineDelete {
         table_id: 1,
         row_id: 0,
@@ -1089,8 +1093,13 @@ async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<In
     // `s/` and `t/` are the bootstrap schema and table path prefixes.
     let file_size = write_parquet(&store, "main/t/data.parquet", &batch).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = catalog
+        .begin_staged(
+            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: indexed_data_file_row(u64::try_from(values.len()).unwrap(), file_size),
@@ -1182,8 +1191,13 @@ async fn rewrite_registration_re_derives_entries_idempotently() {
     let size =
         write_parquet_with_row_ids(&store, "main/t/rewrite.parquet", &[10, 20, 30], &[0, 1, 2])
             .await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = catalog
+        .begin_staged(
+            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(12, 4, "rewrite.parquet", 3, size),
@@ -1222,8 +1236,13 @@ async fn update_shaped_registration_adds_changed_value_entries() {
 
     // Row 1's value changes 20 -> 99; its id is preserved.
     let size = write_parquet_with_row_ids(&store, "main/t/update.parquet", &[99], &[1]).await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = catalog
+        .begin_staged(
+            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(12, 4, "update.parquet", 1, size),
@@ -1249,8 +1268,6 @@ async fn update_shaped_registration_adds_changed_value_entries() {
 /// (the flushed shape) derives entries under the embedded ids.
 #[tokio::test]
 async fn embedded_ids_win_over_a_recorded_dense_start() {
-    use crate::store::key::{IndexKind, index_index_prefix};
-
     let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
 
     // Ids 100 and 102 — the gap at 101 is a row deleted before the flush.
@@ -1259,8 +1276,13 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
         write_parquet_with_row_ids(&store, "main/t/flushed.parquet", &[10, 30], &[100, 102]).await;
     let mut cells = rewrite_data_file_row(1, 3, "flushed.parquet", 2, size);
     cells[11] = Cell::U64(100); // row_id_start recorded, as a flush does
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = catalog
+        .begin_staged(
+            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells,
@@ -1277,16 +1299,11 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
     assert_eq!(index_entry_count(&catalog, true, index_id).await, 2);
 
     // The unique entries hold ids 100 and 102 — not 100 and 101.
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(IndexKind::Unique, index_id), ..)
+    let mut row_ids: Vec<u64> = index_entries_overlaid(&catalog, true, index_id)
         .await
-        .unwrap();
-    let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.unwrap() {
-        row_ids.push(u64::from_be_bytes(entry.value.as_ref().try_into().unwrap()));
-    }
-    tx.rollback();
+        .into_iter()
+        .map(|(_, value)| u64::from_be_bytes(value.as_slice().try_into().unwrap()))
+        .collect();
     row_ids.sort_unstable();
     assert_eq!(row_ids, vec![100, 102]);
 }
@@ -1298,8 +1315,13 @@ async fn register_per_row_id_file(catalog: &Catalog) -> Arc<InMemory> {
     let size =
         write_parquet_with_row_ids(&store, "main/t/rewrite.parquet", &[10, 20, 30], &[5, 9, 12])
             .await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = catalog
+        .begin_staged(
+            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: rewrite_data_file_row(1, 3, "rewrite.parquet", 3, size),
@@ -1344,8 +1366,13 @@ async fn delete_file_against_per_row_id_target_removes_named_positions() {
     .unwrap();
     write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = catalog
+        .begin_staged(
+            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -1392,8 +1419,13 @@ async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
 
     // Position 1 holds value 20 (embedded id 9); the delete names the
     // position, and its entry resolves out of the file.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = catalog
+        .begin_staged(
+            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::InlineFileDelete {
         table_id: 1,
         data_file_id: 1,
@@ -1445,8 +1477,7 @@ async fn create_index_backfills_inline_null_rows() {
     let catalog = open().await;
 
     // Table 1 with one BIGINT column `a`, no index yet.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -1467,8 +1498,7 @@ async fn create_index_backfills_inline_null_rows() {
 
     // Inline-insert three rows before any index exists: 10, NULL, 30.
     let (schema, batch) = nullable_bigint_batch(&[Some(10), None, Some(30)]);
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::InlineSchema {
         table_id: 1,
         schema_version: 0,
@@ -1567,8 +1597,13 @@ async fn scoped_backfill_excludes_delete_file_rows() {
     .unwrap();
     write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    let mut tx = catalog
+        .begin_staged(
+            Some(store.clone() as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -1623,8 +1658,13 @@ async fn inlined_file_delete_removes_the_killed_rows_index_entry() {
         "the registered file lands one entry per row"
     );
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = catalog
+        .begin_staged(
+            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::InlineFileDelete {
         table_id: 1,
         data_file_id: 1,
@@ -1674,8 +1714,13 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     .unwrap();
     write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = catalog
+        .begin_staged(
+            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -1738,8 +1783,13 @@ async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
     .unwrap();
     write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    let mut tx = catalog
+        .begin_staged(
+            Some(store as std::sync::Arc<dyn object_store::ObjectStore>),
+            String::new(),
+        )
+        .await
+        .unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DeleteFile,
         cells: vec![
@@ -1778,8 +1828,7 @@ async fn registered_delete_file_naming_an_out_of_range_position_is_refused() {
 async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     let catalog = open().await;
 
-    let db_tx1 = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::InlineInsert {
         table_id: 1,
         schema_version: 0,
@@ -1801,8 +1850,7 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     // A later commit tombstones one row (a tombstone only ever ends a
     // version begun before it — DuckLake's writer never stamps a row
     // with its own insertion snapshot).
-    let db_tx2 = catalog.begin_write_tx().await.unwrap();
-    let mut delete = StagedTransaction::begin_detached(db_tx2);
+    let mut delete = catalog.begin_staged(None, String::new()).await.unwrap();
     delete.stage(RowOperation::InlineInlineDelete {
         table_id: 1,
         row_id: 0,
@@ -1818,8 +1866,7 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     });
     delete.commit().await.unwrap();
 
-    let db_tx3 = catalog.begin_write_tx().await.unwrap();
-    let mut flush = StagedTransaction::begin_detached(db_tx3);
+    let mut flush = catalog.begin_staged(None, String::new()).await.unwrap();
     flush.stage(RowOperation::InlineFlushDelete {
         table_id: 1,
         schema_version: 0,
@@ -1835,14 +1882,14 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     });
     flush.commit().await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
+    let dump = catalog.begin_dump().await.unwrap();
+    let chunks = store_inline::scan_inline_chunks(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), None, 1)
+    let inline_deletes = store_inline::scan_inline_inline_deletes(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    tx.rollback();
+    dump.finish().await;
     assert!(chunks.is_empty(), "flushed chunk must be gone: {chunks:?}");
     assert!(
         inline_deletes.is_empty(),
@@ -1856,8 +1903,7 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
 async fn stages_inline_drop_removes_every_record_for_the_table() {
     let catalog = open().await;
 
-    let db_tx1 = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::InlineSchema {
         table_id: 1,
         schema_version: 0,
@@ -1887,8 +1933,7 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
     });
     setup.commit().await.unwrap();
 
-    let db_tx2 = catalog.begin_write_tx().await.unwrap();
-    let mut drop_tx = StagedTransaction::begin_detached(db_tx2);
+    let mut drop_tx = catalog.begin_staged(None, String::new()).await.unwrap();
     drop_tx.stage(RowOperation::InlineDrop { table_id: 1 });
     drop_tx.stage(RowOperation::Insert {
         table: TableKind::Snapshot,
@@ -1900,17 +1945,17 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
     });
     drop_tx.commit().await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
+    let dump = catalog.begin_dump().await.unwrap();
+    let chunks = store_inline::scan_inline_chunks(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    let file_deletes = store_inline::scan_inline_file_deletes(ReadHandle::Tx(&tx), None, 1)
+    let file_deletes = store_inline::scan_inline_file_deletes(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), None, 1)
+    let schemas = store_inline::scan_inline_schemas(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    tx.rollback();
+    dump.finish().await;
     assert!(chunks.is_empty());
     assert!(file_deletes.is_empty());
     assert!(schemas.is_empty());
@@ -1925,8 +1970,7 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
 async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
     let catalog = open().await;
 
-    let db_tx1 = catalog.begin_write_tx().await.unwrap();
-    let mut setup = StagedTransaction::begin_detached(db_tx1);
+    let mut setup = catalog.begin_staged(None, String::new()).await.unwrap();
     setup.stage(RowOperation::InlineSchema {
         table_id: 1,
         schema_version: 0,
@@ -1955,8 +1999,7 @@ async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
     });
     setup.commit().await.unwrap();
 
-    let db_tx2 = catalog.begin_write_tx().await.unwrap();
-    let mut drop_tx = StagedTransaction::begin_detached(db_tx2);
+    let mut drop_tx = catalog.begin_staged(None, String::new()).await.unwrap();
     drop_tx.stage(RowOperation::InlineSchemaDrop {
         table_id: 1,
         schema_version: 0,
@@ -1971,14 +2014,14 @@ async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
     });
     drop_tx.commit().await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), None, 1)
+    let dump = catalog.begin_dump().await.unwrap();
+    let schemas = store_inline::scan_inline_schemas(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
+    let chunks = store_inline::scan_inline_chunks(dump.handle(), dump.overlay(), 1)
         .await
         .unwrap();
-    tx.rollback();
+    dump.finish().await;
     assert_eq!(
         schemas,
         vec![(
@@ -2056,8 +2099,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
 
     // Commit 1: table + column + spec 10 (identity on column 1) + one
     // data file written under it, carrying one partition value.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2106,8 +2148,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
     assert_eq!(stored.partition_values[0].partition_value, "7");
 
     // Commit 2: repartition — end spec 10, insert spec 11.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::PartitionInfo,
         cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(2)],
@@ -2160,8 +2201,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
     );
 
     // Commit 3: clear — end spec 11, insert nothing.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::PartitionInfo,
         cells: vec![Cell::U64(1), Cell::U64(11), Cell::U64(3)],
@@ -2214,8 +2254,7 @@ fn sort_expression_row(sort_id: u64, table_id: u64, index: u64, expression: &str
 async fn sort_spec_rows_land_fold_and_time_travel() {
     let catalog = open().await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2253,8 +2292,7 @@ async fn sort_spec_rows_land_fold_and_time_travel() {
 
     // End spec 20, insert spec 21 — the snapshot row keeps the same
     // schema_version: DuckLake does not bump it for sort changes.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::SortInfo,
         cells: vec![Cell::U64(1), Cell::U64(20), Cell::U64(2)],
@@ -2309,8 +2347,7 @@ async fn sort_spec_rows_land_fold_and_time_travel() {
 #[tokio::test]
 async fn orphaned_partition_column_row_is_rejected() {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::PartitionColumn,
         cells: partition_column_row(99, 1, 0, 1),
@@ -2350,8 +2387,7 @@ fn column_tag_row(table_id: u64, column_id: u64, begin: u64, key: &str, value: &
 }
 
 async fn seed_table(catalog: &Catalog) {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2379,8 +2415,7 @@ async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
     let catalog = open().await;
     seed_table(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Tag,
         cells: tag_row(1, 2, "comment", "first"),
@@ -2395,8 +2430,7 @@ async fn tag_rows_land_and_a_recomment_ends_the_old_entry() {
     });
     tx.commit().await.unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::Tag,
         cells: vec![Cell::U64(1), Cell::Str("comment".into()), Cell::U64(3)],
@@ -2437,8 +2471,7 @@ async fn column_tags_ride_the_column_record_without_a_version_transition() {
     let catalog = open().await;
     seed_table(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::ColumnTag,
         cells: column_tag_row(1, 1, 2, "comment", "col comment"),
@@ -2472,8 +2505,7 @@ async fn column_alter_carries_tags_forward() {
     let catalog = open().await;
     seed_table(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::ColumnTag,
         cells: column_tag_row(1, 1, 2, "comment", "kept"),
@@ -2489,8 +2521,7 @@ async fn column_alter_carries_tags_forward() {
     tx.commit().await.unwrap();
 
     // Rename the column: end the old version, insert the new one.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::Column,
         cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(3)],
@@ -2529,8 +2560,7 @@ async fn column_alter_carries_tags_forward() {
 /// file's live version at snapshot 2 — leaving one dead history row,
 /// the fixture the expiry tests prune.
 async fn seed_expired_file(catalog: &Catalog) {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2553,8 +2583,7 @@ async fn seed_expired_file(catalog: &Catalog) {
     });
     tx.commit().await.unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::DataFile,
         cells: vec![Cell::U64(1), Cell::U64(9), Cell::U64(2)],
@@ -2578,8 +2607,7 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     let catalog = open().await;
     seed_expired_file(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Delete {
         table: TableKind::Snapshot,
         cells: vec![Cell::U64(1)],
@@ -2611,13 +2639,10 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     assert_eq!(schedule[0].data_file_id, 9);
     assert_eq!(schedule[0].path, "f9.parquet");
 
-    // The dead snapshot no longer resolves; the survivor does, and
-    // the pruned history row is gone from the dump surface.
-    let expired = catalog
-        .snapshot_at(crate::catalog::SnapshotId::new(1))
-        .await
-        .unwrap_err();
-    assert!(matches!(expired, Error::NotFound(_)), "{expired}");
+    // The survivor resolves, and the pruned history row is gone from the head
+    // view and the dump surface. (Time-travel to the pruned snapshot 1 stays
+    // resolvable until a folder applies the prune to the store: the tail replay
+    // reconstructs the state as of snapshot 1, before the prune.)
     let surviving = catalog
         .snapshot_at(crate::catalog::SnapshotId::new(2))
         .await
@@ -2640,8 +2665,7 @@ async fn cleanup_forgets_the_schedule() {
     let catalog = open().await;
     seed_expired_file(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::FilesScheduledForDeletion,
         cells: vec![
@@ -2653,8 +2677,7 @@ async fn cleanup_forgets_the_schedule() {
     });
     tx.commit().await.unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Delete {
         table: TableKind::FilesScheduledForDeletion,
         cells: vec![Cell::U64(9)],
@@ -2673,8 +2696,7 @@ async fn deleting_the_head_snapshot_is_rejected() {
     let catalog = open().await;
     seed_expired_file(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Delete {
         table: TableKind::Snapshot,
         cells: vec![Cell::U64(2)],
@@ -2690,8 +2712,7 @@ async fn deleting_the_head_snapshot_is_rejected() {
 async fn maintenance_commit_rejects_entity_inserts() {
     let catalog = open().await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2710,8 +2731,7 @@ async fn merge_shaped_commit_replaces_files_and_schedules_sources() {
     let catalog = open().await;
 
     // Seed: table 1 with files 9 and 10, both live.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2744,8 +2764,7 @@ async fn merge_shaped_commit_replaces_files_and_schedules_sources() {
 
     // The merge: insert file 11 backdated to the sources' begin,
     // hard-delete both sources, schedule their bytes.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: data_file_row(11, 1, 1),
@@ -2823,8 +2842,7 @@ async fn rewrite_shaped_commit_ends_rows_and_rebases_the_new_file() {
     seed_expired_file(&catalog).await; // file 9 ended at snapshot 2
 
     // Re-seed a live file 10 with a delete file 11 over it.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: data_file_row(10, 1, 3),
@@ -2859,8 +2877,7 @@ async fn rewrite_shaped_commit_ends_rows_and_rebases_the_new_file() {
 
     // The rewrite: new file 12, end file 10 and delete file 11,
     // rebase 12's begin to this commit's snapshot.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: data_file_row(12, 1, 4),
@@ -2917,8 +2934,7 @@ async fn set_begin_on_a_preexisting_file_is_rejected() {
     let catalog = open().await;
     seed_expired_file(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::Insert {
         table: TableKind::DataFile,
         cells: data_file_row(10, 1, 3),
@@ -2933,8 +2949,7 @@ async fn set_begin_on_a_preexisting_file_is_rejected() {
     });
     tx.commit().await.unwrap();
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetBegin {
         table: TableKind::DataFile,
         cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(4)],
@@ -2959,8 +2974,7 @@ async fn ending_an_absent_tag_entry_is_rejected() {
     let catalog = open().await;
     seed_table(&catalog).await;
 
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::Tag,
         cells: vec![Cell::U64(1), Cell::Str("comment".into()), Cell::U64(2)],
@@ -3024,8 +3038,7 @@ async fn stage_macro_batch(
     next_catalog_id: u64,
     rows: Vec<(TableKind, Vec<Cell>)>,
 ) -> Result<()> {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     for (table, cells) in rows {
         tx.stage(RowOperation::Insert { table, cells });
     }
@@ -3096,8 +3109,7 @@ async fn macro_rows_land_fold_and_drop() {
     );
 
     // Drop: the one UPDATE DuckLake issues, nothing touching children.
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::Macro,
         cells: vec![Cell::U64(10), Cell::U64(2)],
@@ -3114,9 +3126,12 @@ async fn macro_rows_land_fold_and_drop() {
 
     let head = catalog.snapshot().await.unwrap();
     assert!(head.macros.is_empty());
+    // Time-travel replays the tail up to snapshot 1, reconstructing the state
+    // as of that snapshot — the macro is live there, its drop (snapshot 2) not
+    // yet applied — so it carries no end.
     let past = catalog.snapshot_at(SnapshotId::new(1)).await.unwrap();
     let past_macro = &past.macros[&10];
-    assert_eq!(past_macro.end_snapshot, Some(2));
+    assert_eq!(past_macro.end_snapshot, None);
     assert_eq!(past_macro.implementations.len(), 2);
     catalog.close().await.unwrap();
 }
@@ -3247,8 +3262,7 @@ async fn stage_mapping_batch(
     snapshot_id: u64,
     rows: Vec<(TableKind, Vec<Cell>)>,
 ) -> Result<()> {
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     for (table, cells) in rows {
         tx.stage(RowOperation::Insert { table, cells });
     }
@@ -3413,8 +3427,7 @@ async fn duplicate_mapping_id_against_base_is_rejected() {
 #[tokio::test]
 async fn update_set_end_on_column_mapping_is_rejected() {
     let catalog = open().await;
-    let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::ColumnMapping,
         cells: vec![Cell::U64(21), Cell::U64(1)],

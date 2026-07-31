@@ -197,7 +197,7 @@ mod tests {
     use super::*;
     use crate::{
         catalog::CatalogOptions,
-        transaction::staged::{RowOperation, StagedTransaction, TableKind},
+        transaction::staged::{RowOperation, TableKind},
     };
 
     fn snapshot_row(id: u64) -> Vec<crate::transaction::staged::Cell> {
@@ -222,20 +222,10 @@ mod tests {
         ]
     }
 
+    /// A slot-backed catalog: inline data committed through the log is served
+    /// through the unfolded tail until a folder applies it.
     async fn open() -> Catalog {
-        // Drives the single-writer inline path directly through
-        // `begin_write_tx`, which no attach builds after the flip.
-        Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
-            .await
-            .unwrap()
-    }
-
-    /// Opens a slot-backed (multi-writer) catalog: inline data committed
-    /// through the log is served through the unfolded tail until a folder
-    /// applies it.
-    async fn open_slots() -> Catalog {
-        let options = CatalogOptions::default();
-        Catalog::open(Arc::new(InMemory::new()), options)
+        Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap()
     }
@@ -246,7 +236,7 @@ mod tests {
     /// scan returns nothing.
     #[tokio::test]
     async fn scan_inline_serves_unfolded_rows_on_a_slot_backed_attach() {
-        let catalog = open_slots().await;
+        let catalog = open().await;
 
         let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
             .await
@@ -299,8 +289,7 @@ mod tests {
     #[tokio::test]
     async fn scan_inline_materializes_rows_with_chunk_bodies() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
         tx.stage(RowOperation::InlineSchema {
             table_id: 1,
@@ -333,8 +322,7 @@ mod tests {
         });
         tx.commit().await.unwrap();
 
-        let db_tx2 = catalog.begin_write_tx().await.unwrap();
-        let mut inline_delete = StagedTransaction::begin_detached(db_tx2);
+        let mut inline_delete = catalog.begin_staged(None, String::new()).await.unwrap();
         inline_delete.stage(RowOperation::InlineInlineDelete {
             table_id: 1,
             row_id: 1,
@@ -385,8 +373,7 @@ mod tests {
     #[tokio::test]
     async fn inline_file_deletes_read_back_in_key_order() {
         let catalog = open().await;
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
 
         tx.stage(RowOperation::InlineFileDelete {
             table_id: 1,

@@ -26,7 +26,7 @@ async fn unknown_format_is_refused() {
 
     // `Result::unwrap_err` needs `T: Debug`, and `slatedb::Db` has no
     // `Debug` impl; `err().unwrap()` only needs it on the error side.
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
         .await
         .err()
         .unwrap();
@@ -53,7 +53,7 @@ async fn migration_marker_is_refused() {
     .unwrap();
     db.close().await.unwrap();
 
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
         .await
         .err()
         .unwrap();
@@ -155,12 +155,10 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
 /// handles.
 #[tokio::test]
 async fn fresh_reader_sees_committed_head() {
-    use slatedb::DbReader;
-
     use crate::catalog::{Catalog, CatalogOptions};
 
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let catalog = Catalog::open_single_writer(object_store.clone(), CatalogOptions::default())
+    let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
         .await
         .unwrap();
     catalog
@@ -168,19 +166,15 @@ async fn fresh_reader_sees_committed_head() {
         .await
         .unwrap();
 
-    let reader = DbReader::builder("", object_store)
-        .with_segment_extractor(Arc::new(crate::store::segment::TagSegmentExtractor))
-        .build()
+    // The commit rides a slot; a fresh attach replays the tail over the folded
+    // store and sees the committed head.
+    let fresh = Catalog::open(object_store, CatalogOptions::default())
         .await
         .unwrap();
-    let head_bytes = reader
-        .get(Key::Sys(SysKey::Head).encode())
-        .await
-        .unwrap()
-        .expect("fresh reader must see the head");
-    let head: proto::HeadValue = value::decode_value(&head_bytes).unwrap();
-    assert_eq!(head.snapshot_id, 1);
-    reader.close().await.unwrap();
+    let view = fresh.snapshot().await.unwrap();
+    assert_eq!(view.current_snapshot().id.get(), 1);
+    assert!(view.schema_by_name("visible").is_some());
+    fresh.close().await.unwrap();
     catalog.close().await.unwrap();
 }
 
@@ -191,7 +185,7 @@ async fn fresh_reader_sees_committed_head() {
 async fn verb_ddl_records_schema_changed_table_ids() {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile};
 
-    let catalog = Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap();
 
@@ -241,26 +235,31 @@ async fn verb_ddl_records_schema_changed_table_ids() {
         .await
         .unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let ddl = read::read_snapshot(ReadHandle::Tx(&tx), 1)
+    let dump = catalog.begin_dump().await.unwrap();
+    let snapshots = read::scan_snapshots_overlaid(dump.handle(), dump.overlay().unwrap())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(ddl.schema_changed_table_ids, vec![table.get()]);
-    let data_only = read::read_snapshot(ReadHandle::Tx(&tx), 2)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(data_only.schema_changed_table_ids, Vec::<u64>::new());
-    tx.rollback();
+    dump.finish().await;
+    let by_id = |id: u64| snapshots.iter().find(|s| s.snapshot_id == id).unwrap();
+    assert_eq!(by_id(1).schema_changed_table_ids, vec![table.get()]);
+    assert_eq!(by_id(2).schema_changed_table_ids, Vec::<u64>::new());
     catalog.close().await.unwrap();
 }
 
 async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::catalog::TableId) {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
-    let catalog = Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap();
+    // A zero refresh interval so the shared reader reflects folder-role writes
+    // without poll lag: the maintenance sweeps read index entries that a folder
+    // session seeded after this attach opened.
+    let catalog = Catalog::open(
+        Arc::new(InMemory::new()),
+        CatalogOptions {
+            refresh_interval: std::time::Duration::ZERO,
+            ..CatalogOptions::default()
+        },
+    )
+    .await
+    .unwrap();
     let table = std::cell::Cell::new(None);
     catalog
         .commit(|tx| {
@@ -324,9 +323,9 @@ fn null_entry(row_id: u64) -> crate::catalog::IndexEntry {
 }
 
 async fn read_format_version(catalog: &crate::catalog::Catalog) -> u64 {
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let format = read::read_format(ReadHandle::Tx(&tx)).await.unwrap();
-    tx.rollback();
+    let dump = catalog.begin_dump().await.unwrap();
+    let format = read::read_format(dump.handle()).await.unwrap();
+    dump.finish().await;
     format.map_or(FORMAT_VERSION, |f| f.format_version)
 }
 
@@ -337,7 +336,7 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
         store::key::{IndexKind, index_index_prefix},
     };
     let (catalog, table) = catalog_with_two_column_table().await;
-    assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
 
     let index = std::cell::Cell::new(None);
     catalog
@@ -365,20 +364,14 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
     assert_eq!(infos[0].columns, vec![ColumnId::new(1)]);
     assert!(infos[0].unique);
     assert_eq!(infos[0].state, IndexState::Ready);
-    assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
 
     // Both backfill rows produced a stored entry.
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(IndexKind::Unique, index_id.get()), ..)
+    let count = catalog
+        .scan_prefix_overlaid(index_index_prefix(IndexKind::Unique, index_id.get()))
         .await
-        .unwrap();
-    let mut count = 0;
-    while iter.next().await.unwrap().is_some() {
-        count += 1;
-    }
+        .len();
     assert_eq!(count, 2);
-    tx.rollback();
     catalog.close().await.unwrap();
 }
 
@@ -412,7 +405,7 @@ async fn duplicate_unique_value_in_backfill_aborts_create() {
             .indexes_of(table)
             .is_empty()
     );
-    assert_eq!(read_format_version(&catalog).await, FORMAT_VERSION);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
     catalog.close().await.unwrap();
 }
 
@@ -2119,18 +2112,14 @@ async fn scan_index_entries(
     index: crate::catalog::IndexId,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     use crate::store::key::{IndexKind, index_index_prefix};
-    let tx = catalog.begin_write_tx().await.unwrap();
     let mut entries = Vec::new();
     for kind in [IndexKind::Unique, IndexKind::Multi] {
-        let mut iter = ReadHandle::Tx(&tx)
-            .scan_prefix(index_index_prefix(kind, index.get()), ..)
-            .await
-            .unwrap();
-        while let Some(entry) = iter.next().await.unwrap() {
-            entries.push((entry.key.to_vec(), entry.value.to_vec()));
-        }
+        entries.extend(
+            catalog
+                .scan_prefix_overlaid(index_index_prefix(kind, index.get()))
+                .await,
+        );
     }
-    tx.rollback();
     entries.sort();
     entries
 }
@@ -2180,7 +2169,7 @@ async fn staged_build_gates_lookups_flips_ready_and_matches_single_commit() {
     assert_eq!(single_index, staged_index);
 
     // While building: format 3, lookups fail typed.
-    assert_eq!(read_format_version(&staged).await, FORMAT_WITH_STAGED_INDEX);
+    assert_eq!(read_format_version(&staged).await, FORMAT_MULTI_WRITER);
     assert!(matches!(
         staged
             .index_lookup(table_staged, staged_index, &[int_value(20)])
@@ -2487,30 +2476,10 @@ async fn staged_build_step_rejects_a_duplicate_and_a_ready_index() {
 
 #[tokio::test]
 async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
-    use crate::{
-        catalog::{ColumnId, IndexDef},
-        store::key::{IndexKind, index_index_prefix},
-    };
+    use crate::store::key::{IndexKind, index_index_prefix};
     let (catalog, table) = catalog_with_two_column_table().await;
     register_three_row_file(&catalog, table).await;
-    let index = std::cell::Cell::new(None);
-    catalog
-        .commit(|tx| {
-            let id = tx.create_index(
-                table,
-                &IndexDef {
-                    name: "by_a".into(),
-                    columns: vec![ColumnId::new(1)],
-                    unique: true,
-                },
-                &[entry(0, 10), entry(1, 20), entry(2, 30)],
-            )?;
-            index.set(Some(id));
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let index = index.get().unwrap();
+    let index = indexed(&catalog, table, "by_a", 3).await;
 
     // Reclaiming a live index is refused.
     assert!(matches!(
@@ -2529,25 +2498,32 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
     assert_eq!(catalog.reclaim_index_entries(index, 100).await.unwrap(), 0);
 
     // The index range is empty afterward.
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(IndexKind::Unique, index.get()), ..)
-        .await
-        .unwrap();
-    assert!(iter.next().await.unwrap().is_none());
-    tx.rollback();
+    assert!(
+        catalog
+            .scan_prefix_overlaid(index_index_prefix(IndexKind::Unique, index.get()))
+            .await
+            .is_empty()
+    );
     catalog.close().await.unwrap();
 }
 
-/// Creates an index over column `a` carrying `count` entries.
+/// Creates a live index over column `a` and seeds `count` entries into the
+/// folded store — the state a completed fold would leave. The definition rides
+/// the log (empty backfill, so no entries land in the unfolded tail); the
+/// entries are folder-written directly, so the folder-role sweep sees them.
 async fn indexed(
     catalog: &crate::catalog::Catalog,
     table: crate::catalog::TableId,
     name: &str,
     count: u64,
 ) -> crate::catalog::IndexId {
-    use crate::catalog::{ColumnId, IndexDef};
-    let entries: Vec<_> = (0..count).map(|i| entry(i, i128::from(i) * 10)).collect();
+    use crate::{
+        catalog::{ColumnId, IndexDef},
+        store::{
+            index_encoding::{Direction, NullOrder, encode_ordered_values},
+            key::{IndexKey, Key},
+        },
+    };
     let index = std::cell::Cell::new(None);
     catalog
         .commit(|tx| {
@@ -2558,31 +2534,45 @@ async fn indexed(
                     columns: vec![ColumnId::new(1)],
                     unique: true,
                 },
-                &entries,
+                &[],
             )?;
             index.set(Some(id));
             Ok(())
         })
         .await
         .unwrap();
-    index.get().unwrap()
+    let id = index.get().unwrap();
+
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..count)
+        .map(|i| {
+            let canonical = encode_ordered_values(
+                &[Some(int_value(i128::from(i) * 10))],
+                &[Direction::Ascending],
+                &[NullOrder::Last],
+            )
+            .unwrap();
+            let key = Key::Index(IndexKey::Unique {
+                index_id: id.get(),
+                key: canonical,
+            })
+            .encode();
+            (key, i.to_be_bytes().to_vec())
+        })
+        .collect();
+    catalog.seed_folded_writes(entries).await;
+    id
 }
 
 /// Counts every entry left in the `index` subspace, across both kinds.
 async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
     use crate::store::key::{IndexKind, index_kind_prefix};
-    let tx = catalog.begin_write_tx().await.unwrap();
     let mut total = 0;
     for kind in [IndexKind::Unique, IndexKind::Multi] {
-        let mut iter = ReadHandle::Tx(&tx)
-            .scan_prefix(index_kind_prefix(kind), ..)
+        total += catalog
+            .scan_prefix_overlaid(index_kind_prefix(kind))
             .await
-            .unwrap();
-        while iter.next().await.unwrap().is_some() {
-            total += 1;
-        }
+            .len();
     }
-    tx.rollback();
     total
 }
 
@@ -2787,7 +2777,7 @@ async fn maintain_refuses_a_read_only_catalog() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
 
     // Bootstrap and release the writer so the reader has a store to open.
-    let writer = Catalog::open_single_writer(object_store.clone(), CatalogOptions::default())
+    let writer = Catalog::open(object_store.clone(), CatalogOptions::default())
         .await
         .unwrap();
     writer.close().await.unwrap();
@@ -2994,171 +2984,16 @@ async fn drop_index_ends_definition_and_keeps_format() {
             .is_empty()
     );
     // Dropping the last index does not downgrade the stamp.
-    assert_eq!(read_format_version(&catalog).await, FORMAT_WITH_INDEX);
+    assert_eq!(read_format_version(&catalog).await, FORMAT_MULTI_WRITER);
     catalog.close().await.unwrap();
-}
-
-/// The head view the writer folds forward on every commit stays identical
-/// to a fresh scan of the store, across creates, a rename, an option, a
-/// column drop, and a full table drop — whose child deletes the fold must
-/// apply without over-cascading.
-#[tokio::test]
-async fn folded_head_view_matches_a_fresh_scan() {
-    use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile, OptionScope};
-
-    let catalog = Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
-        .await
-        .unwrap();
-    let column = |name: &str| ColumnDef {
-        name: name.into(),
-        column_type: "BIGINT".into(),
-        nulls_allowed: true,
-        default_value: None,
-    };
-
-    let keep = std::cell::Cell::new(None);
-    let doomed = std::cell::Cell::new(None);
-    catalog
-        .commit(|tx| {
-            let schema = tx.create_schema("s")?;
-            let k = tx.create_table(schema, "keep", &[column("a"), column("b")])?;
-            let d = tx.create_table(schema, "doomed", &[column("x")])?;
-            tx.create_view(schema, "v", "duckdb", "SELECT 1")?;
-            keep.set(Some(k));
-            doomed.set(Some(d));
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let keep = keep.get().unwrap();
-    let doomed = doomed.get().unwrap();
-
-    catalog
-        .commit(|tx| {
-            tx.register_data_file(
-                keep,
-                DataFile {
-                    path: "f.parquet".into(),
-                    path_is_relative: true,
-                    file_format: "parquet".into(),
-                    record_count: 3,
-                    file_size_bytes: 100,
-                    footer_size: 8,
-                    encryption_key: None,
-                    column_stats: vec![],
-                },
-                &[],
-            )?;
-            tx.set_option(OptionScope::Global, "answer", "42")?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-
-    catalog
-        .commit(|tx| {
-            tx.rename_table(keep, "keep2")?;
-            let second = tx.columns_of(keep)[1].id;
-            tx.drop_column(keep, second)
-        })
-        .await
-        .unwrap();
-
-    catalog.commit(|tx| tx.drop_table(doomed)).await.unwrap();
-
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let head = read::read_head(ReadHandle::Tx(&tx))
-        .await
-        .unwrap()
-        .unwrap()
-        .snapshot_id;
-    let fresh = materialize(ReadHandle::Tx(&tx), None).await.unwrap();
-    tx.rollback();
-
-    let cached = catalog
-        .projections()
-        .read()
-        .unwrap()
-        .head_view(head)
-        .expect("the writer caches its head view");
-
-    assert_eq!(cached.snapshot.snapshot_id, fresh.snapshot.snapshot_id);
-    // An empty diff both directions means identical current state.
-    assert!(
-        diff_writes(&fresh, &cached, head + 1).is_empty(),
-        "folded head view diverged from a fresh scan"
-    );
-    assert!(
-        diff_writes(&cached, &fresh, head + 1).is_empty(),
-        "folded head view diverged from a fresh scan"
-    );
-    catalog.close().await.unwrap();
-}
-
-/// The first attempt never waits, later ones grow to the cap, and every
-/// wait carries jitter — two writers that collided must not re-collide in
-/// lockstep.
-#[test]
-fn retry_backoff_starts_at_zero_grows_and_caps() {
-    use super::{RETRY_BACKOFF_BASE_MICROS, RETRY_BACKOFF_MAX_MICROS, retry_backoff};
-
-    assert_eq!(retry_backoff(0), std::time::Duration::ZERO);
-
-    let ceiling = u128::from(RETRY_BACKOFF_MAX_MICROS + RETRY_BACKOFF_BASE_MICROS);
-    let mut previous = 0_u128;
-    for attempt in 1..MAX_COMMIT_ATTEMPTS {
-        let waited = retry_backoff(attempt).as_micros();
-        assert!(
-            waited >= u128::from(RETRY_BACKOFF_BASE_MICROS),
-            "attempt {attempt} waited {waited}µs, below the base delay"
-        );
-        assert!(
-            waited <= ceiling,
-            "attempt {attempt} waited {waited}µs, above the cap plus jitter"
-        );
-        // Growth holds until the cap absorbs it; jitter never reverses it.
-        if previous > 0 && previous < u128::from(RETRY_BACKOFF_MAX_MICROS) {
-            assert!(
-                waited > previous,
-                "attempt {attempt} waited {waited}µs, not more than {previous}µs"
-            );
-        }
-        previous = waited;
-    }
-    // The last attempts sit at the cap rather than growing without bound.
-    assert!(
-        retry_backoff(MAX_COMMIT_ATTEMPTS - 1).as_micros() >= u128::from(RETRY_BACKOFF_MAX_MICROS)
-    );
-}
-
-/// The whole budget must span enough time for a competing commit to land,
-/// without leaving a caller waiting on a conflict for seconds.
-#[test]
-fn retry_backoff_budget_stays_in_a_sane_band() {
-    use super::retry_backoff;
-
-    let total: std::time::Duration = (0..MAX_COMMIT_ATTEMPTS).map(retry_backoff).sum();
-    assert!(
-        total >= std::time::Duration::from_millis(100),
-        "whole retry budget waits only {total:?}"
-    );
-    assert!(
-        total <= std::time::Duration::from_millis(600),
-        "whole retry budget waits {total:?}"
-    );
 }
 
 #[tokio::test]
 async fn multi_writer_bootstrap_stamps_format_four_and_fold_zero() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = open_initialized(
-        StoreBuilder::new("", object_store.clone()),
-        false,
-        None,
-        true,
-    )
-    .await
-    .unwrap();
+    let db = open_initialized(StoreBuilder::new("", object_store.clone()), false, None)
+        .await
+        .unwrap();
     let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
     let format = read::read_format(ReadHandle::Tx(&tx))
         .await

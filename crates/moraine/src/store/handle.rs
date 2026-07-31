@@ -50,13 +50,10 @@ impl ReadHandle<'_> {
     }
 }
 
-/// An owned read session backing one materialization: a snapshot-isolated
-/// transaction (read-write catalog) or a shared reader (read-only). Borrow a
-/// [`ReadHandle`] from it for the typed reads, then [`finish`](Self::finish)
-/// to roll back the transaction (a reader has nothing to roll back).
+/// An owned read session backing one materialization: a shared reader
+/// following the manifest. Borrow a [`ReadHandle`] from it for the typed
+/// reads, then [`finish`](Self::finish) to release it.
 pub(crate) enum ReadSession {
-    /// A read-write transaction, rolled back on `finish`.
-    Tx(DbTransaction),
     /// A read-only reader, shared with the catalog.
     Reader(Arc<DbReader>),
 }
@@ -65,15 +62,12 @@ impl ReadSession {
     /// Borrows a read handle over this session.
     pub(crate) fn handle(&self) -> ReadHandle<'_> {
         match self {
-            Self::Tx(tx) => ReadHandle::Tx(tx),
             Self::Reader(reader) => ReadHandle::Reader(reader),
         }
     }
 
-    /// Releases the session, rolling back a read-write transaction.
+    /// Releases the session.
     pub(crate) fn finish(self) {
-        if let Self::Tx(tx) = self {
-            tx.rollback();
-        }
+        let Self::Reader(_) = self;
     }
 }

@@ -492,11 +492,6 @@ impl ChangeSet {
         set
     }
 
-    /// True when the set records no changes at all.
-    pub(crate) fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
     fn touches_schema_list(&self) -> bool {
         !self.created_schemas.is_empty() || !self.dropped_schemas.is_empty()
     }

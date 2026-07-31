@@ -30,12 +30,9 @@ use crate::{
     transaction::commit::StagedWrite,
 };
 
-/// Read-side dispatch for uniqueness probes: the store view alone
-/// (single-writer transactions read their own writes), or the store overlaid
-/// with unfolded tail writes (multi-writer).
+/// Read-side dispatch for uniqueness probes: the folded store view overlaid
+/// with the writes of slots no folder has applied yet.
 pub(crate) enum ProbeHandle<'a> {
-    /// A store view read directly.
-    Store(ReadHandle<'a>),
     /// A store view overlaid with an unfolded tail: a tail write shadows the
     /// stored value, a tail delete hides it.
     Overlaid {
@@ -46,26 +43,15 @@ pub(crate) enum ProbeHandle<'a> {
     },
 }
 
-impl<'a> ProbeHandle<'a> {
+impl ProbeHandle<'_> {
     /// Point read of one key, an overlaid tail's write for it taking
     /// precedence over the store's.
     pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         match self {
-            Self::Store(store) => store.get(key).await.map_err(Error::from),
             Self::Overlaid { store, overlay } => match overlay.get(key) {
                 Some(write) => Ok(write.map(Bytes::copy_from_slice)),
                 None => store.get(key).await.map_err(Error::from),
             },
-        }
-    }
-
-    /// The directly scannable store view, present only when no tail overlays
-    /// it — the bulk-load merged probe needs a store scan an overlay cannot
-    /// join into a `DbIterator`.
-    fn scan_view(&self) -> Option<ReadHandle<'a>> {
-        match self {
-            Self::Store(store) => Some(*store),
-            Self::Overlaid { .. } => None,
         }
     }
 }
@@ -126,18 +112,6 @@ const UNIQUENESS_PROBE_CONCURRENCY: usize = 64;
 /// can hold millions of entries, so probes are resolved in bounded groups
 /// rather than accumulated: peak memory is this many keys, not the batch's.
 const UNIQUENESS_PROBE_GROUP: usize = 1024;
-
-/// Above this many unique puts in one commit, presence is resolved by one
-/// sorted forward pass per index instead of independent point reads. A bulk
-/// load probes nearly every key it stages, and a random read per key against
-/// an index that grows with the load turns the load quadratic; the merged
-/// pass costs one bounded sequential scan per index instead. At or below the
-/// threshold — the OLTP shape — point reads win, so they stay.
-///
-/// The merged pass accumulates every pending probe before resolving, adding
-/// key-sized memory per entry on top of the store's kilobyte; the commit
-/// bound below keeps that share proportionally small.
-const MERGED_PROBE_THRESHOLD: usize = 1024;
 
 /// The most entries one commit may stage.
 ///
@@ -227,103 +201,6 @@ async fn resolve_probes(
     Ok(())
 }
 
-/// Resolves every pending unique put in one sorted forward pass per index.
-/// The keys sort into contiguous per-index runs (the index id leads the
-/// encoded key), and each run is answered by one bounded scan advanced in
-/// step with the run — seeking over gaps — so presence costs sequential
-/// reads over the overlapping key range instead of one random point read
-/// per key. The outcomes match [`resolve_probes`] exactly: present with a
-/// different row id rejects the batch (the earliest staged entry decides
-/// which index the rejection names), present with the same row id stages
-/// nothing, absent stages the put.
-async fn resolve_probes_merged(
-    handle: ReadHandle<'_>,
-    deleted_unique: &HashSet<Vec<u8>>,
-    pending: Vec<PendingProbe>,
-    poisoned: &mut Vec<u64>,
-    writes: &mut Vec<StagedWrite>,
-) -> Result<()> {
-    let mut order: Vec<usize> = (0..pending.len()).collect();
-    order.sort_unstable_by(|&a, &b| pending[a].key.cmp(&pending[b].key));
-
-    let mut held_elsewhere: Option<usize> = None;
-    let mut already_held = vec![false; pending.len()];
-    // Claims that poisoned a building index: staging them would overwrite
-    // the live holder's entry.
-    let mut dropped = vec![false; pending.len()];
-
-    let mut run_start = 0;
-    while run_start < order.len() {
-        let index_id = pending[order[run_start]].index_id;
-        let prefix = index_index_prefix(IndexKind::Unique, index_id);
-        let run_end = order[run_start..]
-            .iter()
-            .position(|&at| pending[at].index_id != index_id)
-            .map_or(order.len(), |offset| run_start + offset);
-
-        // One scan bounded to the run's key span; bounds are suffixes of
-        // the prefix. Every seek target is a run key, so it stays in range.
-        let first = pending[order[run_start]].key[prefix.len()..].to_vec();
-        let last = pending[order[run_end - 1]].key[prefix.len()..].to_vec();
-        let mut iter = handle
-            .scan_prefix(prefix, first..=last)
-            .await
-            .map_err(Error::from)?;
-        let mut current = iter.next().await.map_err(Error::from)?;
-
-        for &batch_position in &order[run_start..run_end] {
-            let probe = &pending[batch_position];
-            let key_bytes = &probe.key;
-            // A value this same batch deletes is free again, whatever the
-            // store still holds.
-            if deleted_unique.contains(key_bytes) {
-                continue;
-            }
-            // Advance to the first stored entry at or past this key. The
-            // seek target exceeds the last key returned, as seek requires:
-            // keys ascend strictly, and equality breaks the loop.
-            while let Some(entry) = &current {
-                if entry.key.as_ref() >= key_bytes.as_slice() {
-                    break;
-                }
-                iter.seek(key_bytes).await.map_err(Error::from)?;
-                current = iter.next().await.map_err(Error::from)?;
-            }
-
-            if let Some(entry) = &current
-                && entry.key.as_ref() == key_bytes.as_slice()
-            {
-                if decode_row_id(&entry.value)? == probe.row_id {
-                    already_held[batch_position] = true;
-                } else if probe.building {
-                    poisoned.push(probe.index_id);
-                    dropped[batch_position] = true;
-                } else {
-                    held_elsewhere = Some(
-                        held_elsewhere
-                            .map_or(batch_position, |earliest| earliest.min(batch_position)),
-                    );
-                }
-            }
-        }
-
-        run_start = run_end;
-    }
-
-    if let Some(batch_position) = held_elsewhere {
-        return Err(unique_violation(pending[batch_position].index_id));
-    }
-
-    for (position, probe) in pending.into_iter().enumerate() {
-        if already_held[position] || dropped[position] {
-            continue;
-        }
-        writes.push((probe.key, Some(probe.row_id.to_be_bytes().to_vec())));
-    }
-
-    Ok(())
-}
-
 /// Resolves accumulated entries into planned writes, enforcing uniqueness at
 /// commit against `probe`. Returns the ids of poisoned building indexes and
 /// the writes to stage — deletes first, then puts, so staging them in order
@@ -371,14 +248,7 @@ pub(crate) async fn plan_index_entries(
     // Non-unique puts plan straight away; unique puts collapse to one probe
     // per distinct key. Two entries claiming one value for different rows
     // collide here, in memory, before any read. Presence is then resolved a
-    // group of point reads at a time — or, past the threshold and when the
-    // probe scans directly, by one sorted pass per index over the whole batch.
-    let unique_puts = entries
-        .iter()
-        .filter(|entry| !entry.delete && entry.unique)
-        .count();
-    let scan_view = probe.scan_view();
-    let merged = scan_view.is_some() && unique_puts > MERGED_PROBE_THRESHOLD;
+    // group of point reads at a time.
     let mut pending: Vec<PendingProbe> = Vec::new();
     let mut claimed: HashMap<Vec<u8>, u64> = HashMap::new();
     let mut poisoned: Vec<u64> = Vec::new();
@@ -405,7 +275,7 @@ pub(crate) async fn plan_index_entries(
             index_id: entry.index_id,
             building: entry.building,
         });
-        if !merged && pending.len() >= UNIQUENESS_PROBE_GROUP {
+        if pending.len() >= UNIQUENESS_PROBE_GROUP {
             resolve_probes(
                 &probe,
                 &deleted_unique,
@@ -416,22 +286,14 @@ pub(crate) async fn plan_index_entries(
             .await?;
         }
     }
-    match scan_view.filter(|_| merged) {
-        Some(handle) => {
-            resolve_probes_merged(handle, &deleted_unique, pending, &mut poisoned, &mut writes)
-                .await?;
-        }
-        None => {
-            resolve_probes(
-                &probe,
-                &deleted_unique,
-                &mut pending,
-                &mut poisoned,
-                &mut writes,
-            )
-            .await?;
-        }
-    }
+    resolve_probes(
+        &probe,
+        &deleted_unique,
+        &mut pending,
+        &mut poisoned,
+        &mut writes,
+    )
+    .await?;
 
     poisoned.sort_unstable();
     poisoned.dedup();

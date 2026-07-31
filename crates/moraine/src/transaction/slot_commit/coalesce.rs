@@ -629,7 +629,7 @@ where
         overlay,
     };
     match assemble_commit(probe, f, view, None, Some(txid.into_bytes())).await {
-        Ok(Prepared::Nothing { .. }) => Product::Nothing,
+        Ok(Prepared::Nothing) => Product::Nothing,
         Ok(Prepared::Staged(assembled)) => {
             let commit = commit_from(txid, &assembled);
             let writes: Vec<StagedWrite> = assembled.writes.clone();

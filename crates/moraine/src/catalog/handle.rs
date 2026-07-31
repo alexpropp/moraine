@@ -13,7 +13,7 @@ use std::{
 
 use futures::StreamExt;
 use object_store::{ObjectStore, path::Path};
-use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
+use slatedb::{Db, DbReader, IsolationLevel};
 use tracing::{info, warn};
 
 use crate::{
@@ -234,8 +234,6 @@ impl ProbeRead {
 /// attach, the unfolded tail to overlay so a winner no folder has applied yet
 /// is not missed. Released by [`finish`](DumpRead::finish).
 pub(crate) enum DumpRead {
-    /// A single read session — a writer transaction or a read-only reader.
-    Session(ReadSession),
     /// A pinned slot-log head: scans read through `reader` (or the one the
     /// head opened past a truncation) overlaid with the tail.
     Slots {
@@ -247,36 +245,30 @@ pub(crate) enum DumpRead {
 impl DumpRead {
     /// The handle raw scans read through.
     pub(crate) fn handle(&self) -> ReadHandle<'_> {
-        match self {
-            Self::Session(session) => session.handle(),
-            Self::Slots { reader, head } => head.handle(ReadHandle::Reader(reader)),
-        }
+        let Self::Slots { reader, head } = self;
+        head.handle(ReadHandle::Reader(reader))
     }
 
-    /// The unfolded tail to overlay, or `None` on a single-topology store.
+    /// The unfolded tail to overlay, `Some` for the overlay-accepting scan
+    /// functions this feeds.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn overlay(&self) -> Option<&moraine_wal::Overlay> {
-        match self {
-            Self::Session(_) => None,
-            Self::Slots { head, .. } => Some(&head.overlay),
-        }
+        let Self::Slots { head, .. } = self;
+        Some(&head.overlay)
     }
 
-    /// The head snapshot id, or `None` on a store with no head yet.
-    pub(crate) async fn head_id(&self) -> Result<Option<u64>> {
-        match self {
-            Self::Session(session) => Ok(crate::store::read::read_head(session.handle())
-                .await?
-                .map(|h| h.snapshot_id)),
-            Self::Slots { head, .. } => Ok(Some(head.view.snapshot.snapshot_id)),
-        }
+    /// The head snapshot id, `Some` for the projection callers that gate on a
+    /// known head.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn head_id(&self) -> Option<u64> {
+        let Self::Slots { head, .. } = self;
+        Some(head.view.snapshot.snapshot_id)
     }
 
-    /// Releases the session, or the reader a hole retry opened.
+    /// Releases the reader a hole retry opened.
     pub(crate) async fn finish(self) {
-        match self {
-            Self::Session(session) => session.finish(),
-            Self::Slots { head, .. } => slot_commit::release_reader(head.reader.as_ref()).await,
-        }
+        let Self::Slots { head, .. } = self;
+        slot_commit::release_reader(head.reader.as_ref()).await;
     }
 }
 
@@ -321,17 +313,11 @@ pub struct MaintenanceReport {
     pub index_entries_reclaimed: u64,
 }
 
-/// The open store behind a catalog. Every production attach — read-write or
-/// read-only — builds [`Store::Slots`]; the single-writer [`Store::Writer`] is
-/// reached only by the single-writer commit and staged paths' own tests, which
-/// are deleted with that path in a later task.
+/// The open store behind a catalog. Every attach — read-write or read-only —
+/// builds [`Store::Slots`].
 enum Store {
-    /// A single-writer `Db`. Test-only: no attach path builds it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Writer(Db),
     /// The slot-log-backed store: a reader following the folded store plus the
-    /// slot log its commits ride. Boxed: it dwarfs the writer variant, the
-    /// coalescer's queue included.
+    /// slot log its commits ride. Boxed to keep the enum's footprint down.
     Slots(Box<SlotStore>),
 }
 
@@ -478,28 +464,6 @@ impl Catalog {
         })
     }
 
-    /// Opens a single-writer catalog directly through the writer, for the
-    /// single-writer commit and staged paths' own tests. No production attach
-    /// builds this; the flip routes every attach through the slot log.
-    #[cfg(test)]
-    pub(crate) async fn open_single_writer(
-        object_store: Arc<dyn ObjectStore>,
-        options: CatalogOptions,
-    ) -> Result<Self> {
-        let store = StoreBuilder::new(&options.path, object_store);
-        let db = commit::open_initialized(
-            store,
-            options.encrypted,
-            options.data_path.as_deref(),
-            false,
-        )
-        .await?;
-        Ok(Self {
-            store: Arc::new(Store::Writer(db)),
-            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
-        })
-    }
-
     /// Resolves a read-write attach to the reader it follows: bootstraps an
     /// empty store at [`commit::FORMAT_MULTI_WRITER`], attaches a store already
     /// there, migrates a legacy format 1–3 store in one atomic batch, and
@@ -603,7 +567,6 @@ impl Catalog {
             writer_store,
             options.encrypted,
             options.data_path.as_deref(),
-            true,
         )
         .await?;
         db.close().await.map_err(Error::from)?;
@@ -697,30 +660,17 @@ impl Catalog {
         &self.projections
     }
 
-    /// Whether this catalog maintains served projections: read-write only —
-    /// a read-only catalog has no local commits to fold, so its dumps
-    /// always scan.
+    /// Whether this catalog maintains served projections. The slot topology
+    /// folds no local commits into a served head view, so dumps always scan.
+    #[allow(clippy::unused_self)]
     pub(crate) fn maintains_projections(&self) -> bool {
-        matches!(self.store.as_ref(), Store::Writer(_))
+        false
     }
 
-    /// The read-write writer, or [`Error::Constraint`] if the catalog was
-    /// opened read-only.
-    fn writer(&self) -> Result<&Db> {
-        match self.store.as_ref() {
-            Store::Writer(db) => Ok(db),
-            Store::Slots(_) => Err(Error::Constraint(
-                "catalog attached over the slot log; the single writer is unavailable".to_string(),
-            )),
-        }
-    }
-
-    /// Whether direct-store writes are available: the single writer, or a
-    /// read-write slot-backed attach (through the folder role). A read-only
-    /// attach refuses.
+    /// Whether direct-store writes are available: a read-write slot-backed
+    /// attach (through the folder role). A read-only attach refuses.
     fn ensure_writable(&self) -> Result<()> {
         match self.store.as_ref() {
-            Store::Writer(_) => Ok(()),
             Store::Slots(store) if !store.read_only => Ok(()),
             Store::Slots(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
@@ -729,15 +679,14 @@ impl Catalog {
     }
 
     /// Runs `body` against a writable `Db` for a direct-store maintenance
-    /// write: the single writer commits through it directly, a slot-backed
-    /// attach opens a fenced folder session for it — the one process allowed to
-    /// write the store directly — and a read-only attach refuses.
+    /// write: a read-write attach opens a fenced folder session for it — the
+    /// one process allowed to write the store directly — and a read-only attach
+    /// refuses.
     async fn with_writer<T, F>(&self, body: F) -> Result<T>
     where
         F: AsyncFnOnce(&Db) -> Result<T>,
     {
         match self.store.as_ref() {
-            Store::Writer(db) => body(db).await,
             Store::Slots(store) if !store.read_only => folder::with_folder(store, body).await,
             Store::Slots(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
@@ -765,53 +714,38 @@ impl Catalog {
     }
 
     async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
-        if let Store::Slots(store) = self.store.as_ref() {
-            return match at {
-                None => {
-                    let head = slot_commit::materialize_slot_head(store).await?;
-                    slot_commit::release_reader(head.reader.as_ref()).await;
-                    Ok(head.view)
-                }
-                Some(snapshot) => slot_commit::materialize_slot_view_at(store, snapshot).await,
-            };
+        let Store::Slots(store) = self.store.as_ref();
+        match at {
+            None => {
+                let head = slot_commit::materialize_slot_head(store).await?;
+                slot_commit::release_reader(head.reader.as_ref()).await;
+                Ok(head.view)
+            }
+            Some(snapshot) => slot_commit::materialize_slot_view_at(store, snapshot).await,
         }
-
-        let session = self.begin_read().await?;
-        let view = commit::materialize(session.handle(), at).await;
-        session.finish();
-
-        view
     }
 
     /// One head read: the view, and on a slot-backed attach the byte-level
     /// overlay of the slots no folder has applied — what a probe the projection
     /// does not model must read over the store.
-    async fn head_view(&self, handle: ReadHandle<'_>) -> Result<HeadRead> {
-        match self.store.as_ref() {
-            Store::Slots(store) => {
-                // A fresh reader: entry scans read folder-written entries — index
-                // backfills above all — straight from the store, not the tail.
-                let head = slot_commit::materialize_slot_head_fresh(store).await?;
-                Ok(HeadRead {
-                    view: head.view,
-                    tail: Some(head.overlay),
-                    reader: head.reader,
-                })
-            }
-            Store::Writer(_) => Ok(HeadRead {
-                view: commit::materialize(handle, None).await?,
-                tail: None,
-                reader: None,
-            }),
-        }
+    async fn head_view(&self) -> Result<HeadRead> {
+        let Store::Slots(store) = self.store.as_ref();
+        // A fresh reader: entry scans read folder-written entries — index
+        // backfills above all — straight from the store, not the tail.
+        let head = slot_commit::materialize_slot_head_fresh(store).await?;
+        Ok(HeadRead {
+            view: head.view,
+            tail: Some(head.overlay),
+            reader: head.reader,
+        })
     }
 
     /// Opens a read session and materializes the head through it, so a probe's
     /// entry scans and the catalog they resolve against are one cut. Released
     /// by [`ProbeRead::finish`].
     async fn begin_probe(&self) -> Result<ProbeRead> {
-        let session = self.begin_read().await?;
-        match self.head_view(session.handle()).await {
+        let session = self.begin_read();
+        match self.head_view().await {
             Ok(head) => Ok(ProbeRead { session, head }),
             Err(err) => {
                 session.finish();
@@ -1055,20 +989,14 @@ impl Catalog {
         outcome
     }
 
-    /// Opens a read session at the current head — a read-write transaction or
-    /// the read-only reader — the same isolation
+    /// Opens a read session at the current head — the read-only reader shared
+    /// with the catalog — the same isolation
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
     /// Used by [`crate::ffi_support`]'s raw current+history dumps and inline
     /// scans; every other reader goes through `snapshot`/`snapshot_at`.
-    pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
-        match self.store.as_ref() {
-            Store::Writer(db) => Ok(ReadSession::Tx(
-                db.begin(IsolationLevel::Snapshot)
-                    .await
-                    .map_err(Error::from)?,
-            )),
-            Store::Slots(store) => Ok(ReadSession::Reader(store.reader.clone())),
-        }
+    pub(crate) fn begin_read(&self) -> ReadSession {
+        let Store::Slots(store) = self.store.as_ref();
+        ReadSession::Reader(store.reader.clone())
     }
 
     /// Opens a read for the raw current+history dumps: a single read session
@@ -1076,23 +1004,69 @@ impl Catalog {
     /// unfolded tail) on a slot-backed attach, so a dump taken mid-transaction
     /// reflects a winner no folder has applied yet.
     pub(crate) async fn begin_dump(&self) -> Result<DumpRead> {
-        match self.store.as_ref() {
-            Store::Slots(store) => {
-                let head = slot_commit::materialize_slot_head(store).await?;
-                Ok(DumpRead::Slots {
-                    reader: store.reader.clone(),
-                    head: Box::new(head),
-                })
-            }
-            Store::Writer(_) => Ok(DumpRead::Session(self.begin_read().await?)),
-        }
+        let Store::Slots(store) = self.store.as_ref();
+        let head = slot_commit::materialize_slot_head(store).await?;
+        Ok(DumpRead::Slots {
+            reader: store.reader.clone(),
+            head: Box::new(head),
+        })
     }
 
-    /// Opens a staged-row transaction over whichever topology this catalog
-    /// attached. A single-writer attach opens a read-write transaction; a
-    /// slot-backed attach materializes the head and pins it, so the staged
-    /// batch races one slot at commit. A read-only attach of either topology
-    /// returns [`Error::Constraint`].
+    /// Test-only: every stored `(key, value)` under `prefix`, read through a
+    /// fresh slot head — the folded store overlaid with the unfolded tail — so
+    /// both folder-written entries and slot-committed ones are seen.
+    #[cfg(test)]
+    pub(crate) async fn scan_prefix_overlaid(&self, prefix: Vec<u8>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Store::Slots(store) = self.store.as_ref();
+        let head = slot_commit::materialize_slot_head_fresh(store)
+            .await
+            .unwrap();
+        let handle = head.handle(ReadHandle::Reader(&store.reader));
+        let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut iter = handle.scan_prefix(prefix.clone(), ..).await.unwrap();
+        while let Some(entry) = iter.next().await.unwrap() {
+            merged.insert(entry.key.to_vec(), entry.value.to_vec());
+        }
+        for (key, value) in head.overlay.prefixed(&prefix) {
+            match value {
+                Some(bytes) => {
+                    merged.insert(key.to_vec(), bytes.to_vec());
+                }
+                None => {
+                    merged.remove(key);
+                }
+            }
+        }
+        slot_commit::release_reader(head.reader.as_ref()).await;
+        merged.into_iter().collect()
+    }
+
+    /// Test-only: writes `entries` straight into the folded store under the
+    /// folder role — the state a completed fold would leave, so the folder-role
+    /// sweep can be exercised before a fold implementation lands.
+    #[cfg(test)]
+    pub(crate) async fn seed_folded_writes(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) {
+        self.with_writer(async |db| {
+            let tx = db
+                .begin(IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
+            for (key, value) in &entries {
+                tx.put(key.clone(), value.clone()).map_err(Error::from)?;
+            }
+            tx.commit_with_options(&commit::durable())
+                .await
+                .map_err(Error::from)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Opens a staged-row transaction: materializes the head and pins it, so
+    /// the staged batch races one slot at commit. A read-only attach returns
+    /// [`Error::Constraint`].
     pub(crate) async fn begin_staged(
         &self,
         data_store: Option<Arc<dyn ObjectStore>>,
@@ -1100,16 +1074,7 @@ impl Catalog {
     ) -> Result<crate::transaction::staged::StagedTransaction> {
         use crate::transaction::staged::StagedTransaction;
 
-        let Store::Slots(store) = self.store.as_ref() else {
-            let db_tx = self.begin_write_tx().await?;
-            return Ok(StagedTransaction::begin(
-                db_tx,
-                self.projections.clone(),
-                data_store,
-                data_prefix,
-            ));
-        };
-
+        let Store::Slots(store) = self.store.as_ref();
         if store.read_only {
             return Err(Error::Constraint(
                 "catalog attached read-only; writes are unavailable".to_string(),
@@ -1120,19 +1085,9 @@ impl Catalog {
             head,
             store.reader.clone(),
             store.slots.clone(),
-            self.projections.clone(),
             data_store,
             data_prefix,
         ))
-    }
-
-    /// Opens a read-write transaction for the staged-row commit path. Fails
-    /// with [`Error::Constraint`] on a read-only catalog.
-    pub(crate) async fn begin_write_tx(&self) -> Result<DbTransaction> {
-        self.writer()?
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(Error::from)
     }
 
     /// Derives the index entries for a file the extension path registers, by
@@ -1204,10 +1159,10 @@ impl Catalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let session = self.begin_read().await?;
+        let session = self.begin_read();
 
         let outcome = async {
-            let head = self.head_view(session.handle()).await?;
+            let head = self.head_view().await?;
             slot_commit::release_reader(head.reader.as_ref()).await;
             let snapshot = head.view;
             // `columns_of` is ordered by the column's ordinal, so a column's
@@ -1478,16 +1433,10 @@ impl Catalog {
             let step = &remaining[..remaining.len().min(step_entries)];
             let is_final = step.len() == remaining.len();
 
-            let committed = match self.store.as_ref() {
-                Store::Slots(store) => {
-                    self.commit_build_step_slots(store, table, index, step, is_final)
-                        .await
-                }
-                Store::Writer(_) => self
-                    .commit(|tx| tx.build_index_step(index, step, is_final).map(|_| ()))
-                    .await
-                    .map(|_| ()),
-            };
+            let Store::Slots(store) = self.store.as_ref();
+            let committed = self
+                .commit_build_step_slots(store, table, index, step, is_final)
+                .await;
             match committed {
                 Ok(()) => {
                     if is_final {
@@ -1612,8 +1561,8 @@ impl Catalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let session = self.begin_read().await?;
-        let head = match self.head_view(session.handle()).await {
+        let session = self.begin_read();
+        let head = match self.head_view().await {
             Ok(head) => head,
             Err(err) => {
                 session.finish();
@@ -1766,7 +1715,7 @@ impl Catalog {
         // `scan_prefix` takes its bounds as a suffix of the prefix.
         let suffix = start[kind_prefix.len()..].to_vec();
 
-        let session = self.begin_read().await?;
+        let session = self.begin_read();
         let first = session
             .handle()
             .scan_prefix(kind_prefix, suffix..)
@@ -1842,10 +1791,8 @@ impl Catalog {
     ///
     /// Returns an error if the underlying store fails to close cleanly.
     pub async fn close(&self) -> Result<()> {
-        match self.store.as_ref() {
-            Store::Writer(db) => db.close().await.map_err(Error::from),
-            Store::Slots(store) => store.reader.close().await.map_err(Error::from),
-        }
+        let Store::Slots(store) = self.store.as_ref();
+        store.reader.close().await.map_err(Error::from)
     }
 
     /// Commits catalog mutations atomically, producing one new snapshot.
@@ -1900,10 +1847,8 @@ impl Catalog {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        match self.store.as_ref() {
-            Store::Slots(store) => store.coalescer.commit(store, &f).await,
-            Store::Writer(db) => commit::commit_cycle(db, &f, &self.projections).await,
-        }
+        let Store::Slots(store) = self.store.as_ref();
+        store.coalescer.commit(store, &f).await
     }
 }
 

@@ -6,15 +6,9 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::{
-    catalog::CatalogSnapshot,
-    store::{
-        key::{CurrentKey, EntityKey, Key},
-        proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
-        read::EntityRecord,
-        value,
-    },
-    transaction::commit::StagedWrite,
+use crate::store::{
+    proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
+    read::EntityRecord,
 };
 
 /// One maintained projection: decoded rows stamped with the head snapshot
@@ -38,108 +32,25 @@ impl<K: Ord, V> Maintained<K, V> {
         self.rows = rows;
     }
 
-    fn clear(&mut self) {
-        self.head = None;
-        self.rows.clear();
-    }
-
-    fn advance(&mut self, new_head: u64) {
-        if self.head.is_some() {
-            self.head = Some(new_head);
-        }
-    }
-
     fn serve(&self, expected_head: u64) -> Option<Vec<V>>
     where
         V: Clone,
     {
         (self.head == Some(expected_head)).then(|| self.rows.values().cloned().collect())
     }
-
-    /// Applies one folded write; on an undecodable put, clears — the
-    /// projection degrades to a rescan rather than serving wrong rows.
-    fn fold(&mut self, key: K, bytes: Option<&[u8]>)
-    where
-        V: prost::Message + Default,
-    {
-        if self.head.is_none() {
-            return;
-        }
-        match bytes {
-            None => {
-                self.rows.remove(&key);
-            }
-            Some(bytes) => match value::decode_value(bytes) {
-                Ok(decoded) => {
-                    self.rows.insert(key, decoded);
-                }
-                Err(_) => self.clear(),
-            },
-        }
-    }
 }
 
-/// Folds a just-committed batch into the shared cache. A poisoned lock is
-/// recovered rather than propagated: panics cannot originate inside the
-/// fold (non-panicking map operations end to end), so the state under a
-/// poisoned lock is never half-applied.
-pub(crate) fn fold_committed_batch(
-    cache: &std::sync::RwLock<ProjectionCache>,
-    writes: &[StagedWrite],
-    new_head: u64,
-) {
-    cache
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .apply_batch(writes, new_head);
-}
-
-/// The cached head view iff it is exactly at `expected_head`.
-pub(crate) fn cached_head_view(
-    cache: &std::sync::RwLock<ProjectionCache>,
-    expected_head: u64,
-) -> Option<Arc<CatalogSnapshot>> {
-    cache
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .head_view(expected_head)
-}
-
-pub(crate) fn install_head_view(
-    cache: &std::sync::RwLock<ProjectionCache>,
-    view: Arc<CatalogSnapshot>,
-) {
-    cache
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_head_view(view);
-}
-
-pub(crate) fn invalidate_head_view(cache: &std::sync::RwLock<ProjectionCache>) {
-    cache
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear_head_view();
-}
-
-/// The projections DuckLake re-reads per transaction, maintained on a
-/// read-write catalog so serving them does not rescan the store.
+/// The projections DuckLake re-reads per transaction, served from one scan
+/// per head so a run of per-kind dumps does not rescan the store.
 pub(crate) struct ProjectionCache {
     snapshots: Maintained<u64, SnapshotValue>,
     table_stats: Maintained<u64, TableStatsValue>,
     table_column_stats: Maintained<(u64, u64), TableColumnStatsValue>,
     /// The full current+history entity scan at one head: populating
     /// DuckLake's metadata tables issues ~two dozen per-kind dumps, and
-    /// this serves them all from one scan pair. Not folded forward —
-    /// Not folded forward —
-    /// entity writes are too varied — so any committed batch drops it
+    /// this serves them all from one scan pair. Any committed batch drops it
     /// and the next dump re-installs it at the new head.
     entities: Option<(u64, Arc<Vec<EntityRecord>>)>,
-    /// The materialized head view, folded forward on every commit and
-    /// served to the commit path so it stages against known state without
-    /// rescanning. Carries its own head (`snapshot.snapshot_id`); a fold
-    /// that cannot be applied faithfully clears it, degrading to a scan.
-    head_view: Option<Arc<CatalogSnapshot>>,
 }
 
 impl ProjectionCache {
@@ -149,24 +60,7 @@ impl ProjectionCache {
             table_stats: Maintained::empty(),
             table_column_stats: Maintained::empty(),
             entities: None,
-            head_view: None,
         }
-    }
-
-    /// The head view iff it is exactly at `expected_head`.
-    pub(crate) fn head_view(&self, expected_head: u64) -> Option<Arc<CatalogSnapshot>> {
-        self.head_view
-            .as_ref()
-            .filter(|view| view.snapshot.snapshot_id == expected_head)
-            .cloned()
-    }
-
-    pub(crate) fn set_head_view(&mut self, view: Arc<CatalogSnapshot>) {
-        self.head_view = Some(view);
-    }
-
-    pub(crate) fn clear_head_view(&mut self) {
-        self.head_view = None;
     }
 
     pub(crate) fn install_entities(&mut self, head: u64, records: Vec<EntityRecord>) {
@@ -218,124 +112,12 @@ impl ProjectionCache {
     ) -> Option<Vec<TableColumnStatsValue>> {
         self.table_column_stats.serve(expected_head)
     }
-
-    /// Folds one committed batch, stamping every installed projection with
-    /// `new_head` (unchanged for maintenance commits, which pass the old
-    /// head). An undecodable key clears everything: the batch cannot be
-    /// attributed, so no projection may claim the new head.
-    pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
-        self.entities = None;
-        for (encoded_key, write) in writes {
-            let bytes = write.as_deref();
-            match Key::decode(encoded_key) {
-                Ok(Key::Snapshot { snapshot_id }) => self.snapshots.fold(snapshot_id, bytes),
-                Ok(Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id }))) => {
-                    self.table_stats.fold(table_id, bytes);
-                }
-                Ok(Key::Current(CurrentKey::Entity(EntityKey::TableColumnStats {
-                    table_id,
-                    column_id,
-                }))) => self.table_column_stats.fold((table_id, column_id), bytes),
-                Ok(_) => {}
-                Err(_) => {
-                    self.snapshots.clear();
-                    self.table_stats.clear();
-                    self.table_column_stats.clear();
-                    return;
-                }
-            }
-        }
-        self.snapshots.advance(new_head);
-        self.table_stats.advance(new_head);
-        self.table_column_stats.advance(new_head);
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use object_store::memory::InMemory;
-
     use super::*;
-    use crate::{
-        Catalog, CatalogOptions, ColumnDef,
-        ffi_support::{dump_snapshots, dump_table_column_stats, dump_table_stats},
-        store::{
-            key::{EntityKey, Key},
-            proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
-            value::encode_value,
-        },
-    };
-
-    /// Snapshot rows read directly from the store, bypassing the cache.
-    async fn scanned_snapshots(catalog: &Catalog) -> Vec<SnapshotValue> {
-        let session = catalog.begin_read().await.unwrap();
-        let rows = crate::store::read::scan_snapshots(session.handle())
-            .await
-            .unwrap();
-        session.finish();
-        rows
-    }
-
-    /// After every commit, the served projections equal fresh scans at the
-    /// same head — served through the cache (installed by the first dump,
-    /// folded forward by each commit), proven equal to the store's truth.
-    #[tokio::test]
-    async fn dumps_after_commits_match_fresh_scans() {
-        // The maintained projection cache is a single-writer path; the slot
-        // topology materializes from the log each time.
-        let catalog =
-            Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
-                .await
-                .unwrap();
-
-        for round in 0..8u64 {
-            // Prime/serve before the commit so the fold path (not the
-            // install path) is what keeps the cache current.
-            let _ = dump_snapshots(&catalog).await.unwrap();
-
-            catalog
-                .commit(|tx| {
-                    let main = tx.schemas()[0].id;
-                    let table = tx.create_table(
-                        main,
-                        &format!("t{round}"),
-                        &[ColumnDef {
-                            name: "id".into(),
-                            column_type: "BIGINT".into(),
-                            nulls_allowed: false,
-                            default_value: None,
-                        }],
-                    )?;
-                    if round % 2 == 0 {
-                        tx.rename_table(table, &format!("t{round}_renamed"))?;
-                    }
-                    Ok(())
-                })
-                .await
-                .unwrap();
-
-            let served = dump_snapshots(&catalog).await.unwrap();
-            assert_eq!(served, scanned_snapshots(&catalog).await, "round {round}");
-
-            let head = served.last().unwrap().snapshot_id;
-            let cache_current = {
-                let guard = catalog
-                    .projections()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.snapshots_at(head).is_some()
-            };
-            assert!(
-                cache_current,
-                "cache must be current at head {head} after serving"
-            );
-
-            let _ = dump_table_stats(&catalog).await.unwrap();
-            let _ = dump_table_column_stats(&catalog).await.unwrap();
-        }
-    }
+    use crate::store::proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue};
 
     fn snapshot_value(id: u64) -> SnapshotValue {
         SnapshotValue {
@@ -383,110 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn fold_inserts_snapshot_and_updates_stats() {
-        let mut cache = installed_at_three();
-
-        let writes = vec![
-            (
-                Key::Snapshot { snapshot_id: 4 }.encode(),
-                Some(encode_value(&snapshot_value(4))),
-            ),
-            (
-                Key::current(EntityKey::TableStats { table_id: 7 }).encode(),
-                Some(encode_value(&stats_value(7, 11))),
-            ),
-        ];
-        cache.apply_batch(&writes, 4);
-
-        let snapshots = cache.snapshots_at(4).unwrap();
-        assert_eq!(snapshots.len(), 5);
-        assert_eq!(snapshots.last().unwrap().snapshot_id, 4);
-
-        let stats = cache.table_stats_at(4).unwrap();
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].record_count, 11);
-
-        assert_eq!(cache.table_column_stats_at(4).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn fold_deletes_remove_rows() {
-        let mut cache = installed_at_three();
-
-        let writes = vec![
-            (Key::Snapshot { snapshot_id: 2 }.encode(), None),
-            (
-                Key::current(EntityKey::TableColumnStats {
-                    table_id: 7,
-                    column_id: 1,
-                })
-                .encode(),
-                None,
-            ),
-        ];
-        cache.apply_batch(&writes, 3);
-
-        let snapshots = cache.snapshots_at(3).unwrap();
-        assert_eq!(snapshots.len(), 3);
-        assert!(snapshots.iter().all(|s| s.snapshot_id != 2));
-        assert!(cache.table_column_stats_at(3).unwrap().is_empty());
-    }
-
-    #[test]
     fn serve_refuses_a_mismatched_head() {
         let cache = installed_at_three();
         assert!(cache.snapshots_at(4).is_none());
         assert!(cache.table_stats_at(2).is_none());
-    }
-
-    #[test]
-    fn fold_on_an_empty_cache_is_a_noop() {
-        let mut cache = ProjectionCache::empty();
-        cache.apply_batch(
-            &[(
-                Key::Snapshot { snapshot_id: 1 }.encode(),
-                Some(encode_value(&snapshot_value(1))),
-            )],
-            1,
-        );
-        assert!(cache.snapshots_at(1).is_none());
-    }
-
-    #[test]
-    fn an_undecodable_value_clears_only_the_touched_projection() {
-        let mut cache = installed_at_three();
-        cache.apply_batch(
-            &[(
-                Key::Snapshot { snapshot_id: 4 }.encode(),
-                Some(vec![0xff, 0xff, 0xff, 0xff]),
-            )],
-            4,
-        );
-        // Snapshots degrade to a rescan; the untouched stats fold forward.
-        assert!(cache.snapshots_at(4).is_none());
-        assert!(cache.table_stats_at(4).is_some());
-    }
-
-    #[test]
-    fn an_undecodable_key_clears_everything() {
-        let mut cache = installed_at_three();
-        cache.apply_batch(&[(vec![0xff, 0xee], Some(vec![]))], 4);
-        assert!(cache.snapshots_at(4).is_none());
-        assert!(cache.table_stats_at(4).is_none());
-        assert!(cache.table_column_stats_at(4).is_none());
-    }
-
-    #[test]
-    fn irrelevant_keys_still_advance_the_head() {
-        let mut cache = installed_at_three();
-        cache.apply_batch(
-            &[(
-                Key::current(EntityKey::Schema { schema_id: 9 }).encode(),
-                Some(vec![1, 2, 3]),
-            )],
-            4,
-        );
-        assert_eq!(cache.snapshots_at(4).unwrap().len(), 4);
-        assert!(cache.snapshots_at(3).is_none());
     }
 }

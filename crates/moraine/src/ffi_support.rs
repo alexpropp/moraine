@@ -68,7 +68,7 @@ pub use crate::store::proto::SnapshotValue as SnapshotRecord;
 /// to one scan pair per head.
 async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
     let read = catalog.begin_dump().await?;
-    let head = read.head_id().await?;
+    let head = read.head_id();
 
     let cache_at = match (catalog.maintains_projections(), head) {
         (true, Some(head)) => {
@@ -255,7 +255,7 @@ async fn dump_projected_current<T: Clone>(
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
     let dump = catalog.begin_dump().await?;
-    let head = dump.head_id().await?;
+    let head = dump.head_id();
 
     let cache_at = match (catalog.maintains_projections(), head) {
         (true, Some(head)) => {
@@ -335,7 +335,7 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
     let dump = catalog.begin_dump().await?;
-    let head = dump.head_id().await?;
+    let head = dump.head_id();
     if let (true, Some(head)) = (catalog.maintains_projections(), head) {
         let cached = projections_read(catalog).snapshots_at(head);
         if let Some(rows) = cached {
@@ -930,14 +930,12 @@ mod tests {
     /// row-faithfully, embedded rows in `column_id` order.
     #[tokio::test]
     async fn dump_mappings_serves_embedded_rows() {
-        use crate::transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind};
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
 
-        let catalog =
-            Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
-                .await
-                .unwrap();
-        let db_tx = catalog.begin_write_tx().await.unwrap();
-        let mut tx = StagedTransaction::begin_detached(db_tx);
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
         tx.stage(RowOperation::Insert {
             table: TableKind::ColumnMapping,
             cells: vec![Cell::U64(21), Cell::U64(1), Cell::Str("map_by_name".into())],

@@ -364,7 +364,6 @@ mod tests {
             StoreBuilder::new(&options.path, Arc::clone(&object_store)),
             false,
             None,
-            true,
         )
         .await
         .unwrap();

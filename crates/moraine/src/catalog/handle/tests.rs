@@ -11,9 +11,9 @@ use crate::{
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, IntWidth, NullOrder, encode_ordered_values,
         },
-        key::{IndexKey, Key},
+        key::{EntityKey, IndexKey, Key, SysKey},
         open::StoreBuilder,
-        read,
+        proto, read, value,
     },
     transaction::commit,
 };
@@ -39,17 +39,68 @@ async fn stored_format_and_fold(object_store: &Arc<dyn ObjectStore>) -> (u64, u6
     (format, fold)
 }
 
-/// Creates a legacy (format 1) store carrying a `legacy` schema, as the
-/// pre-flip single-writer binary left it, then closes its writer.
+/// Hand-seeds a legacy (format 1) store carrying a `legacy` schema, as the
+/// pre-flip single-writer binary left it: the folded store holds every record
+/// and the slot format and fold cursor are both absent. Written through a raw
+/// writer, then closed.
 async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
-    let legacy = Catalog::open_single_writer(object_store, CatalogOptions::default())
-        .await
-        .unwrap();
-    legacy
-        .commit(|tx| tx.create_schema("legacy").map(|_| ()))
-        .await
-        .unwrap();
-    legacy.close().await.unwrap();
+    // Bootstrap supplies the base records (snapshot 0, the `main` schema, the
+    // encrypted option, head 0); the raw writes below downgrade the stamp to
+    // format 1, drop the fold cursor, and land a `legacy` schema at snapshot 1.
+    let db = commit::open_initialized(
+        StoreBuilder::new("", Arc::clone(&object_store)),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Format).encode(),
+        value::encode_value(&proto::FormatValue {
+            format_version: commit::FORMAT_VERSION,
+            writer_version: "legacy".into(),
+        }),
+    )
+    .unwrap();
+    tx.delete(Key::Sys(SysKey::Fold).encode()).unwrap();
+    tx.put(
+        Key::Snapshot { snapshot_id: 1 }.encode(),
+        value::encode_value(&proto::SnapshotValue {
+            snapshot_id: 1,
+            snapshot_time_micros: 1,
+            schema_version: 0,
+            next_catalog_id: 2,
+            next_file_id: 0,
+            changes_made: String::new(),
+            author: None,
+            commit_message: None,
+            commit_extra_info: None,
+            schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
+        }),
+    )
+    .unwrap();
+    tx.put(
+        Key::current(EntityKey::Schema { schema_id: 1 }).encode(),
+        value::encode_value(&proto::SchemaValue {
+            schema_id: 1,
+            schema_uuid: "uuid-legacy".into(),
+            begin_snapshot: 1,
+            end_snapshot: None,
+            schema_name: "legacy".into(),
+            path: "legacy/".into(),
+            path_is_relative: true,
+        }),
+    )
+    .unwrap();
+    tx.put(
+        Key::Sys(SysKey::Head).encode(),
+        value::encode_value(&proto::HeadValue { snapshot_id: 1 }),
+    )
+    .unwrap();
+    tx.commit_with_options(&commit::durable()).await.unwrap();
+    db.close().await.unwrap();
 }
 
 /// A legacy store migrates to the slot-log topology on its first read-write
@@ -166,14 +217,16 @@ async fn concurrent_migrations_converge_on_one_stamp() {
 #[tokio::test]
 async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let legacy = Catalog::open_single_writer(Arc::clone(&object_store), CatalogOptions::default())
-        .await
-        .unwrap();
-    legacy
-        .commit(|tx| tx.create_schema("legacy").map(|_| ()))
+    legacy_store_with_schema(Arc::clone(&object_store)).await;
+
+    // An incumbent old-binary writer holds the store open over the legacy data.
+    let incumbent = StoreBuilder::new("", Arc::clone(&object_store))
+        .open_writer()
         .await
         .unwrap();
 
+    // A new-binary attach migrates the store, opening its own writer — which
+    // fences the incumbent.
     let migrated = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
         .await
         .unwrap();
@@ -186,10 +239,21 @@ async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
             .is_some()
     );
 
-    let err = legacy
-        .commit(|tx| tx.create_schema("doomed").map(|_| ()))
-        .await
-        .unwrap_err();
+    // The fenced incumbent's next write fails typed — never a silent success.
+    // Fencing surfaces on the staging put or the commit, whichever comes first.
+    let tx = incumbent.begin(IsolationLevel::Snapshot).await.unwrap();
+    let staged = tx.put(
+        Key::Sys(SysKey::Head).encode(),
+        value::encode_value(&proto::HeadValue { snapshot_id: 99 }),
+    );
+    let err = match staged {
+        Ok(()) => Error::from(
+            tx.commit_with_options(&commit::durable())
+                .await
+                .unwrap_err(),
+        ),
+        Err(err) => Error::from(err),
+    };
     assert!(matches!(err, Error::Fenced(_)), "{err:?}");
 }
 
@@ -209,14 +273,9 @@ fn value_key(value: u128) -> CanonicalKey {
 /// Bootstraps a fresh slot-backed store through the writer and closes it, so a
 /// later attach opens a reader that already sees everything seeded below.
 async fn bootstrap_multi(object_store: &Arc<dyn ObjectStore>) {
-    let db = commit::open_initialized(
-        StoreBuilder::new("", Arc::clone(object_store)),
-        false,
-        None,
-        true,
-    )
-    .await
-    .unwrap();
+    let db = commit::open_initialized(StoreBuilder::new("", Arc::clone(object_store)), false, None)
+        .await
+        .unwrap();
     db.close().await.unwrap();
 }
 
