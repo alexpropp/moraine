@@ -12,7 +12,7 @@ use crate::{
         open::StoreBuilder,
         read::{EntityRecord, scan_current_entities},
     },
-    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION},
+    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION},
 };
 
 /// The format the test units migrate into: past every real one, so a test
@@ -495,4 +495,61 @@ async fn the_checkpoint_flag_takes_and_releases_one() {
         .unwrap();
     assert_eq!(catalog.snapshot().await.unwrap().schemas().len(), 1);
     catalog.close().await.unwrap();
+}
+
+/// The registry and the readable floor have to agree, and nothing but this
+/// test makes them.
+///
+/// `MIGRATIONS` is empty today, so the floor sits at the base format and
+/// every arm of the version check that depends on it is dormant. The moment
+/// a real unit is added that stops being true: its `to_format` is where the
+/// keys now live, so a store below that is one this binary cannot read
+/// directly and must migrate first. Adding a unit without raising
+/// `MIN_FORMAT_VERSION` with it would leave the below-floor arm silently
+/// unreachable and let an ordinary attach scan for keys the rewrite moved.
+///
+/// The chain shape matters for the same reason: `chain_from` walks by
+/// matching `from_format`, so a gap strands every later unit and a repeat
+/// makes which one runs depend on registry order.
+#[test]
+fn the_registry_and_the_readable_floor_agree() {
+    for pair in MIGRATIONS.windows(2) {
+        assert_eq!(
+            pair[0].to_format, pair[1].from_format,
+            "{} and {} leave a gap the chain cannot cross",
+            pair[0].name, pair[1].name
+        );
+    }
+
+    let mut sources: Vec<u64> = MIGRATIONS.iter().map(|unit| unit.from_format).collect();
+    let before = sources.len();
+    sources.sort_unstable();
+    sources.dedup();
+    assert_eq!(
+        sources.len(),
+        before,
+        "two units read the same format; which one runs would depend on registry order"
+    );
+
+    for unit in MIGRATIONS {
+        assert!(
+            unit.from_format < unit.to_format,
+            "{} does not move the store forward",
+            unit.name
+        );
+        assert!(
+            unit.to_format <= MAX_FORMAT_VERSION,
+            "{} migrates to {}, past the newest format this binary names ({MAX_FORMAT_VERSION})",
+            unit.name,
+            unit.to_format
+        );
+    }
+
+    let expected_floor = MIGRATIONS
+        .last()
+        .map_or(FORMAT_VERSION, |unit| unit.to_format);
+    assert_eq!(
+        MIN_FORMAT_VERSION, expected_floor,
+        "the floor must sit at the newest rewritten layout: below it the keys are somewhere else"
+    );
 }
