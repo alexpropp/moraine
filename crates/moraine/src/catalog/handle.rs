@@ -1169,10 +1169,7 @@ impl Catalog {
             // makes the whole sweep flush-bound, and durability buys nothing
             // here. A dead index id is never reused and the deletes are
             // idempotent, so a batch lost to a crash simply leaves entries a
-            // later pass rediscovers — the id stays visible while any entry
-            // remains — and re-deletes. Nothing resumes; nothing depends on
-            // a returned report being durable. The background flush cadence
-            // drains these regardless.
+            // later pass rediscovers.
             tx.commit_with_options(&commit::non_durable())
                 .await
                 .map_err(Error::from)?;
