@@ -50,6 +50,10 @@ pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
 pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
 /// The lowest structural format this binary reads directly. A store below
 /// this floor must be migrated up before an ordinary attach can use it.
+/// Every format so far is additive — each adds a subspace without moving an
+/// existing key — so the floor sits at the base format and no store in the
+/// world is below it. It rises only when a format rewrites the keyspace,
+/// which is what makes an old store unreadable rather than merely older.
 pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_VERSION;
 /// Bounded internal retries before a benign race is reported as a
 /// conflict.
@@ -128,7 +132,7 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
         Some(format) if format.format_version < MIN_FORMAT_VERSION => {
             Err(Error::Migration(format!(
                 "store format {} predates this binary's minimum ({MIN_FORMAT_VERSION}); \
-             run the migrate verb to upgrade it",
+             it must be migrated up before this binary can open it",
                 format.format_version
             )))
         }
@@ -434,6 +438,11 @@ pub(crate) async fn head_view_for(
 ) -> Result<Arc<CatalogSnapshot>> {
     let epoch = cache_epoch(projections);
     let handle = ReadHandle::Tx(db_tx);
+    // The commit path's own gate. `materialize` below carries one too, but
+    // a warm cache returns before reaching it, and a commit staged against
+    // a view of a keyspace mid-rewrite is the writer-side form of the
+    // partial read the marker exists to forbid.
+    refuse_mid_migration(handle).await?;
     let head = read_head_id(handle).await?;
     if let Some(view) = cached_head_view(projections, head) {
         return Ok(view);
