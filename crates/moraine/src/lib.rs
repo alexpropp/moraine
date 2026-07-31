@@ -112,6 +112,8 @@
 
 mod catalog;
 mod error;
+#[cfg(any(test, feature = "fault-injection"))]
+mod fault;
 #[doc(hidden)]
 pub mod ffi_support;
 mod store;

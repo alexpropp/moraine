@@ -24,6 +24,11 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# Exposes crash-injection seams for the migration and crash test matrix.
+# Off by default; production builds carry no seam code.
+fault-injection = []
+
 [build-dependencies]
 prost-build = { workspace = true }
 protox = { workspace = true }

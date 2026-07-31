@@ -51,10 +51,6 @@ Three things gate disproportionately much of the list:
 
 ## 0002 — SlateDB key encoding for catalog state
 
-- **IMPL** — Check `sys/migration` in **every** materialization, not only on
-  open. The keyspace map requires it; today only the open path reads the
-  marker, so a migration that begins under a live reader is invisible to it.
-  Shared with 0009 and 0015 — the reader gate is one piece of work.
 - **VALIDATE** — Exercise the segmented-store configuration (one-byte segment
   extractor) through the crash and recovery matrix. The segmented path is
   less-exercised in SlateDB, and the choice is only free to reverse before the
@@ -367,10 +363,11 @@ Three things gate disproportionately much of the list:
 
 ## 0015 — On-disk format migration
 
-- **IMPL** — The on-attach `sys/format` check with three-way equal, older,
-  newer dispatch and the typed `Migration` error naming source and target
-  versions. Today the check is two-way — in range or not — and errors
-  `Corruption`.
+- **IMPL** — Dispatch an older-than-binary store from the on-attach
+  `sys/format` check into the migrate path. The typed `Migration` error, the
+  three-way equal/older/newer split, and the newer-than-binary refusal are
+  done; the older arm currently refuses toward migrate but no migrate path
+  yet consumes it.
 - **IMPL** — The start phase: one atomic batch writing the `sys/migration`
   marker with `{from_format, to_format, cursor}`.
 - **IMPL** — The idempotent step loop: write new-format keys before deleting
@@ -379,10 +376,6 @@ Three things gate disproportionately much of the list:
   `sys/format` and clearing the marker.
 - **IMPL** — Reopen-state detection and resume-from-cursor across the three
   (marker, format) states. Nothing reads the marker's cursor field.
-- **IMPL** — The reader-side `sys/migration` gate in every materialization and
-  refresh. This must ship in format version 1, before any migration exists, so
-  future migrations are safe against fielded readers. Shared with 0002 and
-  0009.
 - **IMPL** — An explicit operator-triggered `migrate` verb or flag, distinct
   from ordinary attach.
 - **IMPL** — Named, individually tested `v_n → v_{n+1}` units that compose for
