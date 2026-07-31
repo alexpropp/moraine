@@ -90,6 +90,41 @@ async fn older_format_refuses_toward_migrate() {
     }
 }
 
+/// A migration marker present under a live head makes every materialization
+/// unavailable, not partial — the reader-side gate, not only the open gate.
+#[tokio::test]
+async fn materialize_gate_refuses_on_marker() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = StoreBuilder::new("", object_store)
+        .open_writer()
+        .await
+        .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Head).encode(),
+        value::encode_value(&proto::HeadValue { snapshot_id: 0 }),
+    )
+    .unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: vec![],
+        }),
+    )
+    .unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
+
+    let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let err = materialize(ReadHandle::Tx(&read), None)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+    read.rollback();
+}
+
 /// Renaming one column touches that column and nothing else: churn is
 /// proportional to the change, not to the table's width.
 #[test]

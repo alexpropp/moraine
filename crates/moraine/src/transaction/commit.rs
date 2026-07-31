@@ -288,6 +288,14 @@ pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<D
 /// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
 /// entities live at `s`.
 pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
+    // A structural migration in progress deletes old-layout keys out from
+    // under a scan, so any view built now would be a growing hole. Refuse
+    // loudly under the pinned read snapshot: unavailable, never partial.
+    if read::read_migration(tx).await?.is_some() {
+        return Err(Error::Migration(
+            "store is mid-migration; reads are unavailable until it finishes".to_string(),
+        ));
+    }
     let head = read::read_head(tx)
         .await?
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
