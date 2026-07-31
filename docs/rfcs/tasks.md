@@ -10,8 +10,14 @@ Each item is tagged:
 - **DECISION** — a design question with no answer yet.
 - **DEFERRED** — agreed work, postponed on purpose.
 - **IMPL** — specified in an RFC, not built.
-- **VALIDATE** — a test, pin, or measurement the design depends on.
+- **VALIDATE** — a test the design depends on, closed by writing it.
+- **MEASURE** — a number the design wants from a benchmark or profile. No
+  assertion closes one of these; running something and recording the result
+  does.
 - **DOC** — an operator- or user-facing gap.
+
+A VALIDATE whose subject does not exist yet is blocked on the IMPL item above
+it, not independently actionable: writing that test *is* building the feature.
 
 Resolving an item means updating the owning RFC and deleting the entry.
 
@@ -53,19 +59,13 @@ Four things gate disproportionately much of the list:
   open. The keyspace map requires it; today only the open path reads the
   marker, so a migration that begins under a live reader is invisible to it.
   Shared with 0009 and 0015 — the reader gate is one piece of work.
-- **DECISION** — `fstat` key ordering: file-major (`table_id, data_file_id,
-  column_id`, the current default) versus column-major. The wrong choice costs
-  a factor of the column count on wide tables, and reversing it once the stats
-  table is large requires a migration.
-- **VALIDATE** — Capture real DuckLake statistics queries in the e2e suite and
-  settle the `fstat` ordering from them, before the table grows.
 - **VALIDATE** — Exercise the segmented-store configuration (one-byte segment
   extractor) through the crash and recovery matrix. The segmented path is
   less-exercised in SlateDB, and the choice is only free to reverse before the
   first release.
 - **DEFERRED** — If server-side stats pruning is ever added, it needs
   type-aware min/max comparison rather than lexicographic. A wrong compare
-  silently drops rows. Same question as 0013's partition pushdown.
+  silently drops rows. Part of the single pushdown deferral tracked under 0009.
 - **DEFERRED** — Map future DuckLake spec catalog tables into the keyspace
   using the established conventions (own kind, embedded child, or merged 1:1
   side table) by updating the RFC rather than diverging.
@@ -125,9 +125,9 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — Regression-pin the schema-mutating classification boundary
   cases: comments and tags bump, column and name-mapping registration does
   not, `set_option` neither bumps nor mints a snapshot.
-- **VALIDATE** — Keep the fresh-reader visibility test as a pin on SlateDB's
-  `await_durable` and WAL-replay behavior, and as the per-backend latency
-  measurement.
+- **MEASURE** — Post-commit fresh-reader latency, per object-store backend. The
+  behavioural pin already exists (`fresh_reader_sees_committed_head`); what is
+  missing is the cost figure it was also meant to yield.
 - **DOC** — The single-read-write-process, many-readers limitation belongs in
   the root README. It currently appears only in `ARCHITECTURE.md`. Shared with
   0006.
@@ -137,9 +137,6 @@ Four things gate disproportionately much of the list:
 - **IMPL** — A column-oriented flush decode path handing the imported
   `DataChunk` straight to the writer, eliminating the row-by-row
   `duckdb::Value` materialization and making flush closer to transcode-free.
-- **DECISION** — Pin the exact inlinable-type set. DuckLake's
-  `CanInlineColumns` excludes only `GEOMETRY`, so `VARIANT` may in fact be
-  inlinable; the current e2e pin covers scalars plus `LIST`, `STRUCT`, `MAP`.
 - **DEFERRED** — Auto-flush policy: when to trigger an inline flush. This RFC
   specifies only the mechanism; the policy is an operational concern.
 
@@ -173,9 +170,11 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — Verify the DuckDB v1.5.4 pin has no patch-level ABI friction
   against DuckLake's `v1.5-variegata`, which CI-builds on v1.5.3, and fall
   back if it does.
-- **VALIDATE** — Determine the exact reads, writes, and filter pushdowns
-  DuckLake issues against `ducklake_*`, to know which scans must be optimized.
-  Same question as 0002's stats pushdown and 0013's partition pushdown.
+- **VALIDATE** — Determine which reads and writes DuckLake issues against
+  `ducklake_*`, to know which scans must be optimized. The filter half is
+  settled: DuckDB pushes no row filter into these tables, so there is no
+  predicate to optimize for and the pruning deferrals downstream of it are
+  inert (0009 records the condition that would revive them).
 - **VALIDATE** — Keep pinning the exact nested `ATTACH 'moraine:<uri>'` string
   DuckLake generates, and re-verify on every pin bump.
 - **VALIDATE** — Keep pinning the two conflict-propagation wire obligations:
@@ -211,9 +210,10 @@ Four things gate disproportionately much of the list:
 
 - **DEFERRED** — Finer file-set-grain conflict detection, so two compactions of
   disjoint file sets in one table can run concurrently. Table grain today.
-- **DECISION** — The precise merge-eligibility rule across partition
-  boundaries: a merge must not cross partitions whose values differ under the
-  governing spec. Raised by 0013, owned here.
+- **VALIDATE** — Pin that a merge never crosses a partition boundary: files
+  spread over two partition values merge to one file per value, never one
+  combined file. The rule is DuckLake's and recorded in the RFC; the pin
+  guards moraine against a future DuckLake that batches differently.
 
 ## 0009 — Reader consistency and snapshot caching
 
@@ -236,15 +236,29 @@ Four things gate disproportionately much of the list:
 - **IMPL** — Return `SnapshotExpired` for a view driven past the retention
   window, so a reader re-resolves from head instead of dereferencing reclaimed
   files. Depends on the 0003 error variants.
+- **IMPL** — Stop cloning the whole entity set to serve one kind.
+  `ffi_support::dump_entities` takes its extractor by value, so it clones every
+  record in the cached `Arc<Vec<EntityRecord>>` and then discards the kinds it
+  was not asked for. Fourteen `dump_*` functions route through it and populating
+  DuckLake's metadata tables issues roughly two dozen calls, so one population
+  clones the catalog over and over — each clone heap-allocating, since the
+  records hold strings and vectors. Taking the extractor by reference and
+  cloning only the matched record confines the cost to what is returned. The
+  uncached branch already moves rather than clones, so the waste falls
+  exclusively on the path the cache exists to make cheap.
 - **DEFERRED** — Extend changelog-based incremental refresh to read-only
   catalogs' projection serves. Deferred until reader-side serve cost is shown
   to matter.
 - **DEFERRED** — Partial or lazy materialization to bound memory for an
   unusually large live catalog. Deferred until profiling shows the full
-  in-memory view is a problem.
+  in-memory view is a problem. This is the same decision as server-side filter
+  pushdown (0002, 0006, 0013): lazy materialization needs predicates to know
+  what to fetch, and pushdown buys nothing while the whole view is resident.
+  Whichever is taken first pulls the other with it.
 - **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
   re-resolve per statement? This sets how tight the retention window must be.
-- **VALIDATE** — Measure materialization duration on large catalogs.
+- **MEASURE** — Materialization duration on large catalogs. Also the input the
+  churn-ratio decision above is waiting on.
 - **VALIDATE** — The refresh test suite: a commit landing mid-materialization
   yields an entirely pre- or entirely post-commit view, never torn; a view
   built at `S` still returns the `S` view after `k` commits; an incremental
@@ -274,9 +288,10 @@ Four things gate disproportionately much of the list:
   operator contract, without pre-building for it.
 - **DEFERRED** — A commit-funnel dispatcher serializing a many-connection
   process through a single committer, if a many-committer process appears.
-- **VALIDATE** — Measure whether a separate IO-dedicated runtime or a
-  `spawn_blocking` discipline is needed if SlateDB IO latency starves the
-  shared worker pool under heavy parallel scans.
+- **MEASURE** — Whether SlateDB IO latency starves the shared worker pool under
+  heavy parallel scans, which decides if a separate IO-dedicated runtime or a
+  `spawn_blocking` discipline is needed. Also the input the worker-count
+  decision above is waiting on.
 - **VALIDATE** — Interrupt coverage: before the commit write, head unchanged
   with no partial records; during the shielded write, prompt return while the
   write completes untorn and head is exactly `N` or `N+1`; after the durable
@@ -313,8 +328,6 @@ Four things gate disproportionately much of the list:
 
 ## 0012 — Schema evolution and versioning
 
-- **DECISION** — Dense (`0..n`) versus sparse or fractional ordinals for column
-  reorder. Dense stands unless e2e shows DuckLake expects otherwise.
 - **DEFERRED** — Define the exact `column_mapping` and `name_mapping` key
   components in 0002's keyspace map once implementation reaches
   external-Parquet interop. The kinds themselves are built.
@@ -324,34 +337,25 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — After a widening type promotion, reconstruction at a
   **pre-promotion** snapshot yields the old type. Current coverage asserts
   promotion at head only.
-- **VALIDATE** — A rename of one column, or a reorder moving `k` columns,
-  writes no `history` record and no `current` change for any other column.
-- **VALIDATE** — Pin that verb-path `add_column` allocates ids identically to
-  DuckLake (per-table MAX-over-history plus one, nested fields in pre-order),
-  and that drop-then-add always yields a strictly larger id.
+- **VALIDATE** — Pin that verb-path `add_column` allocates **nested** field ids
+  as DuckLake does, in pre-order. The flat case is pinned on both paths now —
+  `column_order_numbers_from_one_and_keeps_gaps` for the verb path and
+  `ducklake_column_ids_and_positions_match_stock_ducklake` differentially for
+  the staged one — but nothing covers a nested `STRUCT`'s field ids.
 - **DOC** — Give `ducklake_schema_versions` a named home in 0002's keyspace
   map. It is implemented as a fold into the snapshot record, but the map's
   `snapshot` row never mentions it.
 
 ## 0013 — Partitioning, sorting, and pruning
 
-- **DECISION** — Embedded versus own kind for `file_partition_value`. Settle
-  against captured DuckLake partition queries before the collection is large
-  enough that reversing requires a migration.
-- **DECISION** — Where DuckLake draws the line on dropping or altering a
-  partitioned or sorted column, including what it does with a stale verbatim
-  sort expression, and whether moraine must enforce any part of it at the
-  catalog-constraint layer.
-- **DECISION** — Whether DuckLake grows hidden, implicit, or derived
-  partitioning schemes beyond the explicit spec, which would need their own
-  representation.
-- **DEFERRED** — Server-side partition-pruning pushdown. The same question as
-  0002's stats pushdown and 0006's pushdown surface. If built it must be
+- **DEFERRED** — Server-side partition-pruning pushdown. One deferral with
+  0002's stats pushdown, 0006's pushdown surface, and 0009's partial
+  materialization — not four. Nothing pushes a predicate into moraine today, and
+  0009 records why pushdown cannot pay off while the whole catalog is resident,
+  so this revives only alongside that decision. If built it must be
   transform-aware and type-aware, never a naive compare.
-- **VALIDATE** — Capture DuckLake's own partition-pruning queries and its
-  `SET SORTED BY`, sorted-`INSERT`, and `RESET SORTED BY` round trips in the
-  e2e suite, both to validate the mapping and to settle the
-  file-partition-value placement above.
+- **VALIDATE** — Capture DuckLake's `SET SORTED BY`, sorted-`INSERT`, and
+  `RESET SORTED BY` round trips in the e2e suite to validate the mapping.
 
 ## 0014 — Catalog and data encryption
 
@@ -403,8 +407,6 @@ Four things gate disproportionately much of the list:
   each step's new-key write and old-key delete, each cursor advance, the finish
   flip — asserting reopen always yields a coherent store and never
   new-format-with-marker. Depends on 0011.
-- **VALIDATE** — A store whose `sys/format` exceeds the binary errors typed and
-  writes nothing.
 - **VALIDATE** — With the marker present, materialization and refresh on either
   binary version return the typed error and never a partial view.
 - **VALIDATE** — Running the migrate verb against an already-migrated store is
@@ -498,8 +500,8 @@ Four things gate disproportionately much of the list:
   primitive, the residual want after rejecting in-pass forced compaction.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
-- **VALIDATE** — Replace the strawman maintenance batch-size default of 1024
-  with a measured value.
+- **MEASURE** — A defensible maintenance batch size, replacing the strawman
+  default of 1024.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.

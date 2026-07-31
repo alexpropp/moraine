@@ -61,12 +61,16 @@ mod tests {
     }
 
     macro_rules! codec_tests {
+        // Codec roundtrips need breadth, not depth: 48 cases cover the wire
+        // shapes without the default 256 generating multi-megabyte trees for
+        // the deeply-nested messages. Doubly-nested ones set their own lower
+        // count — generation, not assertion, is what costs.
         ($roundtrip:ident, $garbage:ident, $ty:ty) => {
+            codec_tests!($roundtrip, $garbage, $ty, 48);
+        };
+        ($roundtrip:ident, $garbage:ident, $ty:ty, $cases:expr) => {
             proptest! {
-                // Codec roundtrips need breadth, not depth: 48 cases cover the
-                // wire shapes without the default 256 generating multi-megabyte
-                // trees for the deeply-nested messages (e.g. `MacroValue`).
-                #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+                #![proptest_config(ProptestConfig { cases: $cases, ..ProptestConfig::default() })]
                 #[test]
                 fn $roundtrip(msg in any::<$ty>()) {
                     let encoded = encode_value(&msg);
@@ -93,7 +97,7 @@ mod tests {
     codec_tests!(roundtrip_partition, garbage_partition, PartitionValue);
     codec_tests!(roundtrip_sort, garbage_sort, SortValue);
     codec_tests!(roundtrip_index, garbage_index, IndexValue);
-    // codec_tests!(roundtrip_macro, garbage_macro, MacroValue);
+    codec_tests!(roundtrip_macro, garbage_macro, MacroValue, 8);
     codec_tests!(roundtrip_mapping, garbage_mapping, MappingValue);
     codec_tests!(roundtrip_data_file, garbage_data_file, DataFileValue);
     codec_tests!(roundtrip_delete_file, garbage_delete_file, DeleteFileValue);

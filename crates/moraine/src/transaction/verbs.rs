@@ -239,13 +239,13 @@ impl Transaction {
             path_is_relative: true,
             next_column_id: column_count + 1,
         });
-        // Field ids are assigned from 1 in declaration order;
-        // column_order (the position) stays 0-based.
+        // Field ids and positions are both assigned from 1 in declaration
+        // order, as DuckLake assigns them.
         for (order, def) in columns.iter().enumerate() {
             self.state.put_column(new_column(
                 table_id,
                 order as u64 + 1,
-                order as u64,
+                order as u64 + 1,
                 self.new_snapshot_id,
                 def,
             ));
@@ -371,9 +371,13 @@ impl Transaction {
             .copied()
             .unwrap_or(0);
         let column_id = value.next_column_id.max(live_max_id + 1);
+        // Positions continue past the highest live one, never renumbering, so
+        // a dropped column leaves a gap the survivors keep — DuckLake's
+        // behaviour. Positions start at 1, so an all-columns-dropped table
+        // restarts there rather than at 0.
         let position = live_columns
             .and_then(|cols| cols.values().map(|c| c.column_order).max())
-            .map_or(0, |max| max + 1);
+            .map_or(1, |max| max + 1);
         self.state.put_column(new_column(
             table.get(),
             column_id,
@@ -1771,6 +1775,34 @@ mod tests {
     }
 
     #[test]
+    fn column_order_numbers_from_one_and_keeps_gaps() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction
+            .create_table(s, "t", &[col("a"), col("b"), col("c")])
+            .unwrap();
+        assert_eq!(
+            transaction
+                .columns_of(t)
+                .iter()
+                .map(|c| c.position)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        transaction.drop_column(t, ColumnId::new(2)).unwrap();
+        transaction.add_column(t, &col("d")).unwrap();
+        assert_eq!(
+            transaction
+                .columns_of(t)
+                .iter()
+                .map(|c| c.position)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+    }
+
+    #[test]
     fn column_ddl_allocates_fresh_field_ids() {
         let mut transaction = empty_transaction();
         let s = transaction.create_schema("s").unwrap();
@@ -1783,7 +1815,7 @@ mod tests {
         assert_eq!(c, ColumnId::new(3));
         let cols = transaction.columns_of(t);
         assert_eq!(cols.len(), 2);
-        assert_eq!(cols[1].position, 1);
+        assert_eq!(cols[1].position, 2);
 
         transaction
             .rename_column(t, ColumnId::new(1), "a2")
@@ -1894,7 +1926,7 @@ mod tests {
                 begin_snapshot: 1,
                 end_snapshot: None,
                 table_id: 1,
-                column_order: id - 1,
+                column_order: id,
                 column_name: format!("c{id}"),
                 column_type: "BIGINT".into(),
                 initial_default: None,

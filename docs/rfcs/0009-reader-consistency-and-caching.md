@@ -235,6 +235,16 @@ latest `CatalogSnapshot` and hand out clones; a refresh replaces it. There is:
   small. A cold reader pays one `current` scan; a warm reader pays incremental
   refresh.
 
+The view is whole-catalog, and that fixes where filtering can usefully
+happen. DuckDB pushes projection into the `ducklake_*` scans but never a row
+filter, so no predicate reaches the store on the serve path; every metadata
+read is a full range scan of its entity kind, and DuckDB filters over the
+returned rows. Server-side filter pushdown therefore cannot reduce work while
+the whole view is resident — there is nothing left to avoid fetching. Pushdown
+becomes worth building only if moraine stops materializing the whole catalog,
+because lazy materialization needs predicates to know what to fetch. The two
+are one decision, and neither is taken here.
+
 ### Maintained served projections
 
 The DuckDB shim serves row-faithful `ducklake_*` projections through the

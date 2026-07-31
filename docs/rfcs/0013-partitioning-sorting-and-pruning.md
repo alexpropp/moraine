@@ -96,6 +96,13 @@ partition values" is exactly one contiguous `current` range — no join against 
 second subspace, no scatter. That is the shape a planner needs, and it costs no
 new keyspace.
 
+Embedding also costs nothing on writes — partition values are written once
+when the file is registered and never updated, so carrying them in the `file`
+value provokes no rewrite. Nothing reads them selectively, and both placements
+would be read by full scan in any case, so the choice is not contingent on
+observed access patterns; it reopens only with server-side pruning, on the
+terms RFC 0009 sets.
+
 ### The partition spec record
 
 The `partition` value carries the spec's `begin_snapshot`, its ordered
@@ -105,6 +112,11 @@ transform. Partition columns reference their source column **by field id**
 stored **verbatim** as DuckLake defines them (the transform name and its
 parameter, e.g. `bucket(16)` or `truncate(10)`); moraine never parses or
 applies them.
+
+The spec is wholly explicit — there is no implicit or derived partitioning
+alongside it. A bare partition column is written out with the transform
+`identity` rather than left blank, so every partition key is one stored row
+with a named transform and nothing has to be inferred.
 
 ### The sort spec record
 
@@ -166,9 +178,10 @@ planner decides which files to read.
 
 A future **server-side partition-pruning pushdown** is deferred, and it is the
 **same unresolved question** as RFC 0002's stats-pruning pushdown and RFC 0006's
-pushdown surface — moraine serves filter/projection pushdown where it maps
-cleanly onto the key layout, and partition pruning is not such a case today. If
-it is ever added it must be both **transform-aware** and **type-aware**:
+pushdown surface. No row filter is pushed into moraine at all today, so there
+is no predicate here to prune with, and RFC 0009 sets the condition under which
+one would be worth accepting. If it is ever added it must be both
+**transform-aware** and **type-aware**:
 correctly pruning a `bucket(16)` or `year(...)` partition means reproducing
 DuckLake's transform semantics, and comparing a value means DuckLake's typed
 comparison, never a lexicographic compare over stored strings. Doing it wrong
@@ -197,10 +210,18 @@ sits. This is why keying by name would be wrong (see Alternatives).
 
 Sort specs sit on the other side of that contrast: a sort key names its
 column **inside a verbatim SQL expression string**, and no field-id
-indirection can protect a string from a rename. Whether a rename or drop
-invalidates a live sort expression — and what DuckLake does about it — is
-DuckLake's rule; moraine stores the expression untouched and records whatever
-committed state results.
+indirection can protect a string from a rename. DuckLake resolves that by
+rewriting the expression: renaming a sorted column commits a new sort-spec
+version carrying the new name, leaving the old text in `history` where it
+belongs to the snapshots that were written under it. A stale live expression
+therefore never arises.
+
+Dropping a partitioned or sorted column is refused outright, by DuckLake's
+own binder, before anything reaches the catalog — *"Cannot drop column … the
+table is partitioned by this column"*, and the matching message for sorted.
+Rename and type change are allowed. So moraine enforces none of this: it
+stores the expression untouched, records the new sort-spec version a rename
+produces, and never sees the drops that are refused upstream.
 
 Whether a column that a live spec partitions or sorts on **may be dropped or
 altered** is a DuckLake rule, not moraine's. moraine follows DuckLake

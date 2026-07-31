@@ -166,6 +166,16 @@ Per-table collections (`column`, `file`, `fstat`, …) are keyed
 `table_id`-first so "everything about table T" — the unit DuckLake reads
 and invalidates — is one contiguous range per subspace.
 
+Within `fstat` the remaining components are file-major: `data_file_id`
+before `column_id`, so a file's columns sit together. Column-major would win
+only for a read that wants one column across many files, and no such read
+exists — DuckDB pushes no row filter into the served projections (RFC 0009)
+and nothing inside moraine reads statistics selectively, so the only
+operation on `fstat` is a full scan, costing the same either way. The
+ordering reopens only with server-side pruning, on the terms RFC 0009 sets;
+reversing it once the collection is large needs a migration, so that is the
+moment to weigh it.
+
 ### Value codec
 
 Values are protobuf messages (via `prost`; schemas compiled at build time

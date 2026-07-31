@@ -60,6 +60,78 @@ async fn migration_marker_is_refused() {
     assert!(matches!(err, Error::Corruption(_)));
 }
 
+/// Renaming one column touches that column and nothing else: churn is
+/// proportional to the change, not to the table's width.
+#[test]
+fn renaming_one_column_stages_no_write_for_any_sibling() {
+    use crate::{
+        catalog::ColumnDef,
+        store::key::{CurrentKey, HistoryKey},
+    };
+
+    let column_def = |name: &str| ColumnDef {
+        name: name.into(),
+        column_type: "BIGINT".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+
+    let snap0 = proto::SnapshotValue {
+        snapshot_id: 0,
+        snapshot_time_micros: 0,
+        schema_version: 0,
+        next_catalog_id: 1,
+        next_file_id: 0,
+        changes_made: String::new(),
+        author: None,
+        commit_message: None,
+        commit_extra_info: None,
+        schema_changed_table_ids: Vec::new(),
+    };
+    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, vec![], vec![], None), 1);
+    let schema = setup.create_schema("s").unwrap();
+    let table = setup
+        .create_table(
+            schema,
+            "t",
+            &[
+                column_def("a"),
+                column_def("b"),
+                column_def("c"),
+                column_def("d"),
+            ],
+        )
+        .unwrap();
+    let renamed = setup.columns_of(table)[1].id;
+    let base = setup.into_parts().state;
+
+    let mut tx = Transaction::new(base.clone(), 2);
+    tx.rename_column(table, renamed, "b2").unwrap();
+    let state = tx.into_parts().state;
+
+    let touched: Vec<u64> = diff_writes(&base, &state, 2)
+        .iter()
+        .filter_map(|(key_bytes, _)| match Key::decode(key_bytes).unwrap() {
+            Key::Current(CurrentKey::Entity(EntityKey::Column { column_id, .. }))
+            | Key::History(HistoryKey {
+                entity: EntityKey::Column { column_id, .. },
+                ..
+            }) => Some(column_id),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        touched.iter().all(|id| *id == renamed.get()),
+        "a rename of column {} staged writes for siblings: {touched:?}",
+        renamed.get()
+    );
+    assert!(
+        !touched.is_empty(),
+        "the renamed column itself must be written"
+    );
+}
+
 /// A file registered and expired within one commit exists in neither
 /// `base` nor `state`'s `data_files`: its per-file column stats are
 /// orphaned and must never be staged as a write.
