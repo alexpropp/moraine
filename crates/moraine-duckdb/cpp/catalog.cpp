@@ -186,8 +186,6 @@ void ThrowMoraineError(MoraineError &err) {
 	case MORAINE_NOT_FOUND:
 	case MORAINE_ALREADY_EXISTS:
 	case MORAINE_CONSTRAINT:
-	// A time-travel target below the retention horizon: a "not there"
-	// error, not a retryable one — the caller re-resolves from head.
 	case MORAINE_SNAPSHOT_EXPIRED:
 		throw duckdb::CatalogException(message);
 	case MORAINE_COMMIT_CONFLICT:
@@ -195,8 +193,6 @@ void ThrowMoraineError(MoraineError &err) {
 		throw duckdb::TransactionException(message);
 	case MORAINE_INVALID_ARGUMENT:
 		throw duckdb::InvalidInputException(message);
-	// A DuckLake feature moraine does not implement (e.g. inlining a
-	// VARIANT column). Terminal — DuckDB does not retry it.
 	case MORAINE_UNSUPPORTED:
 		throw duckdb::NotImplementedException(message);
 	case MORAINE_INTERRUPTED:
@@ -204,8 +200,6 @@ void ThrowMoraineError(MoraineError &err) {
 	case MORAINE_CORRUPTION:
 	case MORAINE_STORE:
 	case MORAINE_FENCED:
-	// The store needs, is undergoing, or is newer than a format this
-	// binary supports: fatal at attach, never a transient conflict.
 	case MORAINE_MIGRATION:
 		throw duckdb::IOException(message);
 	case MORAINE_INTERNAL:
