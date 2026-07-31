@@ -1165,7 +1165,12 @@ impl Catalog {
                 tx.rollback();
                 return Ok(total);
             }
-            tx.commit_with_options(&commit::durable())
+            // Batches commit non-durably: awaiting a flush tick per batch
+            // makes the whole sweep flush-bound, and durability buys nothing
+            // here. A dead index id is never reused and the deletes are
+            // idempotent, so a batch lost to a crash simply leaves entries a
+            // later pass rediscovers.
+            tx.commit_with_options(&commit::non_durable())
                 .await
                 .map_err(Error::from)?;
             total += deleted as u64;

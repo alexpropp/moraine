@@ -904,10 +904,11 @@ fn scheduler_runs_a_pass_unattended() {
 /// Orphans `entries` index entries in a session of its own, so a later
 /// session's scheduler has something slow to reclaim.
 ///
-/// A pass over them with `MAINTENANCE_BATCH_SIZE 1` takes one durable
-/// commit per entry — each waiting out the WAL flush cadence — so the
-/// pass reliably outruns a sub-second interval. That is the only way to
-/// provoke tick contention without a test-only knob.
+/// A pass over them with `MAINTENANCE_BATCH_SIZE 1` takes one commit per
+/// entry, so its wall-clock is the entry count times per-commit compute
+/// (sub-millisecond, since reclaim batches do not await durability).
+/// Enough entries and the pass outruns a sub-second interval, which is
+/// the only way to provoke tick contention without a test-only knob.
 fn orphaned_range(store: &TempDir, data: &TempDir, entries: u64) {
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
     run_ducklake_sql_with_options(
@@ -943,15 +944,18 @@ fn marked_passes(output: &str) -> Vec<Vec<String>> {
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn scheduler_ticks_skip_a_pass_already_running() {
-    const ENTRIES: u64 = 20;
+    const ENTRIES: u64 = 1_500;
     let store = TempDir::new("maint-single-store");
     let data = TempDir::new("maint-single-data");
     orphaned_range(&store, &data, ENTRIES);
 
-    // The pass takes ~20 durable commits; ticks fire every 100ms, so
-    // many of them land while it is still running.
+    // The pass takes 1 500 commits — about a second, several ticks — so
+    // ticks land while it is still running. The window holds 14 ticks,
+    // fewer than the report retains passes, so the pass that claims the
+    // range cannot be pushed out of the report by the empty ones after
+    // it however fast the machine is.
     let options = format!(
-        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '300 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
@@ -960,7 +964,7 @@ fn scheduler_ticks_skip_a_pass_already_running() {
         data.path(),
         &options,
         "SELECT 1;\n",
-        std::time::Duration::from_millis(3_500),
+        std::time::Duration::from_millis(4_200),
         "SELECT 'PASS' AS marker, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
     );
@@ -1000,15 +1004,15 @@ fn scheduler_ticks_skip_a_pass_already_running() {
 fn detach_during_a_running_pass_completes() {
     let store = TempDir::new("maint-detach-store");
     let data = TempDir::new("maint-detach-data");
-    orphaned_range(&store, &data, 20);
+    orphaned_range(&store, &data, 1_500);
 
     let options = format!(
         ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
-    // The first tick fires at ~100ms and the pass then runs for well over
-    // a second, so detaching at 500ms lands squarely inside it.
+    // The first tick fires at ~100ms and the pass then runs for about a
+    // second, so detaching at 500ms lands squarely inside it.
     let output = run_ducklake_sql_with_pause(
         store.path(),
         data.path(),

@@ -125,9 +125,10 @@ Four things gate disproportionately much of the list:
 - **VALIDATE** — Regression-pin the schema-mutating classification boundary
   cases: comments and tags bump, column and name-mapping registration does
   not, `set_option` neither bumps nor mints a snapshot.
-- **MEASURE** — Post-commit fresh-reader latency, per object-store backend. The
-  behavioural pin already exists (`fresh_reader_sees_committed_head`); what is
-  missing is the cost figure it was also meant to yield.
+- **MEASURE** — Commit latency against a *real* object store. In-memory is
+  settled (`BENCHMARK.md` → Core measurements: `flush_interval + ~2 ms`); what
+  remains is the S3 write-RTT term that localhost MinIO understates, giving
+  `max(flush cadence, write RTT) + ~2 ms`.
 - **DOC** — The single-read-write-process, many-readers limitation belongs in
   the root README. It currently appears only in `ARCHITECTURE.md`. Shared with
   0006.
@@ -225,8 +226,10 @@ Four things gate disproportionately much of the list:
   horizon `H` and the gap's `snapshot` records may have been reclaimed.
 - **IMPL** — A churn-versus-catalog-size threshold that falls back to a full
   `current` rescan when replaying the changelog would cost more.
-- **DECISION** — The churn ratio for that threshold, defaulted after perf work
-  on realistic churn shapes.
+- **DECISION** — The churn ratio for that threshold. Full-materialization cost
+  is measured (`BENCHMARK.md` → Core measurements: ~5–7 µs per live entity,
+  linear); the crossover it trades against needs incremental refresh built to
+  measure the other side.
 - **IMPL** — Pin an explicit read-snapshot on the read-only path. The
   `DbReader` follows the manifest with no pinned checkpoint, so a read-only
   materialization is not snapshot-isolated the way the read-write path is.
@@ -257,8 +260,6 @@ Four things gate disproportionately much of the list:
   Whichever is taken first pulls the other with it.
 - **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
   re-resolve per statement? This sets how tight the retention window must be.
-- **MEASURE** — Materialization duration on large catalogs. Also the input the
-  churn-ratio decision above is waiting on.
 - **VALIDATE** — The refresh test suite: a commit landing mid-materialization
   yields an entirely pre- or entirely post-commit view, never torn; a view
   built at `S` still returns the `S` view after `k` commits; an incremental
@@ -288,10 +289,10 @@ Four things gate disproportionately much of the list:
   operator contract, without pre-building for it.
 - **DEFERRED** — A commit-funnel dispatcher serializing a many-connection
   process through a single committer, if a many-committer process appears.
-- **MEASURE** — Whether SlateDB IO latency starves the shared worker pool under
-  heavy parallel scans, which decides if a separate IO-dedicated runtime or a
-  `spawn_blocking` discipline is needed. Also the input the worker-count
-  decision above is waiting on.
+- **MEASURE** — Whether CPU-bound SST decode monopolizes a worker under a
+  decode-heavy scan — the one axis where a `spawn_blocking` discipline might
+  help. IO latency is settled: it does not starve the pool (`BENCHMARK.md` →
+  Core measurements), so this is the only remaining part of the question.
 - **VALIDATE** — Interrupt coverage: before the commit write, head unchanged
   with no partial records; during the shielded write, prompt return while the
   write completes untorn and head is exactly `N` or `N+1`; after the durable
@@ -500,8 +501,6 @@ Four things gate disproportionately much of the list:
   primitive, the residual want after rejecting in-pass forced compaction.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
-- **MEASURE** — A defensible maintenance batch size, replacing the strawman
-  default of 1024.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.
