@@ -554,72 +554,38 @@ correctness requirement — a batch of one is the normal path. Ordering
 within a group is the committer's choice; conflicts *within* a group are
 impossible because a single committer serializes them before staging.
 
-**Implemented**, and reached two ways over one core — a lone commit is a
-group of one, so there is one commit path, not two.
+**Implemented** two ways over one core — a lone commit is a group of one,
+so there is one commit path, not two. `Catalog::commit_group` batches what
+one caller hands it; concurrent callers of the ordinary `Catalog::commit`
+are batched without asking. A commit that finds the store free opens a
+batch, one that finds a batch forming joins it, one that finds a batch in
+flight waits for the next, and a batch seals as soon as no caller is on its
+way into it — so the flush already in the air is the batching window and an
+uncontended commit waits for nobody. A batch also seals at a bounded member
+count, since under saturation the arrival count never falls to zero.
 
-`Catalog::commit_group` batches what a single caller hands it. Concurrent
-callers of the ordinary `Catalog::commit` are batched *without asking*: a
-commit that finds the store free opens a batch and stages onto it, one that
-finds a batch forming joins it, and one that finds a batch in flight waits
-for the next. A batch seals the moment no caller is on its way into it.
+Steps 1–3 run once per member, against a premise folded forward from the
+member before it (the same fold that refreshes the cached head view), so
+member *i* allocates its ids and detects its name collisions against
+everything members *1..i* did. That is what makes intra-batch conflicts
+unreachable rather than unlikely. Step 4 then runs once.
 
-That rule is the whole batching policy, and it is what makes the
-optimization free rather than a latency trade. Nothing waits on a timer or
-guesses at arrivals: the flush already in the air *is* the batching window,
-so an uncontended commit waits for nobody and pays exactly what it paid
-before, while a contended one rides a batch that grew during a flush it
-would have waited behind regardless. Under saturation the arrival count
-would never fall to zero, so a batch also seals at a bounded member count.
+A batch batches commits; it does not merge them. Each member mints its own
+snapshot, which time travel resolves separately. What batching changes is
+durability granularity, not catalog shape.
 
-Both halves are **verb-path** properties. The staged-row path commits its
-own transaction directly and joins no batch, so SQL through DuckLake gets
-neither: a `BEGIN … COMMIT` already lands as one snapshot, which is a
-merging of statements rather than a batching of commits, and successive SQL
-transactions still cost a flush each. That is a gap rather than a rule —
-the two paths differ in retry rights, not in how they reach the store — but
-it buys little until DuckLake's serialized metadata connection admits
-concurrent committers.
+The batch is the unit of failure. A member that fails discards the batch,
+and its other members re-run; a lost race re-runs every member, conflicting
+if any member's change set does; a crash leaves every member committed or
+none (RFC 0011, `GroupCommit`). A sealed batch commits on a task of its own
+rather than on whichever caller sealed it, because a host interrupt drops
+that caller's future (RFC 0010) and the other members are owed an answer.
 
-A group runs steps 1–3 once per member against a
-premise folded forward from the member before it (the same fold that
-refreshes the cached head view after a commit), so member *i* allocates its
-ids and detects its name collisions against everything members *1..i* did.
-That fold is what makes intra-group conflicts unreachable rather than
-merely unlikely: members are serialized before staging, so there is no
-concurrency between them to arbitrate. The whole group then takes step 4
-once.
-
-A group batches commits; it does not merge them. Each member mints its own
-snapshot with its own id, and time travel resolves each separately — a
-member's `history` records carry its own id, so the intermediate states
-inside a batch are as addressable as if the members had been committed one
-at a time. What a group changes is durability granularity, not catalog
-shape.
-
-The batch is therefore also the unit of failure. A member whose closure
-errors aborts the whole group, including members that already staged;
-a lost race re-runs every member; and a crash leaves every member committed
-or none (RFC 0011, `GroupCommit`). A caller that wants members to fail
-independently commits them separately — which is the same statement as
-"a batch is atomic," seen from the caller's side.
-
-Members are re-run as a group on a lost race, so a batch carries a change
-set per member and conflicts if *any* of them does. Classifying the union
-would be equivalent; keeping the sets apart avoids a merge that would have
-to be updated every time the change grammar grows a kind.
-
-Coalescing does not enlarge that failure unit, but it does mean a caller
-can be inside a batch it never asked for, and two consequences of that are
-load-bearing. A member that fails partway through staging leaves the shared
-transaction carrying part of a commit that reported failure, so the batch
-is discarded and its other members re-run — work redone, never work lost,
-and never one caller's error charged to another's result. And a sealed
-batch is committed on a task of its own rather than by whichever caller
-sealed it: a host interrupt drops that caller's future (RFC 0010), and the
-other members are owed an answer a dropped future cannot give. The same
-reasoning covers the other end — a caller that goes away *before* staging
-seals whatever it was holding open, so a batch never waits on a member that
-will never come.
+Both halves are verb-path properties. The staged-row path commits its own
+transaction and joins no batch, so SQL through DuckLake gets neither: a
+`BEGIN … COMMIT` lands as one snapshot, which merges statements rather than
+batching commits. Closing that gap buys little until DuckLake's serialized
+metadata connection admits concurrent committers.
 
 ### Reader visibility after commit
 

@@ -101,18 +101,16 @@ store-level write freeze RFC 0015's seam coverage wanted is built.
 ## 0004 — Commit and transaction protocol
 
 - **DEFERRED** — Let the staged-row path join a batch, so SQL through
-  DuckLake gets group commit too. It commits its own transaction directly
-  today, so successive SQL transactions still cost a flush each. The
-  obstacle is not the batch — retry rights are the member's, and a staged
-  member losing one would surface its conflict rather than re-run — but
-  that there is nothing to batch it *with* until DuckLake's serialized
-  metadata connection admits concurrent committers.
+  DuckLake gets group commit too. It commits its own transaction today, so
+  successive SQL transactions still cost a flush each. Retry rights stay
+  the member's, so the obstacle is not the batch but that there is nothing
+  to batch it with until DuckLake's serialized metadata connection admits
+  concurrent committers.
 - **MEASURE** — Commit throughput under concurrency, now that concurrent
-  commits coalesce. `BENCHMARK.md` records the sequential number (one
-  commit is `flush_interval + ~2 ms`); what is unrecorded is how many
-  commits a single flush carries as concurrency rises, and where the
-  `MAX_BATCH_MEMBERS` ceiling starts to bind. The same measurement settles
-  the retry-budget DECISION below, since coalescing is what a benign race
+  commits coalesce: how many commits one flush carries as concurrency
+  rises, and where the batch's member ceiling starts to bind.
+  `BENCHMARK.md` records only the sequential number. Settles the
+  retry-budget DECISION below too, since coalescing is what a benign race
   now mostly avoids.
 - **IMPL** — A zero-write reader mode that opens `DbReader` against an
   explicit existing checkpoint id instead of following latest, which CASes the

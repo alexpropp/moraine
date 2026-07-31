@@ -187,18 +187,15 @@ let ids: Vec<SnapshotId> = catalog.commit_group(&[
 ]).await?;
 ```
 
-Members are `CommitMember` — a trait object, so a call site can pass
-closures that do different things, which a homogeneous `&[F]` cannot
-express, and `Sync`, so a grouped commit is as spawnable as a lone one.
-Every contract above holds per member, including purity: a lost race
-re-runs the whole group. One snapshot id comes back per member, in member
-order.
+Members are `CommitMember`: a trait object, so one call can pass closures
+that do different things, and `Sync`, so a grouped commit is as spawnable
+as a lone one. Every contract above holds per member, purity included — a
+lost race re-runs the whole group. One snapshot id comes back per member,
+in member order.
 
-`commit_group` is the *explicit* half of RFC 0004's group commit; the
-implicit half needs no API at all, since concurrent `commit` callers are
-batched together without being asked. Both are optimizations of when the
-flush happens, not of what a commit means: the batching semantics are
-0004's, and nothing about them is visible in the values returned here.
+This is the explicit half of RFC 0004's group commit. The implicit half
+needs no API, since concurrent `commit` callers are batched without asking;
+either way the batching is invisible in what is returned here.
 
 This closure/verb surface is the **embedding API** — one of RFC 0004's two
 commit front doors. The DuckDB extension (RFC 0006) does not call it: that
