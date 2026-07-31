@@ -4,6 +4,7 @@
 
 mod fixtures;
 
+mod cache;
 mod catalog;
 mod commit_concurrency;
 mod data_files;

@@ -60,6 +60,7 @@ below the leading byte is moraine convention, opaque to SlateDB.
 | `current` | Live catalog entities (no `end_snapshot`) | Insert + delete |
 | `history` | Ended entity versions | Append-only |
 | `inline` | Inlined data — reserved for RFC 0005 | Per RFC 0005 |
+| `index` | Equality-index entries (RFC 0016) | Live-only; insert + delete |
 
 (Subspace declaration order — and therefore each subspace's discriminant
 byte — is fixed by the `Key` type and pinned by golden vectors; see Keys.)

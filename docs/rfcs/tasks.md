@@ -28,8 +28,11 @@ deliberately not itemized here.
 
 Three things gate disproportionately much of the list:
 
-- **Reader refresh** (RFC 0009). No incremental refresh exists at all; every
-  public read rematerializes.
+- **Reader refresh** (RFC 0009). Reads now serve from the cache, so a warm
+  read costs one point read. What is missing is *incremental* refresh: a
+  cache that has fallen behind head rematerializes wholesale rather than
+  replaying the gap. Its main beneficiary would be read-only catalogs, which
+  cache nothing at all pending the read-snapshot pin below.
 - **Format migration** (RFC 0015). The `sys/migration` marker is reserved and
   refused-on-open, and nothing else. The reader gate must ship in format
   version 1 — before any migration exists — or fielded readers are unsafe
@@ -222,12 +225,19 @@ Three things gate disproportionately much of the list:
   is measured (`BENCHMARK.md` → Core measurements: ~5–7 µs per live entity,
   linear); the crossover it trades against needs incremental refresh built to
   measure the other side.
-- **IMPL** — Pin an explicit read-snapshot on the read-only path. The
-  `DbReader` follows the manifest with no pinned checkpoint, so a read-only
-  materialization is not snapshot-isolated the way the read-write path is.
-- **IMPL** — Serve public readers from the cached `CatalogSnapshot`. The cache
-  exists but only committers consume it; `Catalog::snapshot()` always
-  rematerializes.
+- **DECISION** — How a read-only handle gets a cut that is both live and
+  consistent. `DbReader` exposes no `snapshot()`, and SlateDB offers only two
+  modes: an explicit `checkpoint_id`, which is consistent but stops polling
+  entirely (it never sees new commits), or no checkpoint, which follows the
+  manifest but gives no consistent cut. Neither is what a reader needs.
+  `DbReader::manifest()` returning a public `VersionedManifest::id()` suggests
+  an optimistic validate — capture the id, read, re-check, retry on change —
+  but that is unverified against the reestablish path.
+- **IMPL** — Pin an explicit read-snapshot on the read-only path, per the
+  decision above. Until it lands, a read-only materialization is not
+  snapshot-isolated the way the read-write path is, which is also why
+  read-only catalogs must not cache: a torn view would persist and compound
+  instead of being discarded with the read that built it.
 - **IMPL** — Return `SnapshotExpired` for a view driven past the retention
   window, so a reader re-resolves from head instead of dereferencing reclaimed
   files. Depends on the 0003 error variants.
@@ -241,9 +251,11 @@ Three things gate disproportionately much of the list:
   cloning only the matched record confines the cost to what is returned. The
   uncached branch already moves rather than clones, so the waste falls
   exclusively on the path the cache exists to make cheap.
-- **DEFERRED** — Extend changelog-based incremental refresh to read-only
-  catalogs' projection serves. Deferred until reader-side serve cost is shown
-  to matter.
+- **DEFERRED** — Extend caching and changelog-based incremental refresh to
+  read-only catalogs, which today rematerialize on every read. Blocked on the
+  read-snapshot pin above, not on cost: a reader cannot fold its own commits
+  forward (it has none), so replay is the only way to advance its cache, and
+  caching a non-isolated view would be worse than not caching.
 - **DEFERRED** — Partial or lazy materialization to bound memory for an
   unusually large live catalog. Deferred until profiling shows the full
   in-memory view is a problem. This is the same decision as server-side filter

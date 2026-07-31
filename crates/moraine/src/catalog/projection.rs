@@ -115,6 +115,29 @@ pub(crate) fn install_head_view(
         .set_head_view(view);
 }
 
+/// The install epoch to capture before reading the store.
+pub(crate) fn cache_epoch(cache: &std::sync::RwLock<ProjectionCache>) -> u64 {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .epoch()
+}
+
+/// Installs `view` only if no invalidation has intervened since `epoch` was
+/// captured. A reader pins its handle and then reads, so without this an
+/// install could land after a head-preserving commit's invalidation and
+/// resurrect the very content that invalidation discarded.
+pub(crate) fn install_head_view_at(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    epoch: u64,
+    view: Arc<CatalogSnapshot>,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_head_view_at(epoch, view);
+}
+
 pub(crate) fn invalidate_head_view(cache: &std::sync::RwLock<ProjectionCache>) {
     cache
         .write()
@@ -140,6 +163,9 @@ pub(crate) struct ProjectionCache {
     /// rescanning. Carries its own head (`snapshot.snapshot_id`); a fold
     /// that cannot be applied faithfully clears it, degrading to a scan.
     head_view: Option<Arc<CatalogSnapshot>>,
+    /// Bumped by every invalidation, so an installer that captured it
+    /// before reading can tell whether its view is still admissible.
+    epoch: u64,
 }
 
 impl ProjectionCache {
@@ -150,6 +176,7 @@ impl ProjectionCache {
             table_column_stats: Maintained::empty(),
             entities: None,
             head_view: None,
+            epoch: 0,
         }
     }
 
@@ -161,12 +188,24 @@ impl ProjectionCache {
             .cloned()
     }
 
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub(crate) fn set_head_view(&mut self, view: Arc<CatalogSnapshot>) {
         self.head_view = Some(view);
     }
 
+    /// Installs only if no invalidation has intervened since `epoch`.
+    pub(crate) fn set_head_view_at(&mut self, epoch: u64, view: Arc<CatalogSnapshot>) {
+        if self.epoch == epoch {
+            self.head_view = Some(view);
+        }
+    }
+
     pub(crate) fn clear_head_view(&mut self) {
         self.head_view = None;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     pub(crate) fn install_entities(&mut self, head: u64, records: Vec<EntityRecord>) {
@@ -267,6 +306,43 @@ mod tests {
             value::encode_value,
         },
     };
+
+    /// A view holding nothing but its head stamp.
+    fn view_at(snapshot_id: u64) -> Arc<CatalogSnapshot> {
+        Arc::new(CatalogSnapshot {
+            snapshot: SnapshotValue {
+                snapshot_id,
+                ..SnapshotValue::default()
+            },
+            ..CatalogSnapshot::default()
+        })
+    }
+
+    /// A reader pins its handle and then reads, so an invalidation can land
+    /// mid-read. Installing afterwards must not resurrect the view that
+    /// invalidation existed to discard.
+    #[test]
+    fn an_interleaved_invalidation_voids_an_install() {
+        let cache = std::sync::RwLock::new(ProjectionCache::empty());
+
+        let epoch = cache_epoch(&cache);
+        invalidate_head_view(&cache);
+        install_head_view_at(&cache, epoch, view_at(7));
+
+        assert!(cached_head_view(&cache, 7).is_none());
+    }
+
+    /// Without an intervening invalidation the same install must land, or
+    /// no read path could ever warm the cache.
+    #[test]
+    fn an_uncontended_install_lands() {
+        let cache = std::sync::RwLock::new(ProjectionCache::empty());
+
+        let epoch = cache_epoch(&cache);
+        install_head_view_at(&cache, epoch, view_at(7));
+
+        assert!(cached_head_view(&cache, 7).is_some());
+    }
 
     /// Snapshot rows read directly from the store, bypassing the cache.
     async fn scanned_snapshots(catalog: &Catalog) -> Vec<SnapshotValue> {
