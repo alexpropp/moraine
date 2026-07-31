@@ -1,6 +1,9 @@
 //! The catalog handle: the entry point a host opens, reads, and commits
 //! through.
 
+#[cfg(test)]
+mod tests;
+
 use std::{
     collections::{HashMap, HashSet},
     ops::Bound,
@@ -29,7 +32,7 @@ use crate::{
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
     },
-    transaction::{Transaction, commit, index_maintenance, slot_commit},
+    transaction::{Transaction, commit, folder, index_maintenance, slot_commit},
 };
 
 /// How many entries one staged build step commits. At roughly a kilobyte
@@ -531,6 +534,36 @@ impl Catalog {
             )),
             Store::MultiWriter(_) => Err(Error::Constraint(
                 "catalog attached over the slot log; commits are not available yet".to_string(),
+            )),
+        }
+    }
+
+    /// Whether direct-store writes are available: the single writer, or a
+    /// read-write slot-backed attach (through the folder role). A read-only
+    /// attach of either topology refuses.
+    fn ensure_writable(&self) -> Result<()> {
+        match self.store.as_ref() {
+            Store::Writer(_) => Ok(()),
+            Store::MultiWriter(multi) if !multi.read_only => Ok(()),
+            Store::Reader(_) | Store::MultiWriter(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
+    }
+
+    /// Runs `body` against a writable `Db` for a direct-store maintenance
+    /// write: the single writer commits through it directly, a slot-backed
+    /// attach opens a fenced folder session for it — the one process allowed to
+    /// write the store directly — and a read-only attach refuses.
+    async fn with_writer<T, F>(&self, body: F) -> Result<T>
+    where
+        F: AsyncFnOnce(&Db) -> Result<T>,
+    {
+        match self.store.as_ref() {
+            Store::Writer(db) => body(db).await,
+            Store::MultiWriter(multi) if !multi.read_only => folder::with_folder(multi, body).await,
+            Store::Reader(_) | Store::MultiWriter(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
             )),
         }
     }
@@ -1118,6 +1151,17 @@ impl Catalog {
         data_prefix: &str,
         step_entries: Option<usize>,
     ) -> Result<IndexId> {
+        // A staged build's entry batches are derived-state writes that belong
+        // in the folder session, while its definition and ready/poison flips
+        // ride slots; splitting the build across the two substrates is not
+        // wired yet, so a slot-backed attach refuses it typed rather than
+        // routing million-entry batches through the log.
+        if let Store::MultiWriter(_) = self.store.as_ref() {
+            return Err(Error::Constraint(
+                "staged index builds are not yet available over the slot log".to_string(),
+            ));
+        }
+
         let step_entries = step_entries.unwrap_or(BUILD_STEP_ENTRIES);
         if step_entries == 0 {
             return Err(Error::Constraint(
@@ -1399,13 +1443,18 @@ impl Catalog {
             )));
         }
 
-        let tx = self.begin_write_tx().await?;
-        let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
-        tx.commit_with_options(&commit::durable())
-            .await
-            .map_err(Error::from)?;
-
-        Ok(deleted)
+        self.with_writer(async |db| {
+            let tx = db
+                .begin(IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
+            let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
+            tx.commit_with_options(&commit::durable())
+                .await
+                .map_err(Error::from)?;
+            Ok(deleted)
+        })
+        .await
     }
 
     /// Runs one maintenance pass, reclaiming what only moraine knows is
@@ -1434,7 +1483,7 @@ impl Catalog {
         // nothing-to-do shortcut: a pass that reclaims nothing is still a
         // pass, and answering it differently on a read-only catalog would
         // make the outcome depend on the request rather than the handle.
-        self.writer()?;
+        self.ensure_writable()?;
         if request.batch_size == 0 {
             return Err(Error::Configuration(
                 "batch_size must be nonzero; zero would reclaim nothing and never terminate"
@@ -1442,9 +1491,8 @@ impl Catalog {
             ));
         }
 
-        let mut report = MaintenanceReport::default();
         if !request.sweep_orphaned_index_entries {
-            return Ok(report);
+            return Ok(MaintenanceReport::default());
         }
 
         // Index ids come from the monotonic catalog-id counter and are
@@ -1459,27 +1507,33 @@ impl Catalog {
             .flat_map(|per_table| per_table.keys().copied())
             .collect();
 
-        for kind in [IndexKind::Unique, IndexKind::Multi] {
-            let mut from = 0u64;
-            while let Some(index_id) = self.first_index_id_from(kind, from).await? {
-                if !live.contains(&index_id) {
-                    let reclaimed = self
-                        .reclaim_dead_range(kind, index_id, request.batch_size)
-                        .await?;
-                    if reclaimed > 0 {
-                        report.indexes_swept += 1;
-                        report.index_entries_reclaimed += reclaimed;
+        // The entry deletions are derived-state upkeep in the index subspace,
+        // never replayed into a view, so they run under the folder role: the
+        // single direct writer of a slot-backed store.
+        self.with_writer(async |db| {
+            let mut report = MaintenanceReport::default();
+            for kind in [IndexKind::Unique, IndexKind::Multi] {
+                let mut from = 0u64;
+                while let Some(index_id) = self.first_index_id_from(kind, from).await? {
+                    if !live.contains(&index_id) {
+                        let reclaimed = self
+                            .reclaim_dead_range(db, kind, index_id, request.batch_size)
+                            .await?;
+                        if reclaimed > 0 {
+                            report.indexes_swept += 1;
+                            report.index_entries_reclaimed += reclaimed;
+                        }
+                    }
+                    // Seek past this index rather than walking its entries.
+                    match index_id.checked_add(1) {
+                        Some(next) => from = next,
+                        None => break,
                     }
                 }
-                // Seek past this index rather than walking its entries.
-                match index_id.checked_add(1) {
-                    Some(next) => from = next,
-                    None => break,
-                }
             }
-        }
-
-        Ok(report)
+            Ok(report)
+        })
+        .await
     }
 
     /// The lowest index id at or after `from` holding an entry of `kind`,
@@ -1521,9 +1575,10 @@ impl Catalog {
 
     /// Deletes every entry of one dead index, `batch_size` per commit,
     /// returning the total. The caller has already established that the
-    /// index is not live.
+    /// index is not live, and holds the writer the batches commit through.
     async fn reclaim_dead_range(
         &self,
+        db: &Db,
         kind: IndexKind,
         index_id: u64,
         batch_size: usize,
@@ -1535,7 +1590,10 @@ impl Catalog {
         // size of the range.
         let mut cursor: Option<Vec<u8>> = None;
         loop {
-            let tx = self.begin_write_tx().await?;
+            let tx = db
+                .begin(IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
             let (deleted, last) = index_maintenance::reclaim_entries_from(
                 &tx,
                 kind,

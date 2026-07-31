@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use futures::StreamExt;
 use moraine::{
     Catalog, CatalogOptions, ColumnId, Error, FileIndexEntry, IndexDef, IndexKeyValue, IntWidth,
-    SnapshotId,
+    MaintenanceRequest, SnapshotId,
 };
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 
@@ -38,6 +38,24 @@ async fn objects_under(store: &Arc<InMemory>, prefix: &str) -> usize {
         count += 1;
     }
     count
+}
+
+/// Maintenance is available on a slot-backed catalog rather than refused like
+/// a read-only attach: it runs under the folder role. A fresh catalog has
+/// nothing to reclaim, and a concurrent commit is unaffected by the pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn maintain_is_available_on_a_multi_writer_catalog() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+
+    let (report, committed) = tokio::join!(
+        catalog.maintain(MaintenanceRequest::default()),
+        catalog.commit(|tx| tx.create_schema("live").map(|_| ())),
+    );
+    let report = report.unwrap();
+    assert_eq!(report.index_entries_reclaimed, 0);
+    assert_eq!(report.indexes_swept, 0);
+    assert_eq!(committed.unwrap(), SnapshotId::new(1));
 }
 
 #[tokio::test]
