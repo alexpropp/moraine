@@ -64,7 +64,8 @@ reader cannot absorb lazily. RFC 0002 states the governing rule: *a
 reader/writer that meets a newer format than it understands errors rather
 than misreading.* This RFC is the other half of that rule — what happens when
 the store is **older** than the binary, and the operator chooses to upgrade it
-in place.
+in place. Not every older store needs upgrading, though — see "Additive
+versus rewriting, within axis 2".
 
 The genesis protocol ([RFC 0011](0011-crash-recovery.md), the genesis cases)
 already establishes the template this RFC follows: a multi-step state change
@@ -83,14 +84,36 @@ table before anything else.
 |---|---|---|
 | What changes | Protobuf fields; per-value encoding version | Subspace tags; key structure |
 | Signal | Framing-header encoding byte (RFC 0002) | `sys/format` structural version |
-| Compatibility | Forward/backward (skip unknown, default missing) | Breaking — key layout differs |
-| Handled by | **Readers, lazily, on decode** | **A one-time rewrite of the store** |
-| Migration? | **None** | **This RFC** |
+| Compatibility | Forward/backward (skip unknown, default missing) | Breaking for a binary that cannot name the new tags |
+| Handled by | **Readers, lazily, on decode** | **A lazy stamp, or a one-time rewrite of the store** |
+| Migration? | **None** | **This RFC — for the rewriting kind only (next section)** |
 
 If a proposed change can be expressed as a new protobuf field a reader
 defaults or ignores, it is axis 1 and does **not** bump `sys/format`. Only a
 change to *where a key lives* or *how it sorts* is axis 2. The bar for axis 2
 is deliberately high, because axis 2 is the expensive one.
+
+### Additive versus rewriting, within axis 2
+
+Axis 2 splits again, and only one half needs this RFC's machinery.
+
+An **additive** structural change introduces a new subspace or a new kind and
+**moves no existing key**. The `index` subspace ([RFC 0016](0016-equality-indexes.md))
+is the worked example: a store that grows one is stamped a higher
+`sys/format` so binaries that cannot name the new tag refuse it, but nothing
+already written is rewritten, and a binary that *does* know the tag reads the
+older store unchanged. The stamp is therefore **lazy** — written the first
+time the feature is used, not on open — and there is **no migration**.
+
+A **rewriting** structural change alters where existing keys live or how they
+sort. Old keys must be read, re-encoded, and deleted. This is the only kind
+that needs the start/step/finish protocol below, and the only kind that makes
+an older store unreadable rather than merely older.
+
+The practical consequence is that a binary reads a **range** of formats, not
+one: every format from the oldest it can still make sense of (its floor) up
+to the newest it can name. Additive bumps widen that range; a rewriting bump
+raises the floor, because below it the keys are somewhere else.
 
 ### On-open version check
 
@@ -99,14 +122,21 @@ structural version to the binary's:
 
 | Store vs. binary | Action |
 |---|---|
-| **Equal** | Proceed normally. |
-| **Store older** | Store is *eligible* for migration. Do **not** migrate implicitly (see "Trigger policy"); open read-only against the old layout is permitted, but a write path that requires the new layout surfaces the typed `Migration` error (RFC 0003) naming the source and target versions. |
-| **Store newer** | **Refuse to open.** Return the typed `Migration` error (RFC 0003, per RFC 0002's meet-a-newer-format rule). Never guess, never downgrade, never write. |
+| **Within the binary's range** (floor ≤ store ≤ newest it names) | Proceed normally. A store *below* the binary's newest is not migration-eligible: the intervening bumps were additive, so its keys are exactly where this binary looks for them. It is stamped forward lazily if and when it uses the newer feature, never rewritten on open. |
+| **Below the floor** | **Refuse to open.** Return the typed `Migration` error (RFC 0003) naming the store's version and the floor. A rewriting migration put this store's keys somewhere this binary does not look; it must be migrated up first. |
+| **Newer than the binary names** | **Refuse to open.** Return the typed `Migration` error (RFC 0003, per RFC 0002's meet-a-newer-format rule). Never guess, never downgrade, never write. |
+| **Absent** | The store is uninitialized. A read-write attach bootstraps it; a read-only attach refuses, having nothing committed to read. |
 
 The newer-than-binary refusal is not optional or best-effort: a binary that
 cannot name every subspace tag it might encounter cannot safely read, so it
 stops. This is the same discipline the framing header applies to an unknown
 value encoding, lifted to the structural level.
+
+Until the first rewriting migration exists, the floor sits at the base format
+and the below-the-floor arm is **dormant** — no store in the world is below
+it. It is specified and implemented now anyway, for the same reason the
+reader gate is: the arm has to be in the fielded binaries *before* the format
+that makes it fire.
 
 ### Single-writer migration
 

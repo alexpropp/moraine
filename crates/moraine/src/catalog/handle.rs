@@ -324,7 +324,6 @@ impl Catalog {
     /// reader polling a quiet catalog pays one point read and no copy: the
     /// committer folds each batch forward, so the cache is normally current.
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
-        commit::refuse_mid_migration(handle).await?;
         let head = commit::read_head_id(handle).await?;
         if let Some(cached) = cached_head_view(&self.projections, head) {
             return Ok(cached);
@@ -565,15 +564,29 @@ impl Catalog {
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
     /// Used by [`crate::ffi_support`]'s raw current+history dumps and inline
     /// scans; every other reader goes through `snapshot`/`snapshot_at`.
+    ///
+    /// Every read in the crate opens its session here, so this is where a
+    /// store mid-structural-migration is refused. The check costs one point
+    /// read per session and belongs here rather than at each call site: a
+    /// reader that skips it scans a keyspace being rewritten under it and
+    /// returns a catalog with a hole in it, and an open-time check cannot
+    /// catch a migration that starts after the handle attached.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
-        match self.store.as_ref() {
-            Store::Writer(db) => Ok(ReadSession::Tx(
+        let session = match self.store.as_ref() {
+            Store::Writer(db) => ReadSession::Tx(
                 db.begin(IsolationLevel::Snapshot)
                     .await
                     .map_err(Error::from)?,
-            )),
-            Store::Reader(reader) => Ok(ReadSession::Reader(reader.clone())),
+            ),
+            Store::Reader(reader) => ReadSession::Reader(reader.clone()),
+        };
+
+        if let Err(error) = commit::refuse_mid_migration(session.handle()).await {
+            session.finish();
+            return Err(error);
         }
+
+        Ok(session)
     }
 
     /// Opens a read-write transaction for the staged-row commit path. Fails

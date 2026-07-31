@@ -33,10 +33,12 @@ Three things gate disproportionately much of the list:
   cache that has fallen behind head rematerializes wholesale rather than
   replaying the gap. Its main beneficiary would be read-only catalogs, which
   cache nothing at all pending the read-snapshot pin below.
-- **Format migration** (RFC 0015). The `sys/migration` marker is reserved and
-  refused-on-open, and nothing else. The reader gate must ship in format
-  version 1 — before any migration exists — or fielded readers are unsafe
-  against the first real one.
+- **Format migration** (RFC 0015). The `sys/migration` marker is reserved,
+  refused on open, and refused at every read session — the reader gate that
+  had to ship in format version 1, before any migration exists, so fielded
+  readers are safe against the first real one. Everything that writes the
+  marker is unbuilt: no start batch, no step loop, no finish flip, no
+  cursor, no migrate verb.
 - **The crash harness** (RFC 0011). The crash cases are enumerated and driven
   as data, with `CommitDurableNotAcknowledged`, `TakeoverMidCommit`,
   `FencedWriterResumes`, and `ConcurrentGenesis` covered end to end. The other
@@ -420,11 +422,12 @@ Three things gate disproportionately much of the list:
 
 ## 0015 — On-disk format migration
 
-- **IMPL** — Dispatch an older-than-binary store from the on-attach
-  `sys/format` check into the migrate path. The typed `Migration` error, the
-  three-way equal/older/newer split, and the newer-than-binary refusal are
-  done; the older arm currently refuses toward migrate but no migrate path
-  yet consumes it.
+- **IMPL** — Dispatch a below-the-floor store from the on-attach `sys/format`
+  check into the migrate path. The typed `Migration` error and the four-way
+  in-range/below-floor/newer/absent split are done, and the arm refuses
+  correctly; what is missing is a migrate path for it to hand off to. The arm
+  is dormant until a rewriting format raises the floor above the base
+  version, so nothing reaches it in the field today.
 - **IMPL** — The start phase: one atomic batch writing the `sys/migration`
   marker with `{from_format, to_format, cursor}`.
 - **IMPL** — The idempotent step loop: write new-format keys before deleting
@@ -447,8 +450,12 @@ Three things gate disproportionately much of the list:
   each step's new-key write and old-key delete, each cursor advance, the finish
   flip — asserting reopen always yields a coherent store and never
   new-format-with-marker. Depends on 0011.
-- **VALIDATE** — With the marker present, materialization and refresh on either
-  binary version return the typed error and never a partial view.
+- **VALIDATE** — With the marker present, a read-only attach that was already
+  open when the migration started returns the typed error. The gate itself is
+  shared (every read opens its session through one place, which refuses), and
+  the read-write side is covered; what is untested is a reader that meets a
+  marker planted by another process after it attached, which needs a second
+  writer and a manifest poll to stage.
 - **VALIDATE** — Running the migrate verb against an already-migrated store is
   a no-op, not a re-rewrite.
 - **VALIDATE** — Migrate, then time-travel: resolving at a pre-migration
