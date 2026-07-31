@@ -24,7 +24,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
 use super::{
-    Admission, SlotHead, admit, apply, classify_lost_race, materialize_slot_head, release_reader,
+    Admission, SlotHead, admit, apply, classify_lost_race, release_reader, revalidated_slot_head,
 };
 use crate::{
     catalog::{CatalogSnapshot, SlotStore, SnapshotId},
@@ -165,7 +165,7 @@ impl CommitCoalescer {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        let head = match materialize_slot_head(store).await {
+        let head = match revalidated_slot_head(store).await {
             Ok(head) => head,
             Err(err) => return Err(err),
         };
@@ -181,6 +181,7 @@ impl CommitCoalescer {
             base,
             original_head,
             last_changes: Vec::new(),
+            last_envelope: None,
             settled: false,
         };
 
@@ -191,6 +192,13 @@ impl CommitCoalescer {
             &RetryPolicy::default(),
         )
         .await;
+
+        // A successful commit updates the handle's head cache directly with the
+        // committed head, so a read on the same handle sees its own write
+        // regardless of the refresh window.
+        if let Ok(CommitDrive::Committed { sequence, .. }) = &drive {
+            committer.cache_committed(store, *sequence);
+        }
 
         let outcome = committer.settle(&drive);
         if committer.base.owns_reader {
@@ -351,6 +359,11 @@ struct CoalescingCommitter<'a, F> {
     // The change set of every member that staged this round, for judging a
     // lost race.
     last_changes: Vec<ChangeSet>,
+    /// The envelope the last round assembled. On a win the driver returns
+    /// without absorbing it (absorb runs only on a lost race), so the cache
+    /// update applies it onto the base to reconstruct the committed head. Valid
+    /// only while this process's coalescer is the sole assembler of its ids.
+    last_envelope: Option<Envelope>,
     /// Set once [`settle`](Self::settle) has delivered outcomes. Its drop guard
     /// re-queues live followers only when this is unset — i.e. when the
     /// leader's own future was dropped mid-batch before it could settle
@@ -371,6 +384,38 @@ impl<F> CoalescingCommitter<'_, F> {
             let slot = Slot::new(member.txid);
             self.followers.push(Follower { member, slot });
         }
+    }
+
+    /// Reconstructs the committed head and records it in the handle's cache.
+    /// The base already carries every benign-lost winner (absorbed on the way);
+    /// applying the winning envelope onto it yields the head this commit
+    /// produced. A batch whose apply cannot chain clears the cache rather than
+    /// caching a wrong head — the next read re-materializes.
+    fn cache_committed(&mut self, store: &SlotStore, sequence: u64) {
+        let Some(envelope) = self.last_envelope.take() else {
+            return;
+        };
+        for commit in &envelope.commits {
+            match admit(&self.base.view, commit, sequence) {
+                Ok(Admission::Apply) => {
+                    if apply(&mut self.base.view, commit, sequence).is_err() {
+                        store.head_cache.invalidate();
+                        return;
+                    }
+                }
+                Ok(Admission::Skip) => {}
+                Err(_) => {
+                    store.head_cache.invalidate();
+                    return;
+                }
+            }
+        }
+        self.base.overlay.absorb(&envelope);
+        store.head_cache.record(
+            &self.base.view,
+            &self.base.overlay,
+            sequence.saturating_add(1),
+        );
     }
 
     /// Distributes the batch's outcome to every follower and returns the
@@ -462,9 +507,12 @@ where
 
         let commits = accum.lock().await.commits.clone();
         if commits.is_empty() {
+            self.last_envelope = None;
             Ok(None)
         } else {
-            Ok(Some(Envelope { commits }))
+            let envelope = Envelope { commits };
+            self.last_envelope = Some(envelope.clone());
+            Ok(Some(envelope))
         }
     }
 

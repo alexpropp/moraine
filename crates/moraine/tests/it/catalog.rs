@@ -411,18 +411,23 @@ async fn set_table_schema_moves_a_table_between_schemas() {
 async fn two_read_write_attaches_coexist_without_fencing() {
     let store: Arc<InMemory> = Arc::new(InMemory::new());
 
-    let first = Catalog::open(store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
+    // A zero refresh window makes each read revalidate its cached head, so a
+    // peer's latest commit is seen through tail replay rather than after the
+    // window elapses.
+    let options = || {
+        let mut options = CatalogOptions::default();
+        options.refresh_interval = std::time::Duration::ZERO;
+        options
+    };
+
+    let first = Catalog::open(store.clone(), options()).await.unwrap();
     first
         .commit(|tx| tx.create_schema("from_first").map(|_| ()))
         .await
         .unwrap();
 
     // A second read-write open does not fence the first; both keep committing.
-    let second = Catalog::open(store.clone(), CatalogOptions::default())
-        .await
-        .unwrap();
+    let second = Catalog::open(store.clone(), options()).await.unwrap();
     second
         .commit(|tx| tx.create_schema("from_second").map(|_| ()))
         .await

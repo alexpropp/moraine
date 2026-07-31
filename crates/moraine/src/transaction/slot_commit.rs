@@ -1,7 +1,11 @@
 //! The multi-writer head: the folded store view with every slot above the
 //! fold cursor replayed onto it.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Instant,
+};
 
 use moraine_wal::{Commit, Envelope, Overlay, Race, SlotLog, SlotPayload, SlotWrite};
 use slatedb::DbReader;
@@ -72,6 +76,173 @@ pub(crate) async fn materialize_slot_head(store: &SlotStore) -> Result<SlotHead>
 /// store rather than through the tail.
 pub(crate) async fn materialize_slot_head_fresh(store: &SlotStore) -> Result<SlotHead> {
     slot_head(store, None, true).await
+}
+
+/// How many slots one cached head may absorb incrementally before a read
+/// re-materializes from the folded store. The overlay accumulates every slot
+/// it absorbs, so this bounds a no-folder run from growing it without end.
+const MAX_INCREMENTAL_SLOTS: u64 = 512;
+
+/// The materialized head cached across a handle's reads. Cheap to clone —
+/// every clone shares the one cache — so the commit paths that hold no
+/// `SlotStore` can still update it. Within
+/// [`CatalogOptions::refresh_interval`] a read serves the cached head
+/// untouched; past it, one LIST from `next_sequence` either finds the head
+/// unchanged or absorbs the new slots into the cached view.
+#[derive(Clone, Default)]
+pub(crate) struct HeadCache {
+    entry: Arc<Mutex<Option<CachedHead>>>,
+}
+
+/// The cached logical head: enough to answer a read and to premise a commit,
+/// with the freshness bookkeeping the bound uses.
+struct CachedHead {
+    view: CatalogSnapshot,
+    overlay: Overlay,
+    next_sequence: u64,
+    /// The frontier at the last full materialization. Incremental absorbs past
+    /// `next_sequence - anchor_sequence > MAX_INCREMENTAL_SLOTS`
+    /// re-materialize.
+    anchor_sequence: u64,
+    refreshed_at: Instant,
+}
+
+impl HeadCache {
+    fn lock(&self) -> MutexGuard<'_, Option<CachedHead>> {
+        self.entry.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Clears the cache, so the next read re-materializes from the folded
+    /// store.
+    pub(crate) fn invalidate(&self) {
+        *self.lock() = None;
+    }
+
+    /// Records the head a commit produced, so a read on the same handle sees
+    /// its own write regardless of the refresh window. `view` and `overlay`
+    /// already carry the committed writes, and `next_sequence` is one past the
+    /// sequence it won. The old anchor rides forward, so the incremental bound
+    /// still forces a periodic re-materialization.
+    pub(crate) fn record(&self, view: &CatalogSnapshot, overlay: &Overlay, next_sequence: u64) {
+        let mut cache = self.lock();
+        let anchor = cache
+            .as_ref()
+            .map_or(next_sequence, |cached| cached.anchor_sequence);
+        *cache = Some(CachedHead {
+            view: view.clone(),
+            overlay: overlay.clone(),
+            next_sequence,
+            anchor_sequence: anchor,
+            refreshed_at: Instant::now(),
+        });
+    }
+}
+
+impl CachedHead {
+    fn to_head(&self) -> SlotHead {
+        SlotHead {
+            view: self.view.clone(),
+            overlay: self.overlay.clone(),
+            next_sequence: self.next_sequence,
+            reader: None,
+        }
+    }
+}
+
+/// The head for a read: the cached head when the freshness bound allows, else a
+/// revalidation that repopulates the cache. Within `refresh_interval` this
+/// touches the store not at all — the bounded-staleness a read accepts in
+/// exchange for the freed request.
+pub(crate) async fn cached_slot_head(store: &SlotStore) -> Result<SlotHead> {
+    {
+        let cache = store.head_cache.lock();
+        if let Some(cached) = cache.as_ref()
+            && cached.refreshed_at.elapsed() < store.options.refresh_interval
+        {
+            return Ok(cached.to_head());
+        }
+    }
+    revalidate_head(store).await
+}
+
+/// The head for a commit premise: always revalidates the frontier, never the
+/// within-window shortcut a read may take. A commit races `next_sequence`, so a
+/// stale one racing a folded-and-truncated sequence would fork history; the
+/// LIST here settles the true frontier. It still skips the folded-store scan
+/// when the cached view can absorb the new slots.
+pub(crate) async fn revalidated_slot_head(store: &SlotStore) -> Result<SlotHead> {
+    revalidate_head(store).await
+}
+
+/// Validity is one LIST from the cached `next_sequence`, never a point probe on
+/// that sequence. A slot written, folded, and truncated between two reads
+/// leaves nothing at `next_sequence`, so a probe would read it absent and call
+/// the cache fresh — serving a head missing that commit. An empty LISTING is
+/// the head unchanged, because a truncated run always leaves newer slots
+/// visible. New slots absorb into the cached view; a hole, a run grown past the
+/// bound, or a slot that does not chain re-materializes from the folded store.
+async fn revalidate_head(store: &SlotStore) -> Result<SlotHead> {
+    let carried = {
+        let cache = store.head_cache.lock();
+        cache.as_ref().map(|cached| {
+            (
+                cached.view.clone(),
+                cached.overlay.clone(),
+                cached.next_sequence,
+                cached.anchor_sequence,
+            )
+        })
+    };
+
+    let Some((mut view, mut overlay, mut next_sequence, anchor)) = carried else {
+        return materialize_into_cache(store).await;
+    };
+
+    let tail = store.slots.read_tail(next_sequence).await?;
+    if tail.gap_at.is_some() || next_sequence.saturating_sub(anchor) > MAX_INCREMENTAL_SLOTS {
+        return materialize_into_cache(store).await;
+    }
+
+    for (sequence, envelope) in &tail.slots {
+        for commit in &envelope.commits {
+            match admit(&view, commit, *sequence)? {
+                Admission::Apply => apply(&mut view, commit, *sequence)?,
+                // A cached view a new slot does not chain onto is not an
+                // incremental step; the folded store settles it.
+                Admission::Skip => return materialize_into_cache(store).await,
+            }
+        }
+        overlay.absorb(envelope);
+        next_sequence = sequence.saturating_add(1);
+    }
+
+    let head = SlotHead {
+        view,
+        overlay,
+        next_sequence,
+        reader: None,
+    };
+    store_cached_head(store, &head, anchor);
+    Ok(head)
+}
+
+/// A full materialization, cached as a fresh anchor. Its own reader (opened
+/// past a truncation) is not cached — only the logical view travels — so a
+/// later read never reuses a reader the batch closed.
+async fn materialize_into_cache(store: &SlotStore) -> Result<SlotHead> {
+    let head = materialize_slot_head(store).await?;
+    store_cached_head(store, &head, head.next_sequence);
+    Ok(head)
+}
+
+fn store_cached_head(store: &SlotStore, head: &SlotHead, anchor_sequence: u64) {
+    *store.head_cache.lock() = Some(CachedHead {
+        view: head.view.clone(),
+        overlay: head.overlay.clone(),
+        next_sequence: head.next_sequence,
+        anchor_sequence,
+        refreshed_at: Instant::now(),
+    });
 }
 
 /// Closes a reader a hole retry opened. A handle's own reader is left alone; a
@@ -382,6 +553,7 @@ mod tests {
             options,
             read_only: false,
             coalescer,
+            head_cache: HeadCache::default(),
         }
     }
 

@@ -45,7 +45,7 @@ use crate::{
     transaction::{
         commit::{self, StagedWrite},
         index_maintenance::{ProbeHandle, StagedIndexEntry, plan_index_entries},
-        slot_commit::{SlotHead, commit_from, release_reader},
+        slot_commit::{HeadCache, SlotHead, commit_from, release_reader},
     },
 };
 
@@ -389,6 +389,9 @@ pub struct StagedTransaction {
     /// scoped-reads registered data files through it; absent it is skipped.
     data_store: Option<Arc<dyn ObjectStore>>,
     data_prefix: String,
+    /// The handle's head cache, updated on a successful commit so a read on the
+    /// same handle sees this write regardless of the refresh window.
+    head_cache: HeadCache,
 }
 
 impl StagedTransaction {
@@ -400,6 +403,7 @@ impl StagedTransaction {
         slots: SlotLog,
         data_store: Option<Arc<dyn ObjectStore>>,
         data_prefix: String,
+        head_cache: HeadCache,
     ) -> Self {
         Self {
             backing: StagedBacking::Slots {
@@ -410,6 +414,7 @@ impl StagedTransaction {
             ops: Vec::new(),
             data_store,
             data_prefix,
+            head_cache,
         }
     }
 
@@ -490,6 +495,7 @@ impl StagedTransaction {
             ops,
             data_store,
             data_prefix,
+            head_cache,
         } = self;
         let staged_rows = ops.len();
 
@@ -497,7 +503,7 @@ impl StagedTransaction {
 
         match backing {
             StagedBacking::Slots { head, slots, .. } => {
-                commit_slots(*head, slots, assembled, staged_rows, started).await
+                commit_slots(*head, slots, assembled, staged_rows, started, &head_cache).await
             }
         }
     }
@@ -624,6 +630,7 @@ async fn commit_slots(
     assembled: Result<Assembly>,
     staged_rows: usize,
     started: std::time::Instant,
+    head_cache: &HeadCache,
 ) -> Result<SnapshotId> {
     let outcome = match assembled {
         Ok(assembly) => {
@@ -641,6 +648,7 @@ async fn commit_slots(
             };
             match slots.commit_slot(head.next_sequence, &envelope).await {
                 Ok(CommitOutcome::Won) => {
+                    record_committed_head(head_cache, &head, &envelope, &assembly.writes);
                     staged_landed(assembly.result_id, staged_rows, started);
                     Ok(SnapshotId::new(assembly.result_id))
                 }
@@ -655,6 +663,27 @@ async fn commit_slots(
 
     release_reader(head.reader.as_ref()).await;
     outcome
+}
+
+/// Records the head this staged commit produced in the handle's cache, so the
+/// next read on the same handle sees it regardless of the refresh window. The
+/// writes were staged against `head.view`, so applying them onto it
+/// reconstructs the committed view; a batch that cannot replay leaves the cache
+/// cleared rather than wrong.
+fn record_committed_head(
+    head_cache: &HeadCache,
+    head: &SlotHead,
+    envelope: &Envelope,
+    writes: &[StagedWrite],
+) {
+    let mut view = head.view.clone();
+    if commit::fold::fold_batch(&mut view, writes).is_err() {
+        head_cache.invalidate();
+        return;
+    }
+    let mut overlay = head.overlay.clone();
+    overlay.absorb(envelope);
+    head_cache.record(&view, &overlay, head.next_sequence.saturating_add(1));
 }
 
 /// One landed staged commit's summary event.

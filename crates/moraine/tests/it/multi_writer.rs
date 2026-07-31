@@ -24,6 +24,14 @@ async fn open_multi_writer_over(store: Arc<dyn ObjectStore>, options: CatalogOpt
     Catalog::open(store, options).await.unwrap()
 }
 
+/// Options whose zero refresh window makes every read revalidate its cached
+/// head, so a peer's commit is seen without waiting out the window.
+fn zero_refresh() -> CatalogOptions {
+    let mut options = CatalogOptions::default();
+    options.refresh_interval = Duration::ZERO;
+    options
+}
+
 /// How many objects sit under `prefix`.
 async fn objects_under(store: &Arc<InMemory>, prefix: &str) -> usize {
     let mut listing = store.list(Some(&Path::from(prefix)));
@@ -146,8 +154,10 @@ async fn disjoint_racing_commits_both_land_in_adjacent_slots() {
     let ta = snapshot.table_by_name(s, "a").unwrap().id;
     let tb = snapshot.table_by_name(s, "b").unwrap().id;
 
-    let a = open_multi_writer(&store).await;
-    let b = open_multi_writer(&store).await;
+    // A zero refresh window makes each read revalidate its cached head, so the
+    // peer's commit is seen at once rather than after the window elapses.
+    let a = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, zero_refresh()).await;
+    let b = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, zero_refresh()).await;
     let (ra, rb) = tokio::join!(
         a.commit(move |tx| tx.add_column(ta, &col("a1")).map(|_| ())),
         b.commit(move |tx| tx.add_column(tb, &col("b1")).map(|_| ())),
@@ -489,4 +499,130 @@ async fn a_cancelled_leader_hands_off_and_keeps_the_handle_live() {
     assert!(snapshot.schema_by_name("follower").is_some());
     assert!(snapshot.schema_by_name("after").is_some());
     assert!(snapshot.schema_by_name("leader").is_none());
+}
+
+/// Once a read has materialized the head, further reads within the refresh
+/// window serve the cached head: no `current`-scan GETs and no slot listing.
+/// This is the whole point of the cache — a repeated `snapshot()` used to pay
+/// a full materialization every time.
+#[tokio::test]
+async fn repeated_snapshots_within_the_window_serve_the_cached_head() {
+    let store = Arc::new(CountingStore::new());
+    let catalog = open_multi_writer_over(
+        store.clone() as Arc<dyn ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await;
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+
+    // The first read materializes the head and warms the cache.
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .is_some()
+    );
+
+    // Every subsequent read within the window is served from the cache: it
+    // touches the store for neither a scan nor a freshness listing.
+    let before = (store.get_count(), store.list_count());
+    let second = catalog.snapshot().await.unwrap();
+    let third = catalog.snapshot().await.unwrap();
+    let (gets, lists) = (store.get_count() - before.0, store.list_count() - before.1);
+
+    assert!(second.schema_by_name("sales").is_some());
+    assert!(third.schema_by_name("sales").is_some());
+    assert_eq!(gets, 0, "a cached read runs no current-scan GETs");
+    assert_eq!(lists, 0, "a cached read runs no freshness listing");
+}
+
+/// A handle's own commit is visible to its next read regardless of the refresh
+/// window: the commit updates the cache directly. Set an hour-long window so a
+/// stale cache could never be revalidated by the clock; only the direct update
+/// makes the write visible.
+#[tokio::test]
+async fn a_handles_own_commit_is_visible_within_the_window() {
+    let store = Arc::new(InMemory::new());
+    let mut options = CatalogOptions::default();
+    options.refresh_interval = Duration::from_secs(3600);
+    let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
+
+    // Warm the cache at the bootstrap head.
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .is_none()
+    );
+
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+
+    // The window has not elapsed, yet the handle sees its own write.
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .is_some()
+    );
+}
+
+/// A peer's commit becomes visible once the refresh window elapses: the read
+/// lists from the cached frontier, finds the peer's slot, and absorbs it
+/// incrementally. A zero window revalidates on every read.
+#[tokio::test]
+async fn a_peer_commit_becomes_visible_after_the_window() {
+    let store = Arc::new(InMemory::new());
+    let mut options = CatalogOptions::default();
+    options.refresh_interval = Duration::ZERO;
+    let a = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options.clone()).await;
+    let b = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
+
+    // Warm A's cache before the peer commits.
+    assert!(
+        a.snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .is_none()
+    );
+
+    b.commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+
+    // With no window, A's next read revalidates and absorbs the peer's slot.
+    assert!(
+        a.snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("sales")
+            .is_some()
+    );
+}
+
+/// The point-probe trap made concrete: a peer commits, folds, and truncates
+/// the slot between two of this handle's reads, leaving nothing at the cached
+/// `next_sequence`. A point-probe validity check would call the cache fresh and
+/// serve a head missing that commit; the LIST-based check does not.
+///
+/// Deferred: needs `fold_sprint` and `truncate_folded_slots`, which land after
+/// this task. Task 11 lands the assertion.
+#[tokio::test]
+#[ignore = "needs fold_sprint (Task 10) and truncation (Task 11)"]
+async fn a_cached_head_survives_a_peer_fold_and_truncation() {
+    // TODO(Task 11): commit, fold, and truncate the slot through a peer handle,
+    // then assert the cached handle still resolves the full head — the
+    // point-probe design fails this, the LIST-based one does not.
 }

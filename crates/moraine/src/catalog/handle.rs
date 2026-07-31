@@ -338,6 +338,10 @@ pub(crate) struct SlotStore {
     /// Serializes and coalesces this process's slot commits. Shared by every
     /// clone of the handle.
     pub(crate) coalescer: slot_commit::CommitCoalescer,
+    /// The materialized head cached across reads, so a repeated read need not
+    /// re-materialize from the folded store. Shared by every clone of the
+    /// handle; a successful commit updates it in place.
+    pub(crate) head_cache: slot_commit::HeadCache,
 }
 
 /// Options for opening a catalog.
@@ -459,6 +463,7 @@ impl Catalog {
                 options,
                 read_only: false,
                 coalescer,
+                head_cache: slot_commit::HeadCache::default(),
             }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
@@ -650,6 +655,7 @@ impl Catalog {
                 options,
                 read_only: true,
                 coalescer,
+                head_cache: slot_commit::HeadCache::default(),
             }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
@@ -717,7 +723,7 @@ impl Catalog {
         let Store::Slots(store) = self.store.as_ref();
         match at {
             None => {
-                let head = slot_commit::materialize_slot_head(store).await?;
+                let head = slot_commit::cached_slot_head(store).await?;
                 slot_commit::release_reader(head.reader.as_ref()).await;
                 Ok(head.view)
             }
@@ -1087,6 +1093,7 @@ impl Catalog {
             store.slots.clone(),
             data_store,
             data_prefix,
+            store.head_cache.clone(),
         ))
     }
 
