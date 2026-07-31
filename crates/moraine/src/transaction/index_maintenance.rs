@@ -38,8 +38,6 @@ pub(crate) enum ProbeHandle<'a> {
     Store(ReadHandle<'a>),
     /// A store view overlaid with an unfolded tail: a tail write shadows the
     /// stored value, a tail delete hides it.
-    // dead_code: constructed by the slot commit cycle, landing in a later task.
-    #[allow(dead_code)]
     Overlaid {
         /// The folded store view.
         store: ReadHandle<'a>,

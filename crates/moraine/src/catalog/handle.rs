@@ -1031,7 +1031,7 @@ impl Catalog {
             let mut killed_positions: HashMap<u64, HashSet<u64>> = HashMap::new();
             let mut killed_row_ids: HashMap<u64, HashSet<u64>> = HashMap::new();
             for (data_file_id, row_id, _) in
-                store_inline::scan_inline_file_deletes(session.handle(), table.get()).await?
+                store_inline::scan_inline_file_deletes(session.handle(), None, table.get()).await?
             {
                 killed_row_ids
                     .entry(data_file_id)
@@ -1328,7 +1328,7 @@ impl Catalog {
             // Rows tombstoned out of their chunk by an inline delete are dead
             // and must not be indexed.
             let dead: std::collections::HashSet<u64> =
-                store_inline::scan_inline_inline_deletes(session.handle(), table.get())
+                store_inline::scan_inline_inline_deletes(session.handle(), None, table.get())
                     .await?
                     .into_iter()
                     .map(|(row_id, _)| row_id)
@@ -1336,19 +1336,23 @@ impl Catalog {
 
             let mut entries = Vec::new();
             for (op, chunk) in
-                store_inline::scan_inline_chunks(session.handle(), table.get()).await?
+                store_inline::scan_inline_chunks(session.handle(), None, table.get()).await?
             {
                 let InlineOperation::Insert { schema_version, .. } = op else {
                     continue;
                 };
-                let schema =
-                    store_inline::read_inline_schema(session.handle(), table.get(), schema_version)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Corruption(format!(
-                                "no inline schema for table {table} version {schema_version}"
-                            ))
-                        })?;
+                let schema = store_inline::read_inline_schema(
+                    session.handle(),
+                    None,
+                    table.get(),
+                    schema_version,
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::Corruption(format!(
+                        "no inline schema for table {table} version {schema_version}"
+                    ))
+                })?;
                 let scoped = scoped_read::inline_batch_entries(
                     &schema.arrow_schema,
                     &chunk.body,

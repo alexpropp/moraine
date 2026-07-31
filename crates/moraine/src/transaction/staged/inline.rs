@@ -1,6 +1,8 @@
 //! Inline-data translation: turning staged inline operations into their
 //! `inline/*` store writes.
 
+use moraine_wal::Overlay;
+
 use super::{
     HashMap, InlineKey, InlineOperation, InlineScanKind, Key, ReadHandle, Result, RowOperation,
     commit, materialize_inline_rows, proto, store_inline, value,
@@ -33,13 +35,15 @@ impl ChunkSeqAllocator {
 /// never the keys to remove.
 pub(super) async fn translate_inline_flush_delete(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    let chunks = store_inline::scan_inline_chunks(handle, table_id).await?;
-    let inline_deletes = store_inline::scan_inline_inline_deletes(handle, table_id).await?;
+    let chunks = store_inline::scan_inline_chunks(handle, overlay, table_id).await?;
+    let inline_deletes =
+        store_inline::scan_inline_inline_deletes(handle, overlay, table_id).await?;
 
     let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
         .into_iter()
@@ -80,13 +84,14 @@ pub(super) async fn translate_inline_flush_delete(
 /// tombstones, read from `db_tx`'s current (pre-commit) state.
 pub(super) async fn translate_inline_drop(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    for (op, _) in store_inline::scan_inline_chunks(handle, table_id).await? {
+    for (op, _) in store_inline::scan_inline_chunks(handle, overlay, table_id).await? {
         writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
     }
-    for (row_id, _) in store_inline::scan_inline_inline_deletes(handle, table_id).await? {
+    for (row_id, _) in store_inline::scan_inline_inline_deletes(handle, overlay, table_id).await? {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
                 table_id,
@@ -97,7 +102,7 @@ pub(super) async fn translate_inline_drop(
         ));
     }
     for (data_file_id, row_id, _) in
-        store_inline::scan_inline_file_deletes(handle, table_id).await?
+        store_inline::scan_inline_file_deletes(handle, overlay, table_id).await?
     {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
@@ -109,7 +114,7 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
-    for (schema_version, _) in store_inline::scan_inline_schemas(handle, table_id).await? {
+    for (schema_version, _) in store_inline::scan_inline_schemas(handle, overlay, table_id).await? {
         writes.push((
             Key::Inline(InlineKey::Schema {
                 table_id,
@@ -210,6 +215,7 @@ pub(super) fn inline_file_delete_write(
 
 pub(super) async fn translate_inline(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     ops: &[RowOperation],
 ) -> Result<Vec<commit::StagedWrite>> {
     let mut writes = Vec::new();
@@ -272,6 +278,7 @@ pub(super) async fn translate_inline(
             } => {
                 translate_inline_flush_delete(
                     handle,
+                    overlay,
                     *table_id,
                     *schema_version,
                     *flush_snapshot,
@@ -280,7 +287,7 @@ pub(super) async fn translate_inline(
                 .await?;
             }
             RowOperation::InlineDrop { table_id } => {
-                translate_inline_drop(handle, *table_id, &mut writes).await?;
+                translate_inline_drop(handle, overlay, *table_id, &mut writes).await?;
             }
             RowOperation::InlineSchemaDrop {
                 table_id,

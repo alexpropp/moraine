@@ -2,6 +2,8 @@
 //! removals from registered files and inline chunks by scoped-reading
 //! them.
 
+use moraine_wal::Overlay;
+
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, Error, HashMap, HashSet, IndexInfo, InlineOperation,
     ObjectStore, ProbeHandle, ReadHandle, Result, RowOperation, ScopedReadEntry, StagedIndexEntry,
@@ -104,6 +106,7 @@ pub(super) async fn per_index_scoped_entries(
 /// itself, so a slot envelope carries the entries too.
 pub(super) async fn stage_index_maintenance(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     probe: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
@@ -144,6 +147,7 @@ pub(super) async fn stage_index_maintenance(
             } => {
                 stage_inline_chunk_entries(
                     handle,
+                    overlay,
                     base,
                     &pending_schemas,
                     *table_id,
@@ -183,6 +187,7 @@ pub(super) async fn stage_index_maintenance(
     for (table_id, row_ids) in &inline_deletes {
         stage_inline_delete_entries(
             handle,
+            overlay,
             base,
             ops,
             &pending_schemas,
@@ -230,6 +235,7 @@ pub(super) fn pending_inline_schemas(ops: &[RowOperation]) -> HashMap<(u64, u64)
 /// registered one, else the committed one.
 pub(super) async fn inline_schema_for<'a>(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     pending_schemas: &HashMap<(u64, u64), &'a [u8]>,
     table_id: u64,
     schema_version: u64,
@@ -237,7 +243,7 @@ pub(super) async fn inline_schema_for<'a>(
     if let Some(bytes) = pending_schemas.get(&(table_id, schema_version)) {
         return Ok(std::borrow::Cow::Borrowed(bytes));
     }
-    let stored = store_inline::read_inline_schema(handle, table_id, schema_version)
+    let stored = store_inline::read_inline_schema(handle, overlay, table_id, schema_version)
         .await?
         .ok_or_else(|| {
             Error::Corruption(format!(
@@ -250,8 +256,10 @@ pub(super) async fn inline_schema_for<'a>(
 /// Appends the index entries for one inline chunk's rows: every row when
 /// `held` is `None` (the chunk is being inserted), or just those rows when
 /// it is `Some` (they are being deleted, so their entries are removals).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_inline_chunk_entries(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     base: &CatalogSnapshot,
     pending_schemas: &HashMap<(u64, u64), &[u8]>,
     table_id: u64,
@@ -265,8 +273,14 @@ pub(super) async fn stage_inline_chunk_entries(
         return Ok(());
     }
 
-    let schema_ipc =
-        inline_schema_for(handle, pending_schemas, table_id, chunk.schema_version).await?;
+    let schema_ipc = inline_schema_for(
+        handle,
+        overlay,
+        pending_schemas,
+        table_id,
+        chunk.schema_version,
+    )
+    .await?;
     let live_columns = base.columns_of(table);
     for index in &indexes {
         let positions = index_positions(&live_columns, index, table)?;
@@ -302,8 +316,10 @@ impl InlineChunk<'_> {
 /// Derives the entry removals for rows tombstoned out of inline chunks. A
 /// tombstoned row's indexed values come from the chunk holding it, so the
 /// removal rides the same batch that kills the row.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_inline_delete_entries(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     pending_schemas: &HashMap<(u64, u64), &[u8]>,
@@ -317,7 +333,7 @@ pub(super) async fn stage_inline_delete_entries(
         return Ok(());
     }
 
-    let committed = store_inline::scan_inline_chunks(handle, table_id).await?;
+    let committed = store_inline::scan_inline_chunks(handle, overlay, table_id).await?;
     let mut chunks: Vec<InlineChunk<'_>> = committed
         .iter()
         .filter_map(|(op, value)| match op {
@@ -364,6 +380,7 @@ pub(super) async fn stage_inline_delete_entries(
         }
         stage_inline_chunk_entries(
             handle,
+            overlay,
             base,
             pending_schemas,
             table_id,

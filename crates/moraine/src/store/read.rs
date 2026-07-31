@@ -152,6 +152,22 @@ pub(crate) async fn scan_decode_overlaid<T>(
         .collect()
 }
 
+/// [`scan_decode`], overlaying the unfolded tail when one is given: `Some`
+/// merges the tail (three-state, last-writer-wins), `None` scans the store
+/// alone. The one dispatch point for scans that must reflect a slot-backed
+/// attach's tail on a `Slots` backing and behave unchanged everywhere else.
+pub(crate) async fn scan_decode_maybe<T>(
+    handle: ReadHandle<'_>,
+    overlay: Option<&moraine_wal::Overlay>,
+    prefix: Vec<u8>,
+    extract: impl FnMut(Key, &[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    match overlay {
+        Some(overlay) => scan_decode_overlaid(handle, overlay, prefix, extract).await,
+        None => scan_decode(handle, prefix, extract).await,
+    }
+}
+
 /// The layout-format stamp, if the store has been initialized.
 pub(crate) async fn read_format(handle: ReadHandle<'_>) -> Result<Option<FormatValue>> {
     read_singleton(handle, Key::Sys(SysKey::Format)).await

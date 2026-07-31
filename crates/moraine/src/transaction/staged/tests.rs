@@ -510,7 +510,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
     tx.commit().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
+    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
     assert_eq!(chunks.len(), 2);
@@ -537,7 +537,7 @@ async fn stages_inline_schema_and_sequential_inserts() {
     );
     assert_eq!(chunks[1].1.body, b"chunk-b");
 
-    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
+    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
     assert_eq!(
@@ -596,10 +596,10 @@ async fn stages_inline_idel_and_row_disappears_from_table_scan_after_it() {
     inline_delete.commit().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
+    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
+    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
     tx.rollback();
@@ -1732,10 +1732,10 @@ async fn stages_inline_flush_delete_removes_flushed_chunks_and_their_idels() {
     flush.commit().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
+    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
-    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), 1)
+    let inline_deletes = store_inline::scan_inline_inline_deletes(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
     tx.rollback();
@@ -1797,13 +1797,13 @@ async fn stages_inline_drop_removes_every_record_for_the_table() {
     drop_tx.commit().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
+    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
-    let file_deletes = store_inline::scan_inline_file_deletes(ReadHandle::Tx(&tx), 1)
+    let file_deletes = store_inline::scan_inline_file_deletes(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
-    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
+    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
     tx.rollback();
@@ -1868,10 +1868,10 @@ async fn stages_inline_schema_drop_removes_only_the_named_schema_version() {
     drop_tx.commit().await.unwrap();
 
     let tx = catalog.begin_write_tx().await.unwrap();
-    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), 1)
+    let schemas = store_inline::scan_inline_schemas(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), 1)
+    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(&tx), None, 1)
         .await
         .unwrap();
     tx.rollback();

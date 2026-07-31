@@ -23,7 +23,7 @@ use std::{
     sync::Arc,
 };
 
-use moraine_wal::{CommitOutcome, Envelope, SlotLog};
+use moraine_wal::{CommitOutcome, Envelope, Overlay, SlotLog};
 use object_store::ObjectStore;
 use slatedb::{DbReader, DbTransaction};
 use tracing::debug;
@@ -370,6 +370,16 @@ impl StagedBacking {
             },
         }
     }
+
+    /// The unfolded tail to overlay on raw `inline/*` scans (which are not
+    /// modeled by the catalog view): `Some` for a slot-backed attach, `None`
+    /// for the writer, whose transaction reads its own state.
+    fn scan_overlay(&self) -> Option<&Overlay> {
+        match self {
+            Self::Tx(_) => None,
+            Self::Slots { head, .. } => Some(&head.overlay),
+        }
+    }
 }
 
 /// A staged-row transaction: one commit backing opened by `begin`
@@ -606,6 +616,7 @@ async fn assemble(
     data_prefix: &str,
 ) -> Result<Assembly> {
     let handle = backing.scan_handle();
+    let overlay = backing.scan_overlay();
     let base: Arc<CatalogSnapshot> = match backing {
         StagedBacking::Tx(db_tx) => commit::head_view_for(db_tx, projections).await?,
         StagedBacking::Slots { head, .. } => Arc::new(head.view.clone()),
@@ -623,7 +634,7 @@ async fn assemble(
     // Read before any write is staged: `InlineFlushDelete`/`InlineDrop` name a
     // table, not keys, and resolve against the pre-commit state exactly like
     // `base`.
-    let inline_writes = translate_inline(handle, ops).await?;
+    let inline_writes = translate_inline(handle, overlay, ops).await?;
 
     let mints_snapshot = ops.iter().any(|op| {
         matches!(
@@ -642,6 +653,7 @@ async fn assemble(
     // returned as writes rather than staged so the slot envelope carries them.
     let (poisoned, index_writes) = stage_index_maintenance(
         handle,
+        overlay,
         backing.probe(),
         base_ref,
         ops,
@@ -735,6 +747,14 @@ async fn commit_tx(
 /// ids, so a lost race cannot be rebased and re-run, only surfaced. An
 /// ambiguous put still resolves inside `commit_slot` by transaction-id
 /// read-back; only *rebasing onto a winner* is forbidden here.
+///
+/// One consequence of the single attempt: unlike the verb path's
+/// `drive_commit`, this does not back off and retry a transient slot
+/// contention. A `commit_slot` that returns `Transport` — including the
+/// "reported taken but reads absent" read-back on a healthy but contended log
+/// — surfaces to DuckLake as [`Error::SlotLog`], terminal by design (it carries
+/// none of DuckLake's retry substrings). DuckLake re-drives the whole
+/// transaction, since it cannot re-derive its authored ids against a new head.
 async fn commit_slots(
     head: SlotHead,
     slots: SlotLog,

@@ -1,8 +1,10 @@
 //! The inline read seam: materializes DuckLake's four inline scan variants
 //! over the `inline/*` keyspace and re-exports
 //! [`InlineScanKind`](crate::catalog::inline::InlineScanKind) from the
-//! otherwise-private `catalog`. Each function opens a fresh read-only
-//! transaction, scans, and rolls back.
+//! otherwise-private `catalog`. Each function opens a fresh dump read and,
+//! on a slot-backed attach, overlays the unfolded tail — so inline data
+//! committed to a slot but not yet folded is served (a folder-less
+//! multi-writer attach is the operating condition until one exists).
 
 #[doc(hidden)]
 pub use crate::catalog::inline::InlineScanKind;
@@ -63,10 +65,11 @@ pub async fn scan_inline(
     snapshot: u64,
     start: u64,
 ) -> Result<InlineScanRecord> {
-    let session = catalog.begin_read().await?;
-    let chunks = store_inline::scan_inline_chunks(session.handle(), table_id).await;
-    let inline_deletes = store_inline::scan_inline_inline_deletes(session.handle(), table_id).await;
-    session.finish();
+    let read = catalog.begin_dump().await?;
+    let chunks = store_inline::scan_inline_chunks(read.handle(), read.overlay(), table_id).await;
+    let inline_deletes =
+        store_inline::scan_inline_inline_deletes(read.handle(), read.overlay(), table_id).await;
+    read.finish().await;
     let chunks = chunks?;
     let inline_deletes = inline_deletes?;
 
@@ -119,9 +122,9 @@ pub async fn scan_inline(
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, Vec<u8>)>> {
-    let session = catalog.begin_read().await?;
-    let schemas = store_inline::scan_inline_schemas(session.handle(), table_id).await;
-    session.finish();
+    let read = catalog.begin_dump().await?;
+    let schemas = store_inline::scan_inline_schemas(read.handle(), read.overlay(), table_id).await;
+    read.finish().await;
     Ok(schemas?
         .into_iter()
         .map(|(schema_version, value)| (schema_version, value.arrow_schema))
@@ -138,9 +141,9 @@ pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64)>> {
-    let session = catalog.begin_read().await?;
-    let schemas = store_inline::scan_all_inline_schemas(session.handle()).await;
-    session.finish();
+    let read = catalog.begin_dump().await?;
+    let schemas = store_inline::scan_all_inline_schemas(read.handle(), read.overlay()).await;
+    read.finish().await;
     Ok(schemas?
         .into_iter()
         .map(|(table_id, schema_version, _)| (table_id, schema_version))
@@ -158,9 +161,10 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -> Result<bool> {
-    let session = catalog.begin_read().await?;
-    let file_deletes = store_inline::scan_inline_file_deletes(session.handle(), table_id).await;
-    session.finish();
+    let read = catalog.begin_dump().await?;
+    let file_deletes =
+        store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id).await;
+    read.finish().await;
     Ok(!file_deletes?.is_empty())
 }
 
@@ -174,9 +178,10 @@ pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_file_deletes(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, u64, u64)>> {
-    let session = catalog.begin_read().await?;
-    let file_deletes = store_inline::scan_inline_file_deletes(session.handle(), table_id).await;
-    session.finish();
+    let read = catalog.begin_dump().await?;
+    let file_deletes =
+        store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id).await;
+    read.finish().await;
     Ok(file_deletes?
         .into_iter()
         .map(|(data_file_id, row_id, value)| (data_file_id, row_id, value.begin_snapshot))
@@ -221,6 +226,70 @@ mod tests {
         Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap()
+    }
+
+    /// Opens a slot-backed (multi-writer) catalog: inline data committed
+    /// through the log is served through the unfolded tail until a folder
+    /// applies it.
+    async fn open_slots() -> Catalog {
+        let options = CatalogOptions {
+            multi_writer: true,
+            ..CatalogOptions::default()
+        };
+        Catalog::open(Arc::new(InMemory::new()), options)
+            .await
+            .unwrap()
+    }
+
+    /// Inline rows committed to a slot with no folder running are served by
+    /// the inline dump through the tail overlay — the reroute the fix made.
+    /// Against the pre-fix folded-only read the tail is invisible and this
+    /// scan returns nothing.
+    #[tokio::test]
+    async fn scan_inline_serves_unfolded_rows_on_a_slot_backed_attach() {
+        let catalog = open_slots().await;
+
+        let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        tx.stage(RowOperation::InlineSchema {
+            table_id: 1,
+            schema_version: 0,
+            arrow_schema: b"schema".to_vec(),
+        });
+        tx.stage(RowOperation::InlineInsert {
+            table_id: 1,
+            schema_version: 0,
+            begin_snapshot: 1,
+            row_id_start: 0,
+            row_count: 2,
+            arrow_body: b"chunk-a".to_vec(),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1),
+        });
+        tx.commit().await.unwrap();
+
+        // No folder has run: the rows live only in the unfolded tail.
+        let record = scan_inline(&catalog, 1, InlineScanKind::Table, 1, 0)
+            .await
+            .unwrap();
+        let mut ids: Vec<u64> = record.rows.iter().map(|r| r.row_id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0, 1],
+            "unfolded inline rows are served through the overlay"
+        );
+        assert_eq!(record.chunk_bodies, vec![b"chunk-a".to_vec()]);
+
+        let schemas = inline_schemas(&catalog, 1).await.unwrap();
+        assert_eq!(schemas, vec![(0, b"schema".to_vec())]);
     }
 
     /// Two chunks (rows 0-1, row 2) staged in one commit, one tombstone

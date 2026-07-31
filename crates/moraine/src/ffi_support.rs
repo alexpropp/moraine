@@ -1159,6 +1159,279 @@ mod tests {
         assert!(deletions.is_empty());
     }
 
+    /// Opens a slot-backed (multi-writer) catalog: its commits land in the
+    /// log and are served through the unfolded tail until a folder applies
+    /// them.
+    async fn open_slots() -> Catalog {
+        let options = CatalogOptions {
+            multi_writer: true,
+            ..CatalogOptions::default()
+        };
+        Catalog::open(Arc::new(InMemory::new()), options)
+            .await
+            .unwrap()
+    }
+
+    /// A tail tombstone hides a folded record: a maintenance commit that
+    /// expires the bootstrap snapshot 0 — already folded into the store —
+    /// removes it from the dump, exercising the overlay's delete (`None`)
+    /// branch that no other slot-backed test covers.
+    #[tokio::test]
+    async fn a_tail_tombstone_hides_a_folded_snapshot_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let catalog = open_slots().await;
+
+        // Advance head off the folded bootstrap snapshot 0 by minting 1.
+        let mut mint = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        mint.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        mint.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_schema:"sales""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        mint.stage(RowOperation::Insert {
+            table: TableKind::Schema,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::Str("sales".into()),
+                Cell::Str("sales/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        mint.commit().await.unwrap();
+
+        // Head-preserving maintenance: expire the now-non-head snapshot 0.
+        let mut expire = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        expire.stage(RowOperation::Delete {
+            table: TableKind::Snapshot,
+            cells: vec![Cell::U64(0)],
+        });
+        expire.stage(RowOperation::Delete {
+            table: TableKind::SnapshotChanges,
+            cells: vec![Cell::U64(0)],
+        });
+        expire.commit().await.unwrap();
+
+        let snapshots = dump_snapshots(&catalog).await.unwrap();
+        assert_eq!(
+            snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
+            vec![1],
+            "the tail tombstone hides the folded snapshot 0"
+        );
+    }
+
+    /// A rename committed through a slot ends the old table version and writes
+    /// a new one. The overlaid history scan must surface the ended version —
+    /// real content for `scan_history_entities_overlaid`, which the prior
+    /// slot-backed dump test left empty.
+    #[tokio::test]
+    async fn history_scan_reflects_an_ended_table_version_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let catalog = open_slots().await;
+
+        // Create table t_old (id 1) in the bootstrap schema `main` (id 0).
+        let mut create = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        create.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-t1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::U64(0),
+                Cell::Str("t_old".into()),
+                Cell::Str("t_old/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        create.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        create.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_table:"main"."t_old""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        create.commit().await.unwrap();
+
+        // Rename: end the old version at snapshot 2, insert t_new.
+        let mut rename = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        rename.stage(RowOperation::UpdateSetEnd {
+            table: TableKind::Table,
+            cells: vec![Cell::U64(1), Cell::U64(2)],
+        });
+        rename.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-t1".into()),
+                Cell::U64(2),
+                Cell::Null,
+                Cell::U64(0),
+                Cell::Str("t_new".into()),
+                Cell::Str("t_new/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        rename.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(2),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        rename.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(2),
+                Cell::Str("altered_table:1".into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        rename.commit().await.unwrap();
+
+        let tables = dump_tables(&catalog).await.unwrap();
+        let ended: Vec<_> = tables
+            .iter()
+            .filter(|t| t.end_snapshot == Some(2))
+            .collect();
+        assert_eq!(
+            ended.len(),
+            1,
+            "the ended old version is in overlaid history: {tables:?}"
+        );
+        assert_eq!(ended[0].table_name, "t_old");
+        assert!(
+            tables
+                .iter()
+                .any(|t| t.table_name == "t_new" && t.end_snapshot.is_none()),
+            "the renamed live version is in overlaid current: {tables:?}"
+        );
+    }
+
+    /// `dump_projected_current` (behind `dump_table_stats`) must reflect the
+    /// unfolded tail on a slot-backed attach, where no projection cache is
+    /// maintained and the read falls to an overlaid `current` scan.
+    #[tokio::test]
+    async fn dump_projected_current_reflects_unfolded_stats_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let catalog = open_slots().await;
+
+        let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-t1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::U64(0),
+                Cell::Str("t".into()),
+                Cell::Str("t/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Column,
+            cells: vec![
+                Cell::U64(1),
+                Cell::U64(0),
+                Cell::Null,
+                Cell::U64(1),
+                Cell::U64(0),
+                Cell::Str("a".into()),
+                Cell::Str("BIGINT".into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Bool(true),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::TableStats,
+            cells: vec![Cell::U64(1), Cell::U64(20), Cell::U64(20), Cell::U64(2048)],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_table:"main"."t""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.commit().await.unwrap();
+
+        let stats = dump_table_stats(&catalog).await.unwrap();
+        assert_eq!(
+            stats.len(),
+            1,
+            "the unfolded table-stats row is served: {stats:?}"
+        );
+        assert_eq!(stats[0].table_id, 1);
+        assert_eq!(stats[0].record_count, 20);
+    }
+
     #[tokio::test]
     async fn dump_snapshots_returns_every_committed_snapshot_in_order() {
         let catalog = seed().await;
