@@ -26,7 +26,11 @@ deliberately not itemized here.
 
 ## Where the weight is
 
-Three things gate disproportionately much of the list:
+Two things gate disproportionately much of the list, the third having
+closed: the crash harness (RFC 0011) now drives every case, the last one —
+`GroupCommit` — having landed with group commit itself. Both guarantees
+moraine owns, atomicity and resumability, have driven cases, and the
+store-level write freeze RFC 0015's seam coverage wanted is built.
 
 - **Reader refresh** (RFC 0009). Reads now serve from the cache, so a warm
   read costs one point read. What is missing is *incremental* refresh: a
@@ -39,14 +43,6 @@ Three things gate disproportionately much of the list:
   readers are safe against the first real one. Everything that writes the
   marker is unbuilt: no start batch, no step loop, no finish flip, no
   cursor, no migrate verb.
-- **The crash harness** (RFC 0011). The crash cases are enumerated and driven
-  as data, with `CommitDurableNotAcknowledged`, `TakeoverMidCommit`,
-  `FencedWriterResumes`, and `ConcurrentGenesis` covered end to end. The other
-  one case that remains is blocked on a feature rather than the harness:
-  group commit is unbuilt, so no batch carries several commits. Both
-  guarantees moraine owns — atomicity and resumability — have driven cases,
-  and the store-level write freeze RFC 0015's seam coverage wanted is
-  built.
 
 ## 0001 — Repository structure and conventions
 
@@ -104,10 +100,20 @@ Three things gate disproportionately much of the list:
 
 ## 0004 — Commit and transaction protocol
 
-- **IMPL** — Group commit: batch several pending catalog commits into one
-  `WriteBatch` and one WAL flush. The protocol permits it; a batch of one is
-  the only path today, so throughput is one flush per commit. This is also
-  the last thing blocking a crash case (0011's `GroupCommit`).
+- **DEFERRED** — Let the staged-row path join a batch, so SQL through
+  DuckLake gets group commit too. It commits its own transaction directly
+  today, so successive SQL transactions still cost a flush each. The
+  obstacle is not the batch — retry rights are the member's, and a staged
+  member losing one would surface its conflict rather than re-run — but
+  that there is nothing to batch it *with* until DuckLake's serialized
+  metadata connection admits concurrent committers.
+- **MEASURE** — Commit throughput under concurrency, now that concurrent
+  commits coalesce. `BENCHMARK.md` records the sequential number (one
+  commit is `flush_interval + ~2 ms`); what is unrecorded is how many
+  commits a single flush carries as concurrency rises, and where the
+  `MAX_BATCH_MEMBERS` ceiling starts to bind. The same measurement settles
+  the retry-budget DECISION below, since coalescing is what a benign race
+  now mostly avoids.
 - **IMPL** — A zero-write reader mode that opens `DbReader` against an
   explicit existing checkpoint id instead of following latest, which CASes the
   manifest and pins SSTs against SlateDB GC. Shared with 0006.
@@ -353,17 +359,7 @@ Three things gate disproportionately much of the list:
 - **DECISION** — Does compaction introduce a state-change seam not already
   shaped like PUT-then-batch? If it does, the seam is the engine's, so the
   case belongs to the e2e item above rather than here.
-- **VALIDATE** — The data-driven test iterating every `CrashCase` exists, and
-  each case declares both its guarantee and its coverage; exhaustive matches
-  make a new case without either a compile error. Nine of ten are driven.
-  Closing the last one closes the enforcement RFC 0011 asks for, since the
-  coverage table will then be empty and "a variant with no assertion fails"
-  becomes literally true rather than a convention.
-- **VALIDATE** — The idempotence cases (`CommitDurableNotAcknowledged`,
-  `StagedBuildInterrupted`, `ReclamationInterrupted`) all re-drive after
-  reopen and assert convergence. Closed; kept here until the remaining four
-  cases land, since a write freeze may add re-drive assertions of its own.
-- **VALIDATE** — The absence cases (`MultiTombstoneDrop`,
+- **VALIDATE** — The absence cases (`MultiTombstoneDrop`, `GroupCommit`,
   `GenesisInterrupted`) sweep the write allowance across every boundary the
   operation has and assert the torn intermediate is unobservable at each.
   Closed.
@@ -373,7 +369,8 @@ Three things gate disproportionately much of the list:
   hook to gate, no `unsafe`, and no fault-injection parameter in any public
   signature. Re-check when RFC 0015's migration driver lands its own hook.
 - **DEFERRED** — A `cargo-fuzz` target that crashes at arbitrary WAL offsets
-  and reopens, asserting the same two guarantees, once every case is green.
+  and reopens, asserting the same two guarantees. Every case is green, so
+  this is now waiting only on the fuzzing tier itself (0001).
 - **DOC** — 0001 and 0004 still carry generic crash-shaped-sequence bullets;
   replace them with citations to `CommitNotDurable` and
   `CommitDurableNotAcknowledged`.

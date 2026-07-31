@@ -147,8 +147,11 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
   a benign race, retried internally; overlapping sets are a true `Conflict`
   aborted with a typed error — the core is DuckLake-agnostic and cannot replay
   the originating SQL, so re-driving belongs to whoever authored the operation.
-- **Group commit** is permitted (one committer can batch several pending commits
-  into one flush) but never required — a batch of one is the normal path.
+- **Group commit** batches several pending commits into one flush, each still
+  minting its own snapshot. `commit_group` batches what one caller hands it;
+  concurrent `commit` callers are batched without asking, using the flush
+  already in the air as the window. A batch of one stays the normal path and
+  waits for nobody.
 
 ## Extension surface
 

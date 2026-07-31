@@ -121,12 +121,12 @@ mod transaction;
 
 pub use catalog::{
     Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
-    ColumnOrder, ColumnStats, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId,
-    DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval, IndexDef, IndexEntry,
-    IndexId, IndexInfo, IndexState, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef,
-    MaintenanceReport, MaintenanceRequest, MappingId, MappingInfo, NameMappingDef, OptionScope,
-    RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo,
-    TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
+    ColumnOrder, ColumnStats, CommitMember, DataFile, DataFileId, DataFileInfo, DeleteFile,
+    DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval, IndexDef,
+    IndexEntry, IndexId, IndexInfo, IndexState, MacroId, MacroImplementationDef, MacroInfo,
+    MacroParameterDef, MaintenanceReport, MaintenanceRequest, MappingId, MappingInfo,
+    NameMappingDef, OptionScope, RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo,
+    SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};

@@ -178,6 +178,28 @@ snapshot, and anything slow — writing Parquet, say — happens *before*
 is implicit — a successful `commit` produces one new snapshot; there is no
 explicit `begin_snapshot` verb.
 
+`commit_group` is the same surface for several closures at once:
+
+```rust
+let ids: Vec<SnapshotId> = catalog.commit_group(&[
+    &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
+    &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
+]).await?;
+```
+
+Members are `CommitMember` — a trait object, so a call site can pass
+closures that do different things, which a homogeneous `&[F]` cannot
+express, and `Sync`, so a grouped commit is as spawnable as a lone one.
+Every contract above holds per member, including purity: a lost race
+re-runs the whole group. One snapshot id comes back per member, in member
+order.
+
+`commit_group` is the *explicit* half of RFC 0004's group commit; the
+implicit half needs no API at all, since concurrent `commit` callers are
+batched together without being asked. Both are optimizations of when the
+flush happens, not of what a commit means: the batching semantics are
+0004's, and nothing about them is visible in the values returned here.
+
 This closure/verb surface is the **embedding API** — one of RFC 0004's two
 commit front doors. The DuckDB extension (RFC 0006) does not call it: that
 path commits DuckLake-authored row mutations through RFC 0004's staged-row

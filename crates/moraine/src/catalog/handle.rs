@@ -161,6 +161,13 @@ impl Default for CatalogOptions {
     }
 }
 
+/// One member of a [`Catalog::commit_group`] batch: a closure authoring
+/// one logical commit.
+///
+/// `Sync` so a grouped commit is as spawnable as a lone one; an ordinary
+/// closure satisfies that on its own.
+pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
+
 /// A handle to a moraine catalog: cheap to clone, drives reads and
 /// commits. The storage substrate never appears in this API — a catalog
 /// lives in a bucket reachable through any [`ObjectStore`].
@@ -170,6 +177,9 @@ pub struct Catalog {
     // Shared across handle clones: decoded projections folded forward on
     // commit, served without rescanning when their head matches.
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
+    // Shared across handle clones: where concurrent commits meet so
+    // several of them become one batch and one flush.
+    commits: Arc<commit::Coalescer>,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -215,9 +225,11 @@ impl Catalog {
             flush_interval_ms = options.flush_interval.as_millis(),
             "opened catalog read-write"
         );
+        let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
-            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+            commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
+            projections,
         })
     }
 
@@ -242,9 +254,11 @@ impl Catalog {
             StoreBuilder::new(&options.path, object_store).cache_dir(options.cache_dir.clone());
         let reader = commit::open_reader_initialized(store).await?;
         info!(path = options.path, "opened catalog read-only");
+        let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(Self {
             store: Arc::new(Store::Reader(Arc::new(reader))),
-            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+            commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
+            projections,
         })
     }
 
@@ -1296,7 +1310,58 @@ impl Catalog {
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
-        commit::commit_cycle(self.writer()?, &f, &self.projections).await
+        let ids =
+            commit::commit_cycle(self.writer()?, std::slice::from_ref(&f), &self.commits).await?;
+        ids.first().copied().ok_or_else(|| {
+            Error::Corruption("a commit of one member reported no snapshot".to_string())
+        })
+    }
+
+    /// Commits several mutations as one batch, made durable by one flush.
+    ///
+    /// Each closure is its own logical commit with its own snapshot — a
+    /// group batches commits, it does not merge them — so the returned ids
+    /// are one per member, in member order, and time travel resolves each
+    /// separately. Members run in the order given, and each stages against
+    /// the state the members before it left, so a group never conflicts
+    /// with itself. Where [`Catalog::commit`] costs one durable flush per
+    /// mutation, a group costs one for all of them.
+    ///
+    /// The batch is the unit of durability: a crash leaves every member
+    /// committed or none of them, and a member that fails aborts the whole
+    /// group, including members that already staged. Closures may be re-run
+    /// as a group after a lost race with a concurrent commit, so the purity
+    /// requirement of [`Catalog::commit`] applies to every member.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever error any member returns (the whole group is
+    /// aborted), or the errors [`Catalog::commit`] documents — a conflict
+    /// or an exhausted retry budget applies to the group as a whole.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, Transaction};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// let ids = catalog
+    ///     .commit_group(&[
+    ///         &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
+    ///         &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
+    ///     ])
+    ///     .await?;
+    ///
+    /// // Two snapshots, one flush.
+    /// assert_eq!(ids.len(), 2);
+    /// assert_eq!(ids[1].get(), ids[0].get() + 1);
+    /// assert!(catalog.snapshot_at(ids[0]).await?.schema_by_name("ops").is_none());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn commit_group(&self, members: &[CommitMember<'_>]) -> Result<Vec<SnapshotId>> {
+        commit::commit_cycle(self.writer()?, members, &self.commits).await
     }
 }
 
