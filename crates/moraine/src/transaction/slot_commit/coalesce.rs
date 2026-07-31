@@ -17,8 +17,7 @@ use std::{
 };
 
 use moraine_wal::{
-    Commit, CommitDrive, Committer, Envelope, Overlay, Race, RetryPolicy, SlotPayload, SlotWrite,
-    drive_commit,
+    Commit, CommitDrive, Committer, Envelope, Overlay, Race, RetryPolicy, drive_commit,
 };
 use slatedb::DbReader;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
@@ -660,21 +659,12 @@ where
 
 /// The one-commit shape a member contributes to the shared envelope.
 fn commit_from(txid: Uuid, assembled: &Assembled) -> Commit {
-    Commit {
-        transaction_id: txid.into_bytes(),
-        payload: SlotPayload {
-            validated_head: assembled.head_before,
-            changes_made: assembled.ours.to_changes_made(),
-            writes: assembled
-                .writes
-                .iter()
-                .map(|(key, value)| SlotWrite {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
-        },
-    }
+    super::commit_from(
+        txid.into_bytes(),
+        assembled.head_before,
+        assembled.ours.to_changes_made(),
+        &assembled.writes,
+    )
 }
 
 /// Asks one follower to assemble against `accum` and waits for its product, or

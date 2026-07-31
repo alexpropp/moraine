@@ -3393,3 +3393,97 @@ fn table_kind_wire_order_is_pinned() {
         }
     }
 }
+
+/// Opens a slot-backed catalog, the topology the staged path commits through
+/// when the attach is multi-writer.
+async fn open_multi_writer_staged() -> Catalog {
+    let options = CatalogOptions {
+        multi_writer: true,
+        ..CatalogOptions::default()
+    };
+    Catalog::open(Arc::new(InMemory::new()), options)
+        .await
+        .unwrap()
+}
+
+/// A minting staged commit on a slot-backed attach lands one slot, and the
+/// head materialized from the log reflects it.
+#[tokio::test]
+async fn a_staged_commit_lands_in_a_slot() {
+    let catalog = open_multi_writer_staged().await;
+    let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+        .await
+        .unwrap();
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_schema:"s""#),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Schema,
+        cells: schema_row(1, "s", 1),
+    });
+
+    let id = tx.commit().await.unwrap();
+    assert_eq!(id, crate::catalog::SnapshotId::new(1));
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("s")
+            .is_some()
+    );
+}
+
+/// A staged commit that loses its slot race surfaces `CommitConflict` and
+/// leaves the store untouched by the loser: one slot, the winner's state only.
+#[tokio::test]
+async fn a_lost_staged_race_surfaces_conflict_and_applies_nothing() {
+    let catalog = open_multi_writer_staged().await;
+    let mut a = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+        .await
+        .unwrap();
+    let mut b = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+        .await
+        .unwrap();
+    a.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    a.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_schema:"a""#),
+    });
+    a.stage(RowOperation::Insert {
+        table: TableKind::Schema,
+        cells: schema_row(1, "a", 1),
+    });
+    b.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    b.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_schema:"b""#),
+    });
+    b.stage(RowOperation::Insert {
+        table: TableKind::Schema,
+        cells: schema_row(1, "b", 1),
+    });
+
+    a.commit().await.unwrap();
+    let err = b.commit().await.err().unwrap();
+    assert!(
+        matches!(err, crate::error::Error::CommitConflict(_)),
+        "{err}"
+    );
+    assert!(err.to_string().contains("conflict"), "{err}");
+
+    let head = catalog.snapshot().await.unwrap();
+    assert!(head.schema_by_name("a").is_some());
+    assert!(head.schema_by_name("b").is_none());
+}

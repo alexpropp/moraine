@@ -27,11 +27,5 @@ pub async fn staged_begin(
     data_store: Option<Arc<dyn ObjectStore>>,
     data_prefix: String,
 ) -> Result<StagedTransaction> {
-    let db_tx = catalog.begin_write_tx().await?;
-    Ok(StagedTransaction::begin(
-        db_tx,
-        catalog.projections().clone(),
-        data_store,
-        data_prefix,
-    ))
+    catalog.begin_staged(data_store, data_prefix).await
 }

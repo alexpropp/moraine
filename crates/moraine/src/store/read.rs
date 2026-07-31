@@ -119,6 +119,39 @@ pub(crate) async fn scan_decode<T>(
     Ok(records)
 }
 
+/// As [`scan_decode`], but with the unfolded tail overlaid over the store:
+/// a tail write shadows the stored value, a tail delete hides it. The merge
+/// is last-writer-wins by key, so a slot-backed dump sees a winner no folder
+/// has applied yet.
+pub(crate) async fn scan_decode_overlaid<T>(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+    prefix: Vec<u8>,
+    mut extract: impl FnMut(Key, &[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    let mut iter = handle.scan_prefix(prefix.clone(), ..).await?;
+    while let Some(entry) = iter.next().await? {
+        merged.insert(entry.key.to_vec(), entry.value.to_vec());
+    }
+    for (key, value) in overlay.prefixed(&prefix) {
+        match value {
+            Some(bytes) => {
+                merged.insert(key.to_vec(), bytes.to_vec());
+            }
+            None => {
+                merged.remove(key);
+            }
+        }
+    }
+
+    merged
+        .iter()
+        .map(|(key, value)| extract(Key::decode(key)?, value))
+        .collect()
+}
+
 /// The layout-format stamp, if the store has been initialized.
 pub(crate) async fn read_format(handle: ReadHandle<'_>) -> Result<Option<FormatValue>> {
     read_singleton(handle, Key::Sys(SysKey::Format)).await
@@ -148,18 +181,38 @@ pub(crate) async fn read_snapshot(
     read_singleton(handle, Key::Snapshot { snapshot_id }).await
 }
 
+/// Decodes one entry of a `ducklake_snapshot` scan.
+fn extract_snapshot(key: Key, bytes: &[u8]) -> Result<SnapshotValue> {
+    match key {
+        Key::Snapshot { .. } => value::decode_value(bytes),
+        other => Err(Error::Corruption(format!(
+            "non-snapshot key in snapshot scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every committed snapshot record (`ducklake_snapshot` +
 /// `ducklake_snapshot_changes`, merged), in key order.
 pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<SnapshotValue>> {
     scan_decode(
         handle,
         subspace_prefix(Subspace::Snapshot),
-        |key, bytes| match key {
-            Key::Snapshot { .. } => value::decode_value(bytes),
-            other => Err(Error::Corruption(format!(
-                "non-snapshot key in snapshot scan: {other:?}"
-            ))),
-        },
+        extract_snapshot,
+    )
+    .await
+}
+
+/// [`scan_snapshots`] with the unfolded tail overlaid, for a slot-backed
+/// attach whose folder has not applied every committed snapshot yet.
+pub(crate) async fn scan_snapshots_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<SnapshotValue>> {
+    scan_decode_overlaid(
+        handle,
+        overlay,
+        subspace_prefix(Subspace::Snapshot),
+        extract_snapshot,
     )
     .await
 }
@@ -196,20 +249,34 @@ pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRec
     }
 }
 
+/// Decodes one entry of a `current`-subspace scan.
+fn extract_current(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
+    match key {
+        Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
+        Key::Current(CurrentKey::GcFile { .. }) => {
+            Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
+        }
+        other => Err(Error::Corruption(format!(
+            "non-current key in current scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every live entity record.
 pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    scan_decode(
+    scan_decode(handle, subspace_prefix(Subspace::Current), extract_current).await
+}
+
+/// [`scan_current_entities`] with the unfolded tail overlaid.
+pub(crate) async fn scan_current_entities_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<EntityRecord>> {
+    scan_decode_overlaid(
         handle,
+        overlay,
         subspace_prefix(Subspace::Current),
-        |key, bytes| match key {
-            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
-            Key::Current(CurrentKey::GcFile { .. }) => {
-                Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
-            }
-            other => Err(Error::Corruption(format!(
-                "non-current key in current scan: {other:?}"
-            ))),
-        },
+        extract_current,
     )
     .await
 }
@@ -220,20 +287,36 @@ pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<
 /// before any consumer, snapshot build or raw dump, could replay it over
 /// the live record.
 pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    scan_decode(
+    scan_decode(handle, subspace_prefix(Subspace::History), extract_history).await
+}
+
+/// [`scan_history_entities`] with the unfolded tail overlaid.
+pub(crate) async fn scan_history_entities_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<EntityRecord>> {
+    scan_decode_overlaid(
         handle,
+        overlay,
         subspace_prefix(Subspace::History),
-        |key, bytes| match key {
-            Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(
-                format!("unversioned key in history scan: {:?}", history.entity),
-            )),
-            Key::History(history) => decode_entity(history.entity, bytes),
-            other => Err(Error::Corruption(format!(
-                "non-history key in history scan: {other:?}"
-            ))),
-        },
+        extract_history,
     )
     .await
+}
+
+/// Decodes one entry of a `history`-subspace scan, refusing an unversioned
+/// kind mirrored there.
+fn extract_history(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
+    match key {
+        Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(format!(
+            "unversioned key in history scan: {:?}",
+            history.entity
+        ))),
+        Key::History(history) => decode_entity(history.entity, bytes),
+        other => Err(Error::Corruption(format!(
+            "non-history key in history scan: {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

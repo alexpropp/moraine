@@ -123,6 +123,56 @@ impl ProbeRead {
     }
 }
 
+/// A raw dump's read: the scan handle it reads through and, on a slot-backed
+/// attach, the unfolded tail to overlay so a winner no folder has applied yet
+/// is not missed. Released by [`finish`](DumpRead::finish).
+pub(crate) enum DumpRead {
+    /// A single read session — a writer transaction or a read-only reader.
+    Session(ReadSession),
+    /// A pinned slot-log head: scans read through `reader` (or the one the
+    /// head opened past a truncation) overlaid with the tail.
+    Slots {
+        reader: Arc<DbReader>,
+        head: Box<crate::transaction::slot_commit::SlotHead>,
+    },
+}
+
+impl DumpRead {
+    /// The handle raw scans read through.
+    pub(crate) fn handle(&self) -> ReadHandle<'_> {
+        match self {
+            Self::Session(session) => session.handle(),
+            Self::Slots { reader, head } => head.handle(ReadHandle::Reader(reader)),
+        }
+    }
+
+    /// The unfolded tail to overlay, or `None` on a single-topology store.
+    pub(crate) fn overlay(&self) -> Option<&moraine_wal::Overlay> {
+        match self {
+            Self::Session(_) => None,
+            Self::Slots { head, .. } => Some(&head.overlay),
+        }
+    }
+
+    /// The head snapshot id, or `None` on a store with no head yet.
+    pub(crate) async fn head_id(&self) -> Result<Option<u64>> {
+        match self {
+            Self::Session(session) => Ok(crate::store::read::read_head(session.handle())
+                .await?
+                .map(|h| h.snapshot_id)),
+            Self::Slots { head, .. } => Ok(Some(head.view.snapshot.snapshot_id)),
+        }
+    }
+
+    /// Releases the session, or the reader a hole retry opened.
+    pub(crate) async fn finish(self) {
+        match self {
+            Self::Session(session) => session.finish(),
+            Self::Slots { head, .. } => slot_commit::release_reader(head.reader.as_ref()).await,
+        }
+    }
+}
+
 /// Whether a run of build steps finished the index or lost its race.
 enum BuildProgress {
     /// A final step flipped the index ready.
@@ -808,6 +858,61 @@ impl Catalog {
             Store::Reader(reader) => Ok(ReadSession::Reader(reader.clone())),
             Store::MultiWriter(multi) => Ok(ReadSession::Reader(multi.reader.clone())),
         }
+    }
+
+    /// Opens a read for the raw current+history dumps: a single read session
+    /// on a single-topology store, or the pinned slot-log head (reader plus
+    /// unfolded tail) on a slot-backed attach, so a dump taken mid-transaction
+    /// reflects a winner no folder has applied yet.
+    pub(crate) async fn begin_dump(&self) -> Result<DumpRead> {
+        match self.store.as_ref() {
+            Store::MultiWriter(multi) => {
+                let head = slot_commit::materialize_slot_head(multi).await?;
+                Ok(DumpRead::Slots {
+                    reader: multi.reader.clone(),
+                    head: Box::new(head),
+                })
+            }
+            _ => Ok(DumpRead::Session(self.begin_read().await?)),
+        }
+    }
+
+    /// Opens a staged-row transaction over whichever topology this catalog
+    /// attached. A single-writer attach opens a read-write transaction; a
+    /// slot-backed attach materializes the head and pins it, so the staged
+    /// batch races one slot at commit. A read-only attach of either topology
+    /// returns [`Error::Constraint`].
+    pub(crate) async fn begin_staged(
+        &self,
+        data_store: Option<Arc<dyn ObjectStore>>,
+        data_prefix: String,
+    ) -> Result<crate::transaction::staged::StagedTransaction> {
+        use crate::transaction::staged::StagedTransaction;
+
+        let Store::MultiWriter(multi) = self.store.as_ref() else {
+            let db_tx = self.begin_write_tx().await?;
+            return Ok(StagedTransaction::begin(
+                db_tx,
+                self.projections.clone(),
+                data_store,
+                data_prefix,
+            ));
+        };
+
+        if multi.read_only {
+            return Err(Error::Constraint(
+                "catalog attached read-only; writes are unavailable".to_string(),
+            ));
+        }
+        let head = slot_commit::materialize_slot_head(multi).await?;
+        Ok(StagedTransaction::begin_slots(
+            head,
+            multi.reader.clone(),
+            multi.slots.clone(),
+            self.projections.clone(),
+            data_store,
+            data_prefix,
+        ))
     }
 
     /// Opens a read-write transaction for the staged-row commit path. Fails

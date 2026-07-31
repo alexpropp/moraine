@@ -2,8 +2,8 @@
 //! `inline/*` store writes.
 
 use super::{
-    DbTransaction, HashMap, InlineKey, InlineOperation, InlineScanKind, Key, ReadHandle, Result,
-    RowOperation, commit, materialize_inline_rows, proto, store_inline, value,
+    HashMap, InlineKey, InlineOperation, InlineScanKind, Key, ReadHandle, Result, RowOperation,
+    commit, materialize_inline_rows, proto, store_inline, value,
 };
 
 /// Allocates `inline/insert` chunk sequence numbers within one commit: the
@@ -32,15 +32,14 @@ impl ChunkSeqAllocator {
 /// inline records — the flush op only ever names the table and snapshot,
 /// never the keys to remove.
 pub(super) async fn translate_inline_flush_delete(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
-    let inline_deletes =
-        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
+    let chunks = store_inline::scan_inline_chunks(handle, table_id).await?;
+    let inline_deletes = store_inline::scan_inline_inline_deletes(handle, table_id).await?;
 
     let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
         .into_iter()
@@ -80,16 +79,14 @@ pub(super) async fn translate_inline_flush_delete(
 /// Removes every `inline/*` record for `table_id`: schema, chunks, and
 /// tombstones, read from `db_tx`'s current (pre-commit) state.
 pub(super) async fn translate_inline_drop(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     table_id: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    for (op, _) in store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await? {
+    for (op, _) in store_inline::scan_inline_chunks(handle, table_id).await? {
         writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
     }
-    for (row_id, _) in
-        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?
-    {
+    for (row_id, _) in store_inline::scan_inline_inline_deletes(handle, table_id).await? {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
                 table_id,
@@ -100,7 +97,7 @@ pub(super) async fn translate_inline_drop(
         ));
     }
     for (data_file_id, row_id, _) in
-        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
+        store_inline::scan_inline_file_deletes(handle, table_id).await?
     {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
@@ -112,9 +109,7 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
-    for (schema_version, _) in
-        store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id).await?
-    {
+    for (schema_version, _) in store_inline::scan_inline_schemas(handle, table_id).await? {
         writes.push((
             Key::Inline(InlineKey::Schema {
                 table_id,
@@ -214,7 +209,7 @@ pub(super) fn inline_file_delete_write(
 }
 
 pub(super) async fn translate_inline(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     ops: &[RowOperation],
 ) -> Result<Vec<commit::StagedWrite>> {
     let mut writes = Vec::new();
@@ -276,7 +271,7 @@ pub(super) async fn translate_inline(
                 flush_snapshot,
             } => {
                 translate_inline_flush_delete(
-                    db_tx,
+                    handle,
                     *table_id,
                     *schema_version,
                     *flush_snapshot,
@@ -285,7 +280,7 @@ pub(super) async fn translate_inline(
                 .await?;
             }
             RowOperation::InlineDrop { table_id } => {
-                translate_inline_drop(db_tx, *table_id, &mut writes).await?;
+                translate_inline_drop(handle, *table_id, &mut writes).await?;
             }
             RowOperation::InlineSchemaDrop {
                 table_id,

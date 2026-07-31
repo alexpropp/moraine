@@ -3,11 +3,11 @@
 //! them.
 
 use super::{
-    Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
-    InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, ScopedReadEntry,
-    StagedIndexEntry, TableId, TableKind,
+    Arc, CatalogSnapshot, Cell, ColumnInfo, Error, HashMap, HashSet, IndexInfo, InlineOperation,
+    ObjectStore, ProbeHandle, ReadHandle, Result, RowOperation, ScopedReadEntry, StagedIndexEntry,
+    StagedWrite, TableId, TableKind,
     decode::{decode_data_file, decode_delete_file},
-    encode_ordered_values, proto, scoped_read, stage_index_entries, store_inline,
+    encode_ordered_values, plan_index_entries, proto, scoped_read, store_inline,
 };
 
 /// Derives and appends the equality-index entries for one registered data
@@ -96,13 +96,20 @@ pub(super) async fn per_index_scoped_entries(
 
 /// Returns the ids of any building indexes a duplicate poisoned; the caller
 /// records the flag on their definitions.
+/// Derives this commit's index-entry writes: the maintenance entries every
+/// registered file and inline chunk owes, resolved for uniqueness through
+/// `probe` (the store overlaid with the unfolded tail on a slot-backed
+/// attach). Returns the poisoned building-index ids and the entry writes for
+/// the caller to fold into the commit's batch — this path stages nothing
+/// itself, so a slot envelope carries the entries too.
 pub(super) async fn stage_index_maintenance(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    probe: ProbeHandle<'_>,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
-) -> Result<Vec<u64>> {
+) -> Result<(Vec<u64>, Vec<StagedWrite>)> {
     let pending_schemas = pending_inline_schemas(ops);
 
     let mut entries: Vec<StagedIndexEntry> = Vec::new();
@@ -136,7 +143,7 @@ pub(super) async fn stage_index_maintenance(
                 ..
             } => {
                 stage_inline_chunk_entries(
-                    db_tx,
+                    handle,
                     base,
                     &pending_schemas,
                     *table_id,
@@ -175,7 +182,7 @@ pub(super) async fn stage_index_maintenance(
 
     for (table_id, row_ids) in &inline_deletes {
         stage_inline_delete_entries(
-            db_tx,
+            handle,
             base,
             ops,
             &pending_schemas,
@@ -199,9 +206,9 @@ pub(super) async fn stage_index_maintenance(
     }
 
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
-    stage_index_entries(db_tx, &entries).await
+    plan_index_entries(probe, &entries).await
 }
 
 /// The inline schemas this commit registers, for a chunk whose
@@ -222,7 +229,7 @@ pub(super) fn pending_inline_schemas(ops: &[RowOperation]) -> HashMap<(u64, u64)
 /// One chunk version's Arrow IPC schema: this commit's staged record if it
 /// registered one, else the committed one.
 pub(super) async fn inline_schema_for<'a>(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     pending_schemas: &HashMap<(u64, u64), &'a [u8]>,
     table_id: u64,
     schema_version: u64,
@@ -230,7 +237,7 @@ pub(super) async fn inline_schema_for<'a>(
     if let Some(bytes) = pending_schemas.get(&(table_id, schema_version)) {
         return Ok(std::borrow::Cow::Borrowed(bytes));
     }
-    let stored = store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version)
+    let stored = store_inline::read_inline_schema(handle, table_id, schema_version)
         .await?
         .ok_or_else(|| {
             Error::Corruption(format!(
@@ -244,7 +251,7 @@ pub(super) async fn inline_schema_for<'a>(
 /// `held` is `None` (the chunk is being inserted), or just those rows when
 /// it is `Some` (they are being deleted, so their entries are removals).
 pub(super) async fn stage_inline_chunk_entries(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     base: &CatalogSnapshot,
     pending_schemas: &HashMap<(u64, u64), &[u8]>,
     table_id: u64,
@@ -259,7 +266,7 @@ pub(super) async fn stage_inline_chunk_entries(
     }
 
     let schema_ipc =
-        inline_schema_for(db_tx, pending_schemas, table_id, chunk.schema_version).await?;
+        inline_schema_for(handle, pending_schemas, table_id, chunk.schema_version).await?;
     let live_columns = base.columns_of(table);
     for index in &indexes {
         let positions = index_positions(&live_columns, index, table)?;
@@ -296,7 +303,7 @@ impl InlineChunk<'_> {
 /// tombstoned row's indexed values come from the chunk holding it, so the
 /// removal rides the same batch that kills the row.
 pub(super) async fn stage_inline_delete_entries(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     pending_schemas: &HashMap<(u64, u64), &[u8]>,
@@ -310,7 +317,7 @@ pub(super) async fn stage_inline_delete_entries(
         return Ok(());
     }
 
-    let committed = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
+    let committed = store_inline::scan_inline_chunks(handle, table_id).await?;
     let mut chunks: Vec<InlineChunk<'_>> = committed
         .iter()
         .filter_map(|(op, value)| match op {
@@ -356,7 +363,7 @@ pub(super) async fn stage_inline_delete_entries(
             continue;
         }
         stage_inline_chunk_entries(
-            db_tx,
+            handle,
             base,
             pending_schemas,
             table_id,

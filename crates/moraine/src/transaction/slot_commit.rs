@@ -3,7 +3,7 @@
 
 use std::{cmp::Ordering, sync::Arc};
 
-use moraine_wal::{Commit, Envelope, Overlay, Race, SlotLog};
+use moraine_wal::{Commit, Envelope, Overlay, Race, SlotLog, SlotPayload, SlotWrite};
 use slatedb::DbReader;
 use tracing::warn;
 
@@ -253,6 +253,32 @@ fn apply(view: &mut CatalogSnapshot, commit: &Commit, sequence: u64) -> Result<(
 
     fold::fold_batch(view, &writes)
         .map_err(|err| Error::Corruption(format!("slot {sequence} could not be replayed: {err}")))
+}
+
+/// Builds one commit from its arbitration-independent parts: the batch every
+/// backing computes the same way, wrapped with the transaction id and the
+/// validated head a replay chains on. Shared by the verb cycle's coalescer and
+/// the staged-row path.
+pub(crate) fn commit_from(
+    transaction_id: [u8; 16],
+    validated_head: u64,
+    changes_made: String,
+    writes: &[StagedWrite],
+) -> Commit {
+    Commit {
+        transaction_id,
+        payload: SlotPayload {
+            validated_head,
+            changes_made,
+            writes: writes
+                .iter()
+                .map(|(key, value)| SlotWrite {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        },
+    }
 }
 
 /// Judges a lost race by comparing this commit's change set against every

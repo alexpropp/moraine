@@ -25,16 +25,12 @@ use crate::{
             TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
         read::{
-            EntityRecord, read_head, scan_current_entities, scan_history_entities, scan_snapshots,
+            EntityRecord, scan_current_entities, scan_current_entities_overlaid,
+            scan_history_entities, scan_history_entities_overlaid, scan_snapshots,
+            scan_snapshots_overlaid,
         },
     },
 };
-
-/// The head snapshot id inside an open read session, or `None` on a
-/// store that has no head yet (mid-bootstrap).
-async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Option<u64>> {
-    Ok(read_head(session.handle()).await?.map(|h| h.snapshot_id))
-}
 
 /// Locks the shared projection state for reading, recovering a poisoned
 /// lock (folds never panic mid-flight, so the state is whole).
@@ -71,13 +67,14 @@ pub use crate::store::proto::SnapshotValue as SnapshotRecord;
 /// issues ~two dozen `dump_*` calls, and this collapses their store cost
 /// to one scan pair per head.
 async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
-    let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
+    let read = catalog.begin_dump().await?;
+    let head = read.head_id().await?;
 
     let cache_at = match (catalog.maintains_projections(), head) {
         (true, Some(head)) => {
-            if let Some(records) = projections_read(catalog).entities_at(head) {
-                session.finish();
+            let cached = projections_read(catalog).entities_at(head);
+            if let Some(records) = cached {
+                read.finish().await;
                 return Ok(records);
             }
             Some(head)
@@ -85,9 +82,17 @@ async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
         _ => None,
     };
 
-    let current = scan_current_entities(session.handle()).await;
-    let history = scan_history_entities(session.handle()).await;
-    session.finish();
+    let (current, history) = match read.overlay() {
+        Some(overlay) => (
+            scan_current_entities_overlaid(read.handle(), overlay).await,
+            scan_history_entities_overlaid(read.handle(), overlay).await,
+        ),
+        None => (
+            scan_current_entities(read.handle()).await,
+            scan_history_entities(read.handle()).await,
+        ),
+    };
+    read.finish().await;
     let mut records = current?;
     records.extend(history?);
     let records = Arc::new(records);
@@ -125,9 +130,12 @@ async fn dump_current_entities<T>(
         return dump_entities(catalog, extract).await;
     }
 
-    let session = catalog.begin_read().await?;
-    let current = scan_current_entities(session.handle()).await;
-    session.finish();
+    let read = catalog.begin_dump().await?;
+    let current = match read.overlay() {
+        Some(overlay) => scan_current_entities_overlaid(read.handle(), overlay).await,
+        None => scan_current_entities(read.handle()).await,
+    };
+    read.finish().await;
     Ok(current?.into_iter().filter_map(extract).collect())
 }
 
@@ -246,13 +254,14 @@ async fn dump_projected_current<T: Clone>(
     install: impl Fn(&mut ProjectionCache, u64, Vec<T>),
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
+    let dump = catalog.begin_dump().await?;
+    let head = dump.head_id().await?;
 
     let cache_at = match (catalog.maintains_projections(), head) {
         (true, Some(head)) => {
-            if let Some(rows) = read(&projections_read(catalog), head) {
-                session.finish();
+            let cached = read(&projections_read(catalog), head);
+            if let Some(rows) = cached {
+                dump.finish().await;
                 return Ok(rows);
             }
             Some(head)
@@ -260,8 +269,11 @@ async fn dump_projected_current<T: Clone>(
         _ => None,
     };
 
-    let current = scan_current_entities(session.handle()).await;
-    session.finish();
+    let current = match dump.overlay() {
+        Some(overlay) => scan_current_entities_overlaid(dump.handle(), overlay).await,
+        None => scan_current_entities(dump.handle()).await,
+    };
+    dump.finish().await;
     let rows: Vec<T> = current?.into_iter().filter_map(extract).collect();
     if let Some(head) = cache_at {
         install(&mut projections_write(catalog), head, rows.clone());
@@ -322,21 +334,25 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 /// installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
-    let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
+    let dump = catalog.begin_dump().await?;
+    let head = dump.head_id().await?;
     if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).snapshots_at(head) {
-            session.finish();
+        let cached = projections_read(catalog).snapshots_at(head);
+        if let Some(rows) = cached {
+            dump.finish().await;
             return Ok(rows);
         }
-        let result = scan_snapshots(session.handle()).await;
-        session.finish();
+        let result = scan_snapshots(dump.handle()).await;
+        dump.finish().await;
         let rows = result?;
         projections_write(catalog).install_snapshots(head, rows.clone());
         return Ok(rows);
     }
-    let result = scan_snapshots(session.handle()).await;
-    session.finish();
+    let result = match dump.overlay() {
+        Some(overlay) => scan_snapshots_overlaid(dump.handle(), overlay).await,
+        None => scan_snapshots(dump.handle()).await,
+    };
+    dump.finish().await;
     result
 }
 
@@ -1078,6 +1094,69 @@ mod tests {
         assert_eq!(file_col_rows.len(), 1);
         assert_eq!(file_col_rows[0].min_value.as_deref(), Some("1"));
         assert_eq!(file_col_rows[0].max_value.as_deref(), Some("10"));
+    }
+
+    /// On a slot-backed attach, a staged commit lands only in the log until a
+    /// folder applies it. The raw dumps must read it through the tail overlay,
+    /// or DuckLake's conflict matrix would miss a committed winner.
+    #[tokio::test]
+    async fn dumps_reflect_an_unfolded_tail_on_a_slot_backed_attach() {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let options = CatalogOptions {
+            multi_writer: true,
+            ..CatalogOptions::default()
+        };
+        let catalog = Catalog::open(Arc::new(InMemory::new()), options)
+            .await
+            .unwrap();
+
+        let mut tx = crate::ffi_support::staged::staged_begin(&catalog, None, String::new())
+            .await
+            .unwrap();
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: vec![
+                Cell::U64(1),
+                Cell::I64(1),
+                Cell::U64(1),
+                Cell::U64(2),
+                Cell::U64(0),
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str(r#"created_schema:"sales""#.into()),
+                Cell::Null,
+                Cell::Null,
+                Cell::Null,
+            ],
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Schema,
+            cells: vec![
+                Cell::U64(1),
+                Cell::Str("uuid-1".into()),
+                Cell::U64(1),
+                Cell::Null,
+                Cell::Str("sales".into()),
+                Cell::Str("sales/".into()),
+                Cell::Bool(true),
+            ],
+        });
+        tx.commit().await.unwrap();
+
+        let snapshots = dump_snapshots(&catalog).await.unwrap();
+        assert_eq!(
+            snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let schemas = dump_schemas(&catalog).await.unwrap();
+        assert!(schemas.iter().any(|s| s.schema_name == "sales"));
+        let deletions = dump_scheduled_deletions(&catalog).await.unwrap();
+        assert!(deletions.is_empty());
     }
 
     #[tokio::test]

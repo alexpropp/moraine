@@ -15,7 +15,6 @@ use std::{
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use moraine_wal::Overlay;
-use slatedb::DbTransaction;
 use tracing::warn;
 
 use crate::{
@@ -28,7 +27,7 @@ use crate::{
             index_value_above, index_value_body, index_value_suffix,
         },
     },
-    transaction::commit::{StagedWrite, stage_writes},
+    transaction::commit::StagedWrite,
 };
 
 /// Read-side dispatch for uniqueness probes: the store view alone
@@ -439,19 +438,6 @@ pub(crate) async fn plan_index_entries(
     poisoned.sort_unstable();
     poisoned.dedup();
     Ok((poisoned, writes))
-}
-
-/// Plans the entries over the transaction's own reads and stages the writes
-/// onto it, returning the poisoned building-index ids. Unique keys land in the
-/// transaction's write set, so two commits inserting one value collide there.
-pub(crate) async fn stage_index_entries(
-    db_tx: &DbTransaction,
-    entries: &[StagedIndexEntry],
-) -> Result<Vec<u64>> {
-    let (poisoned, writes) =
-        plan_index_entries(ProbeHandle::Store(ReadHandle::Tx(db_tx)), entries).await?;
-    stage_writes(db_tx, &writes)?;
-    Ok(poisoned)
 }
 
 /// Records `poisoned` on the working state's definitions, so the commit's
