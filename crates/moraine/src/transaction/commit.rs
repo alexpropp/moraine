@@ -304,6 +304,82 @@ pub(crate) async fn open_reader_initialized(
     }
 }
 
+/// Converts a format 1–3 store to the slot-log topology in one atomic batch:
+/// [`FORMAT_MULTI_WRITER`] and a zero fold cursor, the existing store already
+/// being the folded state and the slot log starting empty. Opening the writer
+/// fences any incumbent old-binary writer.
+///
+/// Idempotent by the format check: a store already stamped
+/// [`FORMAT_MULTI_WRITER`] (a racing migration won) migrates nothing and
+/// succeeds. A migration whose own write is fenced by a competing migration
+/// surfaces [`Error::Fenced`], and the caller re-probes.
+pub(crate) async fn migrate_to_slot_log(store: StoreBuilder<'_>) -> Result<()> {
+    let db = store.open_writer().await?;
+    let outcome = migrate_stamp(&db).await;
+    match db.close().await {
+        Ok(()) => outcome,
+        Err(err) => outcome.and(Err(Error::from(err))),
+    }
+}
+
+/// Stamps the slot-log format and fold cursor through the fenced writer, in one
+/// `WriteBatch` — a crash between the two would leave a half-migrated store, so
+/// they must land together. Re-reads the format under the fence, so a store a
+/// racing migration already converted stamps nothing.
+async fn migrate_stamp(db: &Db) -> Result<()> {
+    let tx = db
+        .begin(IsolationLevel::Snapshot)
+        .await
+        .map_err(Error::from)?;
+
+    match validate_format(ReadHandle::Tx(&tx)).await {
+        Ok(Some(format)) if format.format_version >= FORMAT_MULTI_WRITER => {
+            tx.rollback();
+            return Ok(());
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tx.rollback();
+            return Err(Error::Corruption(
+                "store lost its format stamp before migration could run".to_string(),
+            ));
+        }
+        Err(err) => {
+            tx.rollback();
+            return Err(err);
+        }
+    }
+
+    let stamp = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
+    if let Err(err) = stamp(
+        Key::Sys(SysKey::Format),
+        value::encode_value(&proto::FormatValue {
+            format_version: FORMAT_MULTI_WRITER,
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
+    .and_then(|()| {
+        stamp(
+            Key::Sys(SysKey::Fold),
+            value::encode_value(&moraine_wal::FoldValue { folded_sequence: 0 }),
+        )
+    }) {
+        tx.rollback();
+        return Err(err);
+    }
+
+    match tx.commit_with_options(&durable()).await {
+        Ok(_) => {
+            info!("migrated a legacy store to the slot-log topology");
+            Ok(())
+        }
+        // A racing migration committed first: it stamped the same format, so
+        // the store is already converted.
+        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Materializes a catalog view through an open transaction, so the view
 /// and any staged writes share one read point. `at: None` reads the head
 /// (`current` only); `at: Some(s)` also scans `history` to reconstruct the

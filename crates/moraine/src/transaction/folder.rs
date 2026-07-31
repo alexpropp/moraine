@@ -12,7 +12,7 @@ use std::sync::Arc;
 use slatedb::Db;
 
 use crate::{
-    catalog::MultiWriterStore,
+    catalog::SlotStore,
     error::{Error, Result},
     store::open::StoreBuilder,
 };
@@ -21,12 +21,11 @@ use crate::{
 /// The writer is the single direct writer of the slot-backed store; a second
 /// session opened concurrently fences this one, which surfaces the fencing as
 /// an error from `body` rather than a corrupt store.
-pub(crate) async fn with_folder<T, F>(store: &MultiWriterStore, body: F) -> Result<T>
+pub(crate) async fn with_folder<T, F>(store: &SlotStore, body: F) -> Result<T>
 where
     F: AsyncFnOnce(&Db) -> Result<T>,
 {
     let db = StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
-        .flush_interval(store.options.flush_interval)
         .cache_dir(store.options.cache_dir.clone())
         .open_writer()
         .await?;

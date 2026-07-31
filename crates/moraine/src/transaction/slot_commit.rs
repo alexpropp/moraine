@@ -8,7 +8,7 @@ use slatedb::DbReader;
 use tracing::warn;
 
 use crate::{
-    catalog::{CatalogSnapshot, MultiWriterStore},
+    catalog::{CatalogSnapshot, SlotStore},
     error::{Error, Result},
     store::{handle::ReadHandle, open::StoreBuilder, read},
     transaction::{
@@ -58,9 +58,20 @@ impl SlotHead {
     }
 }
 
-/// The head as of now.
-pub(crate) async fn materialize_slot_head(store: &MultiWriterStore) -> Result<SlotHead> {
-    slot_head(store, None).await
+/// The head as of now, read through the handle's shared reader: for the commit
+/// cycle and catalog-view reads, which the unfolded tail keeps current without
+/// a store refresh.
+pub(crate) async fn materialize_slot_head(store: &SlotStore) -> Result<SlotHead> {
+    slot_head(store, None, false).await
+}
+
+/// The head as of now, read through a reader opened for this materialization so
+/// it reflects the latest durable store state — folder-role writes (index
+/// backfills and maintenance sweeps) included — that the handle's reader has
+/// not yet polled. For entry scans, which read those writes directly from the
+/// store rather than through the tail.
+pub(crate) async fn materialize_slot_head_fresh(store: &SlotStore) -> Result<SlotHead> {
+    slot_head(store, None, true).await
 }
 
 /// Closes a reader a hole retry opened. A handle's own reader is left alone; a
@@ -76,7 +87,7 @@ pub(crate) async fn release_reader(reader: Option<&DbReader>) {
 /// The view at `snapshot`: a target at or below the folded head is history the
 /// store still holds; above it, only the tail carries it.
 pub(crate) async fn materialize_slot_view_at(
-    store: &MultiWriterStore,
+    store: &SlotStore,
     snapshot: u64,
 ) -> Result<CatalogSnapshot> {
     let handle = ReadHandle::Reader(&store.reader);
@@ -87,7 +98,7 @@ pub(crate) async fn materialize_slot_view_at(
         return commit::materialize(handle, Some(snapshot)).await;
     }
 
-    let head = slot_head(store, Some(snapshot)).await?;
+    let head = slot_head(store, Some(snapshot), false).await?;
     let reached = head.view.snapshot.snapshot_id;
     if reached == snapshot {
         release_reader(head.reader.as_ref()).await;
@@ -111,29 +122,29 @@ pub(crate) async fn materialize_slot_view_at(
 /// Replays the tail, telling a truncated prefix this reader is behind from a
 /// destroyed slot. A hole is never served as a head: continuing past it would
 /// hide committed state and let the next committer re-win that sequence.
-async fn slot_head(store: &MultiWriterStore, until: Option<u64>) -> Result<SlotHead> {
-    if let Replayed::Head(head) = replay(&store.reader, &store.slots, until).await? {
+///
+/// `fresh` opens a reader for this materialization rather than reusing the
+/// handle's — the entry-scan paths need it, so a folder-role write the handle's
+/// reader has not yet polled is still seen.
+async fn slot_head(store: &SlotStore, until: Option<u64>, fresh: bool) -> Result<SlotHead> {
+    if !fresh && let Replayed::Head(head) = replay(&store.reader, &store.slots, until).await? {
         return Ok(*head);
     }
 
-    // A peer that folded past the hole truncated it, which leaves this
-    // reader's cursor stale by up to its manifest poll interval. A live
-    // `DbReader` cannot be refreshed, so only a freshly opened one can tell
-    // that from a slot destroyed outside the protocol: replaying from a cursor
-    // at or past the hole never inspects it.
-    let fresh = reopen_reader(store).await?;
-    let retried = replay(&fresh, &store.slots, until).await;
-
-    match retried {
-        // The store this view came from is ahead of the handle's, so the reader
-        // travels with the head: an entry scan through the handle's reader
-        // would miss the writes the truncated slots left.
+    // Either an entry-scan read that must see the latest durable store state, or
+    // a hole through the handle's reader that a peer may merely have truncated:
+    // a live `DbReader` cannot be refreshed, so only a freshly opened one can
+    // tell a stale cursor from a slot destroyed outside the protocol.
+    let reader = reopen_reader(store).await?;
+    match replay(&reader, &store.slots, until).await {
+        // The view came from this reader, so it travels with the head: an entry
+        // scan must read through it, not the handle's staler reader.
         Ok(Replayed::Head(mut head)) => {
-            head.reader = Some(fresh);
+            head.reader = Some(reader);
             Ok(*head)
         }
         Ok(Replayed::Hole { gap_at, folded }) => {
-            release_reader(Some(&fresh)).await;
+            release_reader(Some(&reader)).await;
             Err(Error::Corruption(format!(
                 "slot {gap_at} is absent while higher slots are present, and the fold cursor \
                  {folded} is below it: nothing folded that commit, so no truncation could have \
@@ -141,7 +152,7 @@ async fn slot_head(store: &MultiWriterStore, until: Option<u64>) -> Result<SlotH
             )))
         }
         Err(err) => {
-            release_reader(Some(&fresh)).await;
+            release_reader(Some(&reader)).await;
             Err(err)
         }
     }
@@ -315,7 +326,7 @@ async fn folded_head(handle: ReadHandle<'_>) -> Result<u64> {
 }
 
 /// A reader at the manifest as it stands now.
-async fn reopen_reader(store: &MultiWriterStore) -> Result<DbReader> {
+async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
     StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .cache_dir(store.options.cache_dir.clone())
         .open_reader()
@@ -332,7 +343,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        catalog::{Catalog, CatalogOptions, MultiWriterStore, SnapshotId},
+        catalog::{Catalog, CatalogOptions, SlotStore, SnapshotId},
         store::{
             key::{EntityKey, Key, SysKey},
             open::StoreBuilder,
@@ -342,15 +353,12 @@ mod tests {
     };
 
     fn multi_writer_options() -> CatalogOptions {
-        CatalogOptions {
-            multi_writer: true,
-            ..CatalogOptions::default()
-        }
+        CatalogOptions::default()
     }
 
     /// A bootstrapped slot-backed store, attached as the catalog attaches it:
     /// bootstrap through the writer, then read through a `DbReader`.
-    async fn bootstrap(object_store: Arc<dyn ObjectStore>) -> MultiWriterStore {
+    async fn bootstrap(object_store: Arc<dyn ObjectStore>) -> SlotStore {
         let options = multi_writer_options();
         let db = commit::open_initialized(
             StoreBuilder::new(&options.path, Arc::clone(&object_store)),
@@ -368,7 +376,7 @@ mod tests {
             .unwrap();
         let slots = SlotLog::new(Arc::clone(&object_store), &options.path);
         let coalescer = CommitCoalescer::new(options.commit_batch_window);
-        MultiWriterStore {
+        SlotStore {
             reader: Arc::new(reader),
             slots,
             object_store,
@@ -834,15 +842,12 @@ mod tests {
 
     /// Reopens the store's reader against the current manifest, so a test sees
     /// a fold without waiting on the reader's poll interval.
-    async fn reopen(
-        store: MultiWriterStore,
-        object_store: &Arc<dyn ObjectStore>,
-    ) -> MultiWriterStore {
+    async fn reopen(store: SlotStore, object_store: &Arc<dyn ObjectStore>) -> SlotStore {
         let reader = StoreBuilder::new(&store.options.path, Arc::clone(object_store))
             .open_reader()
             .await
             .unwrap();
-        MultiWriterStore {
+        SlotStore {
             reader: Arc::new(reader),
             ..store
         }

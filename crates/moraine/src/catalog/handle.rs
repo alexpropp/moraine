@@ -43,6 +43,24 @@ const BUILD_STEP_ENTRIES: usize = 1_000_000;
 /// giving up.
 const BUILD_DERIVATION_ATTEMPTS: usize = 8;
 
+/// How many times a read-write open re-probes after a racing migration fences
+/// its own migration write. Each retry re-reads a store one competitor has by
+/// then converted, so a small bound suffices.
+const MIGRATION_ATTEMPTS: usize = 8;
+
+/// A probe reader's stored structural format, as a read-write open classifies
+/// it.
+enum FormatClass {
+    /// No format stamp: an empty or unfinished store, to bootstrap.
+    Empty,
+    /// The slot-log format this binary attaches directly.
+    SlotLog,
+    /// A legacy format 1–3 store, to migrate to the slot-log format.
+    Legacy,
+    /// A format newer than this binary understands, to refuse.
+    TooNew(u64),
+}
+
 /// Whether `path` provably holds no objects. A listing that fails answers
 /// `false`: this licenses creating a store, so anything short of proof that
 /// there is nothing to destroy must deny.
@@ -68,6 +86,31 @@ async fn prefix_is_known_empty(object_store: &Arc<dyn ObjectStore>, path: &str) 
             false
         }
     }
+}
+
+/// Encodes a staged build's entry batch into store-ready staged entries under
+/// the index's declared orders, marked building so a duplicate poisons the
+/// definition rather than failing the commit.
+fn build_staged_entries(
+    info: &IndexInfo,
+    index: IndexId,
+    batch: &[IndexEntry],
+) -> Result<Vec<crate::transaction::index_maintenance::StagedIndexEntry>> {
+    batch
+        .iter()
+        .map(|entry| {
+            let has_null = entry.values.iter().any(Option::is_none);
+            let key = encode_ordered_values(&entry.values, &info.directions, &info.nulls)?;
+            Ok(crate::transaction::index_maintenance::StagedIndexEntry {
+                index_id: index.get(),
+                unique: info.unique && !has_null,
+                key,
+                row_id: entry.row_id,
+                delete: false,
+                building: true,
+            })
+        })
+        .collect()
 }
 
 /// The per-column orders `orders` asks for, as a definition records them.
@@ -217,29 +260,33 @@ pub struct MaintenanceReport {
     pub index_entries_reclaimed: u64,
 }
 
-/// The open store behind a catalog: the read-write `Db` writer, a
-/// read-only `DbReader`, or a commit-log-backed attach. A read-only catalog
-/// never opens a `Db`, so it never fences a live writer.
+/// The open store behind a catalog. Every production attach — read-write or
+/// read-only — builds [`Store::Slots`]; the single-writer [`Store::Writer`] is
+/// reached only by the single-writer commit and staged paths' own tests, which
+/// are deleted with that path in a later task.
 enum Store {
-    /// The single read-write writer.
+    /// A single-writer `Db`. Test-only: no attach path builds it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Writer(Db),
-    /// A read-only reader following the manifest, shared into read sessions.
-    Reader(Arc<DbReader>),
-    /// A commit-log-backed attach: a reader plus the slot log. Transitional
-    /// — removed once the log is the only topology. Boxed: it dwarfs the other
-    /// variants, the coalescer's queue included.
-    MultiWriter(Box<MultiWriterStore>),
+    /// The slot-log-backed store: a reader following the folded store plus the
+    /// slot log its commits ride. Boxed: it dwarfs the writer variant, the
+    /// coalescer's queue included.
+    Slots(Box<SlotStore>),
 }
 
-/// The store behind a [`Store::MultiWriter`] attach.
-// dead_code: `read_only` is read by the fold sprints, landing in a later task.
-#[allow(dead_code)]
-pub(crate) struct MultiWriterStore {
+/// The slot-log-backed store: a reader following the folded store plus the slot
+/// log its commits ride. A read-only attach never opens the fenced writer, so
+/// it never fences a live writer; a read-write attach opens it only for
+/// folder-role work.
+pub(crate) struct SlotStore {
     pub(crate) reader: Arc<DbReader>,
     pub(crate) slots: moraine_wal::SlotLog,
-    /// Retained for fold sprints (reopening the fenced writer) and reads.
+    /// Retained for reopening the fenced writer (folder role) and fresh
+    /// readers (past a truncation).
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) options: CatalogOptions,
+    /// Whether this attach may write: `false` refuses commits and folder-role
+    /// work, so a read-only attach never opens the writer.
     pub(crate) read_only: bool,
     /// Serializes and coalesces this process's slot commits. Shared by every
     /// clone of the handle.
@@ -252,10 +299,7 @@ pub(crate) struct MultiWriterStore {
 ///
 /// ```
 /// let options = moraine::CatalogOptions::default();
-/// assert_eq!(
-///     options.flush_interval,
-///     std::time::Duration::from_millis(100)
-/// );
+/// assert_eq!(options.refresh_interval, std::time::Duration::from_secs(10));
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -269,13 +313,6 @@ pub struct CatalogOptions {
     /// store bootstraps, and ignored on an already-initialized store,
     /// where the stored value is authoritative.
     pub encrypted: bool,
-    /// How often the store's write-ahead log is flushed to object
-    /// storage. Durable commits wait for the next flush, so this bounds
-    /// per-commit latency; smaller values mean more frequent (on S3,
-    /// costlier) object-store PUTs. Zero flushes continuously (no timer),
-    /// so a durable commit waits only on the object-store PUT — the lowest
-    /// latency, at the cost of a busy flush loop. Defaults to 100ms.
-    pub flush_interval: Duration,
     /// Local directory backing SlateDB's on-disk block cache. When set,
     /// reads are served from a disk-backed cache that survives process
     /// restarts, so warm queries skip repeat object-store GETs — worthwhile
@@ -288,16 +325,17 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
-    /// Opt into the slot-log topology at store creation. Transitional:
-    /// removed once the slot log is the only topology.
-    pub multi_writer: bool,
-    /// How long a slot-backed commit may wait to be batched with others of
-    /// this process before racing the log. Zero (the default) still coalesces
-    /// whatever is already queued into one envelope — it only declines to
-    /// *wait* — so an uncontended commit adds no latency. A non-zero window
-    /// trades latency for fewer object-store PUTs under load. Only the
-    /// multi-writer path reads it.
+    /// How long a commit may wait to be batched with others of this process
+    /// before racing the log. Zero (the default) still coalesces whatever is
+    /// already queued into one envelope — it only declines to *wait* — so an
+    /// uncontended commit adds no latency. A non-zero window trades latency
+    /// for fewer object-store PUTs under load, the write-side cost axis.
     pub commit_batch_window: Duration,
+    /// How often a reader polls the object store for a fresher folded view.
+    /// A reader lags the head by up to this interval, replaying that many more
+    /// slots per materialization; a shorter interval trades more manifest
+    /// reads for less fold lag, the read-side cost axis. Defaults to 10s.
+    pub refresh_interval: Duration,
 }
 
 impl Default for CatalogOptions {
@@ -305,11 +343,10 @@ impl Default for CatalogOptions {
         Self {
             path: String::new(),
             encrypted: false,
-            flush_interval: Duration::from_millis(100),
             cache_dir: None,
             data_path: None,
-            multi_writer: false,
             commit_batch_window: Duration::ZERO,
+            refresh_interval: Duration::from_secs(10),
         }
     }
 }
@@ -358,67 +395,17 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
-        if options.multi_writer {
-            return Self::open_multi_writer(object_store, options).await;
-        }
-
-        let store = StoreBuilder::new(&options.path, object_store)
-            .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone());
-        let db = commit::open_initialized(
-            store,
-            options.encrypted,
-            options.data_path.as_deref(),
-            false,
-        )
-        .await?;
+        let reader = Self::open_read_write_reader(&object_store, &options).await?;
         info!(
             path = options.path,
-            flush_interval_ms = options.flush_interval.as_millis(),
+            refresh_interval_ms = options.refresh_interval.as_millis(),
             "opened catalog read-write"
         );
-        Ok(Self {
-            store: Arc::new(Store::Writer(db)),
-            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
-        })
-    }
 
-    /// The `multi_writer: true` open path: attaches directly when the store
-    /// is already initialized, else bootstraps it through the writer
-    /// (stamping [`commit::FORMAT_MULTI_WRITER`]) and reopens as a reader.
-    /// The reader-first order means an already-initialized store is never
-    /// fenced by this open.
-    async fn open_multi_writer(
-        object_store: Arc<dyn ObjectStore>,
-        options: CatalogOptions,
-    ) -> Result<Self> {
-        let reader_store = StoreBuilder::new(&options.path, object_store.clone())
-            .cache_dir(options.cache_dir.clone());
-        let reader = match commit::open_reader_initialized(reader_store).await {
-            Ok(Some((reader, format_version))) => {
-                commit::validate_mode(format_version, true)?;
-                reader
-            }
-            // The store is readable but carries no format stamp: a bootstrap
-            // that did not finish, which `open_initialized` completes
-            // idempotently under conflict detection.
-            Ok(None) => Self::bootstrap_multi_writer(&object_store, &options).await?,
-            // Only a prefix holding no objects licenses a bootstrap. A prefix
-            // holding objects whose manifest will not open is a damaged store,
-            // and stamping a fresh catalog over it would destroy it.
-            Err(err) => {
-                if !prefix_is_known_empty(&object_store, &options.path).await {
-                    return Err(err);
-                }
-                Self::bootstrap_multi_writer(&object_store, &options).await?
-            }
-        };
-
-        info!(path = options.path, "opened catalog multi-writer");
         let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
         let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
         Ok(Self {
-            store: Arc::new(Store::MultiWriter(Box::new(MultiWriterStore {
+            store: Arc::new(Store::Slots(Box::new(SlotStore {
                 reader: Arc::new(reader),
                 slots,
                 object_store,
@@ -430,14 +417,126 @@ impl Catalog {
         })
     }
 
-    /// Bootstraps an uninitialized store through the writer, fencing any
-    /// incumbent old-binary writer, then closes it and reopens read-only.
-    async fn bootstrap_multi_writer(
+    /// Opens a single-writer catalog directly through the writer, for the
+    /// single-writer commit and staged paths' own tests. No production attach
+    /// builds this; the flip routes every attach through the slot log.
+    #[cfg(test)]
+    pub(crate) async fn open_single_writer(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<Self> {
+        let store = StoreBuilder::new(&options.path, object_store);
+        let db = commit::open_initialized(
+            store,
+            options.encrypted,
+            options.data_path.as_deref(),
+            false,
+        )
+        .await?;
+        Ok(Self {
+            store: Arc::new(Store::Writer(db)),
+            projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
+        })
+    }
+
+    /// Resolves a read-write attach to the reader it follows: bootstraps an
+    /// empty store at [`commit::FORMAT_MULTI_WRITER`], attaches a store already
+    /// there, migrates a legacy format 1–3 store in one atomic batch, and
+    /// refuses a format newer than this binary understands. A migration whose
+    /// write a racing migration fenced re-probes and finds the store converted.
+    async fn open_read_write_reader(
+        object_store: &Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+    ) -> Result<DbReader> {
+        for _ in 0..MIGRATION_ATTEMPTS {
+            let Some(reader) = Self::open_probe_reader(object_store, options).await? else {
+                return Self::bootstrap_slot_reader(object_store, options).await;
+            };
+            match Self::classify_format(&reader).await? {
+                FormatClass::SlotLog => return Ok(reader),
+                FormatClass::Empty => {
+                    reader.close().await.map_err(Error::from)?;
+                    return Self::bootstrap_slot_reader(object_store, options).await;
+                }
+                FormatClass::TooNew(version) => {
+                    reader.close().await.map_err(Error::from)?;
+                    return Err(Error::Configuration(format!(
+                        "store format {version} is newer than this binary understands \
+                         (up to {}); upgrade moraine to attach it",
+                        commit::MAX_FORMAT_VERSION
+                    )));
+                }
+                FormatClass::Legacy => {
+                    reader.close().await.map_err(Error::from)?;
+                    let writer_store = StoreBuilder::new(&options.path, object_store.clone())
+                        .cache_dir(options.cache_dir.clone());
+                    match commit::migrate_to_slot_log(writer_store).await {
+                        // Converted, or a racing migration converted it first:
+                        // fall through to re-probe, which finds the slot format.
+                        Ok(()) | Err(Error::Fenced(_)) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+        Err(Error::Fenced(
+            "a legacy store's migration was fenced repeatedly and never converged; \
+             retry the attach"
+                .to_string(),
+        ))
+    }
+
+    /// Opens a probe reader over the store: `Some(reader)` when the prefix is
+    /// readable, `None` when it is a known-empty prefix that licenses a
+    /// bootstrap. A prefix holding objects whose manifest will not open is a
+    /// damaged store, and the error propagates rather than stamping over it.
+    async fn open_probe_reader(
+        object_store: &Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+    ) -> Result<Option<DbReader>> {
+        let reader_store = StoreBuilder::new(&options.path, object_store.clone())
+            .refresh_interval(options.refresh_interval)
+            .cache_dir(options.cache_dir.clone());
+        match reader_store.open_reader().await {
+            Ok(reader) => Ok(Some(reader)),
+            Err(err) => {
+                if prefix_is_known_empty(object_store, &options.path).await {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Classifies a probe reader's stored structural format.
+    async fn classify_format(reader: &DbReader) -> Result<FormatClass> {
+        let handle = ReadHandle::Reader(reader);
+        if crate::store::read::read_migration(handle).await?.is_some() {
+            return Err(Error::Corruption(
+                "store is mid-migration; refusing to open".to_string(),
+            ));
+        }
+        match crate::store::read::read_format(handle).await? {
+            None => Ok(FormatClass::Empty),
+            Some(format) if format.format_version == commit::FORMAT_MULTI_WRITER => {
+                Ok(FormatClass::SlotLog)
+            }
+            Some(format) if format.format_version > commit::MAX_FORMAT_VERSION => {
+                Ok(FormatClass::TooNew(format.format_version))
+            }
+            Some(_) => Ok(FormatClass::Legacy),
+        }
+    }
+
+    /// Bootstraps an empty store at the slot-log format through the writer,
+    /// fencing any incumbent old-binary writer, then closes it and reopens
+    /// read-only.
+    async fn bootstrap_slot_reader(
         object_store: &Arc<dyn ObjectStore>,
         options: &CatalogOptions,
     ) -> Result<DbReader> {
         let writer_store = StoreBuilder::new(&options.path, object_store.clone())
-            .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone());
         let db = commit::open_initialized(
             writer_store,
@@ -449,6 +548,7 @@ impl Catalog {
         db.close().await.map_err(Error::from)?;
 
         let reader_store = StoreBuilder::new(&options.path, object_store.clone())
+            .refresh_interval(options.refresh_interval)
             .cache_dir(options.cache_dir.clone());
         let (reader, _) = commit::open_reader_initialized(reader_store)
             .await?
@@ -479,9 +579,10 @@ impl Catalog {
         options: CatalogOptions,
     ) -> Result<Self> {
         let store = StoreBuilder::new(&options.path, object_store.clone())
+            .refresh_interval(options.refresh_interval)
             .cache_dir(options.cache_dir.clone());
         let opened = commit::open_reader_initialized(store).await?;
-        let (reader, format_version) = opened.ok_or_else(|| {
+        let (reader, _format_version) = opened.ok_or_else(|| {
             Error::Corruption(
                 "store is not an initialized moraine catalog; a read-only attach \
                  needs a writer to have created it first"
@@ -490,24 +591,21 @@ impl Catalog {
         })?;
         info!(path = options.path, "opened catalog read-only");
 
-        // Only a format-4 store rides the slot-log topology.
-        let store = if format_version == commit::FORMAT_MULTI_WRITER {
-            let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
-            let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
-            Store::MultiWriter(Box::new(MultiWriterStore {
+        // Every readable store serves read-only through the slot topology: a
+        // legacy format 1–3 store never migrates (a read-only attach writes
+        // nothing), and its absent fold cursor reads as 0 with an empty tail,
+        // so it is a slot store with no slots.
+        let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
+        let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
+        Ok(Self {
+            store: Arc::new(Store::Slots(Box::new(SlotStore {
                 reader: Arc::new(reader),
                 slots,
                 object_store,
                 options,
                 read_only: true,
                 coalescer,
-            }))
-        } else {
-            Store::Reader(Arc::new(reader))
-        };
-
-        Ok(Self {
-            store: Arc::new(store),
+            }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
     }
@@ -529,23 +627,20 @@ impl Catalog {
     fn writer(&self) -> Result<&Db> {
         match self.store.as_ref() {
             Store::Writer(db) => Ok(db),
-            Store::Reader(_) => Err(Error::Constraint(
-                "catalog opened read-only; writes are unavailable".to_string(),
-            )),
-            Store::MultiWriter(_) => Err(Error::Constraint(
-                "catalog attached over the slot log; commits are not available yet".to_string(),
+            Store::Slots(_) => Err(Error::Constraint(
+                "catalog attached over the slot log; the single writer is unavailable".to_string(),
             )),
         }
     }
 
     /// Whether direct-store writes are available: the single writer, or a
     /// read-write slot-backed attach (through the folder role). A read-only
-    /// attach of either topology refuses.
+    /// attach refuses.
     fn ensure_writable(&self) -> Result<()> {
         match self.store.as_ref() {
             Store::Writer(_) => Ok(()),
-            Store::MultiWriter(multi) if !multi.read_only => Ok(()),
-            Store::Reader(_) | Store::MultiWriter(_) => Err(Error::Constraint(
+            Store::Slots(store) if !store.read_only => Ok(()),
+            Store::Slots(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
             )),
         }
@@ -561,8 +656,8 @@ impl Catalog {
     {
         match self.store.as_ref() {
             Store::Writer(db) => body(db).await,
-            Store::MultiWriter(multi) if !multi.read_only => folder::with_folder(multi, body).await,
-            Store::Reader(_) | Store::MultiWriter(_) => Err(Error::Constraint(
+            Store::Slots(store) if !store.read_only => folder::with_folder(store, body).await,
+            Store::Slots(_) => Err(Error::Constraint(
                 "catalog opened read-only; writes are unavailable".to_string(),
             )),
         }
@@ -588,14 +683,14 @@ impl Catalog {
     }
 
     async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
-        if let Store::MultiWriter(multi) = self.store.as_ref() {
+        if let Store::Slots(store) = self.store.as_ref() {
             return match at {
                 None => {
-                    let head = slot_commit::materialize_slot_head(multi).await?;
+                    let head = slot_commit::materialize_slot_head(store).await?;
                     slot_commit::release_reader(head.reader.as_ref()).await;
                     Ok(head.view)
                 }
-                Some(snapshot) => slot_commit::materialize_slot_view_at(multi, snapshot).await,
+                Some(snapshot) => slot_commit::materialize_slot_view_at(store, snapshot).await,
             };
         }
 
@@ -611,15 +706,17 @@ impl Catalog {
     /// does not model must read over the store.
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<HeadRead> {
         match self.store.as_ref() {
-            Store::MultiWriter(multi) => {
-                let head = slot_commit::materialize_slot_head(multi).await?;
+            Store::Slots(store) => {
+                // A fresh reader: entry scans read folder-written entries — index
+                // backfills above all — straight from the store, not the tail.
+                let head = slot_commit::materialize_slot_head_fresh(store).await?;
                 Ok(HeadRead {
                     view: head.view,
                     tail: Some(head.overlay),
                     reader: head.reader,
                 })
             }
-            Store::Writer(_) | Store::Reader(_) => Ok(HeadRead {
+            Store::Writer(_) => Ok(HeadRead {
                 view: commit::materialize(handle, None).await?,
                 tail: None,
                 reader: None,
@@ -888,8 +985,7 @@ impl Catalog {
                     .await
                     .map_err(Error::from)?,
             )),
-            Store::Reader(reader) => Ok(ReadSession::Reader(reader.clone())),
-            Store::MultiWriter(multi) => Ok(ReadSession::Reader(multi.reader.clone())),
+            Store::Slots(store) => Ok(ReadSession::Reader(store.reader.clone())),
         }
     }
 
@@ -899,14 +995,14 @@ impl Catalog {
     /// reflects a winner no folder has applied yet.
     pub(crate) async fn begin_dump(&self) -> Result<DumpRead> {
         match self.store.as_ref() {
-            Store::MultiWriter(multi) => {
-                let head = slot_commit::materialize_slot_head(multi).await?;
+            Store::Slots(store) => {
+                let head = slot_commit::materialize_slot_head(store).await?;
                 Ok(DumpRead::Slots {
-                    reader: multi.reader.clone(),
+                    reader: store.reader.clone(),
                     head: Box::new(head),
                 })
             }
-            _ => Ok(DumpRead::Session(self.begin_read().await?)),
+            Store::Writer(_) => Ok(DumpRead::Session(self.begin_read().await?)),
         }
     }
 
@@ -922,7 +1018,7 @@ impl Catalog {
     ) -> Result<crate::transaction::staged::StagedTransaction> {
         use crate::transaction::staged::StagedTransaction;
 
-        let Store::MultiWriter(multi) = self.store.as_ref() else {
+        let Store::Slots(store) = self.store.as_ref() else {
             let db_tx = self.begin_write_tx().await?;
             return Ok(StagedTransaction::begin(
                 db_tx,
@@ -932,16 +1028,16 @@ impl Catalog {
             ));
         };
 
-        if multi.read_only {
+        if store.read_only {
             return Err(Error::Constraint(
                 "catalog attached read-only; writes are unavailable".to_string(),
             ));
         }
-        let head = slot_commit::materialize_slot_head(multi).await?;
+        let head = slot_commit::materialize_slot_head(store).await?;
         Ok(StagedTransaction::begin_slots(
             head,
-            multi.reader.clone(),
-            multi.slots.clone(),
+            store.reader.clone(),
+            store.slots.clone(),
             self.projections.clone(),
             data_store,
             data_prefix,
@@ -1151,14 +1247,11 @@ impl Catalog {
         data_prefix: &str,
         step_entries: Option<usize>,
     ) -> Result<IndexId> {
-        // A staged build's entry batches are derived-state writes that belong
-        // in the folder session, while its definition and ready/poison flips
-        // ride slots; splitting the build across the two substrates is not
-        // wired yet, so a slot-backed attach refuses it typed rather than
-        // routing million-entry batches through the log.
-        if let Store::MultiWriter(_) = self.store.as_ref() {
+        if let Store::Slots(store) = self.store.as_ref()
+            && store.read_only
+        {
             return Err(Error::Constraint(
-                "staged index builds are not yet available over the slot log".to_string(),
+                "catalog attached read-only; writes are unavailable".to_string(),
             ));
         }
 
@@ -1279,7 +1372,11 @@ impl Catalog {
     }
 
     /// Commits `entries` above the persisted cursor in steps, the last one
-    /// flipping the index ready.
+    /// flipping the index ready. A single-writer store stages each step's
+    /// entries in the commit itself; a slot-backed store writes them straight
+    /// into the store under the folder role and rides only the cursor advance
+    /// and the ready/poison flip through the log, so a million-row backfill
+    /// never rides one envelope.
     async fn commit_build_steps(
         &self,
         table: TableId,
@@ -1299,11 +1396,18 @@ impl Catalog {
             let step = &remaining[..remaining.len().min(step_entries)];
             let is_final = step.len() == remaining.len();
 
-            match self
-                .commit(|tx| tx.build_index_step(index, step, is_final).map(|_| ()))
-                .await
-            {
-                Ok(_) => {
+            let committed = match self.store.as_ref() {
+                Store::Slots(store) => {
+                    self.commit_build_step_slots(store, table, index, step, is_final)
+                        .await
+                }
+                Store::Writer(_) => self
+                    .commit(|tx| tx.build_index_step(index, step, is_final).map(|_| ()))
+                    .await
+                    .map(|_| ()),
+            };
+            match committed {
+                Ok(()) => {
                     if is_final {
                         return Ok(BuildProgress::Ready);
                     }
@@ -1312,6 +1416,80 @@ impl Catalog {
                 Err(other) => return Err(other),
             }
         }
+    }
+
+    /// Commits one staged build step over the slot log: the entry batch lands
+    /// in the store directly under the folder role, then a slot commit advances
+    /// the build cursor and, on the final step, flips the index ready. A
+    /// duplicate the batch discovers poisons the definition through a slot and
+    /// fails the build.
+    async fn commit_build_step_slots(
+        &self,
+        store: &SlotStore,
+        table: TableId,
+        index: IndexId,
+        step: &[IndexEntry],
+        is_final: bool,
+    ) -> Result<()> {
+        let info = self
+            .snapshot()
+            .await?
+            .indexes_of(table)
+            .into_iter()
+            .find(|info| info.id == index)
+            .ok_or_else(|| Error::NotFound(format!("index {index}")))?;
+
+        if self.write_build_entries(store, &info, index, step).await? {
+            self.commit(|tx| tx.poison_index_build(index)).await?;
+            return Err(Error::Constraint(format!(
+                "index {index} was poisoned by a duplicate value during its staged build"
+            )));
+        }
+
+        // The highest row id this step covered advances the cursor; an empty
+        // final step (no rows) still needs its flip, so the cursor holds.
+        let covered = step.last().map(|entry| entry.row_id);
+        self.commit(|tx| tx.advance_index_build(index, covered, is_final).map(|_| ()))
+            .await
+            .map(|_| ())
+    }
+
+    /// Writes a staged build's entry batch straight into the store under the
+    /// folder role — the single direct writer — enforcing uniqueness against
+    /// the folded store overlaid with the unfolded tail. Returns whether a
+    /// duplicate poisoned the build.
+    async fn write_build_entries(
+        &self,
+        store: &SlotStore,
+        info: &IndexInfo,
+        index: IndexId,
+        batch: &[IndexEntry],
+    ) -> Result<bool> {
+        if batch.is_empty() {
+            return Ok(false);
+        }
+        let staged = build_staged_entries(info, index, batch)?;
+        let head = slot_commit::materialize_slot_head(store).await?;
+        let overlay = head.overlay;
+        let outcome = folder::with_folder(store, async |db| {
+            let tx = db
+                .begin(IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
+            let probe = index_maintenance::ProbeHandle::Overlaid {
+                store: ReadHandle::Tx(&tx),
+                overlay: &overlay,
+            };
+            let (poisoned, writes) = index_maintenance::plan_index_entries(probe, &staged).await?;
+            commit::stage_writes(&tx, &writes)?;
+            tx.commit_with_options(&commit::durable())
+                .await
+                .map_err(Error::from)?;
+            Ok(!poisoned.is_empty())
+        })
+        .await;
+        slot_commit::release_reader(head.reader.as_ref()).await;
+        outcome
     }
 
     /// The staged build's persisted watermark. An index that is no longer
@@ -1627,8 +1805,7 @@ impl Catalog {
     pub async fn close(&self) -> Result<()> {
         match self.store.as_ref() {
             Store::Writer(db) => db.close().await.map_err(Error::from),
-            Store::Reader(reader) => reader.close().await.map_err(Error::from),
-            Store::MultiWriter(multi) => multi.reader.close().await.map_err(Error::from),
+            Store::Slots(store) => store.reader.close().await.map_err(Error::from),
         }
     }
 
@@ -1685,8 +1862,8 @@ impl Catalog {
         F: Fn(&mut Transaction) -> Result<()>,
     {
         match self.store.as_ref() {
-            Store::MultiWriter(multi) => multi.coalescer.commit(multi, &f).await,
-            _ => commit::commit_cycle(self.writer()?, &f, &self.projections).await,
+            Store::Slots(store) => store.coalescer.commit(store, &f).await,
+            Store::Writer(db) => commit::commit_cycle(db, &f, &self.projections).await,
         }
     }
 }

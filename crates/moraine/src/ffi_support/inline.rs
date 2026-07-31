@@ -223,7 +223,9 @@ mod tests {
     }
 
     async fn open() -> Catalog {
-        Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        // Drives the single-writer inline path directly through
+        // `begin_write_tx`, which no attach builds after the flip.
+        Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap()
     }
@@ -232,10 +234,7 @@ mod tests {
     /// through the log is served through the unfolded tail until a folder
     /// applies it.
     async fn open_slots() -> Catalog {
-        let options = CatalogOptions {
-            multi_writer: true,
-            ..CatalogOptions::default()
-        };
+        let options = CatalogOptions::default();
         Catalog::open(Arc::new(InMemory::new()), options)
             .await
             .unwrap()

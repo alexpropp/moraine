@@ -657,13 +657,16 @@ pub unsafe extern "C" fn moraine_attach(
         let mut options = CatalogOptions::default();
         options.path = prefix;
         options.encrypted = encrypted;
-        // 0 means "not given": the default cadence stands. `u64::MAX` is the
-        // shim's sentinel for an explicit zero interval (flush continuously,
-        // no timer); any other value is that many milliseconds.
+        // `flush_interval_ms` is a deprecated alias for the commit batch
+        // window: no commit touches SlateDB's WAL flush timer any more, but an
+        // operator's existing value still expresses "how long a commit may wait
+        // to be batched". 0 means "not given" (the default window); `u64::MAX`
+        // is the shim's sentinel for an explicit zero; any other value is that
+        // many milliseconds.
         match flush_interval_ms {
             0 => {}
-            u64::MAX => options.flush_interval = std::time::Duration::ZERO,
-            ms => options.flush_interval = std::time::Duration::from_millis(ms),
+            u64::MAX => options.commit_batch_window = std::time::Duration::ZERO,
+            ms => options.commit_batch_window = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         // Persist the data root at bootstrap so a later attach reads it back

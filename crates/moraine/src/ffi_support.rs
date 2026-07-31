@@ -932,9 +932,10 @@ mod tests {
     async fn dump_mappings_serves_embedded_rows() {
         use crate::transaction::staged::{Cell, RowOperation, StagedTransaction, TableKind};
 
-        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-            .await
-            .unwrap();
+        let catalog =
+            Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
+                .await
+                .unwrap();
         let db_tx = catalog.begin_write_tx().await.unwrap();
         let mut tx = StagedTransaction::begin_detached(db_tx);
         tx.stage(RowOperation::Insert {
@@ -1103,10 +1104,7 @@ mod tests {
     async fn dumps_reflect_an_unfolded_tail_on_a_slot_backed_attach() {
         use crate::transaction::staged::{Cell, RowOperation, TableKind};
 
-        let options = CatalogOptions {
-            multi_writer: true,
-            ..CatalogOptions::default()
-        };
+        let options = CatalogOptions::default();
         let catalog = Catalog::open(Arc::new(InMemory::new()), options)
             .await
             .unwrap();
@@ -1163,10 +1161,7 @@ mod tests {
     /// log and are served through the unfolded tail until a folder applies
     /// them.
     async fn open_slots() -> Catalog {
-        let options = CatalogOptions {
-            multi_writer: true,
-            ..CatalogOptions::default()
-        };
+        let options = CatalogOptions::default();
         Catalog::open(Arc::new(InMemory::new()), options)
             .await
             .unwrap()

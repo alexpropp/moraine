@@ -9,17 +9,11 @@ use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 
 use crate::fixtures::{CountingStore, col, datafile};
 
-fn multi_writer_options() -> CatalogOptions {
-    let mut options = CatalogOptions::default();
-    options.multi_writer = true;
-    options
-}
-
 #[allow(clippy::unwrap_used)]
 async fn open_multi_writer(store: &Arc<InMemory>) -> Catalog {
     Catalog::open(
         store.clone() as Arc<dyn ObjectStore>,
-        multi_writer_options(),
+        CatalogOptions::default(),
     )
     .await
     .unwrap()
@@ -102,7 +96,7 @@ async fn multi_writer_open_refuses_a_store_it_cannot_read_but_is_not_empty() {
         .await
         .unwrap();
 
-    let mut options = multi_writer_options();
+    let mut options = CatalogOptions::default();
     options.path = "cat".to_string();
     let err = Catalog::open(store.clone() as Arc<dyn ObjectStore>, options)
         .await
@@ -261,7 +255,7 @@ async fn concurrent_commits_coalesce_into_few_slots() {
     let store = Arc::new(CountingStore::new());
     let catalog = open_multi_writer_over(
         store.clone() as Arc<dyn ObjectStore>,
-        multi_writer_options(),
+        CatalogOptions::default(),
     )
     .await;
 
@@ -322,7 +316,7 @@ async fn an_uncontended_commit_waits_for_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failing_batch_member_does_not_poison_its_batch() {
     let store = Arc::new(InMemory::new());
-    let mut options = multi_writer_options();
+    let mut options = CatalogOptions::default();
     options.commit_batch_window = Duration::from_millis(80);
     let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
 
@@ -370,7 +364,7 @@ async fn a_failing_batch_member_does_not_poison_its_batch() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_cancelled_participant_does_not_wedge_the_handle() {
     let store = Arc::new(InMemory::new());
-    let mut options = multi_writer_options();
+    let mut options = CatalogOptions::default();
     options.commit_batch_window = Duration::from_millis(100);
     let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
 
@@ -445,7 +439,7 @@ async fn a_cancelled_participant_does_not_wedge_the_handle() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_cancelled_leader_hands_off_and_keeps_the_handle_live() {
     let store = Arc::new(InMemory::new());
-    let mut options = multi_writer_options();
+    let mut options = CatalogOptions::default();
     options.commit_batch_window = Duration::from_millis(100);
     let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
 

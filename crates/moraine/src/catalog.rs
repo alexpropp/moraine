@@ -11,7 +11,7 @@ pub(crate) mod scoped_read;
 mod snapshot;
 mod types;
 
-pub(crate) use handle::MultiWriterStore;
+pub(crate) use handle::SlotStore;
 pub use handle::{Catalog, CatalogOptions, MaintenanceReport, MaintenanceRequest};
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;

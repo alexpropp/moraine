@@ -283,9 +283,12 @@ mod tests {
     /// folded forward by each commit), proven equal to the store's truth.
     #[tokio::test]
     async fn dumps_after_commits_match_fresh_scans() {
-        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-            .await
-            .unwrap();
+        // The maintained projection cache is a single-writer path; the slot
+        // topology materializes from the log each time.
+        let catalog =
+            Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
+                .await
+                .unwrap();
 
         for round in 0..8u64 {
             // Prime/serve before the commit so the fold path (not the

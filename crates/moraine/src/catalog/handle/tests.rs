@@ -7,23 +7,190 @@ use super::*;
 use crate::{
     catalog::IndexId,
     store::{
+        handle::ReadHandle,
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, IntWidth, NullOrder, encode_ordered_values,
         },
         key::{IndexKey, Key},
         open::StoreBuilder,
+        read,
     },
     transaction::commit,
 };
 
-fn multi_writer_options() -> CatalogOptions {
-    CatalogOptions {
-        multi_writer: true,
-        // Flush continuously so a per-batch durable commit waits only on the
-        // in-memory object store, not a 100ms flush timer.
-        flush_interval: std::time::Duration::ZERO,
-        ..CatalogOptions::default()
-    }
+/// The stored structural format and fold cursor of a store (fold absent reads
+/// as 0), read through a fresh reader.
+async fn stored_format_and_fold(object_store: &Arc<dyn ObjectStore>) -> (u64, u64) {
+    let reader = StoreBuilder::new("", Arc::clone(object_store))
+        .open_reader()
+        .await
+        .unwrap();
+    let handle = ReadHandle::Reader(&reader);
+    let format = read::read_format(handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .format_version;
+    let fold = read::read_fold(handle)
+        .await
+        .unwrap()
+        .map_or(0, |fold| fold.folded_sequence);
+    reader.close().await.unwrap();
+    (format, fold)
+}
+
+/// Creates a legacy (format 1) store carrying a `legacy` schema, as the
+/// pre-flip single-writer binary left it, then closes its writer.
+async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
+    let legacy = Catalog::open_single_writer(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    legacy
+        .commit(|tx| tx.create_schema("legacy").map(|_| ()))
+        .await
+        .unwrap();
+    legacy.close().await.unwrap();
+}
+
+/// A legacy store migrates to the slot-log topology on its first read-write
+/// attach, serving its pre-migration data; the new commit lands in a slot a
+/// fresh reader replays, and reopening is an idempotent no-op migration.
+#[tokio::test]
+async fn a_legacy_store_migrates_on_first_write_attach_and_serves_its_data() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    legacy_store_with_schema(Arc::clone(&object_store)).await;
+
+    let catalog = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("legacy")
+            .is_some(),
+        "the pre-migration schema survives"
+    );
+    assert_eq!(
+        stored_format_and_fold(&object_store).await,
+        (commit::FORMAT_MULTI_WRITER, 0),
+        "one atomic stamp: format 4 and fold 0"
+    );
+
+    catalog
+        .commit(|tx| tx.create_schema("post").map(|_| ()))
+        .await
+        .unwrap();
+
+    // The new commit rode a slot: a fresh reader replays it over the folded,
+    // migrated store.
+    let fresh = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    let view = fresh.snapshot().await.unwrap();
+    assert!(view.schema_by_name("legacy").is_some());
+    assert!(view.schema_by_name("post").is_some());
+
+    // Reopening migrates nothing: still format 4, fold 0.
+    assert_eq!(
+        stored_format_and_fold(&object_store).await,
+        (commit::FORMAT_MULTI_WRITER, 0),
+    );
+}
+
+/// A read-only attach of a legacy store serves it unmigrated: it writes
+/// nothing, and its absent fold cursor reads as 0 with an empty tail.
+#[tokio::test]
+async fn read_only_attach_of_a_legacy_store_serves_it_unmigrated() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    legacy_store_with_schema(Arc::clone(&object_store)).await;
+
+    let reader = Catalog::open_read_only(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        reader
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("legacy")
+            .is_some()
+    );
+
+    // Nothing was written: the store is still the legacy format.
+    assert_eq!(
+        stored_format_and_fold(&object_store).await,
+        (commit::FORMAT_VERSION, 0),
+    );
+}
+
+/// Two new-binary opens racing the same legacy store converge: at least one
+/// migrates, a fenced migration re-probes and finds the store converted, and
+/// both attach cleanly onto exactly format 4 / fold 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_migrations_converge_on_one_stamp() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    legacy_store_with_schema(Arc::clone(&object_store)).await;
+
+    let (ra, rb) = tokio::join!(
+        Catalog::open(Arc::clone(&object_store), CatalogOptions::default()),
+        Catalog::open(Arc::clone(&object_store), CatalogOptions::default()),
+    );
+    let a = ra.expect("first open attaches");
+    let b = rb.expect("second open attaches");
+
+    assert_eq!(
+        stored_format_and_fold(&object_store).await,
+        (commit::FORMAT_MULTI_WRITER, 0),
+    );
+    assert!(
+        a.snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("legacy")
+            .is_some()
+    );
+    assert!(
+        b.snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("legacy")
+            .is_some()
+    );
+}
+
+/// Migrating a legacy store fences an incumbent old-binary writer: the
+/// migration opens its own writer, and the live legacy writer's next commit
+/// fails typed — never corruption, never a silent success.
+#[tokio::test]
+async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let legacy = Catalog::open_single_writer(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    legacy
+        .commit(|tx| tx.create_schema("legacy").map(|_| ()))
+        .await
+        .unwrap();
+
+    let migrated = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        migrated
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("legacy")
+            .is_some()
+    );
+
+    let err = legacy
+        .commit(|tx| tx.create_schema("doomed").map(|_| ()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Fenced(_)), "{err:?}");
 }
 
 /// A one-column ascending key over `value`.
@@ -83,7 +250,7 @@ async fn maintain_sweeps_orphaned_entries_on_a_slot_backed_catalog() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     bootstrap_multi(&object_store).await;
     seed_orphaned_entries(&object_store, 42, 5).await;
-    let catalog = Catalog::open(Arc::clone(&object_store), multi_writer_options())
+    let catalog = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
         .await
         .unwrap();
 
@@ -110,7 +277,7 @@ async fn reclaim_index_entries_runs_under_the_folder_role() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     bootstrap_multi(&object_store).await;
     seed_orphaned_entries(&object_store, 7, 5).await;
-    let catalog = Catalog::open(Arc::clone(&object_store), multi_writer_options())
+    let catalog = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
         .await
         .unwrap();
 
@@ -142,7 +309,7 @@ async fn a_commit_lands_unimpeded_during_a_maintenance_sweep() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     bootstrap_multi(&object_store).await;
     seed_orphaned_entries(&object_store, 42, 500).await;
-    let catalog = Catalog::open(Arc::clone(&object_store), multi_writer_options())
+    let catalog = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
         .await
         .unwrap();
 
@@ -163,12 +330,13 @@ async fn a_commit_lands_unimpeded_during_a_maintenance_sweep() {
     assert!(snapshot.schema_by_name("live").is_some());
 }
 
-/// Staged index builds are not yet wired for the folder role, so a slot-backed
-/// attach refuses them typed rather than routing entry batches through slots.
+/// A staged index build over a slot-backed catalog drives to ready: its
+/// definition and final flip ride the log, so a fresh attach replays the
+/// finished index. An empty table exercises the plumbing without a backfill.
 #[tokio::test]
-async fn create_index_staged_refuses_on_a_slot_backed_catalog() {
+async fn create_index_staged_lands_ready_over_the_slot_log() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let catalog = Catalog::open(Arc::clone(&object_store), multi_writer_options())
+    let catalog = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
         .await
         .unwrap();
     let table = {
@@ -194,7 +362,7 @@ async fn create_index_staged_refuses_on_a_slot_backed_catalog() {
         created.get().unwrap()
     };
 
-    let err = catalog
+    let index = catalog
         .create_index_staged(
             table,
             &crate::catalog::IndexDef {
@@ -208,6 +376,13 @@ async fn create_index_staged_refuses_on_a_slot_backed_catalog() {
             None,
         )
         .await
-        .unwrap_err();
-    assert!(matches!(err, Error::Constraint(_)), "{err:?}");
+        .unwrap();
+
+    // A fresh attach replays the finished index through the log.
+    let other = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    let info = other.snapshot().await.unwrap().indexes_of(table).remove(0);
+    assert_eq!(info.id, index);
+    assert_eq!(info.state, crate::catalog::IndexState::Ready);
 }

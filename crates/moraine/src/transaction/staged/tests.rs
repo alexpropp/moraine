@@ -69,7 +69,10 @@ fn snapshot_changes_row(id: u64, changes_made: &str) -> Vec<Cell> {
 }
 
 async fn open() -> Catalog {
-    Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+    // These tests drive the single-writer staged path directly through
+    // `begin_write_tx`, so they open the single-writer store the flip no
+    // longer builds by attach.
+    Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap()
 }
@@ -3397,10 +3400,7 @@ fn table_kind_wire_order_is_pinned() {
 /// Opens a slot-backed catalog, the topology the staged path commits through
 /// when the attach is multi-writer.
 async fn open_multi_writer_staged() -> Catalog {
-    let options = CatalogOptions {
-        multi_writer: true,
-        ..CatalogOptions::default()
-    };
+    let options = CatalogOptions::default();
     Catalog::open(Arc::new(InMemory::new()), options)
         .await
         .unwrap()

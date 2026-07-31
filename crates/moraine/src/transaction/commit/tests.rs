@@ -160,7 +160,7 @@ async fn fresh_reader_sees_committed_head() {
     use crate::catalog::{Catalog, CatalogOptions};
 
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
+    let catalog = Catalog::open_single_writer(object_store.clone(), CatalogOptions::default())
         .await
         .unwrap();
     catalog
@@ -191,7 +191,7 @@ async fn fresh_reader_sees_committed_head() {
 async fn verb_ddl_records_schema_changed_table_ids() {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile};
 
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+    let catalog = Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap();
 
@@ -258,7 +258,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
 
 async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::catalog::TableId) {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+    let catalog = Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap();
     let table = std::cell::Cell::new(None);
@@ -2787,7 +2787,7 @@ async fn maintain_refuses_a_read_only_catalog() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
 
     // Bootstrap and release the writer so the reader has a store to open.
-    let writer = Catalog::open(object_store.clone(), CatalogOptions::default())
+    let writer = Catalog::open_single_writer(object_store.clone(), CatalogOptions::default())
         .await
         .unwrap();
     writer.close().await.unwrap();
@@ -3006,7 +3006,7 @@ async fn drop_index_ends_definition_and_keeps_format() {
 async fn folded_head_view_matches_a_fresh_scan() {
     use crate::catalog::{Catalog, CatalogOptions, ColumnDef, DataFile, OptionScope};
 
-    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+    let catalog = Catalog::open_single_writer(Arc::new(InMemory::new()), CatalogOptions::default())
         .await
         .unwrap();
     let column = |name: &str| ColumnDef {
@@ -3169,42 +3169,4 @@ async fn multi_writer_bootstrap_stamps_format_four_and_fold_zero() {
     assert_eq!(fold.folded_sequence, 0);
     tx.rollback();
     db.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn single_writer_open_refuses_a_multi_writer_store() {
-    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = open_initialized(
-        StoreBuilder::new("", object_store.clone()),
-        false,
-        None,
-        true,
-    )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, false)
-        .await
-        .err()
-        .unwrap();
-    assert!(matches!(err, Error::Configuration(_)));
-}
-
-#[tokio::test]
-async fn multi_writer_flag_refuses_an_existing_single_writer_store() {
-    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = open_initialized(
-        StoreBuilder::new("", object_store.clone()),
-        false,
-        None,
-        false,
-    )
-    .await
-    .unwrap();
-    db.close().await.unwrap();
-    let err = open_initialized(StoreBuilder::new("", object_store), false, None, true)
-        .await
-        .err()
-        .unwrap();
-    assert!(matches!(err, Error::Configuration(_)));
 }

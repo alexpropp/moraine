@@ -1112,10 +1112,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     async fn seeded() -> (Catalog, Ids) {
         let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
-        let options = CatalogOptions {
-            multi_writer: true,
-            ..CatalogOptions::default()
-        };
+        let options = CatalogOptions::default();
         let catalog = Catalog::open(store, options).await.unwrap();
         catalog
             .commit(|tx| {

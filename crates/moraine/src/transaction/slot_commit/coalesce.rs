@@ -27,7 +27,7 @@ use super::{
     Admission, SlotHead, admit, apply, classify_lost_race, materialize_slot_head, release_reader,
 };
 use crate::{
-    catalog::{CatalogSnapshot, MultiWriterStore, SnapshotId},
+    catalog::{CatalogSnapshot, SlotStore, SnapshotId},
     error::{Error, Result},
     store::handle::ReadHandle,
     transaction::{
@@ -71,7 +71,7 @@ impl CommitCoalescer {
 
     /// Commits `f` through the batch: leads a new batch if none is running,
     /// else joins the running one and waits for its outcome.
-    pub(crate) async fn commit<F>(&self, store: &MultiWriterStore, f: &F) -> Result<SnapshotId>
+    pub(crate) async fn commit<F>(&self, store: &SlotStore, f: &F) -> Result<SnapshotId>
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
@@ -129,12 +129,7 @@ impl CommitCoalescer {
 
     /// Drives one batch to its slot, then hands the baton on. The leader
     /// contributes its own commit inline and orchestrates the followers.
-    async fn lead<F>(
-        &self,
-        store: &MultiWriterStore,
-        f: &F,
-        leader: Arc<Member>,
-    ) -> Result<SnapshotId>
+    async fn lead<F>(&self, store: &SlotStore, f: &F, leader: Arc<Member>) -> Result<SnapshotId>
     where
         F: Fn(&mut Transaction) -> Result<()>,
     {
@@ -163,7 +158,7 @@ impl CommitCoalescer {
 
     async fn drive_batch<F>(
         &self,
-        store: &MultiWriterStore,
+        store: &SlotStore,
         f: &F,
         leader: Arc<Member>,
     ) -> Result<SnapshotId>
@@ -209,7 +204,7 @@ impl CommitCoalescer {
     /// next one itself.
     async fn participate<F>(
         &self,
-        store: &MultiWriterStore,
+        store: &SlotStore,
         f: &F,
         member: Arc<Member>,
     ) -> Result<SnapshotId>
@@ -289,7 +284,7 @@ struct Base {
 }
 
 impl Base {
-    fn from_head(store: &MultiWriterStore, head: SlotHead) -> Self {
+    fn from_head(store: &SlotStore, head: SlotHead) -> Self {
         let SlotHead {
             view,
             overlay,

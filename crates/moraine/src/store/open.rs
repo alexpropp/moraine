@@ -22,25 +22,32 @@ use crate::{
 /// The default WAL flush cadence when none is configured.
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The default reader manifest-poll cadence when none is configured. A reader
+/// following the log lags the head by up to this interval.
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Opens a moraine store on `object_store` — a read-write [`Db`] via
 /// [`open_writer`](Self::open_writer) or a read-only [`DbReader`] via
 /// [`open_reader`](Self::open_reader) — carrying the shared open
-/// configuration: the WAL flush cadence (writer only) and the on-disk cache.
+/// configuration: the WAL flush cadence (writer only), the reader
+/// manifest-poll cadence (reader only), and the on-disk cache.
 pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
     flush_interval: Duration,
+    refresh_interval: Duration,
     cache_dir: Option<PathBuf>,
 }
 
 impl<'a> StoreBuilder<'a> {
     /// A builder for the store at `path` on `object_store`, with the default
-    /// flush cadence and no on-disk cache.
+    /// flush and refresh cadences and no on-disk cache.
     pub(crate) fn new(path: &'a str, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             path,
             object_store,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            refresh_interval: DEFAULT_REFRESH_INTERVAL,
             cache_dir: None,
         }
     }
@@ -51,8 +58,18 @@ impl<'a> StoreBuilder<'a> {
     /// timer), so a durable commit waits only on the object-store PUT — the
     /// lowest latency, at the cost of a busy flush loop. Writer only — a
     /// reader never flushes.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn flush_interval(mut self, flush_interval: Duration) -> Self {
         self.flush_interval = flush_interval;
+        self
+    }
+
+    /// Sets the reader manifest-poll cadence. A reader following the slot log
+    /// refreshes its view of the folded store on this interval, so it lags the
+    /// head by up to this long; a shorter interval trades more manifest reads
+    /// for less fold lag. Reader only — a writer follows its own cadence.
+    pub(crate) fn refresh_interval(mut self, refresh_interval: Duration) -> Self {
+        self.refresh_interval = refresh_interval;
         self
     }
 
@@ -80,7 +97,15 @@ impl<'a> StoreBuilder<'a> {
     /// manifest. A `DbReader` never opens the writer `Db`, so it never fences
     /// a live writer. The flush cadence, if set, is ignored.
     pub(crate) async fn open_reader(self) -> Result<DbReader> {
+        // The checkpoint lifetime must exceed twice the poll interval; keep
+        // SlateDB's default headroom, widening it only for a long interval.
+        let checkpoint_lifetime = self
+            .refresh_interval
+            .saturating_mul(3)
+            .max(Duration::from_secs(10 * 60));
         let options = DbReaderOptions {
+            manifest_poll_interval: self.refresh_interval,
+            checkpoint_lifetime,
             object_store_cache_options: self.cache_options(),
             ..Default::default()
         };

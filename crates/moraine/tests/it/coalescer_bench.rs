@@ -9,11 +9,11 @@
 //! The number that decides the trade is requests **by class** — PUT and LIST
 //! share object storage's expensive tier — counted over `InMemory`, where the
 //! one quantity being weighed (a conditional-PUT round trip) is free of
-//! latency but still one request. Three configurations commit the same
-//! workload: a tuned single-writer baseline (continuous flush), the slot path
-//! driven commit-at-a-time (the coalescer degenerates to a one-member batch,
-//! so this is the ~1-PUT/commit slot cost), and the slot path under
-//! concurrency (the coalescer batches, recovering the PUT rate).
+//! latency but still one request. The flip makes the slot log the only commit
+//! topology, so two configurations of it are measured: driven commit-at-a-time
+//! (the coalescer degenerates to a one-member batch, the ~1-PUT/commit slot
+//! floor) and under concurrency (the coalescer batches, recovering the PUT
+//! rate). These reproduce the slot-path figures Task 8c's gate recorded.
 
 use std::{sync::Arc, time::Duration};
 
@@ -83,15 +83,8 @@ async fn open(store: &Arc<CountingStore>, options: CatalogOptions) -> Catalog {
         .unwrap()
 }
 
-fn single_writer(flush: Duration) -> CatalogOptions {
+fn slots(window: Duration) -> CatalogOptions {
     let mut options = CatalogOptions::default();
-    options.flush_interval = flush;
-    options
-}
-
-fn multi_writer(window: Duration) -> CatalogOptions {
-    let mut options = CatalogOptions::default();
-    options.multi_writer = true;
     options.commit_batch_window = window;
     options
 }
@@ -101,28 +94,11 @@ fn multi_writer(window: Duration) -> CatalogOptions {
 async fn coalescer_bench_counts_requests_by_class() {
     println!("\n=== commit-path request classes over {COMMITS} single-statement commits ===");
 
-    // A tuned single-writer baseline: continuous flush, so every durable
-    // commit pays its object-store write rather than amortizing under the
-    // 100ms flush cap.
-    {
-        let store = Arc::new(CountingStore::new());
-        let catalog = open(&store, single_writer(Duration::ZERO)).await;
-        let before = Sample::of(&store);
-        for i in 0..COMMITS {
-            catalog
-                .commit(move |tx| tx.create_schema(&format!("s{i}")).map(|_| ()))
-                .await
-                .unwrap();
-        }
-        Sample::since(&store, before).report("single-writer (flush=0), serial", COMMITS);
-        catalog.close().await.unwrap();
-    }
-
     // The slot path, commit-at-a-time: the coalescer forms a one-member batch
     // each time, so this is the slot topology's ~1-PUT/commit floor.
     {
         let store = Arc::new(CountingStore::new());
-        let catalog = open(&store, multi_writer(Duration::ZERO)).await;
+        let catalog = open(&store, slots(Duration::ZERO)).await;
         let before = Sample::of(&store);
         for i in 0..COMMITS {
             catalog
@@ -145,7 +121,7 @@ async fn coalescer_bench_counts_requests_by_class() {
         ),
     ] {
         let store = Arc::new(CountingStore::new());
-        let catalog = open(&store, multi_writer(window)).await;
+        let catalog = open(&store, slots(window)).await;
         let before = Sample::of(&store);
         let results = futures::future::join_all(
             (0..COMMITS)
