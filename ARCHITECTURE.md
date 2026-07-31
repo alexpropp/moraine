@@ -202,7 +202,7 @@ failure mode is silent corruption. Tiers, per
 | Tier | Home | What |
 |---|---|---|
 | **Unit** | colocated `#[cfg(test)]` | Tricky internals: key encoding, codecs, conflict resolution. **Proptest roundtrips mandatory** in `store`. |
-| **Integration** | `crates/moraine/tests/` | Public API against **real SlateDB on in-memory `object_store` — no mocks of the store layer.** Snapshot visibility, concurrent-commit conflicts, crash-shaped sequences. |
+| **Integration** | `crates/moraine/tests/` | Public API against **real SlateDB on in-memory `object_store` — no mocks of the store layer.** Snapshot visibility, concurrent-commit conflicts, and the named crash cases below. |
 | **E2E** | `crates/moraine-duckdb/tests/`, via `cargo xtask e2e` | Build the cdylib, load into real DuckDB, run actual DuckLake SQL — validating assumptions about what DuckLake demands, not just that the code does what we think. |
 | **Fuzzing** (future) | `fuzz/` | `cargo-fuzz` on `store` codecs and the commit read-path once codecs stabilize. |
 

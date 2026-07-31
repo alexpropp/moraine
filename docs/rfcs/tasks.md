@@ -26,7 +26,7 @@ deliberately not itemized here.
 
 ## Where the weight is
 
-Three things gate disproportionately much of the list:
+Two things gate disproportionately much of the list:
 
 - **Reader refresh** (RFC 0009). Reads now serve from the cache, so a warm
   read costs one point read. What is missing is *incremental* refresh: a
@@ -39,14 +39,6 @@ Three things gate disproportionately much of the list:
   readers are safe against the first real one. Everything that writes the
   marker is unbuilt: no start batch, no step loop, no finish flip, no
   cursor, no migrate verb.
-- **The crash harness** (RFC 0011). The crash cases are enumerated and driven
-  as data, with `CommitDurableNotAcknowledged`, `TakeoverMidCommit`,
-  `FencedWriterResumes`, and `ConcurrentGenesis` covered end to end. The other
-  one case that remains is blocked on a feature rather than the harness:
-  group commit is unbuilt, so no batch carries several commits. Both
-  guarantees moraine owns — atomicity and resumability — have driven cases,
-  and the store-level write freeze RFC 0015's seam coverage wanted is
-  built.
 
 ## 0001 — Repository structure and conventions
 
@@ -330,18 +322,19 @@ Three things gate disproportionately much of the list:
   that (a deadline, or classifying some object-store errors as terminal) is
   open; the crash cases do not need it, since a dying process never learns
   its outcome either.
-- **VALIDATE** — An e2e crash case for the engine-side ordering contract:
-  kill a process between DuckLake's Parquet PUT and the commit registering
-  it, and assert the file is an orphan rather than a live dangling
-  reference. 0011 now states this boundary but does not enumerate it, since
-  only `cargo xtask e2e` runs both halves.
+- **VALIDATE** — Regression-pin DuckLake's write-before-register ordering,
+  the way 0004 pins its retry loop and conflict matrix: kill a process
+  between DuckLake's Parquet PUT and the commit registering it, and assert
+  the file is an orphan rather than a live dangling reference. The ordering
+  is the engine's to maintain, but moraine's catalog is what would carry the
+  dangling reference if it ever changed, so the assumption is worth pinning
+  where both halves run. Low priority — it needs the e2e tier.
 - **DECISION** — Should a concurrent-open loser surface a typed error?
   `ConcurrentGenesis` shows the store stays coherent (200 races, zero torn
   genesis) but the loser fails as `Error::Fenced` roughly a third of the time
   and as an untyped `Error::Store` carrying SlateDB's manifest-CAS collision
   the rest. The case requires "adopts it, or returns a typed error". Telling
-  that
-  collision from real corruption needs a condition SlateDB keeps
+  that collision from real corruption needs a condition SlateDB keeps
   `pub(crate)` — both surface as `ErrorKind::Data` — so the options are a
   message match, an open-path retry, or an upstream change.
 - **DECISION** — Does moraine pin `WriteOptions` `seqnum` itself, or let
@@ -359,24 +352,8 @@ Three things gate disproportionately much of the list:
   Closing the last one closes the enforcement RFC 0011 asks for, since the
   coverage table will then be empty and "a variant with no assertion fails"
   becomes literally true rather than a convention.
-- **VALIDATE** — The idempotence cases (`CommitDurableNotAcknowledged`,
-  `StagedBuildInterrupted`, `ReclamationInterrupted`) all re-drive after
-  reopen and assert convergence. Closed; kept here until the remaining four
-  cases land, since a write freeze may add re-drive assertions of its own.
-- **VALIDATE** — The absence cases (`MultiTombstoneDrop`,
-  `GenesisInterrupted`) sweep the write allowance across every boundary the
-  operation has and assert the torn intermediate is unobservable at each.
-  Closed.
-- **VALIDATE** — Confirmed by construction: the crash cases added no
-  production surface at all. Crashes come from dropping a handle, freezing a
-  decorating `ObjectStore`, or opening a second writer, so there is no seam
-  hook to gate, no `unsafe`, and no fault-injection parameter in any public
-  signature. Re-check when RFC 0015's migration driver lands its own hook.
 - **DEFERRED** — A `cargo-fuzz` target that crashes at arbitrary WAL offsets
   and reopens, asserting the same two guarantees, once every case is green.
-- **DOC** — 0001 and 0004 still carry generic crash-shaped-sequence bullets;
-  replace them with citations to `CommitNotDurable` and
-  `CommitDurableNotAcknowledged`.
 
 ## 0012 — Schema evolution and versioning
 
@@ -449,7 +426,12 @@ Three things gate disproportionately much of the list:
 - **VALIDATE** — Crash injection at every migration seam — the start batch,
   each step's new-key write and old-key delete, each cursor advance, the finish
   flip — asserting reopen always yields a coherent store and never
-  new-format-with-marker. Depends on 0011.
+  new-format-with-marker. 0011's half is built: the store-level write freeze
+  exists, and the driver is the third resumable path its cases anticipate.
+  This is also the first case needing an in-code seam hook, so it is where
+  `CrashCase` moves into the library and where the gating is re-checked —
+  zero production footprint, no `unsafe`, no fault-injection parameter in
+  any public signature.
 - **VALIDATE** — With the marker present, a read-only attach that was already
   open when the migration started returns the typed error. The gate itself is
   shared (every read opens its session through one place, which refuses), and

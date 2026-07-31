@@ -603,8 +603,11 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   `CommitConflict`.
 - Staged-row commits never retry internally: a lost head on the extension
   path returns `CommitConflict` with the store unchanged by the loser.
-- Crash-shaped sequences: partial batch never observable (atomicity);
-  commit, reopen, verify head and snapshot resolve consistently.
+- Crash-shaped sequences: RFC 0011's `CommitNotDurable` (a batch whose WAL
+  never landed leaves the head unmoved and no record visible) and
+  `CommitDurableNotAcknowledged` (one that landed survives, and a re-drive
+  runs against the advanced head without colliding). Group commit adds
+  `GroupCommit` when it is built.
 - Counter monotonicity: `next_catalog_id`/`next_file_id`/per-table
   `next_row_id` never regress or collide across concurrent commits.
 - Bounded retry terminates: a forced write storm returns `CommitConflict`
