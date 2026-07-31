@@ -93,6 +93,18 @@ pub(crate) fn durable() -> WriteOptions {
     }
 }
 
+/// A commit that returns without waiting for the write to reach object
+/// storage. The write is still atomic and visible to this handle at once;
+/// only the durability wait — a flush-cadence tick — is skipped. Use it
+/// where a lost write is self-correcting, never where a caller treats the
+/// return as a durable fact.
+pub(crate) fn non_durable() -> WriteOptions {
+    WriteOptions {
+        await_durable: false,
+        ..Default::default()
+    }
+}
+
 /// Refuses a store this binary must not touch: mid-migration, or a
 /// format newer/older than it understands. `None` format means the store
 /// is empty and needs bootstrap.
