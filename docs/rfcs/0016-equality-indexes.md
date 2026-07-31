@@ -306,11 +306,11 @@ fits in memory at all. Three properties are load-bearing:
   which entry a rejection names does not depend on which probe finished
   first. A bulk load probes nearly every key it stages, but each probe is a
   bloom-filtered point read whose cost does not grow with the index, and the
-  bounded fan-out overlaps their latency — so the batch stays linear in rows
-  without a second resolution mode. A sorted range scan would be worse for
-  the common case: a bulk load's indexed values are not store-ordered, so one
-  scan sweeps the whole index serially where the concurrent point reads touch
-  only the blocks they need, in parallel.
+  bounded fan-out overlaps the object store's per-read latency — so the batch
+  stays linear in rows without a second resolution mode. A sorted range scan
+  would be worse for the common case: a bulk load's indexed values are not
+  store-ordered, so one scan sweeps the whole index serially where the
+  concurrent point reads touch only the blocks they need, in parallel.
 - **Entries stage onto the transaction directly.** They never enter the
   write list the committer retains for the maintained projections. No
   projection reflects an index entry, so retaining them would hold a second
