@@ -120,6 +120,11 @@ mod tests {
         OptionScopeValue
     );
     codec_tests!(roundtrip_snapshot, garbage_snapshot, SnapshotValue);
+    codec_tests!(
+        roundtrip_commit_delta,
+        garbage_commit_delta,
+        CommitDeltaValue
+    );
     codec_tests!(roundtrip_gcfile, garbage_gcfile, GcFileValue);
     codec_tests!(roundtrip_format, garbage_format, FormatValue);
     codec_tests!(roundtrip_head, garbage_head, HeadValue);

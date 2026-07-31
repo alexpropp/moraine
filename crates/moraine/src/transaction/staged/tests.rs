@@ -2530,6 +2530,42 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     catalog.close().await.unwrap();
 }
 
+/// A commit records the current keys it wrote, and expiry takes that
+/// record with the snapshot: a delta outliving the entity versions it
+/// names would let a refresh replay a gap the store can no longer resolve.
+#[tokio::test]
+async fn expiry_takes_the_commit_delta_with_the_snapshot() {
+    let catalog = open().await;
+    seed_expired_file(&catalog).await;
+
+    let session = catalog.begin_read().await.unwrap();
+    let before = crate::store::read::read_commit_delta(session.handle(), 1)
+        .await
+        .unwrap();
+    session.finish();
+    assert!(
+        before.is_some_and(|delta| !delta.current_keys.is_empty()),
+        "a minting commit must record the keys it wrote"
+    );
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::Snapshot,
+        cells: vec![Cell::U64(1)],
+    });
+    tx.commit().await.unwrap();
+
+    let session = catalog.begin_read().await.unwrap();
+    let after = crate::store::read::read_commit_delta(session.handle(), 1)
+        .await
+        .unwrap();
+    session.finish();
+    assert!(after.is_none(), "the delta must expire with its snapshot");
+
+    catalog.close().await.unwrap();
+}
+
 /// Cleanup's staged shape: after DuckDB deletes the bytes, the
 /// schedule row is forgotten in a head-preserving commit.
 #[tokio::test]

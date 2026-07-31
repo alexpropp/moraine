@@ -130,9 +130,10 @@ better fix; recorded as a follow-up in `docs/rfcs/tasks.md` under 0021.
 
 ### Materialization cost vs. catalog size
 
-`Catalog::snapshot()` calls `materialize` and never consults the projection
-cache, so this cost is paid on *every* public read, not just a cold start.
-Median of 9 materializations, 8 columns and 16 files per table:
+This is the cost of a *cold* read — one whose handle holds no cached view.
+A warm read serves from the projection cache and pays none of it. Median of
+9 materializations, 8 columns and 16 files per table, a fresh handle per
+repeat so no cache hit is timed:
 
 | tables | live entities | median materialization | µs / 1 000 entities |
 |---|---|---|---|
@@ -142,12 +143,38 @@ Median of 9 materializations, 8 columns and 16 files per table:
 | 800 | 20 000 | 146 ms | 7 300 |
 
 Materialization is roughly linear at ~5–7 µs per live entity — flush-interval
-independent, since it is a read. A 20 000-entity catalog costs ~150 ms per
-read; extrapolated, a 100 000-entity catalog would cost most of a second on
-every `snapshot()`. That is the quantitative case for the two open 0009 items:
-serving readers from the maintained cache instead of rematerializing, and,
-further out, lazy materialization to bound the per-read cost on a large
-catalog.
+independent, since it is a read. A 20 000-entity catalog costs ~150 ms; a
+100 000-entity catalog would cost most of a second. Readers now serve from
+the cache rather than paying this per read; lazy materialization to bound
+the cold cost on a large catalog stays open.
+
+### Refresh vs. rematerialization, by churn
+
+What an incremental refresh saves over a full rescan, and where the two
+cross. 200 tables, 16 files each, one commit of `churn` file registrations
+between the held view and head; minimum of 25, which is the stabler figure
+here since noise on an in-memory store only ever adds time.
+
+| churn | live entities | remat | refresh | view copy | speedup |
+|---|---|---|---|---|---|
+| 1 | 3 801 | 5.25 ms | 0.28 ms | 0.27 ms | 18.9× |
+| 10 | 3 810 | 7.75 ms | 0.61 ms | 0.44 ms | 12.7× |
+| 100 | 3 900 | 5.61 ms | 0.86 ms | 0.28 ms | 6.5× |
+| 300 | 4 100 | 5.69 ms | 1.62 ms | 0.26 ms | 3.5× |
+| 1 000 | 4 800 | 6.76 ms | 3.70 ms | 0.28 ms | 1.8× |
+
+Two things fall out. The view copy a refresh must pay before applying
+anything is ~0.07 µs per live entity — about a twentieth of the ~1.4 µs per
+entity a scan costs — so copying the catalog is cheap next to scanning and
+decoding it, and at low churn the copy *is* the whole refresh. Past that,
+each changed key costs ~3 µs, so replay cost is `copy + churn × 3 µs`
+against a scan's `entities × 1.4 µs`; they meet near churn = 0.44 ×
+entities, which is where the refresh threshold is set (two fifths, rounded
+toward falling back early). A real object store makes a point read dearer
+relative to a sequential scan, so its crossover sits lower than this.
+
+The unchanged-head case is not in the table because it does no replay at
+all: two point reads and a refcount bump, independent of catalog size.
 
 ### Read concurrency under IO latency
 

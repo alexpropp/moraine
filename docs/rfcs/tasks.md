@@ -26,10 +26,8 @@ deliberately not itemized here.
 
 ## Where the weight is
 
-Three things gate disproportionately much of the list:
+Two things gate disproportionately much of the list:
 
-- **Reader refresh** (RFC 0009). No incremental refresh exists at all; every
-  public read rematerializes.
 - **Format migration** (RFC 0015). The `sys/migration` marker is reserved and
   refused-on-open, and nothing else. The reader gate must ship in format
   version 1 — before any migration exists — or fielded readers are unsafe
@@ -51,10 +49,6 @@ Three things gate disproportionately much of the list:
 
 ## 0002 — SlateDB key encoding for catalog state
 
-- **IMPL** — Check `sys/migration` in **every** materialization, not only on
-  open. The keyspace map requires it; today only the open path reads the
-  marker, so a migration that begins under a live reader is invisible to it.
-  Shared with 0009 and 0015 — the reader gate is one piece of work.
 - **VALIDATE** — Exercise the segmented-store configuration (one-byte segment
   extractor) through the crash and recovery matrix. The segmented path is
   less-exercised in SlateDB, and the choice is only free to reverse before the
@@ -214,27 +208,25 @@ Three things gate disproportionately much of the list:
 
 ## 0009 — Reader consistency and snapshot caching
 
-- **IMPL** — Incremental refresh: pin a fresh read-snapshot, check `sys/head`
-  and the migration marker, scan `snap/{S+1..head}` under the same handle, and
-  re-read or drop just the entities each record's `snapshot_changes` names.
-  Nothing exists; the only forward-folding applies the committer's own batch.
-- **IMPL** — Fall back to full rematerialization when `S` has fallen below the
-  horizon `H` and the gap's `snapshot` records may have been reclaimed.
-- **IMPL** — A churn-versus-catalog-size threshold that falls back to a full
-  `current` rescan when replaying the changelog would cost more.
-- **DECISION** — The churn ratio for that threshold. Full-materialization cost
-  is measured (`BENCHMARK.md` → Core measurements: ~5–7 µs per live entity,
-  linear); the crossover it trades against needs incremental refresh built to
-  measure the other side.
+- **MEASURE** — The churn ratio against a *real* object store. The shipped
+  ratio (two fifths) comes from the in-memory measurement in `BENCHMARK.md`
+  → Refresh vs. rematerialization, where a point read and a sequential scan
+  cost far more alike than they do over a network. The true crossover on a
+  remote store is lower; how much lower is unmeasured.
+- **MEASURE** — The `MAX_DELTA_KEYS` cap (4096): it bounds one commit's delta
+  record, and nothing has yet checked what fraction of real commits it
+  suppresses.
+- **MEASURE** — Whether the advanced refresh path is reachable in practice on
+  a single writer. Its own commits fold forward into the cache, so a
+  same-process reader lands on the unchanged path instead; the replay only
+  fires in the race window between a concurrent commit's head write and its
+  fold, and would become the main path if caching is extended to read-only
+  catalogs.
 - **IMPL** — Pin an explicit read-snapshot on the read-only path. The
   `DbReader` follows the manifest with no pinned checkpoint, so a read-only
   materialization is not snapshot-isolated the way the read-write path is.
-- **IMPL** — Serve public readers from the cached `CatalogSnapshot`. The cache
-  exists but only committers consume it; `Catalog::snapshot()` always
-  rematerializes.
-- **IMPL** — Return `SnapshotExpired` for a view driven past the retention
-  window, so a reader re-resolves from head instead of dereferencing reclaimed
-  files. Depends on the 0003 error variants.
+  Read-only catalogs keep no cache and rematerialize on every read, so this
+  is also what gates extending refresh to them.
 - **IMPL** — Stop cloning the whole entity set to serve one kind.
   `ffi_support::dump_entities` takes its extractor by value, so it clones every
   record in the cached `Arc<Vec<EntityRecord>>` and then discards the kinds it
@@ -256,14 +248,13 @@ Three things gate disproportionately much of the list:
   Whichever is taken first pulls the other with it.
 - **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
   re-resolve per statement? This sets how tight the retention window must be.
-- **VALIDATE** — The refresh test suite: a commit landing mid-materialization
-  yields an entirely pre- or entirely post-commit view, never torn; a view
-  built at `S` still returns the `S` view after `k` commits; an incremental
-  refresh to head is byte-identical to a full rematerialization; a reader below
-  the horizon rematerializes while an expired request errors; a
-  materialization under `sys/migration` returns the typed error and never a
-  partial view; a commit landing between a commit attempt's materialization
-  and its batch write is always detected.
+- **VALIDATE** — The refresh cases that need concurrency the suite cannot yet
+  stage: a commit landing mid-materialization yields an entirely pre- or
+  entirely post-commit view, never torn; a view built at `S` still returns the
+  `S` view after `k` commits; a commit landing between a commit attempt's
+  materialization and its batch write is always detected. The single-writer
+  cases — refresh equals rematerialization, the three fallbacks, the migration
+  refusal, and the install compare-and-set — are covered.
 
 ## 0010 — Async↔sync bridge
 

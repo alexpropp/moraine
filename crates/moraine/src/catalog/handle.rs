@@ -16,11 +16,12 @@ use crate::{
     catalog::{
         CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo, FileIndexEntry, IndexDef,
         IndexEntry, IndexId, IndexInfo, IndexState, RowHolder, RowLocation, SnapshotId, TableId,
-        projection::ProjectionCache, scoped_read,
+        projection::{ProjectionCache, cache_epoch, cached_head_view_any, install_head_view_at},
+        scoped_read,
     },
     error::{Error, Result},
     store::{
-        handle::ReadSession,
+        handle::{ReadHandle, ReadSession},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
@@ -28,7 +29,7 @@ use crate::{
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
     },
-    transaction::{Transaction, commit, index_maintenance},
+    transaction::{Refreshed, Transaction, commit, index_maintenance},
 };
 
 /// How many entries one staged build step commits. At roughly a kilobyte
@@ -272,10 +273,14 @@ impl Catalog {
 
     /// An immutable view of the catalog at the latest committed snapshot.
     ///
+    /// Shared rather than owned: a warm handle hands back the view it
+    /// already holds, so repeated reads cost neither a store scan nor a
+    /// copy of the catalog.
+    ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be read.
-    pub async fn snapshot(&self) -> Result<CatalogSnapshot> {
+    pub async fn snapshot(&self) -> Result<Arc<CatalogSnapshot>> {
         self.view(None).await
     }
 
@@ -285,16 +290,49 @@ impl Catalog {
     ///
     /// Returns [`Error::NotFound`] if `snapshot` is beyond the head, or
     /// another error if the store cannot be read.
-    pub async fn snapshot_at(&self, snapshot: SnapshotId) -> Result<CatalogSnapshot> {
+    pub async fn snapshot_at(&self, snapshot: SnapshotId) -> Result<Arc<CatalogSnapshot>> {
         self.view(Some(snapshot.get())).await
     }
 
-    async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
+    /// Time travel always materializes: the cache holds head views only, and
+    /// a past snapshot is reconstructed from `history` rather than advanced
+    /// from a newer state. A read-only catalog also materializes — it has no
+    /// local commits, so nothing ever populates a cache for it to serve.
+    async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
+        if at.is_some() || !self.maintains_projections() {
+            let session = self.begin_read().await?;
+            let view = commit::materialize(session.handle(), at).await;
+            session.finish();
+
+            return view.map(Arc::new);
+        }
+
+        // Captured before the first store read, so an invalidation racing
+        // this read cannot be overwritten by what it invalidated.
+        let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
-        let view = commit::materialize(session.handle(), at).await;
+        let view = self.refreshed_head_view(session.handle()).await;
         session.finish();
 
-        view
+        let view = view?;
+        install_head_view_at(&self.projections, epoch, Arc::clone(&view));
+
+        Ok(view)
+    }
+
+    /// Refreshes the cached view forward when there is one, else builds it.
+    /// An unmoved head hands back the very same view, so a reader that polls
+    /// a quiet catalog pays one point read and no copy at all.
+    async fn refreshed_head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
+        if let Some(cached) = cached_head_view_any(&self.projections) {
+            match commit::refresh(handle, &cached).await? {
+                Refreshed::Unchanged => return Ok(cached),
+                Refreshed::Advanced(view) => return Ok(view),
+                Refreshed::Rescan => {}
+            }
+        }
+
+        Ok(Arc::new(commit::materialize(handle, None).await?))
     }
 
     /// Resolves an equality lookup to the rows currently holding `values`.

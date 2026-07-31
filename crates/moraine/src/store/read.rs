@@ -7,10 +7,10 @@ use crate::{
         handle::ReadHandle,
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
-            GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
-            OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
-            TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
+            ColumnValue, CommitDeltaValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
+            FormatValue, GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue,
+            MigrationValue, OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue,
+            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         value,
     },
@@ -140,6 +140,15 @@ pub(crate) async fn read_snapshot(
     snapshot_id: u64,
 ) -> Result<Option<SnapshotValue>> {
     read_singleton(handle, Key::Snapshot { snapshot_id }).await
+}
+
+/// The changed-key record one commit wrote, `None` when the commit wrote
+/// none or the record has expired with its snapshot.
+pub(crate) async fn read_commit_delta(
+    handle: ReadHandle<'_>,
+    snapshot_id: u64,
+) -> Result<Option<CommitDeltaValue>> {
+    read_singleton(handle, Key::CommitDelta { snapshot_id }).await
 }
 
 /// Every committed snapshot record (`ducklake_snapshot` +

@@ -33,14 +33,7 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
     for (encoded_key, write) in writes {
         let bytes = write.as_deref();
         match Key::decode(encoded_key)? {
-            Key::Current(CurrentKey::Entity(entity)) => match bytes {
-                Some(bytes) => view.put_record(decode_entity(entity, bytes)?),
-                None => remove_entity(view, entity)?,
-            },
-            Key::Current(CurrentKey::GcFile { data_file_id }) => match bytes {
-                Some(bytes) => view.put_gc_file(value::decode_value(bytes)?),
-                None => view.remove_gc_file(data_file_id),
-            },
+            Key::Current(current) => apply_current(view, current, bytes)?,
             // The minted snapshot record; an expiry deletes older ones,
             // which leave the head view's entities untouched.
             Key::Snapshot { .. } => {
@@ -68,6 +61,28 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
         view.snapshot = snapshot;
     }
 
+    Ok(())
+}
+
+/// Applies one `current` key's state to `view`: `Some` bytes put the decoded
+/// record, `None` removes it. Shared with the incremental refresh, which
+/// reaches the same states by re-reading each key rather than by replaying a
+/// staged batch — one path, so the two cannot diverge.
+pub(super) fn apply_current(
+    view: &mut CatalogSnapshot,
+    key: CurrentKey,
+    bytes: Option<&[u8]>,
+) -> Result<()> {
+    match key {
+        CurrentKey::Entity(entity) => match bytes {
+            Some(bytes) => view.put_record(decode_entity(entity, bytes)?),
+            None => remove_entity(view, entity)?,
+        },
+        CurrentKey::GcFile { data_file_id } => match bytes {
+            Some(bytes) => view.put_gc_file(value::decode_value(bytes)?),
+            None => view.remove_gc_file(data_file_id),
+        },
+    }
     Ok(())
 }
 

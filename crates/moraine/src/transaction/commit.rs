@@ -15,8 +15,8 @@ use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId,
         projection::{
-            ProjectionCache, cached_head_view, fold_committed_batch, install_head_view,
-            invalidate_head_view,
+            ProjectionCache, cache_epoch, cached_head_view, cached_head_view_any,
+            fold_committed_batch, install_head_view, install_head_view_at, invalidate_head_view,
         },
     },
     error::{Error, Result},
@@ -276,7 +276,22 @@ pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<D
 /// and any staged writes share one read point. `at: None` reads the head
 /// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
 /// entities live at `s`.
+/// Refuses a store whose keyspace is mid-move. A structural migration
+/// rewrites keys in place, so any scan of it may be missing records that
+/// have not arrived yet; failing is the only way to avoid returning a
+/// silently partial catalog.
+pub(crate) async fn refuse_mid_migration(tx: ReadHandle<'_>) -> Result<()> {
+    match read::read_migration(tx).await? {
+        Some(marker) => Err(Error::Migration(format!(
+            "store is migrating from format {} to {}; reads are unavailable until it completes",
+            marker.from_format, marker.to_format
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
+    refuse_mid_migration(tx).await?;
     let head = read::read_head(tx)
         .await?
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
@@ -317,10 +332,14 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
 /// One staged write: `Some` puts, `None` deletes.
 pub(crate) type StagedWrite = (Vec<u8>, Option<Vec<u8>>);
 
+mod delta;
 mod diff;
 mod fold;
+mod refresh;
+pub(crate) use delta::write_for as delta_write_for;
 use diff::diff_options;
 pub(crate) use diff::diff_writes;
+pub(crate) use refresh::{Refreshed, refresh};
 
 /// The result of one commit attempt.
 enum CommitOutcome {
@@ -387,29 +406,41 @@ where
     }
 }
 
-/// Reads the head through `db_tx` and returns the cached head view when it
-/// matches, else materializes it fresh. Staging against this is what lets a
-/// commit skip the full `current` rescan.
+/// The view a commit attempt stages against: the cached one when it already
+/// matches head, else that view refreshed forward, else a fresh
+/// materialization. Staging against this is what lets a commit skip the full
+/// `current` rescan.
 ///
-/// A miss does **not** install: the cache is populated only by a
-/// head-advancing commit's success, whose unique minted id and successful
-/// commit together prove the folded view is the true committed state. A
-/// view materialized here reflects only this transaction's snapshot, which
-/// a racing head-preserving commit (id reused, content changed) could make
-/// stale — installing it under the reused id would let a later commit stage
-/// against diverged state.
+/// Every read runs through `db_tx`, so the premise view and the
+/// conflict-detection window share one start sequence and no commit can land
+/// between them unnoticed. The install is compare-and-set against an epoch
+/// captured first, so a head-preserving commit (id reused, content changed)
+/// that invalidates mid-read cannot have its invalidation undone here.
 pub(crate) async fn head_view_for(
     db_tx: &DbTransaction,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<Arc<CatalogSnapshot>> {
-    let head = read::read_head(ReadHandle::Tx(db_tx))
+    let epoch = cache_epoch(projections);
+    let handle = ReadHandle::Tx(db_tx);
+    let head = read::read_head(handle)
         .await?
         .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
         .snapshot_id;
     if let Some(view) = cached_head_view(projections, head) {
         return Ok(view);
     }
-    Ok(Arc::new(materialize(ReadHandle::Tx(db_tx), None).await?))
+
+    let view = match cached_head_view_any(projections) {
+        Some(cached) => match refresh(handle, &cached).await? {
+            Refreshed::Unchanged => cached,
+            Refreshed::Advanced(view) => view,
+            Refreshed::Rescan => Arc::new(materialize(handle, None).await?),
+        },
+        None => Arc::new(materialize(handle, None).await?),
+    };
+    install_head_view_at(projections, epoch, Arc::clone(&view));
+
+    Ok(view)
 }
 
 /// Folds a just-committed head-advancing batch into `base` and installs the
@@ -594,6 +625,10 @@ where
         commit_extra_info: None,
         schema_changed_table_ids,
     };
+    // Recorded from the entity writes alone, before the snapshot and head
+    // writes join them, so the delta never names its own commit's metadata.
+    let commit_delta = delta::write_for(new_id, &writes);
+    writes.extend(commit_delta);
     writes.push((
         Key::Snapshot {
             snapshot_id: new_id,

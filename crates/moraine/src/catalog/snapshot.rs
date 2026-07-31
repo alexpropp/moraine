@@ -172,6 +172,33 @@ impl CatalogSnapshot {
         view
     }
 
+    /// How many live records the view holds — what a full rematerialization
+    /// would have to read. An incremental refresh weighs its re-read count
+    /// against this to know when scanning has become the cheaper path.
+    pub(crate) fn live_record_count(&self) -> usize {
+        fn nested<K, V>(outer: &BTreeMap<u64, BTreeMap<K, V>>) -> usize {
+            outer.values().map(BTreeMap::len).sum()
+        }
+
+        self.schemas.len()
+            + self.tables.len()
+            + self.views.len()
+            + self.macros.len()
+            + self.table_stats.len()
+            + self.options.len()
+            + self.tags.len()
+            + self.gc_files.len()
+            + nested(&self.columns)
+            + nested(&self.data_files)
+            + nested(&self.delete_files)
+            + nested(&self.partitions)
+            + nested(&self.sorts)
+            + nested(&self.mappings)
+            + nested(&self.indexes)
+            + nested(&self.table_column_stats)
+            + nested(&self.file_column_stats)
+    }
+
     /// Inserts one decoded record into the maps it belongs to, keeping the
     /// name indexes coherent. Shared by [`build`](Self::build) and the
     /// commit-time fold that folds a batch forward without rescanning.

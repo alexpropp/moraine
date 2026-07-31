@@ -7,4 +7,5 @@ pub(crate) mod operations;
 pub(crate) mod staged;
 mod verbs;
 
+pub(crate) use commit::Refreshed;
 pub use verbs::Transaction;

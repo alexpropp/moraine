@@ -11,7 +11,7 @@ while a committer writes concurrently, how a long-lived reader learns of new
 commits, or what happens to a held view when RFC 0007 reclaims the files it
 references. This RFC fills those gaps: a `CatalogSnapshot` is pinned to a
 single **SlateDB read-snapshot** so its scans are mutually consistent; it is
-**refreshed incrementally** from the `snapshot_changes` changelog rather than
+**refreshed incrementally** from the `commitdelta` changelog rather than
 rematerialized; it observes **snapshot isolation** (a fixed catalog snapshot
 `S`, never a torn mix); and it carries a **validity window** tied to RFC
 0007's retention horizon, past which a reader must re-resolve from head. This
@@ -28,8 +28,8 @@ is the read-side companion to RFC 0004's write-side commit protocol.
   append-only + immutable `snapshot`).
 - **Cheap refresh.** Advancing a long-lived reader from `S` to head costs work
   proportional to *churn* (the entities changed between `S` and head), not to
-  live catalog size — using the `snapshot_changes` already in each `snapshot`
-  record (RFC 0002).
+  live catalog size — replaying the `commitdelta` record each commit writes
+  (RFC 0002).
 - **Committer read-your-writes.** The single committer (RFC 0004) advances its
   own view by folding in the batch it just committed, without a re-read.
 - **A defined validity window.** A held `CatalogSnapshot` is valid only within
@@ -150,39 +150,61 @@ snapshot-isolated view for its whole lifetime with no defensive copying beyond
 the initial materialization — this is why RFC 0003 can promise "no store I/O
 after build."
 
+### The changelog a commit writes
+
+Every commit records, under `commitdelta/{snapshot_id}` (RFC 0002), the
+encoded `current` keys its batch put or deleted — the same key set the
+committer already folds into its own view, persisted so a reader can fold
+it too. Keys only, no values: a refresh re-reads each key's state at its
+own pinned cut, so a stored value could only duplicate what the store
+already answers, or contradict it.
+
+A commit whose key count exceeds a fixed cap writes no `commitdelta`
+record at all. That bounds record size against a bulk load registering
+hundreds of thousands of files, and costs nothing but a fallback: a
+refresh spanning that commit rematerializes, which is what it would have
+done before this mechanism existed.
+
 ### Incremental refresh from the changelog
 
 A long-lived reader (or the committer's planning view) advances from `S` to a
-newer head `S+k` without rescanning `current`:
+newer head `S+k` without rescanning `current`. Every read below is issued
+under **one pinned handle**, so a refresh, like a materialization, is one
+consistent cut and never a mix of per-step reads torn by a concurrent commit:
 
-1. Pin a fresh read-snapshot; read `sys/head` and the `sys/migration`
-   marker under it (refusing with `Migration` if the marker is present, as
-   in materialization). If head is unchanged, done — the cached view is
-   current.
-2. Otherwise scan `snap/{S+1 .. head}` **under the same pinned handle**.
-   Each record carries its `snapshot_changes` (RFC 0002) — the precise set
-   of entities the commit touched.
-3. For each changed entity, re-read just that entity's `current` record (or, if
-   it was ended, drop it from the view), still under the same handle — a
-   refresh, like a materialization, is one consistent cut, never a mix of
-   per-step reads torn by a concurrent commit. Apply to the in-memory
-   catalog.
+1. Read the `sys/migration` marker (refusing with `Migration` if present, as
+   in materialization) and `sys/head`. If head is unchanged, done — the
+   cached view is current.
+2. Point-read `commitdelta/{S+1 ..= head}`. Any record absent means the gap
+   is not replayable; fall back.
+3. Union the key sets into one set. A key touched by several commits in the
+   gap collapses to one entry — the union is the distinct churn, and
+   replaying it once is what makes the cost churn-shaped rather than
+   gap-shaped.
+4. Re-read each key in the union. Present decodes and replaces the entity in
+   the view; absent drops it. Stamp the view with the head `snapshot` record.
 
-Cost is proportional to churn across the gap, not to catalog size. This is the
-payoff of merging `snapshot_changes` into the `snapshot` record: the changelog a
-reader needs to refresh is exactly the changelog a commit already writes.
+Reading final state per key, rather than replaying each commit's delta in
+order, is what collapses the work: a file registered and compacted away
+across the gap costs one read that finds nothing, not two applications.
 
 **Fallback to full rematerialization** when incremental is impossible or not
-worth it:
+worth it. The two paths produce identical views, so every fallback is a cost
+choice or a missing-input choice, never a correctness one:
 
-- **`S` fell below the horizon** (`S < H`, RFC 0007): the `snapshot` records for
-  the gap may have been reclaimed, so there is no changelog to replay. The
-  reader rematerializes at head. (If the reader specifically wanted the *old*
-  `S`, that snapshot is gone — see validity window.)
-- **The gap is large** relative to catalog size (churn ≥ live entities): a
-  full `current` rescan is cheaper than replaying a huge changelog. A threshold
-  picks the cheaper path; the two produce identical views, so the choice is
-  purely a cost optimization.
+- **`S` fell below the horizon** (`S < H`, RFC 0007): the `commitdelta`
+  records for the gap are expired with their snapshots, so there is no
+  changelog to replay. The reader rematerializes at head. (If the reader
+  specifically wanted the *old* `S`, that snapshot is gone — see validity
+  window.)
+- **A commit in the gap exceeded the cap**, so it wrote no record.
+- **The union outgrows the view**: once the distinct changed keys exceed the
+  live entities in the held view, re-reading them one by one cannot beat one
+  `current` scan, so the refresh abandons and rematerializes. This bound is a
+  backstop, not a tuned threshold — it only guarantees refresh is never worse
+  than the rematerialization it replaces. The crossover that would let it
+  fall back *earlier*, while re-reading is still cheaper in principle but no
+  longer in practice, needs both sides measured.
 
 ### Committer read-your-writes
 
@@ -223,8 +245,33 @@ still retained (files present) or materialization/refresh fails loudly with
 ### Caching is per-handle, in-memory, logical
 
 The materialized in-memory catalog *is* the cache. A `Catalog` handle (RFC
-0003, an `Arc`-backed clone-cheap handle over `slatedb::Db`) may hold the
-latest `CatalogSnapshot` and hand out clones; a refresh replaces it. There is:
+0003, an `Arc`-backed clone-cheap handle over `slatedb::Db`) holds the
+latest `CatalogSnapshot` behind an `Arc` and hands out shared pointers to
+it; a refresh replaces it. Every head read — the public `snapshot()` and a
+commit attempt's planning view alike — serves from it, refreshing forward
+when head has moved and rematerializing only when it must.
+
+Sharing rather than copying is what makes an unmoved head nearly free. The
+view is immutable, so every caller can safely name the same one, and a read
+that finds head unchanged costs one point read and a refcount bump. Handing
+back an owned view instead would copy the whole catalog per read and return
+most of the saving to the floor.
+
+The cached view is keyed by the head snapshot id it was built at, and a
+head-preserving maintenance commit (RFC 0007 expiry, RFC 0008 compaction)
+reuses that id with different content. Such a commit therefore invalidates
+the cache before its write becomes visible. That alone would not make
+installing safe from a read path: a reader that pinned its handle, read
+head, and then installed could land its now-stale view *after* an
+invalidation, resurrecting content the invalidation existed to discard. So
+the cache carries an **install epoch**, bumped on every invalidation. A
+reader captures the epoch before its first store read and installs only if
+the epoch still matches; any interleaved invalidation makes the install a
+no-op and the reader simply keeps the view it computed. Installation is
+thus compare-and-set, and no path needs to discard a view it has already
+paid for.
+
+There is:
 
 - **No cross-process cache.** RFC 0004's "many readers" are independent
   processes/handles; each materializes its own view. Coordinating a shared
@@ -286,7 +333,12 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **Committer read-your-writes.** After `commit`, the committer's folded view
   reflects the just-committed entities without a store re-read.
 - **Fallback.** A reader whose `S` fell below the horizon rematerializes at
-  head; a reader asking for an expired `S` gets `SnapshotExpired`.
+  head; a reader asking for an expired `S` gets `SnapshotExpired`. Each of
+  the other two fallbacks — a commit over the key cap, a union outgrowing
+  the view — yields the same view a refresh would have.
+- **Install is compare-and-set.** An invalidation interleaved between a
+  reader's first store read and its install voids that install; the cache
+  never serves the resurrected view.
 - **No dangling file.** A view within the retention window resolves every file
   it names; a view driven past the window fails loudly rather than naming a
   reclaimed file.
@@ -317,6 +369,21 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   Rejected: contradicts RFC 0004's no-coordination, cross-process topology and
   reintroduces a notification channel the design deliberately omits. Readers
   poll `sys/head`; that is the whole protocol.
+- **Driving refresh from `changes_made`.** The snapshot record already
+  carries DuckLake's `ducklake_snapshot_changes` string, so it looks like the
+  changelog is free. It is not one: created entities appear as names, not
+  ids, so nothing can be point-read; file changes name only their table; and
+  column, stats, partition, option, and tag changes are absent from the
+  grammar entirely. Reconstructing a precise key set from it would need
+  prefix rescans and an id-range probe, and would still be silent on the
+  kinds it does not model — binding moraine's refresh correctness to another
+  project's display string. moraine writes its own.
+- **The key list as a field on the `snapshot` record.** Rejected on hot-path
+  cost: DuckLake re-reads the snapshots projection at the start of every
+  transaction, and a decoder pays for every field it meets, so the change
+  lists would be dragged through the one scan that must stay cheap. Its own
+  subspace keeps that scan untouched and costs a refresh only point reads it
+  already knows the ids for.
 - **A persistent name→id index to skip materialization.** Already rejected by
   RFC 0002 (complexity without payoff at live-catalog scale); nothing here
   changes that calculus. Name resolution stays against the in-memory view.

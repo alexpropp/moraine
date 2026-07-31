@@ -10,5 +10,6 @@ mod data_files;
 mod index_backfill;
 mod macros;
 mod measure;
+mod refresh;
 mod staged_index_build;
 mod views_options;
