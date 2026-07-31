@@ -26,19 +26,13 @@ deliberately not itemized here.
 
 ## Where the weight is
 
-Three things gate disproportionately much of the list:
+Two things gate disproportionately much of the list:
 
 - **Reader refresh** (RFC 0009). Reads now serve from the cache, so a warm
   read costs one point read. What is missing is *incremental* refresh: a
   cache that has fallen behind head rematerializes wholesale rather than
   replaying the gap. Its main beneficiary would be read-only catalogs, which
   cache nothing at all pending the read-snapshot pin below.
-- **Format migration** (RFC 0015). The `sys/migration` marker is reserved,
-  refused on open, and refused at every read session — the reader gate that
-  had to ship in format version 1, before any migration exists, so fielded
-  readers are safe against the first real one. Everything that writes the
-  marker is unbuilt: no start batch, no step loop, no finish flip, no
-  cursor, no migrate verb.
 - **The crash harness** (RFC 0011). The crash cases are enumerated and driven
   as data, with `CommitDurableNotAcknowledged`, `TakeoverMidCommit`,
   `FencedWriterResumes`, and `ConcurrentGenesis` covered end to end. The other
@@ -428,38 +422,26 @@ Three things gate disproportionately much of the list:
   correctly; what is missing is a migrate path for it to hand off to. The arm
   is dormant until a rewriting format raises the floor above the base
   version, so nothing reaches it in the field today.
-- **IMPL** — The start phase: one atomic batch writing the `sys/migration`
-  marker with `{from_format, to_format, cursor}`.
-- **IMPL** — The idempotent step loop: write new-format keys before deleting
-  superseded old-format keys, advancing the durable cursor in the same batch.
-- **IMPL** — The finish phase: one `WriteBatch` atomically flipping
-  `sys/format` and clearing the marker.
-- **IMPL** — Reopen-state detection and resume-from-cursor across the three
-  (marker, format) states. Nothing reads the marker's cursor field.
-- **IMPL** — An explicit operator-triggered `migrate` verb or flag, distinct
-  from ordinary attach.
-- **IMPL** — Named, individually tested `v_n → v_{n+1}` units that compose for
-  multi-version jumps, each with its own start, step, finish, and cursor.
+- **IMPL** — The first real `v_n → v_{n+1}` unit. The registry ships empty:
+  the driver, the unit shape, and the composition are built and tested
+  against synthetic units, but every format to date is additive, so no
+  rewrite exists to register. The first format that moves an existing key
+  adds the first entry.
+- **DEFERRED** — Expose the migrate verb through the DuckDB extension. The
+  core verb exists; an operator attaching through DuckDB has no way to call
+  it, so a store below the floor is reported and not repairable from SQL.
 - **DEFERRED** — Allowing a trivial, bounded `system`-only migration to
   auto-run on open. The shipping behavior is explicit-verb-only for every
   migration regardless of size; auto-run is a later refinement, not the first
   cut.
 - **DEFERRED** — Rolling a fleet across a structural bump with mixed binary
   versions online.
-- **VALIDATE** — Crash injection at every migration seam — the start batch,
-  each step's new-key write and old-key delete, each cursor advance, the finish
-  flip — asserting reopen always yields a coherent store and never
-  new-format-with-marker. Depends on 0011.
 - **VALIDATE** — With the marker present, a read-only attach that was already
   open when the migration started returns the typed error. The gate itself is
   shared (every read opens its session through one place, which refuses), and
   the read-write side is covered; what is untested is a reader that meets a
   marker planted by another process after it attached, which needs a second
   writer and a manifest poll to stage.
-- **VALIDATE** — Running the migrate verb against an already-migrated store is
-  a no-op, not a re-rewrite.
-- **VALIDATE** — Migrate, then time-travel: resolving at a pre-migration
-  snapshot after migration still returns correct historical state.
 
 ## 0016 — Equality indexes
 
