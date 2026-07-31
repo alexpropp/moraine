@@ -30,7 +30,7 @@ async fn unknown_format_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Corruption(_)));
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
 }
 
 /// A mid-migration marker refuses the open outright.
@@ -57,7 +57,7 @@ async fn migration_marker_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Corruption(_)));
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
 }
 
 /// Renaming one column touches that column and nothing else: churn is

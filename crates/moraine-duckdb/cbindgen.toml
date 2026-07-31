@@ -40,6 +40,9 @@ enum {
 	MORAINE_INTERRUPTED = 9,
 	MORAINE_RETRY_EXHAUSTED = 10,
 	MORAINE_FENCED = 11,
+	MORAINE_MIGRATION = 12,
+	MORAINE_SNAPSHOT_EXPIRED = 13,
+	MORAINE_UNSUPPORTED = 14,
 };
 """
 
@@ -62,6 +65,9 @@ exclude = [
     "INTERRUPTED",
     "RETRY_EXHAUSTED",
     "FENCED",
+    "MIGRATION",
+    "SNAPSHOT_EXPIRED",
+    "UNSUPPORTED",
     # `logging::levels` mirrors DuckDB's own `LogLevel` values for the sink
     # to forward. Exported, these become `#define ERROR 50` and friends in a
     # header DuckDB's C++ includes — the very collision DuckDB's own logging

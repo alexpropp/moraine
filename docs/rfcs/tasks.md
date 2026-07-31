@@ -26,12 +26,8 @@ deliberately not itemized here.
 
 ## Where the weight is
 
-Four things gate disproportionately much of the list:
+Three things gate disproportionately much of the list:
 
-- **The error taxonomy** (RFC 0003). None of `Unsupported`, `SnapshotExpired`,
-  `Interrupted`, or `Migration` exist. Mid-migration surfaces as `Corruption`,
-  an expired snapshot as `NotFound`. RFCs 0004, 0007, 0009, 0010, and 0015 all
-  specify behavior in terms of these variants.
 - **Reader refresh** (RFC 0009). No incremental refresh exists at all; every
   public read rematerializes.
 - **Format migration** (RFC 0015). The `sys/migration` marker is reserved and
@@ -72,11 +68,11 @@ Four things gate disproportionately much of the list:
 
 ## 0003 — Public API shape of the core
 
-- **IMPL** — The four missing `Error` variants: `Unsupported` (a DuckLake
-  feature moraine does not implement), `SnapshotExpired` (a snapshot below the
-  retention horizon), `Interrupted` (host interrupt before the point of no
-  return), `Migration` (a store that requires, is undergoing, or is newer than
-  the binary's format).
+- **IMPL** — `Error::Interrupted` and `Error::Unsupported` exist and are
+  bridged, but nothing in the core raises them yet: the interrupt path is
+  0010's shielding work, and the one live unsupported-feature rejection
+  (VARIANT inlining) is thrown shim-side. Wire the core to raise them as those
+  paths land. `SnapshotExpired` and `Migration` are raised.
 - **IMPL** — `set_partitioning` / `clear_partitioning` verbs and the
   `PartitionSpec` domain type. Specs reach the store only through the generic
   staged-row path today.
@@ -391,17 +387,10 @@ Four things gate disproportionately much of the list:
   from ordinary attach.
 - **IMPL** — Named, individually tested `v_n → v_{n+1}` units that compose for
   multi-version jumps, each with its own start, step, finish, and cursor.
-- **DECISION** — The rollback strategy for one-way structural migrations: a
-  pre-migration snapshot as sanctioned recovery, versus writing and testing
-  paired inverse migrations.
-- **DECISION** — Whether a structural bump can ever be served online across two
-  binary versions simultaneously, or whether drain and brief unavailability is
-  the permanent answer.
-- **DECISION** — Precisely which migrations are trivial enough to auto-run on
-  open (bounded `system`-only rewrites) versus requiring the explicit verb.
-- **DECISION** — Policy for a whole-store pre-migration
-  `Db::create_checkpoint()`: on by default or behind an operator flag, and when
-  it is released after success.
+- **DEFERRED** — Allowing a trivial, bounded `system`-only migration to
+  auto-run on open. The shipping behavior is explicit-verb-only for every
+  migration regardless of size; auto-run is a later refinement, not the first
+  cut.
 - **DEFERRED** — Rolling a fleet across a structural bump with mixed binary
   versions online.
 - **VALIDATE** — Crash injection at every migration seam — the start batch,
@@ -472,11 +461,6 @@ Four things gate disproportionately much of the list:
   `ducklake_name_mapping` rows. Served tables stay insert-only until then.
   0007 work.
 
-## 0019 — Scalar and table macros
-
-- **VALIDATE** — Enable the commented-out `MacroValue` codec proptest in
-  `store/value.rs`. It is the one store obligation still unbuilt, with no
-  replacement coverage.
 
 ## 0021 — Maintenance orchestration
 

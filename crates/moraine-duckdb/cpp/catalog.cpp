@@ -186,17 +186,21 @@ void ThrowMoraineError(MoraineError &err) {
 	case MORAINE_NOT_FOUND:
 	case MORAINE_ALREADY_EXISTS:
 	case MORAINE_CONSTRAINT:
+	case MORAINE_SNAPSHOT_EXPIRED:
 		throw duckdb::CatalogException(message);
 	case MORAINE_COMMIT_CONFLICT:
 	case MORAINE_RETRY_EXHAUSTED:
 		throw duckdb::TransactionException(message);
 	case MORAINE_INVALID_ARGUMENT:
 		throw duckdb::InvalidInputException(message);
+	case MORAINE_UNSUPPORTED:
+		throw duckdb::NotImplementedException(message);
 	case MORAINE_INTERRUPTED:
 		throw duckdb::InterruptException();
 	case MORAINE_CORRUPTION:
 	case MORAINE_STORE:
 	case MORAINE_FENCED:
+	case MORAINE_MIGRATION:
 		throw duckdb::IOException(message);
 	case MORAINE_INTERNAL:
 	default:
