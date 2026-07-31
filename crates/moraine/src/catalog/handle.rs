@@ -9,7 +9,10 @@ use std::{
 };
 
 use object_store::{ObjectStore, path::Path};
-use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
+use slatedb::{
+    Db, DbReader, DbTransaction, IsolationLevel,
+    config::{CheckpointOptions, CheckpointScope},
+};
 use tracing::{info, warn};
 
 use crate::{
@@ -29,7 +32,7 @@ use crate::{
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
         open::StoreBuilder,
     },
-    transaction::{Transaction, commit, index_maintenance},
+    transaction::{MigrationReport, Transaction, commit, index_maintenance, migration},
 };
 
 /// How many entries one staged build step commits. At roughly a kilobyte
@@ -83,6 +86,18 @@ impl Default for MaintenanceRequest {
             batch_size: 1024,
         }
     }
+}
+
+/// How a [`Catalog::migrate`] call should run.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct MigrationRequest {
+    /// Take a whole-store checkpoint before the first rewrite and release it
+    /// once the last finish batch is durable, leaving a manual recovery point
+    /// if the migration fails partway. Off by default: migrations are
+    /// one-way and there is no automatic rollback, so the checkpoint is the
+    /// sanctioned recovery path when an operator wants one.
+    pub checkpoint: bool,
 }
 
 /// What a maintenance pass reclaimed.
@@ -246,6 +261,90 @@ impl Catalog {
             store: Arc::new(Store::Reader(Arc::new(reader))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
+    }
+
+    /// Rewrites the store in place to the newest structural format this
+    /// binary understands, resuming an interrupted migration if one is in
+    /// flight, and reports what it did.
+    ///
+    /// Deliberately **not** part of opening a catalog. A structural rewrite
+    /// walks the keyspace and holds the single writer for its duration, so
+    /// it is the operator's explicit choice, never a side effect of someone
+    /// attaching with a newer binary. It takes the writer epoch exactly as
+    /// [`open`](Self::open) does, so it fences a running catalog and is
+    /// itself fenced by one — exactly one migrator runs.
+    ///
+    /// Running it against a store already at the newest format is a no-op:
+    /// the returned report names the same format twice and no units.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if the store is not an initialized
+    /// moraine catalog, or carries a marker its format stamp contradicts;
+    /// [`Error::Migration`] if a migration is in flight that this binary does
+    /// not carry; or a store error if a batch fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, MigrationRequest};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let object_store = Arc::new(InMemory::new());
+    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+    /// catalog.close().await?;
+    ///
+    /// let report = Catalog::migrate(
+    ///     object_store,
+    ///     CatalogOptions::default(),
+    ///     MigrationRequest::default(),
+    /// )
+    /// .await?;
+    /// // A fresh store is already current, so nothing runs.
+    /// assert_eq!(report.from_format, report.to_format);
+    /// assert!(report.units_run.is_empty());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn migrate(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        request: MigrationRequest,
+    ) -> Result<MigrationReport> {
+        let db = StoreBuilder::new(&options.path, object_store.clone())
+            .flush_interval(options.flush_interval)
+            .cache_dir(options.cache_dir.clone())
+            .open_writer()
+            .await?;
+
+        let checkpoint = if request.checkpoint {
+            let taken = db
+                .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+                .await
+                .map_err(Error::from)?;
+            info!(checkpoint = %taken.id, "took a pre-migration checkpoint");
+            Some(taken)
+        } else {
+            None
+        };
+
+        let report = migration::run(&db).await;
+        let closed = db.close().await.map_err(Error::from);
+
+        // A failed migration keeps its checkpoint: it is the recovery point
+        // the operator asked for, and releasing it here would discard the one
+        // thing that makes the failure recoverable.
+        let report = report.and_then(|report| closed.map(|()| report))?;
+
+        if let Some(checkpoint) = checkpoint {
+            slatedb::admin::Admin::builder(options.path.as_str(), object_store)
+                .build()
+                .delete_checkpoint(checkpoint.id)
+                .await
+                .map_err(Error::from)?;
+        }
+
+        Ok(report)
     }
 
     /// The maintained-projection state shared by this handle's clones.

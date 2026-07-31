@@ -283,6 +283,12 @@ from ordinary attach), **not** a silent auto-run on open. The reasoning:
 - Migration cost (time, object-store traffic, writer occupancy) is an
   operational decision with a maintenance-window shape; the operator owns it.
 
+The verb takes the object store rather than an open catalog, because the
+store it must act on is precisely the one an ordinary attach refuses: below
+the floor, or carrying a marker. It opens the writer itself — taking the
+same epoch `open` takes, so it fences a running catalog and is fenced by
+one — runs the plan the durable state implies, and closes.
+
 Every migration is triggered by the explicit verb; nothing auto-runs on open.
 A **trivial metadata migration** (bounded, O(1)-ish, e.g. rewriting only the
 `system` records with no keyspace walk) carries none of the surprise and could
@@ -295,11 +301,18 @@ These extend [RFC 0011](0011-crash-recovery.md)'s cases; they
 run against real SlateDB on in-memory `object_store`, no store mocks
 (RFC 0001), and are naturally expressed as new `CrashCase`-style cases.
 
-- **Crash at every migration seam.** Inject a crash at the start batch, at
-  each step's new-key-write, at each step's old-key-delete, at the cursor
-  advance, and at the finish flip. Each reopen resumes to a **coherent
-  store** — new format if the finish landed, else resumed from the cursor —
-  and never exposes new-format-with-marker.
+- **Crash at every migration seam.** Inject a crash after the start batch,
+  after each step batch, before the finish flip, and after it. Each reopen
+  resumes to a **coherent store** — new format if the finish landed, else
+  resumed from the cursor — and never exposes new-format-with-marker.
+
+  Those four are the *whole* set, because a seam is only meaningful where a
+  durable state exists to crash into. A step's new-key write, its old-key
+  delete, and its cursor advance all land in **one batch**, so there is no
+  durable intermediate between them to inject at: the interleavings are
+  unrepresentable rather than merely untested. The same holds for the finish
+  flip and the marker clear. Injecting "inside" a batch would test SlateDB's
+  atomicity, not this protocol's.
 - **Refuse-to-open on a future format.** A store whose `sys/format` exceeds
   the binary errors typed, writes nothing.
 - **Reader gate mid-migration.** With the `sys/migration` marker present, a

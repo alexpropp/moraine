@@ -11,7 +11,9 @@ pub(crate) mod scoped_read;
 mod snapshot;
 mod types;
 
-pub use handle::{Catalog, CatalogOptions, MaintenanceReport, MaintenanceRequest};
+pub use handle::{
+    Catalog, CatalogOptions, MaintenanceReport, MaintenanceRequest, MigrationRequest,
+};
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
 pub use types::{
