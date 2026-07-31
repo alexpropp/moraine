@@ -1634,10 +1634,10 @@ fn bulk_file(path: &str, count: u64) -> crate::catalog::DataFile {
     }
 }
 
-/// A commit staging more unique entries than the merged-probe threshold
-/// resolves them in one sorted pass per index; enforcement is unchanged:
-/// fresh values land, a value a committed live row already holds aborts
-/// the whole commit, and nothing of the aborted commit remains visible.
+/// A large bulk commit resolves its unique entries in bounded concurrent
+/// groups; enforcement is unchanged: fresh values land, a value a committed
+/// live row already holds aborts the whole commit, and nothing of the aborted
+/// commit remains visible.
 #[tokio::test]
 async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
     use crate::catalog::{ColumnId, IndexDef};
@@ -1725,8 +1725,8 @@ async fn bulk_unique_commit_lands_and_committed_duplicate_aborts() {
 }
 
 /// Values killed earlier in the same bulk commit are free again for the
-/// commit's own inserts — the delete-then-reinsert contract holds above
-/// the merged-probe threshold too.
+/// commit's own inserts — the delete-then-reinsert contract holds for a
+/// large bulk commit too.
 #[tokio::test]
 async fn bulk_unique_commit_frees_values_deleted_in_the_same_commit() {
     use crate::catalog::{ColumnId, FileIndexRemoval, IndexDef};

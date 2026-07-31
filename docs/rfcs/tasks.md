@@ -427,6 +427,18 @@ Three things gate disproportionately much of the list:
   serves both directions and a composite its exact-opposite order, versus
   keeping "declare the direction or build a second index". Reverse currently
   materializes the row-id vector and reverses it.
+- **MEASURE** — Confirm on a *real* object store that bounded-concurrency point
+  reads keep bulk uniqueness resolution linear as the index grows. Resolution
+  now uses one path — bloom-filtered point reads with a bounded fan-out — at
+  every batch size; the earlier sorted-scan mode was removed after it measured
+  as a pessimization (in-memory, store-proportional and CPU-bound; under a
+  5 ms-per-GET model, a serial near-whole-index block sweep tens to ~190x
+  slower than the concurrent probes, since a bulk load's values are not
+  store-ordered). `measure_index_maintenance_by_store_size` in
+  `tests/it/measure.rs` shows the point-read path stays flat in-memory —
+  scattered no longer tracks the store; a real-store run (a `ThrottledStore`
+  GET latency, as the 0010 harness models, or S3) would close it. No
+  real-store number recorded yet.
 - **DEFERRED** — Make the per-commit index-entry cap a `CatalogOptions` field
   threaded through both commit paths and the FFI, instead of a hardcoded
   constant, once a caller has a legitimate reason to raise it.
