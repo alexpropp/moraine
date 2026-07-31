@@ -110,7 +110,7 @@ pub(crate) fn non_durable() -> WriteOptions {
 /// is empty and needs bootstrap.
 async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
     if read::read_migration(tx).await?.is_some() {
-        return Err(Error::Corruption(
+        return Err(Error::Migration(
             "store is mid-migration; refusing to open".to_string(),
         ));
     }
@@ -118,7 +118,7 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
         Some(format) if (FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&format.format_version) => {
             Ok(Some(format))
         }
-        Some(format) => Err(Error::Corruption(format!(
+        Some(format) => Err(Error::Migration(format!(
             "store format {} is outside the supported range {FORMAT_VERSION}..={MAX_FORMAT_VERSION}",
             format.format_version
         ))),
@@ -290,12 +290,16 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         Some(requested) => requested,
         None => head,
     };
-    // A missing record at or below head is an expired snapshot, not
-    // corruption: expiry deletes snapshot records without renumbering.
-    // The caller re-resolves from head.
-    let snapshot = read::read_snapshot(tx, target)
-        .await?
-        .ok_or_else(|| Error::NotFound(format!("snapshot {target} (expired or never minted)")))?;
+    // A missing record at or below head is an expired snapshot, not a
+    // missing one: ids are sequential to head, so `target` was minted, and
+    // expiry deletes snapshot records without renumbering. The reader
+    // re-resolves from head rather than dereference reclaimed files.
+    let snapshot = read::read_snapshot(tx, target).await?.ok_or_else(|| {
+        Error::SnapshotExpired(format!(
+            "snapshot {target} is below the retention horizon (head is {head}); \
+             re-resolve from head"
+        ))
+    })?;
     let current = read::scan_current_entities(tx).await?;
     let history = match at {
         Some(_) => read::scan_history_entities(tx).await?,

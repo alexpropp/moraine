@@ -2507,13 +2507,14 @@ async fn expiry_prunes_history_and_schedules_files_without_advancing_head() {
     assert_eq!(schedule[0].data_file_id, 9);
     assert_eq!(schedule[0].path, "f9.parquet");
 
-    // The dead snapshot no longer resolves; the survivor does, and
-    // the pruned history row is gone from the dump surface.
+    // The dead snapshot no longer resolves — below head with its record
+    // reclaimed, so `SnapshotExpired`, not a plain miss; the survivor
+    // resolves, and the pruned history row is gone from the dump surface.
     let expired = catalog
         .snapshot_at(crate::catalog::SnapshotId::new(1))
         .await
         .unwrap_err();
-    assert!(matches!(expired, Error::NotFound(_)), "{expired}");
+    assert!(matches!(expired, Error::SnapshotExpired(_)), "{expired}");
     let surviving = catalog
         .snapshot_at(crate::catalog::SnapshotId::new(2))
         .await
