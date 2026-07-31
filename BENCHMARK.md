@@ -130,9 +130,10 @@ better fix; recorded as a follow-up in `docs/rfcs/tasks.md` under 0021.
 
 ### Materialization cost vs. catalog size
 
-`Catalog::snapshot()` calls `materialize` and never consults the projection
-cache, so this cost is paid on *every* public read, not just a cold start.
-Median of 9 materializations, 8 columns and 16 files per table:
+This is the cost of a *cold* read — one whose handle holds no cached view.
+A warm read serves from the projection cache and pays none of it. Median of
+9 materializations, 8 columns and 16 files per table, a fresh handle per
+repeat so no cache hit is timed:
 
 | tables | live entities | median materialization | µs / 1 000 entities |
 |---|---|---|---|
@@ -142,12 +143,10 @@ Median of 9 materializations, 8 columns and 16 files per table:
 | 800 | 20 000 | 146 ms | 7 300 |
 
 Materialization is roughly linear at ~5–7 µs per live entity — flush-interval
-independent, since it is a read. A 20 000-entity catalog costs ~150 ms per
-read; extrapolated, a 100 000-entity catalog would cost most of a second on
-every `snapshot()`. That is the quantitative case for the two open 0009 items:
-serving readers from the maintained cache instead of rematerializing, and,
-further out, lazy materialization to bound the per-read cost on a large
-catalog.
+independent, since it is a read. A 20 000-entity catalog costs ~150 ms; a
+100 000-entity catalog would cost most of a second. Readers now serve from
+the cache rather than paying this per read; lazy materialization to bound
+the cold cost on a large catalog stays open.
 
 ### Read concurrency under IO latency
 

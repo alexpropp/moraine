@@ -125,16 +125,20 @@ async fn measure_materialization_by_catalog_size() {
             .map(|t| 1 + view.columns_of(t.id).len() + view.data_files_of(t.id).len())
             .sum();
 
-        // Reuse one handle: snapshot() rematerializes every call regardless,
-        // so repeats do not warm anything that would skew the figure.
+        probe.close().await.unwrap();
+
+        // A fresh handle per repeat: `snapshot()` serves from the maintained
+        // cache, so reusing one would time a cache hit and report
+        // materialization as free. Only the read is timed, not the open.
         let mut samples = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
+            let probe = open_with(store.clone(), SEED_FLUSH_MS).await;
             let start = Instant::now();
             let view = probe.snapshot().await.unwrap();
             samples.push(start.elapsed());
             std::hint::black_box(&view);
+            probe.close().await.unwrap();
         }
-        probe.close().await.unwrap();
 
         let stats = Stats::of(samples);
         let us_per_1k = (stats.median_ms * 1_000.0) / (entities as f64 / 1_000.0);

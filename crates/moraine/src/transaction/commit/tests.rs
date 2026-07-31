@@ -3231,6 +3231,76 @@ async fn folded_head_view_matches_a_fresh_scan() {
     catalog.close().await.unwrap();
 }
 
+/// Seeds a catalog with `tables` tables of two columns each, so a base view
+/// holds enough live records that a small gap stays under the refresh's
+/// size backstop.
+#[allow(clippy::unwrap_used)]
+async fn seeded_catalog(tables: usize) -> (crate::catalog::Catalog, Vec<crate::catalog::TableId>) {
+    use crate::catalog::{Catalog, CatalogOptions, ColumnDef};
+
+    let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        .await
+        .unwrap();
+    let column = |name: &str| ColumnDef {
+        name: name.into(),
+        column_type: "BIGINT".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+
+    let ids = std::cell::RefCell::new(Vec::new());
+    catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            for index in 0..tables {
+                let id =
+                    tx.create_table(schema, &format!("t{index}"), &[column("a"), column("b")])?;
+                ids.borrow_mut().push(id);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let ids = ids.into_inner();
+    (catalog, ids)
+}
+
+/// A migration may be moving keys mid-scan, so a read refuses rather than
+/// return a view that is silently missing records — and a warm cache is no
+/// exception. The first read below installs a view; the marker must still
+/// win over it, or a cached reader would sail through a migration.
+#[tokio::test]
+async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
+    let (catalog, _) = seeded_catalog(3).await;
+    catalog.snapshot().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let tx = catalog.begin_write_tx().await.unwrap();
+    let materialized = materialize(ReadHandle::Tx(&tx), None).await.err().unwrap();
+    tx.rollback();
+
+    let served = catalog.snapshot().await.err().unwrap();
+
+    assert!(
+        matches!(materialized, Error::Migration(_)),
+        "{materialized:?}"
+    );
+    assert!(matches!(served, Error::Migration(_)), "{served:?}");
+    catalog.close().await.unwrap();
+}
+
 /// The first attempt never waits, later ones grow to the cap, and every
 /// wait carries jitter — two writers that collided must not re-collide in
 /// lockstep.

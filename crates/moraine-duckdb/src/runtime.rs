@@ -131,11 +131,11 @@ impl MoraineCatalogHandle {
 /// from [`moraine_snapshot`](crate::abi::moraine_snapshot) and released
 /// via [`moraine_snapshot_free`](crate::abi::moraine_snapshot_free).
 pub struct MoraineSnapshotHandle {
-    pub(crate) snapshot: CatalogSnapshot,
+    pub(crate) snapshot: Arc<CatalogSnapshot>,
 }
 
 impl MoraineSnapshotHandle {
-    pub(crate) fn new(snapshot: CatalogSnapshot) -> Self {
+    pub(crate) fn new(snapshot: Arc<CatalogSnapshot>) -> Self {
         Self { snapshot }
     }
 }
