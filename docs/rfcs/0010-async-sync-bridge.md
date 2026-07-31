@@ -44,7 +44,7 @@ a typed error, never undefined behavior.
   on catalog state, and a committed commit is never "half-cancelled" — the
   write itself is shielded from cancellation, at the documented cost that an
   interrupt racing the write yields an ambiguous (`Interrupted`-but-landed)
-  outcome equivalent to RFC 0011's A2 crash row.
+  outcome equivalent to RFC 0011's `CommitDurableNotAcknowledged`.
 - **Panics never cross the C ABI.** Every FFI boundary catches unwinding and
   converts it to a typed error mapped to a DuckDB error code (RFC 0006), never
   UB. Consistent with the CLAUDE.md no-panic-in-library policy and the
@@ -243,7 +243,7 @@ clean two:
   fails, but is never torn. The caller-visible outcome is therefore
   **ambiguous**: `Interrupted` was returned, yet the commit may have
   landed. This is not a new hazard — it is byte-for-byte the semantics of
-  RFC 0011's A2 row (`CommitBatchLandedNoAck`): a caller that must know
+  RFC 0011's `CommitDurableNotAcknowledged`: a caller that must know
   re-resolves head and re-drives, observing either the landed commit or
   clean pre-commit state. The ambiguity is documented on the FFI commit
   entry point rather than papered over.
@@ -292,7 +292,7 @@ paths are exercised by the `cargo xtask e2e` DuckDB harness (RFC 0006):
   spawned batch write is in flight returns `Interrupted` promptly; the
   write still completes (or fails) in the background, never torn — a
   subsequent read observes head at exactly `N` or exactly `N+1`, and a
-  re-drive behaves per RFC 0011 A2.
+  re-drive behaves per RFC 0011's `CommitDurableNotAcknowledged`.
 - **Commit past the point of no return.** An interrupt delivered after the
   durable write completed still reports the committed snapshot; state is
   consistent.

@@ -405,7 +405,7 @@ fences any incumbent old-binary writer — safe by RFC 0004 fencing, and a
 release-note item. Read-only attaches never migrate and need not: an
 absent fold cursor reads as zero with an empty tail.
 
-The crash matrix (RFC 0011) grows: crash between payload and slot, crash
+RFC 0011's crash cases grow: crash between payload and slot, crash
 after slot before ack, folder crash mid-batch, fold-then-truncate races,
 folder-takeover fencing races, concurrent migrations, a destroyed or
 substituted slot, a stale reader meeting a peer's truncation, leader loss

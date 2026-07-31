@@ -7,6 +7,7 @@ mod fixtures;
 mod cache;
 mod catalog;
 mod commit_concurrency;
+mod crash_recovery;
 mod data_files;
 mod index_backfill;
 mod macros;

@@ -261,7 +261,7 @@ Per RFC 0001:
   crash/recovery path, but the extractor is fixed per store at creation,
   making format-v1 genesis the only free adoption moment — deferring would
   price the `inline`-isolation payoff at an RFC 0015 rebuild per store.
-  The risk is testable instead: the RFC 0011 matrix runs against segmented
+  The risk is testable instead: RFC 0011's crash cases run against segmented
   stores, and the decision can still flip for free before first release.
   Prefix bloom filters (the other half of SlateDB's prefix machinery) stay
   unused — a catalog this small doesn't earn them; they can be enabled per

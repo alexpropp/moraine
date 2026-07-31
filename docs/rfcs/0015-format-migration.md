@@ -27,7 +27,7 @@ any of this machinery.
   ([RFC 0004](0004-commit-protocol.md)), one-batch atomicity per step
   ([RFC 0002](0002-slatedb-key-encoding.md)), data-before-metadata ordering
   ([RFC 0007](0007-snapshot-expiry-and-gc.md)), and crash-resumability
-  ([RFC 0011](0011-crash-injection-test-matrix.md)).
+  ([RFC 0011](0011-crash-recovery.md)).
 - Refuse, loudly and typed, to open a store whose `sys/format` is *newer* than
   the running binary understands (RFC 0002's meet-a-newer-format rule) — never
   silently downgrade or misread.
@@ -51,7 +51,7 @@ Non-goals:
   manual and rests on old objects surviving until new ones are durable
   (below). Rollback strategy is unresolved.
 - **Inventing new atomicity or fencing primitives.** This RFC composes the
-  existing ones exactly as [RFC 0011](0011-crash-injection-test-matrix.md)
+  existing ones exactly as [RFC 0011](0011-crash-recovery.md)
   composes them for genesis.
 
 ## Background
@@ -67,7 +67,7 @@ the store is **older** than the binary, and the operator chooses to upgrade it
 in place. Not every older store needs upgrading, though — see "Additive
 versus rewriting, within axis 2".
 
-The genesis protocol ([RFC 0011](0011-crash-injection-test-matrix.md), D-rows)
+The genesis protocol ([RFC 0011](0011-crash-recovery.md), the genesis cases)
 already establishes the template this RFC follows: a multi-step state change
 that cannot always be one `WriteBatch`, made safe by a durable marker, a
 resume-from-cursor loop, and a final atomic flip. Genesis births a store;
@@ -143,7 +143,8 @@ that makes it fire.
 A structural migration is a sequence of writes, so it runs under the **one
 fenced writer** (RFC 0004). This is not new machinery: SlateDB's
 `writer_epoch` CAS-on-open means a second process attempting to migrate the
-same store is fenced — it loses the epoch and writes nothing (RFC 0011, C-rows).
+same store is fenced — it loses the epoch and writes nothing (RFC 0011, the
+takeover cases).
 So **exactly one migrator runs**, by the same guarantee that makes an
 accidental second catalog writer safe. Readers, meanwhile, must never observe
 a half-migrated store; the resume protocol below is structured so the only
@@ -196,8 +197,8 @@ distinguished by reading `sys/format` and `sys/migration`:
 
 The one combination that must be impossible — **new format with the marker
 still present** — is made impossible by putting the flip and the clear in the
-same batch. This is exactly RFC 0011 D2's "one `WriteBatch` for the terminal
-transition" applied to the migration's end instead of genesis's.
+same batch. This is exactly `GenesisInterrupted`'s "one `WriteBatch` for the
+terminal transition" applied to the migration's end instead of genesis's.
 
 ### Reader coherence during migration
 
@@ -290,9 +291,9 @@ explicit for every migration regardless of size.
 
 ### Test obligations
 
-These extend [RFC 0011](0011-crash-injection-test-matrix.md)'s matrix; they
+These extend [RFC 0011](0011-crash-recovery.md)'s cases; they
 run against real SlateDB on in-memory `object_store`, no store mocks
-(RFC 0001), and are naturally expressed as new `CrashPoint`-style rows.
+(RFC 0001), and are naturally expressed as new `CrashCase`-style cases.
 
 - **Crash at every migration seam.** Inject a crash at the start batch, at
   each step's new-key-write, at each step's old-key-delete, at the cursor

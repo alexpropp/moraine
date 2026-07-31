@@ -39,8 +39,14 @@ Three things gate disproportionately much of the list:
   readers are safe against the first real one. Everything that writes the
   marker is unbuilt: no start batch, no step loop, no finish flip, no
   cursor, no migrate verb.
-- **The crash harness** (RFC 0011). No `CrashPoint`, no `fault-injection`
-  feature, no matrix test. RFC 0015's seam coverage depends on it.
+- **The crash harness** (RFC 0011). The crash cases are enumerated and driven
+  as data, with `CommitDurableNotAcknowledged`, `TakeoverMidCommit`,
+  `FencedWriterResumes`, and `ConcurrentGenesis` covered end to end. The other
+  one case that remains is blocked on a feature rather than the harness:
+  group commit is unbuilt, so no batch carries several commits. Both
+  guarantees moraine owns — atomicity and resumability — have driven cases,
+  and the store-level write freeze RFC 0015's seam coverage wanted is
+  built.
 
 ## 0001 — Repository structure and conventions
 
@@ -57,7 +63,7 @@ Three things gate disproportionately much of the list:
 ## 0002 — SlateDB key encoding for catalog state
 
 - **VALIDATE** — Exercise the segmented-store configuration (one-byte segment
-  extractor) through the crash and recovery matrix. The segmented path is
+  extractor) through the crash-recovery cases. The segmented path is
   less-exercised in SlateDB, and the choice is only free to reverse before the
   first release.
 - **DEFERRED** — If server-side stats pruning is ever added, it needs
@@ -100,7 +106,8 @@ Three things gate disproportionately much of the list:
 
 - **IMPL** — Group commit: batch several pending catalog commits into one
   `WriteBatch` and one WAL flush. The protocol permits it; a batch of one is
-  the only path today, so throughput is one flush per commit.
+  the only path today, so throughput is one flush per commit. This is also
+  the last thing blocking a crash case (0011's `GroupCommit`).
 - **IMPL** — A zero-write reader mode that opens `DbReader` against an
   explicit existing checkpoint id instead of following latest, which CASes the
   manifest and pins SSTs against SlateDB GC. Shared with 0006.
@@ -305,33 +312,71 @@ Three things gate disproportionately much of the list:
   write, the committed snapshot still reported; an interrupted materialization
   releases its read-snapshot with no durable effect.
 
-## 0011 — Crash-injection test matrix
+## 0011 — Crash recovery
 
-- **IMPL** — The `CrashPoint` enum, whose variants are exactly the matrix rows,
-  plus a `#[cfg(any(test, feature = "fault-injection"))]` seam hook that
-  consults an injected `Option<CrashPoint>` and unwinds there. Neither the enum
-  nor the feature exists.
-- **IMPL** — Decompose the `transaction`, flush, and GC code so tests can drive
-  an operation up to a named seam and drop the writer handle mid-path.
+- **IMPL** — Move `CrashCase` from the integration suite into the library,
+  gated on `#[cfg(any(test, feature = "fault-injection"))]`, once a case needs
+  an in-code seam hook. It and its coverage table live in
+  `tests/it/crash_recovery.rs` today because no driven case needs one. The
+  `fault-injection` feature already exists, but the `CrashPoint` behind it
+  enumerates the migration driver's batch boundaries — a separate thing that
+  happens to be crash-shaped, not these cases.
+- **DECISION** — A commit does not return if object storage stops accepting
+  writes. SlateDB treats a failed write as retryable and retries
+  indefinitely, so a permanent refusal — expired credentials, a revoked
+  bucket policy — hangs the writer instead of surfacing an error. Measured
+  while building the write freeze: 8 retries in 5s with nothing returned, and
+  the catalog state stayed correct throughout. Whether moraine should bound
+  that (a deadline, or classifying some object-store errors as terminal) is
+  open; the crash cases do not need it, since a dying process never learns
+  its outcome either.
+- **VALIDATE** — An e2e crash case for the engine-side ordering contract:
+  kill a process between DuckLake's Parquet PUT and the commit registering
+  it, and assert the file is an orphan rather than a live dangling
+  reference. 0011 now states this boundary but does not enumerate it, since
+  only `cargo xtask e2e` runs both halves.
+- **DECISION** — Should a concurrent-open loser surface a typed error?
+  `ConcurrentGenesis` shows the store stays coherent (200 races, zero torn
+  genesis) but the loser fails as `Error::Fenced` roughly a third of the time
+  and as an untyped `Error::Store` carrying SlateDB's manifest-CAS collision
+  the rest. The case requires "adopts it, or returns a typed error". Telling
+  that
+  collision from real corruption needs a condition SlateDB keeps
+  `pub(crate)` — both surface as `ErrorKind::Data` — so the options are a
+  message match, an open-path retry, or an upstream change.
 - **DECISION** — Does moraine pin `WriteOptions` `seqnum` itself, or let
-  SlateDB generate them? This determines how an A2 re-drive is detected as a
-  duplicate rather than a fresh commit.
+  SlateDB generate them? This determines how a re-drive after
+  `CommitDurableNotAcknowledged` is detected as a duplicate rather than a
+  fresh commit. That case currently asserts the scope RFC 0011 states: guarded
+  re-drives surface their guard, and a data-only re-drive lands as a clean
+  second commit.
 - **DECISION** — Does compaction introduce a state-change seam not already
-  shaped like PUT-then-batch, requiring its own B-style rows?
-- **VALIDATE** — The single data-driven test iterating every `CrashPoint`
-  variant: build pre-crash state, inject, reopen, assert that row's invariant.
-  A variant with no assertion must fail.
-- **VALIDATE** — For idempotence rows A2, B1, B3, B4: re-drive after reopen and
-  assert convergence — no id collision, no torn state, only protocol-permitted
-  typed errors.
-- **VALIDATE** — For absence rows A3 and D2: enumerate all WAL boundaries and
-  assert the torn intermediate is unobservable at each.
-- **VALIDATE** — Confirm the seam hooks gate to zero production footprint, no
-  `unsafe`, and no fault-injection parameter in public signatures.
+  shaped like PUT-then-batch? If it does, the seam is the engine's, so the
+  case belongs to the e2e item above rather than here.
+- **VALIDATE** — The data-driven test iterating every `CrashCase` exists, and
+  each case declares both its guarantee and its coverage; exhaustive matches
+  make a new case without either a compile error. Nine of ten are driven.
+  Closing the last one closes the enforcement RFC 0011 asks for, since the
+  coverage table will then be empty and "a variant with no assertion fails"
+  becomes literally true rather than a convention.
+- **VALIDATE** — The idempotence cases (`CommitDurableNotAcknowledged`,
+  `StagedBuildInterrupted`, `ReclamationInterrupted`) all re-drive after
+  reopen and assert convergence. Closed; kept here until the remaining four
+  cases land, since a write freeze may add re-drive assertions of its own.
+- **VALIDATE** — The absence cases (`MultiTombstoneDrop`,
+  `GenesisInterrupted`) sweep the write allowance across every boundary the
+  operation has and assert the torn intermediate is unobservable at each.
+  Closed.
+- **VALIDATE** — Confirmed by construction: the crash cases added no
+  production surface at all. Crashes come from dropping a handle, freezing a
+  decorating `ObjectStore`, or opening a second writer, so there is no seam
+  hook to gate, no `unsafe`, and no fault-injection parameter in any public
+  signature. Re-check when RFC 0015's migration driver lands its own hook.
 - **DEFERRED** — A `cargo-fuzz` target that crashes at arbitrary WAL offsets
-  and reopens, asserting the same two invariants, once the matrix is green.
+  and reopens, asserting the same two guarantees, once every case is green.
 - **DOC** — 0001 and 0004 still carry generic crash-shaped-sequence bullets;
-  replace them with citations to rows A1, A2, and B3.
+  replace them with citations to `CommitNotDurable` and
+  `CommitDurableNotAcknowledged`.
 
 ## 0012 — Schema evolution and versioning
 

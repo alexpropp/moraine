@@ -779,7 +779,7 @@ and `index` kind — no migration, no rewrite; dropping the last index does not
 downgrade the stamp. Staged builds bump once more, to format 3 (Staged
 builds), under the same lazy posture. The `index` discriminant leaves the
 segment extractor ("first byte") untouched, so existing segments and the
-RFC 0011 crash matrix are unaffected.
+RFC 0011 crash cases are unaffected.
 
 ### Reclamation
 

@@ -25,7 +25,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [features]
-# Exposes crash-injection seams for the migration and crash test matrix.
+# Exposes crash-injection seams for the format-migration driver.
 # Off by default; production builds carry no seam code.
 fault-injection = []
 

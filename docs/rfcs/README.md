@@ -32,7 +32,7 @@ directly here as RFCs; there is no separate specs directory.
 | [0008](0008-compaction.md) | Compaction and delete-file consolidation |
 | [0009](0009-reader-consistency-and-caching.md) | Reader consistency and snapshot caching |
 | [0010](0010-async-sync-bridge.md) | Async↔sync bridge |
-| [0011](0011-crash-injection-test-matrix.md) | Crash-injection test matrix |
+| [0011](0011-crash-recovery.md) | Crash recovery |
 | [0012](0012-schema-evolution-and-versioning.md) | Schema evolution and versioning |
 | [0013](0013-partitioning-sorting-and-pruning.md) | Partitioning, sorting, and pruning |
 | [0014](0014-encryption.md) | Catalog and data encryption |

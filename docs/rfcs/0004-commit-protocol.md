@@ -119,7 +119,7 @@ of a lock: SlateDB's `writer_epoch` means **the newest writer wins**. A
 second process opening the store read-write bumps the epoch and **fences
 the incumbent** — the first writer's next durable write fails, not the
 second's. Safety is absolute (a fenced writer writes nothing, never
-corrupts — RFC 0011 C2), but availability is not: two processes attaching
+corrupts — RFC 0011's `FencedWriterResumes`), but availability is not: two processes attaching
 read-write do not degrade to "second one fails," they take turns killing
 each other's committer. The operational rule follows: **exactly one
 process attaches read-write; every other process attaches read-only**
