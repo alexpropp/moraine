@@ -31,7 +31,7 @@ use crate::{
     catalog::{
         CatalogSnapshot, ColumnInfo, IndexInfo, SnapshotId, TableId,
         inline::{InlineScanKind, materialize_inline_rows},
-        projection::{ProjectionCache, fold_committed_batch, invalidate_head_view},
+        projection::ProjectionCache,
         scoped_read::{self, ScopedReadEntry},
     },
     error::{Error, Result},
@@ -543,25 +543,25 @@ impl StagedTransaction {
                     db_tx.rollback();
                     return Err(err);
                 }
-                // A head-preserving (maintenance) commit reuses the head id;
-                // drop the cache before the write is visible so no concurrent
-                // attempt reads a stale view that still matches by id.
-                if !mints_snapshot {
-                    invalidate_head_view(&projections);
-                }
-                match db_tx.commit_with_options(&commit::durable()).await {
-                    Ok(_) => {
-                        fold_committed_batch(&projections, &writes, result_id);
-                        if mints_snapshot {
-                            commit::refresh_head_view(&projections, base_ref, &writes);
-                        }
+                // The same landing the verb path takes: one durable write,
+                // one head-race classification, one projection refresh.
+                // This path never retries the loss — DuckLake authored the
+                // rows, so re-driving them is DuckLake's call.
+                let landed = commit::commit_batch(
+                    db_tx,
+                    base_ref.snapshot.snapshot_id,
+                    result_id,
+                    &writes,
+                    base_ref,
+                    &projections,
+                )
+                .await?;
+                match landed {
+                    commit::Landed::Committed => {
                         staged_landed(result_id, staged_rows, started);
                         Ok(SnapshotId::new(result_id))
                     }
-                    Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
-                        Err(staged_lost_race(result_id, staged_rows))
-                    }
-                    Err(err) => Err(err.into()),
+                    commit::Landed::LostRace => Err(staged_lost_race(result_id, staged_rows)),
                 }
             }
             Err(err) => {
@@ -606,6 +606,21 @@ fn translate(
 ) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
     let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
+
+    // DuckLake mints the id from the head it read, so an id at or below the
+    // head this commit lands on means the two disagree about where the
+    // catalog stands. Landing it would overwrite a snapshot record and move
+    // the head backwards, and every write below stamps `new_id` as the
+    // version it begins at.
+    if new_id <= base.snapshot.snapshot_id {
+        return Err(corrupt_row(
+            TableKind::Snapshot,
+            format!(
+                "snapshot_id {new_id} does not advance the head ({})",
+                base.snapshot.snapshot_id
+            ),
+        ));
+    }
 
     // Ends and deletes apply before inserts, independent of DuckLake's
     // emit order: a rename ends the old version and inserts a new one
@@ -664,42 +679,7 @@ fn translate(
         }
     }
 
-    if !children.partition_columns.is_empty() {
-        return Err(corrupt_row(
-            TableKind::PartitionColumn,
-            "partition_column rows without a matching partition_info insert in this commit",
-        ));
-    }
-    if !children.sort_expressions.is_empty() {
-        return Err(corrupt_row(
-            TableKind::SortExpression,
-            "sort_expression rows without a matching sort_info insert in this commit",
-        ));
-    }
-    if !children.file_partition_values.is_empty() {
-        return Err(corrupt_row(
-            TableKind::FilePartitionValue,
-            "file_partition_value rows without a matching data_file insert in this commit",
-        ));
-    }
-    if !children.macro_implementations.is_empty() {
-        return Err(corrupt_row(
-            TableKind::MacroImpl,
-            "macro_impl rows without a matching macro insert in this commit",
-        ));
-    }
-    if !children.macro_parameters.is_empty() {
-        return Err(corrupt_row(
-            TableKind::MacroParameters,
-            "macro_parameters rows without a matching macro_impl in this commit",
-        ));
-    }
-    if !children.name_mappings.is_empty() {
-        return Err(corrupt_row(
-            TableKind::NameMapping,
-            "name_mapping rows without a matching column_mapping insert in this commit",
-        ));
-    }
+    refuse_orphaned_children(&children)?;
 
     // DuckLake authors column ids itself, so its inserts advance no
     // counter; float each table's field-id counter above every live id so
@@ -720,6 +700,51 @@ fn translate(
     let mut writes = commit::diff_writes(base, &state, new_id);
     writes.extend(direct);
     Ok((new_id, writes, snapshot))
+}
+
+/// Refuses child rows left over after every parent was applied. An
+/// embedded child whose parent is not in the same commit has nowhere to
+/// live, and dropping it silently would lose a partition column or a macro
+/// parameter DuckLake believes it wrote.
+fn refuse_orphaned_children(children: &ChildRows) -> Result<()> {
+    let orphans = [
+        (
+            children.partition_columns.is_empty(),
+            TableKind::PartitionColumn,
+            "partition_column rows without a matching partition_info insert in this commit",
+        ),
+        (
+            children.sort_expressions.is_empty(),
+            TableKind::SortExpression,
+            "sort_expression rows without a matching sort_info insert in this commit",
+        ),
+        (
+            children.file_partition_values.is_empty(),
+            TableKind::FilePartitionValue,
+            "file_partition_value rows without a matching data_file insert in this commit",
+        ),
+        (
+            children.macro_implementations.is_empty(),
+            TableKind::MacroImpl,
+            "macro_impl rows without a matching macro insert in this commit",
+        ),
+        (
+            children.macro_parameters.is_empty(),
+            TableKind::MacroParameters,
+            "macro_parameters rows without a matching macro_impl in this commit",
+        ),
+        (
+            children.name_mappings.is_empty(),
+            TableKind::NameMapping,
+            "name_mapping rows without a matching column_mapping insert in this commit",
+        ),
+    ];
+    for (applied, table, detail) in orphans {
+        if !applied {
+            return Err(corrupt_row(table, detail));
+        }
+    }
+    Ok(())
 }
 
 /// Translates a head-preserving maintenance commit: snapshot expiry and

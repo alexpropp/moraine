@@ -19,7 +19,7 @@ use std::sync::{
 use slatedb::{Db, DbTransaction, IsolationLevel};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
-use super::{Prepared, StagedWrite, commit_batch, fold, head_view_for, prepare_and_stage};
+use super::{Landed, Prepared, StagedWrite, commit_batch, fold, head_view_for, prepare_and_stage};
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
@@ -38,17 +38,20 @@ use crate::{
 const MAX_BATCH_MEMBERS: usize = 64;
 
 /// What a sealed batch did, told to every member that rode it.
+///
+/// A batch's write failure does not appear here as itself. The answer goes
+/// to members that never saw the store and cannot be handed an error one
+/// of them owns, so it arrives as [`Outcome::Nothing`] and is surfaced
+/// typed by whichever member meets the same failure on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Landed {
+pub(crate) enum Outcome {
     /// Committed. Every member's allocated ids stand.
     Committed,
     /// Lost the head race. Every member re-runs, classifying its own
     /// change set against the commits that won.
     LostRace,
-    /// Nothing was written, for a reason no member can classify from
-    /// here: the write failed, or the batch was abandoned before it
-    /// sealed. Every member re-attempts, and one that meets the same
-    /// failure on its own surfaces it typed.
+    /// Nothing was written: the write failed, or the batch was abandoned
+    /// before it sealed. Every member re-attempts.
     Nothing,
 }
 
@@ -65,7 +68,7 @@ pub(crate) struct Staged {
     /// not is unaffected by the batch's fate.
     pub(crate) contributed: bool,
     /// The batch's outcome, once it lands.
-    pub(crate) outcome: watch::Receiver<Option<Landed>>,
+    pub(crate) outcome: watch::Receiver<Option<Outcome>>,
 }
 
 /// A batch being formed: one open transaction carrying every member's
@@ -88,7 +91,7 @@ struct Batch {
     /// Commits staged onto the batch, against [`MAX_BATCH_MEMBERS`].
     members: usize,
     writes: Vec<StagedWrite>,
-    outcome: watch::Sender<Option<Landed>>,
+    outcome: watch::Sender<Option<Outcome>>,
 }
 
 impl Batch {
@@ -308,7 +311,16 @@ impl Coalescer {
         } = batch;
 
         let landed =
-            commit_batch(db_tx, head_before, head, &writes, &base, &self.projections).await;
+            match commit_batch(db_tx, head_before, head, &writes, &base, &self.projections).await {
+                Ok(Landed::Committed) => Outcome::Committed,
+                Ok(Landed::LostRace) => Outcome::LostRace,
+                Err(err) => {
+                    // The only record of this error. Its members re-attempt,
+                    // and the one that meets it alone returns it typed.
+                    tracing::warn!(error = %err, "commit batch failed to write; its members retry");
+                    Outcome::Nothing
+                }
+            };
         // Every member may already have gone; the batch landed regardless.
         let _ = outcome.send(Some(landed));
 
@@ -344,7 +356,7 @@ impl Coalescer {
 ///
 /// A sender dropped with nothing published means the batch was abandoned
 /// before it sealed — nothing was written, so the member re-runs.
-pub(crate) async fn await_outcome(mut outcome: watch::Receiver<Option<Landed>>) -> Landed {
+pub(crate) async fn await_outcome(mut outcome: watch::Receiver<Option<Outcome>>) -> Outcome {
     loop {
         if let Some(landed) = *outcome.borrow_and_update() {
             return landed;
@@ -352,7 +364,7 @@ pub(crate) async fn await_outcome(mut outcome: watch::Receiver<Option<Landed>>) 
         if outcome.changed().await.is_err() {
             // Re-read rather than assume: the sender may have published
             // and dropped between the borrow above and this wait.
-            return outcome.borrow().unwrap_or(Landed::Nothing);
+            return outcome.borrow().unwrap_or(Outcome::Nothing);
         }
     }
 }

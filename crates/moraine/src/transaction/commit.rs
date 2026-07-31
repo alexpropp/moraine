@@ -359,7 +359,16 @@ mod group;
 use diff::diff_options;
 pub(crate) use diff::diff_writes;
 pub(crate) use group::Coalescer;
-use group::Landed;
+use group::Outcome;
+
+/// What a batch's durable write did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Landed {
+    /// The batch is durable.
+    Committed,
+    /// A concurrent commit advanced the head first; nothing was written.
+    LostRace,
+}
 
 /// The result of one attempt at a group.
 enum CommitOutcome {
@@ -403,12 +412,12 @@ where
     }
 
     match group::await_outcome(staged.outcome).await {
-        Landed::Committed => Ok(CommitOutcome::Committed(staged.ids)),
-        Landed::LostRace => Ok(CommitOutcome::LostRace {
+        Outcome::Committed => Ok(CommitOutcome::Committed(staged.ids)),
+        Outcome::LostRace => Ok(CommitOutcome::LostRace {
             ours: staged.ours,
             head_before: staged.head_before,
         }),
-        Landed::Nothing => Ok(CommitOutcome::Nothing),
+        Outcome::Nothing => Ok(CommitOutcome::Nothing),
     }
 }
 
@@ -659,10 +668,9 @@ pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Res
 /// folds the result into the maintained projections. `head` is the id the
 /// batch leaves at the head pointer, its last snapshot-minting member's.
 ///
-/// Every failure resolves to a [`Landed`] rather than an error, because
-/// the answer goes to members that never saw the store: a write failure is
-/// logged here and re-surfaced typed by whichever member meets it again on
-/// its own.
+/// The one place a catalog batch reaches the store: both front doors land
+/// here, so the durable write, the head-race classification, and the
+/// projection bookkeeping that must accompany them are written once.
 pub(crate) async fn commit_batch(
     db_tx: DbTransaction,
     head_before: u64,
@@ -670,7 +678,7 @@ pub(crate) async fn commit_batch(
     writes: &[StagedWrite],
     base: &CatalogSnapshot,
     projections: &std::sync::RwLock<ProjectionCache>,
-) -> Landed {
+) -> Result<Landed> {
     // A head-preserving commit reuses the head id with new content; drop the
     // cache before the write is visible so no concurrent attempt reads a
     // stale view that still matches by id.
@@ -684,15 +692,10 @@ pub(crate) async fn commit_batch(
             if head_advanced {
                 refresh_head_view(projections, base, writes);
             }
-            Landed::Committed
+            Ok(Landed::Committed)
         }
-        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Landed::LostRace,
-        Err(err) => {
-            // The only record of this error: its members re-attempt, and
-            // the one that meets it alone returns it typed.
-            tracing::warn!(error = %err, "commit batch failed to write; its members will retry");
-            Landed::Nothing
-        }
+        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Landed::LostRace),
+        Err(err) => Err(err.into()),
     }
 }
 

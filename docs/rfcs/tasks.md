@@ -100,12 +100,12 @@ store-level write freeze RFC 0015's seam coverage wanted is built.
 
 ## 0004 — Commit and transaction protocol
 
-- **DEFERRED** — Let the staged-row path join a batch, so SQL through
-  DuckLake gets group commit too. It commits its own transaction today, so
-  successive SQL transactions still cost a flush each. Retry rights stay
-  the member's, so the obstacle is not the batch but that there is nothing
-  to batch it with until DuckLake's serialized metadata connection admits
-  concurrent committers.
+- **DEFERRED** — Let the staged-row path join a batch. Both front doors now
+  land through one function, but the staged path still commits its own
+  transaction: its snapshot id is DuckLake's, authored against the head it
+  read, so it can only ever lead a batch, never fold onto a member. Worth
+  building when DuckLake's serialized metadata connection admits concurrent
+  committers — until then there is nothing to batch it with.
 - **MEASURE** — Commit throughput under concurrency, now that concurrent
   commits coalesce: how many commits one flush carries as concurrency
   rises, and where the batch's member ceiling starts to bind.

@@ -581,11 +581,21 @@ none (RFC 0011, `GroupCommit`). A sealed batch commits on a task of its own
 rather than on whichever caller sealed it, because a host interrupt drops
 that caller's future (RFC 0010) and the other members are owed an answer.
 
-Both halves are verb-path properties. The staged-row path commits its own
-transaction and joins no batch, so SQL through DuckLake gets neither: a
-`BEGIN … COMMIT` lands as one snapshot, which merges statements rather than
-batching commits. Closing that gap buys little until DuckLake's serialized
-metadata connection admits concurrent committers.
+Both front doors land through one function, so the durable write, the
+head-race classification, and the projection bookkeeping exist once. What
+the staged-row path does not do is *join* a batch: it commits its own
+transaction, because DuckLake authors its snapshot id against the head it
+read, and no fold onto a preceding member can re-derive that id. The id is
+therefore checked rather than trusted — a staged commit whose id does not
+advance the head it lands on is refused, where before it relied on the
+head-pointer race to catch the same disagreement.
+
+So batching is a verb-path property, and SQL through DuckLake reaches it
+only where a statement runs a verb (index DDL, maintenance). DuckLake's own
+DML and DDL do not batch, and would gain nothing if they did: its metadata
+connection is serialized, so successive SQL transactions never overlap and
+there is nothing to batch them with. A `BEGIN … COMMIT` still lands as one
+snapshot, but that is statements merged, not commits batched.
 
 ### Reader visibility after commit
 
