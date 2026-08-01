@@ -554,6 +554,49 @@ correctness requirement — a batch of one is the normal path. Ordering
 within a group is the committer's choice; conflicts *within* a group are
 impossible because a single committer serializes them before staging.
 
+**Implemented** two ways over one core — a lone commit is a group of one,
+so there is one commit path, not two. `Catalog::commit_group` batches what
+one caller hands it; concurrent callers of the ordinary `Catalog::commit`
+are batched without asking. A commit that finds the store free opens a
+batch, one that finds a batch forming joins it, one that finds a batch in
+flight waits for the next, and a batch seals as soon as no caller is on its
+way into it — so the flush already in the air is the batching window and an
+uncontended commit waits for nobody. A batch also seals at a bounded member
+count, since under saturation the arrival count never falls to zero.
+
+Steps 1–3 run once per member, against a premise folded forward from the
+member before it (the same fold that refreshes the cached head view), so
+member *i* allocates its ids and detects its name collisions against
+everything members *1..i* did. That is what makes intra-batch conflicts
+unreachable rather than unlikely. Step 4 then runs once.
+
+A batch batches commits; it does not merge them. Each member mints its own
+snapshot, which time travel resolves separately. What batching changes is
+durability granularity, not catalog shape.
+
+The batch is the unit of failure. A member that fails discards the batch,
+and its other members re-run; a lost race re-runs every member, conflicting
+if any member's change set does; a crash leaves every member committed or
+none (RFC 0011, `GroupCommit`). A sealed batch commits on a task of its own
+rather than on whichever caller sealed it, because a host interrupt drops
+that caller's future (RFC 0010) and the other members are owed an answer.
+
+Both front doors land through one function, so the durable write, the
+head-race classification, and the projection bookkeeping exist once. What
+the staged-row path does not do is *join* a batch: it commits its own
+transaction, because DuckLake authors its snapshot id against the head it
+read, and no fold onto a preceding member can re-derive that id. The id is
+therefore checked rather than trusted — a staged commit whose id does not
+advance the head it lands on is refused, where before it relied on the
+head-pointer race to catch the same disagreement.
+
+So batching is a verb-path property, and SQL through DuckLake reaches it
+only where a statement runs a verb (index DDL, maintenance). DuckLake's own
+DML and DDL do not batch, and would gain nothing if they did: its metadata
+connection is serialized, so successive SQL transactions never overlap and
+there is nothing to batch them with. A `BEGIN … COMMIT` still lands as one
+snapshot, but that is statements merged, not commits batched.
+
 ### Reader visibility after commit
 
 Step 4 makes a commit **durable**; a *separate* reader observing it is a
@@ -621,6 +664,17 @@ SlateDB on in-memory `object_store` — no mocks of the store:
 - Fresh-reader visibility: after `commit` returns, a newly opened reader
   resolves the new snapshot (the store-harness validation above, run
   against real SlateDB on in-memory `object_store`).
+- Group commit: a group costs fewer object-store writes than the same
+  members committed separately; every member mints its own consecutive
+  snapshot and time travel resolves each one to that member's state; a
+  member stages against what the members before it left; a failing member
+  aborts the group; a group that loses a disjoint race re-runs and lands
+  every member.
+- Coalescing: a burst of concurrent `commit` calls costs fewer
+  object-store writes than the same calls made one at a time, while each
+  still mints its own snapshot; and a commit whose future is dropped part
+  way — the shape a host interrupt takes, swept across the commit's life —
+  never strands the commits sharing its batch.
 
 E2E testing validates the protocol against real DuckLake SQL.
 

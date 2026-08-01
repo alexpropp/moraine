@@ -248,10 +248,12 @@ data-driven test that iterates `CrashCase`:
   data-only re-drive lands as a *clean second commit* (the duplicate is the
   caller's to prevent until the `seqnum` question is settled), never a
   corrupted one.
-- The absence cases (`MultiTombstoneDrop`, `GenesisInterrupted`) assert torn
-  intermediate states are *unobservable* across **all** WAL boundaries of
-  the operation, not just one — the test enumerates the boundaries and
-  checks each.
+- The absence cases (`MultiTombstoneDrop`, `GroupCommit`,
+  `GenesisInterrupted`) assert torn intermediate states are *unobservable*
+  across **all** WAL boundaries of the operation, not just one — the test
+  enumerates the boundaries and checks each. For `GroupCommit` the torn
+  state to rule out is a group missing its tail, or a head standing at a
+  member other than the last.
 
 This test **replaces** the generic "crash-shaped sequences (commit, reopen,
 verify)" line in RFC 0001's testing table and **subsumes** RFC 0004's

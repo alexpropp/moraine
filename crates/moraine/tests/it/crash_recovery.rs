@@ -6,7 +6,7 @@
 //! object store, with no in-memory carryover from the process that died.
 //! Cases run against real SlateDB on in-memory `object_store`.
 
-mod freezing_store;
+pub mod freezing_store;
 
 use std::sync::Arc;
 
@@ -96,63 +96,39 @@ fn guarantee(case: CrashCase) -> Guarantee {
     }
 }
 
-/// Whether a case is driven by a test here.
-#[derive(Debug, PartialEq, Eq)]
-enum Coverage {
-    /// A test below builds the pre-crash state, crashes, reopens, and
-    /// asserts what must hold.
-    Driven,
-    /// Nothing can crash the operation at that point yet; carries what
-    /// must be built first.
-    Blocked(&'static str),
-}
-
-fn coverage(case: CrashCase) -> Coverage {
+/// What must be built before a test here can crash the case, or `None`
+/// when a test below already builds the pre-crash state, crashes, reopens,
+/// and asserts what must hold. Every case is driven today; the return type
+/// is what a case that cannot be yet has to fill in.
+fn blocked_on(case: CrashCase) -> Option<&'static str> {
     match case {
         CrashCase::CommitNotDurable
         | CrashCase::CommitDurableNotAcknowledged
         | CrashCase::MultiTombstoneDrop
+        | CrashCase::GroupCommit
         | CrashCase::TakeoverMidCommit
         | CrashCase::FencedWriterResumes
         | CrashCase::GenesisInterrupted
         | CrashCase::ConcurrentGenesis
         | CrashCase::StagedBuildInterrupted
-        | CrashCase::ReclamationInterrupted => Coverage::Driven,
-
-        CrashCase::GroupCommit => {
-            Coverage::Blocked("group commit is unbuilt: a batch of one is the only path today")
-        }
+        | CrashCase::ReclamationInterrupted => None,
     }
 }
 
-/// Pins which cases are driven and requires the rest to name what blocks
-/// them, so a case cannot be quietly stubbed out. The exhaustive matches
-/// in [`guarantee`] and [`coverage`] cover the other half: a new case
-/// fails to compile until both decisions are made.
-///
-/// Every case is driven but one, and that one is blocked on a feature
-/// rather than on the harness: group commit is unbuilt, so no batch
-/// carries several commits for a crash to catch half-applied.
+/// Pins that every case is driven and requires any that is not to name
+/// what blocks it, so a case cannot be quietly stubbed out. The exhaustive
+/// matches in [`guarantee`] and [`blocked_on`] cover the other half: a new
+/// case fails to compile until both decisions are made.
 #[test]
 fn every_case_declares_its_guarantee_and_coverage() {
     let driven: Vec<CrashCase> = CASES
         .into_iter()
-        .filter(|case| coverage(*case) == Coverage::Driven)
+        .filter(|case| blocked_on(*case).is_none())
         .collect();
     assert_eq!(
         driven,
-        vec![
-            CrashCase::CommitNotDurable,
-            CrashCase::CommitDurableNotAcknowledged,
-            CrashCase::MultiTombstoneDrop,
-            CrashCase::TakeoverMidCommit,
-            CrashCase::FencedWriterResumes,
-            CrashCase::GenesisInterrupted,
-            CrashCase::ConcurrentGenesis,
-            CrashCase::StagedBuildInterrupted,
-            CrashCase::ReclamationInterrupted,
-        ],
-        "driven cases changed; update this list as cases land"
+        CASES.to_vec(),
+        "a case stopped being driven; it may only do so by naming what blocks it"
     );
     for expected in [Guarantee::Atomicity, Guarantee::Resumability] {
         assert!(
@@ -162,7 +138,7 @@ fn every_case_declares_its_guarantee_and_coverage() {
     }
 
     for case in CASES {
-        if let Coverage::Blocked(reason) = coverage(case) {
+        if let Some(reason) = blocked_on(case) {
             assert!(!reason.is_empty(), "{case:?} is blocked without a reason");
         }
     }
@@ -847,5 +823,107 @@ async fn interrupted_genesis_is_never_observed_half_created() {
     assert!(
         interrupted > 0,
         "no round actually stopped genesis, so the sweep proved nothing"
+    );
+}
+
+/// The three members of the group below, each a schema with a table in it.
+/// Naming them by position lets the assertion count survivors without
+/// caring which one it is looking at.
+const GROUP_MEMBERS: [&str; 3] = ["m1", "m2", "m3"];
+
+/// Stages a three-member group onto `catalog`: one schema and one table per
+/// member, so the batch carries far more than the head pointer.
+#[allow(clippy::unwrap_used)]
+async fn commit_a_group(catalog: &Catalog) -> Result<Vec<moraine::SnapshotId>, Error> {
+    let member = |name: &'static str| {
+        move |tx: &mut moraine::Transaction| {
+            let schema = tx.create_schema(name)?;
+            tx.create_table(schema, "rows", &[col("x")]).map(|_| ())
+        }
+    };
+    let (first, second, third) = (
+        member(GROUP_MEMBERS[0]),
+        member(GROUP_MEMBERS[1]),
+        member(GROUP_MEMBERS[2]),
+    );
+    catalog.commit_group(&[&first, &second, &third]).await
+}
+
+/// `GroupCommit` — several catalog commits staged into one batch. A batch
+/// is a batch regardless of how many logical commits it carries, so
+/// stopping the store at *every* write the group issues must leave every
+/// member committed or none: never a group missing its tail, and never a
+/// head pointing at a snapshot whose members did not all land.
+#[tokio::test]
+async fn a_group_is_never_observed_half_committed() {
+    // How many writes the group issues, measured on an unfrozen run.
+    let probe_backing: Arc<InMemory> = Arc::new(InMemory::new());
+    let probe_store = Arc::new(FreezingStore::thawed(probe_backing.clone()));
+    let probe = Catalog::open(probe_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let before_group = probe_store.writes_attempted();
+    let ids = commit_a_group(&probe).await.unwrap();
+    let boundaries = probe_store.writes_attempted() - before_group;
+    probe.close().await.unwrap();
+    assert_eq!(ids.len(), GROUP_MEMBERS.len());
+    assert!(
+        boundaries > 0,
+        "the group must write something to be worth stopping"
+    );
+
+    let mut interrupted = 0;
+    for stop_after in 0..=boundaries {
+        let backing: Arc<InMemory> = Arc::new(InMemory::new());
+        let store = Arc::new(FreezingStore::thawed(backing.clone()));
+        let catalog = Catalog::open(store.clone(), CatalogOptions::default())
+            .await
+            .unwrap();
+        let start = catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .current_snapshot()
+            .id
+            .get();
+
+        // Die partway through the group, one write later each round. Once
+        // the allowance covers every write, it commits normally — that is
+        // the end of the sweep, not a failure.
+        store.freeze_after(i64::try_from(stop_after).unwrap());
+        let outcome = tokio::time::timeout(UNTIL_CRASH, commit_a_group(&catalog)).await;
+        if !matches!(outcome, Ok(Ok(_))) {
+            interrupted += 1;
+        }
+        drop(catalog);
+
+        let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
+            .await
+            .unwrap();
+        let recovered = reopened.snapshot().await.unwrap();
+        let landed = GROUP_MEMBERS
+            .iter()
+            .filter(|name| recovered.schema_by_name(name).is_some())
+            .count();
+        assert!(
+            landed == 0 || landed == GROUP_MEMBERS.len(),
+            "stopping after {stop_after} writes left {landed} of {} members committed",
+            GROUP_MEMBERS.len()
+        );
+        let expected_head = if landed == 0 {
+            start
+        } else {
+            start + u64::try_from(GROUP_MEMBERS.len()).unwrap()
+        };
+        assert_eq!(
+            recovered.current_snapshot().id.get(),
+            expected_head,
+            "stopping after {stop_after} writes left the head out of step with the group"
+        );
+        reopened.close().await.unwrap();
+    }
+    assert!(
+        interrupted > 0,
+        "no round actually stopped the group, so the sweep proved nothing"
     );
 }

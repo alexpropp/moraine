@@ -3498,3 +3498,58 @@ fn table_kind_wire_order_is_pinned() {
         }
     }
 }
+
+/// DuckLake mints the snapshot id from the head it read, so an id that does
+/// not advance the head means the two disagree about where the catalog
+/// stands. Landing it would overwrite a snapshot record and move the head
+/// backwards, so it is refused rather than trusted.
+#[tokio::test]
+async fn a_snapshot_id_that_does_not_advance_the_head_is_refused() {
+    for authored in [0, 1] {
+        let catalog = open().await;
+        // Head stands at 1 after this commit.
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(1, 0, "t", 1, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+        });
+        tx.commit().await.unwrap();
+
+        let db_tx = catalog.begin_write_tx().await.unwrap();
+        let mut tx = StagedTransaction::begin_detached(db_tx);
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Table,
+            cells: table_row(2, 0, "u", authored, None),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(authored, 2, 3),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(authored, r#"created_table:"main"."u""#),
+        });
+        let err = tx.commit().await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Corruption(detail) if detail.contains("does not advance the head")),
+            "{authored}: {err:?}"
+        );
+
+        let snapshot = catalog.snapshot().await.unwrap();
+        assert_eq!(snapshot.current_snapshot().id.get(), 1);
+        assert!(
+            snapshot
+                .table_by_name(crate::catalog::SchemaId::new(0), "u")
+                .is_none()
+        );
+    }
+}

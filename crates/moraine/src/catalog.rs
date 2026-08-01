@@ -12,7 +12,7 @@ mod snapshot;
 mod types;
 
 pub use handle::{
-    Catalog, CatalogOptions, MaintenanceReport, MaintenanceRequest, MigrationRequest,
+    Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest, MigrationRequest,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;

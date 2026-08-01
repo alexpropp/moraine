@@ -9,6 +9,7 @@ mod catalog;
 mod commit_concurrency;
 mod crash_recovery;
 mod data_files;
+mod group_commit;
 mod index_backfill;
 mod macros;
 mod measure;

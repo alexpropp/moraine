@@ -355,71 +355,69 @@ pub(crate) type StagedWrite = (Vec<u8>, Option<Vec<u8>>);
 
 mod diff;
 mod fold;
+mod group;
 use diff::diff_options;
 pub(crate) use diff::diff_writes;
+pub(crate) use group::Coalescer;
+use group::Outcome;
 
-/// The result of one commit attempt.
-enum CommitOutcome {
-    /// The attempt committed; carries the resulting snapshot id.
-    Committed(SnapshotId),
-    /// Lost the head race: what we tried to change, and the head our
-    /// premise was read at — classification reads the commits above it.
-    LostRace {
-        ours: Box<ChangeSet>,
-        head_before: u64,
-    },
+/// What a batch's durable write did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Landed {
+    /// The batch is durable.
+    Committed,
+    /// A concurrent commit advanced the head first; nothing was written.
+    LostRace,
 }
 
-/// Runs one commit attempt: materialize, run the closure, stage, commit.
-/// An empty op set commits nothing and returns the unchanged head. Every
-/// exit that does not reach the final commit rolls the transaction back.
-async fn attempt_commit<F>(
+/// The result of one attempt at a group.
+enum CommitOutcome {
+    /// The attempt committed; carries one snapshot id per member, in
+    /// member order.
+    Committed(Vec<SnapshotId>),
+    /// Lost the head race: what each member tried to change, and the head
+    /// the batch's premise was read at — classification reads the commits
+    /// above it.
+    LostRace {
+        ours: Vec<ChangeSet>,
+        head_before: u64,
+    },
+    /// Nothing landed, for a reason the attempt cannot classify. Retrying
+    /// is the only way to learn more: an attempt that meets the same
+    /// failure without a batch to share surfaces it typed.
+    Nothing,
+}
+
+/// Runs one attempt: stage every member onto whichever batch the store is
+/// forming, and take that batch's fate as this attempt's.
+///
+/// Members are staged one caller at a time, so each stages against the
+/// state the members before it left — a batch can never conflict with
+/// itself, only fail on a premise an earlier member invalidated.
+async fn attempt_group<F>(
     db: &Db,
-    f: &F,
-    projections: &std::sync::RwLock<ProjectionCache>,
+    members: &[F],
+    coalescer: &Arc<Coalescer>,
 ) -> Result<CommitOutcome>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
-    let db_tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let staged = coalescer.stage(db, members).await?;
 
-    let base = match head_view_for(&db_tx, projections).await {
-        Ok(base) => base,
-        Err(err) => {
-            db_tx.rollback();
-            return Err(err);
-        }
-    };
+    // A caller that staged nothing is not riding the batch and does not
+    // wait on it: it reports the head standing at its turn, exactly as a
+    // commit of the same closure alone would.
+    if !staged.contributed {
+        return Ok(CommitOutcome::Committed(staged.ids));
+    }
 
-    match prepare_and_stage(&db_tx, f, &base).await {
-        Ok(Prepared::Nothing { head }) => {
-            db_tx.rollback();
-            Ok(CommitOutcome::Committed(SnapshotId::new(head)))
-        }
-        Ok(Prepared::Staged {
-            ours,
-            head_before,
-            commits,
-            writes,
-        }) => {
-            finish_commit(
-                db_tx,
-                ours,
-                head_before,
-                commits,
-                writes,
-                &base,
-                projections,
-            )
-            .await
-        }
-        Err(err) => {
-            db_tx.rollback();
-            Err(err)
-        }
+    match group::await_outcome(staged.outcome).await {
+        Outcome::Committed => Ok(CommitOutcome::Committed(staged.ids)),
+        Outcome::LostRace => Ok(CommitOutcome::LostRace {
+            ours: staged.ours,
+            head_before: staged.head_before,
+        }),
+        Outcome::Nothing => Ok(CommitOutcome::Nothing),
     }
 }
 
@@ -488,10 +486,8 @@ enum Prepared {
     },
     /// Writes are staged and ready to commit.
     Staged {
-        /// This attempt's change set, empty for an options-only commit.
+        /// This member's change set, empty for an options-only commit.
         ours: Box<ChangeSet>,
-        /// The head snapshot id the attempt's premise was read at.
-        head_before: u64,
         /// The snapshot id a successful commit reports.
         commits: u64,
         /// The staged batch, kept so a successful commit can fold it into
@@ -594,7 +590,6 @@ where
         stage_writes(db_tx, &writes)?;
         return Ok(Prepared::Staged {
             ours: Box::default(),
-            head_before: head,
             commits: head,
             writes,
         });
@@ -653,7 +648,6 @@ where
 
     Ok(Prepared::Staged {
         ours: Box::new(ours),
-        head_before: head,
         commits: new_id,
         writes,
     })
@@ -670,47 +664,54 @@ pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Res
     Ok(())
 }
 
-async fn finish_commit(
+/// Commits one staged batch — one commit's or a whole batch of them — and
+/// folds the result into the maintained projections. `head` is the id the
+/// batch leaves at the head pointer, its last snapshot-minting member's.
+///
+/// The one place a catalog batch reaches the store: both front doors land
+/// here, so the durable write, the head-race classification, and the
+/// projection bookkeeping that must accompany them are written once.
+pub(crate) async fn commit_batch(
     db_tx: DbTransaction,
-    ours: Box<ChangeSet>,
     head_before: u64,
-    commits: u64,
-    writes: Vec<StagedWrite>,
+    head: u64,
+    writes: &[StagedWrite],
     base: &CatalogSnapshot,
     projections: &std::sync::RwLock<ProjectionCache>,
-) -> Result<CommitOutcome> {
+) -> Result<Landed> {
     // A head-preserving commit reuses the head id with new content; drop the
     // cache before the write is visible so no concurrent attempt reads a
     // stale view that still matches by id.
-    let head_advanced = commits > head_before;
+    let head_advanced = head > head_before;
     if !head_advanced {
         invalidate_head_view(projections);
     }
     match db_tx.commit_with_options(&durable()).await {
         Ok(_) => {
-            fold_committed_batch(projections, &writes, commits);
+            fold_committed_batch(projections, writes, head);
             if head_advanced {
-                refresh_head_view(projections, base, &writes);
+                refresh_head_view(projections, base, writes);
             }
-            Ok(CommitOutcome::Committed(SnapshotId::new(commits)))
+            Ok(Landed::Committed)
         }
-        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
-            Ok(CommitOutcome::LostRace { ours, head_before })
-        }
+        Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Landed::LostRace),
         Err(err) => Err(err.into()),
     }
 }
 
-/// Commits through the closure, retrying benign races with a full re-run
-/// — fresh snapshot, closure, ids — so premises re-validate against the
-/// state that won. A true conflict surfaces as [`Error::CommitConflict`],
-/// which the caller may retry; an exhausted budget surfaces as
-/// [`Error::RetryBudgetExhausted`], which it may not.
+/// Commits a group of closures as one batch, retrying benign races with a
+/// full re-run — fresh snapshot, closures, ids — so every member's premise
+/// re-validates against the state that won. A true conflict surfaces as
+/// [`Error::CommitConflict`], which the caller may retry; an exhausted
+/// budget surfaces as [`Error::RetryBudgetExhausted`], which it may not.
+///
+/// Returns one snapshot id per member, in member order. A group of one is
+/// the ordinary commit path.
 pub(crate) async fn commit_cycle<F>(
     db: &Db,
-    f: &F,
-    projections: &std::sync::RwLock<ProjectionCache>,
-) -> Result<SnapshotId>
+    members: &[F],
+    coalescer: &Arc<Coalescer>,
+) -> Result<Vec<SnapshotId>>
 where
     F: Fn(&mut Transaction) -> Result<()>,
 {
@@ -726,20 +727,24 @@ where
         if attempt > 0 {
             tokio::time::sleep(retry_backoff(attempt)).await;
         }
-        match attempt_commit(db, f, projections).await? {
-            CommitOutcome::Committed(id) => {
+        match attempt_group(db, members, coalescer).await? {
+            CommitOutcome::Nothing => {
+                tracing::debug!(attempt, "commit's batch wrote nothing; retrying");
+            }
+            CommitOutcome::Committed(ids) => {
                 tracing::debug!(
-                    snapshot = id.get(),
+                    snapshot = ids.last().map(|id| id.get()),
+                    members = members.len(),
                     attempt,
                     elapsed_ms = started.elapsed().as_millis(),
                     "commit landed"
                 );
-                return Ok(id);
+                return Ok(ids);
             }
             CommitOutcome::LostRace { ours, head_before } => {
                 first_head.get_or_insert(head_before);
                 // An options-only loser is last-write-wins: always benign.
-                if ours.is_empty() {
+                if ours.iter().all(ChangeSet::is_empty) {
                     tracing::debug!(
                         attempt,
                         head_before,
@@ -749,7 +754,12 @@ where
                 }
                 let intervening = intervening_changes(db, head_before).await?;
                 for (snapshot_id, theirs) in &intervening {
-                    if crate::transaction::operations::conflicts(&ours, theirs) {
+                    // A group conflicts if any of its members does: they
+                    // share a batch, so they share a fate.
+                    if ours
+                        .iter()
+                        .any(|mine| crate::transaction::operations::conflicts(mine, theirs))
+                    {
                         tracing::debug!(
                             attempt,
                             head_before,
