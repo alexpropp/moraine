@@ -175,6 +175,74 @@ async fn same_table_appends_both_land_with_dense_row_ids() {
     catalog.close().await.unwrap();
 }
 
+/// Two concurrent deletes from one table, targeting different data files,
+/// both land through the public API.
+///
+/// This is the end-to-end shape, not the classifier: concurrent commits
+/// coalesce into one batch far more often than they race, so what this
+/// pins is that nothing on the way — the one-live-delete-file-per-data-file
+/// rule above all — turns two disjoint deletes into a failure. The grain
+/// the classifier applies when they *do* race is pinned directly, over the
+/// whole matrix, in `transaction::operations`.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_table_deletes_of_different_files_both_land() {
+    use moraine::DeleteFile;
+
+    let (catalog, _s, a, _b) = seeded().await;
+    // Two data files to delete from, registered up front.
+    catalog
+        .commit(move |tx| {
+            tx.register_data_file(a, datafile(100), &[])?;
+            tx.register_data_file(a, datafile(50), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    let mut ids: Vec<_> = head.data_files_of(a).iter().map(|f| f.id).collect();
+    ids.sort_unstable();
+    let (first, second) = (ids[0], ids[1]);
+
+    let delete_over = |data_file_id| DeleteFile {
+        data_file_id,
+        path: format!("d{data_file_id}.parquet"),
+        path_is_relative: true,
+        format: "parquet".into(),
+        delete_count: 1,
+        file_size_bytes: 10,
+        footer_size: 4,
+        encryption_key: None,
+    };
+
+    let c1 = catalog.clone();
+    let c2 = catalog.clone();
+    let t1 = tokio::spawn(async move {
+        c1.commit(move |tx| {
+            tx.register_delete_file(a, delete_over(first), &[])
+                .map(|_| ())
+        })
+        .await
+    });
+    let t2 = tokio::spawn(async move {
+        c2.commit(move |tx| {
+            tx.register_delete_file(a, delete_over(second), &[])
+                .map(|_| ())
+        })
+        .await
+    });
+    t1.await.unwrap().unwrap();
+    t2.await.unwrap().unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        head.delete_files_of(a).len(),
+        2,
+        "deletes of different files must both land, not conflict"
+    );
+    catalog.close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn append_vs_drop_is_a_real_error() {
     let (catalog, s, a, _b) = seeded().await;

@@ -330,6 +330,12 @@ message SnapshotValue {
   optional string commit_message = 9;
   optional string commit_extra_info = 10;
   repeated uint64 schema_changed_table_ids = 11;
+  // The data files this commit's delete files target. moraine-internal,
+  // like schema_changed_table_ids: DuckLake's changes_made grammar names
+  // the table and not the file, and delete-versus-delete is the one pair
+  // it checks at file grain. Empty on a DuckLake-authored snapshot, which
+  // is read back as "deletes from the whole table".
+  repeated uint64 deleted_data_file_ids = 12;
 }
 
 // ducklake_files_scheduled_for_deletion.

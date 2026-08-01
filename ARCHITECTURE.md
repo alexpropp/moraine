@@ -145,8 +145,11 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
   locally, stages one batch, and writes it conditional on `sys/head` being
   unchanged. Nothing spans two batches; the write floor is one durable WAL
   flush.
-- **Table-level conflict detection.** On a failed CAS, the committer compares
-  the `table_id`s it touched against the intervening commits'. Disjoint sets are
+- **Table-level conflict detection**, with one file-grain exception. On a
+  failed CAS, the committer compares the `table_id`s it touched against the
+  intervening commits' — except delete-versus-delete, which compares the
+  data files each targeted, matching the one place DuckLake goes finer.
+  Disjoint sets are
   a benign race, retried internally; overlapping sets are a true `Conflict`
   aborted with a typed error — the core is DuckLake-agnostic and cannot replay
   the originating SQL, so re-driving belongs to whoever authored the operation.

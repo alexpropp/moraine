@@ -1245,6 +1245,10 @@ impl Transaction {
         }
 
         let delete_file_id = self.alloc_file_id();
+        // Kept before `file` is consumed below: the change set names it, so
+        // a concurrent delete of this table classifies against this commit
+        // at file grain rather than table grain.
+        let targeted = file.data_file_id.get();
 
         self.state.put_delete_file(DeleteFileValue {
             delete_file_id,
@@ -1266,6 +1270,7 @@ impl Transaction {
 
         self.ops.push(Operation::RegisterDeleteFile {
             table_id: table.get(),
+            data_file_id: targeted,
         });
 
         Ok(DeleteFileId::new(delete_file_id))
@@ -2147,6 +2152,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            deleted_data_file_ids: Vec::new(),
         };
         Transaction::new(CatalogSnapshot::build(snapshot, vec![], vec![], None), 5)
     }
@@ -2418,6 +2424,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            deleted_data_file_ids: Vec::new(),
         };
         let table = TableValue {
             table_id: 1,
@@ -2814,6 +2821,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            deleted_data_file_ids: Vec::new(),
         };
         let main = SchemaValue {
             schema_id: 0,

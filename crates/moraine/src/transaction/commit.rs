@@ -212,6 +212,7 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            deleted_data_file_ids: Vec::new(),
         }),
     )?;
     stage(
@@ -678,6 +679,9 @@ where
         commit_message: None,
         commit_extra_info: None,
         schema_changed_table_ids,
+        // Recorded so a later loser can classify a delete against this
+        // commit at file grain; `changes_made` carries only the table.
+        deleted_data_file_ids: ours.deleted_data_file_ids.iter().copied().collect(),
     };
     writes.push((
         Key::Snapshot {
@@ -867,7 +871,18 @@ async fn intervening_changes(db: &Db, head_before: u64) -> Result<Vec<(u64, Chan
         {
             Some(bytes) => {
                 let snapshot: proto::SnapshotValue = value::decode_value(&bytes)?;
-                ChangeSet::parse(&snapshot.changes_made)
+                let mut change_set = ChangeSet::parse(&snapshot.changes_made);
+                // The grammar named the tables this commit deleted from;
+                // the record names the files. With both, a delete of ours
+                // classifies against it at file grain — without the file
+                // ids (a DuckLake-authored snapshot) it stays untargeted
+                // and table grain stands.
+                if !snapshot.deleted_data_file_ids.is_empty() {
+                    change_set.deleted_data_file_ids =
+                        snapshot.deleted_data_file_ids.iter().copied().collect();
+                    change_set.deletes_untargeted_files = false;
+                }
+                change_set
             }
             None => ChangeSet {
                 has_unknown: true,
