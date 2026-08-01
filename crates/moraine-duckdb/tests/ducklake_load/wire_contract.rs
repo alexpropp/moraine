@@ -455,3 +455,79 @@ fn duckdb_pin() -> &'static str {
         .and_then(|entry| entry.split_whitespace().next())
         .expect(".github/duckdb-versions lists no DuckDB version")
 }
+
+/// The upstream DuckLake catalog-cache race the whole suite pins
+/// `SET threads=1` for — still live at the tracked version, and still
+/// nothing to do with moraine.
+///
+/// A fresh attach's catalog listing comes back **empty** right after a
+/// write, under DuckDB's default multi-threaded execution. This drives the
+/// reference chain — a plain duckdb-file-backed DuckLake catalog, zero
+/// moraine code in it — so a failure here means the race is gone upstream,
+/// not that moraine broke. When that happens, delete this test and the
+/// `SET threads=1` every session runner sets.
+///
+/// Deliberately asserts the bug's *presence*: the workaround costs every
+/// e2e session its parallelism, and without a canary nobody learns when it
+/// stopped being needed. Observed at roughly three runs in five, so the
+/// attempt count makes a false alarm vanishingly unlikely while staying
+/// cheap.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI and network access to INSTALL ducklake"]
+fn the_upstream_ducklake_listing_race_still_needs_threads_1() {
+    const ATTEMPTS: usize = 15;
+
+    // Spawned directly: every shared session runner sets `threads=1`,
+    // which is the very thing under examination.
+    let reference_session = |meta: &Path, data: &Path, sql: &str| -> String {
+        let output = Command::new(cli_path())
+            .arg("-csv")
+            .arg("-c")
+            .arg(format!(
+                "SET extension_directory='{}';",
+                extension_directory().display()
+            ))
+            .arg("-c")
+            .arg("INSTALL ducklake;")
+            .arg("-c")
+            .arg("LOAD ducklake;")
+            .arg("-c")
+            .arg(format!(
+                "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}');",
+                meta.join("meta.ducklake").display(),
+                data.display()
+            ))
+            .arg("-c")
+            .arg(sql)
+            .output()
+            .expect("failed to spawn duckdb CLI");
+        assert_session_ok(output, "reference DuckLake session", sql)
+    };
+
+    let mut empty_listings = 0;
+    for attempt in 0..ATTEMPTS {
+        let meta_dir = TempDir::new(&format!("race-meta-{attempt}"));
+        let data_dir = TempDir::new(&format!("race-data-{attempt}"));
+
+        reference_session(
+            meta_dir.path(),
+            data_dir.path(),
+            "CREATE TABLE lake.main.x (i BIGINT);",
+        );
+        let listed = reference_session(
+            meta_dir.path(),
+            data_dir.path(),
+            "SELECT name FROM (SHOW ALL TABLES) WHERE database = 'lake';",
+        );
+        if csv_rows(&listed).is_empty() {
+            empty_listings += 1;
+        }
+    }
+
+    assert!(
+        empty_listings > 0,
+        "the upstream DuckLake listing race did not fire in {ATTEMPTS} attempts against a \
+         plain duckdb-backed catalog. If it is fixed upstream, drop `SET threads=1` from \
+         `helpers.rs` and delete this test; if it merely got rarer, raise ATTEMPTS."
+    );
+}
