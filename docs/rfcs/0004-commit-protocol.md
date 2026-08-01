@@ -597,6 +597,31 @@ connection is serialized, so successive SQL transactions never overlap and
 there is nothing to batch them with. A `BEGIN … COMMIT` still lands as one
 snapshot, but that is statements merged, not commits batched.
 
+### Sequence numbers are the store's, not moraine's
+
+A commit writes with SlateDB's generated sequence number; moraine never pins
+one. The knob exists — a non-zero `WriteOptions::seqnum` overrides the
+generated value, and a write below the store's current maximum is refused —
+so it reads at first like an exactly-once primitive: pin the same number on
+a re-drive and the duplicate is rejected.
+
+It is not one here, for two reasons. The sequence space is **global to the
+store**, not per catalog commit: index build steps, entry reclamation,
+inlined writes, and migration batches all advance it while minting no
+snapshot, so no function of a snapshot id stays in step with it, and any
+mapping moraine chose would be stale the moment a non-committing write
+landed. And the number moraine would need to pin does not exist at re-drive
+time anyway. A re-drive re-runs the caller's closure against the *advanced*
+head, so it is a different logical commit computed from a different premise
+— there is nothing stable across the crash to pin *to*.
+
+Exactly-once across a process death needs a **caller-supplied idempotency
+token**, recorded in the commit and checked before staging. That is an API
+change this RFC does not make, and pinning `seqnum` would not substitute for
+it. So a re-driven commit is an ordinary commit: guarded operations surface
+their guard, and a data-only re-drive lands a second time (RFC 0011,
+`CommitDurableNotAcknowledged`).
+
 ### Reader visibility after commit
 
 Step 4 makes a commit **durable**; a *separate* reader observing it is a
@@ -646,8 +671,12 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   `CommitConflict`.
 - Staged-row commits never retry internally: a lost head on the extension
   path returns `CommitConflict` with the store unchanged by the loser.
-- Crash-shaped sequences: partial batch never observable (atomicity);
-  commit, reopen, verify head and snapshot resolve consistently.
+- Crash-shaped sequences: owned by RFC 0011 rather than restated here.
+  `CommitNotDurable` covers the batch whose flush never landed — the head
+  does not move and no record of it is visible — and
+  `CommitDurableNotAcknowledged` the flush that landed before the process
+  died, where the head and snapshot resolve consistently on reopen and a
+  re-drive surfaces its guard.
 - Counter monotonicity: `next_catalog_id`/`next_file_id`/per-table
   `next_row_id` never regress or collide across concurrent commits.
 - Bounded retry terminates: a forced write storm returns `CommitConflict`

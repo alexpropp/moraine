@@ -25,7 +25,7 @@ use crate::{
         key::{Key, SysKey},
         proto, read, value,
     },
-    transaction::commit::durable,
+    transaction::commit::commit_durable,
 };
 
 /// Where a step left off: the cursor the next step resumes at, or `None`
@@ -169,7 +169,7 @@ async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
         tx.rollback();
         return Err(error);
     }
-    tx.commit_with_options(&durable())
+    commit_durable(tx, "migration start")
         .await
         .map_err(Error::from)?;
     Ok(())
@@ -197,7 +197,7 @@ async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
         return Err(Error::from(error));
     }
 
-    tx.commit_with_options(&durable())
+    commit_durable(tx, "migration finish")
         .await
         .map_err(Error::from)?;
     Ok(())
@@ -239,7 +239,7 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
             tx.rollback();
             return Err(error);
         }
-        tx.commit_with_options(&durable())
+        commit_durable(tx, "migration step")
             .await
             .map_err(Error::from)?;
         crash_seam(CrashPoint::AfterStep)?;

@@ -7,6 +7,7 @@
 //! Cases run against real SlateDB on in-memory `object_store`.
 
 pub mod freezing_store;
+mod racing_store;
 
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use moraine::{
 use object_store::{ObjectStore, memory::InMemory};
 
 use crate::{
-    crash_recovery::freezing_store::FreezingStore,
+    crash_recovery::{freezing_store::FreezingStore, racing_store::RacingStore},
     fixtures::{col, datafile},
 };
 
@@ -48,10 +49,12 @@ pub enum CrashCase {
     StagedBuildInterrupted,
     /// A batched entry reclamation died between two of its batches.
     ReclamationInterrupted,
+    /// A structural format migration died between two of its batches.
+    MigrationInterrupted,
 }
 
 /// Every case.
-const CASES: [CrashCase; 10] = [
+const CASES: [CrashCase; 11] = [
     CrashCase::CommitNotDurable,
     CrashCase::CommitDurableNotAcknowledged,
     CrashCase::MultiTombstoneDrop,
@@ -62,6 +65,7 @@ const CASES: [CrashCase; 10] = [
     CrashCase::ConcurrentGenesis,
     CrashCase::StagedBuildInterrupted,
     CrashCase::ReclamationInterrupted,
+    CrashCase::MigrationInterrupted,
 ];
 
 /// Why a case is survivable. Which one applies follows from the path: a
@@ -90,9 +94,9 @@ fn guarantee(case: CrashCase) -> Guarantee {
         | CrashCase::GenesisInterrupted
         | CrashCase::ConcurrentGenesis => Guarantee::Atomicity,
 
-        CrashCase::StagedBuildInterrupted | CrashCase::ReclamationInterrupted => {
-            Guarantee::Resumability
-        }
+        CrashCase::StagedBuildInterrupted
+        | CrashCase::ReclamationInterrupted
+        | CrashCase::MigrationInterrupted => Guarantee::Resumability,
     }
 }
 
@@ -112,13 +116,24 @@ fn blocked_on(case: CrashCase) -> Option<&'static str> {
         | CrashCase::ConcurrentGenesis
         | CrashCase::StagedBuildInterrupted
         | CrashCase::ReclamationInterrupted => None,
+
+        CrashCase::MigrationInterrupted => Some(
+            "no migration unit ships: every format so far is additive, so the driver's \
+             registry is empty and the migrate verb cannot put a store mid-migration. \
+             Its four seams are covered against a caller-supplied registry in the \
+             driver's own unit tests until one does",
+        ),
     }
 }
 
-/// Pins that every case is driven and requires any that is not to name
-/// what blocks it, so a case cannot be quietly stubbed out. The exhaustive
-/// matches in [`guarantee`] and [`blocked_on`] cover the other half: a new
-/// case fails to compile until both decisions are made.
+/// Pins which cases are driven and requires the rest to name what blocks
+/// them, so a case cannot be quietly stubbed out. The exhaustive matches
+/// in [`guarantee`] and [`blocked_on`] cover the other half: a new case
+/// fails to compile until both decisions are made.
+///
+/// Every case is driven but one, and that one is blocked on a feature
+/// rather than on the harness: no migration unit ships, so no store can be
+/// mid-migration to crash.
 #[test]
 fn every_case_declares_its_guarantee_and_coverage() {
     let driven: Vec<CrashCase> = CASES
@@ -127,8 +142,19 @@ fn every_case_declares_its_guarantee_and_coverage() {
         .collect();
     assert_eq!(
         driven,
-        CASES.to_vec(),
-        "a case stopped being driven; it may only do so by naming what blocks it"
+        vec![
+            CrashCase::CommitNotDurable,
+            CrashCase::CommitDurableNotAcknowledged,
+            CrashCase::MultiTombstoneDrop,
+            CrashCase::GroupCommit,
+            CrashCase::TakeoverMidCommit,
+            CrashCase::FencedWriterResumes,
+            CrashCase::GenesisInterrupted,
+            CrashCase::ConcurrentGenesis,
+            CrashCase::StagedBuildInterrupted,
+            CrashCase::ReclamationInterrupted,
+        ],
+        "driven cases changed; update this list as cases land"
     );
     for expected in [Guarantee::Atomicity, Guarantee::Resumability] {
         assert!(
@@ -250,13 +276,20 @@ async fn durable_commit_survives_a_crash_before_its_acknowledgement() {
 /// The race runs repeatedly because its two guards trip at different
 /// points and one round samples only one of them.
 ///
-/// The loser's *error shape* is deliberately not pinned. It is sometimes
-/// [`Error::Fenced`] and sometimes an untyped [`Error::Store`] carrying
-/// SlateDB's manifest-CAS collision, which "adopts it, or returns a typed
-/// error" does not admit. Telling that collision from real corruption
-/// needs a condition SlateDB keeps `pub(crate)`, so the taxonomy decision
-/// is open; asserted below is the part that is guaranteed — the loser
-/// never half-creates the catalog.
+/// The loser fails typed, whichever of the two guards caught it: it lost
+/// the manifest race and never created the store ([`Error::OpenRaced`]),
+/// or it created the store and was displaced ([`Error::Fenced`]). What it
+/// never does is fail as an untyped store error, which "adopts it, or
+/// returns a typed error" does not admit.
+///
+/// The typing rests on matching SlateDB's message text, which a round that
+/// happens not to collide would not exercise —
+/// [`a_lost_manifest_race_surfaces_typed_rather_than_as_a_store_error`]
+/// stages the collision deterministically and pins the wording.
+///
+/// Re-attempting the losing open was tried and rejected: the re-attempt
+/// takes the writer epoch in turn and fences whichever initializer had
+/// just won, so both can lose. That is what the first assertion pins.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_genesis_leaves_exactly_one_catalog() {
     for round in 0..25 {
@@ -279,8 +312,8 @@ async fn concurrent_genesis_leaves_exactly_one_catalog() {
         // a duplicate, or a missing entity would mean genesis itself tore.
         for result in &results {
             match result {
-                Ok(_) | Err(Error::Fenced(_) | Error::CommitConflict(_) | Error::Store(_)) => {}
-                Err(other) => panic!("round {round}: the race tore the catalog: {other:?}"),
+                Ok(_) | Err(Error::OpenRaced(_) | Error::Fenced(_) | Error::CommitConflict(_)) => {}
+                Err(other) => panic!("round {round}: the loser failed untyped: {other:?}"),
             }
         }
 
@@ -304,6 +337,47 @@ async fn concurrent_genesis_leaves_exactly_one_catalog() {
         assert_eq!(schemas[0].name, "main");
         reopened.close().await.unwrap();
     }
+}
+
+/// The genesis race's loser fails **typed**, and this pins the one thread
+/// holding that up.
+///
+/// A lost manifest compare-and-swap and a damaged manifest both reach
+/// moraine as the same store-error kind, and the predicate separating them
+/// is private to SlateDB — so the mapping matches SlateDB's message text
+/// instead. Text is a fragile contract, which is exactly why it is pinned
+/// here rather than left to the racing test above, where a round that
+/// happens not to collide would prove nothing.
+///
+/// Losing the first manifest write is staged from outside, so the failure
+/// is SlateDB's real one on every run. If a SlateDB bump rewords it, the
+/// match stops firing and this fails with [`Error::Store`] — loudly, at
+/// the seam that broke, instead of every genesis race quietly going
+/// untyped again.
+#[tokio::test]
+async fn a_lost_manifest_race_surfaces_typed_rather_than_as_a_store_error() {
+    let backing: Arc<InMemory> = Arc::new(InMemory::new());
+    let store = Arc::new(RacingStore::losing_the_first_manifest_write(
+        backing.clone(),
+    ));
+
+    let err = Catalog::open(store, CatalogOptions::default())
+        .await
+        .expect_err("an open that loses the manifest race cannot succeed");
+    assert!(
+        matches!(err, Error::OpenRaced(_)),
+        "the loser must name the race it lost; got {err:?}"
+    );
+
+    // Benign, and the message says so: the store is untouched, so opening
+    // it again creates the catalog rather than finding a half-made one.
+    let reopened = Catalog::open(backing, CatalogOptions::default())
+        .await
+        .unwrap();
+    let snapshot = reopened.snapshot().await.unwrap();
+    assert_eq!(snapshot.current_snapshot().id.get(), 0);
+    assert_eq!(snapshot.schemas().len(), 1);
+    reopened.close().await.unwrap();
 }
 
 /// `TakeoverMidCommit` — a second writer opens the store while the first
