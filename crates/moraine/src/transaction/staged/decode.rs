@@ -546,7 +546,8 @@ pub(super) fn decode_end(table: TableKind, cells: &[Cell]) -> Result<(EntityKey,
         | TableKind::MacroImpl
         | TableKind::MacroParameters
         | TableKind::ColumnMapping
-        | TableKind::NameMapping => {
+        | TableKind::NameMapping
+        | TableKind::Metadata => {
             return Err(Error::Constraint(format!(
                 "update_set_end is not defined for {table:?}"
             )));
@@ -627,4 +628,36 @@ pub(super) fn decode_hard_delete(
     let end_snapshot = c.opt_u64()?;
     c.finish()?;
     Ok((key, end_snapshot))
+}
+
+/// Decodes a `ducklake_metadata` row into the option it names: the scope's
+/// key components and the key/value pair.
+///
+/// DuckLake's `scope` is a name (`schema` / `table`, absent for a global
+/// option) where moraine's key carries a scope kind, so this is the one
+/// place the two vocabularies meet. `value` may be absent — DuckLake
+/// writes a NULL value for an option it wants recorded as empty — and is
+/// stored as the empty string, since a scope's map holds strings.
+pub(super) fn decode_metadata(cells: &[Cell]) -> Result<((u64, u64), String, String)> {
+    let mut c = Cursor::new(TableKind::Metadata, cells);
+    let key = c.string()?;
+    let value = c.opt_string()?.unwrap_or_default();
+    let scope = c.opt_string()?;
+    let scope_id = c.opt_u64()?.unwrap_or_default();
+    c.finish()?;
+
+    let scope_kind = match scope.as_deref() {
+        None => 0,
+        Some("schema") => 1,
+        Some("table") => 2,
+        Some(other) => {
+            return Err(corrupt_row(
+                TableKind::Metadata,
+                format!("unknown option scope `{other}`"),
+            ));
+        }
+    };
+    // A global option carries no id, whatever the row says.
+    let scope_id = if scope_kind == 0 { 0 } else { scope_id };
+    Ok(((scope_kind, scope_id), key, value))
 }

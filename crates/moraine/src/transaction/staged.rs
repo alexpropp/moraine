@@ -130,13 +130,19 @@ pub enum TableKind {
     ColumnMapping,
     /// `ducklake_name_mapping` — folded into its mapping's record.
     NameMapping,
+    /// `ducklake_metadata`: catalog options, keyed by `(key, scope,
+    /// scope_id)`. Outside the snapshot protocol — DuckLake writes it
+    /// within its metadata connection, minting no snapshot and bumping no
+    /// schema version — so its rows overwrite the scope's option record in
+    /// place, last write wins.
+    Metadata,
 }
 
 impl TableKind {
     /// Every kind, in wire-discriminant order — the decode table for the
     /// ABI's `table_kind` values. A new variant added anywhere but the
     /// end fails the order test pinning `ALL[i] as i32 == i`.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Snapshot,
         Self::SnapshotChanges,
         Self::Schema,
@@ -162,6 +168,7 @@ impl TableKind {
         Self::MacroParameters,
         Self::ColumnMapping,
         Self::NameMapping,
+        Self::Metadata,
     ];
 }
 
@@ -768,14 +775,20 @@ fn translate_maintenance(
             op,
             RowOperation::Delete { .. }
                 | RowOperation::Insert {
-                    table: TableKind::FilesScheduledForDeletion,
+                    table: TableKind::FilesScheduledForDeletion
+                        // An option write mints no snapshot by design —
+                        // DuckLake writes `ducklake_metadata` within its
+                        // metadata connection, outside the protocol — so it
+                        // arrives here exactly as reclamation does.
+                        | TableKind::Metadata,
                     ..
                 }
         ) || is_inline_op(op);
         if !allowed {
             return Err(Error::Constraint(
                 "a staged commit without a ducklake_snapshot insert may only reclaim state \
-                 (maintenance deletes and deletion-schedule inserts)"
+                 or set options (maintenance deletes, deletion-schedule inserts, and \
+                 ducklake_metadata writes)"
                     .to_string(),
             ));
         }

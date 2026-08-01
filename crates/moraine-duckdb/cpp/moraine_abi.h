@@ -553,6 +553,20 @@ typedef struct MoraineNameMappingRow {
   bool is_partition;
 } MoraineNameMappingRow;
 
+// One `ducklake_metadata` row, as returned by [`moraine_dump_options`].
+typedef struct MoraineOptionRow {
+  // `key`, owned.
+  char *key;
+  // `value`, owned.
+  char *value;
+  // `scope`, owned, null for a global option.
+  char *scope;
+  // Whether `scope_id` is present.
+  bool has_scope_id;
+  // `scope_id`, valid iff `has_scope_id`.
+  uint64_t scope_id;
+} MoraineOptionRow;
+
 // One `ducklake_partition_info` row, as returned by
 // [`moraine_dump_partition_info`]. Partition columns
 // (`ducklake_partition_column`) are a separate table served by
@@ -1710,6 +1724,31 @@ int32_t moraine_dump_name_mappings(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pair a matching
 // [`moraine_dump_name_mappings`] call wrote, not yet freed.
 void moraine_dump_name_mappings_free(struct MoraineNameMappingRow *items, size_t len);
+
+// Dumps every stored `ducklake_metadata` row into
+// `*out_items`/`*out_len`.
+//
+// # Safety
+//
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
+int32_t moraine_dump_options(struct MoraineCatalogHandle *handle,
+                             struct MoraineOptionRow **out_items,
+                             size_t *out_len,
+                             MoraineInterruptProbe probe,
+                             void *probe_ctx,
+                             struct MoraineError *err);
+
+// Frees the array returned by [`moraine_dump_options`].
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_options`] call wrote, not yet freed.
+void moraine_dump_options_free(struct MoraineOptionRow *items, size_t len);
 
 // Dumps every `ducklake_partition_info` row — current and history — into
 // `*out_items`/`*out_len`.

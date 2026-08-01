@@ -175,9 +175,8 @@ fn ducklake_row_id_allocation_matches_stock_ducklake() {
 ///
 /// The cases that carry the item: comments and tags **bump** (DuckLake
 /// models them as table alters), a name-mapping registration does **not**
-/// (its own test below), and `set_option` mints no snapshot — through
-/// moraine because the write is refused outright, DuckLake's own
-/// `ducklake_metadata` write having no translation on the staged-row path.
+/// (its own test below), and `set_option` neither bumps nor mints a
+/// snapshot at all — global or table-scoped — while still taking effect.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn ducklake_schema_version_classification_matches_stock_ducklake() {
@@ -241,24 +240,41 @@ fn ducklake_schema_version_classification_matches_stock_ducklake() {
     );
 
     // `set_option` is outside the snapshot protocol entirely: DuckLake
-    // writes `ducklake_metadata` within its metadata connection, minting no
-    // snapshot and bumping nothing. moraine serves that table read-only, so
-    // the write is refused rather than silently dropped — pinned here as
-    // the behavior it actually has, and refused *before* touching the
-    // snapshot history, which is the half the classification cares about.
-    let refused = run_ducklake_sql_expect_err(
-        twin.store.path(),
-        twin.data.path(),
-        "CALL lake.set_option('parquet_compression', 'zstd');",
+    // writes `ducklake_metadata` within its metadata connection, so it
+    // mints no snapshot and bumps no version — while still taking effect.
+    let unchanged = (comment_snapshot, column_commented_version);
+    twin.apply("CALL lake.set_option('parquet_compression', 'zstd');");
+    assert_eq!(
+        latest(&history()),
+        unchanged,
+        "`set_option` must neither mint a snapshot nor bump `schema_version`"
     );
-    assert!(
-        refused.contains("ducklake_metadata"),
-        "a refused option write must name the table it could not write: {refused}"
+    assert_eq!(
+        twin.probe(
+            "SELECT key, value FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'parquet_compression';"
+        ),
+        vec![vec!["parquet_compression".to_string(), "zstd".to_string()]],
+        "the option must be recorded, just outside the snapshot protocol"
+    );
+
+    // Scoped options land on their scope, not the global one, and the
+    // last write wins — options are unversioned.
+    twin.apply("CALL lake.set_option('parquet_compression', 'snappy', table_name => 't');");
+    assert_eq!(
+        twin.probe(
+            "SELECT value, scope, scope_id FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'parquet_compression' ORDER BY scope NULLS FIRST;"
+        ),
+        vec![
+            vec!["zstd".to_string(), "NULL".to_string(), "NULL".to_string()],
+            vec!["snappy".to_string(), "table".to_string(), "1".to_string()],
+        ]
     );
     assert_eq!(
         latest(&history()),
-        (comment_snapshot, column_commented_version),
-        "a refused `set_option` must leave the snapshot history untouched"
+        unchanged,
+        "a scoped `set_option` mints no snapshot either"
     );
 }
 

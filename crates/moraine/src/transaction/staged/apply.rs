@@ -10,9 +10,9 @@ use super::{
         decode_data_file, decode_delete_file, decode_delete_key, decode_end,
         decode_file_column_stats, decode_file_partition_value, decode_gc_file_row,
         decode_hard_delete, decode_macro, decode_macro_impl, decode_macro_parameter,
-        decode_name_mapping, decode_partition_column, decode_partition_info, decode_schema,
-        decode_sort_expression, decode_sort_info, decode_table, decode_table_column_stats,
-        decode_table_stats, decode_tag_row, decode_view, table_value,
+        decode_metadata, decode_name_mapping, decode_partition_column, decode_partition_info,
+        decode_schema, decode_sort_expression, decode_sort_info, decode_table,
+        decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view, table_value,
     },
     proto,
 };
@@ -318,6 +318,14 @@ pub(super) fn apply_insert(
         | TableKind::MacroImpl
         | TableKind::MacroParameters
         | TableKind::NameMapping => {}
+        // An option row overwrites its key in the scope's record: outside
+        // the snapshot protocol, last write wins.
+        TableKind::Metadata => {
+            let (components, key, value) = decode_metadata(cells)?;
+            let mut record = state.options.get(&components).cloned().unwrap_or_default();
+            record.options.insert(key, value);
+            state.set_option_record(components, record);
+        }
         TableKind::Schema => state.put_schema(decode_schema(cells)?),
         TableKind::Table => state.put_table(table_value(base, decode_table(cells)?)),
         TableKind::View => state.put_view(decode_view(cells)?),
@@ -647,6 +655,45 @@ pub(super) fn apply_update_set_begin(
 /// (statistics, the deletion schedule) leave the working state and their
 /// removal reaches the store through the diff; versioned rows and
 /// snapshot records are pruned with direct key deletes (`history` keys
+/// Removes a row from the physical-deletion schedule. Unlike an option
+/// delete, a missing entry is an error: the schedule is the record of what
+/// still needs deleting, and a cleanup pass claiming to have deleted
+/// something never scheduled has lost track of the store.
+fn apply_schedule_delete(
+    state: &mut CatalogSnapshot,
+    table: TableKind,
+    cells: &[Cell],
+) -> Result<()> {
+    let mut c = Cursor::new(table, cells);
+    let data_file_id = c.u64()?;
+    c.finish()?;
+    if state.gc_files.remove(&data_file_id).is_none() {
+        return Err(corrupt_row(
+            table,
+            format!("no scheduled deletion for file {data_file_id}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Removes an option row's key from its scope, and the scope's record with
+/// it once the last key goes. Absent keys are a no-op: options are
+/// unversioned and last-write-wins, so a delete of one already gone is not
+/// a disagreement about state.
+fn apply_option_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+    let (components, key, _value) = decode_metadata(cells)?;
+    let Some(mut record) = state.options.get(&components).cloned() else {
+        return Ok(());
+    };
+    record.options.remove(&key);
+    if record.options.is_empty() {
+        state.remove_option_record(components);
+    } else {
+        state.set_option_record(components, record);
+    }
+    Ok(())
+}
+
 /// exist only in the store, never in the working state); embedded rows
 /// (tag entries, spec columns) rewrite or ride their parent.
 pub(super) fn apply_delete(
@@ -660,18 +707,7 @@ pub(super) fn apply_delete(
         TableKind::TableStats | TableKind::TableColumnStats | TableKind::FileColumnStats => {
             apply_stats_delete(state, table, cells)
         }
-        TableKind::FilesScheduledForDeletion => {
-            let mut c = Cursor::new(table, cells);
-            let data_file_id = c.u64()?;
-            c.finish()?;
-            if state.gc_files.remove(&data_file_id).is_none() {
-                return Err(corrupt_row(
-                    table,
-                    format!("no scheduled deletion for file {data_file_id}"),
-                ));
-            }
-            Ok(())
-        }
+        TableKind::FilesScheduledForDeletion => apply_schedule_delete(state, table, cells),
         // The merged snapshot record dies with the `ducklake_snapshot`
         // delete; the paired `ducklake_snapshot_changes` delete names the
         // same id and stages nothing.
@@ -693,6 +729,7 @@ pub(super) fn apply_delete(
             c.finish()?;
             Ok(())
         }
+        TableKind::Metadata => apply_option_delete(state, cells),
         // Mappings are unversioned create-only records with no history
         // mirror: cleanup is a direct `current` key delete. The working
         // state keeps its (now equal-to-base) entry, which the create-only
@@ -1026,5 +1063,9 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         commit_message,
         commit_extra_info,
         schema_changed_table_ids,
+        // DuckLake authored this snapshot and names only the tables it
+        // deleted from, so the file set stays empty and a later commit
+        // classifies against it at table grain.
+        deleted_data_file_ids: Vec::new(),
     })
 }
