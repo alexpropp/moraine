@@ -12,7 +12,7 @@ use crate::{
         open::StoreBuilder,
         read::{EntityRecord, scan_current_entities},
     },
-    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION},
+    transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, durable},
 };
 
 /// The format the test units migrate into: past every real one, so a test

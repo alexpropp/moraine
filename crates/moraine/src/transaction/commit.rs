@@ -8,7 +8,7 @@ use std::{
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -97,6 +97,41 @@ pub(crate) fn durable() -> WriteOptions {
     WriteOptions {
         await_durable: true,
         ..Default::default()
+    }
+}
+
+/// How long a durable commit may wait before the wait itself is reported,
+/// and how often it is reported thereafter.
+const STALL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Commits `tx` and waits for the batch to reach object storage, naming
+/// `operation` in the log if the wait runs long.
+///
+/// The wait is unbounded on purpose. A failed object-store write is retried
+/// beneath us indefinitely, so a permanent refusal — expired credentials, a
+/// revoked bucket policy — stalls here rather than failing. Giving up on a
+/// deadline would not undo the staged batch: the flush continues, so the
+/// deadline would report failure for a commit that still lands, and a
+/// caller re-driving it would apply it twice. A stall that says so in the
+/// log is the half of that trade worth having.
+pub(crate) async fn commit_durable(
+    tx: DbTransaction,
+    operation: &'static str,
+) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
+    let options = durable();
+    let mut commit = Box::pin(tx.commit_with_options(&options));
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Ok(outcome) = tokio::time::timeout(STALL_INTERVAL, &mut commit).await {
+            return outcome;
+        }
+        waited = waited.saturating_add(STALL_INTERVAL);
+        warn!(
+            operation,
+            waited_seconds = waited.as_secs(),
+            "still waiting for object storage to accept a durable write; writes are retried \
+             indefinitely, so check credentials and bucket policy"
+        );
     }
 }
 
@@ -217,6 +252,13 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
 /// Opens the store, bootstrapping an empty one in one atomic batch under
 /// conflict detection — a lost bootstrap race re-validates instead of
 /// double-initializing. Every exit that does not commit rolls back.
+///
+/// The open is deliberately **not** retried. Every open takes the writer
+/// epoch by a manifest compare-and-swap, so a concurrent open loses that
+/// CAS — and re-attempting it takes the epoch in turn, fencing whichever
+/// initializer had just won. Two initializers that both re-attempt can
+/// therefore both lose, which is worse than the loss the retry was meant to
+/// smooth over: the race currently always leaves a winner.
 pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
@@ -245,7 +287,7 @@ pub(crate) async fn open_initialized(
         return Err(err);
     }
 
-    match tx.commit_with_options(&durable()).await {
+    match commit_durable(tx, "bootstrap").await {
         Ok(_) => {
             // Once per store, ever: the commit that created the catalog.
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
@@ -686,7 +728,7 @@ pub(crate) async fn commit_batch(
     if !head_advanced {
         invalidate_head_view(projections);
     }
-    match db_tx.commit_with_options(&durable()).await {
+    match commit_durable(db_tx, "commit").await {
         Ok(_) => {
             fold_committed_batch(projections, writes, head);
             if head_advanced {

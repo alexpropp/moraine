@@ -202,6 +202,11 @@ void ThrowMoraineError(MoraineError &err) {
 	case MORAINE_STORE:
 	case MORAINE_FENCED:
 	case MORAINE_MIGRATION:
+	// An attach that lost the store-creation race. Grouped here rather than
+	// with the transaction codes on purpose: the remedy is to attach again,
+	// and re-driving a commit would answer a race that predates any
+	// transaction.
+	case MORAINE_OPEN_RACED:
 		throw duckdb::IOException(message);
 	case MORAINE_INTERNAL:
 	default:
