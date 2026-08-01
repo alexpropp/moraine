@@ -137,7 +137,10 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
 
 - **Topology: single writer, many readers.** Uncoordinated readers resolve
   snapshots from object storage; a deployment needing commit concurrency
-  funnels commits through one long-lived committer process.
+  funnels commits through one long-lived committer process. A reader
+  following the latest state still writes a manifest checkpoint of its own;
+  one opened against an existing checkpoint id writes nothing at all, and
+  sees the cut that checkpoint named.
 - **Optimistic, head-CAS.** A commit loads the head snapshot, allocates ids
   locally, stages one batch, and writes it conditional on `sys/head` being
   unchanged. Nothing spans two batches; the write floor is one durable WAL
