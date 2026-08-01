@@ -70,14 +70,6 @@ only on a format that actually rewrites a key.
   it: the interrupt path is 0010's shielding work. Wire the core to raise it
   as that path lands. `Unsupported`, `SnapshotExpired` and `Migration` are
   raised.
-- **VALIDATE** — Confirm the core's `VARIANT` refusal reaches a DuckLake user
-  before the shim's Arrow-conversion one does. Both refuse at `CREATE TABLE`
-  and both name moraine, the type, and Arrow, so
-  `ducklake_variant_column_rejected_with_clear_error` passes either way — but
-  which fires first is unverified, and it decides whether the shim's guard is
-  a duplicate that can go or the only thing standing between the user and
-  DuckDB's bare "Unsupported Arrow type VARIANT". Needs the e2e tier's
-  DuckDB CLI and network.
 - **DEFERRED** — A general verb for registering a row-id-preserving (rewrite)
   data file. Owned by a future RFC covering the compaction surface (0016).
   `flush_inlined_data` carries its own registration, so the inline path does

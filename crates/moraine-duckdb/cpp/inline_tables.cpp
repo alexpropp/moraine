@@ -110,11 +110,11 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 	types.reserve(user_columns.size());
 	names.reserve(user_columns.size());
 	for (auto &col : user_columns) {
-		// The core owns this policy and refuses a VARIANT column at the commit
-		// that creates it. This is the same refusal at the Arrow conversion
-		// itself, which runs against a DuckDB `LogicalType` rather than a
-		// DuckLake type string, and reaches the user before `ToArrowSchema`
-		// can throw a bare "Unsupported Arrow type VARIANT".
+		// The core refuses this column too, but not in time: DuckLake builds the
+		// inlined data table while flushing the CREATE TABLE, before the
+		// `ducklake_column` rows the core validates reach a commit. Without this
+		// refusal the user sees DuckDB's bare "Unsupported Arrow type VARIANT"
+		// instead, which names neither moraine nor a way forward.
 		if (col.type.id() == duckdb::LogicalTypeId::VARIANT) {
 			throw duckdb::NotImplementedException(
 			    "moraine: column \"%s\" is VARIANT, which moraine cannot store — its inline "

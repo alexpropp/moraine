@@ -293,7 +293,12 @@ Notes:
   `Unsupported` for a type moraine cannot store. The rule is the core's, and
   the staged path enforces the same one at the same boundary, so a `VARIANT`
   column is refused where it enters the catalog rather than at the first
-  insert that would need it.
+  insert that would need it. The shim keeps its own refusal at the Arrow
+  conversion, and it is not redundant: DuckLake builds the inlined data table
+  while flushing the `CREATE TABLE`, *before* the `ducklake_column` rows the
+  core validates reach a commit, so removing it leaves the user with DuckDB's
+  bare "Unsupported Arrow type VARIANT". Measured by deleting it and running
+  the e2e suite.
 - `flush_inlined_data` registers the files it drains into, rather than leaving
   them to `register_data_file`. A flushed file is not an ordinary
   registration: its rows keep the ids they were inlined under and its record
