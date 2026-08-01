@@ -1,0 +1,160 @@
+# name: test/sql/commit_concurrency.test
+# group: [moraine]
+#
+# Two DuckLake transactions racing over one moraine lake.
+#
+# Every other e2e test drives the DuckDB CLI, which holds one connection, so
+# a DuckLake transaction there can never lose a race: its metadata connection
+# is serialized and a second process would fence rather than race. This file
+# runs through DuckDB's own sqllogictest runner instead, which gives several
+# connections over one instance — and therefore two overlapping DuckLake
+# transactions against one attached lake, which is the only way to make
+# DuckLake's `RunCommitLoop` and `CheckForConflicts` actually run.
+#
+# What that exercises on moraine's side is the wire contract: a loser must
+# come back with an error whose text DuckLake recognizes as retryable, or
+# DuckLake abandons a transaction it could have re-driven.
+#
+# Skipped unless the packaged extension and cached extension directory are
+# named in the environment; `cargo xtask e2e` supplies both.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+# DuckLake's catalog cache races under multiple threads independently of
+# moraine (a fresh attach sometimes returns an empty table list), so pin one
+# thread and let the connections, not the scheduler, be the concurrency.
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/race-store' AS lake (DATA_PATH '__TEST_DIR__/race-data/');
+
+statement ok
+CREATE TABLE lake.main.t(a BIGINT);
+
+statement ok
+CREATE TABLE lake.main.u(a BIGINT);
+
+# A benign race: two transactions appending to the same table. DuckLake's
+# matrix calls concurrent inserts compatible, so the loser must re-drive
+# against the winner's head and land — both sets of rows survive, and the
+# loser's carry row ids allocated above the winner's.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO lake.main.t SELECT i FROM range(50) t(i);
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+INSERT INTO lake.main.t SELECT i + 100 FROM range(50) t(i);
+
+statement ok con2
+COMMIT;
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+100
+
+# Dense and unique across the race: the loser re-allocated rather than
+# reusing or skipping ids.
+query III
+SELECT count(DISTINCT rowid), min(rowid), max(rowid) FROM lake.main.t;
+----
+100	0	99
+
+# A benign race across *different* tables, the disjoint case.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO lake.main.t VALUES (1000);
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+INSERT INTO lake.main.u VALUES (2000);
+
+statement ok con2
+COMMIT;
+
+statement ok con1
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM lake.main.t), (SELECT count(*) FROM lake.main.u);
+----
+101	1
+
+# A true conflict: an insert against a concurrent drop of the same table.
+# DuckLake's matrix calls that incompatible, so its loop stops re-driving
+# and throws to the application rather than looping to its budget.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO lake.main.u VALUES (3000);
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+DROP TABLE lake.main.u;
+
+statement ok con2
+COMMIT;
+
+statement error con1
+COMMIT;
+----
+<REGEX>:.*(Conflict|conflict|TransactionContext Error).*
+
+# The lake survives the conflict: the drop stands, the other table is intact,
+# and a fresh statement commits normally.
+statement ok
+INSERT INTO lake.main.t VALUES (4000);
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+102
+
+query I
+SELECT count(*) FROM (SHOW ALL TABLES) WHERE name = 'u';
+----
+0
+
+# Every snapshot the race minted is intact and consecutive, so time travel
+# still resolves each one: a re-driven commit mints a fresh snapshot rather
+# than overwriting the winner's.
+query I
+SELECT count(*) = max(snapshot_id) + 1 FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+true

@@ -1,10 +1,13 @@
 //! The `e2e` task: downloads/caches the pinned DuckDB CLI, builds and
 //! packages the extension, and runs
-//! `crates/moraine-duckdb/tests/duckdb_load.rs` and
-//! `crates/moraine-duckdb/tests/ducklake_load.rs` un-ignored against the
-//! real binaries (plus a real `INSTALL ducklake`) as a hard assertion.
+//! `crates/moraine-duckdb/tests/duckdb_load.rs`,
+//! `crates/moraine-duckdb/tests/ducklake_load.rs`, and the `test/sql`
+//! sqllogictest files un-ignored against the real binaries (plus a real
+//! `INSTALL ducklake`) as a hard assertion.
 
-use std::process::Command;
+use std::{path::Path, process::Command};
+
+use anyhow::{Context, ensure};
 
 use crate::duckdb;
 
@@ -18,6 +21,13 @@ const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb"
 /// ducklake`. Adding a test there means bumping this count, or `e2e`
 /// fails — deliberate, so a silently-filtered test can never pass.
 const DUCKLAKE_LOAD_TEST_COUNT: &str = "71 passed";
+
+/// Every file under `test/sql`, run together through DuckDB's own
+/// sqllogictest runner. Adding one means bumping this count, exactly as for
+/// the suites above — and a file that *skips* (its `require-env` unmet, or
+/// an extension download failing) reports no passing case at all, so a
+/// silent skip fails the gate instead of looking like a pass.
+const SQLLOGIC_TEST_COUNT: &str = "1 test case";
 
 /// Downloads/caches the pinned DuckDB CLI, builds and packages the
 /// extension, runs the crate's test suite, then runs `duckdb_load.rs`
@@ -58,5 +68,50 @@ pub fn e2e() -> anyhow::Result<()> {
         "ok: real DuckDB + ducklake attached through moraine:'s metadata catalog and read the lake"
     );
 
+    run_sqllogictests(&extension)?;
+    println!("ok: two DuckLake transactions raced over one lake through several connections");
+
+    Ok(())
+}
+
+/// Runs `test/sql/*.test` through DuckDB's own sqllogictest runner, built
+/// alongside the extension.
+///
+/// This is the one harness that gives **several connections over one DuckDB
+/// instance**, which the CLI cannot: two overlapping DuckLake transactions
+/// against one attached lake are the only way to make DuckLake's commit
+/// retry loop run against moraine. The runner loads the packaged extension
+/// by path, so it exercises the same artifact the CLI suites do.
+fn run_sqllogictests(extension: &Path) -> anyhow::Result<()> {
+    let root = duckdb::workspace_root();
+    let runner = root.join("build/release/test/unittest");
+    ensure!(
+        runner.exists(),
+        "the sqllogictest runner is missing at {}; `make release` builds it \
+         alongside the extension",
+        runner.display()
+    );
+
+    let extension_dir = root.join("target/duckdb-extensions");
+    let output = Command::new(&runner)
+        .arg("--test-dir")
+        .arg(&root)
+        .arg("test/sql/*")
+        .env("MORAINE_DUCKDB_EXT", extension.as_os_str())
+        .env("MORAINE_EXTENSION_DIR", extension_dir.as_os_str())
+        .output()
+        .with_context(|| format!("spawning {}", runner.display()))?;
+
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    ensure!(output.status.success(), "the sqllogictest suite failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    ensure!(
+        stdout.contains("All tests passed") && stdout.contains(SQLLOGIC_TEST_COUNT),
+        "expected the sqllogictest suite to report `All tests passed` over \
+         `{SQLLOGIC_TEST_COUNT}`; a file may have been added, deleted, or silently \
+         skipped. Got:\n{stdout}"
+    );
     Ok(())
 }

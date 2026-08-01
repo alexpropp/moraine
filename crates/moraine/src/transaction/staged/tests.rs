@@ -3540,8 +3540,12 @@ async fn a_snapshot_id_that_does_not_advance_the_head_is_refused() {
         });
         let err = tx.commit().await.unwrap_err();
         assert!(
-            matches!(&err, Error::Corruption(detail) if detail.contains("does not advance the head")),
+            matches!(&err, Error::CommitConflict(_)),
             "{authored}: {err:?}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("conflict"),
+            "the loser must carry the text DuckLake's commit loop retries on: {err}"
         );
 
         let snapshot = catalog.snapshot().await.unwrap();

@@ -608,18 +608,16 @@ fn translate(
     let new_id = snapshot.snapshot_id;
 
     // DuckLake mints the id from the head it read, so an id at or below the
-    // head this commit lands on means the two disagree about where the
-    // catalog stands. Landing it would overwrite a snapshot record and move
-    // the head backwards, and every write below stamps `new_id` as the
-    // version it begins at.
+    // head this commit lands on means another commit landed in between.
+    // Landing it would overwrite a snapshot record and move the head
+    // backwards, and every write below stamps `new_id` as the version it
+    // begins at — so refuse it, as the lost race it is. Reporting anything
+    // else would be a wire-contract bug rather than a wording one: DuckLake
+    // re-drives on the text of the error, and a loser it does not recognize
+    // is a transaction it abandons instead of re-running against the head
+    // that won.
     if new_id <= base.snapshot.snapshot_id {
-        return Err(corrupt_row(
-            TableKind::Snapshot,
-            format!(
-                "snapshot_id {new_id} does not advance the head ({})",
-                base.snapshot.snapshot_id
-            ),
-        ));
+        return Err(staged_lost_race(new_id, ops.len()));
     }
 
     // Ends and deletes apply before inserts, independent of DuckLake's
