@@ -105,6 +105,21 @@ typedef struct MoraineError {
 // `cpp/moraine_abi.h`.
 typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
 
+// What one [`moraine_migrate`] call did.
+typedef struct MoraineMigrationReport {
+  // The structural format the store carried when the call began.
+  uint64_t from_format;
+  // The format it carries now. Equal to `from_format` when there was
+  // nothing to run.
+  uint64_t to_format;
+  // Whether the call resumed a migration a previous run left partly
+  // applied, rather than starting from a settled store.
+  bool resumed;
+  // Comma-separated names of the units that ran, in order, or null when
+  // none did. Free with [`moraine_string_free`].
+  char *units_run;
+} MoraineMigrationReport;
+
 // One schema, as returned by [`moraine_snapshot_schemas`].
 typedef struct MoraineSchemaDesc {
   // The schema's id.
@@ -892,6 +907,39 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
                           void *probe_ctx,
                           char **out,
                           struct MoraineError *err);
+
+// Applies every structural format migration this binary carries that the
+// store at `path` still needs.
+//
+// Deliberately not part of [`moraine_attach`]: a rewrite takes the single
+// writer for its duration, so it is the operator's explicit choice. It
+// also opens the store itself, because the stores it exists to repair —
+// those carrying a migration marker — are exactly the ones an attach
+// refuses.
+//
+// `checkpoint` takes a whole-store checkpoint before the first rewrite and
+// releases it once the run is durable, leaving a manual recovery point if
+// the migration fails partway.
+//
+// Returns [`codes::OK`] on success, having written `*out`. On failure
+// `*out` is left unwritten and, if `err` is non-null, `*err` carries the
+// code and a message.
+//
+// # Safety
+//
+// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
+// point to a valid [`MoraineS3Config`] whose non-null fields are valid
+// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
+// NUL-terminated C string. `out` must be a valid, writable
+// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
+// writable [`MoraineError`]. All for the duration of this call.
+int32_t moraine_migrate(const char *path,
+                        const struct MoraineS3Config *s3,
+                        uint64_t flush_interval_ms,
+                        const char *cache_dir,
+                        bool checkpoint,
+                        struct MoraineMigrationReport *out,
+                        struct MoraineError *err);
 
 // Frees a string previously written through [`moraine_data_path`]'s `out`.
 // A null pointer is ignored.

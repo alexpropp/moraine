@@ -4,6 +4,7 @@
 #include "metadata_tables.hpp"
 #include "owned_array.hpp"
 #include "scan.hpp"
+#include "s3_secret.hpp"
 #include "staged_write.hpp"
 #include "transaction_manager.hpp"
 
@@ -739,39 +740,11 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			cache_dir = option.second.GetValue<std::string>();
 		}
 	}
-	// For an s3:// store, resolve credentials from the matching DuckDB secret
-	// (the same secret DuckLake/httpfs use for DATA_PATH); fields the secret
-	// omits fall back to the AWS_* environment in the core. The backing strings
-	// must outlive the moraine_attach call, so they live in this scope.
+	// The backing strings must outlive the moraine_attach call, so they live
+	// in this scope rather than inside the resolver.
 	MoraineS3Config s3 {};
-	s3.use_ssl = -1;
-	std::string key_id, secret, region, session_token, endpoint, url_style;
-	bool is_s3 = duckdb::StringUtil::StartsWith(info.path, "s3://");
-	if (is_s3) {
-		auto &secret_manager = duckdb::SecretManager::Get(context);
-		auto transaction = duckdb::CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto match = secret_manager.LookupSecret(transaction, info.path, "s3");
-		if (match.HasMatch()) {
-			auto &kv = dynamic_cast<const duckdb::KeyValueSecret &>(match.GetSecret());
-			auto take = [&](const char *key, std::string &into, const char *&field) {
-				duckdb::Value value;
-				if (kv.TryGetValue(key, value) && !value.IsNull()) {
-					into = value.ToString();
-					field = into.c_str();
-				}
-			};
-			take("key_id", key_id, s3.key_id);
-			take("secret", secret, s3.secret);
-			take("region", region, s3.region);
-			take("session_token", session_token, s3.session_token);
-			take("endpoint", endpoint, s3.endpoint);
-			take("url_style", url_style, s3.url_style);
-			duckdb::Value ssl;
-			if (kv.TryGetValue("use_ssl", ssl) && !ssl.IsNull()) {
-				s3.use_ssl = ssl.GetValue<bool>() ? 1 : 0;
-			}
-		}
-	}
+	S3SecretStrings s3_strings;
+	bool is_s3 = ResolveS3Config(context, info.path, s3, s3_strings);
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
 	                           data_path.empty() ? nullptr : data_path.c_str(), &handle, &err);

@@ -775,6 +775,150 @@ pub unsafe extern "C" fn moraine_data_path(
     }
 }
 
+/// What one [`moraine_migrate`] call did.
+#[repr(C)]
+pub struct MoraineMigrationReport {
+    /// The structural format the store carried when the call began.
+    pub from_format: u64,
+    /// The format it carries now. Equal to `from_format` when there was
+    /// nothing to run.
+    pub to_format: u64,
+    /// Whether the call resumed a migration a previous run left partly
+    /// applied, rather than starting from a settled store.
+    pub resumed: bool,
+    /// Comma-separated names of the units that ran, in order, or null when
+    /// none did. Free with [`moraine_string_free`].
+    pub units_run: *mut c_char,
+}
+
+/// Applies every structural format migration this binary carries that the
+/// store at `path` still needs.
+///
+/// Deliberately not part of [`moraine_attach`]: a rewrite takes the single
+/// writer for its duration, so it is the operator's explicit choice. It
+/// also opens the store itself, because the stores it exists to repair —
+/// those carrying a migration marker — are exactly the ones an attach
+/// refuses.
+///
+/// `checkpoint` takes a whole-store checkpoint before the first rewrite and
+/// releases it once the run is durable, leaving a manual recovery point if
+/// the migration fails partway.
+///
+/// Returns [`codes::OK`] on success, having written `*out`. On failure
+/// `*out` is left unwritten and, if `err` is non-null, `*err` carries the
+/// code and a message.
+///
+/// # Safety
+///
+/// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
+/// point to a valid [`MoraineS3Config`] whose non-null fields are valid
+/// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
+/// NUL-terminated C string. `out` must be a valid, writable
+/// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
+/// writable [`MoraineError`]. All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_migrate(
+    path: *const c_char,
+    s3: *const MoraineS3Config,
+    flush_interval_ms: u64,
+    cache_dir: *const c_char,
+    checkpoint: bool,
+    out: *mut MoraineMigrationReport,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        // Before anything that could emit an event, so a migrate failure is
+        // itself drainable.
+        crate::logging::install();
+        if out.is_null() {
+            return Err(AbiError::invalid_argument("`out` is null"));
+        }
+        // SAFETY: `path` validity is this function's own safety contract.
+        let path_str = unsafe { borrow_str(path, "path") }?;
+        // SAFETY: `cache_dir` validity is this function's own safety
+        // contract; null (or empty) means "no on-disk cache".
+        let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
+        let (store_kind, prefix) = StoreKind::from_path(path_str)?;
+
+        // SAFETY: `s3` validity is this function's own safety contract; null
+        // means "no secret — the environment supplies credentials".
+        let s3_config = unsafe { s3.as_ref() };
+        let s3_creds = s3_config.map(|c| {
+            // SAFETY: each string field of `*c` is null or a NUL-terminated C
+            // string valid for this call (the shim keeps them alive across it).
+            unsafe {
+                S3Creds {
+                    key_id: opt_str(c.key_id),
+                    secret: opt_str(c.secret),
+                    region: opt_str(c.region),
+                    session_token: opt_str(c.session_token),
+                    endpoint: opt_str(c.endpoint),
+                    url_style: opt_str(c.url_style),
+                    use_ssl: match c.use_ssl {
+                        0 => Some(false),
+                        1 => Some(true),
+                        _ => None,
+                    },
+                }
+            }
+        });
+
+        // Opened before the runtime for the same reason an attach does it: a
+        // bad path must not cost a runtime spun up just to be torn down.
+        let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
+        let log_id = crate::logging::allocate_handle_id();
+        let _log_guard = crate::logging::enter_handle(log_id);
+        let runtime = new_runtime(log_id).map_err(|e| {
+            AbiError::new(
+                codes::INTERNAL,
+                format!("failed to start tokio runtime: {e}"),
+            )
+        })?;
+
+        // `CatalogOptions` is `#[non_exhaustive]`, so it is built through
+        // `default()` and field assignment rather than a struct literal.
+        let mut options = moraine::CatalogOptions::default();
+        options.path = prefix;
+        // 0 means "not given": the default cadence stands. `u64::MAX` is the
+        // shim's sentinel for an explicit zero interval.
+        match flush_interval_ms {
+            0 => {}
+            u64::MAX => options.flush_interval = std::time::Duration::ZERO,
+            ms => options.flush_interval = std::time::Duration::from_millis(ms),
+        }
+        options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+
+        let mut request = moraine::MigrationRequest::default();
+        request.checkpoint = checkpoint;
+
+        let report = runtime
+            .block_on(moraine::Catalog::migrate(object_store, options, request))
+            .map_err(AbiError::from)?;
+
+        let units_run = if report.units_run.is_empty() {
+            ptr::null_mut()
+        } else {
+            to_c_string(&report.units_run.join(","))?.into_raw()
+        };
+        // SAFETY: `out` is non-null and writable per the caller contract.
+        unsafe {
+            *out = MoraineMigrationReport {
+                from_format: report.from_format,
+                to_format: report.to_format,
+                resumed: report.resumed,
+                units_run,
+            };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Frees a string previously written through [`moraine_data_path`]'s `out`.
 /// A null pointer is ignored.
 ///

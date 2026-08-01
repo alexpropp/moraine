@@ -416,20 +416,23 @@ Two things gate disproportionately much of the list:
 
 ## 0015 — On-disk format migration
 
-- **IMPL** — Dispatch a below-the-floor store from the on-attach `sys/format`
-  check into the migrate path. The typed `Migration` error and the four-way
-  in-range/below-floor/newer/absent split are done, and the arm refuses
-  correctly; what is missing is a migrate path for it to hand off to. The arm
-  is dormant until a rewriting format raises the floor above the base
+- **DOC** — Name `moraine_migrate` in the below-the-floor refusal, now that
+  an operator has something to run. The typed `Migration` error and the
+  four-way in-range/below-floor/newer/absent split are done, and the arm
+  stays dormant until a rewriting format raises the floor above the base
   version, so nothing reaches it in the field today.
 - **IMPL** — The first real `v_n → v_{n+1}` unit. The registry ships empty:
   the driver, the unit shape, and the composition are built and tested
   against synthetic units, but every format to date is additive, so no
   rewrite exists to register. The first format that moves an existing key
-  adds the first entry.
-- **DEFERRED** — Expose the migrate verb through the DuckDB extension. The
-  core verb exists; an operator attaching through DuckDB has no way to call
-  it, so a store below the floor is reported and not repairable from SQL.
+  adds the first entry — and must raise `MIN_FORMAT_VERSION` with it, since
+  its `to_format` is where the keys then live. A test pins the two together
+  so that cannot be forgotten, along with the chain shape `chain_from`
+  depends on.
+- **VALIDATE** — Drive a real rewrite end to end through SQL once such a unit
+  exists. `moraine_migrate` is only reachable against stores that need
+  nothing today, so the dormant path is covered and the one that moves keys
+  is not yet reachable.
 - **DEFERRED** — Allowing a trivial, bounded `system`-only migration to
   auto-run on open. The shipping behavior is explicit-verb-only for every
   migration regardless of size; auto-run is a later refinement, not the first
