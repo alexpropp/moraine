@@ -739,6 +739,30 @@ mod tests {
         assert!(!conflicts(&benign, &theirs));
     }
 
+    /// A DuckLake-authored append — an ordinary insert, or the inline
+    /// flush that turns staged rows into a file — reaches the classifier
+    /// only as a parsed `inserted_into_table` entry. It must classify like
+    /// one of ours: benign against our appends and against a compaction of
+    /// the same table, a conflict against a delete, alter, or drop of it.
+    #[test]
+    fn a_parsed_insert_classifies_like_an_append() {
+        let theirs = ChangeSet::parse("inserted_into_table:1");
+        assert!(!theirs.has_unknown);
+
+        let append = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        let compaction = ChangeSet::from_operations(&[Operation::ExpireDataFile { table_id: 1 }]);
+        assert!(!conflicts(&append, &theirs));
+        assert!(!conflicts(&compaction, &theirs));
+
+        for ours in [
+            ChangeSet::from_operations(&[Operation::RegisterDeleteFile { table_id: 1 }]),
+            ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]),
+            ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]),
+        ] {
+            assert!(conflicts(&ours, &theirs));
+        }
+    }
+
     #[test]
     fn changes_made_exact_serialization() {
         let ops = [
