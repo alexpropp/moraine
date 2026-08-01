@@ -138,10 +138,20 @@ Accessors (all in-memory, name→id resolved internally):
 | `table_stats(table)` / `column_stats(table, column)` | statistics |
 | `option(scope, key)` | resolved option value |
 | `current_snapshot()` | snapshot id + metadata of this view |
-| `recent_rows(table)` / `recent_row(table, row_id)` | recently inlined rows served natively from the store's `inline` subspace |
 
 Reads issue no store I/O after the snapshot is built — a `CatalogSnapshot` is a
 value, not a cursor.
+
+Inlined rows (RFC 0005) are the one read the snapshot does **not** serve.
+`recent_rows(table)` and `recent_row(table, row_id)` are `Catalog` methods,
+each one contiguous range scan of the `inline` subspace at head. They are row
+data, not catalog metadata: an inlined chunk carries the table's actual values
+as an Arrow IPC body, so materializing them into every `CatalogSnapshot` would
+put unbounded row bytes behind an accessor the whole catalog shares and break
+the "the live catalog is small by design" premise the materialized view rests
+on. Rows of one chunk share one body and rows of one schema version share one
+schema, so each set of bytes is read and returned once however many rows
+reference it.
 
 ### Writes: closure-with-retry
 
@@ -234,10 +244,11 @@ The public surface is hand-written domain types, decoupled from the
 
 - **Newtype ids** (wrapping the DuckLake-allocated `u64`s of RFC 0002):
   `SchemaId`, `TableId`, `ViewId`, `MacroId`, `MappingId`, `ColumnId`,
-  `DataFileId`, `DeleteFileId`, `SnapshotId`.
+  `DataFileId`, `DeleteFileId`, `PartitionId`, `SnapshotId`.
 - **Value structs:** `TableInfo`, `ViewInfo`, `MacroInfo`, `MappingInfo`,
-  `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `ColumnStats`,
-  `TableStats`, `OptionScope`.
+  `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `PartitionColumnDef`,
+  `ColumnStats`, `TableStats`, `OptionScope`, `TagTarget`, `InlineChunk`,
+  `FlushedDataFile`, `RecentRow`.
 
 Keeping these separate from the wire types is what lets RFC 0002's protobuf
 field evolution stay an internal change instead of a public breaking one.
@@ -260,7 +271,7 @@ semantics and the entities RFC 0002 maps:
 | **Data files** | `register_data_file` (carries its file column stats), `expire_data_file` |
 | **Delete files** | `register_delete_file`, `expire_delete_file` |
 | **Statistics** | `update_table_stats`, `update_column_stats` |
-| **Tags** | `set_tag`, `remove_tag` |
+| **Tags** | `set_tag`, `remove_tag` (on a schema, table, or view; column tags travel on the column record and have no verb) |
 | **Options** | `set_option`, `unset_option` (global / schema / table scopes) |
 | **Inlined data** (RFC 0005) | `inline_insert`, `inline_delete`, `flush_inlined_data` |
 | **Maintenance** (RFC 0021) | `maintain` — reclaims the entry ranges of indexes no longer live; not a `Transaction` mutator but a `Catalog` verb, since it mints no snapshot |
@@ -277,6 +288,24 @@ Notes:
 - `alter_column` is one verb taking an optional change per attribute, rather
   than three verbs, because DuckLake models a column alteration as a single
   new column version regardless of which attributes changed.
+- Every verb that puts a column type into the catalog — `create_table`,
+  `add_column`, `alter_column` — enforces the RFC 0005 type policy and raises
+  `Unsupported` for a type moraine cannot store. The rule is the core's, and
+  the staged path enforces the same one at the same boundary, so a `VARIANT`
+  column is refused where it enters the catalog rather than at the first
+  insert that would need it. The shim keeps its own refusal at the Arrow
+  conversion, and it is not redundant: DuckLake builds the inlined data table
+  while flushing the `CREATE TABLE`, *before* the `ducklake_column` rows the
+  core validates reach a commit, so removing it leaves the user with DuckDB's
+  bare "Unsupported Arrow type VARIANT". Measured by deleting it and running
+  the e2e suite.
+- `flush_inlined_data` registers the files it drains into, rather than leaving
+  them to `register_data_file`. A flushed file is not an ordinary
+  registration: its rows keep the ids they were inlined under and its record
+  is backdated to the earliest snapshot among them, neither of which
+  `register_data_file` can express. Keeping that inside the flush verb is what
+  lets the general row-id-preserving registration stay deferred to the
+  compaction surface.
 - Column/name mappings (RFC 0018) have **no verb**: DuckLake creates them
   only as a side effect of `ducklake_add_data_files`, and the embedding API
   has no consumer registering foreign Parquet today. `register_data_file`

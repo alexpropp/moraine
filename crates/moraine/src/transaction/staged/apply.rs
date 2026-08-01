@@ -323,6 +323,13 @@ pub(super) fn apply_insert(
         TableKind::View => state.put_view(decode_view(cells)?),
         TableKind::Column => {
             let mut value = decode_column(cells)?;
+            // The column-type policy is the core's on both front doors, so
+            // a type moraine cannot store is refused where the column
+            // enters the catalog rather than at its first insert.
+            crate::catalog::inline_policy::ensure_inlinable(
+                &value.column_name,
+                &value.column_type,
+            )?;
             // Column tags outlive column versions (DuckLake keys them by
             // (table_id, column_id) with their own lifecycle), so a new
             // version carries the prior version's entries forward —

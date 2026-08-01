@@ -74,6 +74,11 @@ id_type!(
     /// global catalog-id counter).
     IndexId
 );
+id_type!(
+    /// Identifies a partition spec within its table (allocated from the
+    /// global catalog-id counter).
+    PartitionId
+);
 
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
@@ -142,6 +147,58 @@ pub struct DeleteFile {
     /// Encryption key material, verbatim — an opaque string moraine
     /// stores and returns but never interprets.
     pub encryption_key: Option<String>,
+}
+
+/// One key of a partition spec: a source column and the transform applied
+/// to it. Transforms are stored verbatim as DuckLake writes them
+/// (`identity`, `year`, `bucket(16)`, …); moraine never parses or applies
+/// one. A bare partition column carries `identity` rather than an empty
+/// transform, so every key is explicit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionColumnDef {
+    /// The source column, by field id — never by name, so a rename leaves
+    /// the spec intact.
+    pub column: ColumnId,
+    /// The transform, verbatim.
+    pub transform: String,
+}
+
+/// A table's partition spec: its partition keys in order. A table has at
+/// most one live spec; setting a new one ends the old, and files written
+/// under the old spec keep referencing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionSpec {
+    /// The spec's id.
+    pub id: PartitionId,
+    /// The partition keys, in `partition_key_index` order.
+    pub columns: Vec<PartitionColumnDef>,
+}
+
+/// A catalog object a tag can be attached to. Schemas, tables, and views
+/// share one id space, so the variant selects which entity the verb
+/// validates against and how the change is classified, not how the tag is
+/// keyed. Column tags are carried on the column itself and are not
+/// reachable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagTarget {
+    /// One schema.
+    Schema(SchemaId),
+    /// One table.
+    Table(TableId),
+    /// One view.
+    View(ViewId),
+}
+
+impl TagTarget {
+    /// The tagged object's id — the key the tag container is stored under.
+    #[must_use]
+    pub const fn object_id(self) -> u64 {
+        match self {
+            Self::Schema(id) => id.get(),
+            Self::Table(id) => id.get(),
+            Self::View(id) => id.get(),
+        }
+    }
 }
 
 /// A live data file, as read from a snapshot.
@@ -551,6 +608,66 @@ pub struct ScheduledDeletion {
     pub path_is_relative: bool,
     /// Microseconds since epoch, UTC, when the file was scheduled.
     pub schedule_start_micros: i64,
+}
+
+/// A chunk of rows to inline: one Arrow IPC record-batch body over the
+/// table's user columns, decoded against the schema-only stream recorded
+/// for its `schema_version`. Row ids are allocated by the commit from the
+/// table's row-id counter, never caller-provided — the same allocation a
+/// data-file registration performs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineChunk {
+    /// The catalog schema version the body's columns match. Chunks are
+    /// decoded against their own version's schema, so evolving the table
+    /// never rewrites an existing chunk.
+    pub schema_version: u64,
+    /// The Arrow IPC schema-only stream for `schema_version`. Written once
+    /// per version; a chunk for a version already recorded may repeat it
+    /// (the record is overwritten with identical bytes).
+    pub arrow_schema: Vec<u8>,
+    /// The Arrow IPC record-batch body: the batch message and buffers, with
+    /// no schema message.
+    pub arrow_body: Vec<u8>,
+    /// How many rows the body carries.
+    pub row_count: u64,
+}
+
+/// A data file a flush wrote, carrying rows that were inlined before it.
+/// Unlike an ordinary registration, the rows keep the ids they were
+/// inlined under and the record is backdated, so a pre-flush time-travel
+/// read finds them in the file rather than in the drained chunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushedDataFile {
+    /// The written file. Its rows are already counted in the table's
+    /// statistics from when they were inlined, so registering it adds only
+    /// its bytes.
+    pub file: DataFile,
+    /// The first row id the file carries — preserved from the inlined
+    /// rows, never reallocated.
+    pub row_id_start: u64,
+    /// The snapshot the file record is backdated to: the earliest
+    /// `begin_snapshot` among the rows it carries.
+    pub begin_snapshot: SnapshotId,
+}
+
+/// One inlined row, with the Arrow IPC bytes a caller needs to decode it.
+/// Rows of one chunk share one `chunk_body`, and rows of one schema
+/// version share one `arrow_schema`, so a scan carries each set of bytes
+/// once however many rows reference it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentRow {
+    /// The row's dense id.
+    pub row_id: u64,
+    /// The commit that inserted it.
+    pub begin_snapshot: SnapshotId,
+    /// The schema version its body decodes against.
+    pub schema_version: u64,
+    /// The row's offset within its chunk.
+    pub offset_in_chunk: u64,
+    /// The owning chunk's Arrow IPC record-batch body.
+    pub chunk_body: std::sync::Arc<Vec<u8>>,
+    /// The Arrow IPC schema-only stream of `schema_version`.
+    pub arrow_schema: std::sync::Arc<Vec<u8>>,
 }
 
 /// An option scope: global, or one schema or table.

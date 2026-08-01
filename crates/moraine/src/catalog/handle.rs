@@ -18,7 +18,9 @@ use tracing::{info, warn};
 use crate::{
     catalog::{
         CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo, FileIndexEntry, IndexDef,
-        IndexEntry, IndexId, IndexInfo, IndexState, RowHolder, RowLocation, SnapshotId, TableId,
+        IndexEntry, IndexId, IndexInfo, IndexState, RecentRow, RowHolder, RowLocation, SnapshotId,
+        TableId,
+        inline::{InlineScanKind, materialize_inline_rows},
         projection::{ProjectionCache, cache_epoch, cached_head_view, install_head_view_at},
         scoped_read,
     },
@@ -405,6 +407,153 @@ impl Catalog {
     /// another error if the store cannot be read.
     pub async fn snapshot_at(&self, snapshot: SnapshotId) -> Result<Arc<CatalogSnapshot>> {
         self.view(Some(snapshot.get())).await
+    }
+
+    /// A table's inlined rows live at the latest committed snapshot, in
+    /// row-id order, each carrying the Arrow IPC bytes it decodes from.
+    ///
+    /// These rows are not part of a [`CatalogSnapshot`]: they are row data,
+    /// not catalog metadata, so they are served from the `inline` subspace
+    /// on demand — one contiguous range scan per call — rather than
+    /// materialized into a view every reader of the catalog shares. Rows of
+    /// one chunk share one body and rows of one schema version share one
+    /// schema, so each set of bytes is read and carried once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if a chunk names a schema version with
+    /// no recorded schema, or another error if the store cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, ColumnDef, InlineChunk};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// # let created = std::cell::Cell::new(None);
+    /// catalog
+    ///     .commit(|tx| {
+    ///         let main = tx.schema_by_name("main").expect("bootstrap schema").id;
+    ///         let orders = tx.create_table(
+    ///             main,
+    ///             "orders",
+    ///             &[ColumnDef {
+    ///                 name: "id".into(),
+    ///                 column_type: "BIGINT".into(),
+    ///                 nulls_allowed: false,
+    ///                 default_value: None,
+    ///             }],
+    ///         )?;
+    ///         // The Arrow bytes are the caller's to produce; moraine stores
+    ///         // and returns them verbatim.
+    ///         tx.inline_insert(
+    ///             orders,
+    ///             &InlineChunk {
+    ///                 schema_version: 0,
+    ///                 arrow_schema: arrow_schema_bytes(),
+    ///                 arrow_body: record_batch_bytes(),
+    ///                 row_count: 2,
+    ///             },
+    ///             &[],
+    ///         )?;
+    /// #       created.set(Some(orders));
+    ///         Ok(())
+    ///     })
+    ///     .await?;
+    /// # let orders = created.get().unwrap();
+    ///
+    /// let rows = catalog.recent_rows(orders).await?;
+    /// assert_eq!(rows.len(), 2);
+    /// assert_eq!(rows[0].row_id, 0);
+    /// assert_eq!(rows[1].offset_in_chunk, 1);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// # fn arrow_schema_bytes() -> Vec<u8> { b"schema".to_vec() }
+    /// # fn record_batch_bytes() -> Vec<u8> { b"body".to_vec() }
+    /// ```
+    pub async fn recent_rows(&self, table: TableId) -> Result<Vec<RecentRow>> {
+        let session = self.begin_read().await?;
+        let outcome = self.scan_recent_rows(&session, table).await;
+        session.finish();
+
+        outcome
+    }
+
+    /// One inlined row of a table by id, or `None` when no live inlined row
+    /// carries it — including when the row lives in a data file instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::recent_rows`].
+    pub async fn recent_row(&self, table: TableId, row_id: u64) -> Result<Option<RecentRow>> {
+        Ok(self
+            .recent_rows(table)
+            .await?
+            .into_iter()
+            .find(|row| row.row_id == row_id))
+    }
+
+    /// The live-at-head inline rows of `table`, read through an open
+    /// session.
+    async fn scan_recent_rows(
+        &self,
+        session: &ReadSession,
+        table: TableId,
+    ) -> Result<Vec<RecentRow>> {
+        let handle = session.handle();
+        commit::refuse_mid_migration(handle).await?;
+        let head = commit::read_head_id(handle).await?;
+        let chunks = store_inline::scan_inline_chunks(handle, table.get()).await?;
+        let tombstones = store_inline::scan_inline_inline_deletes(handle, table.get()).await?;
+
+        let live =
+            InlineScanKind::Table.select(&materialize_inline_rows(&chunks, &tombstones), head, 0);
+        // One body per referenced chunk and one schema per referenced
+        // version, however many rows point at them.
+        let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
+        let mut schemas: HashMap<u64, Arc<Vec<u8>>> = HashMap::new();
+        let mut rows = Vec::with_capacity(live.len());
+        for row in live {
+            let (operation, chunk) = &chunks[row.chunk];
+            // Every chunk a row was materialized from is an insert.
+            let InlineOperation::Insert { schema_version, .. } = operation else {
+                return Err(Error::Corruption(format!(
+                    "inline row {} of table {table} references a non-insert chunk",
+                    row.row_id
+                )));
+            };
+            let arrow_schema = if let Some(schema) = schemas.get(schema_version) {
+                Arc::clone(schema)
+            } else {
+                let schema = store_inline::read_inline_schema(handle, table.get(), *schema_version)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "no inline schema for table {table} version {schema_version}"
+                        ))
+                    })?;
+                let schema = Arc::new(schema.arrow_schema);
+                schemas.insert(*schema_version, Arc::clone(&schema));
+                schema
+            };
+            let chunk_body = Arc::clone(
+                bodies
+                    .entry(row.chunk)
+                    .or_insert_with(|| Arc::new(chunk.body.clone())),
+            );
+
+            rows.push(RecentRow {
+                row_id: row.row_id,
+                begin_snapshot: SnapshotId::new(row.begin_snapshot),
+                schema_version: *schema_version,
+                offset_in_chunk: row.offset_in_chunk,
+                chunk_body,
+                arrow_schema,
+            });
+        }
+
+        Ok(rows)
     }
 
     /// Time travel always materializes: the cache holds head views only, and

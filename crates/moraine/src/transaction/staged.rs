@@ -51,7 +51,7 @@ use crate::{
 mod apply;
 mod decode;
 mod index_upkeep;
-mod inline;
+pub(crate) mod inline;
 #[cfg(test)]
 mod tests;
 

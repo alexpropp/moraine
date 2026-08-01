@@ -110,10 +110,11 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 	types.reserve(user_columns.size());
 	names.reserve(user_columns.size());
 	for (auto &col : user_columns) {
-		// Inline data is serialized through Arrow, and DuckDB's Arrow format
-		// has no VARIANT support (unlike GEOMETRY, which the spatial extension
-		// registers). Reject it here with a clear message instead of letting
-		// `ToArrowSchema` throw a bare "Unsupported Arrow type VARIANT".
+		// The core refuses this column too, but not in time: DuckLake builds the
+		// inlined data table while flushing the CREATE TABLE, before the
+		// `ducklake_column` rows the core validates reach a commit. Without this
+		// refusal the user sees DuckDB's bare "Unsupported Arrow type VARIANT"
+		// instead, which names neither moraine nor a way forward.
 		if (col.type.id() == duckdb::LogicalTypeId::VARIANT) {
 			throw duckdb::NotImplementedException(
 			    "moraine: column \"%s\" is VARIANT, which moraine cannot store — its inline "

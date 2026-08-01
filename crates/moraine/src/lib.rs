@@ -54,6 +54,18 @@
 //! same [`Catalog::commit`] path, minting a snapshot without bumping the
 //! schema version.
 //!
+//! # Inlined data
+//!
+//! A small insert need not cost a Parquet file. [`Transaction::inline_insert`]
+//! stores a chunk of rows in the catalog itself — Arrow IPC bytes the caller
+//! encodes, carried by the same single write the commit already performs —
+//! and the rows draw ids from the table's row-id counter exactly as a
+//! registered file's do. [`Catalog::recent_rows`] reads them back,
+//! [`Transaction::inline_delete`] tombstones one, and
+//! [`Transaction::flush_inlined_data`] drains them into a data file the
+//! caller wrote, preserving their ids and backdating the file's record so
+//! time travel across the flush still finds them exactly once.
+//!
 //! # Maintenance
 //!
 //! Dropping an equality index (or a table that has one) makes its entries
@@ -148,11 +160,12 @@ mod transaction;
 pub use catalog::{
     Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
     ColumnOrder, ColumnStats, CommitMember, DataFile, DataFileId, DataFileInfo, DeleteFile,
-    DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval, IndexDef,
-    IndexEntry, IndexId, IndexInfo, IndexState, MacroId, MacroImplementationDef, MacroInfo,
-    MacroParameterDef, MaintenanceReport, MaintenanceRequest, MappingId, MappingInfo,
-    MigrationRequest, NameMappingDef, OptionScope, RowHolder, RowLocation, ScheduledDeletion,
-    SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry,
+    DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
+    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, MacroId,
+    MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
+    MappingId, MappingInfo, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
+    PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId,
+    SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, TagTarget,
     ViewId, ViewInfo,
 };
 pub use error::{Error, Result};

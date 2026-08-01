@@ -7,9 +7,9 @@ use crate::{
     catalog::types::{
         ColumnId, ColumnInfo, ColumnStats, DataFileId, DataFileInfo, DeleteFileId, DeleteFileInfo,
         IndexId, IndexInfo, IndexState, MacroId, MacroImplementationDef, MacroInfo,
-        MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, ScheduledDeletion,
-        SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry,
-        ViewId, ViewInfo,
+        MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef,
+        PartitionId, PartitionSpec, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
+        SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
     },
     error::{Error, Result},
     store::{
@@ -29,9 +29,10 @@ use crate::{
 /// is a value, not a cursor. The default value is an empty view at
 /// snapshot 0.
 ///
-/// Partition and sort specs carry no read accessors by design: hosts read
-/// them through the ffi dumps, and the transaction layer diffs and
-/// mutates the whole per-table maps directly.
+/// Sort specs carry no read accessor: hosts read them through the ffi
+/// dumps, and the transaction layer diffs the whole per-table map
+/// directly. Partition specs, which the verb surface sets and clears,
+/// have [`partitioning_of`](Self::partitioning_of).
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
     pub(crate) snapshot: SnapshotValue,
@@ -336,6 +337,19 @@ impl CatalogSnapshot {
             .get(&table.get())
             .map(|per_table| per_table.values().map(mapping_info).collect())
             .unwrap_or_default()
+    }
+
+    /// The table's partition spec live at this view's snapshot, or `None`
+    /// when the table is unpartitioned. A table has at most one live spec;
+    /// a store carrying more (only reachable through the staged path, which
+    /// stores DuckLake's rows verbatim) yields the lowest-numbered, the one
+    /// a scan in key order meets first.
+    #[must_use]
+    pub fn partitioning_of(&self, table: TableId) -> Option<PartitionSpec> {
+        self.partitions
+            .get(&table.get())
+            .and_then(|per_table| per_table.values().next())
+            .map(partition_spec)
     }
 
     /// A table's live equality indexes, ordered by id.
@@ -783,6 +797,21 @@ fn mapping_info(value: &MappingValue) -> MappingInfo {
                 target_field_id: row.target_field_id,
                 parent_column: row.parent_column,
                 is_partition: row.is_partition,
+            })
+            .collect(),
+    }
+}
+
+fn partition_spec(value: &PartitionValue) -> PartitionSpec {
+    let mut columns: Vec<&crate::store::proto::PartitionColumn> = value.columns.iter().collect();
+    columns.sort_by_key(|column| column.partition_key_index);
+    PartitionSpec {
+        id: PartitionId::new(value.partition_id),
+        columns: columns
+            .into_iter()
+            .map(|column| PartitionColumnDef {
+                column: ColumnId::new(column.column_id),
+                transform: column.transform.clone(),
             })
             .collect(),
     }

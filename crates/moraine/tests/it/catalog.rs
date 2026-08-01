@@ -3,10 +3,13 @@
 
 use std::sync::Arc;
 
-use moraine::{Catalog, CatalogOptions, ColumnId, Error, OptionScope, SchemaId, SnapshotId};
+use moraine::{
+    Catalog, CatalogOptions, ColumnAlteration, ColumnDef, ColumnId, Error, OptionScope, SchemaId,
+    SnapshotId,
+};
 use object_store::memory::InMemory;
 
-use crate::fixtures::{col, open_memory};
+use crate::fixtures::{col, open_memory, seeded};
 
 #[tokio::test]
 async fn encrypted_flag_is_fixed_at_bootstrap() {
@@ -502,4 +505,63 @@ async fn second_writer_fences_the_first_with_a_typed_error() {
         .await
         .unwrap();
     second.close().await.unwrap();
+}
+
+/// A type moraine cannot store is refused where the column enters the
+/// catalog — at creation, at addition, and at an alteration that would
+/// change into it — rather than at the first insert that would need it.
+/// Typed `Unsupported`, so a bridge maps it to "not implemented" without
+/// reading the message.
+#[tokio::test]
+async fn a_variant_column_is_refused_as_unsupported_on_every_column_verb() {
+    let (catalog, schema, table, _) = seeded().await;
+    let variant = ColumnDef {
+        name: "v".into(),
+        column_type: "VARIANT".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+
+    let on_create = catalog
+        .commit({
+            let variant = variant.clone();
+            move |tx| {
+                tx.create_table(schema, "with_variant", std::slice::from_ref(&variant))?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(on_create, Error::Unsupported(_)), "{on_create}");
+
+    let on_add = catalog
+        .commit(move |tx| {
+            tx.add_column(table, &variant)?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(on_add, Error::Unsupported(_)), "{on_add}");
+
+    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let on_alter = catalog
+        .commit(move |tx| {
+            tx.alter_column(
+                table,
+                column,
+                ColumnAlteration {
+                    column_type: Some("VARIANT".into()),
+                    ..ColumnAlteration::default()
+                },
+            )
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(on_alter, Error::Unsupported(_)), "{on_alter}");
+
+    // Nothing landed: the table still has only the column it was seeded
+    // with, and the refused table was never created.
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(head.columns_of(table).len(), 1);
+    assert!(head.table_by_name(schema, "with_variant").is_none());
 }
