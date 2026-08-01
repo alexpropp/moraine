@@ -36,3 +36,4 @@ mod migrate;
 mod partitioning;
 mod time_travel;
 mod types;
+mod wire_contract;

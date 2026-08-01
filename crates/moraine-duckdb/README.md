@@ -286,11 +286,24 @@ DuckLake's own `DuckLakeAttach` (`src/storage/ducklake_storage.cpp`)
 constructs the nested path: `options.metadata_path = info.path` (the literal
 string after `ducklake:` is stripped by the *same* mechanism one level up),
 and `options.metadata_database = "__ducklake_metadata_" + name`.
-`DuckLakeInitializer::Initialize` then issues `ATTACH OR REPLACE
-{METADATA_PATH} AS {METADATA_CATALOG_NAME_IDENTIFIER}` — i.e. literally
-`ATTACH OR REPLACE 'moraine:<path>' AS __ducklake_metadata_lake` — through
-the same top-level-statement machinery, so the prefix dispatch fires again,
-unmodified.
+`DuckLakeInitializer::Initialize` then issues that as a top-level statement,
+so the prefix dispatch fires again, unmodified. The generated text is
+captured from a running session rather than read off the source — DuckDB's
+`QueryLog` records DuckLake's own metadata connection — and pinned by
+`tests/ducklake_load/wire_contract.rs`:
+
+```sql
+ATTACH OR REPLACE 'moraine:<path>' AS "__ducklake_metadata_warehouse" (HIDDEN true)
+SELECT NULL FROM "__ducklake_metadata_warehouse"."main".ducklake_metadata LIMIT 1
+```
+
+Two consequences of that shape. The catalog name is derived from the outer
+alias, so `AS warehouse` nests `__ducklake_metadata_warehouse` — the
+metadata catalog is addressable by name (`SELECT * FROM
+__ducklake_metadata_warehouse.main.ducklake_snapshot` works, and is how
+these tests inspect what DuckLake wrote). And `HIDDEN true` keeps it out of
+`duckdb_databases()`, which lists only the outer `warehouse` — whose `path`
+column is exactly the nested attach string, `moraine:<path>`.
 
 The schema DuckLake queries is `main` — `duckdb::Catalog`'s base-class
 default, which `MoraineCatalog` never overrides, and the schema bootstrap
