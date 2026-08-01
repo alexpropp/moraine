@@ -79,6 +79,16 @@ long-lived writer process. Concurrent commits inside that process share a
 flush rather than each waiting for one of their own, so the funnel is not
 the throughput ceiling it looks like.
 
+`READ_ONLY` is read-only at the *catalog* level, not the IAM level: a
+reader that follows the latest state writes a checkpoint into the manifest
+and refreshes it while it lives, so its credentials still need write
+access. A deployment whose readers hold strictly read-only credentials
+pins them to a checkpoint taken ahead of time (`CHECKPOINT`), which writes
+nothing at all — in exchange for reading the fixed cut that checkpoint
+named rather than following head. See
+[`crates/moraine-duckdb/README.md`](crates/moraine-duckdb/README.md) for
+the attach surface.
+
 ## Architecture
 
 - **`crates/moraine`** — the core library: DuckLake catalog semantics

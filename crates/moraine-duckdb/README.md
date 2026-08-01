@@ -29,6 +29,60 @@ DDL issued directly against a user schema/table (outside DuckLake's own
 `ducklake_*` writes), plus querying a view's definition, raises
 `NotImplementedException`.
 
+## Attach modes: one writer, many readers
+
+**Exactly one process may attach a given store read-write.** Every other
+process must pass `READ_ONLY`. SlateDB fences by *newest writer wins*, so a
+second read-write attach does not fail — it takes the writer role from the
+incumbent, whose next commit then raises the `FENCED` error telling it to
+re-attach. Two processes attaching read-write take turns breaking each
+other, and neither is told at attach time.
+
+```sql
+-- The one writer.
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+
+-- Every other process.
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY);
+```
+
+A read-only attach opens SlateDB's `DbReader`, never the writer `Db`: it
+never fences anyone, never participates in fencing, and any number may run
+alongside the writer. DuckDB resolves `READ_ONLY` into the access mode this
+shim reads, and DuckLake forwards it into the nested metadata attach.
+
+`READ_ONLY` is read-only at the **catalog** level, not the IAM level. A
+follow-latest reader writes a checkpoint into the manifest on open and
+refreshes it for the attach's lifetime, so reader credentials still need
+manifest write access. For strictly read-only credentials, see
+`CHECKPOINT_ID` below.
+
+**`CHECKPOINT_ID` — a truly-zero-write read-only attach.** Given the id of a
+SlateDB checkpoint created ahead of time, moraine opens the reader against
+that checkpoint instead of establishing its own: no manifest CAS, no
+refresh, no delete on close — the attach issues object-store reads and
+nothing else.
+
+```sql
+-- With write credentials, once: mint a checkpoint and note its id.
+LOAD moraine;
+SELECT checkpoint_id FROM moraine_create_checkpoint('s3://bucket/prefix');
+
+-- Thereafter, from a process holding only s3:GetObject/ListBucket:
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY,
+   META_CHECKPOINT_ID '4a1f…');
+```
+
+The cost is that the attach reads a **fixed cut**: it never sees commits
+made after the checkpoint, because seeing them is exactly what the manifest
+poll it is forgoing would do. Refreshing means minting a new checkpoint and
+re-attaching. `CHECKPOINT_ID` requires `READ_ONLY` — a read-write attach
+naming one is refused — and a checkpoint the manifest no longer carries
+fails the attach rather than silently falling back to latest.
+
 **Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
 attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
 …) read-only by default, and a read-only attach cannot create a catalog. To

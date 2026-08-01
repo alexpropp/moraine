@@ -3701,3 +3701,236 @@ async fn staged_option_rows_set_scoped_options_without_minting_a_snapshot() {
     );
     catalog.close().await.unwrap();
 }
+
+fn delete_file_row(delete_file_id: u64, table_id: u64, data_file_id: u64, begin: u64) -> Vec<Cell> {
+    vec![
+        Cell::U64(delete_file_id),
+        Cell::U64(table_id),
+        Cell::U64(begin),
+        Cell::Null, // end_snapshot
+        Cell::U64(data_file_id),
+        Cell::Str("deletes.parquet".into()), // path
+        Cell::Bool(true),                    // path_is_relative
+        Cell::Str("parquet".into()),         // format
+        Cell::U64(1),                        // delete_count
+        Cell::U64(128),                      // file_size_bytes
+        Cell::U64(32),                       // footer_size
+        Cell::Null,                          // encryption_key
+        Cell::Null,                          // partial_max
+    ]
+}
+
+/// Stages `rows` plus the snapshot pair minting `snapshot_id`, and commits.
+async fn stage_batch(
+    catalog: &Catalog,
+    snapshot_id: u64,
+    rows: Vec<(TableKind, Vec<Cell>)>,
+) -> Result<()> {
+    let db_tx = catalog.begin_write_tx().await?;
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    for (table, cells) in rows {
+        tx.stage(RowOperation::Insert { table, cells });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(snapshot_id, snapshot_id, 100),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(snapshot_id, "none"),
+    });
+    tx.commit().await.map(|_| ())
+}
+
+/// The id-collision backstop, one case per primary-keyed kind DuckLake's
+/// own schema declares: `ducklake_schema`, `ducklake_data_file`, and
+/// `ducklake_delete_file`. Inserting an id whose row is already live
+/// would displace that row and mint a history version DuckLake never
+/// authored, so it is refused with a typed `Constraint` — the same
+/// refusal a SQL catalog's primary key gives DuckLake.
+#[tokio::test]
+async fn duplicate_live_ids_are_refused_on_every_primary_keyed_kind() {
+    // Seed: schema 7, table 1, data file 3, delete file 4 — all live.
+    let catalog = open().await;
+    stage_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::Schema, schema_row(7, "s", 1)),
+            (TableKind::Table, table_row(1, 7, "t", 1, None)),
+            (TableKind::DataFile, data_file_row(3, 1, 1)),
+            (TableKind::DeleteFile, delete_file_row(4, 1, 3, 1)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let collisions = [
+        (TableKind::Schema, schema_row(7, "other", 2), "schema_id 7"),
+        (
+            TableKind::DataFile,
+            data_file_row(3, 1, 2),
+            "data_file_id 3",
+        ),
+        (
+            TableKind::DeleteFile,
+            delete_file_row(4, 1, 3, 2),
+            "delete_file_id 4",
+        ),
+    ];
+    for (table, cells, named) in collisions {
+        let err = stage_batch(&catalog, 2, vec![(table, cells)])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Constraint(detail)
+                if detail.contains(named) && detail.contains("already live")),
+            "{table:?}: {err:?}"
+        );
+    }
+
+    // Nothing landed: head still stands where the seed left it.
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(snapshot.current_snapshot().id.get(), 1);
+    assert_eq!(
+        snapshot
+            .schema_by_id(crate::catalog::SchemaId::new(7))
+            .expect("schema 7 survives")
+            .name,
+        "s"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// The two snapshot kinds are primary-keyed too, and their backstop is
+/// the head-advance check rather than a lookup: a snapshot record exists
+/// only for an id at or below head, so an id that advances the head
+/// cannot collide, and one that does not is already refused
+/// (`a_snapshot_id_that_does_not_advance_the_head_is_refused`). This
+/// pins the reasoning as a property — re-inserting *any* already-minted
+/// snapshot id fails.
+///
+/// It fails as a lost race rather than as corruption, which is the right
+/// reading: DuckLake mints the id from the head it read, so an id at or
+/// below head means a commit landed in between, and DuckLake re-drives on
+/// the text of that error.
+#[tokio::test]
+async fn re_minting_an_existing_snapshot_id_is_refused() {
+    let catalog = open().await;
+    stage_batch(
+        &catalog,
+        1,
+        vec![(TableKind::Schema, schema_row(7, "s", 1))],
+    )
+    .await
+    .unwrap();
+    stage_batch(
+        &catalog,
+        2,
+        vec![(TableKind::Schema, schema_row(8, "u", 2))],
+    )
+    .await
+    .unwrap();
+
+    for existing in [0, 1, 2] {
+        let err = stage_batch(&catalog, existing, vec![]).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::CommitConflict(_)),
+            "snapshot {existing}: {err:?}"
+        );
+    }
+    catalog.close().await.unwrap();
+}
+
+/// Ending a row frees its id within the same commit: a rename ends the
+/// old version and re-inserts under the same id, and the backstop must
+/// not mistake that for a collision. Pinned for each kind the backstop
+/// covers that DuckLake actually re-inserts this way.
+#[tokio::test]
+async fn re_inserting_an_id_whose_row_ended_in_the_same_commit_is_accepted() {
+    let catalog = open().await;
+    stage_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::Schema, schema_row(7, "s", 1)),
+            (TableKind::Table, table_row(1, 7, "t", 1, None)),
+            (TableKind::DataFile, data_file_row(3, 1, 1)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::Schema,
+        cells: vec![Cell::U64(7), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Schema,
+        cells: schema_row(7, "renamed", 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 2, 100),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "none"),
+    });
+    tx.commit().await.unwrap();
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot
+            .schema_by_id(crate::catalog::SchemaId::new(7))
+            .expect("schema 7 is live under its new name")
+            .name,
+        "renamed"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// No name uniqueness is enforced anywhere on the staged path. DuckLake's
+/// own catalog schema declares no `UNIQUE` constraint on any name column
+/// — it polices naming in its binder, above the catalog — so moraine
+/// must accept two live rows sharing a name rather than inventing a
+/// constraint DuckLake's other backends do not have. (The verb path is a
+/// different surface: it authors ids itself and does refuse a duplicate
+/// name.)
+#[tokio::test]
+async fn staged_rows_enforce_no_name_uniqueness() {
+    let catalog = open().await;
+    stage_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::Schema, schema_row(7, "dup", 1)),
+            (TableKind::Schema, schema_row(8, "dup", 1)),
+            (TableKind::Table, table_row(1, 7, "dup", 1, None)),
+            (TableKind::Table, table_row(2, 7, "dup", 1, None)),
+            (TableKind::Column, column_row(1, 1, "dup", 0)),
+            (TableKind::Column, column_row(1, 2, "dup", 1)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    let schemas: Vec<_> = snapshot
+        .schemas()
+        .into_iter()
+        .filter(|s| s.name == "dup")
+        .collect();
+    assert_eq!(schemas.len(), 2, "two live schemas may share a name");
+    let tables = snapshot.tables_in(crate::catalog::SchemaId::new(7));
+    assert_eq!(tables.len(), 2, "two live tables may share a name");
+    let columns = snapshot.columns_of(crate::catalog::TableId::new(1));
+    assert_eq!(
+        columns.iter().filter(|c| c.name == "dup").count(),
+        2,
+        "two live columns may share a name"
+    );
+    catalog.close().await.unwrap();
+}
