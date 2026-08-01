@@ -711,9 +711,13 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
 	// `CACHE_DIR` is a local directory for SlateDB's on-disk block cache; it
 	// must outlive the moraine_attach call, so it lives in this scope.
+	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
+	// time, so the open writes nothing at all; the ABI refuses it on a
+	// read-write attach.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
+	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
 	// it is the DATA_PATH the index scoped read and maintenance resolve data
 	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
@@ -743,6 +747,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
+		} else if (name == "checkpoint") {
+			checkpoint = option.second.GetValue<std::string>();
 		}
 	}
 	// The backing strings must outlive the moraine_attach call, so they live
@@ -752,7 +758,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	bool is_s3 = ResolveS3Config(context, info.path, s3, s3_strings);
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
-	                           data_path.empty() ? nullptr : data_path.c_str(), &handle, &err);
+	                           data_path.empty() ? nullptr : data_path.c_str(),
+	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.

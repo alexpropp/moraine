@@ -142,6 +142,17 @@ impl<'a> StoreBuilder<'a> {
             .map_err(Error::from)
     }
 
+    /// Every checkpoint the store's manifest currently carries, oldest
+    /// first — reader-established ones included.
+    pub(crate) async fn list_checkpoints(&self) -> Result<Vec<Uuid>> {
+        let checkpoints = AdminBuilder::new(self.path, Arc::clone(&self.object_store))
+            .build()
+            .list_checkpoints(None)
+            .await
+            .map_err(Error::from)?;
+        Ok(checkpoints.into_iter().map(|c| c.id).collect())
+    }
+
     /// SlateDB settings for a writer. A zero flush interval flushes
     /// continuously rather than on a timer: durable commits then wait only
     /// on the object-store PUT, at the cost of a busy flush loop.

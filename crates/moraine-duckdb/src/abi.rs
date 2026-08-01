@@ -14,6 +14,8 @@
 //! [`Catalog`]: moraine::Catalog
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
+mod checkpoints;
+
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -21,6 +23,7 @@ use std::{
     sync::Arc,
 };
 
+pub use checkpoints::*;
 use moraine::CatalogOptions;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::warn;
@@ -227,7 +230,7 @@ pub struct MoraineS3Config {
 
 /// S3 credentials borrowed from a [`MoraineS3Config`]. Every field is
 /// optional; an absent field defers to the AWS_* environment.
-struct S3Creds<'a> {
+pub(crate) struct S3Creds<'a> {
     key_id: Option<&'a str>,
     secret: Option<&'a str>,
     region: Option<&'a str>,
@@ -235,6 +238,36 @@ struct S3Creds<'a> {
     endpoint: Option<&'a str>,
     url_style: Option<&'a str>,
     use_ssl: Option<bool>,
+}
+
+/// Borrows the credentials out of a nullable [`MoraineS3Config`]. Null
+/// means "no secret — the environment supplies credentials".
+///
+/// # Safety
+///
+/// `s3`, if non-null, must point to a valid [`MoraineS3Config`] whose
+/// non-null string fields are NUL-terminated C strings, all valid for
+/// reads for the duration of the borrow.
+pub(crate) unsafe fn borrow_s3_creds<'a>(s3: *const MoraineS3Config) -> Option<S3Creds<'a>> {
+    // SAFETY: caller contract above.
+    let config = unsafe { s3.as_ref() }?;
+    // SAFETY: each string field is null or a NUL-terminated C string valid
+    // for the borrow, per the same contract.
+    Some(unsafe {
+        S3Creds {
+            key_id: opt_str(config.key_id),
+            secret: opt_str(config.secret),
+            region: opt_str(config.region),
+            session_token: opt_str(config.session_token),
+            endpoint: opt_str(config.endpoint),
+            url_style: opt_str(config.url_style),
+            use_ssl: match config.use_ssl {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+        }
+    })
 }
 
 /// Borrows a nullable C string as `Some(&str)`, mapping null, empty, and
@@ -264,7 +297,7 @@ unsafe fn opt_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 ///
 /// `ptr`, if non-null, must point to a NUL-terminated C string valid for
 /// reads for the duration of this call.
-unsafe fn opt_borrow_str<'a>(
+pub(crate) unsafe fn opt_borrow_str<'a>(
     ptr: *const c_char,
     arg_name: &str,
 ) -> Result<Option<&'a str>, AbiError> {
@@ -277,7 +310,7 @@ unsafe fn opt_borrow_str<'a>(
 }
 
 /// The object store an attach path resolves to.
-enum StoreKind {
+pub(crate) enum StoreKind {
     /// A directory on the local filesystem, created if absent.
     LocalFile,
     /// A fresh, empty in-memory store.
@@ -289,7 +322,7 @@ enum StoreKind {
 impl StoreKind {
     /// Classifies an attach path by scheme, returning the store kind and the
     /// bucket-relative key prefix (empty for local and in-memory stores).
-    fn from_path(path: &str) -> Result<(Self, String), AbiError> {
+    pub(crate) fn from_path(path: &str) -> Result<(Self, String), AbiError> {
         if let Some(rest) = path.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
             if bucket.is_empty() {
@@ -320,7 +353,11 @@ impl StoreKind {
         Ok((Self::LocalFile, String::new()))
     }
 
-    fn open(&self, path: &str, s3: Option<&S3Creds>) -> Result<Arc<dyn ObjectStore>, AbiError> {
+    pub(crate) fn open(
+        &self,
+        path: &str,
+        s3: Option<&S3Creds>,
+    ) -> Result<Arc<dyn ObjectStore>, AbiError> {
         match self {
             Self::LocalFile => {
                 std::fs::create_dir_all(path).map_err(|e| {
@@ -562,6 +599,13 @@ fn resolve_data_store(
 /// already-initialized store, whose stored flag
 /// ([`moraine_catalog_encrypted`]) is authoritative.
 ///
+/// `checkpoint` pins a **read-only** attach to an existing SlateDB
+/// checkpoint (see [`moraine_create_checkpoint`]), so the open writes
+/// nothing at all — no manifest record of the reader, no refresh, no
+/// delete on close — and serves a fixed cut that never advances. Null or
+/// empty follows the latest manifest; a non-null value with `read_only`
+/// false is [`codes::INVALID_ARGUMENT`].
+///
 /// Returns [`codes::OK`] on success. On failure, `*out` is left
 /// unwritten and, if `err` is non-null, `*err` carries the code and a
 /// message.
@@ -570,9 +614,11 @@ fn resolve_data_store(
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null,
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
-/// valid NUL-terminated C strings. `out` must be a valid, writable
-/// `*mut *mut MoraineCatalogHandle`. `err`, if non-null, must be a valid,
-/// writable [`MoraineError`]. All for the duration of this call.
+/// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
+/// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+/// `out` must be a valid, writable `*mut *mut MoraineCatalogHandle`.
+/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All for
+/// the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_attach(
     path: *const c_char,
@@ -582,6 +628,7 @@ pub unsafe extern "C" fn moraine_attach(
     flush_interval_ms: u64,
     cache_dir: *const c_char,
     data_path: *const c_char,
+    checkpoint: *const c_char,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -597,31 +644,23 @@ pub unsafe extern "C" fn moraine_attach(
         // SAFETY: `cache_dir` validity is this function's own safety contract;
         // null (or empty) means "no on-disk cache".
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
+        // SAFETY: `checkpoint` validity is this function's own safety
+        // contract; null (or empty) means "follow the latest manifest".
+        let checkpoint = unsafe { opt_borrow_str(checkpoint, "checkpoint") }?;
+        // Refused here rather than left to the core: the core's message
+        // would name the option, and the caller needs to be told which
+        // half of the attach to change.
+        if checkpoint.is_some() && !read_only {
+            return Err(AbiError::invalid_argument(
+                "moraine_attach: a checkpoint pins a fixed past cut, so it applies to a \
+                 read-only attach only — add READ_ONLY, or drop the checkpoint",
+            ));
+        }
 
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
-        // SAFETY: `s3` validity is this function's own safety contract; null
-        // means "no secret — the environment supplies credentials".
-        let s3_config = unsafe { s3.as_ref() };
-        let s3_creds = s3_config.map(|c| {
-            // SAFETY: each string field of `*c` is null or a NUL-terminated C
-            // string valid for this call (the shim keeps them alive across it).
-            unsafe {
-                S3Creds {
-                    key_id: opt_str(c.key_id),
-                    secret: opt_str(c.secret),
-                    region: opt_str(c.region),
-                    session_token: opt_str(c.session_token),
-                    endpoint: opt_str(c.endpoint),
-                    url_style: opt_str(c.url_style),
-                    use_ssl: match c.use_ssl {
-                        0 => Some(false),
-                        1 => Some(true),
-                        _ => None,
-                    },
-                }
-            }
-        });
+        // SAFETY: `s3` validity is this function's own safety contract.
+        let s3_creds = unsafe { borrow_s3_creds(s3) };
 
         // Open the store first: it is synchronous and fallible, and a bad
         // path must not cost a runtime spun up just to be torn down.
@@ -666,6 +705,7 @@ pub unsafe extern "C" fn moraine_attach(
             ms => options.flush_interval = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        options.checkpoint = checkpoint.map(str::to_owned);
         // Persist the data root at bootstrap so a later attach reads it back
         // without being told it again.
         options.data_path.clone_from(&data_path_arg);
@@ -840,28 +880,8 @@ pub unsafe extern "C" fn moraine_migrate(
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
-        // SAFETY: `s3` validity is this function's own safety contract; null
-        // means "no secret — the environment supplies credentials".
-        let s3_config = unsafe { s3.as_ref() };
-        let s3_creds = s3_config.map(|c| {
-            // SAFETY: each string field of `*c` is null or a NUL-terminated C
-            // string valid for this call (the shim keeps them alive across it).
-            unsafe {
-                S3Creds {
-                    key_id: opt_str(c.key_id),
-                    secret: opt_str(c.secret),
-                    region: opt_str(c.region),
-                    session_token: opt_str(c.session_token),
-                    endpoint: opt_str(c.endpoint),
-                    url_style: opt_str(c.url_style),
-                    use_ssl: match c.use_ssl {
-                        0 => Some(false),
-                        1 => Some(true),
-                        _ => None,
-                    },
-                }
-            }
-        });
+        // SAFETY: `s3` validity is this function's own safety contract.
+        let s3_creds = unsafe { borrow_s3_creds(s3) };
 
         // Opened before the runtime for the same reason an attach does it: a
         // bad path must not cost a runtime spun up just to be torn down.
@@ -2961,6 +2981,7 @@ mod tests {
                 0,
                 ptr::null(),
                 c_bad.as_ptr(),
+                ptr::null(),
                 &raw mut bad_handle,
                 &raw mut bad_err,
             )
@@ -2993,6 +3014,7 @@ mod tests {
                 0,
                 ptr::null(),
                 c_good.as_ptr(),
+                ptr::null(),
                 &raw mut good_handle,
                 &raw mut good_err,
             )
@@ -3026,6 +3048,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 &raw mut handle,
@@ -3152,6 +3175,7 @@ mod tests {
                 0,
                 ptr::null(),
                 c_data.as_ptr(),
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3186,6 +3210,7 @@ mod tests {
                 0,
                 ptr::null(),
                 c_safe.as_ptr(),
+                ptr::null(),
                 &raw mut ok_handle,
                 &raw mut ok_err,
             )
@@ -3222,6 +3247,7 @@ mod tests {
                 0,
                 ptr::null(),
                 c_first.as_ptr(),
+                ptr::null(),
                 &raw mut first_handle,
                 &raw mut first_err,
             )
@@ -3250,6 +3276,7 @@ mod tests {
                 0,
                 ptr::null(),
                 c_other.as_ptr(),
+                ptr::null(),
                 &raw mut other_handle,
                 &raw mut other_err,
             )
@@ -3286,6 +3313,7 @@ mod tests {
                 true,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 &raw mut handle,
@@ -3329,6 +3357,7 @@ mod tests {
                 false,
                 true,
                 0,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 &raw mut handle,
@@ -3669,6 +3698,7 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3702,6 +3732,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 &raw mut handle,
@@ -3756,6 +3787,7 @@ mod tests {
                 false,
                 false,
                 0,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 &raw mut handle,

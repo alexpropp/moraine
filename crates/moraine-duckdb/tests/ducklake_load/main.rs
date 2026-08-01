@@ -25,6 +25,7 @@ mod helpers;
 
 mod attach;
 mod change_feed;
+mod checkpoints;
 mod commit_protocol;
 mod crash;
 mod ddl;

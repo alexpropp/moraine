@@ -57,31 +57,39 @@ shim reads, and DuckLake forwards it into the nested metadata attach.
 follow-latest reader writes a checkpoint into the manifest on open and
 refreshes it for the attach's lifetime, so reader credentials still need
 manifest write access. For strictly read-only credentials, see
-`CHECKPOINT_ID` below.
+`CHECKPOINT` below.
 
-**`CHECKPOINT_ID` — a truly-zero-write read-only attach.** Given the id of a
+**`CHECKPOINT` — a truly-zero-write read-only attach.** Given the id of a
 SlateDB checkpoint created ahead of time, moraine opens the reader against
 that checkpoint instead of establishing its own: no manifest CAS, no
 refresh, no delete on close — the attach issues object-store reads and
 nothing else.
 
 ```sql
--- With write credentials, once: mint a checkpoint and note its id.
-LOAD moraine;
-SELECT checkpoint_id FROM moraine_create_checkpoint('s3://bucket/prefix');
+-- On the writer, once: mint a checkpoint and note its id.
+SELECT checkpoint_id FROM moraine_create_checkpoint('lake');
 
 -- Thereafter, from a process holding only s3:GetObject/ListBucket:
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY,
-   META_CHECKPOINT_ID '4a1f…');
+   META_CHECKPOINT '4a1f…');
 ```
 
 The cost is that the attach reads a **fixed cut**: it never sees commits
 made after the checkpoint, because seeing them is exactly what the manifest
 poll it is forgoing would do. Refreshing means minting a new checkpoint and
-re-attaching. `CHECKPOINT_ID` requires `READ_ONLY` — a read-write attach
+re-attaching. `CHECKPOINT` requires `READ_ONLY` — a read-write attach
 naming one is refused — and a checkpoint the manifest no longer carries
 fails the attach rather than silently falling back to latest.
+
+`moraine_create_checkpoint` names an **attached catalog** rather than a
+store path, because the core mints through the writer that attach already
+opened and a second read-write open would fence it. The other two name a
+store path, and neither opens the writer, so both run against a live
+catalog: `moraine_checkpoints('<store>')` lists what the manifest carries
+— which is how a checkpoint whose id was lost is found, since one given no
+lifetime pins its objects until deleted — and
+`moraine_delete_checkpoint('<store>', '<id>')` releases one.
 
 **Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
 attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
