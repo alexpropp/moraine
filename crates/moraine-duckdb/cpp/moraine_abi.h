@@ -85,6 +85,12 @@ typedef struct MoraineS3Config {
   int32_t use_ssl;
 } MoraineS3Config;
 
+// A C-side cancellation probe polled while a cancellable call's core
+// future is pending; returning `true` cancels the call. `None` disables
+// the pull channel for that call. Mirrors `MoraineInterruptProbe` in
+// `cpp/moraine_abi.h`.
+typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
+
 // The `(code, message)` pair carried across the FFI boundary.
 //
 // Caller-allocated and passed by pointer to every fallible `moraine_*`
@@ -99,12 +105,6 @@ typedef struct MoraineError {
   // A UTF-8, NUL-terminated, heap-allocated message, or null.
   char *message;
 } MoraineError;
-
-// A C-side cancellation probe polled while a cancellable call's core
-// future is pending; returning `true` cancels the call. `None` disables
-// the pull channel for that call. Mirrors `MoraineInterruptProbe` in
-// `cpp/moraine_abi.h`.
-typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
 
 // What one [`moraine_migrate`] call did.
 typedef struct MoraineMigrationReport {
@@ -895,6 +895,20 @@ extern "C" {
 // empty follows the latest manifest; a non-null value with `read_only`
 // false is [`codes::INVALID_ARGUMENT`].
 //
+// Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
+// are: the store open is the one long blocking call an attach makes, and
+// against an unreachable endpoint it is the one worth escaping. A
+// cancelled attach returns [`codes::INTERRUPTED`], writes no handle, and
+// leaves nothing attached. It may still have fenced a writer that was
+// attached before it — an attach takes the writer epoch before it can
+// know whether it will finish — so the previously attached process must
+// re-attach either way, exactly as after any failed attach.
+//
+// [`moraine_detach`] takes no probe and never will: it is teardown, and
+// an interrupt part-way through would either leak the handle or leave
+// the store half-closed. Cancellation exists to escape a wait, and
+// detach's wait is the flush that makes committed data durable.
+//
 // Returns [`codes::OK`] on success. On failure, `*out` is left
 // unwritten and, if `err` is non-null, `*err` carries the code and a
 // message.
@@ -905,9 +919,10 @@ extern "C" {
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-// `out` must be a valid, writable `*mut *mut MoraineCatalogHandle`.
-// `err`, if non-null, must be a valid, writable [`MoraineError`]. All for
-// the duration of this call.
+// `probe`, if non-null, must be safe to call with `probe_ctx` from any
+// thread. `out` must be a valid, writable `*mut *mut
+// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
+// [`MoraineError`]. All for the duration of this call.
 int32_t moraine_attach(const char *path,
                        const struct MoraineS3Config *s3,
                        bool read_only,
@@ -916,6 +931,8 @@ int32_t moraine_attach(const char *path,
                        const char *cache_dir,
                        const char *data_path,
                        const char *checkpoint,
+                       MoraineInterruptProbe probe,
+                       void *probe_ctx,
                        struct MoraineCatalogHandle **out,
                        struct MoraineError *err);
 

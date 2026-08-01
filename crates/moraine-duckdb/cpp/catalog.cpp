@@ -759,7 +759,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
 	                           data_path.empty() ? nullptr : data_path.c_str(),
-	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), &handle, &err);
+	                           checkpoint.empty() ? nullptr : checkpoint.c_str(),
+	                           moraine_shim_is_interrupted, &context, &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.

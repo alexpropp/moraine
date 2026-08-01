@@ -30,7 +30,10 @@ use tracing::warn;
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
-    runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle, new_runtime},
+    runtime::{
+        CANCELLED_ATTACH_SHUTDOWN, MoraineCatalogHandle, MoraineInterruptProbe,
+        MoraineSnapshotHandle, block_on_cancellable_in, new_runtime,
+    },
 };
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
@@ -584,6 +587,20 @@ fn resolve_data_store(
     }
 }
 
+/// Winds down the runtime of an attach that will not produce a handle,
+/// and returns the error that ended it.
+///
+/// A cancelled open leaves a half-built store behind whose background
+/// tasks may be mid-request. Dropping the runtime would block until every
+/// one of them finished — turning a cancellation into the hang it was
+/// meant to escape — so it is shut down with a deadline instead, after
+/// which the stragglers are abandoned. Nothing was committed through this
+/// runtime, so abandoning them loses no durable state.
+fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError {
+    runtime.shutdown_timeout(CANCELLED_ATTACH_SHUTDOWN);
+    error
+}
+
 /// Attaches a moraine catalog: creates the runtime this handle owns for
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.
@@ -606,6 +623,20 @@ fn resolve_data_store(
 /// empty follows the latest manifest; a non-null value with `read_only`
 /// false is [`codes::INVALID_ARGUMENT`].
 ///
+/// Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
+/// are: the store open is the one long blocking call an attach makes, and
+/// against an unreachable endpoint it is the one worth escaping. A
+/// cancelled attach returns [`codes::INTERRUPTED`], writes no handle, and
+/// leaves nothing attached. It may still have fenced a writer that was
+/// attached before it — an attach takes the writer epoch before it can
+/// know whether it will finish — so the previously attached process must
+/// re-attach either way, exactly as after any failed attach.
+///
+/// [`moraine_detach`] takes no probe and never will: it is teardown, and
+/// an interrupt part-way through would either leak the handle or leave
+/// the store half-closed. Cancellation exists to escape a wait, and
+/// detach's wait is the flush that makes committed data durable.
+///
 /// Returns [`codes::OK`] on success. On failure, `*out` is left
 /// unwritten and, if `err` is non-null, `*err` carries the code and a
 /// message.
@@ -616,9 +647,10 @@ fn resolve_data_store(
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
 /// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 /// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-/// `out` must be a valid, writable `*mut *mut MoraineCatalogHandle`.
-/// `err`, if non-null, must be a valid, writable [`MoraineError`]. All for
-/// the duration of this call.
+/// `probe`, if non-null, must be safe to call with `probe_ctx` from any
+/// thread. `out` must be a valid, writable `*mut *mut
+/// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
+/// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_attach(
     path: *const c_char,
@@ -629,6 +661,8 @@ pub unsafe extern "C" fn moraine_attach(
     cache_dir: *const c_char,
     data_path: *const c_char,
     checkpoint: *const c_char,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -709,17 +743,38 @@ pub unsafe extern "C" fn moraine_attach(
         // Persist the data root at bootstrap so a later attach reads it back
         // without being told it again.
         options.data_path.clone_from(&data_path_arg);
-        let catalog = if read_only {
-            // A read-only attach never bootstraps; on a fresh store the open
-            // fails, so surface the reason (DuckDB defaults remote attaches to
-            // read-only) and the fix (add READ_WRITE).
-            runtime
-                .block_on(moraine::Catalog::open_read_only(object_store, options))
-                .map_err(|e| AbiError::from(e).with_read_only_attach_hint())?
-        } else {
-            runtime
-                .block_on(moraine::Catalog::open(object_store, options))
-                .map_err(AbiError::from)?
+        // Cancellable: opening a store is the one long blocking call an
+        // attach makes, and against an unreachable S3 endpoint it is the
+        // one a user is most likely to want out of. A cancelled open
+        // abandons a half-built store, so the runtime is wound down with a
+        // deadline rather than dropped — see `cancel_attach`.
+        //
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let opened = unsafe {
+            if read_only {
+                block_on_cancellable_in(
+                    &runtime,
+                    probe,
+                    probe_ctx,
+                    moraine::Catalog::open_read_only(object_store, options),
+                )
+                // A read-only attach never bootstraps; on a fresh store the
+                // open fails, so surface the reason (DuckDB defaults remote
+                // attaches to read-only) and the fix (add READ_WRITE).
+                .map_err(AbiError::with_read_only_attach_hint)
+            } else {
+                block_on_cancellable_in(
+                    &runtime,
+                    probe,
+                    probe_ctx,
+                    moraine::Catalog::open(object_store, options),
+                )
+            }
+        };
+        let catalog = match opened {
+            Ok(catalog) => catalog,
+            Err(error) => return Err(cancel_attach(runtime, error)),
         };
 
         // Resolve the DATA_PATH object store index maintenance and backfill
@@ -2982,6 +3037,8 @@ mod tests {
                 ptr::null(),
                 c_bad.as_ptr(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut bad_handle,
                 &raw mut bad_err,
             )
@@ -3015,6 +3072,8 @@ mod tests {
                 ptr::null(),
                 c_good.as_ptr(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut good_handle,
                 &raw mut good_err,
             )
@@ -3051,6 +3110,8 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3176,6 +3237,8 @@ mod tests {
                 ptr::null(),
                 c_data.as_ptr(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3211,6 +3274,8 @@ mod tests {
                 ptr::null(),
                 c_safe.as_ptr(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut ok_handle,
                 &raw mut ok_err,
             )
@@ -3248,6 +3313,8 @@ mod tests {
                 ptr::null(),
                 c_first.as_ptr(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut first_handle,
                 &raw mut first_err,
             )
@@ -3277,6 +3344,8 @@ mod tests {
                 ptr::null(),
                 c_other.as_ptr(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut other_handle,
                 &raw mut other_err,
             )
@@ -3316,6 +3385,8 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3360,6 +3431,8 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3699,6 +3772,8 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3735,6 +3810,8 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3790,6 +3867,8 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -4001,6 +4080,119 @@ mod tests {
             moraine_snapshot_free(snap2);
             moraine_detach(handle);
         }
+    }
+
+    /// Cancellation is per call, not per handle: two reads in flight on
+    /// one handle carry their own probes, and interrupting one leaves the
+    /// other to finish.
+    ///
+    /// This is the shape a real session takes — DuckDB's probe is a load
+    /// of `ClientContext::interrupted`, one context per connection, and
+    /// several connections share one attached catalog. A design routing
+    /// cancellation through a single per-handle signal would let one
+    /// connection's Ctrl-C abort another's query, or be consumed by it.
+    #[test]
+    fn concurrent_reads_on_one_handle_cancel_independently() {
+        let dir = TempDir::new("probe-concurrent");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+        let handle_address = handle as usize;
+
+        // The interrupted read never resolves on its own, so only its own
+        // probe can end it; the survivor waits for that to happen before
+        // resolving, so the two genuinely overlap.
+        let cancelled_first = Arc::new(std::sync::Barrier::new(2));
+        let waiter = Arc::clone(&cancelled_first);
+
+        let interrupted = std::thread::spawn(move || {
+            let handle = handle_address as *mut MoraineCatalogHandle;
+            // SAFETY: the handle outlives both threads — it is detached
+            // only after they are joined.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe_always` accepts a null context.
+            let result: Result<(), AbiError> = unsafe {
+                handle_ref.block_on_cancellable(
+                    Some(probe_always),
+                    ptr::null_mut(),
+                    std::future::pending::<Result<(), moraine::Error>>(),
+                )
+            };
+            cancelled_first.wait();
+            result
+        });
+
+        let survivor = std::thread::spawn(move || {
+            let handle = handle_address as *mut MoraineCatalogHandle;
+            // SAFETY: as above.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe_never` accepts a null context.
+            unsafe {
+                handle_ref.block_on_cancellable(Some(probe_never), ptr::null_mut(), async move {
+                    waiter.wait();
+                    Ok::<_, moraine::Error>(7u32)
+                })
+            }
+        });
+
+        assert_eq!(
+            interrupted
+                .join()
+                .expect("interrupted read")
+                .unwrap_err()
+                .code,
+            codes::INTERRUPTED
+        );
+        assert_eq!(
+            survivor.join().expect("surviving read").unwrap(),
+            7,
+            "one read's interrupt must not cancel or be consumed by another's"
+        );
+
+        // SAFETY: both threads are joined; freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// An attach whose probe is already firing is cancelled before the
+    /// store is opened: no handle, the interrupted code, and — the part
+    /// that matters — the call returns rather than winding down a runtime
+    /// with a half-built store still on it.
+    #[test]
+    fn attach_is_cancelled_by_a_firing_probe() {
+        let dir = TempDir::new("probe-attach");
+        seed(dir.path());
+
+        let c_path = dir.c_path();
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `c_path` is a valid C string, the out-params are local
+        // slots, and `probe_always` accepts a null context.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert_eq!(err.code, codes::INTERRUPTED);
+        assert!(handle.is_null(), "a cancelled attach writes no handle");
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        // The store is untouched by the cancellation: a plain attach still
+        // works, so nothing was left half-initialized.
+        let handle = attach_ok(dir.path());
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
     }
 
     /// A lookup value coerces to the same canonical `IndexKeyValue` the

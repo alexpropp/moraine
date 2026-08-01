@@ -84,45 +84,77 @@ impl MoraineCatalogHandle {
     where
         AbiError: From<E>,
     {
-        // Checked before the future is first polled, not left to the
-        // interval below: a timer's first tick is pending at the poll
-        // level even when already elapsed, and a future that completes on
-        // its first poll would otherwise win over a pending interrupt.
-        if let Some(probe) = probe {
-            // SAFETY: caller contract — `probe` is callable with
-            // `probe_ctx` for the duration of this call.
-            if unsafe { probe(probe_ctx) } {
-                return Err(AbiError::interrupted());
-            }
-        }
-
         let _guard = enter_handle(self.log_id);
-        self.runtime.block_on(async {
-            let probe_fired = async {
-                let Some(probe) = probe else {
-                    return std::future::pending::<()>().await;
-                };
-                let mut ticks = tokio::time::interval(INTERRUPT_POLL_INTERVAL);
-                loop {
-                    ticks.tick().await;
-                    // SAFETY: caller contract — `probe` is callable with
-                    // `probe_ctx` for the duration of this call.
-                    if unsafe { probe(probe_ctx) } {
-                        return;
-                    }
-                }
-            };
-
-            // `biased`: a cancellation signal wins whenever ready, even if
-            // the core future is also immediately ready.
-            tokio::select! {
-                biased;
-                () = probe_fired => Err(AbiError::interrupted()),
-                result = future => result.map_err(AbiError::from),
-            }
-        })
+        // SAFETY: forwarded caller contract.
+        unsafe { block_on_cancellable_in(&self.runtime, probe, probe_ctx, future) }
     }
 }
+
+/// Runs `future` on `runtime` unless `probe` cancels it first — the whole
+/// of the cancellation seam, shared by every cancellable entry point.
+///
+/// Cancellation is per **call**, not per handle: the probe and its context
+/// come from the caller, and each in-flight call selects over its own. Two
+/// concurrent reads on one handle therefore cancel independently, and
+/// neither can consume the other's signal.
+///
+/// # Safety
+///
+/// `probe`, if `Some`, must be safe to call with `probe_ctx` from any
+/// thread for the duration of this call.
+pub(crate) unsafe fn block_on_cancellable_in<T, E>(
+    runtime: &Runtime,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, AbiError>
+where
+    AbiError: From<E>,
+{
+    // Checked before the future is first polled, not left to the interval
+    // below: a timer's first tick is pending at the poll level even when
+    // already elapsed, and a future that completes on its first poll would
+    // otherwise win over a pending interrupt.
+    if let Some(probe) = probe {
+        // SAFETY: caller contract — `probe` is callable with `probe_ctx`
+        // for the duration of this call.
+        if unsafe { probe(probe_ctx) } {
+            return Err(AbiError::interrupted());
+        }
+    }
+
+    runtime.block_on(async {
+        let probe_fired = async {
+            let Some(probe) = probe else {
+                return std::future::pending::<()>().await;
+            };
+            let mut ticks = tokio::time::interval(INTERRUPT_POLL_INTERVAL);
+            loop {
+                ticks.tick().await;
+                // SAFETY: caller contract — `probe` is callable with
+                // `probe_ctx` for the duration of this call.
+                if unsafe { probe(probe_ctx) } {
+                    return;
+                }
+            }
+        };
+
+        // `biased`: a cancellation signal wins whenever ready, even if
+        // the core future is also immediately ready.
+        tokio::select! {
+            biased;
+            () = probe_fired => Err(AbiError::interrupted()),
+            result = future => result.map_err(AbiError::from),
+        }
+    })
+}
+
+/// How long a cancelled attach waits for its abandoned runtime to wind
+/// down before abandoning it in turn. An interrupted open drops a
+/// half-built store whose background tasks may still be mid-request, and
+/// a plain runtime drop blocks until every one of them finishes — turning
+/// a cancellation into exactly the hang it was meant to escape.
+pub(crate) const CANCELLED_ATTACH_SHUTDOWN: Duration = Duration::from_secs(5);
 
 /// A materialized snapshot view, held across the FFI boundary so
 /// listing calls need no further store I/O.
