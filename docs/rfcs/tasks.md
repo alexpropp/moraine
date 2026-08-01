@@ -100,40 +100,25 @@ key.
   read, so it can only ever lead a batch, never fold onto a member. Worth
   building when DuckLake's serialized metadata connection admits concurrent
   committers — until then there is nothing to batch it with.
-- **MEASURE** — Commit throughput under concurrency, now that concurrent
-  commits coalesce: how many commits one flush carries as concurrency
-  rises, and where the batch's member ceiling starts to bind.
-  `BENCHMARK.md` records only the sequential number. Settles the
-  retry-budget DECISION below too, since coalescing is what a benign race
-  now mostly avoids.
-- **IMPL** — A zero-write reader mode that opens `DbReader` against an
-  explicit existing checkpoint id instead of following latest, which CASes the
-  manifest and pins SSTs against SlateDB GC. Shared with 0006.
-- **DECISION** — The benign-race retry attempt count and backoff. DuckLake's
-  10 retries / 100 ms base / 1.5× jittered backoff is the strawman; confirm
-  once e2e shows realistic contention shapes.
 - **DEFERRED** — File-grain (`data_file_id`) delete-delete conflict detection,
   matching DuckLake's finer granularity. Table grain today.
-- **VALIDATE** — Regression-pin DuckLake's `RunCommitLoop` /
-  `CheckForConflicts` retry behavior against the tracked version, including
-  the error-text substring contract and the mid-retry
-  `ducklake_snapshot_changes` queries moraine must serve.
-- **VALIDATE** — Confirm row-id allocation matches DuckLake's
-  `next_row_id += record_count` exactly, including preservation under UPDATE
-  and compaction.
-- **VALIDATE** — Regression-pin DuckLake's conflict matrix for concurrent
-  same-table appends (inserts against drops, alters, deletes, and
-  compatibility with flushes and compactions).
-- **VALIDATE** — Regression-pin the schema-mutating classification boundary
-  cases: comments and tags bump, column and name-mapping registration does
-  not, `set_option` neither bumps nor mints a snapshot.
-- **MEASURE** — Commit latency against a *real* object store. In-memory is
-  settled (`BENCHMARK.md` → Core measurements: `flush_interval + ~2 ms`); what
-  remains is the S3 write-RTT term that localhost MinIO understates, giving
-  `max(flush cadence, write RTT) + ~2 ms`.
-- **DOC** — The single-read-write-process, many-readers limitation belongs in
-  the root README. It currently appears only in `ARCHITECTURE.md`. Shared with
-  0006.
+- **IMPL** — Translate DuckLake's `ducklake_metadata` write on the staged-row
+  path, so `CALL <lake>.set_option(…)` works through the extension as it does
+  through the verb path. moraine serves that table read-only today and the
+  write is refused. Shared with 0006.
+- **MEASURE** — Commit latency against a *real* S3, not a loopback one. The
+  composition is settled and measured both ways (`BENCHMARK.md` → Core
+  measurements: `max(flush cadence, write RTT) + ~2 ms`, confirmed by an
+  injected-RTT sweep and validated against MinIO), so what remains is only
+  the absolute S3 PUT term the harness needs a real bucket to see:
+  point `object_storage.rs` at one and record the row.
+- **VALIDATE** — Drive DuckLake's `RunCommitLoop` / `CheckForConflicts`
+  against a *lost* race, which needs a harness with two DuckDB connections on
+  one instance (the CLI has one, and a second process fences rather than
+  races). The observable halves are pinned — its retry budget, the
+  `ducklake_snapshot_changes` reads it issues between attempts, and the
+  `changes_made` grammar it re-parses — but the loop itself has never run
+  against moraine.
 
 ## 0005 — Data inlining on SlateDB
 
@@ -148,9 +133,15 @@ key.
 - **IMPL** — A per-DuckDB-version build-and-signing distribution pipeline. The
   loadable's signature region is left zero, the release workflow publishes
   unsigned, and every e2e harness passes `-unsigned`.
-- **IMPL** — A truly-zero-write attach option opening against a pre-created
-  SlateDB checkpoint id, for deployments with strictly read-only credentials.
-  Shared with 0004.
+- **IMPL** — Expose the zero-write checkpoint reader as an attach option. The
+  core half is built (`CatalogOptions::checkpoint` opens a `DbReader` against
+  an existing checkpoint, writing nothing; `Catalog::create_checkpoint` mints
+  one), so what remains is carrying an id from `ATTACH` through the shim into
+  the read-only open. Shared with 0004 and 0017.
+- **IMPL** — Translate `INSERT INTO ducklake_metadata` on the staged-row path,
+  so DuckLake's `set_option` reaches moraine's option records instead of being
+  refused. The verb path already has `set_option`/`unset_option`; the table is
+  served read-only. Shared with 0004.
 - **DECISION** — Should scan results cross the C ABI as Arrow (the Arrow C Data
   Interface) rather than the current owned `#[repr(C)]` row-struct arrays?
 - **DECISION** — The DuckDB and DuckLake pin bump policy: does moraine track
@@ -186,8 +177,8 @@ key.
 - **VALIDATE** — Verify the id-collision backstop (a typed `Constraint` error
   on inserting an id already live) covers all five primary-keyed kinds, and
   that no name-uniqueness is enforced anywhere.
-- **DOC** — The single-writer and `READ_ONLY` fencing limitation belongs at the
-  user surface: the ATTACH docs and the root README. Shared with 0004.
+- **DOC** — The single-writer and `READ_ONLY` fencing limitation belongs in the
+  ATTACH docs. The root README now carries it. Shared with 0004.
 
 ## 0007 — Snapshot expiry and garbage collection
 

@@ -109,10 +109,20 @@ One source-verified caveat keeps "read-only" from being oversimplified:
 reader's lifetime. So a reader does not fence and does not write data,
 but it *does* need write access to the manifest object and generates
 manifest traffic, and its checkpoint pins SSTs against SlateDB's own GC
-for the checkpoint lifetime. Deployments that want truly zero-write
-readers configure `DbReader` against an existing checkpoint id instead;
-the default "follow latest" mode trades a small manifest write for
-consistent WAL-inclusive reads.
+for the checkpoint lifetime. The default "follow latest" mode trades that
+small manifest write for consistent WAL-inclusive reads.
+
+Deployments whose reader credentials cannot write at all open against an
+existing checkpoint instead. A checkpoint id given at open selects a
+`DbReader` that resolves a fixed cut: it neither creates a checkpoint, nor
+replays WALs, nor polls the manifest, so the open and everything after it
+write nothing whatsoever — verified by opening one against a store that
+refuses every write and reading through it. The cost is the other half of
+the trade: a pinned reader never sees a commit made after its checkpoint,
+however long it stays open. Checkpoints are minted by the writer (which
+alone can write the manifest) and released explicitly or by their
+lifetime, since one that is neither pins the objects it references against
+SlateDB's garbage collection for as long as it exists.
 
 Be precise about what fencing does, because its direction is the opposite
 of a lock: SlateDB's `writer_epoch` means **the newest writer wins**. A
@@ -264,6 +274,23 @@ When the head conflict fires, the committer compares the set of
   budget spans a few hundred milliseconds. A commit that lands on its
   first attempt never waits, so the backoff costs the uncontended path
   nothing.
+
+  **The budget is deliberately not DuckLake's**, whose own loop waits
+  100 ms × 1.5ᵏ over 10 attempts. Two reasons, both consequences of what
+  moraine's races actually are. First, a benign race here clears in one
+  WAL flush — the shape group commit made visible, where concurrent
+  commits inside the process meet in a batch rather than racing at all,
+  leaving only a staged-path commit colliding with a verb-path batch. A
+  budget of ten attempts capped at 50 ms spans several flush intervals at
+  the 100 ms default, which is several times more than the collision it
+  waits out. Second, the two budgets **compose**: DuckLake re-drives a
+  retryable moraine error up to ten times, so moraine's own waits are
+  multiplied by ten before an application sees anything. At DuckLake's
+  cadence that product is tens of seconds of invisible waiting; at
+  moraine's it is a few seconds worst case, and typically one retry that
+  waits 2 ms. Ten attempts is kept: losing ten consecutive races requires
+  a pathology the topology does not otherwise admit, and past that
+  `RetryBudgetExhausted` is the honest answer.
 - **Overlapping table set → true conflict** (subject to the append-append
   refinement below). A concurrent commit mutated a table this commit also
   mutated. The premise may be invalid (the table was dropped, a column
@@ -456,7 +483,13 @@ data (RFC 0003 verb names):
   `ducklake_metadata` within the transaction's metadata connection — it
   mints no snapshot, bumps no `schema_version`, and is not recorded in
   `snapshot_changes` (so it is invisible to conflict detection; options
-  are last-write-wins).
+  are last-write-wins). The verb path implements exactly that. The
+  staged-row path does not yet: moraine serves `ducklake_metadata`
+  read-only, so DuckLake's write is refused rather than applied, and
+  `CALL <lake>.set_option(…)` fails. The classification above is
+  unaffected either way — a refused option write mints no snapshot — but
+  the surface is a gap, tracked against RFC 0006's staged-row
+  translation.
 
 This classification is source-verified against DuckLake
 (`DuckLakeTransactionState::SchemaChangesMade`, which tests exactly the
@@ -573,6 +606,14 @@ unreachable rather than unlikely. Step 4 then runs once.
 A batch batches commits; it does not merge them. Each member mints its own
 snapshot, which time travel resolves separately. What batching changes is
 durability granularity, not catalog shape.
+
+Measured, the coalescing is exact: a batch carries as many commits as there
+are concurrent committers, so throughput is `concurrency / flush_interval`
+with no overhead visible at any level, up to the member ceiling — where 128
+concurrent commits land as two full batches at the same rate 64 do
+(`BENCHMARK.md`, "Commit throughput vs. concurrency"). The ceiling, not the
+flush cadence, is what binds first under saturation, and it is the lever if
+a workload ever needs past it.
 
 The batch is the unit of failure. A member that fails discards the batch,
 and its other members re-run; a lost race re-runs every member, conflicting
@@ -693,6 +734,25 @@ SlateDB on in-memory `object_store` — no mocks of the store:
 - Fresh-reader visibility: after `commit` returns, a newly opened reader
   resolves the new snapshot (the store-harness validation above, run
   against real SlateDB on in-memory `object_store`).
+- Checkpoint readers: a reader pinned to a checkpoint serves the state at
+  it and never a later commit; it opens, reads, and closes against a store
+  that refuses every write, attempting none, where a latest-following
+  reader on the same store writes; a writer refuses a checkpoint, a
+  read-only catalog refuses to mint one, and a malformed, unknown, or
+  deleted id is refused rather than silently followed.
+- DuckLake-facing pins, differential against a stock DuckLake catalog fed
+  the identical statements: row ids allocate as `next_row_id +=
+  record_count` per table, stay dense, survive an UPDATE of other rows,
+  and never contend across tables; `schema_version` bumps for column DDL
+  and for comments and tags, and is carried forward by inserts (file and
+  inlined) and by name-mapping registration; and DuckLake's retry budget
+  (`ducklake_max_retry_count` 10, `ducklake_retry_wait_ms` 100,
+  `ducklake_retry_backoff` 1.5) is what the composed budget above assumes.
+  A genuine concurrent DuckLake race is unreachable from one CLI session
+  (one serialized metadata connection; a second read-write attach fences),
+  so what a retry *would* read mid-flight is pinned instead: the
+  `ducklake_snapshot_changes` rows above a snapshot id, and the exact
+  `changes_made` entries moraine authors on the verb path.
 - Group commit: a group costs fewer object-store writes than the same
   members committed separately; every member mints its own consecutive
   snapshot and time travel resolves each one to that member's state; a
