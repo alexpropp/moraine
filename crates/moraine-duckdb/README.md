@@ -466,7 +466,18 @@ inserts; `cpp/inline_tables.cpp` recognizes two dynamic name families —
 `begin_snapshot`) — and routes `CREATE`/`INSERT`/`UPDATE`/`DELETE`/
 `SELECT` against them into the `inline/*` keyspace over the same
 staged-row commit path the fixed tables ride, instead of materializing
-real tables. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
+real tables.
+
+One property of the delete family is worth stating because it is easy to
+get wrong: it exists from the table's first inlined deletion until the
+table is dropped, and **emptying it does not remove it**.
+`ducklake_flush_inlined_data` writes those deletions out as a real delete
+file and then clears the table with an unqualified `DELETE`; DuckLake
+caches the table's existence for the life of the catalog and never
+re-probes, so anything it runs afterwards in the same session still binds
+against it. Existence is therefore recorded in the store
+(`inline/file_delete_table`) rather than derived from whether any
+deletion is currently held. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
 (as implemented)" for the exact operation → keyspace mapping.
 
 Chunk bodies (`inline/schema`, `inline/insert`) are Arrow IPC. DuckDB's C++

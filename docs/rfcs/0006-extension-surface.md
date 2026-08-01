@@ -753,12 +753,19 @@ the one place moraine's catalog lookup does more than serve the fixed
   reports "does not exist" before the first `CREATE`, and the same
   connection's own `LookupInlineTableEntry` accepts the `CREATE` that
   follows).
-- `ducklake_inlined_delete_<table_id>` — recognized once at least one
-  `inline/file_delete` has been staged for `table_id` (DuckLake probes this
-  table's existence with `SELECT NULL FROM ... LIMIT 1` and treats a
-  bind error as "does not exist"; unlike the data family this one must
-  report missing for a real table_id until its first inlined
-  file-delete, or DuckLake's own existence discipline breaks).
+- `ducklake_inlined_delete_<table_id>` — recognized from the table's
+  first inlined file-delete until the table is dropped. DuckLake probes
+  this table's existence with `SELECT NULL FROM ... LIMIT 1` and treats a
+  bind error as "does not exist", so unlike the data family this one must
+  report missing for a real table_id until that first file-delete, or
+  DuckLake's own existence discipline breaks. It must equally keep
+  existing once emptied: `ducklake_flush_inlined_data` writes the table's
+  deletions out as a real delete file and clears it with an unqualified
+  `DELETE`, and DuckLake caches the table's existence for the life of the
+  catalog rather than re-probing — so an existence derived from whether
+  any deletion is currently held vanishes under it mid-session and every
+  later bind fails. Existence is recorded in the store (RFC 0005's
+  `inline/file_delete_table` marker) for exactly that reason.
 
 Both route through the same staged-row commit path (`cpp/inline_tables.
 cpp`) as the fixed `ducklake_*` tables, translating into `inline/*`

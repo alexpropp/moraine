@@ -1313,6 +1313,187 @@ async fn inline_file_delete_against_per_row_id_target_removes_the_row() {
     );
 }
 
+/// Removing an inlined file-delete drops exactly the named records and
+/// leaves the rest, so a filtered `DELETE` against
+/// `ducklake_inlined_delete_<t>` removes what it matched.
+///
+/// This is the flush's clean-up step: once an inlined deletion has been
+/// materialized into a real delete file, the inlined form has to go, or
+/// the row is counted deleted twice.
+#[tokio::test]
+async fn removing_inlined_file_deletes_drops_only_the_named_records() {
+    let catalog = open().await;
+    let stage = |snapshot_id: u64, ops: Vec<RowOperation>| {
+        let catalog = &catalog;
+        async move {
+            let db_tx = catalog.begin_write_tx().await?;
+            let mut tx = StagedTransaction::begin_detached(db_tx);
+            for op in ops {
+                tx.stage(op);
+            }
+            tx.stage(RowOperation::Insert {
+                table: TableKind::Snapshot,
+                cells: snapshot_row(snapshot_id, 1, 2),
+            });
+            tx.stage(RowOperation::Insert {
+                table: TableKind::SnapshotChanges,
+                cells: snapshot_changes_row(snapshot_id, "inlined_delete:1"),
+            });
+            tx.commit().await.map(|_| ())
+        }
+    };
+
+    stage(
+        1,
+        (0..3)
+            .map(|row_id| RowOperation::InlineFileDelete {
+                table_id: 1,
+                data_file_id: 7,
+                row_id,
+                begin_snapshot: 1,
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    let live = |catalog: &Catalog| {
+        let catalog = catalog.clone();
+        async move {
+            crate::ffi_support::inline::inline_file_deletes(&catalog, 1)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(live(&catalog).await.len(), 3);
+
+    stage(
+        2,
+        vec![RowOperation::InlineFileDeleteRemove {
+            table_id: 1,
+            data_file_id: 7,
+            row_id: 1,
+        }],
+    )
+    .await
+    .unwrap();
+    let remaining: Vec<u64> = live(&catalog)
+        .await
+        .into_iter()
+        .map(|(_, row_id, _)| row_id)
+        .collect();
+    assert_eq!(remaining, vec![0, 2], "only the named record is removed");
+
+    // Removing what is no longer there is drift, not a no-op: a raw key
+    // delete would pass silently, so the miss is refused.
+    let err = stage(
+        3,
+        vec![RowOperation::InlineFileDeleteRemove {
+            table_id: 1,
+            data_file_id: 7,
+            row_id: 1,
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Corruption(detail) if detail.contains("no live inlined file-delete")),
+        "{err:?}"
+    );
+
+    // The failed commit staged nothing.
+    assert_eq!(live(&catalog).await.len(), 2);
+    catalog.close().await.unwrap();
+}
+
+/// `ducklake_inlined_delete_<t>` exists from its first inlined deletion
+/// until the table is dropped — including after a flush has cleared every
+/// deletion it held.
+///
+/// The "including" is the whole point. DuckLake caches the table's
+/// existence for the life of the catalog and never re-probes, so an
+/// existence derived from whether any deletion is currently recorded
+/// vanishes under it the moment a flush empties the table, and every
+/// later query in that session fails to bind. An emptied SQL table still
+/// exists; so does this one.
+#[tokio::test]
+async fn the_inlined_deletion_table_exists_from_its_first_deletion_until_the_drop() {
+    let catalog = open().await;
+    let exists = |catalog: &Catalog| {
+        let catalog = catalog.clone();
+        async move {
+            crate::ffi_support::inline::inline_file_delete_table_exists(&catalog, 1)
+                .await
+                .unwrap()
+        }
+    };
+    let stage = |snapshot_id: u64, op: RowOperation| {
+        let catalog = &catalog;
+        async move {
+            let db_tx = catalog.begin_write_tx().await?;
+            let mut tx = StagedTransaction::begin_detached(db_tx);
+            tx.stage(op);
+            tx.stage(RowOperation::Insert {
+                table: TableKind::Snapshot,
+                cells: snapshot_row(snapshot_id, 1, 2),
+            });
+            tx.stage(RowOperation::Insert {
+                table: TableKind::SnapshotChanges,
+                cells: snapshot_changes_row(snapshot_id, "inlined_delete:1"),
+            });
+            tx.commit().await.map(|_| ())
+        }
+    };
+
+    assert!(
+        !exists(&catalog).await,
+        "a table with no inlined deletion has no such table to bind"
+    );
+
+    stage(
+        1,
+        RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 7,
+            row_id: 3,
+            begin_snapshot: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(exists(&catalog).await);
+
+    stage(
+        2,
+        RowOperation::InlineFileDeleteRemove {
+            table_id: 1,
+            data_file_id: 7,
+            row_id: 3,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        crate::ffi_support::inline::inline_file_deletes(&catalog, 1)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the flush cleared every deletion"
+    );
+    assert!(
+        exists(&catalog).await,
+        "an emptied inlined-deletion table still exists"
+    );
+
+    stage(3, RowOperation::InlineDrop { table_id: 1 })
+        .await
+        .unwrap();
+    assert!(
+        !exists(&catalog).await,
+        "dropping the table takes its inlined-deletion table with it"
+    );
+    catalog.close().await.unwrap();
+}
+
 /// Backfill over a table holding a per-row-id file derives its entries
 /// under the embedded ids.
 #[tokio::test]

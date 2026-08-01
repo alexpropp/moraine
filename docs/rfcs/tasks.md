@@ -117,15 +117,6 @@ key.
 
 ## 0006 — Extension surface (DuckDB)
 
-- **IMPL** — Translate `DELETE FROM ducklake_inlined_delete_<table_id>`. The
-  dynamic inline-delete family serves `SELECT` and `INSERT`, so
-  `ducklake_flush_inlined_data` fails with `NotImplementedException` the
-  moment a table has inlined file-deletions to flush — reproducible with a
-  hundred-row insert (past the inlining limit, so a real data file lands), one
-  `DELETE`, then a flush. Found by the access-set validation, which is where
-  DuckLake's own `DELETE FROM {METADATA_CATALOG}.<inlined_table>` first became
-  visible. Needs a staged op that drops a table's `inline/file_delete`
-  records, so it is an 0005 keyspace change as much as a shim one.
 - **DEFERRED** — The upstream DuckLake catalog-cache multi-threaded race: a
   fresh attach's listing comes back empty right after a write, so every e2e
   session pins `SET threads=1`. Not moraine's to fix, and re-verified live at

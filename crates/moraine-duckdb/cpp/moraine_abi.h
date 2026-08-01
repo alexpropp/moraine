@@ -2474,6 +2474,26 @@ int32_t moraine_tx_stage_inline_file_delete(struct MoraineTxHandle *tx,
                                             uint64_t begin_snapshot,
                                             struct MoraineError *err);
 
+// Stages the removal of one live `inline/file_delete` record — the
+// row-grain counterpart of [`moraine_tx_stage_inline_file_delete`],
+// which a `DELETE` against `ducklake_inlined_delete_<table_id>`
+// translates to.
+//
+// DuckLake issues that `DELETE` at the end of
+// `ducklake_flush_inlined_data`, once it has materialized the table's
+// inlined deletions into a real delete file: leaving the inlined form
+// behind would count those rows deleted twice. Naming a record the table
+// does not carry is [`codes::CORRUPTION`], not a no-op.
+//
+// # Safety
+//
+// Same contract as [`moraine_tx_stage_inline_inline_delete`].
+int32_t moraine_tx_stage_inline_file_delete_remove(struct MoraineTxHandle *tx,
+                                                   uint64_t table_id,
+                                                   uint64_t data_file_id,
+                                                   uint64_t row_id,
+                                                   struct MoraineError *err);
+
 // Stages a flush-delete: removes every `inline/insert` chunk begun at or
 // before `flush_snapshot` for `(table_id, schema_version)`, plus the
 // `inline/inline_delete` tombstones those chunks' rows consumed.

@@ -171,13 +171,14 @@ pub(super) fn apply_op(
         | RowOperation::InlineInsert { .. }
         | RowOperation::InlineInlineDelete { .. }
         | RowOperation::InlineFileDelete { .. }
+        | RowOperation::InlineFileDeleteRemove { .. }
         | RowOperation::InlineFlushDelete { .. }
         | RowOperation::InlineDrop { .. }
         | RowOperation::InlineSchemaDrop { .. } => Ok(()),
     }
 }
 
-/// Whether `op` is one of the seven inline variants — routed to
+/// Whether `op` is one of the eight inline variants — routed to
 /// `translate_inline`, never to [`apply_op`]'s `CatalogSnapshot` diff.
 pub(super) fn is_inline_op(op: &RowOperation) -> bool {
     matches!(
@@ -186,6 +187,7 @@ pub(super) fn is_inline_op(op: &RowOperation) -> bool {
             | RowOperation::InlineInsert { .. }
             | RowOperation::InlineInlineDelete { .. }
             | RowOperation::InlineFileDelete { .. }
+            | RowOperation::InlineFileDeleteRemove { .. }
             | RowOperation::InlineFlushDelete { .. }
             | RowOperation::InlineDrop { .. }
             | RowOperation::InlineSchemaDrop { .. }

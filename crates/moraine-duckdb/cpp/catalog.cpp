@@ -553,11 +553,11 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 	}
 
 	if (auto delete_table_id = ParseInlinedDeleteTableName(table_name)) {
-		// Fixed shape, no store-side schema to stage — existence follows from
-		// the first `inline/fdel` staged against it (see inline_tables.hpp),
-		// so CREATE only builds and caches the entry for the rest of this
-		// transaction. The find below is a defensive re-check; DuckLake
-		// de-duplicates its own CREATE-per-batch.
+		// Fixed shape, no store-side schema to stage — the store records the
+		// table's existence when the first `inline/fdel` is staged against it
+		// (see inline_tables.hpp), so CREATE only builds and caches the entry
+		// for the rest of this transaction. The find below is a defensive
+		// re-check; DuckLake de-duplicates its own CREATE-per-batch.
 		auto found = tables_.find(table_name);
 		if (found != tables_.end()) {
 			if (info.Base().on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT) {
@@ -883,6 +883,11 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, du
 	// decided in PlanMetadataDelete/PlanInlineDataDelete.
 	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {
 		auto &delete_op = PlanInlineDataDelete(planner, op, *inline_data_table);
+		delete_op.children.push_back(plan);
+		return delete_op;
+	}
+	if (auto *inline_delete_table = dynamic_cast<MoraineInlineDeleteTableEntry *>(&op.table)) {
+		auto &delete_op = PlanInlineDeleteDelete(planner, op, *inline_delete_table);
 		delete_op.children.push_back(plan);
 		return delete_op;
 	}
