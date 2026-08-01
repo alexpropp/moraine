@@ -3465,7 +3465,7 @@ fn table_kind_wire_order_is_pinned() {
         assert_eq!(*kind as usize, index, "{kind:?}");
         assert_eq!(TableKind::try_from(*kind as i32), Ok(*kind));
     }
-    assert_eq!(TableKind::try_from(25), Err(25));
+    assert_eq!(TableKind::try_from(26), Err(26));
     assert_eq!(TableKind::try_from(-1), Err(-1));
 
     for kind in TableKind::ALL {
@@ -3494,15 +3494,17 @@ fn table_kind_wire_order_is_pinned() {
             | TableKind::MacroImpl
             | TableKind::MacroParameters
             | TableKind::ColumnMapping
-            | TableKind::NameMapping => {}
+            | TableKind::NameMapping
+            | TableKind::Metadata => {}
         }
     }
 }
 
 /// DuckLake mints the snapshot id from the head it read, so an id that does
-/// not advance the head means the two disagree about where the catalog
-/// stands. Landing it would overwrite a snapshot record and move the head
-/// backwards, so it is refused rather than trusted.
+/// not advance the head means a commit landed in between. Landing it would
+/// overwrite a snapshot record and move the head backwards, so it is
+/// refused — as the lost race it is, carrying the text DuckLake re-drives
+/// on, never as corruption it would abandon the transaction over.
 #[tokio::test]
 async fn a_snapshot_id_that_does_not_advance_the_head_is_refused() {
     for authored in [0, 1] {
@@ -3540,8 +3542,12 @@ async fn a_snapshot_id_that_does_not_advance_the_head_is_refused() {
         });
         let err = tx.commit().await.unwrap_err();
         assert!(
-            matches!(&err, Error::Corruption(detail) if detail.contains("does not advance the head")),
+            matches!(&err, Error::CommitConflict(_)),
             "{authored}: {err:?}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("conflict"),
+            "the loser must carry the text DuckLake's commit loop retries on: {err}"
         );
 
         let snapshot = catalog.snapshot().await.unwrap();
@@ -3594,4 +3600,104 @@ async fn a_variant_column_is_refused_as_unsupported() {
             .table_by_name(crate::catalog::SchemaId::new(0), "t")
             .is_none()
     );
+}
+
+/// Options arrive as `ducklake_metadata` rows and mint no snapshot:
+/// DuckLake writes them within its metadata connection, outside the
+/// protocol, so the head must not move — while the option itself takes
+/// effect. A later row for the same key overwrites it (last write wins),
+/// a delete removes it, and a scope is carried through to the record the
+/// key names.
+///
+/// Read back through a separate read-only handle rather than the staging
+/// one: `begin_detached` stages against a throwaway projection cache, so
+/// the staging handle's own cached view never learns of a commit that
+/// leaves the head where it was. A reader opens on the store itself, which
+/// is also the stronger claim — the option is durable, not just applied.
+#[tokio::test]
+async fn staged_option_rows_set_scoped_options_without_minting_a_snapshot() {
+    use crate::catalog::{OptionScope, TableId};
+
+    let store = Arc::new(InMemory::new());
+    let catalog = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let head_before = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .current_snapshot()
+        .id
+        .get();
+
+    let option_row = |key: &str, value: &str, scope: Option<(&str, u64)>| {
+        vec![
+            Cell::Str(key.to_string()),
+            Cell::Str(value.to_string()),
+            scope.map_or(Cell::Null, |(name, _)| Cell::Str(name.to_string())),
+            scope.map_or(Cell::Null, |(_, id)| Cell::U64(id)),
+        ]
+    };
+    let stored = |key: &'static str, scope: OptionScope| {
+        let store = store.clone();
+        async move {
+            let reader = Catalog::open_read_only(store, CatalogOptions::default())
+                .await
+                .unwrap();
+            let value = reader.snapshot().await.unwrap().option(scope, key);
+            reader.close().await.unwrap();
+            value
+        }
+    };
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Metadata,
+        cells: option_row("parquet_compression", "zstd", None),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Metadata,
+        cells: option_row("parquet_compression", "snappy", Some(("table", 1))),
+    });
+    let id = tx.commit().await.unwrap();
+    assert_eq!(
+        id.get(),
+        head_before,
+        "an option write mints no snapshot, so the head stands"
+    );
+
+    assert_eq!(
+        stored("parquet_compression", OptionScope::Global).await,
+        Some("zstd".to_string())
+    );
+    assert_eq!(
+        stored("parquet_compression", OptionScope::Table(TableId::new(1))).await,
+        Some("snappy".to_string())
+    );
+
+    // Last write wins on the same key and scope; a delete removes it.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Metadata,
+        cells: option_row("parquet_compression", "gzip", None),
+    });
+    tx.stage(RowOperation::Delete {
+        table: TableKind::Metadata,
+        cells: option_row("parquet_compression", "snappy", Some(("table", 1))),
+    });
+    assert_eq!(tx.commit().await.unwrap().get(), head_before);
+
+    assert_eq!(
+        stored("parquet_compression", OptionScope::Global).await,
+        Some("gzip".to_string())
+    );
+    // The table override is gone, so the table scope resolves to the
+    // global value again rather than to nothing.
+    assert_eq!(
+        stored("parquet_compression", OptionScope::Table(TableId::new(1))).await,
+        Some("gzip".to_string())
+    );
+    catalog.close().await.unwrap();
 }

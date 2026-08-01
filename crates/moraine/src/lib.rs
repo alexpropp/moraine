@@ -66,6 +66,41 @@
 //! caller wrote, preserving their ids and backdating the file's record so
 //! time travel across the flush still finds them exactly once.
 //!
+//! # Readers
+//!
+//! [`Catalog::open_read_only`] opens the same store without becoming its
+//! writer, so it never fences one. It comes in two forms, and the
+//! difference is what the reader's credentials must be allowed to do.
+//!
+//! The default follows the latest state: it sees every commit as it lands,
+//! and pays for that by writing a checkpoint into the manifest on open and
+//! refreshing it while it lives. The other form pins the reader to a
+//! checkpoint minted in advance, and writes nothing whatsoever — for a
+//! deployment whose readers hold strictly read-only credentials:
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use moraine::{Catalog, CatalogOptions};
+//! # use object_store::memory::InMemory;
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+//! # let object_store = Arc::new(InMemory::new());
+//! # let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+//! catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+//! let checkpoint = catalog.create_checkpoint(None).await?;
+//!
+//! let mut options = CatalogOptions::default();
+//! options.checkpoint = Some(checkpoint);
+//! let reader = Catalog::open_read_only(object_store, options).await?;
+//! assert!(reader.snapshot().await?.schema_by_name("sales").is_some());
+//! # Ok::<(), moraine::Error>(()) }).unwrap();
+//! ```
+//!
+//! A pinned reader reads that cut and no other, however long it stays open
+//! — a commit made after the checkpoint is invisible to it. The checkpoint
+//! also pins the objects it references against SlateDB's own collection
+//! until it expires or [`Catalog::delete_checkpoint`] removes it, so give
+//! one a lifetime unless something else will.
+//!
 //! # Maintenance
 //!
 //! Dropping an equality index (or a table that has one) makes its entries

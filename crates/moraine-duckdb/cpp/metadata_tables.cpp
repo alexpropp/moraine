@@ -1,5 +1,9 @@
 #include "metadata_tables.hpp"
 
+#include <algorithm>
+#include <set>
+#include <string>
+
 #include "catalog.hpp"
 #include "inline_tables.hpp"
 #include "owned_array.hpp"
@@ -619,6 +623,53 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *ha
 		served += '/';
 		rows.push_back({Varchar("data_path"), Varchar(served.c_str()), null_varchar, null_bigint});
 	}
+
+	// Stored options last. Most override a fixed row of the same key and
+	// scope — the rows above are what a store *without* a setting serves,
+	// and `set_option` is what replaces one; without the override a user
+	// could set `data_inlining_row_limit` and never see it take effect.
+	//
+	// The exceptions are the keys above that are *store facts* rather than
+	// defaults: `version` is the protocol constant, `encrypted` is fixed
+	// when the catalog is created, and `data_path` is served in the
+	// normalized form DuckLake compares against the ATTACH value (the
+	// stored option holds it verbatim, which would not match). Those are
+	// moraine's to project, so a stored row of the same key is dropped
+	// rather than served twice or allowed to win.
+	static const std::set<std::string> kServedByMoraine = {"version", "created_by", "encrypted",
+	                                                       "data_path"};
+	auto stored = DumpRows<MoraineOptionRow>(handle, probe, probe_ctx, moraine_dump_options,
+	                                         moraine_dump_options_free,
+	                                         [](const MoraineOptionRow &r) -> std::vector<duckdb::Value> {
+		                                         return {
+		                                             Varchar(r.key),
+		                                             Varchar(r.value),
+		                                             OptVarchar(r.scope),
+		                                             r.has_scope_id ? Bigint(r.scope_id)
+		                                                            : duckdb::Value(duckdb::LogicalType::BIGINT),
+		                                         };
+	                                         });
+	for (auto &row : stored) {
+		// Only the global scope: a table-scoped option of the same name is
+		// a user setting, not one of these store facts.
+		if (row[2].IsNull() && kServedByMoraine.count(row[0].GetValue<std::string>()) > 0) {
+			continue;
+		}
+		auto same_key = [&row](const std::vector<duckdb::Value> &existing) {
+			// Null-aware: a global option's scope and scope_id are both
+			// NULL, and duckdb::Value's operator== throws on those rather
+			// than returning false.
+			auto same = [](const duckdb::Value &a, const duckdb::Value &b) {
+				if (a.IsNull() || b.IsNull()) {
+					return a.IsNull() && b.IsNull();
+				}
+				return a == b;
+			};
+			return same(existing[0], row[0]) && same(existing[2], row[2]) && same(existing[3], row[3]);
+		};
+		rows.erase(std::remove_if(rows.begin(), rows.end(), same_key), rows.end());
+		rows.push_back(std::move(row));
+	}
 	return rows;
 }
 
@@ -1104,6 +1155,13 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"scope_id", "BIGINT", false},
 	        },
 	        ProvideMetadata,
+	        // Options are unversioned and outside the snapshot protocol, so
+	        // DuckLake's `set_option` writes them as a delete of the old row
+	        // (by its whole key) followed by an insert of the new one.
+	        25,
+	        {},
+	        0,
+	        /* delete key: key, scope, scope_id */ {0, 2, 3},
 	    },
 	};
 	return specs;

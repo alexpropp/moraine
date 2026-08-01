@@ -30,7 +30,7 @@ const S3_BUCKET: &str = "moraine";
 /// Every `#[ignore]`d test in `object_storage.rs`, run together. A
 /// deleted test or a changed `#[ignore]` fails `s3` instead of silently
 /// shrinking the suite.
-const OBJECT_STORAGE_TEST_COUNT: &str = "2 passed";
+const OBJECT_STORAGE_TEST_COUNT: &str = "3 passed";
 
 /// Downloads/caches the pinned MinIO server and client, starts the
 /// server on `S3_ADDRESS` over a fresh data directory, creates the test
@@ -80,11 +80,14 @@ pub fn s3() -> anyhow::Result<()> {
     println!("ok: minio serving bucket `{S3_BUCKET}` on {S3_ADDRESS}");
 
     let endpoint = format!("http://{S3_ADDRESS}");
+    // Release, single-threaded, and uncaptured: the suite carries a commit
+    // latency measurement whose numbers a debug build or a parallel run
+    // would make meaningless, and whose table is the point of running it.
     crate::duckdb::run_ignored_suite(
         "moraine",
         "object_storage",
-        false,
-        &[],
+        true,
+        &["--test-threads=1", "--nocapture"],
         &[
             ("MORAINE_S3_ENDPOINT", endpoint.as_ref()),
             ("MORAINE_S3_BUCKET", S3_BUCKET.as_ref()),

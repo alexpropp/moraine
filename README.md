@@ -52,6 +52,33 @@ skip the per-commit Parquet-file tax. Workloads needing sub-PUT commit
 latency want a hot server with local state — moraine stays serverless and
 won't compete there.
 
+## One writer, many readers
+
+**Exactly one process may attach a moraine lake read-write; every other
+process must attach `READ_ONLY`.** Readers are uncoordinated and unbounded
+in number, and never disturb the writer. But SlateDB's writer fencing means
+the *newest* writer wins: a second process attaching read-write silently
+fences the first, so two of them take turns killing each other's committer
+rather than one failing cleanly.
+
+```sql
+-- The one writer.
+ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
+       (DATA_PATH 's3://bucket/lake-data/', READ_WRITE);
+-- Everyone else.
+ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
+       (DATA_PATH 's3://bucket/lake-data/', READ_ONLY);
+```
+
+Safety is never at risk — a fenced writer writes nothing and corrupts
+nothing — but availability is, so this is a real limitation next to the
+multi-client SQL catalogs DuckLake otherwise uses: a fleet of independent
+DuckDB processes writing one lake is not a topology moraine supports today.
+A deployment that needs commit concurrency funnels its commits through one
+long-lived writer process. Concurrent commits inside that process share a
+flush rather than each waiting for one of their own, so the funnel is not
+the throughput ceiling it looks like.
+
 ## Architecture
 
 - **`crates/moraine`** — the core library: DuckLake catalog semantics

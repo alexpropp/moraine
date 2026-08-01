@@ -87,7 +87,8 @@ findings.
 **One thing dominates: the WAL flush interval.** A durable commit waits for
 the next flush tick, so at the 100 ms default a single commit costs ~100 ms —
 regardless of backend, and swamping the ~2 ms of compute underneath. Every
-durable-commit-bound cost inherits this.
+durable-commit-bound cost inherits this. Concurrency is the way out, not a
+faster commit: K concurrent commits share one flush.
 
 ### Durable-commit latency vs. flush interval
 
@@ -103,8 +104,81 @@ durable-commit-bound cost inherits this.
 
 Commit latency is `flush_interval + ~2 ms`. The ~2 ms is the real compute
 floor; everything above it is the wait for the flush tick. On a real object
-store the tick wait is replaced (or joined) by the WAL PUT round-trip, so the
-per-backend commit latency is `max(flush cadence, write RTT) + ~2 ms`.
+store the tick wait is replaced (or joined) by the WAL PUT round-trip — the
+next two sections measure that term rather than assume it.
+
+### Durable-commit latency vs. write round-trip
+
+The composition of the two terms, measured by wrapping the in-memory store in
+a `ThrottledStore` that sleeps before every PUT and sweeping that delay
+against the flush interval. 30 sequential commits per cell, median:
+
+| PUT round-trip | flush 1 ms | flush 25 ms | flush 100 ms |
+|---|---|---|---|
+| 0 ms | 2.2 ms | 26.4 ms | 101.4 ms |
+| 5 ms | 7.5 ms | 26.3 ms | 100.9 ms |
+| 25 ms | 27.5 ms | 27.6 ms | 101.0 ms |
+| 100 ms | 102.7 ms | 102.7 ms | 102.6 ms |
+
+Every cell is the **larger** of the two terms plus the ~2 ms compute floor,
+never their sum: a commit waits for one flush, and that flush waits for
+whichever of the tick and the PUT is slower. So the model is
+`max(flush cadence, write RTT) + ~2 ms`, confirmed rather than posited. The
+practical reading: lowering the flush interval below the store's write RTT
+buys nothing, and a fast store cannot make up for a slow flush cadence.
+
+### Durable-commit latency against a real endpoint
+
+The same sweep against a live S3-compatible endpoint, where the PUT is the
+endpoint's own round trip (`cargo xtask s3`, which runs
+`object_storage.rs`'s `measure_commit_latency_against_the_endpoint` in
+release against a pinned MinIO):
+
+| flush interval | median commit | min | max |
+|---|---|---|---|
+| 1 ms | 2.5 ms | 1.5 ms | 3.7 ms |
+| 25 ms | 25.9 ms | 22.5 ms | 29.9 ms |
+| 100 ms | 101.4 ms | 83.0 ms | 116.7 ms |
+
+A loopback MinIO's PUT costs about a millisecond, so it lands in the
+`RTT ≈ 0` row of the table above and the flush cadence dominates everywhere:
+this *validates the composition against a real object-storage protocol*, but
+it understates S3, whose PUT is tens of milliseconds. For the number a given
+deployment will see, point the same harness at the real bucket
+(`MORAINE_S3_ENDPOINT`/`MORAINE_S3_BUCKET`); the injected-RTT table says what
+to expect before you do.
+
+### Commit throughput vs. concurrency
+
+The sequential number above is one commit per flush by construction. This is
+the concurrent one, now that concurrent commits coalesce into a shared batch:
+K callers commit 128/K times each, every caller appending to a table of its
+own, at the 100 ms default interval. Batch size is measured, not inferred —
+the harness counts the WAL objects the burst wrote:
+
+| concurrency | wall | commits/s | WAL writes | mean batch |
+|---|---|---|---|---|
+| 1 | 12.94 s | 9.9 | 128 | 1.0 |
+| 2 | 6.47 s | 19.8 | 64 | 2.0 |
+| 4 | 3.24 s | 39.6 | 32 | 4.0 |
+| 8 | 1.62 s | 79.1 | 16 | 8.0 |
+| 16 | 0.81 s | 158.3 | 8 | 16.0 |
+| 32 | 0.40 s | 316.3 | 4 | 32.0 |
+| 64 | 0.20 s | 632.1 | 2 | 64.0 |
+| 128 | 0.20 s | 632.5 | 2 | 64.0 |
+
+**Batch size equals concurrency, exactly, until the member ceiling binds.**
+Throughput is therefore `concurrency / flush_interval` — linear, with no
+coalescing overhead visible at any level: K commits cost the flushes of one.
+The ceiling is `MAX_BATCH_MEMBERS` (64), and it binds precisely where it
+says: 128 concurrent commits take the same wall-clock as 64 and land at the
+same rate, because they arrive as two full batches instead of one. Raising
+the ceiling is the lever if a workload ever needs past ~630 commits/s at the
+default cadence; lowering the flush interval is the other, and the two
+multiply.
+
+This is what makes the single-writer topology's funnel affordable: routing a
+fleet's commits through one process costs them a shared flush, not a queue.
 
 ### Reclaim throughput vs. maintenance batch size
 

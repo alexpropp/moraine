@@ -13,6 +13,9 @@ this file is the operational summary.
 - `crates/moraine-duckdb` — DuckDB extension: a thin C++ shim registering a
   `StorageExtension` over a C ABI to the Rust core (RFC 0006). Thin by policy:
   if logic accumulates here, move it to the core.
+- `test/sql` — sqllogictest files run by DuckDB's own runner, for what the
+  CLI cannot express: several connections over one instance (concurrent
+  DuckLake transactions). Driven by `cargo xtask e2e`.
 - `xtask` — automation (`cargo xtask e2e`). Rust, not shell scripts.
 
 ## Rules

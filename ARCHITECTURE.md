@@ -137,13 +137,19 @@ that **one commit = exactly one SlateDB `WriteBatch`**.
 
 - **Topology: single writer, many readers.** Uncoordinated readers resolve
   snapshots from object storage; a deployment needing commit concurrency
-  funnels commits through one long-lived committer process.
+  funnels commits through one long-lived committer process. A reader
+  following the latest state still writes a manifest checkpoint of its own;
+  one opened against an existing checkpoint id writes nothing at all, and
+  sees the cut that checkpoint named.
 - **Optimistic, head-CAS.** A commit loads the head snapshot, allocates ids
   locally, stages one batch, and writes it conditional on `sys/head` being
   unchanged. Nothing spans two batches; the write floor is one durable WAL
   flush.
-- **Table-level conflict detection.** On a failed CAS, the committer compares
-  the `table_id`s it touched against the intervening commits'. Disjoint sets are
+- **Table-level conflict detection**, with one file-grain exception. On a
+  failed CAS, the committer compares the `table_id`s it touched against the
+  intervening commits' — except delete-versus-delete, which compares the
+  data files each targeted, matching the one place DuckLake goes finer.
+  Disjoint sets are
   a benign race, retried internally; overlapping sets are a true `Conflict`
   aborted with a typed error — the core is DuckLake-agnostic and cannot replay
   the originating SQL, so re-driving belongs to whoever authored the operation.

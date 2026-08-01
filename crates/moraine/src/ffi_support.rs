@@ -433,6 +433,63 @@ pub async fn dump_tags(catalog: &Catalog) -> Result<Vec<TagRow>> {
         .collect())
 }
 
+/// One `ducklake_metadata` row: a catalog option, flattened from its
+/// scope's record.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionRow {
+    /// Option key.
+    pub key: String,
+    /// Option value.
+    pub value: String,
+    /// The scope's name — `None` for a global option, else `"schema"` or
+    /// `"table"`, matching the vocabulary DuckLake writes and reads.
+    pub scope: Option<String>,
+    /// The scoped object's id; `None` alongside a `None` scope.
+    pub scope_id: Option<u64>,
+}
+
+/// Every stored `ducklake_metadata` row. Options carry no lifecycle —
+/// they live outside the snapshot protocol, last write wins — so this is
+/// simply what is set now.
+#[doc(hidden)]
+pub async fn dump_options(catalog: &Catalog) -> Result<Vec<OptionRow>> {
+    let scopes = dump_current_entities(catalog, |r| match r {
+        EntityRecord::Option {
+            scope_kind,
+            scope_id,
+            value,
+        } => Some((scope_kind, scope_id, value)),
+        _ => None,
+    })
+    .await?;
+
+    let mut rows: Vec<OptionRow> = scopes
+        .into_iter()
+        .flat_map(|(scope_kind, scope_id, value)| {
+            let scope = match scope_kind {
+                1 => Some("schema".to_string()),
+                2 => Some("table".to_string()),
+                _ => None,
+            };
+            let scope_id = scope.as_ref().map(|_| scope_id);
+            value
+                .options
+                .into_iter()
+                .map(move |(key, value)| OptionRow {
+                    key,
+                    value,
+                    scope: scope.clone(),
+                    scope_id,
+                })
+        })
+        .collect();
+    // A stable order: the store's map iteration is not one callers should
+    // depend on, and DuckLake reads these back by key.
+    rows.sort_by(|a, b| (&a.scope, a.scope_id, &a.key).cmp(&(&b.scope, b.scope_id, &b.key)));
+    Ok(rows)
+}
+
 /// One `ducklake_column_tag` row, flattened from its column's record.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]

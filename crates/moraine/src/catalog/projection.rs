@@ -422,6 +422,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            deleted_data_file_ids: Vec::new(),
         }
     }
 

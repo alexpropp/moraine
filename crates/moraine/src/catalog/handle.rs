@@ -9,10 +9,7 @@ use std::{
 };
 
 use object_store::{ObjectStore, path::Path};
-use slatedb::{
-    Db, DbReader, DbTransaction, IsolationLevel,
-    config::{CheckpointOptions, CheckpointScope},
-};
+use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
 use tracing::{info, warn};
 
 use crate::{
@@ -32,7 +29,7 @@ use crate::{
         },
         inline as store_inline,
         key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
-        open::StoreBuilder,
+        open::{self, StoreBuilder},
     },
     transaction::{MigrationReport, Transaction, commit, index_maintenance, migration},
 };
@@ -164,6 +161,16 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
+    /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
+    /// as reported by [`Catalog::create_checkpoint`].
+    ///
+    /// The default (`None`) follows the latest state, which writes a
+    /// checkpoint of its own into the manifest on open and refreshes it for
+    /// the catalog's lifetime. Set it for a reader whose credentials cannot
+    /// write at all: the open then reads a fixed cut and writes nothing —
+    /// at the cost of never seeing a later commit. Refused by
+    /// [`Catalog::open`], which is a writer.
+    pub checkpoint: Option<String>,
 }
 
 impl Default for CatalogOptions {
@@ -174,8 +181,20 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
             data_path: None,
+            checkpoint: None,
         }
     }
+}
+
+/// Parses a configured checkpoint id, naming the option in the error.
+fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
+    checkpoint
+        .map(|id| {
+            uuid::Uuid::parse_str(id).map_err(|err| {
+                Error::Configuration(format!("checkpoint `{id}` is not a valid id: {err}"))
+            })
+        })
+        .transpose()
 }
 
 /// One member of a [`Catalog::commit_group`] batch: a closure authoring
@@ -232,6 +251,13 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
+        if options.checkpoint.is_some() {
+            return Err(Error::Configuration(
+                "a checkpoint pins a read-only catalog to a fixed cut; a writer commits new \
+                 state and cannot be opened against one"
+                    .to_string(),
+            ));
+        }
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone());
@@ -251,7 +277,8 @@ impl Catalog {
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
-    /// as a `DbReader` following the latest manifest.
+    /// as a `DbReader` following the latest manifest — or, when
+    /// [`CatalogOptions::checkpoint`] is set, pinned to that checkpoint.
     ///
     /// A read-only catalog never opens the writer `Db`, so it never fences a
     /// live read-write process — any number of read-only catalogs may attach
@@ -259,18 +286,57 @@ impl Catalog {
     /// store no writer has initialized is refused. [`commit`](Self::commit)
     /// returns [`Error::Constraint`].
     ///
+    /// "Read-only" is a catalog property, not an IAM one: following the
+    /// latest state means writing a checkpoint into the manifest on open and
+    /// refreshing it while the catalog lives, so those credentials still
+    /// need manifest write access. A catalog opened against a checkpoint
+    /// writes nothing whatsoever, and in exchange reads the fixed cut that
+    /// checkpoint names — later commits never appear, however long it stays
+    /// open.
+    ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be opened, is not an initialized
-    /// moraine catalog, or is stamped with an unknown structural format.
+    /// moraine catalog, is stamped with an unknown structural format, or
+    /// names a checkpoint that is not a valid id or no longer exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let object_store = Arc::new(InMemory::new());
+    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+    /// let checkpoint = catalog.create_checkpoint(None).await?;
+    ///
+    /// // A commit after the checkpoint is not in it.
+    /// catalog.commit(|tx| tx.create_schema("ops").map(|_| ())).await?;
+    ///
+    /// let mut options = CatalogOptions::default();
+    /// options.checkpoint = Some(checkpoint);
+    /// let reader = Catalog::open_read_only(object_store, options).await?;
+    /// let view = reader.snapshot().await?;
+    /// assert!(view.schema_by_name("sales").is_some());
+    /// assert!(view.schema_by_name("ops").is_none());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
     pub async fn open_read_only(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<Self> {
-        let store =
-            StoreBuilder::new(&options.path, object_store).cache_dir(options.cache_dir.clone());
+        let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
+        let store = StoreBuilder::new(&options.path, object_store)
+            .cache_dir(options.cache_dir.clone())
+            .checkpoint(checkpoint);
         let reader = commit::open_reader_initialized(store).await?;
-        info!(path = options.path, "opened catalog read-only");
+        info!(
+            path = options.path,
+            checkpoint = options.checkpoint,
+            "opened catalog read-only"
+        );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(Self {
             store: Arc::new(Store::Reader(Arc::new(reader))),
@@ -334,11 +400,8 @@ impl Catalog {
             .await?;
 
         let checkpoint = if request.checkpoint {
-            let taken = db
-                .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
-                .await
-                .map_err(Error::from)?;
-            info!(checkpoint = %taken.id, "took a pre-migration checkpoint");
+            let taken = open::create_checkpoint(&db, None).await?;
+            info!(checkpoint = %taken, "took a pre-migration checkpoint");
             Some(taken)
         } else {
             None
@@ -353,14 +416,60 @@ impl Catalog {
         let report = report.and_then(|report| closed.map(|()| report))?;
 
         if let Some(checkpoint) = checkpoint {
-            slatedb::admin::Admin::builder(options.path.as_str(), object_store)
-                .build()
-                .delete_checkpoint(checkpoint.id)
-                .await
-                .map_err(Error::from)?;
+            StoreBuilder::new(&options.path, object_store)
+                .delete_checkpoint(checkpoint)
+                .await?;
         }
 
         Ok(report)
+    }
+
+    /// Pins everything committed so far as a checkpoint, and reports its id.
+    ///
+    /// A checkpoint is an immutable cut of the store that
+    /// [`CatalogOptions::checkpoint`] opens a reader against — the one way to
+    /// read a moraine catalog with credentials that cannot write at all,
+    /// since a reader that follows the latest state maintains a checkpoint of
+    /// its own and so writes the manifest.
+    ///
+    /// It also pins every object it references against SlateDB's garbage
+    /// collection, so a checkpoint with no `lifetime` holds storage until
+    /// [`delete_checkpoint`](Self::delete_checkpoint) removes it. Give one a
+    /// lifetime unless something will.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
+    /// creating a checkpoint is a manifest write — or a store error if the
+    /// write fails.
+    pub async fn create_checkpoint(&self, lifetime: Option<Duration>) -> Result<String> {
+        let id = open::create_checkpoint(self.writer()?, lifetime).await?;
+        info!(checkpoint = %id, "created a checkpoint");
+        Ok(id.to_string())
+    }
+
+    /// Deletes the checkpoint `checkpoint`, releasing the objects it pinned.
+    ///
+    /// Free-standing rather than a method, exactly as
+    /// [`migrate`](Self::migrate) is: it CASes the manifest and never opens
+    /// the writer `Db`, so it runs against a live catalog without fencing
+    /// it. Readers already open against the deleted checkpoint keep
+    /// serving; a reader that opens against it afterwards is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Configuration`] if `checkpoint` is not a valid id,
+    /// or a store error if the manifest update fails.
+    pub async fn delete_checkpoint(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        checkpoint: &str,
+    ) -> Result<()> {
+        let id = parse_checkpoint(Some(checkpoint))?
+            .ok_or_else(|| Error::Configuration("no checkpoint given".to_string()))?;
+        StoreBuilder::new(&options.path, object_store)
+            .delete_checkpoint(id)
+            .await
     }
 
     /// The maintained-projection state shared by this handle's clones.
