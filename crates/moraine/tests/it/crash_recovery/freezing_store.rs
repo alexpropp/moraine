@@ -27,6 +27,7 @@ pub struct FreezingStore {
     /// would go negative the store is frozen and stays frozen.
     allowance: AtomicI64,
     attempted: AtomicU64,
+    wal_puts: AtomicU64,
 }
 
 impl FreezingStore {
@@ -37,6 +38,7 @@ impl FreezingStore {
             inner,
             allowance: AtomicI64::new(i64::MAX),
             attempted: AtomicU64::new(0),
+            wal_puts: AtomicU64::new(0),
         }
     }
 
@@ -48,6 +50,12 @@ impl FreezingStore {
     /// How many writes have been attempted, permitted or not.
     pub fn writes_attempted(&self) -> u64 {
         self.attempted.load(Ordering::SeqCst)
+    }
+
+    /// How many of those writes were WAL objects — SlateDB's durable-commit
+    /// unit, so this counts flushes rather than total store traffic.
+    pub fn wal_writes(&self) -> u64 {
+        self.wal_puts.load(Ordering::SeqCst)
     }
 
     /// Accounts for one write, refusing it once the allowance is spent.
@@ -80,6 +88,11 @@ impl ObjectStore for FreezingStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.permit("put")?;
+        // SlateDB keeps WAL objects under a `wal/` directory of the store
+        // root; every durable commit lands as one of them.
+        if location.parts().any(|part| part.as_ref() == "wal") {
+            self.wal_puts.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 

@@ -104,6 +104,19 @@ It also carries the store's path within the bucket, defaulting to the bucket
 root — the default deployment stays "a bucket and credentials", and a prefix
 is opt-in for hosts sharing a bucket.
 
+`Catalog::open_read_only` is the reader's door onto the same store, and takes
+the same options. One of them selects *which* kind of reader:
+`CatalogOptions::checkpoint` pins the open to an existing checkpoint id
+instead of following the latest state, which is the difference between a
+reader that writes the manifest and one that writes nothing at all (RFC
+0004, Topology). Checkpoints are minted through `Catalog::create_checkpoint`
+on a writer and released through `Catalog::delete_checkpoint`, which — like
+`Catalog::migrate` — is free-standing because it touches only the manifest
+and so runs against a live catalog without fencing it. The id crosses the
+API as a `String`, matching how every other identifier of SlateDB's that
+moraine hands out is spelled, so no `slatedb::` or `uuid::` name appears
+publicly.
+
 ### Reads
 
 ```rust
