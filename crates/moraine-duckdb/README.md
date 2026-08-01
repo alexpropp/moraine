@@ -151,10 +151,14 @@ The loadable lands at `build/release/extension/moraine/moraine.duckdb_extension`
 (gitignored). `cargo xtask e2e` builds it that way and drives it through a
 real DuckDB CLI plus a real `INSTALL ducklake`.
 
-The DuckDB pin has one source per side: the `duckdb` submodule ref (the
-build) and the `duckdb_pin()` constant in `xtask/src/duckdb.rs` (the CLI
-download). Bumping the pin means moving both submodules to the new tag and
-updating that constant.
+### The pin, and what a bump touches
+
+`.github/duckdb-versions` is the single source of truth: one DuckDB release
+per line, newest first, the first line carrying the commit each submodule
+must sit on. `xtask` reads it (`include_str!`), the release workflows build
+a matrix from it (`cargo xtask version-matrix`), and `cargo xtask
+check-pins` fails if any other place naming a version disagrees — the two
+submodules, both workflow files, and the table below.
 
 | What | Pinned at |
 |---|---|
@@ -164,29 +168,63 @@ updating that constant.
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
 | DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
 
-## Installing
+**Bumping** means putting the new release at the top of the manifest with
+both submodule commits, moving the submodules there, and running `cargo
+xtask check-pins`, which names whatever is still stale. Then `cargo xtask
+e2e` re-proves the whole chain against the new pair, including the
+regression pins in `tests/ducklake_load/wire_contract.rs` — the nested
+attach text, DuckLake's catalog access set, and the DuckLake commit
+`INSTALL ducklake` resolves to.
 
-Once moraine is published to the DuckDB community-extensions repository,
-installing verifies DuckDB's own signature — no flags needed:
+**Which releases get builds.** Every one still listed in the manifest.
+This is not a preference: DuckDB refuses a C++-ABI extension whose footer
+names a different version *string*, patch releases included
+(`ParsedExtensionMetaData::GetInvalidMetadataError`), so a v1.5.3 user
+cannot load a v1.5.4 build. The list is short by design — each entry
+multiplies the release build by five platforms, and only the primary is
+proven end-to-end against a real DuckLake — so it holds the releases users
+are plausibly on, and older ones keep whatever assets they were already
+published with.
+
+**Which DuckDB series moraine tracks.** The one DuckLake's current release
+branch targets, adopted when DuckLake cuts that branch rather than when
+DuckDB releases: the extension exists to be DuckLake's catalog, and a
+DuckDB with no DuckLake built for it has nothing to attach. DuckLake
+versions by DuckDB-series branch (`v1.3-ossivalis`, `v1.4-andium`,
+`v1.5-variegata`), so the two move together.
+
+## Installing
 
 ```sql
 INSTALL moraine FROM community;
 LOAD moraine;
 ```
 
-Until then — or to load a locally built artifact — load the unsigned
-loadable directly with signature checks off. The CLI must be *started* with
-`-unsigned`; the setting cannot be changed on a running database:
+That path verifies a signature and needs no flags. **Signing is DuckDB's,
+not moraine's**: the public keys `ExtensionHelper::GetPublicKeys` trusts are
+compiled into every DuckDB binary, so no third party can produce a
+signature the stock CLI accepts. `extension-upload-single.sh` fills the
+footer's 256-byte signature region with zeros unless it holds one of those
+private keys, which is why every artifact moraine's own release workflow
+publishes is unsigned, and why the e2e harness starts the CLI with
+`-unsigned`. The community-extensions pipeline is the only route to a
+signed build, and `description.yml` is what points it at this repo.
+
+To load a release asset or a locally built artifact directly, start the CLI
+with `-unsigned` — the setting cannot be changed on a running database:
 
 ```sh
 duckdb -unsigned -c "LOAD './build/release/extension/moraine/moraine.duckdb_extension';"
 ```
 
-The loadable's base filename (`moraine`) is load-bearing: DuckDB derives the
-entry symbol (`moraine_duckdb_cpp_init`, defined in
-`cpp/moraine_extension.cpp`) from the filename before the first `.`. A
-version/platform mismatch against the running DuckDB is rejected even when
-unsigned.
+Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
+(`moraine.v1.5.4.linux_amd64.duckdb_extension`). Pick the one matching your
+DuckDB *exactly*: a mismatch is rejected even when unsigned, because a
+C++-ABI extension is bound to the version string in its footer. The
+loadable's base filename (`moraine`) is load-bearing too — DuckDB derives
+the entry symbol (`moraine_duckdb_cpp_init`, defined in
+`cpp/moraine_extension.cpp`) from the filename before the first `.` — so
+rename an asset to `moraine.duckdb_extension` before loading it.
 
 ## Obtaining a DuckDB v1.5.4 CLI for testing
 

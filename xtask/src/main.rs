@@ -6,12 +6,16 @@
 //!   stock DuckDB file, and Postgres — on identical workloads (see `bench.rs`).
 //! - `s3` runs the catalog's object storage suite against a pinned MinIO server
 //!   (see `s3.rs`).
+//! - `check-pins` verifies every place naming a DuckDB version agrees with
+//!   `.github/duckdb-versions` (see `pins.rs`), and `version-matrix` prints
+//!   that manifest as the JSON array the release workflows build from.
 
 use anyhow::bail;
 
 mod bench;
 mod duckdb;
 mod e2e;
+mod pins;
 mod s3;
 
 fn main() -> anyhow::Result<()> {
@@ -21,7 +25,16 @@ fn main() -> anyhow::Result<()> {
         Some("e2e") => e2e::e2e(),
         Some("bench") => bench::bench(&arguments),
         Some("s3") => s3::s3(),
-        Some(other) => bail!("unknown task `{other}`; available: e2e, bench, s3"),
-        None => bail!("usage: cargo xtask <task>; available: e2e, bench, s3"),
+        Some("check-pins") => pins::check_pins(),
+        Some("version-matrix") => {
+            pins::print_version_matrix();
+            Ok(())
+        }
+        Some(other) => {
+            bail!("unknown task `{other}`; available: e2e, bench, s3, check-pins, version-matrix")
+        }
+        None => bail!(
+            "usage: cargo xtask <task>; available: e2e, bench, s3, check-pins, version-matrix"
+        ),
     }
 }

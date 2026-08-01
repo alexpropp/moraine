@@ -41,14 +41,34 @@ jobs:
             echo "moraine $version not on crates.io - release pending."
           fi
 
-  build-extension:
+  # A C++-ABI extension only loads into the exact DuckDB version stamped in
+  # its footer, so every supported release gets its own build. The list lives
+  # in .github/duckdb-versions.
+  versions:
     needs: should-release
     if: needs.should-release.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        run: echo "matrix=$(cargo run -q -p xtask -- version-matrix)" >> "$GITHUB_OUTPUT"
+
+  build-extension:
+    needs: [should-release, versions]
+    if: needs.should-release.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        duckdb_version: ${{ fromJson(needs.versions.outputs.matrix) }}
+    # Pinned to the primary release; its inputs, not this ref, select which
+    # DuckDB and toolchain each matrix entry checks out.
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
     with:
       extension_name: moraine
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5.4
+      duckdb_version: ${{ matrix.duckdb_version }}
+      ci_tools_version: ${{ matrix.duckdb_version }}
       enable_rust: true
       # moraine's Rust core (tokio, object_store, SlateDB) does not target
       # WebAssembly, and Windows is unverified; the community build excludes

@@ -63,7 +63,7 @@ this file is the operational summary.
 cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
-  && cargo deny check && cargo xtask e2e
+  && cargo deny check && cargo xtask check-pins && cargo xtask e2e
 ```
 
 The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`,

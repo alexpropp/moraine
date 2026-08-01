@@ -444,11 +444,14 @@ fn the_pinned_duckdb_and_ducklake_builds_interoperate() {
     );
 }
 
-/// The pinned DuckDB version, read from the same constant `xtask` builds
-/// and downloads against, so a bump moves one place.
+/// The primary DuckDB pin, read from the same manifest the build and the
+/// release matrix use, so a bump moves one place. `xtask` is not a
+/// dependency of this crate, so the file is included rather than called.
 fn duckdb_pin() -> &'static str {
-    // Mirrors `xtask/src/duckdb.rs`'s `duckdb_pin`; xtask is not a
-    // dependency of this crate, and the loadable's own footer carries the
-    // same string.
-    "v1.5.4"
+    include_str!("../../../../.github/duckdb-versions")
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .and_then(|entry| entry.split_whitespace().next())
+        .expect(".github/duckdb-versions lists no DuckDB version")
 }

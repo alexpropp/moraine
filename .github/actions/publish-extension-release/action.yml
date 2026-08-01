@@ -1,5 +1,5 @@
 name: Publish extension release
-description: Attach built per-arch extensions to a draft ext-v* release, reveal it, and pin the descriptor ref.
+description: Attach built per-DuckDB-version, per-arch extensions to a draft ext-v* release, reveal it, and pin the descriptor ref.
 inputs:
   tag:
     description: The ext-v<version>[-build.N] release/tag name.
@@ -16,24 +16,44 @@ runs:
     - uses: actions/download-artifact@v4
       with:
         path: artifacts
-    - name: Stage per-arch assets
+    # The build workflow names each artifact
+    # `moraine-<duckdb_version>-extension-<arch>`, so both halves come from
+    # the directory name. Both are load-bearing in the asset name: a
+    # C++-ABI extension is refused by any DuckDB whose version string
+    # differs from the one in its footer, so a user must be able to pick
+    # the build matching their engine, not just their platform.
+    - name: Stage per-version, per-arch assets
       shell: bash
       run: |
+        set -euo pipefail
         mkdir -p dist
-        for d in artifacts/*-extension-*/; do
-          arch=${d##*-extension-}
-          arch=${arch%/}
-          cp "$d/moraine.duckdb_extension" "dist/moraine.${arch}.duckdb_extension"
+        shopt -s nullglob
+        staged=0
+        for d in artifacts/moraine-*-extension-*/; do
+          name=${d%/}
+          name=${name##*/}
+          arch=${name##*-extension-}
+          duckdb_version=${name#moraine-}
+          duckdb_version=${duckdb_version%-extension-*}
+          cp "$d/moraine.duckdb_extension" \
+             "dist/moraine.${duckdb_version}.${arch}.duckdb_extension"
+          staged=$((staged + 1))
         done
+        if [ "$staged" -eq 0 ]; then
+          echo "no built extensions found under artifacts/ - nothing to publish" >&2
+          exit 1
+        fi
         ls -l dist
     - name: Create draft release, attach binaries, reveal
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
       run: |
+        versions=$(ls dist \
+          | sed -E 's/^moraine\.(v[0-9.]+)\..*/\1/' | sort -u | paste -sd', ' -)
         gh release create "${{ inputs.tag }}" --target "${{ inputs.target }}" --draft \
           --title "${{ inputs.tag }}" \
-          --notes "Unsigned moraine extension built against DuckDB v1.5.4. Signed install: INSTALL moraine FROM community; LOAD moraine;" \
+          --notes "Unsigned moraine extension, built for DuckDB ${versions}. Assets are named moraine.<duckdb-version>.<platform>.duckdb_extension; a build only loads into the DuckDB version it names, and needs a CLI started with -unsigned. Signed install (no flags, any supported version): INSTALL moraine FROM community; LOAD moraine;" \
           || true
         gh release upload "${{ inputs.tag }}" dist/*.duckdb_extension --clobber
         gh release edit "${{ inputs.tag }}" --draft=false
