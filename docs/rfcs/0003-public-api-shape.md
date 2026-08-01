@@ -264,6 +264,7 @@ semantics and the entities RFC 0002 maps:
 | **Options** | `set_option`, `unset_option` (global / schema / table scopes) |
 | **Inlined data** (RFC 0005) | `inline_insert`, `inline_delete`, `flush_inlined_data` |
 | **Maintenance** (RFC 0021) | `maintain` — reclaims the entry ranges of indexes no longer live; not a `Transaction` mutator but a `Catalog` verb, since it mints no snapshot |
+| **Format migration** (RFC 0015) | `migrate` — rewrites the store to the newest structural format the binary understands. Not a `Transaction` mutator and not even a `Catalog` method: an associated function taking the object store, because the stores it exists to act on are the ones an ordinary attach refuses |
 
 Notes:
 

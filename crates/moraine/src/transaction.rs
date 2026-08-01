@@ -3,8 +3,10 @@
 
 pub(crate) mod commit;
 pub(crate) mod index_maintenance;
+pub(crate) mod migration;
 pub(crate) mod operations;
 pub(crate) mod staged;
 mod verbs;
 
+pub use migration::MigrationReport;
 pub use verbs::Transaction;
