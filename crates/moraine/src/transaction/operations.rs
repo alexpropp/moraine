@@ -22,6 +22,14 @@ pub(crate) enum Operation {
         /// The dropped schema's id.
         schema_id: u64,
     },
+    /// An existing schema's tags changed. Mints a snapshot and bumps the
+    /// schema version, but feeds no change-set entry: DuckLake's
+    /// `changes_made` grammar has no schema-alter kind, and a concurrent
+    /// drop of the schema is caught by the closure re-run instead.
+    AlterSchema {
+        /// The mutated schema's id.
+        schema_id: u64,
+    },
     /// A table was created.
     CreateTable {
         /// The schema the table was created in.
@@ -111,6 +119,26 @@ pub(crate) enum Operation {
         /// `"scalar"` or `"table"` — selects the change-set entry kind.
         macro_type: String,
     },
+    /// Rows were inlined into a table. Classifies as an append, exactly as
+    /// a data-file registration does — DuckLake's inlined inserts carry
+    /// `inserted_into_table` too.
+    InlineInsert {
+        /// The table rows were inlined into.
+        table_id: u64,
+    },
+    /// Inlined rows were tombstoned. Classifies as a delete, like a delete
+    /// file.
+    InlineDelete {
+        /// The table rows were tombstoned in.
+        table_id: u64,
+    },
+    /// Inlined rows were drained to a data file. Classifies as compaction:
+    /// it rewrites rows that already exist rather than adding any, so it
+    /// races a concurrent delete or drop but not a concurrent append.
+    FlushInlinedData {
+        /// The table whose inlined rows were drained.
+        table_id: u64,
+    },
 }
 
 impl Operation {
@@ -120,6 +148,7 @@ impl Operation {
         match self {
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
+            | Operation::AlterSchema { .. }
             | Operation::CreateTable { .. }
             | Operation::AlterTable { .. }
             | Operation::DropTable { .. }
@@ -132,7 +161,10 @@ impl Operation {
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
             | Operation::ExpireDeleteFile { .. }
-            | Operation::UpdateStats { .. } => false,
+            | Operation::UpdateStats { .. }
+            | Operation::InlineInsert { .. }
+            | Operation::InlineDelete { .. }
+            | Operation::FlushInlinedData { .. } => false,
         }
     }
 
@@ -151,6 +183,7 @@ impl Operation {
             // `ducklake_schema_versions` row for macro DDL.
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
+            | Operation::AlterSchema { .. }
             | Operation::DropTable { .. }
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
@@ -159,7 +192,10 @@ impl Operation {
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
             | Operation::ExpireDeleteFile { .. }
-            | Operation::UpdateStats { .. } => None,
+            | Operation::UpdateStats { .. }
+            | Operation::InlineInsert { .. }
+            | Operation::InlineDelete { .. }
+            | Operation::FlushInlinedData { .. } => None,
         }
     }
 }
@@ -324,22 +360,28 @@ impl ChangeSet {
                 Operation::DropTable { table_id } => {
                     set.dropped_tables.insert(*table_id);
                 }
-                Operation::RegisterDataFile { table_id } => {
+                // An inlined insert is an append and an inlined tombstone
+                // a delete: they classify exactly as their file-backed
+                // counterparts, because to a concurrent writer they are the
+                // same change to the same table.
+                Operation::RegisterDataFile { table_id } | Operation::InlineInsert { table_id } => {
                     set.inserted_tables.insert(*table_id);
                 }
-                Operation::RegisterDeleteFile { table_id } => {
+                Operation::RegisterDeleteFile { table_id }
+                | Operation::InlineDelete { table_id } => {
                     set.deleted_from_tables.insert(*table_id);
                 }
-                Operation::ExpireDataFile { table_id } => {
+                Operation::ExpireDataFile { table_id }
+                | Operation::FlushInlinedData { table_id } => {
                     set.merge_adjacent_tables.insert(*table_id);
                 }
                 Operation::ExpireDeleteFile { table_id } => {
                     set.rewrite_delete_tables.insert(*table_id);
                 }
-                Operation::UpdateStats { .. } => {
-                    // UpdateStats does not populate any set; it exists so a
-                    // stats-only commit is non-empty and mints a snapshot.
-                }
+                // Neither populates a set: each exists so its commit is
+                // non-empty and mints a snapshot. A schema alteration has no
+                // kind in the wire grammar at all.
+                Operation::UpdateStats { .. } | Operation::AlterSchema { .. } => {}
                 Operation::CreateView {
                     schema_id,
                     schema_name,

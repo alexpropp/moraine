@@ -3553,3 +3553,45 @@ async fn a_snapshot_id_that_does_not_advance_the_head_is_refused() {
         );
     }
 }
+
+/// The column-type policy is the core's, so the staged path refuses a
+/// `VARIANT` column at the commit that creates it — the same refusal the
+/// verb path raises, and typed `Unsupported` rather than a constraint so
+/// the bridge maps it to "not implemented".
+#[tokio::test]
+async fn a_variant_column_is_refused_as_unsupported() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    let mut column = column_row(1, 1, "v", 0);
+    column[6] = Cell::Str("VARIANT".to_string());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column,
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+
+    let err = tx.commit().await.unwrap_err();
+    assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+    // Nothing landed: the whole commit aborts, table included.
+    assert!(
+        catalog
+            .snapshot()
+            .await
+            .unwrap()
+            .table_by_name(crate::catalog::SchemaId::new(0), "t")
+            .is_none()
+    );
+}

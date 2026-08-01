@@ -66,25 +66,31 @@ only on a format that actually rewrites a key.
 
 ## 0003 — Public API shape of the core
 
-- **IMPL** — `Error::Interrupted` and `Error::Unsupported` exist and are
-  bridged, but nothing in the core raises them yet: the interrupt path is
-  0010's shielding work, and the one live unsupported-feature rejection
-  (VARIANT inlining) is thrown shim-side. Wire the core to raise them as those
-  paths land. `SnapshotExpired` and `Migration` are raised.
-- **IMPL** — `set_partitioning` / `clear_partitioning` verbs and the
-  `PartitionSpec` domain type. Specs reach the store only through the generic
-  staged-row path today.
-- **IMPL** — The `partitioning_of(table)` snapshot accessor, or a decision to
-  drop it from the RFC. The code currently asserts the opposite intent.
-- **IMPL** — Public `set_tag` / `remove_tag` verbs. The read side (`tags_of`)
-  exists with no mutator.
-- **IMPL** — Public `inline_insert`, `inline_delete`, and `flush_inlined_data`
-  on `Transaction`. Only the raw ABI staging shim exists.
-- **IMPL** — `recent_rows(table)` / `recent_row(table, row_id)` accessors
-  serving the `inline` subspace natively.
-- **DEFERRED** — A verb for registering a row-id-preserving (rewrite) data
-  file. Inexpressible on the verb surface today; owned by a future RFC
-  covering the compaction surface (0016).
+- **IMPL** — `Error::Interrupted` is bridged but nothing in the core raises
+  it: the interrupt path is 0010's shielding work. Wire the core to raise it
+  as that path lands. `Unsupported`, `SnapshotExpired` and `Migration` are
+  raised.
+- **VALIDATE** — Confirm the core's `VARIANT` refusal reaches a DuckLake user
+  before the shim's Arrow-conversion one does. Both refuse at `CREATE TABLE`
+  and both name moraine, the type, and Arrow, so
+  `ducklake_variant_column_rejected_with_clear_error` passes either way — but
+  which fires first is unverified, and it decides whether the shim's guard is
+  a duplicate that can go or the only thing standing between the user and
+  DuckDB's bare "Unsupported Arrow type VARIANT". Needs the e2e tier's
+  DuckDB CLI and network.
+- **DEFERRED** — A general verb for registering a row-id-preserving (rewrite)
+  data file. Owned by a future RFC covering the compaction surface (0016).
+  `flush_inlined_data` carries its own registration, so the inline path does
+  not wait on this.
+- **DEFERRED** — A time-travelling inline read. `recent_rows` serves head;
+  the selection underneath it takes any snapshot (it is what the extension's
+  four scan variants ride), so a `recent_rows_at` is a signature away. No
+  embedding consumer needs one yet.
+- **DEFERRED** — Let one commit both inline into a table and flush it. The
+  drain reads the store as it stood before the commit, so a chunk staged in
+  the same commit would survive its own flush; the verb refuses the
+  combination rather than double-count. Lifting it means resolving the drain
+  against the transaction's own staged chunks as well as the store's.
 - **DEFERRED** — A `create_mapping` verb, if an embedding consumer
   materializes (0018).
 - **DEFERRED** — A snapshot-expiry verb (0007).
@@ -534,9 +540,6 @@ RFC edit, and the RFC is binding until edited.
 
 - **0001** marks the real-object-storage test tier as future and not built. It
   exists, as an integration test plus an xtask target.
-- **0003** specifies a `partitioning_of(table)` accessor; the snapshot code
-  states that partition and sort specs carry no read accessors by design.
-  Tracked as an item under 0003.
 - **0006** prescribes no `build.rs` and a plain `staticlib` crate type. The
   crate has a `build.rs` and declares `staticlib` plus `rlib`.
 - **0018** says reject UPDATE and DELETE against the mapping tables. UPDATE is

@@ -27,7 +27,7 @@ use crate::{
         proto, read, value,
     },
     transaction::{
-        index_maintenance,
+        index_maintenance, inline,
         operations::{ChangeSet, Operation},
         verbs::{Transaction, TransactionParts},
     },
@@ -568,6 +568,7 @@ where
     let TransactionParts {
         operations,
         index_entries,
+        inline_ops,
         mut state,
         next_catalog_id,
         next_file_id,
@@ -601,10 +602,15 @@ where
     index_maintenance::apply_poison(&mut state, &poisoned);
 
     let mut writes = diff_writes(base, &state, new_id);
+    // Inline records live outside the entity model, so they are translated
+    // rather than diffed — and translated against `db_tx`'s pre-commit
+    // state, before any of this batch's writes are staged onto it.
+    writes.extend(inline::stage_inline_writes(db_tx, &inline_ops).await?);
     writes.extend(format_stamp(db_tx, &state).await?);
     tracing::debug!(
         snapshot = new_id,
         index_entries = index_entries.len(),
+        inline_ops = inline_ops.len(),
         catalog_writes = writes.len(),
         poisoned_indexes = poisoned.len(),
         "commit staged"

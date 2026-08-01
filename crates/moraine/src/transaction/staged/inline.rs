@@ -31,7 +31,7 @@ impl ChunkSeqAllocator {
 /// those chunks' rows consumed. Reads `db_tx`'s current (pre-commit)
 /// inline records — the flush op only ever names the table and snapshot,
 /// never the keys to remove.
-pub(super) async fn translate_inline_flush_delete(
+pub(crate) async fn translate_inline_flush_delete(
     db_tx: &DbTransaction,
     table_id: u64,
     schema_version: u64,
@@ -133,7 +133,7 @@ pub(super) async fn translate_inline_drop(
 /// (for `InlineFlushDelete`/`InlineDrop`, which name a table rather than
 /// the keys to remove) at its pre-commit state, before any of this
 /// commit's own writes are staged onto it.
-pub(super) fn inline_schema_write(
+pub(crate) fn inline_schema_write(
     table_id: u64,
     schema_version: u64,
     arrow_schema: &[u8],
@@ -151,7 +151,7 @@ pub(super) fn inline_schema_write(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn inline_insert_write(
+pub(crate) fn inline_insert_write(
     table_id: u64,
     schema_version: u64,
     begin_snapshot: u64,
@@ -177,7 +177,7 @@ pub(super) fn inline_insert_write(
     )
 }
 
-pub(super) fn inline_inline_delete_write(
+pub(crate) fn inline_inline_delete_write(
     table_id: u64,
     row_id: u64,
     end_snapshot: u64,
