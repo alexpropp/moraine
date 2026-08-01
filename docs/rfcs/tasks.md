@@ -100,25 +100,12 @@ key.
   read, so it can only ever lead a batch, never fold onto a member. Worth
   building when DuckLake's serialized metadata connection admits concurrent
   committers — until then there is nothing to batch it with.
-- **DEFERRED** — File-grain (`data_file_id`) delete-delete conflict detection,
-  matching DuckLake's finer granularity. Table grain today.
-- **IMPL** — Translate DuckLake's `ducklake_metadata` write on the staged-row
-  path, so `CALL <lake>.set_option(…)` works through the extension as it does
-  through the verb path. moraine serves that table read-only today and the
-  write is refused. Shared with 0006.
 - **MEASURE** — Commit latency against a *real* S3, not a loopback one. The
   composition is settled and measured both ways (`BENCHMARK.md` → Core
   measurements: `max(flush cadence, write RTT) + ~2 ms`, confirmed by an
   injected-RTT sweep and validated against MinIO), so what remains is only
   the absolute S3 PUT term the harness needs a real bucket to see:
   point `object_storage.rs` at one and record the row.
-- **VALIDATE** — Drive DuckLake's `RunCommitLoop` / `CheckForConflicts`
-  against a *lost* race, which needs a harness with two DuckDB connections on
-  one instance (the CLI has one, and a second process fences rather than
-  races). The observable halves are pinned — its retry budget, the
-  `ducklake_snapshot_changes` reads it issues between attempts, and the
-  `changes_made` grammar it re-parses — but the loop itself has never run
-  against moraine.
 
 ## 0005 — Data inlining on SlateDB
 
@@ -138,10 +125,6 @@ key.
   an existing checkpoint, writing nothing; `Catalog::create_checkpoint` mints
   one), so what remains is carrying an id from `ATTACH` through the shim into
   the read-only open. Shared with 0004 and 0017.
-- **IMPL** — Translate `INSERT INTO ducklake_metadata` on the staged-row path,
-  so DuckLake's `set_option` reaches moraine's option records instead of being
-  refused. The verb path already has `set_option`/`unset_option`; the table is
-  served read-only. Shared with 0004.
 - **DECISION** — Should scan results cross the C ABI as Arrow (the Arrow C Data
   Interface) rather than the current owned `#[repr(C)]` row-struct arrays?
 - **DECISION** — The DuckDB and DuckLake pin bump policy: does moraine track

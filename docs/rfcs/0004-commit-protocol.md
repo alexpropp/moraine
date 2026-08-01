@@ -350,15 +350,23 @@ conflict and make moraine strictly stricter than the catalog it serves.
 
 DuckLake is finer-grained in exactly one place — two transactions
 *deleting* from the same table conflict only if they touched the same
-**data files** (its `CheckForConflicts` fetches the
-files deleted after the transaction's snapshot and conflict-checks at
-`data_file_id` grain). moraine keeps delete-delete at table grain on the
-verb path: stricter is safe there, because the verb path is moraine's own
-embedding API — while on the extension path DuckLake applies its own
-matrix itself (see Staged-row commits), so fidelity to DuckLake is
-structural, not something moraine's classifier must reproduce. File-grain
-delete-delete is a possible later refinement if an embedding workload
-wants it.
+**data files** (its `CheckForConflicts` fetches the files deleted after
+the transaction's snapshot and conflict-checks at `data_file_id` grain) —
+and moraine matches it. A `register_delete_file` records the data file it
+targets, and two commits deleting from one table classify benign when
+those targets are disjoint. The premise holds because moraine allows one
+live delete file per data file: disjoint targets write disjoint records,
+so neither commit invalidates the other's.
+
+Two cases fall back to table grain, both because the file set is not
+knowable rather than as a policy choice. An **inlined** delete names a
+row, not a file. And a **DuckLake-authored** change set arrives through
+the `changes_made` grammar, which carries `deleted_from_table:<id>` and
+no file — so a commit whose file ids moraine did not author is treated as
+deleting from all of them. Since data-file ids are global, a shared id is
+a shared file and the comparison needs no table key; the file ids ride the
+snapshot record as moraine-internal state, exactly as
+`schema_changed_table_ids` does, and are invisible to DuckLake.
 
 **Name collisions are invisible to id-set comparison.** Two concurrent
 commits each creating a table named `orders` in the same schema allocate
@@ -483,13 +491,14 @@ data (RFC 0003 verb names):
   `ducklake_metadata` within the transaction's metadata connection — it
   mints no snapshot, bumps no `schema_version`, and is not recorded in
   `snapshot_changes` (so it is invisible to conflict detection; options
-  are last-write-wins). The verb path implements exactly that. The
-  staged-row path does not yet: moraine serves `ducklake_metadata`
-  read-only, so DuckLake's write is refused rather than applied, and
-  `CALL <lake>.set_option(…)` fails. The classification above is
-  unaffected either way — a refused option write mints no snapshot — but
-  the surface is a gap, tracked against RFC 0006's staged-row
-  translation.
+  are last-write-wins). Both paths implement exactly that. On the
+  staged-row path a `ducklake_metadata` row translates to a write of the
+  scope's option record, and because such a commit carries no
+  `ducklake_snapshot` insert it takes the head-preserving path — the same
+  one snapshot expiry and file cleanup take. So `CALL
+  <lake>.set_option(…)` lands the option and moves nothing else: no
+  snapshot, no `schema_version`, no `snapshot_changes` entry, and so
+  nothing for conflict detection to see.
 
 This classification is source-verified against DuckLake
 (`DuckLakeTransactionState::SchemaChangesMade`, which tests exactly the
@@ -629,7 +638,11 @@ transaction, because DuckLake authors its snapshot id against the head it
 read, and no fold onto a preceding member can re-derive that id. The id is
 therefore checked rather than trusted — a staged commit whose id does not
 advance the head it lands on is refused, where before it relied on the
-head-pointer race to catch the same disagreement.
+head-pointer race to catch the same disagreement. That refusal is a lost
+race and must be reported as one: it carries `CommitConflict`'s text, the
+substring DuckLake re-drives on. Reporting it as corruption instead would
+be a wire-contract bug, not a wording one — DuckLake would abandon a
+transaction it could have re-run against the head that won.
 
 So batching is a verb-path property, and SQL through DuckLake reaches it
 only where a statement runs a verb (index DDL, maintenance). DuckLake's own
@@ -704,6 +717,10 @@ SlateDB on in-memory `object_store` — no mocks of the store:
 - Concurrent pure appends to the same table both succeed (append-append
   refinement); the loser's rows carry row ids re-allocated above the
   winner's advanced `next_row_id`, with no collision or gap.
+- Concurrent deletes from the same table are benign when their target data
+  files are disjoint and a conflict when they meet on one; an inlined
+  delete, and a delete parsed from DuckLake's grammar, fall back to table
+  grain.
 - Concurrent same-name creates (two commits each creating table `orders`
   in one schema): exactly one succeeds; the other's retry re-runs the
   closure and returns `AlreadyExists` — never two live tables with one
@@ -748,11 +765,18 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   inlined) and by name-mapping registration; and DuckLake's retry budget
   (`ducklake_max_retry_count` 10, `ducklake_retry_wait_ms` 100,
   `ducklake_retry_backoff` 1.5) is what the composed budget above assumes.
-  A genuine concurrent DuckLake race is unreachable from one CLI session
-  (one serialized metadata connection; a second read-write attach fences),
-  so what a retry *would* read mid-flight is pinned instead: the
+  A genuine concurrent DuckLake race needs more than one connection on one
+  DuckDB instance, which the CLI cannot give: `test/sql` drives DuckDB's
+  own sqllogictest runner for that, and pins the loop end to end — two
+  overlapping DuckLake transactions where a compatible loser re-drives and
+  lands (with row ids dense across the race), and an incompatible one
+  throws. What a retry reads mid-flight is pinned alongside it: the
   `ducklake_snapshot_changes` rows above a snapshot id, and the exact
   `changes_made` entries moraine authors on the verb path.
+- Options through the staged-row path: `set_option` records the option,
+  global or table-scoped, and mints no snapshot; a second write of one key
+  wins over the first; a delete removes it and the scope resolves to its
+  parent's value again.
 - Group commit: a group costs fewer object-store writes than the same
   members committed separately; every member mints its own consecutive
   snapshot and time travel resolves each one to that member's state; a
@@ -789,17 +813,16 @@ E2E testing validates the protocol against real DuckLake SQL.
   disjoint-table writers would falsely conflict. The single-`WriteBatch`
   CAS already serializes the physical write; there is no reason to also
   serialize logically-disjoint commits.
-- **Entity-level conflict detection (per-file/column).** Rejected for the
-  verb path, with the precise shape of DuckLake's model in view: DuckLake's
-  matrix is operation-grained over tables everywhere except one case —
-  delete-vs-delete on the same table is checked at `data_file_id` grain.
-  Reproducing that one file-grain check buys concurrency only for
-  concurrent deleters of one table (rare in the workloads moraine targets)
-  at real machinery cost, and matters not at all on the extension path,
-  where DuckLake applies its own matrix. Table grain plus the
-  append-append refinement matches DuckLake everywhere else; the
-  file-grain delete-delete check is the noted candidate if an embedding
-  workload ever needs it.
+- **Entity-level conflict detection (per-file/column) everywhere.**
+  Rejected, but with one exception now built. DuckLake's matrix is
+  operation-grained over tables everywhere except delete-vs-delete on one
+  table, which it checks at `data_file_id` grain — and moraine reproduces
+  exactly that one check (above), because a delete already names its
+  target file and carrying the id costs a set comparison. Generalizing the
+  idea to columns or to per-file inserts is what stays rejected: it buys
+  no concurrency the append-append refinement does not already give, and
+  it would put entity-shaped knowledge in a classifier whose whole virtue
+  is not needing any.
 - **Global `next_row_id` in the snapshot record.** Rejected: contradicts
   DuckLake (`next_row_id` is per-table in `ducklake_table_stats`) and would
   make every insert into any table contend on one counter, turning benign
