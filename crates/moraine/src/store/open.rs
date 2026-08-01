@@ -66,9 +66,9 @@ impl<'a> StoreBuilder<'a> {
     }
 
     /// Opens (or creates) the store as a read-write [`Db`].
-    pub(crate) async fn open_writer(self) -> Result<Db> {
+    pub(crate) async fn open_writer(&self) -> Result<Db> {
         let settings = self.settings();
-        Db::builder(self.path, self.object_store)
+        Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .build()
@@ -79,12 +79,12 @@ impl<'a> StoreBuilder<'a> {
     /// Opens the store read-only as a [`DbReader`] following the latest
     /// manifest. A `DbReader` never opens the writer `Db`, so it never fences
     /// a live writer. The flush cadence, if set, is ignored.
-    pub(crate) async fn open_reader(self) -> Result<DbReader> {
+    pub(crate) async fn open_reader(&self) -> Result<DbReader> {
         let options = DbReaderOptions {
             object_store_cache_options: self.cache_options(),
             ..Default::default()
         };
-        DbReader::builder(self.path, self.object_store)
+        DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_options(options)
             .build()

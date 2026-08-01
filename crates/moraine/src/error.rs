@@ -88,10 +88,38 @@ pub enum Error {
     #[error("writer fenced: {0}")]
     Fenced(String),
 
+    /// Another process created this store while this open was creating it.
+    /// Benign: the store exists now, so opening again adopts it. Distinct
+    /// from [`Error::Fenced`], which displaces a writer that had already
+    /// attached — here nothing was ever attached, and nothing was written.
+    ///
+    /// Only reachable on an empty store. Once a store exists, the writer
+    /// epoch is claimed under a retry that absorbs the same race, so a
+    /// second open takes over rather than failing.
+    ///
+    /// Free of the four substrings DuckLake's commit loop retries on: this
+    /// is an attach-time race, not a commit conflict, and re-driving a
+    /// commit would be the wrong response to it.
+    #[error("open raced: {0}")]
+    OpenRaced(String),
+
     /// The underlying store failed (SlateDB / object-store I/O).
     #[error("store error")]
     Store(#[source] Box<slatedb::Error>),
 }
+
+/// What SlateDB reports when a compare-and-swap loses to a version that
+/// already landed — for moraine, the first manifest two processes both try
+/// to create on an empty store.
+///
+/// Matched as text because the condition behind it is `pub(crate)` upstream:
+/// this and a damaged manifest both arrive as [`slatedb::ErrorKind::Data`],
+/// so the kind alone cannot separate a benign race from real corruption.
+/// The crash-recovery suite pins this wording by failing a real manifest
+/// CAS, so a SlateDB bump that rewords it fails there rather than silently
+/// sending every genesis race back to the untyped [`Error::Store`].
+pub(crate) const MANIFEST_VERSION_EXISTS: &str =
+    "transactional object (e.g. manifest) version already exists";
 
 impl From<slatedb::Error> for Error {
     fn from(err: slatedb::Error) -> Self {
@@ -105,6 +133,18 @@ impl From<slatedb::Error> for Error {
                     .to_string(),
             );
         }
+
+        if err.kind() == slatedb::ErrorKind::Data
+            && err.to_string().contains(MANIFEST_VERSION_EXISTS)
+        {
+            warn!("another process created this store first; nothing was written");
+            return Self::OpenRaced(
+                "another process created this store while this open was creating it; \
+                 nothing was written — open again to adopt the store it created"
+                    .to_string(),
+            );
+        }
+
         Self::Store(Box::new(err))
     }
 }
@@ -137,6 +177,7 @@ mod tests {
             Error::IndexBuilding(sample.into()),
             Error::Configuration(sample.into()),
             Error::Fenced(sample.into()),
+            Error::OpenRaced(sample.into()),
             Error::Unsupported(sample.into()),
             Error::SnapshotExpired(sample.into()),
             Error::Interrupted(sample.into()),

@@ -1,8 +1,73 @@
 use std::sync::Arc;
 
-use object_store::memory::InMemory;
+use futures::TryStreamExt;
+use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
 
 use super::*;
+
+/// The durable-commit wrapper is transparent: it hands back exactly what
+/// the commit reported. The wait it wraps is unbounded on purpose — a
+/// deadline could not cancel the staged batch, so it would report failure
+/// for a commit that still lands — and all it adds is a log line once the
+/// wait runs long.
+#[tokio::test]
+async fn a_durable_commit_returns_its_own_outcome() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = StoreBuilder::new("", object_store)
+        .open_writer()
+        .await
+        .unwrap();
+
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(Key::Sys(SysKey::Head).encode(), b"head").unwrap();
+    assert!(commit_durable(tx, "test").await.is_ok());
+    assert_eq!(
+        db.get(&Key::Sys(SysKey::Head).encode())
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"head"
+    );
+
+    db.close().await.unwrap();
+}
+
+/// A store whose manifest cannot be read fails the open outright, rather
+/// than being mistaken for an empty store and bootstrapped over.
+#[tokio::test]
+async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    StoreBuilder::new("", object_store.clone())
+        .open_writer()
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+
+    // Overwrite every manifest with bytes no version of one can parse.
+    let manifests: Vec<_> = object_store
+        .list(None)
+        .map_ok(|meta| meta.location)
+        .try_filter(|location| futures::future::ready(location.to_string().contains("manifest")))
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(!manifests.is_empty(), "the store must have a manifest");
+    for manifest in manifests {
+        object_store
+            .put(&manifest, vec![0xff; 64].into())
+            .await
+            .unwrap();
+    }
+
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Store(_)), "{err:?}");
+}
 
 /// A store stamped with a newer structural format must be refused,
 /// not misread.

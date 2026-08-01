@@ -25,6 +25,7 @@ mod helpers;
 
 mod attach;
 mod change_feed;
+mod crash;
 mod ddl;
 mod index;
 mod inline;

@@ -1180,7 +1180,7 @@ impl Catalog {
 
         let tx = self.begin_write_tx().await?;
         let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
-        tx.commit_with_options(&commit::durable())
+        commit::commit_durable(tx, "entry reclamation")
             .await
             .map_err(Error::from)?;
 

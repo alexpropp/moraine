@@ -73,10 +73,11 @@ takeover adds no torn state of its own, it only changes *who* observes the
 all-or-none result.
 
 **Resumability — a long operation is several batches, and remembers how far
-it got.** Some work is too large for one batch: a staged index backfill, and
-the reclamation of a dead index's entries. These run one batch per commit so
-a large operation never holds the writer, which means they are genuinely
-*not* atomic as a whole and a crash can land between batches. What carries
+it got.** Some work is too large for one batch: a staged index backfill, the
+reclamation of a dead index's entries, and a structural format migration.
+These run one batch per commit so a large operation never holds the writer,
+which means they are genuinely *not* atomic as a whole and a crash can land
+between batches. What carries
 them is that each batch is atomic and the operation persists its own
 progress, so a re-run continues from there — never restarting, never
 double-counting, and never serving reads from a half-built state.
@@ -106,6 +107,26 @@ engine PUT and its commit can only be staged where both run — the e2e tier,
 not here. This RFC does not enumerate those cases; it states the boundary so
 their absence is a decision rather than an oversight.
 
+That boundary is covered where it lives. The e2e suite kills a DuckDB
+process between DuckLake's Parquet write and the commit that would register
+it, then asserts the direction the contract runs in: the bytes are left
+**orphaned** — on disk, referenced by nothing — and never the reverse, a
+live catalog row pointing at a file that was never written. An orphan
+wastes space until cleanup reclaims it; a dangling reference is unreadable
+data. moraine's half of that test is the atomicity above, which is why the
+uncommitted insert leaves no trace in the catalog at all.
+
+Compaction sits entirely on the engine's side of that line, and introduces
+no seam of its own. RFC 0008 makes it an ordinary snapshot-minting commit:
+DuckLake writes the new Parquet, then one metadata transaction that lands as
+one `WriteBatch` — PUT-then-batch, the shape already above. It allocates no
+row ids, carries no cursor, and spans no second batch, so it adds no
+resumability case; and RFC 0008 explicitly **rejected** deleting superseded
+bytes inside the commit, so it adds no delete ordering either — it schedules
+rows and RFC 0007's cleanup deletes later. Compaction is therefore covered
+by `CommitNotDurable` and `CommitDurableNotAcknowledged` like any other
+commit, with its physical half belonging to the e2e boundary above.
+
 ## The cases
 
 ### Governed by atomicity
@@ -113,13 +134,13 @@ their absence is a decision rather than an oversight.
 | Case | What the crash interrupts | What must hold after reopen |
 |---|---|---|
 | `CommitNotDurable` | Batch staged (step 3), WAL flush withheld (step 4 not durable) | `sys/head` still `N`; snapshot `N+1` absent; no `current`/`history`/`inline`/`tstat` record from the commit is visible. All-or-none: none. |
-| `CommitDurableNotAcknowledged` | Flush landed; the process dies before returning to the caller | The commit is durable: `sys/head` = `N+1`, snapshot `N+1` resolves fully. A caller re-drive of the same logical operation runs against the advanced head and never corrupts: ids never collide (counters advanced with the landed commit) and logically-guarded operations surface their guard (`AlreadyExists` for a re-driven create, `CommitConflict`/`NotFound` where the premise moved). The scope is deliberate: a re-driven *data-only* operation — `register_data_file` of the same file, an identical inline insert — is a fresh commit and lands a second time; nothing in the protocol dedups it, absent the idempotence machinery a `seqnum` pinning decision would enable. This case asserts consistency of the landed commit and guard-surfacing on re-drive, not universal exactly-once. |
+| `CommitDurableNotAcknowledged` | Flush landed; the process dies before returning to the caller | The commit is durable: `sys/head` = `N+1`, snapshot `N+1` resolves fully. A caller re-drive of the same logical operation runs against the advanced head and never corrupts: ids never collide (counters advanced with the landed commit) and logically-guarded operations surface their guard (`AlreadyExists` for a re-driven create, `CommitConflict`/`NotFound` where the premise moved). The scope is deliberate: a re-driven *data-only* operation — `register_data_file` of the same file, an identical inline insert — is a fresh commit and lands a second time; nothing in the protocol dedups it, and nothing will short of a caller-supplied idempotency token (RFC 0004, "Sequence numbers are the store's, not moraine's" — pinning a `seqnum` was considered there and does not substitute). This case asserts consistency of the landed commit and guard-surfacing on re-drive, not universal exactly-once, and that scope is now settled rather than provisional. |
 | `MultiTombstoneDrop` | A `DROP TABLE`/`DROP SCHEMA` ending *many* records (the table row, every column, every `file`/`delfile` → `history`; every live `inline` chunk deleted), crashed at every reachable WAL boundary | Reopen shows the table **fully present** or **fully dropped** — never a torn table missing some columns or files. There is **no** reachable point "after the first tombstone, before the last," because the entire multi-tombstone `DROP` is one `WriteBatch` (RFC 0002). This case's job is to *prove that absence*: it fails if any code path splits a `DROP` across batches. |
 | `GroupCommit` | Several catalog commits staged into one batch (RFC 0004, "Group commit") | All-or-none over the *whole group*: reopen shows every member committed or none. No partial group — a batch is a batch regardless of how many logical commits it carries. |
 | `TakeoverMidCommit` | Writer A dies mid-commit; writer B opens the store and takes over (SlateDB epoch fence) | B reads a consistent head. If A's flush had not landed, B sees `sys/head` = `N` and A's batch is invisible. If A's flush *had* landed, B sees `N+1` and continues from there. No split-brain, no partial-A visibility. |
 | `FencedWriterResumes` | A wakes and attempts its CAS/flush *after* B has taken over and bumped the writer epoch | A is fenced: it loses the `sys/head` CAS or is epoch-fenced by SlateDB, returns a typed error, and writes nothing. The store is byte-identical to the timeline in which A never woke. Confirms RFC 0004's "an accidental second writer never corrupts." |
 | `GenesisInterrupted` | A single initializer dies after writing `sys/format` but before `sys/head`/snapshot `0` | Reopen shows the store **empty** (genesis re-attempted from scratch) or **fully initialized** — never half-initialized (a `sys/format` with no head). This forces initialization to be **one `WriteBatch`** like any commit, i.e. the atomicity guarantee extends to genesis. |
-| `ConcurrentGenesis` | Two processes initialize the *same empty* store concurrently, each trying to write `sys/format` + genesis `sys/head`/snapshot `0` | Exactly one wins. There is no create-if-absent primitive to lean on; the guards are the real ones: SlateDB's `writer_epoch` (the second `Db::open` fences the first, so the fenced initializer's genesis batch writes nothing) and, within one writer, transactional write-write conflict detection on `sys/format`. The loser observes the store already initialized and adopts it, or returns a typed error — never writing a second `sys/format`, a divergent genesis snapshot, or a conflicting head. Reopen shows a single, coherent genesis. |
+| `ConcurrentGenesis` | Two processes initialize the *same empty* store concurrently, each trying to write `sys/format` + genesis `sys/head`/snapshot `0` | Exactly one wins. There is no create-if-absent primitive to lean on; the guards are the real ones: SlateDB's `writer_epoch` (the second `Db::open` fences the first, so the fenced initializer's genesis batch writes nothing) and, within one writer, transactional write-write conflict detection on `sys/format`. The loser observes the store already initialized and adopts it, or returns a typed error — `OpenRaced` if it lost the race to create the first manifest, `Fenced` if it was displaced after creating one, never an untyped store error — and never writes a second `sys/format`, a divergent genesis snapshot, or a conflicting head. Reopen shows a single, coherent genesis. |
 
 `TakeoverMidCommit` decomposes into the two atomicity outcomes under a *new*
 process rather than being a third outcome. `FencedWriterResumes` is its
@@ -131,6 +152,33 @@ wake, cannot still land its stale batch.
 processes plus conflict detection on `sys/format` within one, and the
 loser's correct behavior is to **adopt**, not to conflict — a fresh store is
 not a true conflict but a benign "someone beat me to genesis" race.
+
+The losing open is **not** re-attempted, and the reason is a property of
+the fence rather than a preference. Every open takes the writer epoch by a
+manifest compare-and-swap, so a concurrent open loses that CAS — but
+re-attempting takes the epoch in turn, which fences whichever initializer
+had just won. Two initializers that both re-attempt can therefore both
+lose, trading a race that always leaves a winner for one that sometimes
+leaves none. Failing the losing open immediately is what makes "exactly one
+wins" hold.
+
+The loser still fails **typed**, by one of two guards depending on how far
+it got. If it lost the race to create the store's first manifest it never
+attached at all, and that is `OpenRaced`: benign, nothing written, and
+opening again adopts the store the winner created. If it created the store
+and was displaced afterwards, that is the ordinary `Fenced`. The two are
+worth keeping apart — one says re-attach and you will find a catalog, the
+other says you already had one and lost it.
+
+Only the first is peculiar to genesis, and only because there is nothing to
+fence yet: once a store exists, the epoch claim retries internally and
+absorbs the same race, so a second open takes over instead of failing.
+Typing it costs a match on SlateDB's message text, because the condition
+that separates a lost CAS from a damaged manifest is private upstream and
+both arrive as the same error kind. That is a fragile contract held
+deliberately: the suite stages a real lost CAS from outside and asserts the
+typed result, so a SlateDB bump that rewords the message fails there rather
+than quietly returning every genesis race to an untyped store error.
 `GenesisInterrupted` forces genesis itself under the one-batch rule so that
 the winner never leaves a torn genesis for the loser (or a reader) to
 observe.
@@ -141,6 +189,7 @@ observe.
 |---|---|---|
 | `StagedBuildInterrupted` | A staged index backfill (RFC 0016) partway through: some steps committed, the build not finished | The index is still `Building`, and **serves no reads** — a lookup returns `IndexBuilding`, never the subset of rows already backfilled, which would be a silently partial answer. Its `build_cursor` is durable, so re-issuing the build resumes from the watermark rather than restarting; entries re-derived below it land as idempotent puts. The finished index covers every row exactly once. |
 | `ReclamationInterrupted` | A dead index's entry reclamation (RFC 0007) partway through: some batches committed, others not | The committed batches stay reclaimed and the remaining entries survive to be found again. A re-run finishes them without re-reclaiming what is already gone, and converges: a further pass reclaims nothing. Live indexes and data files are untouched — the sweep only ever removes entries of an index the catalog no longer lists, and an index id is never reused. |
+| `MigrationInterrupted` | A structural format migration (RFC 0015) partway through: the driver dies after its start batch, after a step batch, before the finish flip, or after it | Reopen finds the store coherently **old** — stamped the source format, marker present, cursor durable — or coherently **new**: stamped the target format, marker gone. Never new-format-with-marker, because the flip and the clear land in one batch. A re-run reads the marker, resumes the named unit from its durable cursor, and finishes; it never restarts the rewrite from zero. Those four are the whole set of seams: a step's new-key write, its old-key delete, and its cursor advance share one batch, so there is no durable intermediate between them to crash into. |
 
 ## Why these are all of them
 
@@ -152,11 +201,12 @@ guarantee:
   commit, genesis, takeover — reduce to the two atomicity outcomes. The
   cases above instantiate that across every operation that could plausibly
   be tempted to span batches.
-- **Multi-batch paths** — the staged index backfill and entry reclamation —
-  are the only operations moraine deliberately spreads across commits, and
-  both carry durable progress. A third is coming: the format-migration
-  driver (RFC 0015) is start/step/finish over a cursor, the same shape, and
-  earns a case when it is built.
+- **Multi-batch paths** — the staged index backfill, entry reclamation, and
+  the format-migration driver — are the only operations moraine deliberately
+  spreads across commits, and all three carry durable progress. The
+  migration driver (RFC 0015) is start/step/finish over a cursor, the same
+  shape as the other two, and now that it is built it carries
+  `MigrationInterrupted`.
 
 Anything else moraine does is one commit, and a crash point inside one
 commit is, by RFC 0002's atomicity invariant, not reachable. The `CrashCase`
@@ -201,6 +251,21 @@ The harness therefore bounds the wait and treats "did not succeed" as the
 crash, asserting only that the operation never reported *success*, since
 success would mean the batch became durable after all.
 
+**moraine does not bound that wait in production**, and the reason is not
+convenience. A store that refuses writes permanently — expired credentials,
+a revoked bucket policy — stalls the writer instead of failing it, which is
+a poor thing to do to an operator. But a deadline would be worse than the
+stall: abandoning the wait does not undo the staged batch, because the
+flush continues beneath us. The deadline would therefore report failure for
+a commit that still lands, and a caller re-driving it would apply it twice —
+manufacturing the one outcome `CommitDurableNotAcknowledged` exists to say
+is safe only because nothing claims it failed. A timeout can honestly say
+"I do not know yet," and moraine's error taxonomy has no such answer. What
+moraine does instead is make the stall *visible*: a durable commit that has
+waited long enough logs what it is waiting for and what to check. That
+cannot produce a false negative, and it turns an invisible hang into a
+diagnosable one.
+
 This replaces an earlier design that reached for SlateDB's
 `Settings { flush_interval: None }` and `WriteOptions { await_durable: false }`
 to freeze the pre-flush instant from inside. That would have needed two
@@ -227,8 +292,9 @@ production knob added for it. The resumability cases are interruptible by
 construction — their batches are separate commits, so the harness stops
 driving and reopens — and every other case is produced from outside the
 operation, by dropping a handle, freezing the store, or opening a second
-writer. The one path that will need its own seam hook is RFC 0015's
-migration driver, which carries one.
+writer. The one path that needs its own seam hook is RFC 0015's migration
+driver, which carries one: its batch boundaries are internal to a single
+call, so there is no handle to drop between them.
 
 ## Test obligations
 
@@ -240,10 +306,11 @@ data-driven test that iterates `CrashCase`:
   and assert the case's invariant. A variant with no assertion is a test
   failure — this prevents a case from being silently stubbed out.
 - The idempotence cases (`CommitDurableNotAcknowledged`,
-  `StagedBuildInterrupted`, `ReclamationInterrupted`) additionally re-drive
-  the operation after reopen and assert convergence — no id collision, no
-  torn state, no double-counting, and no error other than the typed ones the
-  protocol permits. For `CommitDurableNotAcknowledged` the assertion matches
+  `StagedBuildInterrupted`, `ReclamationInterrupted`,
+  `MigrationInterrupted`) additionally re-drive the operation after reopen
+  and assert convergence — no id collision, no torn state, no
+  double-counting, and no error other than the typed ones the protocol
+  permits. For `CommitDurableNotAcknowledged` the assertion matches
   that case's stated scope: guarded operations surface their guard, and a
   data-only re-drive lands as a *clean second commit* (the duplicate is the
   caller's to prevent until the `seqnum` question is settled), never a
@@ -295,7 +362,7 @@ half — reclaiming entries in resumable batches — is
   ceiling.
 - **One crash test per RFC, owned by that RFC.** Rejected: the invariants
   are cross-cutting (atomicity recurs in commit, drop, takeover, and
-  genesis; resumability in backfill, reclamation, and the coming migration
+  genesis; resumability in backfill, reclamation, and the migration
   driver), so per-RFC ownership re-derives the same two guarantees several
   times over and makes the coverage argument impossible to state in one
   place.

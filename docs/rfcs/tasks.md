@@ -27,11 +27,12 @@ deliberately not itemized here.
 ## Where the weight is
 
 One thing gates disproportionately much of the list, the other two having
-closed. The crash harness (RFC 0011) now drives every case, the last one —
-`GroupCommit` — having landed with group commit itself; both guarantees
-moraine owns, atomicity and resumability, have driven cases. Format
-migration (RFC 0015) has its driver, its verb, and its marker, and waits
-only on a format that actually rewrites a key.
+closed. The crash harness (RFC 0011) drives every case but one: `GroupCommit`
+landed with group commit itself, and `MigrationInterrupted` waits on exactly
+what format migration waits on. Both guarantees moraine owns, atomicity and
+resumability, have driven cases. Format migration (RFC 0015) has its driver,
+its verb, and its marker, and waits only on a format that actually rewrites a
+key.
 
 - **Reader refresh** (RFC 0009). Reads now serve from the cache, so a warm
   read costs one point read. What is missing is *incremental* refresh: a
@@ -314,59 +315,23 @@ only on a format that actually rewrites a key.
 ## 0011 — Crash recovery
 
 - **IMPL** — Move `CrashCase` from the integration suite into the library,
-  gated on `#[cfg(any(test, feature = "fault-injection"))]`, once a case needs
-  an in-code seam hook. It and its coverage table live in
-  `tests/it/crash_recovery.rs` today because no driven case needs one. The
-  `fault-injection` feature already exists, but the `CrashPoint` behind it
-  enumerates the migration driver's batch boundaries — a separate thing that
-  happens to be crash-shaped, not these cases.
-- **DECISION** — A commit does not return if object storage stops accepting
-  writes. SlateDB treats a failed write as retryable and retries
-  indefinitely, so a permanent refusal — expired credentials, a revoked
-  bucket policy — hangs the writer instead of surfacing an error. Measured
-  while building the write freeze: 8 retries in 5s with nothing returned, and
-  the catalog state stayed correct throughout. Whether moraine should bound
-  that (a deadline, or classifying some object-store errors as terminal) is
-  open; the crash cases do not need it, since a dying process never learns
-  its outcome either.
-- **VALIDATE** — An e2e crash case for the engine-side ordering contract:
-  kill a process between DuckLake's Parquet PUT and the commit registering
-  it, and assert the file is an orphan rather than a live dangling
-  reference. 0011 now states this boundary but does not enumerate it, since
-  only `cargo xtask e2e` runs both halves.
-- **DECISION** — Should a concurrent-open loser surface a typed error?
-  `ConcurrentGenesis` shows the store stays coherent (200 races, zero torn
-  genesis) but the loser fails as `Error::Fenced` roughly a third of the time
-  and as an untyped `Error::Store` carrying SlateDB's manifest-CAS collision
-  the rest. The case requires "adopts it, or returns a typed error". Telling
-  that
-  collision from real corruption needs a condition SlateDB keeps
-  `pub(crate)` — both surface as `ErrorKind::Data` — so the options are a
-  message match, an open-path retry, or an upstream change.
-- **DECISION** — Does moraine pin `WriteOptions` `seqnum` itself, or let
-  SlateDB generate them? This determines how a re-drive after
-  `CommitDurableNotAcknowledged` is detected as a duplicate rather than a
-  fresh commit. That case currently asserts the scope RFC 0011 states: guarded
-  re-drives surface their guard, and a data-only re-drive lands as a clean
-  second commit.
-- **DECISION** — Does compaction introduce a state-change seam not already
-  shaped like PUT-then-batch? If it does, the seam is the engine's, so the
-  case belongs to the e2e item above rather than here.
-- **VALIDATE** — The absence cases (`MultiTombstoneDrop`, `GroupCommit`,
-  `GenesisInterrupted`) sweep the write allowance across every boundary the
-  operation has and assert the torn intermediate is unobservable at each.
-  Closed.
-- **VALIDATE** — Confirmed by construction: the crash cases added no
-  production surface at all. Crashes come from dropping a handle, freezing a
-  decorating `ObjectStore`, or opening a second writer, so there is no seam
-  hook to gate, no `unsafe`, and no fault-injection parameter in any public
-  signature. Re-check when RFC 0015's migration driver lands its own hook.
+  gated on `#[cfg(any(test, feature = "fault-injection"))]`, once a *driven*
+  case needs an in-code seam hook. It and its coverage table live in
+  `tests/it/crash_recovery.rs` today because no driven case needs one:
+  crashes come from outside the operation. `MigrationInterrupted` is the
+  case that will trip this, since the migration driver's boundaries are
+  internal to one call and its `CrashPoint` seams are the only way in — but
+  it is blocked below, so the move is not yet due.
+- **VALIDATE** — Drive `MigrationInterrupted` at the integration tier.
+  Blocked on the first shipped migration unit: `MIGRATIONS` is empty because
+  every format so far is additive, so `Catalog::migrate` is a no-op against
+  every store and no public path can put one mid-migration. All four seams
+  are covered today in the driver's own unit tests, which drive `Db`
+  directly against a caller-supplied registry — the right assertions at the
+  wrong tier, since RFC 0001 puts crash coverage against the public API.
 - **DEFERRED** — A `cargo-fuzz` target that crashes at arbitrary WAL offsets
-  and reopens, asserting the same two guarantees. Every case is green, so
-  this is now waiting only on the fuzzing tier itself (0001).
-- **DOC** — 0001 and 0004 still carry generic crash-shaped-sequence bullets;
-  replace them with citations to `CommitNotDurable` and
-  `CommitDurableNotAcknowledged`.
+  and reopens, asserting the same two guarantees. Every driven case is green,
+  so this is now waiting only on the fuzzing tier itself (0001).
 
 ## 0012 — Schema evolution and versioning
 
