@@ -117,51 +117,23 @@ key.
 
 ## 0006 — Extension surface (DuckDB)
 
-- **IMPL** — A per-DuckDB-version build-and-signing distribution pipeline. The
-  loadable's signature region is left zero, the release workflow publishes
-  unsigned, and every e2e harness passes `-unsigned`.
-- **IMPL** — Expose the zero-write checkpoint reader as an attach option. The
-  core half is built (`CatalogOptions::checkpoint` opens a `DbReader` against
-  an existing checkpoint, writing nothing; `Catalog::create_checkpoint` mints
-  one), so what remains is carrying an id from `ATTACH` through the shim into
-  the read-only open. Shared with 0004 and 0017.
-- **DECISION** — Should scan results cross the C ABI as Arrow (the Arrow C Data
-  Interface) rather than the current owned `#[repr(C)]` row-struct arrays?
-- **DECISION** — The DuckDB and DuckLake pin bump policy: does moraine track
-  each DuckDB minor as DuckLake cuts its matching branch, and how many past
-  series receive builds?
-- **DECISION** — How DuckLake's `ducklake:` prefix names or nests the moraine
-  attach.
-- **DEFERRED** — Make `moraine_attach` and `moraine_detach` cancellable. They
-  take no interrupt probe.
-- **DEFERRED** — Concurrent multi-read cancellation on a single handle. One
-  `Notify` per handle today.
-- **DEFERRED** — Model variant-column stats. `ducklake_file_variant_stats` is
-  the last always-empty stand-in.
-- **DEFERRED** — Resolve the upstream DuckLake catalog-cache multi-threaded
-  race (an empty listing right after a write) so the `SET threads=1` workaround
-  in the e2e harness can go.
-- **DEFERRED** — Semantic projection of the catalog: store a re-modeled form
-  and project it into `ducklake_*` on read. Revisit only with e2e evidence
-  that a specific access pattern demands it.
-- **VALIDATE** — Verify the DuckDB v1.5.4 pin has no patch-level ABI friction
-  against DuckLake's `v1.5-variegata`, which CI-builds on v1.5.3, and fall
-  back if it does.
-- **VALIDATE** — Determine which reads and writes DuckLake issues against
-  `ducklake_*`, to know which scans must be optimized. The filter half is
-  settled: DuckDB pushes no row filter into these tables, so there is no
-  predicate to optimize for and the pruning deferrals downstream of it are
-  inert (0009 records the condition that would revive them).
-- **VALIDATE** — Keep pinning the exact nested `ATTACH 'moraine:<uri>'` string
-  DuckLake generates, and re-verify on every pin bump.
-- **VALIDATE** — Keep pinning the two conflict-propagation wire obligations:
-  the `conflict` substring in the lost-commit message, and serving
-  `ducklake_snapshot` / `ducklake_snapshot_changes` reads mid-retry.
-- **VALIDATE** — Verify the id-collision backstop (a typed `Constraint` error
-  on inserting an id already live) covers all five primary-keyed kinds, and
-  that no name-uniqueness is enforced anywhere.
-- **DOC** — The single-writer and `READ_ONLY` fencing limitation belongs in the
-  ATTACH docs. The root README now carries it. Shared with 0004.
+- **IMPL** — Translate `DELETE FROM ducklake_inlined_delete_<table_id>`. The
+  dynamic inline-delete family serves `SELECT` and `INSERT`, so
+  `ducklake_flush_inlined_data` fails with `NotImplementedException` the
+  moment a table has inlined file-deletions to flush — reproducible with a
+  hundred-row insert (past the inlining limit, so a real data file lands), one
+  `DELETE`, then a flush. Found by the access-set validation, which is where
+  DuckLake's own `DELETE FROM {METADATA_CATALOG}.<inlined_table>` first became
+  visible. Needs a staged op that drops a table's `inline/file_delete`
+  records, so it is an 0005 keyspace change as much as a shim one.
+- **DEFERRED** — The upstream DuckLake catalog-cache multi-threaded race: a
+  fresh attach's listing comes back empty right after a write, so every e2e
+  session pins `SET threads=1`. Not moraine's to fix, and re-verified live at
+  the tracked version — 23 of 40 runs against a plain duckdb-file-backed
+  catalog with no moraine in the chain, and not `RENAME`-specific (a plain
+  `CREATE TABLE` is enough). A test now asserts the race's *presence* against
+  the reference chain, so its failure is the signal that the workaround can
+  go.
 
 ## 0007 — Snapshot expiry and garbage collection
 
@@ -471,7 +443,5 @@ RFC edit, and the RFC is binding until edited.
 
 - **0001** marks the real-object-storage test tier as future and not built. It
   exists, as an integration test plus an xtask target.
-- **0006** prescribes no `build.rs` and a plain `staticlib` crate type. The
-  crate has a `build.rs` and declares `staticlib` plus `rlib`.
 - **0018** says reject UPDATE and DELETE against the mapping tables. UPDATE is
   rejected; DELETE is deliberately accepted to serve expiry cleanup.
