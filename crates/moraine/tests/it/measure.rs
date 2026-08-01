@@ -32,7 +32,10 @@ use object_store::{
     throttle::{ThrottleConfig, ThrottledStore},
 };
 
-use crate::fixtures::{col, datafile};
+use crate::{
+    crash_recovery::freezing_store::FreezingStore,
+    fixtures::{col, datafile},
+};
 
 /// Median, min, and max of a set of samples, in milliseconds.
 struct Stats {
@@ -205,6 +208,168 @@ async fn measure_commit_latency_by_flush_interval() {
             "{flush_ms:>10}  {:>11.3}  {:>9.3}  {:>9.3}",
             stats.median_ms, stats.min_ms, stats.max_ms
         );
+    }
+    println!();
+}
+
+/// 0004 — commit throughput as concurrency rises, and where the batch's
+/// member ceiling starts to bind.
+///
+/// A lone commit costs one WAL flush, so sequential throughput is
+/// `1 / flush_interval` and nothing else — that is the number
+/// `measure_commit_latency_by_flush_interval` already records. This asks
+/// the question that one cannot: what concurrent commits cost, now that
+/// they coalesce. K callers commit `COMMITS / K` times each, every caller
+/// appending to a table of its own so nothing conflicts, and the harness
+/// counts the WAL objects the burst wrote — SlateDB's durable-commit unit,
+/// so `commits / wal_writes` is the mean batch size, measured rather than
+/// inferred.
+///
+/// Run at the default flush interval, because the flush in flight *is* the
+/// batching window: a faster interval closes the window sooner and batches
+/// less. The ladder runs past `MAX_BATCH_MEMBERS` (64) so the ceiling shows
+/// up as the batch size flattening while concurrency keeps climbing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_commit_throughput_by_concurrency() {
+    const COMMITS: usize = 128;
+    let ladder = [1usize, 2, 4, 8, 16, 32, 64, 128];
+
+    println!("\n# 0004 commit throughput by concurrency (in-memory object_store)");
+    println!(
+        "# {COMMITS} appends per level at the {DEFAULT_FLUSH_MS} ms default flush interval, \
+         one table per caller,"
+    );
+    println!("# 4-worker runtime; batch size is commits per WAL object written\n");
+    println!(
+        "{:>12}  {:>11}  {:>12}  {:>12}  {:>12}",
+        "concurrency", "wall_ms", "commits_per_s", "wal_writes", "batch_size"
+    );
+
+    for &concurrency in &ladder {
+        let store = Arc::new(FreezingStore::thawed(Arc::new(InMemory::new())));
+        let mut options = CatalogOptions::default();
+        options.flush_interval = Duration::from_millis(DEFAULT_FLUSH_MS);
+        let catalog = Catalog::open(store.clone(), options).await.unwrap();
+
+        // One table per caller, created up front so the timed burst is
+        // appends only.
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                for t in 0..concurrency {
+                    tx.create_table(schema, &format!("t{t}"), &[col("a")])?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let head = catalog.snapshot().await.unwrap();
+        let schema = head.schema_by_name("main").unwrap().id;
+        let tables: Vec<_> = (0..concurrency)
+            .map(|t| head.table_by_name(schema, &format!("t{t}")).unwrap().id)
+            .collect();
+
+        let per_caller = COMMITS / concurrency;
+        let wal_before = store.wal_writes();
+        let start = Instant::now();
+        let callers: Vec<_> = tables
+            .into_iter()
+            .map(|table| {
+                let catalog = catalog.clone();
+                tokio::spawn(async move {
+                    for _ in 0..per_caller {
+                        catalog
+                            .commit(move |tx| {
+                                tx.register_data_file(table, datafile(10), &[]).map(|_| ())
+                            })
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+        let wal_writes = store.wal_writes() - wal_before;
+        catalog.close().await.unwrap();
+
+        let wall_ms = elapsed.as_secs_f64() * 1_000.0;
+        let landed = (per_caller * concurrency) as f64;
+        let commits_per_s = landed / elapsed.as_secs_f64();
+        let batch_size = landed / wal_writes.max(1) as f64;
+        println!(
+            "{concurrency:>12}  {wall_ms:>11.1}  {commits_per_s:>12.1}  \
+             {wal_writes:>12}  {batch_size:>12.1}"
+        );
+    }
+    println!();
+}
+
+/// 0004 — durable-commit latency against a write round-trip, which is what
+/// a real object store adds and the in-memory store has none of.
+///
+/// `measure_commit_latency_by_flush_interval` settles the in-memory shape:
+/// `flush_interval + ~2 ms`. The open question is the other term — an S3
+/// PUT's round trip — and whether the two compose as `max(flush cadence,
+/// write RTT) + ~2 ms` or add up. This injects the round trip directly, by
+/// wrapping the in-memory store in a `ThrottledStore` that sleeps before
+/// every PUT, and sweeps it against the flush interval. A `max` composition
+/// prints a table whose cells track the larger of the two; an additive one
+/// prints their sum.
+///
+/// The injected latency is the honest instrument here: a localhost MinIO
+/// understates a real S3 PUT by an order of magnitude, so measuring against
+/// it would answer a question nobody asked. `object_storage.rs` carries the
+/// endpoint-backed run for the absolute number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_commit_latency_by_write_rtt() {
+    const COMMITS: usize = 30;
+    let flush_intervals = [1u64, 25, 100];
+    let round_trips = [0u64, 5, 25, 100];
+
+    println!("\n# 0004 durable-commit latency by injected write round-trip");
+    println!("# {COMMITS} sequential commits per cell, median ms; columns are flush intervals\n");
+    print!("{:>10}", "put_rtt_ms");
+    for flush_ms in flush_intervals {
+        print!("  {:>12}", format!("flush={flush_ms}ms"));
+    }
+    println!();
+
+    for rtt_ms in round_trips {
+        print!("{rtt_ms:>10}");
+        for flush_ms in flush_intervals {
+            let config = ThrottleConfig {
+                wait_put_per_call: Duration::from_millis(rtt_ms),
+                ..ThrottleConfig::default()
+            };
+            let store = Arc::new(ThrottledStore::new(InMemory::new(), config));
+            let mut options = CatalogOptions::default();
+            options.flush_interval = Duration::from_millis(flush_ms);
+            let catalog = Catalog::open(store, options).await.unwrap();
+
+            let mut samples = Vec::with_capacity(COMMITS);
+            for i in 0..COMMITS {
+                let start = Instant::now();
+                catalog
+                    .commit(move |tx| {
+                        let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                        tx.create_table(schema, &format!("t{i}"), &[col("a")])?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                samples.push(start.elapsed());
+            }
+            catalog.close().await.unwrap();
+            print!("  {:>12.1}", Stats::of(samples).median_ms);
+        }
+        println!();
     }
     println!();
 }
