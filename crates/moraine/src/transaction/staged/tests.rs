@@ -1405,6 +1405,174 @@ async fn removing_inlined_file_deletes_drops_only_the_named_records() {
     catalog.close().await.unwrap();
 }
 
+/// Hard-deleting a data file's catalog row drops the inlined deletions
+/// targeting it.
+///
+/// A merge subsumes its sources' whole visibility history into the
+/// backdated replacement and then hard-deletes their rows, current and
+/// history alike — so nothing can ever read those files again, and an
+/// inlined deletion against one is unreachable. Left behind, it would be
+/// served by `ducklake_inlined_delete_<t>` until a flush tried to
+/// materialize it into a delete file naming a data file that no longer
+/// exists.
+///
+/// Deletions against a *different* file, and against the same file id on
+/// another table, are untouched.
+#[tokio::test]
+async fn hard_deleting_a_data_file_drops_the_inlined_deletions_against_it() {
+    let catalog = open().await;
+    let stage = |snapshot_id: u64, ops: Vec<RowOperation>| {
+        let catalog = &catalog;
+        async move {
+            let db_tx = catalog.begin_write_tx().await?;
+            let mut tx = StagedTransaction::begin_detached(db_tx);
+            for op in ops {
+                tx.stage(op);
+            }
+            tx.stage(RowOperation::Insert {
+                table: TableKind::Snapshot,
+                cells: snapshot_row(snapshot_id, 1, 2),
+            });
+            tx.stage(RowOperation::Insert {
+                table: TableKind::SnapshotChanges,
+                cells: snapshot_changes_row(snapshot_id, "inlined_delete:1"),
+            });
+            tx.commit().await.map(|_| ())
+        }
+    };
+
+    let mut deletions: Vec<RowOperation> = (0..2)
+        .map(|row_id| RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: 7,
+            row_id,
+            begin_snapshot: 1,
+        })
+        .collect();
+    deletions.push(RowOperation::InlineFileDelete {
+        table_id: 1,
+        data_file_id: 9,
+        row_id: 0,
+        begin_snapshot: 1,
+    });
+    deletions.push(RowOperation::InlineFileDelete {
+        table_id: 2,
+        data_file_id: 7,
+        row_id: 0,
+        begin_snapshot: 1,
+    });
+    stage(1, deletions).await.unwrap();
+
+    let live = |table_id: u64| {
+        let catalog = catalog.clone();
+        async move {
+            crate::ffi_support::inline::inline_file_deletes(&catalog, table_id)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(live(1).await.len(), 3);
+    assert_eq!(live(2).await.len(), 1);
+
+    // A maintenance commit hard-pruning table 1's data file 7.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut prune = StagedTransaction::begin_detached(db_tx);
+    prune.stage(RowOperation::Delete {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(7), Cell::Null],
+    });
+    prune.commit().await.unwrap();
+
+    let remaining: Vec<(u64, u64)> = live(1)
+        .await
+        .into_iter()
+        .map(|(data_file_id, row_id, _)| (data_file_id, row_id))
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![(9, 0)],
+        "only the pruned file's deletions go; file 9's stays"
+    );
+    assert_eq!(
+        live(2).await.len(),
+        1,
+        "the same file id on another table is a different file"
+    );
+
+    // The table still exists: an emptied inlined-deletion table is not a
+    // missing one, and the cascade must not take the marker with it.
+    assert!(
+        crate::ffi_support::inline::inline_file_delete_table_exists(&catalog, 1)
+            .await
+            .unwrap()
+    );
+    catalog.close().await.unwrap();
+}
+
+/// Ending a data file into history — what a rewrite does to its source —
+/// leaves the inlined deletions against it alone.
+///
+/// A rewrite materializes deletes, so its output holds fewer rows than the
+/// source and a reader below the rewrite must still see the deleted ones.
+/// The source is ended rather than pruned for exactly that reason, and the
+/// deletions that make those rows dead have to stay readable with it.
+#[tokio::test]
+async fn ending_a_data_file_keeps_the_inlined_deletions_against_it() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(db_tx);
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: indexed_data_file_row(3, 512),
+    });
+    setup.stage(RowOperation::InlineFileDelete {
+        table_id: 1,
+        data_file_id: 1,
+        row_id: 0,
+        begin_snapshot: 1,
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, "inlined_delete:1"),
+    });
+    setup.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut end = StagedTransaction::begin_detached(db_tx);
+    end.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(2)],
+    });
+    end.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(2, 1, 2),
+    });
+    end.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(2, "compacted_table:1"),
+    });
+    end.commit().await.unwrap();
+
+    assert_eq!(
+        crate::ffi_support::inline::inline_file_deletes(&catalog, 1)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the ended file is still readable below the end, and so is its deletion"
+    );
+    catalog.close().await.unwrap();
+}
+
 /// `ducklake_inlined_delete_<t>` exists from its first inlined deletion
 /// until the table is dropped — including after a flush has cleared every
 /// deletion it held.

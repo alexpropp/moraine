@@ -968,3 +968,70 @@ fn flushing_an_indexed_table_with_deleted_inlined_rows() {
         "the reinserted value resolves to exactly one row"
     );
 }
+
+/// Index entries across the whole data-file lifecycle: a file that is
+/// ended by a rewrite and then hard-pruned by expiry and cleanup.
+///
+/// Nothing removes a live index's entries when a data file's row leaves
+/// the catalog — the sweep only reclaims entries of *dropped* indexes. The
+/// invariant that keeps that sound is that a file's rows never leave
+/// without either a row-grain deletion having already taken their entries
+/// (a delete file, an inlined delete) or a replacement re-deriving them
+/// under their preserved row ids. This walks the full sequence and holds
+/// the index to the table's own answer at each step.
+///
+/// A stale entry is visible here, not silent: a row id no live file's
+/// range holds resolves as `Inline` rather than being filtered out, so a
+/// leaked entry shows up as a lookup that still finds a deleted value.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_entries_survive_the_data_file_lifecycle() {
+    let store = TempDir::new("index-lifecycle-store");
+    let data = TempDir::new("index-lifecycle-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+    let lookup_count = |key: i64| {
+        csv_rows(&run(&format!(
+            "SELECT count(*) FROM moraine_index_lookup('lake', 'main', 't', 'by_a', {key});"
+        )))
+    };
+    let found = |n: &str| vec![vec![n.to_string()]];
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(100) t(i);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+    run("DELETE FROM lake.main.t WHERE a IN (1, 2, 3);");
+
+    // The rewrite ends the source into history and writes a replacement
+    // holding only the survivors.
+    run("CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.01);");
+    assert_eq!(lookup_count(1), found("0"), "deleted keys stay gone");
+    assert_eq!(lookup_count(50), found("1"), "survivors stay found");
+
+    // Expiry plus cleanup hard-prunes the ended source's row, so the file
+    // the original entries were derived from is gone from the catalog
+    // entirely.
+    run("CALL ducklake_expire_snapshots('lake', older_than => now() + INTERVAL 1 DAY);");
+    run("CALL ducklake_cleanup_old_files('lake', cleanup_all => true);");
+
+    assert_eq!(
+        csv_rows(&run("SELECT count(*), sum(a) FROM lake.main.t;")),
+        vec![vec!["97".to_string(), "4944".to_string()]],
+        "the table is unchanged by the pruning"
+    );
+    assert_eq!(
+        lookup_count(1),
+        found("0"),
+        "a pruned file must not leave its deleted rows' entries behind"
+    );
+    assert_eq!(lookup_count(50), found("1"), "survivors are still indexed");
+
+    // The sharpest probe: a stale unique entry for a deleted value would
+    // refuse this insert as a duplicate.
+    run("INSERT INTO lake.main.t VALUES (1, 'again');");
+    assert_eq!(
+        lookup_count(1),
+        found("1"),
+        "the freed value is claimable again, exactly once"
+    );
+}

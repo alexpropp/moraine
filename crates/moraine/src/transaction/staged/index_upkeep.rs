@@ -299,6 +299,7 @@ async fn stage_adds(
             _ => {}
         }
     }
+
     Ok(registered)
 }
 
