@@ -64,6 +64,7 @@ pub(super) fn collect_hard_deletes(ops: &[RowOperation]) -> Result<BTreeSet<Enti
 
 pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
     let mut children = ChildRows::default();
+
     for op in ops {
         if let RowOperation::Insert { table, cells } = op {
             match table {
@@ -119,21 +120,27 @@ pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
             }
         }
     }
+
     for columns in children.partition_columns.values_mut() {
         columns.sort_by_key(|c| c.partition_key_index);
     }
+
     for expressions in children.sort_expressions.values_mut() {
         expressions.sort_by_key(|e| e.sort_key_index);
     }
+
     for values in children.file_partition_values.values_mut() {
         values.sort_by_key(|v| v.partition_key_index);
     }
+
     for implementations in children.macro_implementations.values_mut() {
         implementations.sort_by_key(|i| i.impl_id);
     }
+
     for parameters in children.macro_parameters.values_mut() {
         parameters.sort_by_key(|p| p.column_id);
     }
+
     for rows in children.name_mappings.values_mut() {
         rows.sort_by_key(|r| r.column_id);
     }
@@ -777,6 +784,7 @@ fn apply_schema_version_delete(
     let _schema_version = c.u64()?;
     let table_id = c.u64()?;
     c.finish()?;
+
     direct.push((
         Key::SchemaVersion {
             table_id,
