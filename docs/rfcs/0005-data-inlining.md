@@ -310,6 +310,36 @@ governed the implementation:
   the imported `DataChunk` to the flush writer directly, but the row
   materialization is not on the tiny-commit hot path inlining optimizes.
 
+### Flush registers a data file and a delete file against it in one commit
+
+A flush does not filter tombstoned rows out of the Parquet it writes. It
+materializes **every** inlined row of the table — live and tombstoned
+alike — into one data file, then writes a delete file naming the
+tombstoned rows' *positions in that file*
+(`ducklake_flush_inlined_data.cpp`'s `AttachDeleteFilesToWrittenFiles`).
+One commit therefore carries a `ducklake_data_file` insert and a
+`ducklake_delete_file` insert whose `data_file_id` is that same
+brand-new file.
+
+Equality-index upkeep therefore resolves such a delete **at the add**: the
+rows it kills are left out of the file's entries as the file is read, so
+they are never indexed at all. The commit's deletes are collected before
+any add is derived, since nothing fixes the two rows' order in the batch.
+
+Staging a removal beside the add instead would be wrong, not merely
+wasteful. An index entry's key carries no file, so an add and a removal of
+one `(key, row_id)` in a single batch is *exactly* the shape an `UPDATE`
+produces — DuckLake rewrites the updated row into a new file under its
+preserved row id, ending the old file's copy — and there the entry must
+survive. The two are indistinguishable at the batch layer and can only be
+told apart by whether the removal targets the very file the add came from.
+`stage_file_delete_entries` accordingly handles only targets the committed
+head already holds; a target the commit itself registers is skipped there
+because the add already accounted for it.
+
+Only an indexed table reaches any of this: upkeep returns early when the
+table carries no live index.
+
 ## Alternatives considered
 
 - **Row-per-key inserts (`inline/insert/<table_id>/<row_id>`):** enables

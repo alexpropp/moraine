@@ -893,3 +893,78 @@ fn moraine_index_create_staged_builds_over_existing_data() {
         );
     }
 }
+
+/// Flushing an indexed table whose inlined rows are partly deleted — the
+/// shape that reaches `stage_file_delete_entries` with a target the
+/// committed head has never seen.
+///
+/// DuckLake's flush writes *every* inlined row into one Parquet file,
+/// tombstoned ones included, then writes a delete file naming the
+/// tombstoned rows' positions in that same just-written file. So one
+/// commit carries both the `ducklake_data_file` insert and a
+/// `ducklake_delete_file` insert against it, and index upkeep has to
+/// resolve the target through the commit's own rows rather than the head.
+/// It also derives an add and a removal of the killed rows' entries in
+/// that one batch, which must net to removed.
+///
+/// Only an indexed table reaches any of this: upkeep returns early when
+/// the table carries no index, which is why the uninindexed flush tests in
+/// `inline.rs` pass either way.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn flushing_an_indexed_table_with_deleted_inlined_rows() {
+    let store = TempDir::new("index-flush-store");
+    let data = TempDir::new("index-flush-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true);");
+
+    // Under the inlining limit, so these land as inlined rows rather than
+    // a Parquet file.
+    run("INSERT INTO lake.main.t SELECT i, 'x' FROM range(5) t(i);");
+    run("DELETE FROM lake.main.t WHERE a IN (1, 3);");
+
+    // The flush materializes all five rows and deletes two back out.
+    run("CALL ducklake_flush_inlined_data('lake');");
+
+    assert_eq!(
+        csv_rows(&run("SELECT count(*), sum(a) FROM lake.main.t;")),
+        vec![vec!["3".to_string(), "6".to_string()]],
+        "rows 1 and 3 stay deleted across the flush"
+    );
+
+    // The index must agree with the table: survivors resolve, and the
+    // flushed-then-deleted rows must not — a stale entry here is the
+    // silent half of the bug, invisible to the count above.
+    for survivor in ["0", "2", "4"] {
+        assert_eq!(
+            csv_rows(&run(&format!(
+                "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', {survivor});"
+            ))),
+            vec![vec!["1".to_string()]],
+            "surviving value {survivor} is indexed after the flush"
+        );
+    }
+    for killed in ["1", "3"] {
+        assert_eq!(
+            csv_rows(&run(&format!(
+                "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', {killed});"
+            ))),
+            vec![vec!["0".to_string()]],
+            "deleted value {killed} must not survive in the index"
+        );
+    }
+
+    // The value a deleted row held is free again: re-inserting it must not
+    // trip the unique index against a resurrected entry.
+    run("INSERT INTO lake.main.t VALUES (1, 'again');");
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
+        )),
+        vec![vec!["1".to_string()]],
+        "the reinserted value resolves to exactly one row"
+    );
+}

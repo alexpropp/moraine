@@ -1788,6 +1788,161 @@ async fn registered_delete_file_removes_the_killed_rows_index_entries() {
     );
 }
 
+/// A delete file may target a data file its own commit registers, which
+/// is the shape a flush of partly-tombstoned inlined rows takes: DuckLake
+/// writes every inlined row — live and tombstoned alike — into one Parquet
+/// file, then writes a delete file naming the tombstoned rows' positions
+/// in it. Index upkeep must resolve the target through this commit's own
+/// inserts, not the committed head alone, and the killed rows must end up
+/// unindexed even though the same commit indexed the whole file.
+#[tokio::test]
+async fn delete_file_may_target_a_data_file_its_own_commit_registers() {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+
+    let store = Arc::new(InMemory::new());
+    let (_, batch) = bigint_batch(&[10, 20, 30]);
+    let file_size = write_parquet(&store, "main/t/data.parquet", &batch).await;
+
+    let deletes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["data.parquet", "data.parquet"])),
+            Arc::new(Int64Array::from(vec![0, 2])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    // The delete file is staged *before* its target, so the fix cannot
+    // rest on DuckLake's emit order.
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: vec![
+            Cell::U64(2),
+            Cell::U64(1),
+            Cell::U64(3),
+            Cell::Null,
+            Cell::U64(1), // data_file_id, registered below
+            Cell::Str("deletes.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(2), // delete_count
+            Cell::U64(512),
+            Cell::U64(64),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: indexed_data_file_row(3, file_size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        1,
+        "the file's three rows are indexed and the two the delete file \
+         kills are removed, in the one commit that did both"
+    );
+}
+
+/// The same shape against a non-unique index, where the killed row and
+/// the survivor share a value and their entries differ only by row id.
+///
+/// The killed row must never be indexed rather than be indexed and then
+/// removed. Removals stage before adds, so a removal beside the add would
+/// leave the entry standing — and it could not simply be cancelled
+/// against the add either: an entry's key carries no file, so that pair is
+/// indistinguishable from an UPDATE's, which rewrites a row into a new
+/// file under its preserved row id and must keep its entry.
+#[tokio::test]
+async fn a_row_deleted_out_of_the_file_its_own_commit_registers_is_never_indexed() {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(false).await;
+
+    let store = Arc::new(InMemory::new());
+    // Both rows share one value, so the killed row's entry and the
+    // survivor's differ only in the row id embedded in the key.
+    let (_, batch) = bigint_batch(&[7, 7]);
+    let file_size = write_parquet(&store, "main/t/data.parquet", &batch).await;
+
+    let deletes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["data.parquet"])),
+            Arc::new(Int64Array::from(vec![0])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&store, "main/t/deletes.parquet", &deletes).await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store);
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: indexed_data_file_row(2, file_size),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DeleteFile,
+        cells: vec![
+            Cell::U64(2),
+            Cell::U64(1),
+            Cell::U64(3),
+            Cell::Null,
+            Cell::U64(1),
+            Cell::Str("deletes.parquet".into()),
+            Cell::Bool(true),
+            Cell::Str("parquet".into()),
+            Cell::U64(1),
+            Cell::U64(512),
+            Cell::U64(64),
+            Cell::Null,
+            Cell::Null,
+        ],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, false, index_id).await,
+        1,
+        "row 0's entry is removed and row 1's survives"
+    );
+}
+
 /// A delete file naming a position past the target file's row count could
 /// never match a scoped entry; rather than silently orphan index rows, the
 /// commit is refused.
