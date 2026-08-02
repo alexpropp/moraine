@@ -29,6 +29,68 @@ DDL issued directly against a user schema/table (outside DuckLake's own
 `ducklake_*` writes), plus querying a view's definition, raises
 `NotImplementedException`.
 
+## Attach modes: one writer, many readers
+
+**Exactly one process may attach a given store read-write.** Every other
+process must pass `READ_ONLY`. SlateDB fences by *newest writer wins*, so a
+second read-write attach does not fail — it takes the writer role from the
+incumbent, whose next commit then raises the `FENCED` error telling it to
+re-attach. Two processes attaching read-write take turns breaking each
+other, and neither is told at attach time.
+
+```sql
+-- The one writer.
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE);
+
+-- Every other process.
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY);
+```
+
+A read-only attach opens SlateDB's `DbReader`, never the writer `Db`: it
+never fences anyone, never participates in fencing, and any number may run
+alongside the writer. DuckDB resolves `READ_ONLY` into the access mode this
+shim reads, and DuckLake forwards it into the nested metadata attach.
+
+`READ_ONLY` is read-only at the **catalog** level, not the IAM level. A
+follow-latest reader writes a checkpoint into the manifest on open and
+refreshes it for the attach's lifetime, so reader credentials still need
+manifest write access. For strictly read-only credentials, see
+`CHECKPOINT` below.
+
+**`CHECKPOINT` — a truly-zero-write read-only attach.** Given the id of a
+SlateDB checkpoint created ahead of time, moraine opens the reader against
+that checkpoint instead of establishing its own: no manifest CAS, no
+refresh, no delete on close — the attach issues object-store reads and
+nothing else.
+
+```sql
+-- On the writer, once: mint a checkpoint and note its id.
+SELECT checkpoint_id FROM moraine_create_checkpoint('lake');
+
+-- Thereafter, from a process holding only s3:GetObject/ListBucket:
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_ONLY,
+   META_CHECKPOINT '4a1f…');
+```
+
+The cost is that the attach reads a **fixed cut**: it never sees commits
+made after the checkpoint, because seeing them is exactly what the manifest
+poll it is forgoing would do. Refreshing means minting a new checkpoint and
+re-attaching. `CHECKPOINT` requires `READ_ONLY` — a read-write attach
+naming one is refused — and a checkpoint the manifest no longer carries
+fails the attach rather than silently falling back to latest.
+
+`moraine_create_checkpoint` names an **attached catalog** rather than a
+store path, because the core mints through the writer that attach already
+opened and a second read-write open would fence it. The other two name a
+store path, and neither opens the writer, so both run against a live
+catalog: `moraine_checkpoints('<store>')` lists what the manifest carries
+— which is how a checkpoint whose id was lost is found, since one given no
+lifetime pins its objects until deleted — and
+`moraine_delete_checkpoint('<store>', '<id>')` releases one.
+
 **Creating or writing an S3 lake requires `READ_WRITE`.** DuckDB opens any
 attach whose path starts with a remote prefix (`s3://`, `gcs://`, `azure://`,
 …) read-only by default, and a read-only attach cannot create a catalog. To
@@ -89,10 +151,14 @@ The loadable lands at `build/release/extension/moraine/moraine.duckdb_extension`
 (gitignored). `cargo xtask e2e` builds it that way and drives it through a
 real DuckDB CLI plus a real `INSTALL ducklake`.
 
-The DuckDB pin has one source per side: the `duckdb` submodule ref (the
-build) and the `duckdb_pin()` constant in `xtask/src/duckdb.rs` (the CLI
-download). Bumping the pin means moving both submodules to the new tag and
-updating that constant.
+### The pin, and what a bump touches
+
+`.github/duckdb-versions` is the single source of truth: one DuckDB release
+per line, newest first, the first line carrying the commit each submodule
+must sit on. `xtask` reads it (`include_str!`), the release workflows build
+a matrix from it (`cargo xtask version-matrix`), and `cargo xtask
+check-pins` fails if any other place naming a version disagrees — the two
+submodules, both workflow files, and the table below.
 
 | What | Pinned at |
 |---|---|
@@ -102,29 +168,63 @@ updating that constant.
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
 | DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
 
-## Installing
+**Bumping** means putting the new release at the top of the manifest with
+both submodule commits, moving the submodules there, and running `cargo
+xtask check-pins`, which names whatever is still stale. Then `cargo xtask
+e2e` re-proves the whole chain against the new pair, including the
+regression pins in `tests/ducklake_load/wire_contract.rs` — the nested
+attach text, DuckLake's catalog access set, and the DuckLake commit
+`INSTALL ducklake` resolves to.
 
-Once moraine is published to the DuckDB community-extensions repository,
-installing verifies DuckDB's own signature — no flags needed:
+**Which releases get builds.** Every one still listed in the manifest.
+This is not a preference: DuckDB refuses a C++-ABI extension whose footer
+names a different version *string*, patch releases included
+(`ParsedExtensionMetaData::GetInvalidMetadataError`), so a v1.5.3 user
+cannot load a v1.5.4 build. The list is short by design — each entry
+multiplies the release build by five platforms, and only the primary is
+proven end-to-end against a real DuckLake — so it holds the releases users
+are plausibly on, and older ones keep whatever assets they were already
+published with.
+
+**Which DuckDB series moraine tracks.** The one DuckLake's current release
+branch targets, adopted when DuckLake cuts that branch rather than when
+DuckDB releases: the extension exists to be DuckLake's catalog, and a
+DuckDB with no DuckLake built for it has nothing to attach. DuckLake
+versions by DuckDB-series branch (`v1.3-ossivalis`, `v1.4-andium`,
+`v1.5-variegata`), so the two move together.
+
+## Installing
 
 ```sql
 INSTALL moraine FROM community;
 LOAD moraine;
 ```
 
-Until then — or to load a locally built artifact — load the unsigned
-loadable directly with signature checks off. The CLI must be *started* with
-`-unsigned`; the setting cannot be changed on a running database:
+That path verifies a signature and needs no flags. **Signing is DuckDB's,
+not moraine's**: the public keys `ExtensionHelper::GetPublicKeys` trusts are
+compiled into every DuckDB binary, so no third party can produce a
+signature the stock CLI accepts. `extension-upload-single.sh` fills the
+footer's 256-byte signature region with zeros unless it holds one of those
+private keys, which is why every artifact moraine's own release workflow
+publishes is unsigned, and why the e2e harness starts the CLI with
+`-unsigned`. The community-extensions pipeline is the only route to a
+signed build, and `description.yml` is what points it at this repo.
+
+To load a release asset or a locally built artifact directly, start the CLI
+with `-unsigned` — the setting cannot be changed on a running database:
 
 ```sh
 duckdb -unsigned -c "LOAD './build/release/extension/moraine/moraine.duckdb_extension';"
 ```
 
-The loadable's base filename (`moraine`) is load-bearing: DuckDB derives the
-entry symbol (`moraine_duckdb_cpp_init`, defined in
-`cpp/moraine_extension.cpp`) from the filename before the first `.`. A
-version/platform mismatch against the running DuckDB is rejected even when
-unsigned.
+Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
+(`moraine.v1.5.4.linux_amd64.duckdb_extension`). Pick the one matching your
+DuckDB *exactly*: a mismatch is rejected even when unsigned, because a
+C++-ABI extension is bound to the version string in its footer. The
+loadable's base filename (`moraine`) is load-bearing too — DuckDB derives
+the entry symbol (`moraine_duckdb_cpp_init`, defined in
+`cpp/moraine_extension.cpp`) from the filename before the first `.` — so
+rename an asset to `moraine.duckdb_extension` before loading it.
 
 ## Obtaining a DuckDB v1.5.4 CLI for testing
 
@@ -224,11 +324,24 @@ DuckLake's own `DuckLakeAttach` (`src/storage/ducklake_storage.cpp`)
 constructs the nested path: `options.metadata_path = info.path` (the literal
 string after `ducklake:` is stripped by the *same* mechanism one level up),
 and `options.metadata_database = "__ducklake_metadata_" + name`.
-`DuckLakeInitializer::Initialize` then issues `ATTACH OR REPLACE
-{METADATA_PATH} AS {METADATA_CATALOG_NAME_IDENTIFIER}` — i.e. literally
-`ATTACH OR REPLACE 'moraine:<path>' AS __ducklake_metadata_lake` — through
-the same top-level-statement machinery, so the prefix dispatch fires again,
-unmodified.
+`DuckLakeInitializer::Initialize` then issues that as a top-level statement,
+so the prefix dispatch fires again, unmodified. The generated text is
+captured from a running session rather than read off the source — DuckDB's
+`QueryLog` records DuckLake's own metadata connection — and pinned by
+`tests/ducklake_load/wire_contract.rs`:
+
+```sql
+ATTACH OR REPLACE 'moraine:<path>' AS "__ducklake_metadata_warehouse" (HIDDEN true)
+SELECT NULL FROM "__ducklake_metadata_warehouse"."main".ducklake_metadata LIMIT 1
+```
+
+Two consequences of that shape. The catalog name is derived from the outer
+alias, so `AS warehouse` nests `__ducklake_metadata_warehouse` — the
+metadata catalog is addressable by name (`SELECT * FROM
+__ducklake_metadata_warehouse.main.ducklake_snapshot` works, and is how
+these tests inspect what DuckLake wrote). And `HIDDEN true` keeps it out of
+`duckdb_databases()`, which lists only the outer `warehouse` — whose `path`
+column is exactly the nested attach string, `moraine:<path>`.
 
 The schema DuckLake queries is `main` — `duckdb::Catalog`'s base-class
 default, which `MoraineCatalog` never overrides, and the schema bootstrap
@@ -353,7 +466,18 @@ inserts; `cpp/inline_tables.cpp` recognizes two dynamic name families —
 `begin_snapshot`) — and routes `CREATE`/`INSERT`/`UPDATE`/`DELETE`/
 `SELECT` against them into the `inline/*` keyspace over the same
 staged-row commit path the fixed tables ride, instead of materializing
-real tables. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
+real tables.
+
+One property of the delete family is worth stating because it is easy to
+get wrong: it exists from the table's first inlined deletion until the
+table is dropped, and **emptying it does not remove it**.
+`ducklake_flush_inlined_data` writes those deletions out as a real delete
+file and then clears the table with an unqualified `DELETE`; DuckLake
+caches the table's existence for the life of the catalog and never
+re-probes, so anything it runs afterwards in the same session still binds
+against it. Existence is therefore recorded in the store
+(`inline/file_delete_table`) rather than derived from whether any
+deletion is currently held. See `docs/rfcs/0005-data-inlining.md`'s "Extension surface
 (as implemented)" for the exact operation → keyspace mapping.
 
 Chunk bodies (`inline/schema`, `inline/insert`) are Arrow IPC. DuckDB's C++

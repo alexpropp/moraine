@@ -472,6 +472,30 @@ impl Catalog {
             .await
     }
 
+    /// Every checkpoint the store's manifest carries, as the ids
+    /// [`create_checkpoint`](Self::create_checkpoint) hands out.
+    ///
+    /// Free-standing for the same reason
+    /// [`delete_checkpoint`](Self::delete_checkpoint) is: it reads the
+    /// manifest and never opens the writer `Db`, so it runs against a live
+    /// catalog without fencing it. A checkpoint given no lifetime pins
+    /// what it references until it is deleted, so this is how an operator
+    /// finds one whose id was lost — reader-established checkpoints show
+    /// up here too, and are not theirs to delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the manifest cannot be read.
+    pub async fn checkpoints(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<Vec<String>> {
+        let ids = StoreBuilder::new(&options.path, object_store)
+            .list_checkpoints()
+            .await?;
+        Ok(ids.iter().map(uuid::Uuid::to_string).collect())
+    }
+
     /// The maintained-projection state shared by this handle's clones.
     pub(crate) fn projections(&self) -> &Arc<std::sync::RwLock<ProjectionCache>> {
         &self.projections

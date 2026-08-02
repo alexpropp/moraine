@@ -14,6 +14,8 @@
 //! [`Catalog`]: moraine::Catalog
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
+mod checkpoints;
+
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -21,13 +23,17 @@ use std::{
     sync::Arc,
 };
 
+pub use checkpoints::*;
 use moraine::CatalogOptions;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::warn;
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
-    runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle, new_runtime},
+    runtime::{
+        CANCELLED_ATTACH_SHUTDOWN, MoraineCatalogHandle, MoraineInterruptProbe,
+        MoraineSnapshotHandle, block_on_cancellable_in, new_runtime,
+    },
 };
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
@@ -227,7 +233,7 @@ pub struct MoraineS3Config {
 
 /// S3 credentials borrowed from a [`MoraineS3Config`]. Every field is
 /// optional; an absent field defers to the AWS_* environment.
-struct S3Creds<'a> {
+pub(crate) struct S3Creds<'a> {
     key_id: Option<&'a str>,
     secret: Option<&'a str>,
     region: Option<&'a str>,
@@ -235,6 +241,36 @@ struct S3Creds<'a> {
     endpoint: Option<&'a str>,
     url_style: Option<&'a str>,
     use_ssl: Option<bool>,
+}
+
+/// Borrows the credentials out of a nullable [`MoraineS3Config`]. Null
+/// means "no secret — the environment supplies credentials".
+///
+/// # Safety
+///
+/// `s3`, if non-null, must point to a valid [`MoraineS3Config`] whose
+/// non-null string fields are NUL-terminated C strings, all valid for
+/// reads for the duration of the borrow.
+pub(crate) unsafe fn borrow_s3_creds<'a>(s3: *const MoraineS3Config) -> Option<S3Creds<'a>> {
+    // SAFETY: caller contract above.
+    let config = unsafe { s3.as_ref() }?;
+    // SAFETY: each string field is null or a NUL-terminated C string valid
+    // for the borrow, per the same contract.
+    Some(unsafe {
+        S3Creds {
+            key_id: opt_str(config.key_id),
+            secret: opt_str(config.secret),
+            region: opt_str(config.region),
+            session_token: opt_str(config.session_token),
+            endpoint: opt_str(config.endpoint),
+            url_style: opt_str(config.url_style),
+            use_ssl: match config.use_ssl {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+        }
+    })
 }
 
 /// Borrows a nullable C string as `Some(&str)`, mapping null, empty, and
@@ -264,7 +300,7 @@ unsafe fn opt_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 ///
 /// `ptr`, if non-null, must point to a NUL-terminated C string valid for
 /// reads for the duration of this call.
-unsafe fn opt_borrow_str<'a>(
+pub(crate) unsafe fn opt_borrow_str<'a>(
     ptr: *const c_char,
     arg_name: &str,
 ) -> Result<Option<&'a str>, AbiError> {
@@ -277,7 +313,7 @@ unsafe fn opt_borrow_str<'a>(
 }
 
 /// The object store an attach path resolves to.
-enum StoreKind {
+pub(crate) enum StoreKind {
     /// A directory on the local filesystem, created if absent.
     LocalFile,
     /// A fresh, empty in-memory store.
@@ -289,7 +325,7 @@ enum StoreKind {
 impl StoreKind {
     /// Classifies an attach path by scheme, returning the store kind and the
     /// bucket-relative key prefix (empty for local and in-memory stores).
-    fn from_path(path: &str) -> Result<(Self, String), AbiError> {
+    pub(crate) fn from_path(path: &str) -> Result<(Self, String), AbiError> {
         if let Some(rest) = path.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
             if bucket.is_empty() {
@@ -320,7 +356,11 @@ impl StoreKind {
         Ok((Self::LocalFile, String::new()))
     }
 
-    fn open(&self, path: &str, s3: Option<&S3Creds>) -> Result<Arc<dyn ObjectStore>, AbiError> {
+    pub(crate) fn open(
+        &self,
+        path: &str,
+        s3: Option<&S3Creds>,
+    ) -> Result<Arc<dyn ObjectStore>, AbiError> {
         match self {
             Self::LocalFile => {
                 std::fs::create_dir_all(path).map_err(|e| {
@@ -547,6 +587,20 @@ fn resolve_data_store(
     }
 }
 
+/// Winds down the runtime of an attach that will not produce a handle,
+/// and returns the error that ended it.
+///
+/// A cancelled open leaves a half-built store behind whose background
+/// tasks may be mid-request. Dropping the runtime would block until every
+/// one of them finished — turning a cancellation into the hang it was
+/// meant to escape — so it is shut down with a deadline instead, after
+/// which the stragglers are abandoned. Nothing was committed through this
+/// runtime, so abandoning them loses no durable state.
+fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError {
+    runtime.shutdown_timeout(CANCELLED_ATTACH_SHUTDOWN);
+    error
+}
+
 /// Attaches a moraine catalog: creates the runtime this handle owns for
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.
@@ -562,6 +616,27 @@ fn resolve_data_store(
 /// already-initialized store, whose stored flag
 /// ([`moraine_catalog_encrypted`]) is authoritative.
 ///
+/// `checkpoint` pins a **read-only** attach to an existing SlateDB
+/// checkpoint (see [`moraine_create_checkpoint`]), so the open writes
+/// nothing at all — no manifest record of the reader, no refresh, no
+/// delete on close — and serves a fixed cut that never advances. Null or
+/// empty follows the latest manifest; a non-null value with `read_only`
+/// false is [`codes::INVALID_ARGUMENT`].
+///
+/// Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
+/// are: the store open is the one long blocking call an attach makes, and
+/// against an unreachable endpoint it is the one worth escaping. A
+/// cancelled attach returns [`codes::INTERRUPTED`], writes no handle, and
+/// leaves nothing attached. It may still have fenced a writer that was
+/// attached before it — an attach takes the writer epoch before it can
+/// know whether it will finish — so the previously attached process must
+/// re-attach either way, exactly as after any failed attach.
+///
+/// [`moraine_detach`] takes no probe and never will: it is teardown, and
+/// an interrupt part-way through would either leak the handle or leave
+/// the store half-closed. Cancellation exists to escape a wait, and
+/// detach's wait is the flush that makes committed data durable.
+///
 /// Returns [`codes::OK`] on success. On failure, `*out` is left
 /// unwritten and, if `err` is non-null, `*err` carries the code and a
 /// message.
@@ -570,9 +645,12 @@ fn resolve_data_store(
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null,
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
-/// valid NUL-terminated C strings. `out` must be a valid, writable
-/// `*mut *mut MoraineCatalogHandle`. `err`, if non-null, must be a valid,
-/// writable [`MoraineError`]. All for the duration of this call.
+/// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
+/// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+/// `probe`, if non-null, must be safe to call with `probe_ctx` from any
+/// thread. `out` must be a valid, writable `*mut *mut
+/// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
+/// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_attach(
     path: *const c_char,
@@ -582,6 +660,9 @@ pub unsafe extern "C" fn moraine_attach(
     flush_interval_ms: u64,
     cache_dir: *const c_char,
     data_path: *const c_char,
+    checkpoint: *const c_char,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -597,31 +678,23 @@ pub unsafe extern "C" fn moraine_attach(
         // SAFETY: `cache_dir` validity is this function's own safety contract;
         // null (or empty) means "no on-disk cache".
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
+        // SAFETY: `checkpoint` validity is this function's own safety
+        // contract; null (or empty) means "follow the latest manifest".
+        let checkpoint = unsafe { opt_borrow_str(checkpoint, "checkpoint") }?;
+        // Refused here rather than left to the core: the core's message
+        // would name the option, and the caller needs to be told which
+        // half of the attach to change.
+        if checkpoint.is_some() && !read_only {
+            return Err(AbiError::invalid_argument(
+                "moraine_attach: a checkpoint pins a fixed past cut, so it applies to a \
+                 read-only attach only — add READ_ONLY, or drop the checkpoint",
+            ));
+        }
 
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
-        // SAFETY: `s3` validity is this function's own safety contract; null
-        // means "no secret — the environment supplies credentials".
-        let s3_config = unsafe { s3.as_ref() };
-        let s3_creds = s3_config.map(|c| {
-            // SAFETY: each string field of `*c` is null or a NUL-terminated C
-            // string valid for this call (the shim keeps them alive across it).
-            unsafe {
-                S3Creds {
-                    key_id: opt_str(c.key_id),
-                    secret: opt_str(c.secret),
-                    region: opt_str(c.region),
-                    session_token: opt_str(c.session_token),
-                    endpoint: opt_str(c.endpoint),
-                    url_style: opt_str(c.url_style),
-                    use_ssl: match c.use_ssl {
-                        0 => Some(false),
-                        1 => Some(true),
-                        _ => None,
-                    },
-                }
-            }
-        });
+        // SAFETY: `s3` validity is this function's own safety contract.
+        let s3_creds = unsafe { borrow_s3_creds(s3) };
 
         // Open the store first: it is synchronous and fallible, and a bad
         // path must not cost a runtime spun up just to be torn down.
@@ -666,20 +739,42 @@ pub unsafe extern "C" fn moraine_attach(
             ms => options.flush_interval = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        options.checkpoint = checkpoint.map(str::to_owned);
         // Persist the data root at bootstrap so a later attach reads it back
         // without being told it again.
         options.data_path.clone_from(&data_path_arg);
-        let catalog = if read_only {
-            // A read-only attach never bootstraps; on a fresh store the open
-            // fails, so surface the reason (DuckDB defaults remote attaches to
-            // read-only) and the fix (add READ_WRITE).
-            runtime
-                .block_on(moraine::Catalog::open_read_only(object_store, options))
-                .map_err(|e| AbiError::from(e).with_read_only_attach_hint())?
-        } else {
-            runtime
-                .block_on(moraine::Catalog::open(object_store, options))
-                .map_err(AbiError::from)?
+        // Cancellable: opening a store is the one long blocking call an
+        // attach makes, and against an unreachable S3 endpoint it is the
+        // one a user is most likely to want out of. A cancelled open
+        // abandons a half-built store, so the runtime is wound down with a
+        // deadline rather than dropped — see `cancel_attach`.
+        //
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let opened = unsafe {
+            if read_only {
+                block_on_cancellable_in(
+                    &runtime,
+                    probe,
+                    probe_ctx,
+                    moraine::Catalog::open_read_only(object_store, options),
+                )
+                // A read-only attach never bootstraps; on a fresh store the
+                // open fails, so surface the reason (DuckDB defaults remote
+                // attaches to read-only) and the fix (add READ_WRITE).
+                .map_err(AbiError::with_read_only_attach_hint)
+            } else {
+                block_on_cancellable_in(
+                    &runtime,
+                    probe,
+                    probe_ctx,
+                    moraine::Catalog::open(object_store, options),
+                )
+            }
+        };
+        let catalog = match opened {
+            Ok(catalog) => catalog,
+            Err(error) => return Err(cancel_attach(runtime, error)),
         };
 
         // Resolve the DATA_PATH object store index maintenance and backfill
@@ -840,28 +935,8 @@ pub unsafe extern "C" fn moraine_migrate(
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
-        // SAFETY: `s3` validity is this function's own safety contract; null
-        // means "no secret — the environment supplies credentials".
-        let s3_config = unsafe { s3.as_ref() };
-        let s3_creds = s3_config.map(|c| {
-            // SAFETY: each string field of `*c` is null or a NUL-terminated C
-            // string valid for this call (the shim keeps them alive across it).
-            unsafe {
-                S3Creds {
-                    key_id: opt_str(c.key_id),
-                    secret: opt_str(c.secret),
-                    region: opt_str(c.region),
-                    session_token: opt_str(c.session_token),
-                    endpoint: opt_str(c.endpoint),
-                    url_style: opt_str(c.url_style),
-                    use_ssl: match c.use_ssl {
-                        0 => Some(false),
-                        1 => Some(true),
-                        _ => None,
-                    },
-                }
-            }
-        });
+        // SAFETY: `s3` validity is this function's own safety contract.
+        let s3_creds = unsafe { borrow_s3_creds(s3) };
 
         // Opened before the runtime for the same reason an attach does it: a
         // bad path must not cost a runtime spun up just to be torn down.
@@ -2961,6 +3036,9 @@ mod tests {
                 0,
                 ptr::null(),
                 c_bad.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut bad_handle,
                 &raw mut bad_err,
             )
@@ -2993,6 +3071,9 @@ mod tests {
                 0,
                 ptr::null(),
                 c_good.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut good_handle,
                 &raw mut good_err,
             )
@@ -3028,6 +3109,9 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3152,6 +3236,9 @@ mod tests {
                 0,
                 ptr::null(),
                 c_data.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3186,6 +3273,9 @@ mod tests {
                 0,
                 ptr::null(),
                 c_safe.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut ok_handle,
                 &raw mut ok_err,
             )
@@ -3222,6 +3312,9 @@ mod tests {
                 0,
                 ptr::null(),
                 c_first.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut first_handle,
                 &raw mut first_err,
             )
@@ -3250,6 +3343,9 @@ mod tests {
                 0,
                 ptr::null(),
                 c_other.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut other_handle,
                 &raw mut other_err,
             )
@@ -3288,6 +3384,9 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3331,6 +3430,9 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3669,6 +3771,9 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3704,6 +3809,9 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3758,6 +3866,9 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3969,6 +4080,119 @@ mod tests {
             moraine_snapshot_free(snap2);
             moraine_detach(handle);
         }
+    }
+
+    /// Cancellation is per call, not per handle: two reads in flight on
+    /// one handle carry their own probes, and interrupting one leaves the
+    /// other to finish.
+    ///
+    /// This is the shape a real session takes — DuckDB's probe is a load
+    /// of `ClientContext::interrupted`, one context per connection, and
+    /// several connections share one attached catalog. A design routing
+    /// cancellation through a single per-handle signal would let one
+    /// connection's Ctrl-C abort another's query, or be consumed by it.
+    #[test]
+    fn concurrent_reads_on_one_handle_cancel_independently() {
+        let dir = TempDir::new("probe-concurrent");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+        let handle_address = handle as usize;
+
+        // The interrupted read never resolves on its own, so only its own
+        // probe can end it; the survivor waits for that to happen before
+        // resolving, so the two genuinely overlap.
+        let cancelled_first = Arc::new(std::sync::Barrier::new(2));
+        let waiter = Arc::clone(&cancelled_first);
+
+        let interrupted = std::thread::spawn(move || {
+            let handle = handle_address as *mut MoraineCatalogHandle;
+            // SAFETY: the handle outlives both threads — it is detached
+            // only after they are joined.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe_always` accepts a null context.
+            let result: Result<(), AbiError> = unsafe {
+                handle_ref.block_on_cancellable(
+                    Some(probe_always),
+                    ptr::null_mut(),
+                    std::future::pending::<Result<(), moraine::Error>>(),
+                )
+            };
+            cancelled_first.wait();
+            result
+        });
+
+        let survivor = std::thread::spawn(move || {
+            let handle = handle_address as *mut MoraineCatalogHandle;
+            // SAFETY: as above.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe_never` accepts a null context.
+            unsafe {
+                handle_ref.block_on_cancellable(Some(probe_never), ptr::null_mut(), async move {
+                    waiter.wait();
+                    Ok::<_, moraine::Error>(7u32)
+                })
+            }
+        });
+
+        assert_eq!(
+            interrupted
+                .join()
+                .expect("interrupted read")
+                .unwrap_err()
+                .code,
+            codes::INTERRUPTED
+        );
+        assert_eq!(
+            survivor.join().expect("surviving read").unwrap(),
+            7,
+            "one read's interrupt must not cancel or be consumed by another's"
+        );
+
+        // SAFETY: both threads are joined; freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// An attach whose probe is already firing is cancelled before the
+    /// store is opened: no handle, the interrupted code, and — the part
+    /// that matters — the call returns rather than winding down a runtime
+    /// with a half-built store still on it.
+    #[test]
+    fn attach_is_cancelled_by_a_firing_probe() {
+        let dir = TempDir::new("probe-attach");
+        seed(dir.path());
+
+        let c_path = dir.c_path();
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `c_path` is a valid C string, the out-params are local
+        // slots, and `probe_always` accepts a null context.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert_eq!(err.code, codes::INTERRUPTED);
+        assert!(handle.is_null(), "a cancelled attach writes no handle");
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        // The store is untouched by the cancellation: a plain attach still
+        // works, so nothing was left half-initialized.
+        let handle = attach_ok(dir.path());
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
     }
 
     /// A lookup value coerces to the same canonical `IndexKeyValue` the

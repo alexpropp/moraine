@@ -171,13 +171,14 @@ pub(super) fn apply_op(
         | RowOperation::InlineInsert { .. }
         | RowOperation::InlineInlineDelete { .. }
         | RowOperation::InlineFileDelete { .. }
+        | RowOperation::InlineFileDeleteRemove { .. }
         | RowOperation::InlineFlushDelete { .. }
         | RowOperation::InlineDrop { .. }
         | RowOperation::InlineSchemaDrop { .. } => Ok(()),
     }
 }
 
-/// Whether `op` is one of the seven inline variants — routed to
+/// Whether `op` is one of the eight inline variants — routed to
 /// `translate_inline`, never to [`apply_op`]'s `CatalogSnapshot` diff.
 pub(super) fn is_inline_op(op: &RowOperation) -> bool {
     matches!(
@@ -186,6 +187,7 @@ pub(super) fn is_inline_op(op: &RowOperation) -> bool {
             | RowOperation::InlineInsert { .. }
             | RowOperation::InlineInlineDelete { .. }
             | RowOperation::InlineFileDelete { .. }
+            | RowOperation::InlineFileDeleteRemove { .. }
             | RowOperation::InlineFlushDelete { .. }
             | RowOperation::InlineDrop { .. }
             | RowOperation::InlineSchemaDrop { .. }
@@ -298,6 +300,81 @@ pub(super) fn apply_mapping_insert(
     Ok(())
 }
 
+/// The id-collision backstop for one primary-keyed kind: an insert whose
+/// id already names a live row is refused, rather than displacing that row
+/// and minting a history version DuckLake never authored.
+///
+/// Scoped to the kinds DuckLake's own schema declares a `PRIMARY KEY` on
+/// (`ducklake_schema`, `ducklake_data_file`, `ducklake_delete_file`, and
+/// the two snapshot tables, whose backstop is instead the head-advance
+/// check — a snapshot record exists only at or below head). Extending it
+/// to kinds DuckLake leaves unconstrained would refuse rows another
+/// DuckLake backend accepts.
+///
+/// Checked against the working state, not the base, so the shape DuckLake
+/// really writes — end the old version, re-insert under the same id —
+/// still passes: ends apply before inserts and free the id.
+///
+/// The message carries none of the four substrings DuckLake's commit loop
+/// retries on: a duplicate id that survived the head CAS is drift, and
+/// re-driving it would produce the same row again.
+fn refuse_live_id(table: TableKind, live: bool, named: &str) -> Result<()> {
+    if live {
+        return Err(Error::Constraint(format!(
+            "{table:?}: {named} is already live; DuckLake authors this id and \
+             its own catalog would refuse the duplicate row"
+        )));
+    }
+    Ok(())
+}
+
+fn apply_schema_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+    let value = decode_schema(cells)?;
+    refuse_live_id(
+        TableKind::Schema,
+        state.schemas.contains_key(&value.schema_id),
+        &format!("schema_id {}", value.schema_id),
+    )?;
+    state.put_schema(value);
+    Ok(())
+}
+
+fn apply_data_file_insert(
+    state: &mut CatalogSnapshot,
+    cells: &[Cell],
+    children: &mut ChildRows,
+) -> Result<()> {
+    let mut value = decode_data_file(cells)?;
+    refuse_live_id(
+        TableKind::DataFile,
+        state
+            .data_files
+            .get(&value.table_id)
+            .is_some_and(|files| files.contains_key(&value.data_file_id)),
+        &format!("data_file_id {}", value.data_file_id),
+    )?;
+    value.partition_values = children
+        .file_partition_values
+        .remove(&(value.table_id, value.data_file_id))
+        .unwrap_or_default();
+    state.put_data_file(value);
+    Ok(())
+}
+
+fn apply_delete_file_insert(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
+    let value = decode_delete_file(cells)?;
+    refuse_live_id(
+        TableKind::DeleteFile,
+        state
+            .delete_files
+            .get(&value.table_id)
+            .is_some_and(|files| files.contains_key(&value.delete_file_id)),
+        &format!("delete_file_id {}", value.delete_file_id),
+    )?;
+    state.put_delete_file(value);
+    Ok(())
+}
+
 pub(super) fn apply_insert(
     base: &CatalogSnapshot,
     state: &mut CatalogSnapshot,
@@ -326,7 +403,7 @@ pub(super) fn apply_insert(
             record.options.insert(key, value);
             state.set_option_record(components, record);
         }
-        TableKind::Schema => state.put_schema(decode_schema(cells)?),
+        TableKind::Schema => apply_schema_insert(state, cells)?,
         TableKind::Table => state.put_table(table_value(base, decode_table(cells)?)),
         TableKind::View => state.put_view(decode_view(cells)?),
         TableKind::Column => {
@@ -351,15 +428,8 @@ pub(super) fn apply_insert(
             }
             state.put_column(value);
         }
-        TableKind::DataFile => {
-            let mut value = decode_data_file(cells)?;
-            value.partition_values = children
-                .file_partition_values
-                .remove(&(value.table_id, value.data_file_id))
-                .unwrap_or_default();
-            state.put_data_file(value);
-        }
-        TableKind::DeleteFile => state.put_delete_file(decode_delete_file(cells)?),
+        TableKind::DataFile => apply_data_file_insert(state, cells, children)?,
+        TableKind::DeleteFile => apply_delete_file_insert(state, cells)?,
         TableKind::PartitionInfo => {
             let mut value = decode_partition_info(cells)?;
             value.columns = children

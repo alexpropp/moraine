@@ -300,6 +300,23 @@ pub enum RowOperation {
         /// The commit snapshot the delete takes effect at.
         begin_snapshot: u64,
     },
+    /// Removes one live `inline/file_delete` record — the row-grain
+    /// counterpart of [`Self::InlineFileDelete`], issued when a flush has
+    /// materialized that inlined deletion into a real delete file and the
+    /// inlined form must go, or the row would be counted deleted twice.
+    ///
+    /// Row-grain rather than table-wide on purpose: DuckLake's flush
+    /// happens to clear the whole table, but the operation it issues is an
+    /// ordinary SQL `DELETE`, and translating it per row means a filtered
+    /// one removes exactly what it matched instead of everything.
+    InlineFileDeleteRemove {
+        /// Owning table.
+        table_id: u64,
+        /// The data file the removed deletion targeted.
+        data_file_id: u64,
+        /// The row the removed deletion killed.
+        row_id: u64,
+    },
     /// Removes every `inline/insert` chunk begun at or before
     /// `flush_snapshot` for `(table_id, schema_version)`, plus the
     /// `inline/inline_delete` tombstones those chunks' rows consumed — the

@@ -362,4 +362,45 @@ mod tests {
             assert_eq!(AbiError::from(error).code, expected, "{rendered}");
         }
     }
+
+    /// The first of the two conflict-propagation wire obligations: the
+    /// message a lost commit carries must still contain `conflict` once it
+    /// has crossed this boundary. DuckLake's `RetryOnError` decides
+    /// retryability by substring on the lowercased text, so a conversion
+    /// that summarized or replaced the message would turn every benign
+    /// race into an aborted transaction — silently, and only under
+    /// concurrency.
+    ///
+    /// The counterpart is pinned alongside it: no other error the shim
+    /// raises from a commit may carry any of the four substrings, or an
+    /// unretryable failure is re-driven until DuckLake's own budget runs
+    /// out.
+    #[test]
+    fn the_commit_conflict_message_keeps_its_retry_substring() {
+        let conflict = AbiError::from(moraine::Error::CommitConflict(
+            "a concurrent commit changed state this one read".to_string(),
+        ));
+        assert_eq!(conflict.code, codes::COMMIT_CONFLICT);
+        assert!(
+            conflict.message.to_lowercase().contains("conflict"),
+            "the lost-commit message must stay retryable: {}",
+            conflict.message
+        );
+
+        for error in [
+            moraine::Error::RetryBudgetExhausted("budget".to_string()),
+            moraine::Error::Fenced("fenced".to_string()),
+            moraine::Error::Constraint("constrained".to_string()),
+            moraine::Error::Unsupported("unsupported".to_string()),
+        ] {
+            let rendered = format!("{error:?}");
+            let message = AbiError::from(error).message.to_lowercase();
+            for substring in ["conflict", "concurrent", "unique", "primary key"] {
+                assert!(
+                    !message.contains(substring),
+                    "{rendered} must not carry retry substring {substring:?}: {message}"
+                );
+            }
+        }
+    }
 }

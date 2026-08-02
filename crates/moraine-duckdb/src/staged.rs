@@ -560,6 +560,50 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete(
     }
 }
 
+/// Stages the removal of one live `inline/file_delete` record — the
+/// row-grain counterpart of [`moraine_tx_stage_inline_file_delete`],
+/// which a `DELETE` against `ducklake_inlined_delete_<table_id>`
+/// translates to.
+///
+/// DuckLake issues that `DELETE` at the end of
+/// `ducklake_flush_inlined_data`, once it has materialized the table's
+/// inlined deletions into a real delete file: leaving the inlined form
+/// behind would count those rows deleted twice. Naming a record the table
+/// does not carry is [`codes::CORRUPTION`], not a no-op.
+///
+/// # Safety
+///
+/// Same contract as [`moraine_tx_stage_inline_inline_delete`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_remove(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    data_file_id: u64,
+    row_id: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
+        }
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineFileDeleteRemove {
+            table_id,
+            data_file_id,
+            row_id,
+        });
+
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Stages a flush-delete: removes every `inline/insert` chunk begun at or
 /// before `flush_snapshot` for `(table_id, schema_version)`, plus the
 /// `inline/inline_delete` tombstones those chunks' rows consumed.

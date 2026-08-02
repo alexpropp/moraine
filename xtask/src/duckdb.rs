@@ -10,11 +10,55 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 
-/// The pinned DuckDB version: the extension is built against the `duckdb`
-/// submodule at this tag, and xtask downloads the matching CLI to load the
-/// artifact against. Keep in lockstep with the submodule ref.
+/// The DuckDB versions manifest, compiled in so every consumer reads one
+/// copy. `cargo xtask check-pins` verifies the file has not moved since.
+pub const DUCKDB_VERSIONS_MANIFEST: &str = include_str!("../../.github/duckdb-versions");
+
+/// The manifest's content lines, comments and blanks dropped, newest
+/// first.
+fn manifest_entries() -> impl Iterator<Item = &'static str> {
+    DUCKDB_VERSIONS_MANIFEST
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// Every DuckDB release moraine builds for, newest first, as
+/// `.github/duckdb-versions` lists them.
+pub fn supported_duckdb_versions() -> Vec<String> {
+    manifest_entries()
+        .filter_map(|entry| entry.split_whitespace().next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `(submodule path, commit)` pins the primary entry carries — the
+/// two submodules the local build compiles against. Empty for any entry
+/// but the first: CI checks DuckDB out by tag for those and never touches
+/// a submodule.
+pub fn primary_submodule_pins() -> Vec<(String, String)> {
+    manifest_entries()
+        .next()
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .skip(1)
+        .filter_map(|pin| pin.split_once('='))
+        .map(|(path, commit)| (path.to_owned(), commit.to_owned()))
+        .collect()
+}
+
+/// The primary DuckDB pin: the version the `duckdb` and
+/// `extension-ci-tools` submodules sit on, that the extension is built
+/// against locally, and whose CLI xtask downloads to load the artifact.
+/// The first entry of `.github/duckdb-versions`.
+///
+/// An empty manifest yields an empty string, which every consumer then
+/// fails on with its own message — `check-pins` first among them.
 pub fn duckdb_pin() -> &'static str {
-    "v1.5.4"
+    manifest_entries()
+        .next()
+        .and_then(|entry| entry.split_whitespace().next())
+        .unwrap_or_default()
 }
 
 const DUCKDB_RELEASE_BASE_URL: &str = "https://github.com/duckdb/duckdb/releases/download";

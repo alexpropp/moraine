@@ -251,6 +251,19 @@ pub(crate) enum InlineKey {
     Live(InlineOperation),
     /// The archived form of an inlined-data record.
     Arch(InlineOperation),
+    /// Marks that a table's `ducklake_inlined_delete_<table_id>` exists,
+    /// once per table. Appended last so the variants above keep their
+    /// discriminants.
+    ///
+    /// Existence has to be recorded rather than derived from whether any
+    /// `FileDelete` record is currently live: a flush materializes those
+    /// into a real delete file and clears them, and an emptied SQL table
+    /// still exists — which is what DuckLake, having cached the table's
+    /// existence for the life of the catalog, goes on assuming.
+    FileDeleteTable {
+        /// Owning table.
+        table_id: u64,
+    },
 }
 
 /// An inlined-data record that exists in both live and archived form.
@@ -1340,6 +1353,7 @@ mod tests {
             }),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
+            any::<u64>().prop_map(|table_id| Key::Inline(InlineKey::FileDeleteTable { table_id })),
             arb_index().prop_map(Key::Index),
         ]
     }

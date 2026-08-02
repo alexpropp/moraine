@@ -390,3 +390,11 @@ message InlineInlineDeleteValue {
 message InlineFileDeleteValue {
   uint64 begin_snapshot = 1;
 }
+
+// inline/file_delete_table: the existence marker for a table's
+// ducklake_inlined_delete_<table_id>. Empty — the key is the fact. It
+// exists because DuckLake caches "this table exists" for the life of the
+// catalog, so existence cannot be derived from whether any inlined
+// deletion is currently recorded: a flush empties them, and an emptied
+// SQL table still exists.
+message InlineFileDeleteTableValue {}

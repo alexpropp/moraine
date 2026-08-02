@@ -25,6 +25,7 @@ mod helpers;
 
 mod attach;
 mod change_feed;
+mod checkpoints;
 mod commit_protocol;
 mod crash;
 mod ddl;
@@ -35,3 +36,4 @@ mod migrate;
 mod partitioning;
 mod time_travel;
 mod types;
+mod wire_contract;

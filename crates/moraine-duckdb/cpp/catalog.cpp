@@ -553,11 +553,11 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 	}
 
 	if (auto delete_table_id = ParseInlinedDeleteTableName(table_name)) {
-		// Fixed shape, no store-side schema to stage — existence follows from
-		// the first `inline/fdel` staged against it (see inline_tables.hpp),
-		// so CREATE only builds and caches the entry for the rest of this
-		// transaction. The find below is a defensive re-check; DuckLake
-		// de-duplicates its own CREATE-per-batch.
+		// Fixed shape, no store-side schema to stage — the store records the
+		// table's existence when the first `inline/fdel` is staged against it
+		// (see inline_tables.hpp), so CREATE only builds and caches the entry
+		// for the rest of this transaction. The find below is a defensive
+		// re-check; DuckLake de-duplicates its own CREATE-per-batch.
 		auto found = tables_.find(table_name);
 		if (found != tables_.end()) {
 			if (info.Base().on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT) {
@@ -711,9 +711,13 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
 	// `CACHE_DIR` is a local directory for SlateDB's on-disk block cache; it
 	// must outlive the moraine_attach call, so it lives in this scope.
+	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
+	// time, so the open writes nothing at all; the ABI refuses it on a
+	// read-write attach.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
+	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
 	// it is the DATA_PATH the index scoped read and maintenance resolve data
 	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
@@ -743,6 +747,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
+		} else if (name == "checkpoint") {
+			checkpoint = option.second.GetValue<std::string>();
 		}
 	}
 	// The backing strings must outlive the moraine_attach call, so they live
@@ -752,7 +758,9 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	bool is_s3 = ResolveS3Config(context, info.path, s3, s3_strings);
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
-	                           data_path.empty() ? nullptr : data_path.c_str(), &handle, &err);
+	                           data_path.empty() ? nullptr : data_path.c_str(),
+	                           checkpoint.empty() ? nullptr : checkpoint.c_str(),
+	                           moraine_shim_is_interrupted, &context, &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.
@@ -875,6 +883,11 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, du
 	// decided in PlanMetadataDelete/PlanInlineDataDelete.
 	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {
 		auto &delete_op = PlanInlineDataDelete(planner, op, *inline_data_table);
+		delete_op.children.push_back(plan);
+		return delete_op;
+	}
+	if (auto *inline_delete_table = dynamic_cast<MoraineInlineDeleteTableEntry *>(&op.table)) {
+		auto &delete_op = PlanInlineDeleteDelete(planner, op, *inline_delete_table);
 		delete_op.children.push_back(plan);
 		return delete_op;
 	}

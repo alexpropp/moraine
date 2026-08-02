@@ -79,8 +79,18 @@ inherit that limitation.
 | `inline/insert` | `table_id, schema_version, begin_snapshot, chunk_seq` | Arrow IPC record-batch **body** (the batch message + buffers, no schema) over the user columns + `row_id_start`, `row_count`. Decoded against the version's `inline/schema` stream, so the schema is not re-serialized per chunk |
 | `inline/inline_delete` | `table_id, row_id` | `end_snapshot` (tombstone for an inlined insert row) |
 | `inline/file_delete` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
+| `inline/file_delete_table` | `table_id` | Empty — the key is the fact. Marks that `ducklake_inlined_delete_<table_id>` exists |
 
-All three are append-only on the commit path.
+The first four are append-only on the commit path. The fifth is a marker,
+and exists because existence cannot be derived from the fourth: a flush
+materializes a table's inlined deletions into a real delete file and
+clears them, and an emptied SQL table still exists. DuckLake caches that
+table's existence for the life of the catalog and never re-probes, so a
+content-derived existence disappears under it mid-session and every later
+bind fails. Written idempotently by both paths that prove the table
+exists — staging a deletion into it, and removing one from it, the latter
+so a store written before the marker heals on its first flush — and
+removed by the `DROP TABLE` cascade.
 
 ### Write path
 
@@ -241,7 +251,8 @@ The operation → keyspace mapping (source-verified against DuckLake
 | `INSERT INTO ducklake_inlined_data_<t>_<v> VALUES (row_id, {snap}, NULL, <cols>), …` (one multi-row `VALUES` per commit) | one `inline/insert` chunk at `(t, v, begin_snapshot={snap}, chunk_seq)`: the user-column cells as one Arrow IPC record-batch body (no schema message; decoded against the version's `inline/schema`), plus `row_id_start` (first row's `row_id`) and `row_count`. The `row_id`/`begin_snapshot`/`end_snapshot` columns are moraine-derived on read (`row_id = row_id_start + offset`, `begin_snapshot` from the key, `end_snapshot` from `inline/inline_delete`), never stored in the body |
 | `UPDATE ducklake_inlined_data_<t>_<v> SET end_snapshot={snap} WHERE row_id=r …` | `inline/inline_delete` at `(t, r)` holding `end_snapshot={snap}` |
 | `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, subtract `inline/inline_delete` tombstones, project and order by `row_id` |
-| `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}` |
+| `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}`, plus the `inline/file_delete_table` marker for `t` |
+| `DELETE FROM ducklake_inlined_delete_<t>` (the flush's clean-up, once those deletions are written out as a real delete file) | remove the `inline/file_delete` record behind each matched row, keeping the `inline/file_delete_table` marker. Translated per row rather than as a table-wide clear: DuckLake's flush happens to delete every row, but what it issues is an ordinary SQL `DELETE`, so a filtered one removes exactly what it matched. Naming a record the table does not carry is a typed error, not a silent no-op |
 | `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks and consumed `inline/inline_delete`; drop the `inline/schema` and deregister. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
 | `DROP TABLE lake.<schema>.<t>` cascade | drop every `inline/*` record for `t` |
 
