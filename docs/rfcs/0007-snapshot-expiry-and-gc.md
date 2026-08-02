@@ -152,10 +152,18 @@ moraine must translate into one atomic batch:
   record (`ducklake_column_tag`, `ducklake_partition_column`,
   `ducklake_sort_expression`, `ducklake_file_partition_value`) ride their
   parent's deletion in the same cascade and translate as validated
-  no-ops; `ducklake_schema_versions` rows fold into snapshot records that
-  the same transaction deletes, likewise a validated no-op. Unmodeled
-  stand-in tables (macros, mappings, variant stats) accept void-deletes —
-  they can never have a live row.
+  no-ops. Unmodeled stand-in tables (macros, mappings, variant stats)
+  accept void-deletes — they can never have a live row.
+- **Schema-version rows.** `ducklake_schema_versions` rows are **not**
+  expired with the snapshots that wrote them. They live in their own
+  subspace (RFC 0002) and are deleted only where DuckLake's own catalogs
+  delete them: step 5's dead-table cleanup, by `table_id`. Expiring them
+  with their snapshot would leave every data file older than the
+  retention horizon unable to resolve the schema version it was written
+  under, which aborts DuckLake's compaction planner (RFC 0008) at bind
+  for the whole table. A store that lost its rows that way is repaired on
+  read: the projection floors each affected table at its oldest data
+  file, carrying the oldest schema version still known for it.
 - **No snapshot minted.** A staged transaction whose operations are all
   maintenance operations commits without a `ducklake_snapshot` insert:
   one `WriteBatch`, no new snapshot record, no head update. Atomicity is

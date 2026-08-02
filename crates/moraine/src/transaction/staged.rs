@@ -99,9 +99,11 @@ pub enum TableKind {
     /// `(begin_snapshot, schema_version, table_id)` row per
     /// created-or-schema-altered table per commit. The first two values
     /// are always the committing snapshot's own id and `schema_version`,
-    /// so the table-id set is the only new information — folded into the
-    /// snapshot record's `schema_changed_table_ids`, with both redundant values
-    /// validated against the `ducklake_snapshot` row in the same batch.
+    /// validated against the `ducklake_snapshot` row in the same batch
+    /// rather than trusted. Each row lands as a `schema_version` record of
+    /// its own — the snapshot record names the same tables, but expiry
+    /// deletes it and a data file older than every surviving snapshot
+    /// still has to resolve the version it was written under.
     SchemaVersions,
     /// `ducklake_partition_info`.
     PartitionInfo,
@@ -656,6 +658,7 @@ fn translate(
     let mut children = collect_child_rows(ops)?;
     let mut direct = Vec::new();
     let hard_deleted = collect_hard_deletes(ops)?;
+
     for op in ops {
         if !is_inline_op(op)
             && !matches!(
@@ -674,6 +677,7 @@ fn translate(
             )?;
         }
     }
+
     for op in ops {
         if matches!(op, RowOperation::Insert { .. }) {
             apply_op(
@@ -687,6 +691,7 @@ fn translate(
             )?;
         }
     }
+
     for op in ops {
         if matches!(op, RowOperation::UpdateSetBegin { .. }) {
             apply_op(
@@ -721,6 +726,17 @@ fn translate(
 
     let mut writes = commit::diff_writes(base, &state, new_id);
     writes.extend(direct);
+    // The `ducklake_schema_versions` rows this commit staged, as records of
+    // their own: `snapshot` carries them too, but only until expiry deletes
+    // it, and the files they describe outlive that.
+    for table_id in &snapshot.schema_changed_table_ids {
+        writes.push(commit::schema_version_write(
+            *table_id,
+            new_id,
+            snapshot.schema_version,
+        ));
+    }
+
     Ok((new_id, writes, snapshot))
 }
 

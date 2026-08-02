@@ -16,7 +16,7 @@
 //! every function here can return [`crate::Error::Migration`] however it
 //! would otherwise have succeeded.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     catalog::{Catalog, projection::ProjectionCache},
@@ -28,7 +28,8 @@ use crate::{
             TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
         read::{
-            EntityRecord, read_head, scan_current_entities, scan_history_entities, scan_snapshots,
+            EntityRecord, read_head, scan_current_entities, scan_history_entities,
+            scan_schema_versions, scan_snapshots,
         },
     },
 };
@@ -344,8 +345,8 @@ pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
 }
 
 /// One `ducklake_schema_versions` row: `(begin_snapshot, schema_version,
-/// table_id)`, flattened from a snapshot record; the first two values are
-/// the snapshot's own.
+/// table_id)` — the snapshot a table's shape changed in, and the catalog
+/// schema version that snapshot minted.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchemaVersionRow {
@@ -357,25 +358,97 @@ pub struct SchemaVersionRow {
     pub table_id: u64,
 }
 
-/// Every `ducklake_schema_versions` row, flattened from the snapshot
-/// history: one row per `(snapshot, schema-changed table)` pair, in
-/// snapshot order.
+/// Every `ducklake_schema_versions` row, in `(table_id, begin_snapshot)`
+/// order: the `schema_version` records, plus the same rows still folded
+/// into snapshot records written before those records existed, plus a
+/// floor row for any table whose oldest data file predates every row it
+/// has left.
+///
+/// The last two are what a store carries out of the era when this
+/// projection was derived from snapshot records alone. Expiry deletes
+/// snapshots; DuckLake's own catalogs never delete a schema-version row
+/// for a live table, and its compaction planner reads a data file's
+/// schema version by joining `begin_snapshot` against these rows — an
+/// uncovered file makes that join yield NULL and aborts the planner
+/// before it does any work. The floor row is the repair a store whose
+/// rows are already gone needs: it carries the oldest schema version
+/// still known for the table (the current one when none is), which is
+/// also what stock DuckLake resolves for a file that old once the
+/// columns of its era have themselves expired.
 #[doc(hidden)]
 pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersionRow>> {
-    let snapshots = dump_snapshots(catalog).await?;
-    Ok(snapshots
+    let session = catalog.begin_read().await?;
+    let records = scan_schema_versions(session.handle()).await;
+    session.finish();
+
+    let mut rows: BTreeMap<(u64, u64), u64> = records?
         .into_iter()
-        .flat_map(|snapshot| {
-            let begin_snapshot = snapshot.snapshot_id;
-            let schema_version = snapshot.schema_version;
-            snapshot
-                .schema_changed_table_ids
-                .into_iter()
-                .map(move |table_id| SchemaVersionRow {
-                    begin_snapshot,
-                    schema_version,
-                    table_id,
-                })
+        .map(|(table_id, begin_snapshot, schema_version)| {
+            ((table_id, begin_snapshot), schema_version)
+        })
+        .collect();
+    for snapshot in dump_snapshots(catalog).await? {
+        for table_id in snapshot.schema_changed_table_ids {
+            rows.entry((table_id, snapshot.snapshot_id))
+                .or_insert(snapshot.schema_version);
+        }
+    }
+    rows.extend(schema_version_floors(catalog, &rows).await?);
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |((table_id, begin_snapshot), schema_version)| SchemaVersionRow {
+                begin_snapshot,
+                schema_version,
+                table_id,
+            },
+        )
+        .collect())
+}
+
+/// The floor rows [`dump_schema_versions`] adds for tables whose oldest
+/// live data file sits below every row they have left: one row at that
+/// file's `begin_snapshot`, carrying the table's oldest surviving schema
+/// version, or the catalog's current one when the table has no row at
+/// all. A table whose rows are intact — every store this binary has
+/// written from the start — produces nothing here.
+async fn schema_version_floors(
+    catalog: &Catalog,
+    rows: &BTreeMap<(u64, u64), u64>,
+) -> Result<BTreeMap<(u64, u64), u64>> {
+    let mut oldest_file: BTreeMap<u64, u64> = BTreeMap::new();
+    for file in dump_data_files(catalog).await? {
+        oldest_file
+            .entry(file.table_id)
+            .and_modify(|oldest| *oldest = (*oldest).min(file.begin_snapshot))
+            .or_insert(file.begin_snapshot);
+    }
+
+    let uncovered: Vec<(u64, u64)> = oldest_file
+        .into_iter()
+        .filter(|&(table_id, file_begin_snapshot)| {
+            rows.range((table_id, 0)..=(table_id, file_begin_snapshot))
+                .next()
+                .is_none()
+        })
+        .collect();
+    if uncovered.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let current_schema_version = dump_snapshots(catalog)
+        .await?
+        .last()
+        .map_or(0, |snapshot| snapshot.schema_version);
+    Ok(uncovered
+        .into_iter()
+        .map(|(table_id, file_begin_snapshot)| {
+            let schema_version = rows
+                .range((table_id, 0)..=(table_id, u64::MAX))
+                .next()
+                .map_or(current_schema_version, |(_, version)| *version);
+            ((table_id, file_begin_snapshot), schema_version)
         })
         .collect())
 }
@@ -796,7 +869,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{
-        CatalogOptions, ColumnDef, ColumnStats, DataFile, DeleteFile, FileColumnStats,
+        Catalog, CatalogOptions, ColumnDef, ColumnStats, DataFile, DeleteFile, FileColumnStats,
         MacroImplementationDef, MacroParameterDef,
     };
 
@@ -986,6 +1059,94 @@ mod tests {
         assert!(
             refuses(&inline::inline_file_deletes(&catalog, 1).await),
             "inline_file_deletes"
+        );
+    }
+
+    /// Expires every snapshot below the head and, when `records`, the
+    /// schema-version records too — the two DELETE streams DuckLake's
+    /// expiry and dead-table cleanup issue, staged the way DuckLake stages
+    /// them. Dropping the records models a store written before they
+    /// existed.
+    async fn expire_snapshots_below_head(catalog: &Catalog, records: bool) {
+        use crate::transaction::staged::{Cell, RowOperation, TableKind};
+
+        let head = catalog.snapshot().await.unwrap().current_snapshot().id;
+        let mut tx = staged::staged_begin(catalog, None, String::new())
+            .await
+            .unwrap();
+        for snapshot in dump_snapshots(catalog).await.unwrap() {
+            if snapshot.snapshot_id == head.get() {
+                continue;
+            }
+            tx.stage(RowOperation::Delete {
+                table: TableKind::Snapshot,
+                cells: vec![Cell::U64(snapshot.snapshot_id)],
+            });
+        }
+        if records {
+            for row in dump_schema_versions(catalog).await.unwrap() {
+                tx.stage(RowOperation::Delete {
+                    table: TableKind::SchemaVersions,
+                    cells: vec![
+                        Cell::U64(row.begin_snapshot),
+                        Cell::U64(row.schema_version),
+                        Cell::U64(row.table_id),
+                    ],
+                });
+            }
+        }
+        tx.commit().await.unwrap();
+    }
+
+    /// Schema-version rows outlive the snapshots that wrote them: expiry
+    /// takes the snapshot records, and the rows a data file resolves its
+    /// schema version through stay exactly as they were.
+    #[tokio::test]
+    async fn schema_version_rows_outlive_the_snapshots_that_wrote_them() {
+        let catalog = seed().await;
+
+        let before = dump_schema_versions(&catalog).await.unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|row| row.begin_snapshot == 1 && row.schema_version == 1),
+            "the creating commit's rows must be recorded: {before:?}"
+        );
+
+        expire_snapshots_below_head(&catalog, false).await;
+        assert_eq!(dump_snapshots(&catalog).await.unwrap().len(), 1);
+        assert_eq!(dump_schema_versions(&catalog).await.unwrap(), before);
+    }
+
+    /// A store written before schema-version records existed lost its rows
+    /// with the snapshots that carried them, leaving its data files with
+    /// no row to resolve against. The projection floors each such table at
+    /// its oldest file, carrying the oldest schema version still known.
+    #[tokio::test]
+    async fn a_store_whose_schema_version_rows_are_gone_gets_a_floor_row() {
+        let catalog = seed().await;
+        let file = dump_data_files(&catalog).await.unwrap()[0].clone();
+        assert_eq!(file.begin_snapshot, 1);
+
+        expire_snapshots_below_head(&catalog, true).await;
+
+        // The head snapshot survives expiry and still carries its own
+        // row (the rename's); the file predates it, so the floor covers
+        // the gap between the file and that row.
+        assert_eq!(
+            dump_schema_versions(&catalog).await.unwrap(),
+            vec![
+                SchemaVersionRow {
+                    begin_snapshot: file.begin_snapshot,
+                    schema_version: 2,
+                    table_id: file.table_id,
+                },
+                SchemaVersionRow {
+                    begin_snapshot: 2,
+                    schema_version: 2,
+                    table_id: file.table_id,
+                },
+            ]
         );
     }
 

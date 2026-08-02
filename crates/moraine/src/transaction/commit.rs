@@ -596,6 +596,28 @@ async fn format_stamp(
     )))
 }
 
+/// The `ducklake_schema_versions` record a schema-changing commit owes for
+/// one table. Written by both commit paths and outliving the snapshot
+/// record that names the same table: expiry deletes snapshots, and a data
+/// file older than every surviving snapshot still has to resolve its
+/// schema version.
+pub(crate) fn schema_version_write(
+    table_id: u64,
+    begin_snapshot: u64,
+    schema_version: u64,
+) -> StagedWrite {
+    (
+        Key::SchemaVersion {
+            table_id,
+            begin_snapshot,
+        }
+        .encode(),
+        Some(value::encode_value(&proto::SchemaVersionValue {
+            schema_version,
+        })),
+    )
+}
+
 async fn prepare_and_stage<F>(
     db_tx: &DbTransaction,
     f: &F,
@@ -666,12 +688,16 @@ where
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let schema_version = base.snapshot.schema_version + u64::from(schema_changed);
+    for table_id in &schema_changed_table_ids {
+        writes.push(schema_version_write(*table_id, new_id, schema_version));
+    }
     let ours = ChangeSet::from_operations(&operations);
 
     let snapshot = proto::SnapshotValue {
         snapshot_id: new_id,
         snapshot_time_micros: now_micros(),
-        schema_version: base.snapshot.schema_version + u64::from(schema_changed),
+        schema_version,
         next_catalog_id,
         next_file_id,
         changes_made: ours.to_changes_made(),

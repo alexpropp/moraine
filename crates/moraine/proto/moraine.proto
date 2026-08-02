@@ -311,11 +311,10 @@ message OptionScopeValue {
 }
 
 // ducklake_snapshot + ducklake_snapshot_changes, merged (1:1).
-// schema_changed_table_ids also folds in this snapshot's
-// ducklake_schema_versions rows: each row DuckLake writes there is
-// (snapshot_id, schema_version, table_id) with the first two always the
-// committing snapshot's own values, so the table-id set is the only new
-// information and lives here rather than under a key kind of its own.
+// schema_changed_table_ids names the tables whose shape this snapshot
+// changed. The matching ducklake_schema_versions rows are written to the
+// schema_version subspace as well: they outlive the snapshot record,
+// which expiry deletes.
 message SnapshotValue {
   uint64 snapshot_id = 1;
   int64 snapshot_time_micros = 2;
@@ -336,6 +335,13 @@ message SnapshotValue {
   // it checks at file grain. Empty on a DuckLake-authored snapshot, which
   // is read back as "deletes from the whole table".
   repeated uint64 deleted_data_file_ids = 12;
+}
+
+// schema_version/<table_id>/<begin_snapshot>: the catalog schema version
+// the snapshot minted. The key carries the other two columns of the
+// ducklake_schema_versions row.
+message SchemaVersionValue {
+  uint64 schema_version = 1;
 }
 
 // ducklake_files_scheduled_for_deletion.

@@ -289,9 +289,10 @@ invented: DuckLake persists it as a catalog table.
 snapshot at which each schema version took effect — backfilled from
 `ducklake_snapshot` on metadata upgrade, and carrying a `table_id` column
 for per-table schema versions from metadata version 1.1 onward. moraine
-stores those rows row-faithfully like every other `ducklake_*` table; their
-keyed home enters RFC 0002's keyspace map as implementation reaches them,
-per that RFC's convention.
+stores those rows row-faithfully like every other `ducklake_*` table, in
+the `schema_version` subspace (RFC 0002) — their own keys rather than a
+field of the snapshot record, so snapshot expiry (RFC 0007) cannot take
+the reverse index a surviving data file still needs.
 
 ### Conflicts
 

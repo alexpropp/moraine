@@ -18,9 +18,9 @@ use crate::{
 /// this.
 pub(crate) const TAG_PREFIX_LEN: usize = 1;
 
-/// A fully addressed store key. The six variants are the six subspaces;
-/// each is also a SlateDB segment (the store is created with a one-byte
-/// segment extractor over the leading discriminant).
+/// A fully addressed store key. The seven variants are the seven
+/// subspaces; each is also a SlateDB segment (the store is created with a
+/// one-byte segment extractor over the leading discriminant).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum Key {
     /// Store-level singletons: format version, head pointer, migration
@@ -41,6 +41,17 @@ pub(crate) enum Key {
     /// Equality-index entries. Live-only; keyed by index and canonical
     /// value.
     Index(IndexKey),
+    /// `ducklake_schema_versions`: one record per snapshot at which a
+    /// table's shape changed, holding the catalog schema version that
+    /// snapshot minted. Retained across snapshot expiry — a data file
+    /// resolves its schema version through these long after the snapshot
+    /// that wrote it is gone — and removed only with the table.
+    SchemaVersion {
+        /// The created-or-altered table (or view).
+        table_id: u64,
+        /// The snapshot the change landed in.
+        begin_snapshot: u64,
+    },
 }
 
 /// An equality-index entry key. The unique kind keys on the value alone —
@@ -234,9 +245,9 @@ impl EntityKey {
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
-/// record, or the archived (post-flush) form of a live record. `Live` and
-/// `Arch` share [`InlineOp`], so an archive key has exactly the components
-/// of its live form.
+/// record, the archived (post-flush) form of a live record, or a
+/// delete-table existence marker. `Live` and `Arch` share [`InlineOp`], so
+/// an archive key has exactly the components of its live form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum InlineKey {
     /// Arrow IPC schema message, once per `(table, schema_version)`. Has
@@ -353,6 +364,8 @@ pub(crate) enum Subspace {
     // whole-subspace scan yet.
     #[allow(dead_code)]
     Index,
+    /// Per-table schema-version records.
+    SchemaVersion,
 }
 
 impl Subspace {
@@ -371,6 +384,10 @@ impl Subspace {
                 index_id: 0,
                 key: CanonicalKey::empty(),
             }),
+            Self::SchemaVersion => Key::SchemaVersion {
+                table_id: 0,
+                begin_snapshot: 0,
+            },
         }
     }
 }
@@ -812,6 +829,14 @@ mod tests {
     }
 
     #[test]
+    fn golden_inline_file_delete_table_key() {
+        let mut expect = vec![0x06, 0x05];
+        expect.extend(be(7));
+        let key = Key::Inline(InlineKey::FileDeleteTable { table_id: 7 });
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
     fn golden_arch_kinds_are_distinct_from_live() {
         let ops = [
             InlineOperation::Insert {
@@ -1105,6 +1130,7 @@ mod tests {
                 data_file_id: 2,
                 row_id: 3,
             })),
+            Key::Inline(InlineKey::FileDeleteTable { table_id: 1 }),
         ];
         for key in keys {
             let decoded = Key::decode(&key.encode()).unwrap();
