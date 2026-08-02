@@ -357,6 +357,25 @@ entries plus row-id payloads is the whole design: every alternative payload
 (file id, chunk key) turns flush and compaction into index rewrites
 proportional to moved rows.
 
+Nothing removes a live index's entries when a data file's *row* leaves the
+catalog, either — the maintenance sweep reclaims only the entries of
+indexes that are themselves dropped. What keeps that sound is an invariant
+worth stating, because it is the thing a future data-file lifecycle could
+break: **a file's rows never leave without either a row-grain deletion
+having already taken their entries, or a replacement re-deriving them under
+their preserved row ids.** A rewrite materializes deletes that each removed
+their entries when their delete file was registered, and re-derives the
+survivors (idempotently — an add naming the row that already holds the
+value is a no-op). A merge subsumes its sources. Expiry and cleanup prune
+rows a replacement already covers. The whole sequence is held to the
+table's own answer by the e2e test
+`moraine_index_entries_survive_the_data_file_lifecycle`.
+
+A leaked entry would not be silent: a row id no live file's range holds
+resolves as `Inline` rather than being filtered out, so it surfaces as a
+lookup that still finds a deleted value — and, under a unique index, as a
+bogus duplicate rejection when that value is claimed again.
+
 ### Lookups
 
 One accessor family on `CatalogSnapshot`, served under the snapshot's pinned

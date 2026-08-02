@@ -18,6 +18,7 @@ use super::{
 pub(super) async fn stage_data_file_index_entries(
     base: &CatalogSnapshot,
     cells: &[Cell],
+    killed: Option<&KilledRows>,
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
     entries: &mut Vec<StagedIndexEntry>,
@@ -28,6 +29,7 @@ pub(super) async fn stage_data_file_index_entries(
     if indexes.is_empty() {
         return Ok(());
     }
+
     // The file must be read to maintain the index; no store to read it means
     // the index would silently miss these rows.
     let data_store = data_store.ok_or_else(|| {
@@ -37,12 +39,31 @@ pub(super) async fn stage_data_file_index_entries(
             file.data_file_id, file.table_id
         ))
     })?;
+
+    let killed = match killed {
+        Some(killed) => {
+            refuse_out_of_range(killed, &file)?;
+            Some(&killed.positions)
+        }
+        None => None,
+    };
     let path = data_file_object_path(base, &file, data_prefix)?;
     let per_index =
         per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
 
+    // A row this same commit deletes out of the file it also registers is
+    // never indexed, rather than indexed and then removed. The two are not
+    // interchangeable: an entry's key carries no file, so a removal beside
+    // an add would be indistinguishable from an UPDATE's — which rewrites
+    // a row into a new file under its preserved id and must keep its entry.
     for (index, scoped) in indexes.iter().zip(per_index) {
-        push_index_entries(entries, index, scoped, false)?;
+        let surviving = scoped
+            .into_iter()
+            .enumerate()
+            .filter(|(ordinal, _)| !killed.is_some_and(|k| k.contains(&(*ordinal as u64))))
+            .map(|(_, entry)| entry)
+            .collect();
+        push_index_entries(entries, index, surviving, false)?;
     }
     Ok(())
 }
@@ -111,67 +132,31 @@ pub(super) async fn stage_index_maintenance(
     let mut inline_deletes: HashMap<u64, Vec<u64>> = HashMap::new();
     let mut file_deletes: HashMap<(u64, u64), KilledRows> = HashMap::new();
 
-    for op in ops {
-        match op {
-            RowOperation::Insert {
-                table: TableKind::DataFile,
-                cells,
-            } => {
-                stage_data_file_index_entries(base, cells, data_store, data_prefix, &mut entries)
-                    .await?;
-            }
-            RowOperation::Insert {
-                table: TableKind::DeleteFile,
-                cells,
-            } => {
-                collect_delete_file_rows(base, cells, data_store, data_prefix, &mut file_deletes)
-                    .await?;
-            }
-            RowOperation::InlineInsert {
-                table_id,
-                schema_version,
-                row_id_start,
-                row_count,
-                arrow_body,
-                ..
-            } => {
-                stage_inline_chunk_entries(
-                    db_tx,
-                    base,
-                    &pending_schemas,
-                    *table_id,
-                    &InlineChunk {
-                        schema_version: *schema_version,
-                        row_id_start: *row_id_start,
-                        row_count: *row_count,
-                        body: arrow_body,
-                    },
-                    None,
-                    &mut entries,
-                )
-                .await?;
-            }
-            RowOperation::InlineInlineDelete {
-                table_id, row_id, ..
-            } => {
-                inline_deletes.entry(*table_id).or_default().push(*row_id);
-            }
-            RowOperation::InlineFileDelete {
-                table_id,
-                data_file_id,
-                row_id: position,
-                ..
-            } => {
-                // An inlined file-delete names a physical position in the
-                // file, exactly as a delete file's `pos` does.
-                file_deletes
-                    .entry((*table_id, *data_file_id))
-                    .or_default()
-                    .insert_position(*position);
-            }
-            _ => {}
-        }
-    }
+    // Deletes are collected before any add is derived: a delete against a
+    // data file this same commit registers decides which of that file's
+    // rows are indexed at all, so it has to be known by the time the file
+    // is read. Nothing fixes the two rows' order within the batch.
+    collect_deletes(
+        base,
+        ops,
+        data_store,
+        data_prefix,
+        &mut inline_deletes,
+        &mut file_deletes,
+    )
+    .await?;
+
+    let registered = stage_adds(
+        db_tx,
+        base,
+        ops,
+        &pending_schemas,
+        &file_deletes,
+        data_store,
+        data_prefix,
+        &mut entries,
+    )
+    .await?;
 
     for (table_id, row_ids) in &inline_deletes {
         stage_inline_delete_entries(
@@ -186,6 +171,11 @@ pub(super) async fn stage_index_maintenance(
         .await?;
     }
     for ((table_id, data_file_id), killed) in &file_deletes {
+        // Already resolved at the add: the rows this delete kills were left
+        // out of the file's entries rather than staged and removed.
+        if registered.contains(&(*table_id, *data_file_id)) {
+            continue;
+        }
         stage_file_delete_entries(
             base,
             *table_id,
@@ -202,6 +192,115 @@ pub(super) async fn stage_index_maintenance(
         return Ok(Vec::new());
     }
     stage_index_entries(db_tx, &entries).await
+}
+
+/// Groups every row this commit kills: inlined rows by table, and file
+/// rows by the `(table_id, data_file_id)` whose positions they name.
+async fn collect_deletes(
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+    data_store: Option<&Arc<dyn ObjectStore>>,
+    data_prefix: &str,
+    inline_deletes: &mut HashMap<u64, Vec<u64>>,
+    file_deletes: &mut HashMap<(u64, u64), KilledRows>,
+) -> Result<()> {
+    for op in ops {
+        match op {
+            RowOperation::Insert {
+                table: TableKind::DeleteFile,
+                cells,
+            } => {
+                collect_delete_file_rows(base, cells, data_store, data_prefix, file_deletes)
+                    .await?;
+            }
+            RowOperation::InlineFileDelete {
+                table_id,
+                data_file_id,
+                row_id: position,
+                ..
+            } => {
+                // An inlined file-delete names a physical position in the
+                // file, exactly as a delete file's `pos` does.
+                file_deletes
+                    .entry((*table_id, *data_file_id))
+                    .or_default()
+                    .insert_position(*position);
+            }
+            RowOperation::InlineInlineDelete {
+                table_id, row_id, ..
+            } => {
+                inline_deletes.entry(*table_id).or_default().push(*row_id);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Derives the entry adds for every data file and inline chunk this commit
+/// registers, in stage order, and returns the `(table_id, data_file_id)`
+/// of the data files among them — the targets whose deletes are already
+/// accounted for here rather than as removals.
+#[allow(clippy::too_many_arguments)]
+async fn stage_adds(
+    db_tx: &DbTransaction,
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+    pending_schemas: &HashMap<(u64, u64), &[u8]>,
+    file_deletes: &HashMap<(u64, u64), KilledRows>,
+    data_store: Option<&Arc<dyn ObjectStore>>,
+    data_prefix: &str,
+    entries: &mut Vec<StagedIndexEntry>,
+) -> Result<HashSet<(u64, u64)>> {
+    let mut registered: HashSet<(u64, u64)> = HashSet::new();
+    for op in ops {
+        match op {
+            RowOperation::Insert {
+                table: TableKind::DataFile,
+                cells,
+            } => {
+                let file = decode_data_file(cells)?;
+                let key = (file.table_id, file.data_file_id);
+                registered.insert(key);
+                stage_data_file_index_entries(
+                    base,
+                    cells,
+                    file_deletes.get(&key),
+                    data_store,
+                    data_prefix,
+                    entries,
+                )
+                .await?;
+            }
+            RowOperation::InlineInsert {
+                table_id,
+                schema_version,
+                row_id_start,
+                row_count,
+                arrow_body,
+                ..
+            } => {
+                stage_inline_chunk_entries(
+                    db_tx,
+                    base,
+                    pending_schemas,
+                    *table_id,
+                    &InlineChunk {
+                        schema_version: *schema_version,
+                        row_id_start: *row_id_start,
+                        row_count: *row_count,
+                        body: arrow_body,
+                    },
+                    None,
+                    entries,
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(registered)
 }
 
 /// The inline schemas this commit registers, for a chunk whose
@@ -429,8 +528,11 @@ pub(super) async fn collect_delete_file_rows(
     Ok(())
 }
 
-/// Derives the entry removals for rows killed inside one data file, by
-/// scoped-reading the file and keeping the rows this commit marks dead.
+/// Derives the entry removals for rows killed inside one data file the
+/// committed head already holds, by scoped-reading the file and keeping
+/// the rows this commit marks dead. A delete against a file this same
+/// commit registers never reaches here — those rows are left unindexed at
+/// the add instead.
 pub(super) async fn stage_file_delete_entries(
     base: &CatalogSnapshot,
     table_id: u64,
@@ -454,18 +556,7 @@ pub(super) async fn stage_file_delete_entries(
         ))
     })?;
 
-    // Positions are physical row ordinals read out of the delete file; one
-    // naming a row the target does not hold could never match a scoped
-    // entry and would silently orphan index rows, so refuse it here.
-    for &position in &killed.positions {
-        if position >= file.record_count {
-            return Err(Error::Constraint(format!(
-                "delete file for data file {data_file_id} on table {table_id} names position \
-                 {position} outside the file's record count {}",
-                file.record_count
-            )));
-        }
-    }
+    refuse_out_of_range(killed, &file)?;
 
     let path = data_file_object_path(base, &file, data_prefix)?;
     let per_index =
@@ -486,7 +577,7 @@ pub(super) async fn stage_file_delete_entries(
 }
 
 /// One live data file of a table.
-pub(super) fn live_data_file(
+fn live_data_file(
     base: &CatalogSnapshot,
     table_id: u64,
     data_file_id: u64,
@@ -496,6 +587,22 @@ pub(super) fn live_data_file(
         .and_then(|files| files.get(&data_file_id))
         .cloned()
         .ok_or_else(|| Error::NotFound(format!("data file {data_file_id} of table {table_id}")))
+}
+
+/// Positions are physical row ordinals read out of the delete file; one
+/// naming a row the target does not hold could never match a scoped entry
+/// and would silently orphan index rows, so refuse it.
+fn refuse_out_of_range(killed: &KilledRows, file: &proto::DataFileValue) -> Result<()> {
+    for &position in &killed.positions {
+        if position >= file.record_count {
+            return Err(Error::Constraint(format!(
+                "delete file for data file {} on table {} names position {position} outside the \
+                 file's record count {}",
+                file.data_file_id, file.table_id, file.record_count
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The object path of a registered data file: its stored path relative to the

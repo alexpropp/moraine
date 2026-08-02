@@ -254,6 +254,8 @@ The operation → keyspace mapping (source-verified against DuckLake
 | `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}`, plus the `inline/file_delete_table` marker for `t` |
 | `DELETE FROM ducklake_inlined_delete_<t>` (the flush's clean-up, once those deletions are written out as a real delete file) | remove the `inline/file_delete` record behind each matched row, keeping the `inline/file_delete_table` marker. Translated per row rather than as a table-wide clear: DuckLake's flush happens to delete every row, but what it issues is an ordinary SQL `DELETE`, so a filtered one removes exactly what it matched. Naming a record the table does not carry is a typed error, not a silent no-op |
 | `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks and consumed `inline/inline_delete`; drop the `inline/schema` and deregister. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
+| hard `DELETE FROM ducklake_data_file` naming `(t, file_id)` (a merge pruning its sources, cleanup draining the schedule) | remove every `inline/file_delete` record targeting that file, keeping the marker. Silent on a miss, unlike the removal above: this cascade names a file rather than records, and a pruned file carrying no inlined deletion is the ordinary case |
+| `UPDATE ducklake_data_file SET end_snapshot` (a rewrite ending its source) | nothing — see below |
 | `DROP TABLE lake.<schema>.<t>` cascade | drop every `inline/*` record for `t` |
 
 This is served through the same staged-row commit path (RFC 0004): the
@@ -309,6 +311,64 @@ governed the implementation:
   re-encodes to Parquet. A future column-oriented decode path could hand
   the imported `DataChunk` to the flush writer directly, but the row
   materialization is not on the tiny-commit hot path inlining optimizes.
+
+### Flush registers a data file and a delete file against it in one commit
+
+A flush does not filter tombstoned rows out of the Parquet it writes. It
+materializes **every** inlined row of the table — live and tombstoned
+alike — into one data file, then writes a delete file naming the
+tombstoned rows' *positions in that file*
+(`ducklake_flush_inlined_data.cpp`'s `AttachDeleteFilesToWrittenFiles`).
+One commit therefore carries a `ducklake_data_file` insert and a
+`ducklake_delete_file` insert whose `data_file_id` is that same
+brand-new file.
+
+Equality-index upkeep therefore resolves such a delete **at the add**: the
+rows it kills are left out of the file's entries as the file is read, so
+they are never indexed at all. The commit's deletes are collected before
+any add is derived, since nothing fixes the two rows' order in the batch.
+
+Staging a removal beside the add instead would be wrong, not merely
+wasteful. An index entry's key carries no file, so an add and a removal of
+one `(key, row_id)` in a single batch is *exactly* the shape an `UPDATE`
+produces — DuckLake rewrites the updated row into a new file under its
+preserved row id, ending the old file's copy — and there the entry must
+survive. The two are indistinguishable at the batch layer and can only be
+told apart by whether the removal targets the very file the add came from.
+`stage_file_delete_entries` accordingly handles only targets the committed
+head already holds; a target the commit itself registers is skipped there
+because the add already accounted for it.
+
+Only an indexed table reaches any of this: upkeep returns early when the
+table carries no live index.
+
+### An inlined deletion dies with its target's row, not with its target
+
+`ducklake_inlined_delete_<t>` has no `end_snapshot` column: a deletion
+exists or it does not, and there is no way to express one that applied over
+a window. Removal is therefore the only way one goes away, and every
+removal has to be paired with something that preserves what it meant — the
+flush pairs its clear with a backdated delete file.
+
+That forces the cascade to key on how a data file leaves, which RFC 0021
+already distinguishes for its own reasons:
+
+- **Pruned** (a merge's sources, cleanup's schedule) — the row is
+  hard-deleted, current *and* history, because the backdated replacement
+  subsumed its whole visibility history. Nothing can read that file at any
+  snapshot again, so an inlined deletion against it is unreachable. It is
+  removed with the file's row. Left behind, it would still be served, and
+  the next flush would materialize it into a delete file naming a data file
+  that no longer exists — which the commit refuses.
+- **Ended** (a rewrite's source) — the row moves to `history` precisely
+  because a reader below the rewrite must still see the rows it
+  materialized deletes for. The deletions that make those rows dead have to
+  stay readable alongside it, so ending a file removes nothing. They go
+  later, when expiry and cleanup prune the ended row.
+
+Both are covered by
+`hard_deleting_a_data_file_drops_the_inlined_deletions_against_it` and
+`ending_a_data_file_keeps_the_inlined_deletions_against_it`.
 
 ## Alternatives considered
 
