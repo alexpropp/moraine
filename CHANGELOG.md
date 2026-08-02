@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/morainedb/moraine/compare/v0.4.0...v0.4.1) - 2026-08-02
+
+### Added
+
+- settle the extension surface — checkpoint attach and per-version builds ([#67](https://github.com/morainedb/moraine/pull/67))
+- close out the RFC 0004 commit-protocol follow-ups ([#66](https://github.com/morainedb/moraine/pull/66))
+- complete the RFC 0003 verb surface — partitioning, tags, inlining ([#65](https://github.com/morainedb/moraine/pull/65))
+- Type the genesis open race and settle the crash-recovery follow-ups ([#64](https://github.com/morainedb/moraine/pull/64))
+- batch several catalog commits into one WriteBatch and one flush ([#62](https://github.com/morainedb/moraine/pull/62))
+- Expose the migrate verb through the DuckDB extension ([#63](https://github.com/morainedb/moraine/pull/63))
+- Add the crash-resumable format-migration driver and migrate verb ([#61](https://github.com/morainedb/moraine/pull/61))
+- Guard readers against format migration and add crash-injection seams ([#50](https://github.com/morainedb/moraine/pull/50))
+- Complete the error taxonomy and settle format migration ([#53](https://github.com/morainedb/moraine/pull/53))
+- Route diagnostics per attached catalog
+
+### Fixed
+
+- keep ducklake_schema_versions rows across snapshot expiry ([#68](https://github.com/morainedb/moraine/pull/68))
+- Close the format-migration reader gate and settle the version check ([#58](https://github.com/morainedb/moraine/pull/58))
+
+### Other
+
+- resolve unique index probes with concurrent point reads, not a scan ([#60](https://github.com/morainedb/moraine/pull/60))
+- Add the crash-recovery suite and rescope RFC 0011 ([#59](https://github.com/morainedb/moraine/pull/59))
+- Serve catalog reads from the cached view ([#56](https://github.com/morainedb/moraine/pull/56))
+- Reclaim dead index entries off the durability path ([#52](https://github.com/morainedb/moraine/pull/52))
+- Settle the open DuckLake behaviour questions ([#51](https://github.com/morainedb/moraine/pull/51))
+- project website on GitHub Pages, branded, at morainedb.github.io ([#41](https://github.com/morainedb/moraine/pull/41))
+
 ## [0.4.0](https://github.com/alexpropp/moraine/compare/v0.3.3...v0.4.0) - 2026-07-28
 
 ### Added
