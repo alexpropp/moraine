@@ -1190,3 +1190,78 @@ fn maintenance_renders_an_interval_older_than_as_a_rolling_window() {
         vec![vec!["4".to_string()]]
     );
 }
+
+/// Compaction after expiry, differential against a stock DuckLake
+/// catalog: `ducklake_schema_versions` keeps the rows the expired
+/// snapshots wrote, so `ducklake_merge_adjacent_files` still resolves
+/// each data file's schema version and merges. Deriving those rows from
+/// surviving snapshots instead leaves the compaction planner's join
+/// with a NULL and aborts it at bind.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_merge_adjacent_files_survives_expiry() {
+    let store = TempDir::new("merge-expire-store");
+    let data = TempDir::new("merge-expire-data");
+    let reference_meta = TempDir::new("merge-expire-ref-meta");
+    let reference_data = TempDir::new("merge-expire-ref-data");
+
+    let apply = |sql: &str| {
+        run_ducklake_sql(store.path(), data.path(), sql);
+        run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+    };
+    let probe = |sql: &str| -> Vec<Vec<String>> {
+        let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+        let reference_rows = csv_rows(&run_reference_ducklake_sql(
+            reference_meta.path(),
+            reference_data.path(),
+            sql,
+        ));
+        assert_eq!(
+            moraine_rows, reference_rows,
+            "moraine diverges from stock DuckLake for `{sql}`"
+        );
+        moraine_rows
+    };
+
+    // Three small Parquet files, each from its own snapshot: merge input
+    // once flushed. `ALTER TABLE` gives the table a second schema
+    // version, so the rows being retained are more than one.
+    apply("CREATE TABLE lake.main.t(a BIGINT);");
+    for range in ["range(10)", "range(10, 20)", "range(20, 30)"] {
+        apply(&format!(
+            "INSERT INTO lake.main.t SELECT i FROM {range} t(i);\
+             CALL ducklake_flush_inlined_data('lake');"
+        ));
+    }
+    apply("ALTER TABLE lake.main.t ADD COLUMN b VARCHAR;");
+    let recorded = probe(
+        "SELECT begin_snapshot, schema_version, table_id \
+         FROM __ducklake_metadata_lake.ducklake_schema_versions ORDER BY 1, 3;",
+    );
+    assert_eq!(recorded.len(), 2, "create and alter each record a row");
+
+    // Expiry takes every snapshot below the head — including the ones
+    // those rows were written in, and every one the three data files
+    // were written in.
+    apply("CALL ducklake_expire_snapshots('lake', older_than => now());");
+    assert_eq!(
+        probe("SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot;"),
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        probe(
+            "SELECT begin_snapshot, schema_version, table_id \
+             FROM __ducklake_metadata_lake.ducklake_schema_versions ORDER BY 1, 3;"
+        ),
+        recorded
+    );
+
+    assert_eq!(
+        probe("SELECT files_processed, files_created FROM ducklake_merge_adjacent_files('lake');"),
+        vec![vec!["3".to_string(), "1".to_string()]]
+    );
+    assert_eq!(
+        probe("SELECT count(*), sum(a) FROM lake.main.t;"),
+        vec![vec!["30".to_string(), "435".to_string()]]
+    );
+}

@@ -64,6 +64,7 @@ pub(super) fn collect_hard_deletes(ops: &[RowOperation]) -> Result<BTreeSet<Enti
 
 pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
     let mut children = ChildRows::default();
+
     for op in ops {
         if let RowOperation::Insert { table, cells } = op {
             match table {
@@ -119,21 +120,27 @@ pub(super) fn collect_child_rows(ops: &[RowOperation]) -> Result<ChildRows> {
             }
         }
     }
+
     for columns in children.partition_columns.values_mut() {
         columns.sort_by_key(|c| c.partition_key_index);
     }
+
     for expressions in children.sort_expressions.values_mut() {
         expressions.sort_by_key(|e| e.sort_key_index);
     }
+
     for values in children.file_partition_values.values_mut() {
         values.sort_by_key(|v| v.partition_key_index);
     }
+
     for implementations in children.macro_implementations.values_mut() {
         implementations.sort_by_key(|i| i.impl_id);
     }
+
     for parameters in children.macro_parameters.values_mut() {
         parameters.sort_by_key(|p| p.column_id);
     }
+
     for rows in children.name_mappings.values_mut() {
         rows.sort_by_key(|r| r.column_id);
     }
@@ -764,6 +771,31 @@ fn apply_option_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()
     Ok(())
 }
 
+/// The dead-table cleanup's `DELETE FROM ducklake_schema_versions WHERE
+/// table_id IN (...)`: the record goes, exactly as it does in a
+/// SQL-backed catalog. The row's copy inside the snapshot record needs no
+/// removal — expiry deletes that record whole.
+fn apply_schema_version_delete(
+    cells: &[Cell],
+    direct: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    let mut c = Cursor::new(TableKind::SchemaVersions, cells);
+    let begin_snapshot = c.u64()?;
+    let _schema_version = c.u64()?;
+    let table_id = c.u64()?;
+    c.finish()?;
+
+    direct.push((
+        Key::SchemaVersion {
+            table_id,
+            begin_snapshot,
+        }
+        .encode(),
+        None,
+    ));
+    Ok(())
+}
+
 /// exist only in the store, never in the working state); embedded rows
 /// (tag entries, spec columns) rewrite or ride their parent.
 pub(super) fn apply_delete(
@@ -876,18 +908,7 @@ pub(super) fn apply_delete(
         | TableKind::MacroImpl
         | TableKind::MacroParameters
         | TableKind::NameMapping => apply_embedded_delete(state, table, cells, hard_deleted),
-        TableKind::SchemaVersions => {
-            // Schema-version rows fold into snapshot records; the rows a
-            // dead-table cleanup deletes are visible only through
-            // snapshots the same transaction deletes, so there is nothing
-            // separate to remove.
-            let mut c = Cursor::new(table, cells);
-            let _begin_snapshot = c.u64()?;
-            let _schema_version = c.u64()?;
-            let _table_id = c.u64()?;
-            c.finish()?;
-            Ok(())
-        }
+        TableKind::SchemaVersions => apply_schema_version_delete(cells, direct),
     }
 }
 
@@ -1091,9 +1112,10 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         ));
     }
 
-    // `ducklake_schema_versions` rows fold in as the table-id set; the two
-    // redundant columns are validated against this commit's own snapshot
-    // values rather than trusted, so a mismatch is drift caught loudly.
+    // `ducklake_schema_versions` rows name their tables here and are
+    // written as records of their own by the caller; the two redundant
+    // columns are validated against this commit's own snapshot values
+    // rather than trusted, so a mismatch is drift caught loudly.
     let schema_changed_table_ids = ops
         .iter()
         .filter_map(|op| match op {

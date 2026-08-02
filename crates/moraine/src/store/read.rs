@@ -9,8 +9,8 @@ use crate::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
             GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
-            OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
-            TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
+            OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue, SnapshotValue,
+            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         value,
     },
@@ -188,6 +188,30 @@ pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRec
         }),
         EntityKey::Tag { .. } => Ok(EntityRecord::Tag(value::decode_value(bytes)?)),
     }
+}
+
+/// Every `ducklake_schema_versions` record as `(table_id,
+/// begin_snapshot, schema_version)`, in key order. Retained across
+/// snapshot expiry, so this is the projection's durable source — the
+/// snapshot records only carry the same rows for as long as they live.
+pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64, u64)>> {
+    scan_decode(
+        handle,
+        subspace_prefix(Subspace::SchemaVersion),
+        |key, bytes| match key {
+            Key::SchemaVersion {
+                table_id,
+                begin_snapshot,
+            } => {
+                let value: SchemaVersionValue = value::decode_value(bytes)?;
+                Ok((table_id, begin_snapshot, value.schema_version))
+            }
+            other => Err(Error::Corruption(format!(
+                "non-schema-version key in schema-version scan: {other:?}"
+            ))),
+        },
+    )
+    .await
 }
 
 /// Every live entity record.
