@@ -1063,11 +1063,12 @@ fn rewrite_data_file_row(
     ]
 }
 
-/// A compaction-shaped commit re-registers surviving rows in a
-/// per-row-id file: every derived entry already exists, the commit
-/// lands, and the `index` range is byte-identical.
+/// A commit that re-registers rows in a per-row-id file derives entries
+/// that already exist: the commit lands and the `index` range is
+/// byte-identical. Marked as an append, the derivation the compaction
+/// kinds skip below.
 #[tokio::test]
-async fn rewrite_registration_re_derives_entries_idempotently() {
+async fn per_row_id_registration_re_derives_entries_idempotently() {
     let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
     let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
     let before = index_entry_keys(&catalog, true, index_id).await;
@@ -1098,7 +1099,7 @@ async fn rewrite_registration_re_derives_entries_idempotently() {
     });
     tx.stage(RowOperation::Insert {
         table: TableKind::SnapshotChanges,
-        cells: snapshot_changes_row(4, "rewrite_delete:1"),
+        cells: snapshot_changes_row(4, "inserted_into_table:1"),
     });
     tx.commit().await.unwrap();
 
@@ -1107,6 +1108,100 @@ async fn rewrite_registration_re_derives_entries_idempotently() {
         before,
         "the index range is byte-identical: re-derived entries are no-ops"
     );
+}
+
+/// Stages a compaction-shaped commit under `changes`: file 12 replaces
+/// file 1, carrying per-row ids unless `row_id_start` gives it a dense
+/// range. The replacement is never written to the store, so a commit
+/// that reads it to derive entries fails and one that skips it lands.
+async fn commit_compaction(
+    catalog: &Catalog,
+    store: &Arc<InMemory>,
+    changes: &str,
+    row_id_start: Option<u64>,
+) -> Result<SnapshotId> {
+    let mut cells = rewrite_data_file_row(12, 4, "merged.parquet", 3, 1024);
+    if let Some(start) = row_id_start {
+        cells[11] = Cell::U64(start);
+    }
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells,
+    });
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(1), Cell::U64(4)],
+    });
+    tx.stage(RowOperation::UpdateSetBegin {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(12), Cell::U64(4)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 2),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, changes),
+    });
+    tx.commit().await
+}
+
+/// Compaction re-homes rows without renumbering or rewriting them, so
+/// every entry it would derive is already stored under the same key.
+/// The commit stages no index work at all: it does not even read the
+/// file it registers, which is what keeps a merge of a large indexed
+/// table under the per-commit entry limit.
+#[tokio::test]
+async fn compaction_registration_stages_no_index_work() {
+    for (changes, row_id_start) in [
+        // A merge of adjacent ranges keeps the dense range it merged.
+        ("merge_adjacent:1", Some(0)),
+        // A rewrite carries the ids it preserved per row.
+        ("rewrite_delete:1", None),
+    ] {
+        let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+        let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+        let before = index_entry_keys(&catalog, true, index_id).await;
+        assert_eq!(before.len(), 3);
+
+        commit_compaction(&catalog, &store, changes, row_id_start)
+            .await
+            .unwrap_or_else(|err| panic!("{changes} must not read the file it registers: {err}"));
+
+        assert_eq!(
+            index_entry_keys(&catalog, true, index_id).await,
+            before,
+            "{changes} leaves the index range untouched"
+        );
+        catalog.close().await.unwrap();
+    }
+}
+
+/// DuckLake commits compaction alone or not at all, so a change set that
+/// mixes the two is drift: the file is read and its entries derived,
+/// never skipped on the compaction marker's word.
+#[tokio::test]
+async fn a_commit_mixing_compaction_with_another_change_still_derives() {
+    let (catalog, _) = catalog_with_indexed_inline_table(true).await;
+    let store = register_indexed_data_file(&catalog, &[10, 20, 30]).await;
+
+    let err = commit_compaction(
+        &catalog,
+        &store,
+        "merge_adjacent:1,inserted_into_table:1",
+        Some(0),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("merged.parquet"),
+        "the registered file is read, not skipped: {err}"
+    );
+    catalog.close().await.unwrap();
 }
 
 /// An UPDATE-shaped per-row-id file carries changed values under
