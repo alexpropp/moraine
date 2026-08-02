@@ -32,7 +32,6 @@ pub fn check_pins() -> anyhow::Result<()> {
     println!("supported:   {}", supported.join(", "));
 
     let mut problems = Vec::new();
-
     // Compared by commit rather than tag: a submodule is routinely a
     // shallow clone with no tags fetched, where `git describe` has nothing
     // to say.
@@ -43,6 +42,7 @@ pub fn check_pins() -> anyhow::Result<()> {
          (`duckdb=<commit> extension-ci-tools=<commit>`); it pins {}",
         pinned_submodules.len()
     );
+
     for (path, expected) in pinned_submodules {
         match submodule_commit(&path) {
             Ok(commit) if commit == expected => {}
@@ -75,6 +75,7 @@ pub fn check_pins() -> anyhow::Result<()> {
             ));
         }
     }
+
     for file in ["crates/moraine-duckdb/README.md"] {
         if !read(file)?.contains(pin) {
             problems.push(format!(

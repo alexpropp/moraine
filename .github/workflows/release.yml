@@ -1,13 +1,8 @@
 name: Release
-
 # On push to main, when Cargo.toml's version isn't on crates.io yet: build the
 # extension for every platform, and only if that succeeds, publish the crate and
 # cut both the v<version> crate release and the ext-v<version> extension release
-# (binaries attached). The crate never publishes without a working extension.
-# An ordinary push (no version bump) no-ops at the should-release gate.
-#
-# Secrets: RELEASE_PLZ_TOKEN (contents+PRs; authors the tag/release, pushes the
-# descriptor ref bump, triggers downstream workflows) and CARGO_REGISTRY_TOKEN.
+# (binaries attached).
 on:
   workflow_dispatch:
   push:

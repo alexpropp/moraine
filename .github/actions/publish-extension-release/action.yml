@@ -16,12 +16,6 @@ runs:
     - uses: actions/download-artifact@v4
       with:
         path: artifacts
-    # The build workflow names each artifact
-    # `moraine-<duckdb_version>-extension-<arch>`, so both halves come from
-    # the directory name. Both are load-bearing in the asset name: a
-    # C++-ABI extension is refused by any DuckDB whose version string
-    # differs from the one in its footer, so a user must be able to pick
-    # the build matching their engine, not just their platform.
     - name: Stage per-version, per-arch assets
       shell: bash
       run: |
