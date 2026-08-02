@@ -61,6 +61,7 @@ below the leading byte is moraine convention, opaque to SlateDB.
 | `history` | Ended entity versions | Append-only |
 | `inline` | Inlined data — reserved for RFC 0005 | Per RFC 0005 |
 | `index` | Equality-index entries (RFC 0016) | Live-only; insert + delete |
+| `schema_version` | `ducklake_schema_versions` rows | Insert + delete, and never expired with the snapshot that wrote one |
 
 (Subspace declaration order — and therefore each subspace's discriminant
 byte — is fixed by the `Key` type and pinned by golden vectors; see Keys.)
@@ -152,6 +153,7 @@ Other subspaces:
 | `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together) |
 | `current/gcfile` | `data_file_id` | `ducklake_files_scheduled_for_deletion` — keyed by the scheduled file's id, the row's identity in DuckLake's own schema (inserts carry it, cleanup deletes by it); unique because a file's catalog rows are removed in the same transaction that schedules it, so no moraine-allocated id or counter exists (RFC 0007) |
 | `inline/*` | `table_id, schema_version, …` | Inlined data — RFC 0005 owns the five kinds (`schema`, `insert`, `inline_delete`, `file_delete`, and the `file_delete_table` existence marker) |
+| `schema_version` | `table_id, begin_snapshot` | The catalog `schema_version` that snapshot minted — the third column of a `ducklake_schema_versions` row. Its own subspace rather than a field of the snapshot record, because expiry (RFC 0007) deletes snapshot records and these rows must outlive them: a data file resolves the schema version it was written under by joining its `begin_snapshot` against them, long after that snapshot is gone. Removed only by the dead-table cleanup, exactly as DuckLake's own catalogs remove them |
 
 Two mapping conventions apply throughout: **1:1 side tables merge** into
 their parent record, and **pure child tables with no independent lifecycle
