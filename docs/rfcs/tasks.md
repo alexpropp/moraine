@@ -190,15 +190,6 @@ key.
   partial view; a commit landing between a commit attempt's materialization
   and its batch write is always detected.
 
-## 0010 — Async↔sync bridge
-
-- **DEFERRED** — Share one runtime across many attached catalogs in a single
-  process, if many-catalog processes prove common.
-- **DEFERRED** — Track DuckDB's extension API for a future async catalog or
-  operator contract, without pre-building for it.
-- **DEFERRED** — A commit-funnel dispatcher serializing a many-connection
-  process through a single committer, if a many-committer process appears.
-
 ## 0011 — Crash recovery
 
 - **IMPL** — Move `CrashCase` from the integration suite into the library,

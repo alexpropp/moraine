@@ -116,7 +116,9 @@ callback on completion that resumes DuckDB.
   into, so it would park the DuckDB thread anyway (defeating its only advantage)
   or demand deep DuckDB changes moraine does not control. It also adds a
   callback protocol crossing the C ABI — more surface, more unwind-across-FFI
-  risk — against RFC 0006's "thin, synchronous C functions."
+  risk — against RFC 0006's "thin, synchronous C functions." Should DuckDB
+  ever grow an async catalog or operator contract, this is the option to
+  re-open — but nothing here is built in anticipation of one.
 
 **C. Channel to a background runtime (dispatcher/actor).** The runtime runs on
 dedicated background thread(s); the FFI thread serializes each request onto a
