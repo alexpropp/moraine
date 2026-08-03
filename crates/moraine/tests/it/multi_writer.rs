@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use futures::StreamExt;
 use moraine::{
     Catalog, CatalogOptions, ColumnId, Error, FileIndexEntry, IndexDef, IndexKeyValue, IntWidth,
-    MaintenanceRequest, SnapshotId,
+    MaintenanceRequest, OptionScope, SnapshotId,
 };
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 
@@ -660,6 +660,418 @@ async fn a_peer_commit_becomes_visible_after_the_window() {
             .schema_by_name("sales")
             .is_some()
     );
+}
+
+/// A bounded fold drains the tail into the store and leaves the served state
+/// byte-for-byte where it was: folding is invisible to readers. A second sprint
+/// finds nothing left to fold.
+#[tokio::test]
+async fn fold_sprint_drains_the_tail_and_preserves_the_served_state() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    for name in ["a", "b", "c"] {
+        catalog
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    let before = catalog.snapshot().await.unwrap();
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 3);
+
+    let report = catalog.fold_sprint(u64::MAX).await.unwrap();
+    assert_eq!(report.slots_folded, 3);
+    assert_eq!(report.folded_through, 3);
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
+
+    // Folding is invisible to readers: same state, now served from the store.
+    let after = open_multi_writer(&store).await.snapshot().await.unwrap();
+    assert_eq!(after.current_snapshot().id, before.current_snapshot().id);
+    assert!(after.schema_by_name("c").is_some());
+
+    // Idempotent: a second sprint folds nothing.
+    assert_eq!(catalog.fold_sprint(u64::MAX).await.unwrap().slots_folded, 0);
+}
+
+/// A partial sprint advances the durable cursor atomically with its applies, so
+/// the next sprint resumes from it and never re-applies a folded slot.
+#[tokio::test]
+async fn an_interrupted_sprint_resumes_from_the_durable_cursor() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    for name in ["a", "b", "c", "d"] {
+        catalog
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    catalog.fold_sprint(2).await.unwrap(); // partial: folds slots 1-2
+    let report = catalog.fold_sprint(u64::MAX).await.unwrap();
+    assert_eq!(report.slots_folded, 2, "resumes at 3, no re-apply");
+    assert_eq!(report.folded_through, 4);
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
+
+    // The full head survives across the two sprints unchanged.
+    let head = open_multi_writer(&store).await.snapshot().await.unwrap();
+    assert_eq!(head.current_snapshot().id, SnapshotId::new(4));
+    for name in ["a", "b", "c", "d"] {
+        assert!(head.schema_by_name(name).is_some(), "{name} survived");
+    }
+}
+
+/// After a full sprint, a committed transaction still resolves to the snapshot
+/// it minted — now from the folded snapshot record rather than the tail scan.
+#[tokio::test]
+async fn transaction_outcome_resolves_from_a_folded_snapshot_after_a_sprint() {
+    use moraine_wal::SlotLog;
+    use uuid::Uuid;
+
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+
+    let slots = SlotLog::new(store.clone() as Arc<dyn ObjectStore>, "");
+    let envelope = slots
+        .read_slot(1)
+        .await
+        .unwrap()
+        .expect("the commit's slot");
+    let id = Uuid::from_bytes(envelope.commits[0].transaction_id);
+
+    catalog.fold_sprint(u64::MAX).await.unwrap();
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
+
+    let resolved = catalog
+        .transaction_outcome(id, SnapshotId::new(0))
+        .await
+        .unwrap();
+    assert_eq!(resolved, Some(SnapshotId::new(1)));
+}
+
+/// A read-only attach refuses every folder surface with a typed error: folding
+/// is the writer's monopoly.
+#[tokio::test]
+async fn folder_surfaces_refuse_a_read_only_attach() {
+    let store = Arc::new(InMemory::new());
+    open_multi_writer(&store).await; // bootstrap so the read-only open succeeds
+
+    let read_only = Catalog::open_read_only(
+        store.clone() as Arc<dyn ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        read_only.fold_sprint(u64::MAX).await,
+        Err(Error::Constraint(_))
+    ));
+    assert!(matches!(
+        read_only.unfolded_tail().await,
+        Err(Error::Constraint(_))
+    ));
+    assert!(matches!(
+        read_only.fold_if_stalled(0, Duration::ZERO, u64::MAX).await,
+        Err(Error::Constraint(_))
+    ));
+}
+
+/// The self-appointment rule wired over the real log: a stalled tail past the
+/// threshold appoints this handle, which folds it; a tail at or below the
+/// threshold appoints no one. A real (short) delay is used rather than a paused
+/// clock, since folding drives a live SlateDB writer whose flush loop needs
+/// real time to make progress.
+#[tokio::test]
+async fn fold_if_stalled_appoints_only_past_the_threshold() {
+    let store = Arc::new(InMemory::new());
+    let catalog =
+        open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, zero_refresh()).await;
+    for name in ["a", "b", "c"] {
+        catalog
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    // A tail of 3 at or below the threshold appoints no folder.
+    assert!(
+        catalog
+            .fold_if_stalled(3, Duration::from_millis(1), u64::MAX)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 3);
+
+    // Past the threshold it appoints this handle, which folds the tail.
+    let report = catalog
+        .fold_if_stalled(2, Duration::from_millis(1), u64::MAX)
+        .await
+        .unwrap()
+        .expect("a stalled tail appoints a folder");
+    assert_eq!(report.slots_folded, 3);
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
+}
+
+/// The full logical catalog, read through a fresh attach so the folded store
+/// (not a lagging reader) is what the dumps reconstruct over. Every dump merges
+/// the folded store with the unfolded tail, so this is invariant to how far a
+/// fold has advanced — the byte-level statement of "the log is truth, the store
+/// is a derived index."
+#[allow(clippy::unwrap_used)]
+async fn logical_dump(store: &Arc<InMemory>) -> Vec<String> {
+    use moraine::ffi_support::{
+        dump_columns, dump_data_files, dump_schemas, dump_snapshots, dump_tables,
+    };
+    let catalog = open_multi_writer(store).await;
+    let dump = vec![
+        format!("{:?}", dump_snapshots(&catalog).await.unwrap()),
+        format!("{:?}", dump_schemas(&catalog).await.unwrap()),
+        format!("{:?}", dump_tables(&catalog).await.unwrap()),
+        format!("{:?}", dump_columns(&catalog).await.unwrap()),
+        format!("{:?}", dump_data_files(&catalog).await.unwrap()),
+    ];
+    catalog.close().await.unwrap();
+    dump
+}
+
+/// Step 4b — the design's central proof. For a store with k slots,
+/// materializing after folding to **any** prefix `0..=k` yields byte-identical
+/// catalog state. A varied workload (schema and table DDL, an append, an
+/// options-only head-preserving commit, and an index definition) commits into k
+/// slots; then each successive fold is dumped through a fresh attach and
+/// compared to the fully-unfolded materialization. Any divergence would mean
+/// the folded and replayed paths disagree — the one bug class that makes
+/// folding observable.
+#[tokio::test]
+async fn folding_to_any_prefix_yields_byte_identical_catalog_state() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+
+    // Sequential commits, one slot each: schema, table, a column, an append, an
+    // options-only commit, and an index definition.
+    catalog
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+    let sales = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .schema_by_name("sales")
+        .unwrap()
+        .id;
+    catalog
+        .commit(move |tx| tx.create_table(sales, "orders", &[col("id")]).map(|_| ()))
+        .await
+        .unwrap();
+    let orders = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .table_by_name(sales, "orders")
+        .unwrap()
+        .id;
+    catalog
+        .commit(move |tx| tx.add_column(orders, &col("amount")).map(|_| ()))
+        .await
+        .unwrap();
+    catalog
+        .commit(move |tx| tx.register_data_file(orders, datafile(1), &[]).map(|_| ()))
+        .await
+        .unwrap();
+    catalog
+        .commit(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
+        .await
+        .unwrap();
+    catalog
+        .commit(move |tx| {
+            tx.create_index(
+                orders,
+                &IndexDef {
+                    name: "by_id".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: false,
+                },
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    let k = catalog.unfolded_tail().await.unwrap();
+    assert_eq!(k, 6, "the workload committed one slot each");
+
+    // Prefix 0: the fully-unfolded materialization is the reference.
+    let reference = logical_dump(&store).await;
+
+    // Every prefix 1..=k must materialize byte-for-byte the same state.
+    for prefix in 1..=k {
+        catalog.fold_sprint(1).await.unwrap();
+        assert_eq!(catalog.unfolded_tail().await.unwrap(), k - prefix);
+        assert_eq!(
+            logical_dump(&store).await,
+            reference,
+            "folding to prefix {prefix} diverged from the unfolded materialization"
+        );
+    }
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
+
+    // The materialized head, now fully folded, still carries the whole workload.
+    let head = open_multi_writer(&store).await.snapshot().await.unwrap();
+    let orders = head.table_by_name(sales, "orders").unwrap().id;
+    assert!(head.schema_by_name("sales").is_some());
+    assert!(head.columns_of(orders).iter().any(|c| c.name == "amount"));
+    assert_eq!(head.data_files_of(orders).len(), 1);
+    assert!(head.index_by_name(orders, "by_id").is_some());
+    assert_eq!(
+        head.option(OptionScope::Global, "answer").as_deref(),
+        Some("42")
+    );
+}
+
+/// A drop is fold-invisible: dropping a schema removes it from the head and
+/// ends its history record, and folding those writes into the store reconciles
+/// exactly — a fresh attach reading the folded store agrees with the unfolded
+/// tail on both the head (the schema gone) and time travel (the schema live at
+/// the snapshot before its drop).
+#[tokio::test]
+async fn folding_is_invisible_across_a_dropped_schema() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    catalog
+        .commit(|tx| tx.create_schema("doomed").map(|_| ()))
+        .await
+        .unwrap();
+    let doomed = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .schema_by_name("doomed")
+        .unwrap()
+        .id;
+    catalog
+        .commit(move |tx| tx.drop_schema(doomed))
+        .await
+        .unwrap();
+
+    // Before folding: doomed gone from the head, live at snapshot 1 (the drop
+    // is snapshot 2), read through the unfolded tail.
+    let before = open_multi_writer(&store).await;
+    assert!(
+        before
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("doomed")
+            .is_none()
+    );
+    assert!(
+        before
+            .snapshot_at(SnapshotId::new(1))
+            .await
+            .unwrap()
+            .schema_by_name("doomed")
+            .is_some()
+    );
+
+    catalog.fold_sprint(u64::MAX).await.unwrap();
+
+    // After folding: identical semantics, now from the folded store's stored
+    // end_snapshot plus lifecycle filtering.
+    let after = open_multi_writer(&store).await;
+    assert!(
+        after
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("doomed")
+            .is_none(),
+        "the drop folded: doomed is gone from the head"
+    );
+    assert!(
+        after
+            .snapshot_at(SnapshotId::new(1))
+            .await
+            .unwrap()
+            .schema_by_name("doomed")
+            .is_some(),
+        "the drop is fold-invisible: doomed is still live at snapshot 1"
+    );
+}
+
+/// A pruned snapshot is time-travelable until a folder applies the prune to the
+/// store; folding reconciles the divergence. An expiry deletes snapshot 1's
+/// record in a head-preserving commit: the unfolded tail still reconstructs the
+/// state as of snapshot 1, but once folded the store no longer holds that
+/// record and time travel to it resolves to `NotFound`.
+#[tokio::test]
+async fn folding_reconciles_an_expired_snapshot_to_not_found() {
+    use moraine::ffi_support::staged::{Cell, RowOperation, TableKind, staged_begin};
+
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    catalog
+        .commit(|tx| tx.create_schema("keep").map(|_| ()))
+        .await
+        .unwrap(); // snapshot 1
+    catalog
+        .commit(|tx| tx.create_schema("extra").map(|_| ()))
+        .await
+        .unwrap(); // snapshot 2
+
+    // Snapshot 1 is time-travelable before the expiry.
+    open_multi_writer(&store)
+        .await
+        .snapshot_at(SnapshotId::new(1))
+        .await
+        .unwrap();
+
+    // A head-preserving maintenance commit expires snapshot 1's record.
+    let mut expire = staged_begin(&catalog, None, String::new()).await.unwrap();
+    expire.stage(RowOperation::Delete {
+        table: TableKind::Snapshot,
+        cells: vec![Cell::U64(1)],
+    });
+    expire.stage(RowOperation::Delete {
+        table: TableKind::SnapshotChanges,
+        cells: vec![Cell::U64(1)],
+    });
+    let head_after = expire.commit().await.unwrap();
+    assert_eq!(
+        head_after,
+        SnapshotId::new(2),
+        "expiry must not advance the head"
+    );
+
+    // Pruned but unfolded: the tail replay still reconstructs snapshot 1.
+    open_multi_writer(&store)
+        .await
+        .snapshot_at(SnapshotId::new(1))
+        .await
+        .expect("a pruned-but-unfolded snapshot stays time-travelable");
+
+    catalog.fold_sprint(u64::MAX).await.unwrap();
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
+
+    // Folding reconciles: the store no longer holds snapshot 1, so time travel
+    // to it resolves to NotFound — the folded/single-writer semantics.
+    let err = open_multi_writer(&store)
+        .await
+        .snapshot_at(SnapshotId::new(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+
+    // The surviving snapshot and its schemas are unaffected.
+    let head = open_multi_writer(&store).await.snapshot().await.unwrap();
+    assert_eq!(head.current_snapshot().id, SnapshotId::new(2));
+    assert!(head.schema_by_name("keep").is_some());
+    assert!(head.schema_by_name("extra").is_some());
 }
 
 /// The point-probe trap made concrete: a peer commits, folds, and truncates

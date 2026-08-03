@@ -12,6 +12,7 @@ use std::{
 };
 
 use futures::StreamExt;
+use moraine_wal::FoldReport;
 use object_store::{ObjectStore, path::Path};
 use slatedb::{Db, DbReader, IsolationLevel};
 use tracing::{info, warn};
@@ -1886,6 +1887,66 @@ impl Catalog {
                 .await?
                 .map(SnapshotId::new),
         )
+    }
+
+    /// One bounded fold pass: opens the fenced writer, applies up to `limit`
+    /// unfolded slots — each as one atomic batch advancing the fold cursor —
+    /// and closes, leaving the store an accurate index of the log that far.
+    /// Folding is invisible to readers: the served state is byte-identical
+    /// before and after. Resuming after a crash re-reads the durable cursor and
+    /// never re-applies a folded slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only attach, [`Error::Fenced`]
+    /// if a concurrent folder fenced this session, [`Error::Corruption`] if the
+    /// tail has a hole or a slot does not chain, or a store error.
+    pub async fn fold_sprint(&self, limit: u64) -> Result<FoldReport> {
+        let store = self.folder_store()?;
+        folder::fold_sprint(store, limit).await
+    }
+
+    /// Slots committed but not yet folded — the clock-free staleness signal.
+    /// One tail-length probe from the fold cursor: existence checks, no slot
+    /// bodies fetched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only attach, or a store error.
+    pub async fn unfolded_tail(&self) -> Result<u64> {
+        let store = self.folder_store()?;
+        folder::unfolded_tail(store).await
+    }
+
+    /// The self-appointment rule: if the unfolded tail exceeds `threshold`,
+    /// wait `delay` plus jitter, re-check fold progress, and sprint only if no
+    /// other folder advanced the cursor. `Ok(None)` means this handle stood
+    /// down — the tail was short, or a peer folded during the wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only attach, [`Error::Fenced`]
+    /// if a concurrent folder fenced this session, or a store error.
+    pub async fn fold_if_stalled(
+        &self,
+        threshold: u64,
+        delay: Duration,
+        limit: u64,
+    ) -> Result<Option<FoldReport>> {
+        let store = self.folder_store()?;
+        folder::fold_if_stalled(store, threshold, delay, limit).await
+    }
+
+    /// The slot store a folder surface runs against, refusing a read-only
+    /// attach: folding and the staleness signal are the writer's monopoly.
+    fn folder_store(&self) -> Result<&SlotStore> {
+        let Store::Slots(store) = self.store.as_ref();
+        if store.read_only {
+            return Err(Error::Constraint(
+                "catalog attached read-only; folding is unavailable".to_string(),
+            ));
+        }
+        Ok(store)
     }
 }
 

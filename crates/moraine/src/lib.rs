@@ -127,5 +127,6 @@ pub use catalog::{
     TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
+pub use moraine_wal::FoldReport;
 pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};
 pub use transaction::Transaction;
