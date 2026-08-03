@@ -328,8 +328,15 @@ run. This term is ~0.2 ms there; it would take on the order of a million
 SSTs to cost minutes. An attach that is slow against a large `index` is
 therefore not slow *because of* it.
 
-What remains is `current`'s **live** bytes — 12.8 MB on that store — and
-what a read does with them. Materialization costs ~5-7 µs per live entity
+What remained was `current`'s **live** bytes — 12.8 MB on that store — and
+what a read did with them, which turned out to be the whole answer: SlateDB's
+scan default is `read_ahead_bytes: 1` (one block) with `max_fetch_tasks: 1`,
+so a whole-subspace scan paid one object-store round trip per block. The
+instrumented attach measured a single materialization at **276.7 s** for
+those 12.8 MB — ~46 KB/s, which is the latency of ~3 200 sequential 4 KB
+fetches and nothing else, against 6.9 s of user CPU across the whole 833 s
+attach. Reading ahead and fetching concurrently is the fix; on an in-memory
+store the same scan costs 5 reads instead of 89. Materialization costs ~5-7 µs per live entity
 (below), and before RFC 0009's caching landed a read-only catalog
 rematerialized on *every* read while `dump_entities` cloned the whole record
 set per call. At ~2.4 s per rescan over the network, a 642 s attach is on the
