@@ -6,18 +6,24 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
 };
 
 use anyhow::{Context, bail, ensure};
 
-/// The DuckDB versions manifest, compiled in so every consumer reads one
-/// copy. `cargo xtask check-pins` verifies the file has not moved since.
-pub const DUCKDB_VERSIONS_MANIFEST: &str = include_str!("../../.github/duckdb-versions");
+/// The DuckDB versions manifest, read once so every consumer sees one
+/// copy.
+fn duckdb_versions_manifest() -> &'static str {
+    static MANIFEST: OnceLock<String> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        fs::read_to_string(workspace_root().join(".github/duckdb-versions")).unwrap_or_default()
+    })
+}
 
 /// The manifest's content lines, comments and blanks dropped, newest
 /// first.
 fn manifest_entries() -> impl Iterator<Item = &'static str> {
-    DUCKDB_VERSIONS_MANIFEST
+    duckdb_versions_manifest()
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
