@@ -300,10 +300,11 @@ deliberately not itemized here.
   sequence today.
 - **DEFERRED** — Collapse the batched sweep into one range-delete per dead
   index if SlateDB exposes a range delete. Shared with 0016.
-- **IMPL** — The DuckDB surface for both verbs: step 8 and its three attach
-  options, and the `moraine_store_census` table function, which must serve a
-  read-only attach. The core verbs and the C ABI beneath them exist; nothing
-  in `cpp/` calls them yet, so an operator can reach neither from SQL.
+- **DECISION** — Whether the store merge deserves an on-demand trigger of
+  its own. It is reachable only through a pass today, so merging once
+  against a lake whose attach did not configure step 8 means re-attaching.
+  The census has a function; the merge deliberately does not, on the
+  argument that a one-off merge is rare and re-attaching is cheap.
 - **MEASURE** — Attach cost against `current`-subspace physical bytes,
   before and after a merge, on a store churned into a large dead fraction.
   The 642 s production attach is the only data point and it has no

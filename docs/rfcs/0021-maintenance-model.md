@@ -360,10 +360,14 @@ an operator needs a way to run one before a backup or after a bulk load
 without re-attaching.
 
 `CALL moraine_store_census('lake')` is a separate table function, not a
-trigger and not a step. It takes one optional boolean for the scanning leg,
-issues no SQL, mutates nothing, and is available on a read-only attach —
-which is the attach shape an operator investigating a production store
-actually has. It is the intended first move against a store whose size is
+trigger and not a step. It takes one named parameter, `live`, for the
+scanning leg, issues no SQL, mutates nothing, and is available on a
+read-only attach — which is the attach shape an operator investigating a
+production store actually has. It emits one row per subspace carrying the
+manifest version measured, so two censuses can be told apart, and the live
+columns are **NULL rather than zero** when the scan was not asked for: a
+subspace with no live keys and a subspace nobody counted are different
+answers. It is the intended first move against a store whose size is
 unexplained: run the census, read which subspace holds the bulk, and only
 then decide whether the answer is step 8, a `cleanup_old_files` the lake
 never ran, or neither.

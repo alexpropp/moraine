@@ -5,6 +5,7 @@
 
 #include "catalog.hpp"
 #include "moraine_abi.h"
+#include "owned_array.hpp"
 
 #include <algorithm>
 
@@ -64,6 +65,8 @@ std::string KnownStepList() {
 MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::string, duckdb::Value>> &options) {
 	MaintenanceConfig config;
 	std::vector<PendingStep> pending(StepSpecs().size());
+	bool compact_store_parameter_given = false;
+	bool compact_store_explicitly_disabled = false;
 
 	for (auto &option : options) {
 		auto name = duckdb::StringUtil::Lower(option.first);
@@ -95,6 +98,36 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 		}
 		if (rest == "sweep_indexes") {
 			config.sweep_indexes = option.second.GetValue<bool>();
+			continue;
+		}
+		if (rest == "compact_store") {
+			config.compact_store = option.second.GetValue<bool>();
+			compact_store_explicitly_disabled = !config.compact_store;
+			continue;
+		}
+		if (rest == "compact_store_subspace") {
+			// Validated by the core, which owns the subspace vocabulary;
+			// only emptiness is a shim-level mistake.
+			config.compact_store_subspace = option.second.GetValue<std::string>();
+			if (config.compact_store_subspace.empty()) {
+				throw duckdb::BinderException("MAINTENANCE_COMPACT_STORE_SUBSPACE must name a subspace");
+			}
+			// Supplying a parameter enables its step.
+			compact_store_parameter_given = true;
+			continue;
+		}
+		if (rest == "compact_store_timeout") {
+			if (option.second.type().id() == duckdb::LogicalTypeId::INTERVAL) {
+				auto interval = option.second.GetValue<duckdb::interval_t>();
+				config.compact_store_timeout_ms =
+				    static_cast<uint64_t>(duckdb::Interval::GetMicro(interval) / 1000);
+			} else {
+				config.compact_store_timeout_ms = option.second.GetValue<uint64_t>() * 1000;
+			}
+			if (config.compact_store_timeout_ms == 0) {
+				throw duckdb::BinderException("MAINTENANCE_COMPACT_STORE_TIMEOUT must be a positive duration");
+			}
+			compact_store_parameter_given = true;
 			continue;
 		}
 
@@ -152,6 +185,18 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			throw duckdb::BinderException("unknown maintenance option \"MAINTENANCE_%s\"; known steps are: %s",
 			                              duckdb::StringUtil::Upper(rest), KnownStepList());
 		}
+	}
+
+	// Supplying a parameter enables its step, as it does for every
+	// DuckLake step — but disabling a step while parameterizing it says
+	// two contradictory things, so it is refused rather than resolved.
+	if (compact_store_parameter_given) {
+		if (compact_store_explicitly_disabled) {
+			throw duckdb::BinderException(
+			    "MAINTENANCE_COMPACT_STORE is false but one of its parameters was supplied; drop one or "
+			    "the other");
+		}
+		config.compact_store = true;
 	}
 
 	for (duckdb::idx_t i = 0; i < pending.size(); i++) {
@@ -315,6 +360,14 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	                     ? RunSweep()
 	                     : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
 
+	// The store merge runs last, on what every step above it left behind:
+	// expiry tombstones rows and the sweep deletes index ranges, so
+	// merging earlier would leave exactly the tombstones this pass just
+	// created for the next pass to reclaim.
+	report.push_back(config_.compact_store
+	                     ? RunStoreMerge()
+	                     : MaintenanceStep {"compact_store", "skipped", "not configured at attach"});
+
 	{
 		std::lock_guard<std::mutex> guard(report_lock_);
 		passes_.push_back(MaintenancePass {started_at, trigger, report});
@@ -379,6 +432,47 @@ MaintenanceStep MaintenanceScheduler::RunSweep() {
 	                        "reclaimed " + std::to_string(entries) + (entries == 1 ? " entry" : " entries") +
 	                            " from " + std::to_string(indexes) +
 	                            (indexes == 1 ? " dropped index" : " dropped indexes")};
+}
+
+MaintenanceStep MaintenanceScheduler::RunStoreMerge() {
+	OwnedArray<MoraineSubspaceMerge> merges(moraine_compact_store_free);
+	MoraineError err {};
+	// No interrupt probe: the pass runs on the scheduler's own thread,
+	// which stops through the stop flag rather than a query interrupt.
+	auto code = moraine_compact_store(handle_,
+	                                  config_.compact_store_subspace.empty()
+	                                      ? nullptr
+	                                      : config_.compact_store_subspace.c_str(),
+	                                  config_.compact_store_timeout_ms, merges.OutItems(), merges.OutLen(),
+	                                  nullptr, nullptr, &err);
+	if (code != MORAINE_OK) {
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"compact_store", "failed", message};
+	}
+
+	// One clause per subspace, so a pass that merged some and skipped
+	// others says which was which rather than reporting a total.
+	std::string detail;
+	uint64_t reclaimed = 0;
+	for (auto &merge : merges) {
+		if (!detail.empty()) {
+			detail += ", ";
+		}
+		detail += std::string(merge.subspace) + ": " + merge.outcome;
+		if (merge.detail != nullptr && *merge.detail != '\0') {
+			detail += " (" + std::string(merge.detail) + ")";
+		}
+		if (merge.has_bytes_after && merge.bytes_after < merge.bytes_before) {
+			reclaimed += merge.bytes_before - merge.bytes_after;
+		}
+	}
+	if (reclaimed > 0) {
+		detail += "; reclaimed " + std::to_string(reclaimed) + " bytes";
+	}
+	return MaintenanceStep {"compact_store", "ran", detail};
 }
 
 namespace {

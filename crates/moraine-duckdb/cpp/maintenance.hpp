@@ -54,6 +54,16 @@ struct MaintenanceConfig {
 	// Zero takes the core's own batch default.
 	uint64_t batch_size = 0;
 	bool sweep_indexes = true;
+	// Off by default: the merge rewrites whatever the store holds and
+	// pays for every byte in object-store traffic. It destroys nothing a
+	// query can observe, so the default is about cost, not safety.
+	bool compact_store = false;
+	// Empty merges every subspace holding sorted runs.
+	std::string compact_store_subspace;
+	// How long a pass waits for each submitted merge to commit. Zero
+	// returns as soon as they are submitted; a merge that outlives the
+	// wait keeps running and is reported pending.
+	uint64_t compact_store_timeout_ms = 0;
 	std::vector<DuckLakeStep> ducklake_steps;
 };
 
@@ -105,6 +115,7 @@ private:
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
 	                                const DuckLakeStep &step);
 	MaintenanceStep RunSweep();
+	MaintenanceStep RunStoreMerge();
 	// The DuckLake catalog sitting above this metadata catalog, found by
 	// matching attached databases on path. DuckLake's own maintenance
 	// functions take that name, not this catalog's.
