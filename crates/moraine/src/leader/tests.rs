@@ -250,7 +250,12 @@ async fn commit_session(
             Response::Ok
         );
     }
-    client.request(&Request::Commit).await.unwrap()
+    client
+        .request(&Request::Commit {
+            transaction_id: *uuid::Uuid::new_v4().as_bytes(),
+        })
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -281,7 +286,12 @@ async fn a_leader_binds_announces_and_serves_a_full_session() {
         client.request(&Request::Stage(gc_insert(1))).await.unwrap(),
         Response::Ok
     );
-    let committed = client.request(&Request::Commit).await.unwrap();
+    let committed = client
+        .request(&Request::Commit {
+            transaction_id: *uuid::Uuid::new_v4().as_bytes(),
+        })
+        .await
+        .unwrap();
     assert!(
         matches!(committed, Response::Committed { .. }),
         "{committed:?}"

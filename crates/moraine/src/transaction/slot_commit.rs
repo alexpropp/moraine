@@ -53,6 +53,15 @@ impl ContentionCounters {
         self.exhausted.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
+    /// Records one lost slot race the staged path surfaces to its caller — the
+    /// verb path counts its own losses through [`record_committed`]. A nonzero
+    /// `races_lost` is the contention proof that arms forwarding.
+    ///
+    /// [`record_committed`]: Self::record_committed
+    pub(crate) fn record_lost(&self) {
+        self.races_lost.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
     /// A point-in-time read of the counters for a host or a forwarding client.
     pub(crate) fn snapshot(&self) -> Contention {
         Contention {
@@ -65,6 +74,113 @@ impl ContentionCounters {
 
 mod coalesce;
 pub(crate) use coalesce::CommitCoalescer;
+
+/// Per-store forwarding state shared across a handle's clones: the set of
+/// leader endpoints given up on for the life of the process. Aging is local —
+/// a client that cannot reach an advertised address stops trying it and commits
+/// directly, without deciding anything about the endpoint for its peers.
+#[cfg(feature = "leader")]
+#[derive(Debug, Default)]
+pub(crate) struct Forwarding {
+    aged: Mutex<std::collections::HashSet<String>>,
+}
+
+#[cfg(feature = "leader")]
+impl Forwarding {
+    fn lock(&self) -> MutexGuard<'_, std::collections::HashSet<String>> {
+        self.aged.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stops trying `endpoint` for the rest of this process's life.
+    pub(crate) fn age(&self, endpoint: &str) {
+        self.lock().insert(endpoint.to_string());
+    }
+
+    /// Whether `endpoint` was aged out this session.
+    pub(crate) fn is_aged(&self, endpoint: &str) -> bool {
+        self.lock().contains(endpoint)
+    }
+}
+
+/// A reachable leader a contended staged transaction forwards to: its
+/// advertised endpoint and the store-held session token.
+#[cfg(feature = "leader")]
+pub(crate) struct ForwardTarget {
+    pub(crate) endpoint: String,
+    pub(crate) secret: [u8; commit::SECRET_LEN],
+}
+
+/// The leader a staged transaction should forward to, or `None` to commit
+/// directly. Forwarding is armed only by a lost race — an uncontended client
+/// (`races_lost == 0`) never connects, so a live leader's advert alone never
+/// pulls a solo committer onto the network. A withdrawal (endpoint-absent
+/// advert) and an endpoint already aged this session both resolve to direct.
+#[cfg(feature = "leader")]
+pub(crate) async fn forward_target(store: &SlotStore) -> Result<Option<ForwardTarget>> {
+    if store.contention.snapshot().races_lost == 0 {
+        return Ok(None);
+    }
+
+    let Some(advert) = crate::leader::current_advert(store).await? else {
+        return Ok(None);
+    };
+    let Some(endpoint) = advert.endpoint else {
+        return Ok(None);
+    };
+    if store.forwarding.is_aged(&endpoint) {
+        return Ok(None);
+    }
+
+    let Some(secret) = read_forwarding_secret(store).await? else {
+        return Ok(None);
+    };
+    Ok(Some(ForwardTarget { endpoint, secret }))
+}
+
+/// The forwarding context a latched staged transaction carries: the leader
+/// target plus the store parts a direct fallback and an ambiguous-outcome scan
+/// need.
+#[cfg(feature = "leader")]
+pub(crate) fn forward_context(
+    store: &SlotStore,
+    target: ForwardTarget,
+) -> crate::transaction::staged::forward::Forward {
+    crate::transaction::staged::forward::Forward::new(
+        target.endpoint,
+        target.secret,
+        Arc::clone(&store.forwarding),
+        Arc::clone(&store.object_store),
+        store.options.path.clone(),
+        store.options.cache_dir.clone(),
+        store.slots.clone(),
+    )
+}
+
+/// The store-held session token, read through the handle's reader and, if that
+/// has not polled it yet, a fresh one. `None` when the store holds no token —
+/// the client then commits directly rather than forward unauthenticated.
+#[cfg(feature = "leader")]
+async fn read_forwarding_secret(store: &SlotStore) -> Result<Option<[u8; commit::SECRET_LEN]>> {
+    if let Some(value) = read::read_secret(ReadHandle::Reader(&store.reader)).await? {
+        return Ok(Some(secret_bytes(&value)?));
+    }
+    let reader = reopen_reader(store).await?;
+    let value = read::read_secret(ReadHandle::Reader(&reader)).await;
+    release_reader(Some(&reader)).await;
+    value?.map(|value| secret_bytes(&value)).transpose()
+}
+
+/// The token bytes at the stored width, refusing a wrong one.
+#[cfg(feature = "leader")]
+fn secret_bytes(value: &crate::store::proto::SecretValue) -> Result<[u8; commit::SECRET_LEN]> {
+    <[u8; commit::SECRET_LEN]>::try_from(value.token.as_slice()).map_err(|_| {
+        Error::Corruption(format!(
+            "forwarding token is {} bytes, expected {}",
+            value.token.len(),
+            commit::SECRET_LEN
+        ))
+    })
+}
 
 /// The multi-writer head: folded store state plus replay of every slot
 /// past the fold cursor.
@@ -346,31 +462,57 @@ pub(crate) async fn transaction_outcome(
     floor: u64,
 ) -> Result<Option<u64>> {
     let reader = reopen_reader(store).await?;
-    let handle = ReadHandle::Reader(&reader);
-
-    let outcome = async {
-        if let Some(snapshot_id) =
-            read::snapshot_of_transaction(handle, floor, &transaction_id).await?
-        {
-            return Ok(Some(snapshot_id));
-        }
-
-        let fold = fold_cursor(handle).await?;
-        match store
-            .slots
-            .find_transaction(fold.saturating_add(1), transaction_id)
-            .await?
-        {
-            Some(sequence) => Ok(Some(
-                tail_minted_snapshot(&store.slots, sequence, transaction_id).await?,
-            )),
-            None => Ok(None),
-        }
-    }
-    .await;
-
+    let outcome = resolve_outcome(&reader, &store.slots, transaction_id, floor).await;
     release_reader(Some(&reader)).await;
     outcome
+}
+
+/// [`transaction_outcome`] over the parts a forwarding client holds: it opens
+/// its own fresh reader (the handle's may lag a just-folded record) and scans
+/// the same folded-then-tail path. Resolves an ambiguous forwarded commit —
+/// the slot landed but the ack was lost — by the client's own transaction id.
+#[cfg(feature = "leader")]
+pub(crate) async fn transaction_outcome_from(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    path: &str,
+    cache_dir: Option<std::path::PathBuf>,
+    slots: &SlotLog,
+    transaction_id: [u8; 16],
+    floor: u64,
+) -> Result<Option<u64>> {
+    let reader = StoreBuilder::new(path, Arc::clone(object_store))
+        .cache_dir(cache_dir)
+        .open_reader()
+        .await?;
+    let outcome = resolve_outcome(&reader, slots, transaction_id, floor).await;
+    release_reader(Some(&reader)).await;
+    outcome
+}
+
+/// The folded-record scan, then the tail scan, for one transaction id through
+/// `reader`.
+async fn resolve_outcome(
+    reader: &DbReader,
+    slots: &SlotLog,
+    transaction_id: [u8; 16],
+    floor: u64,
+) -> Result<Option<u64>> {
+    let handle = ReadHandle::Reader(reader);
+    if let Some(snapshot_id) = read::snapshot_of_transaction(handle, floor, &transaction_id).await?
+    {
+        return Ok(Some(snapshot_id));
+    }
+
+    let fold = fold_cursor(handle).await?;
+    match slots
+        .find_transaction(fold.saturating_add(1), transaction_id)
+        .await?
+    {
+        Some(sequence) => Ok(Some(
+            tail_minted_snapshot(slots, sequence, transaction_id).await?,
+        )),
+        None => Ok(None),
+    }
 }
 
 /// The snapshot a committed transaction minted, read from the slot the tail
@@ -682,7 +824,9 @@ mod tests {
             read_only: false,
             coalescer,
             head_cache: HeadCache::default(),
-            contention: ContentionCounters::default(),
+            contention: Arc::new(ContentionCounters::default()),
+            #[cfg(feature = "leader")]
+            forwarding: Arc::new(Forwarding::default()),
         }
     }
 

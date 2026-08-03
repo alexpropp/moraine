@@ -38,6 +38,8 @@ mod funnel;
 mod session;
 
 #[cfg(test)]
+mod forward_tests;
+#[cfg(test)]
 mod tests;
 
 use funnel::CommitFunnel;

@@ -51,6 +51,8 @@ use crate::{
 
 mod apply;
 mod decode;
+#[cfg(feature = "leader")]
+pub(crate) mod forward;
 mod index_upkeep;
 mod inline;
 #[cfg(test)]
@@ -366,6 +368,25 @@ impl StagedBacking {
         }
     }
 
+    /// The pinned head's snapshot id — the floor a forwarded commit's ambiguous
+    /// outcome is resolved from (the landed snapshot is above it).
+    #[cfg(feature = "leader")]
+    fn head_floor(&self) -> u64 {
+        match self {
+            Self::Slots { head, .. } => head.view.snapshot.snapshot_id,
+        }
+    }
+
+    /// Releases the reader the pinned head opened past a truncation, if any —
+    /// the forwarded path's early return does not reach `commit_slots`, which
+    /// otherwise owns this.
+    #[cfg(feature = "leader")]
+    async fn release_head(&self) {
+        match self {
+            Self::Slots { head, .. } => release_reader(head.reader.as_ref()).await,
+        }
+    }
+
     /// The uniqueness-probe handle: the store overlaid with the unfolded tail.
     fn probe(&self) -> ProbeHandle<'_> {
         match self {
@@ -404,6 +425,15 @@ pub struct StagedTransaction {
     /// The handle's head cache, updated on a successful commit so a read on the
     /// same handle sees this write regardless of the refresh window.
     head_cache: HeadCache,
+    /// The shared contention counters this transaction arms forwarding through:
+    /// a lost race increments `races_lost`, which the next transaction's
+    /// forwarding trigger reads.
+    contention: Arc<crate::transaction::slot_commit::ContentionCounters>,
+    /// Set when a lost race armed forwarding and a leader is reachable: this
+    /// transaction forwards its commit and, on an unreachable leader, ages the
+    /// endpoint and falls back to a fresh direct attempt.
+    #[cfg(feature = "leader")]
+    forward: Option<forward::Forward>,
 }
 
 impl StagedTransaction {
@@ -416,6 +446,7 @@ impl StagedTransaction {
         data_store: Option<Arc<dyn ObjectStore>>,
         data_prefix: String,
         head_cache: HeadCache,
+        contention: Arc<crate::transaction::slot_commit::ContentionCounters>,
     ) -> Self {
         Self {
             backing: StagedBacking::Slots {
@@ -427,7 +458,18 @@ impl StagedTransaction {
             data_store,
             data_prefix,
             head_cache,
+            contention,
+            #[cfg(feature = "leader")]
+            forward: None,
         }
+    }
+
+    /// Marks this transaction forwarded: its commit routes through `forward`'s
+    /// leader, falling back to a direct race only if the leader is unreachable.
+    #[cfg(feature = "leader")]
+    pub(crate) fn forwarded(mut self, forward: forward::Forward) -> Self {
+        self.forward = Some(forward);
+        self
     }
 
     /// Accumulates one row mutation. Nothing touches the store until
@@ -508,14 +550,48 @@ impl StagedTransaction {
             data_store,
             data_prefix,
             head_cache,
+            contention,
+            #[cfg(feature = "leader")]
+            forward,
         } = self;
         let staged_rows = ops.len();
 
-        let assembled = assemble(&backing, &ops, data_store.as_ref(), &data_prefix).await;
+        // A forwarded transaction commits through the leader; only an
+        // unreachable leader retreats to a fresh direct attempt below, so a
+        // transaction's id never rides both paths.
+        #[cfg(feature = "leader")]
+        if let Some(forward) = &forward {
+            match forward::forward_commit(forward, &ops, backing.head_floor()).await {
+                forward::Forwarded::Committed(id) => {
+                    // The commit advanced the shared log through the leader; the
+                    // handle's cached head no longer reflects it, so drop it and
+                    // let the next read or transaction re-materialize the tail.
+                    head_cache.invalidate();
+                    backing.release_head().await;
+                    return Ok(id);
+                }
+                forward::Forwarded::Surface(err) => {
+                    backing.release_head().await;
+                    return Err(err);
+                }
+                forward::Forwarded::FallBack => {}
+            }
+        }
+
+        let assembled = assemble(&backing, &ops, data_store.as_ref(), &data_prefix, None).await;
 
         match backing {
             StagedBacking::Slots { head, slots, .. } => {
-                commit_slots(*head, slots, assembled, staged_rows, started, &head_cache).await
+                commit_slots(
+                    *head,
+                    slots,
+                    assembled,
+                    staged_rows,
+                    started,
+                    &head_cache,
+                    &contention,
+                )
+                .await
             }
         }
     }
@@ -545,6 +621,7 @@ pub(crate) async fn assemble(
     ops: &[RowOperation],
     data_store: Option<&Arc<dyn ObjectStore>>,
     data_prefix: &str,
+    transaction_id: Option<[u8; 16]>,
 ) -> Result<Assembly> {
     let handle = backing.scan_handle();
     let overlay = backing.scan_overlay();
@@ -553,10 +630,11 @@ pub(crate) async fn assemble(
     };
     let base_ref: &CatalogSnapshot = &base;
 
-    // A slot-backed commit stamps a fresh transaction id so a lost race can be
-    // resolved by identity and a landed snapshot survives folding for the
-    // dedup scan.
-    let transaction_id = Some(uuid::Uuid::new_v4().into_bytes());
+    // A slot-backed commit stamps a transaction id — the caller's own for a
+    // forwarded commit the client must resolve by identity, else a fresh one —
+    // so a lost race resolves by identity and a landed snapshot survives folding
+    // for the dedup scan.
+    let transaction_id = Some(transaction_id.unwrap_or_else(|| uuid::Uuid::new_v4().into_bytes()));
 
     // Read before any write is staged: `InlineFlushDelete`/`InlineDrop` name a
     // table, not keys, and resolve against the pre-commit state exactly like
@@ -643,6 +721,7 @@ async fn commit_slots(
     staged_rows: usize,
     started: std::time::Instant,
     head_cache: &HeadCache,
+    contention: &crate::transaction::slot_commit::ContentionCounters,
 ) -> Result<SnapshotId> {
     let outcome = match assembled {
         Ok(assembly) => {
@@ -666,6 +745,9 @@ async fn commit_slots(
                     Ok(SnapshotId::new(assembly.result_id))
                 }
                 Ok(CommitOutcome::Lost(_)) => {
+                    // The lost race is contention proof: it arms the next
+                    // re-drive's forwarding trigger through the shared counters.
+                    contention.record_lost();
                     Err(staged_lost_race(assembly.result_id, staged_rows))
                 }
                 Err(err) => Err(err.into()),

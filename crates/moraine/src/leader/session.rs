@@ -148,8 +148,8 @@ impl Session<'_> {
                 self.ops.push(wire_operation(operation)?);
                 Ok(Response::Ok)
             }
-            Request::Commit => {
-                let snapshot = self.commit().await?;
+            Request::Commit { transaction_id } => {
+                let snapshot = self.commit(transaction_id).await?;
                 Ok(Response::Committed {
                     snapshot_id: snapshot.get(),
                 })
@@ -171,8 +171,10 @@ impl Session<'_> {
     }
 
     /// Assembles the staged rows against the pinned head and routes the commit
-    /// through the funnel, returning only after the slot PUT is durable.
-    async fn commit(&mut self) -> Result<crate::catalog::SnapshotId> {
+    /// through the funnel, returning only after the slot PUT is durable. The
+    /// client's `transaction_id` stamps the commit so the client can resolve an
+    /// ambiguous outcome by identity; an all-zero id lets the leader mint one.
+    async fn commit(&mut self, transaction_id: [u8; 16]) -> Result<crate::catalog::SnapshotId> {
         let head = self
             .head
             .take()
@@ -191,7 +193,8 @@ impl Session<'_> {
             slots,
         );
 
-        let assembly = staged::assemble(&backing, &ops, None, "").await?;
+        let client_id = (transaction_id != [0; 16]).then_some(transaction_id);
+        let assembly = staged::assemble(&backing, &ops, None, "", client_id).await?;
         let validated_head = head.view.snapshot.snapshot_id;
         self.context.funnel.submit(validated_head, assembly).await
     }

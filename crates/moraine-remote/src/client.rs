@@ -115,7 +115,7 @@ mod tests {
             let request = Request::decode(&framed)?;
             let response = match request {
                 Request::Hello { .. } | Request::Begin | Request::Stage(_) => Response::Ok,
-                Request::Commit => Response::Committed { snapshot_id: 42 },
+                Request::Commit { .. } => Response::Committed { snapshot_id: 42 },
                 Request::Snapshot | Request::VisibleSnapshots | Request::ScheduledDeletions => {
                     Response::Snapshot(vec![b"row".to_vec()])
                 }
@@ -169,7 +169,12 @@ mod tests {
             Response::Ok
         );
         assert_eq!(
-            client.request(&Request::Commit).await.unwrap(),
+            client
+                .request(&Request::Commit {
+                    transaction_id: [0; 16],
+                })
+                .await
+                .unwrap(),
             Response::Committed { snapshot_id: 42 }
         );
     }
@@ -205,7 +210,12 @@ mod tests {
 
         let mut second = Client::connect(addr, Duration::from_secs(5)).await.unwrap();
         assert_eq!(
-            second.request(&Request::Commit).await.unwrap(),
+            second
+                .request(&Request::Commit {
+                    transaction_id: [0; 16],
+                })
+                .await
+                .unwrap(),
             Response::Committed { snapshot_id: 42 }
         );
     }

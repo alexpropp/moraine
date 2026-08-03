@@ -359,8 +359,16 @@ pub(crate) struct SlotStore {
     /// handle; a successful commit updates it in place.
     pub(crate) head_cache: slot_commit::HeadCache,
     /// Slot-race and retry counters accumulated across commits, shared by every
-    /// clone of the handle through the store's `Arc`.
-    pub(crate) contention: slot_commit::ContentionCounters,
+    /// clone of the handle through the store's `Arc` and by the staged
+    /// transactions it opens, which arm forwarding by counting their lost
+    /// races.
+    pub(crate) contention: Arc<slot_commit::ContentionCounters>,
+    /// The endpoints this process has given up forwarding to, shared by every
+    /// clone of the handle. A lost race arms forwarding; an unreachable
+    /// endpoint ages here so the client stops retrying it and commits
+    /// directly.
+    #[cfg(feature = "leader")]
+    pub(crate) forwarding: Arc<slot_commit::Forwarding>,
 }
 
 /// Options for opening a catalog.
@@ -483,7 +491,9 @@ impl Catalog {
                 read_only: false,
                 coalescer,
                 head_cache: slot_commit::HeadCache::default(),
-                contention: slot_commit::ContentionCounters::default(),
+                contention: Arc::new(slot_commit::ContentionCounters::default()),
+                #[cfg(feature = "leader")]
+                forwarding: Arc::new(slot_commit::Forwarding::default()),
             }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
@@ -676,7 +686,9 @@ impl Catalog {
                 read_only: true,
                 coalescer,
                 head_cache: slot_commit::HeadCache::default(),
-                contention: slot_commit::ContentionCounters::default(),
+                contention: Arc::new(slot_commit::ContentionCounters::default()),
+                #[cfg(feature = "leader")]
+                forwarding: Arc::new(slot_commit::Forwarding::default()),
             }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
@@ -1116,14 +1128,26 @@ impl Catalog {
             ));
         }
         let head = slot_commit::materialize_slot_head(store).await?;
-        Ok(StagedTransaction::begin_slots(
+        let transaction = StagedTransaction::begin_slots(
             head,
             store.reader.clone(),
             store.slots.clone(),
             data_store,
             data_prefix,
             store.head_cache.clone(),
-        ))
+            Arc::clone(&store.contention),
+        );
+
+        // A lost race arms forwarding: this fresh re-drive opens forwarded when a
+        // leader is reachable, direct otherwise. An uncontended transaction never
+        // reaches this and never connects.
+        #[cfg(feature = "leader")]
+        let transaction = match slot_commit::forward_target(store).await? {
+            Some(target) => transaction.forwarded(slot_commit::forward_context(store, target)),
+            None => transaction,
+        };
+
+        Ok(transaction)
     }
 
     /// Derives the index entries for a file the extension path registers, by

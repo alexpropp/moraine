@@ -13,16 +13,19 @@ use crate::{
     error::{Error, Result},
     frame,
     proto::{
-        CellValue, CommittedValue, ErrorKindValue, ErrorValue, HelloValue, InlineDropValue,
-        InlineFileDeleteValue, InlineFlushDeleteValue, InlineInlineDeleteValue, InlineInsertValue,
-        InlineSchemaDropValue, InlineSchemaValue, RequestMessage, ResponseMessage, RowCellsValue,
-        RowOperationValue, SnapshotRowsValue, Unit, cell_value, request_message, response_message,
-        row_operation_value,
+        CellValue, CommitValue, CommittedValue, ErrorKindValue, ErrorValue, HelloValue,
+        InlineDropValue, InlineFileDeleteValue, InlineFlushDeleteValue, InlineInlineDeleteValue,
+        InlineInsertValue, InlineSchemaDropValue, InlineSchemaValue, RequestMessage,
+        ResponseMessage, RowCellsValue, RowOperationValue, SnapshotRowsValue, Unit, cell_value,
+        request_message, response_message, row_operation_value,
     },
 };
 
 /// The width of a session token: a shared bucket secret.
 pub const TOKEN_LEN: usize = 32;
+
+/// The width of a transaction id a client stamps a forwarded commit with.
+pub const TXID_LEN: usize = 16;
 
 /// One request in a forwarded catalog session. One connection carries one
 /// session, opened by [`Request::Hello`] and driven through to
@@ -47,8 +50,12 @@ pub enum Request {
     ScheduledDeletions,
     /// Stage one row mutation.
     Stage(WireRowOperation),
-    /// Commit the staged transaction.
-    Commit,
+    /// Commit the staged transaction, stamped with the client's transaction
+    /// id. An all-zero id lets the leader mint one.
+    Commit {
+        /// The id the client resolves an ambiguous outcome by.
+        transaction_id: [u8; TXID_LEN],
+    },
     /// Discard the staged transaction.
     Rollback,
 }
@@ -315,7 +322,9 @@ impl Request {
             Self::VisibleSnapshots => Wire::VisibleSnapshots(Unit {}),
             Self::ScheduledDeletions => Wire::ScheduledDeletions(Unit {}),
             Self::Stage(operation) => Wire::Stage(operation.to_wire()),
-            Self::Commit => Wire::Commit(Unit {}),
+            Self::Commit { transaction_id } => Wire::Commit(CommitValue {
+                transaction_id: transaction_id.to_vec(),
+            }),
             Self::Rollback => Wire::Rollback(Unit {}),
         };
         RequestMessage {
@@ -338,7 +347,9 @@ impl Request {
             Wire::VisibleSnapshots(_) => Self::VisibleSnapshots,
             Wire::ScheduledDeletions(_) => Self::ScheduledDeletions,
             Wire::Stage(operation) => Self::Stage(WireRowOperation::from_wire(operation)?),
-            Wire::Commit(_) => Self::Commit,
+            Wire::Commit(commit) => Self::Commit {
+                transaction_id: txid_from_wire(&commit.transaction_id)?,
+            },
             Wire::Rollback(_) => Self::Rollback,
         })
     }
@@ -600,6 +611,20 @@ fn token_from_wire(bytes: &[u8]) -> Result<[u8; TOKEN_LEN]> {
     })
 }
 
+/// A commit's transaction id: the wire width, or all-zero when the client sent
+/// an empty id and left minting to the leader.
+fn txid_from_wire(bytes: &[u8]) -> Result<[u8; TXID_LEN]> {
+    if bytes.is_empty() {
+        return Ok([0; TXID_LEN]);
+    }
+    <[u8; TXID_LEN]>::try_from(bytes).map_err(|_| {
+        Error::Protocol(format!(
+            "transaction id is {} bytes, expected {TXID_LEN}",
+            bytes.len()
+        ))
+    })
+}
+
 fn encode_message<M: Message>(message: &M) -> Vec<u8> {
     let mut buf = Vec::with_capacity(message.encoded_len());
     // Infallible by construction: insufficient capacity is the only error
@@ -730,7 +755,7 @@ mod tests {
             Just(Request::VisibleSnapshots),
             Just(Request::ScheduledDeletions),
             any_row_operation().prop_map(Request::Stage),
-            Just(Request::Commit),
+            any::<[u8; TXID_LEN]>().prop_map(|transaction_id| Request::Commit { transaction_id }),
             Just(Request::Rollback),
         ]
     }

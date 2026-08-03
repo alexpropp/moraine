@@ -20,7 +20,7 @@ message RequestMessage {
     Unit visible_snapshots = 4;
     Unit scheduled_deletions = 5;
     RowOperationValue stage = 6;
-    Unit commit = 7;
+    CommitValue commit = 7;
     Unit rollback = 8;
   }
 }
@@ -49,6 +49,14 @@ message HelloValue {
 // type.
 message SnapshotRowsValue {
   repeated bytes rows = 1;
+}
+
+// A commit request. The client stamps the transaction with an id it can later
+// resolve through the log, so an ambiguous outcome (the slot landed, the ack
+// was lost) is settled by id rather than re-driven blind. An empty id lets the
+// leader mint one.
+message CommitValue {
+  bytes transaction_id = 1;
 }
 
 // A committed transaction's minted snapshot.

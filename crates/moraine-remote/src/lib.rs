@@ -69,4 +69,4 @@ mod protocol;
 
 pub use client::Client;
 pub use error::Error;
-pub use protocol::{ErrorKind, Request, Response, TOKEN_LEN, WireCell, WireRowOperation};
+pub use protocol::{ErrorKind, Request, Response, TOKEN_LEN, TXID_LEN, WireCell, WireRowOperation};
