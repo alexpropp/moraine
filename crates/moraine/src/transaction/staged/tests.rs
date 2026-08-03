@@ -3601,3 +3601,200 @@ async fn a_lost_staged_race_surfaces_conflict_and_applies_nothing() {
     assert!(head.schema_by_name("a").is_some());
     assert!(head.schema_by_name("b").is_none());
 }
+
+/// N staged sessions in one process, each pinned to the same head, are a fan:
+/// they race one slot, exactly one lands its snapshot, and every other returns
+/// `CommitConflict` for its DuckLake to re-drive. No session lands a wrong
+/// outcome, and none coalesce — DuckLake-authored ids cannot be rebased, so
+/// each takes its own slot. This is the composition a shared metadata store
+/// gives DuckLake today.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_staged_sessions_fan_to_one_winner() {
+    const SESSIONS: usize = 8;
+    let catalog = open().await;
+
+    let mut sessions = Vec::new();
+    for i in 0..SESSIONS {
+        let name = format!("s{i}");
+        let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Schema,
+            cells: schema_row(1, &name, 1),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::Snapshot,
+            cells: snapshot_row(1, 1, 2),
+        });
+        tx.stage(RowOperation::Insert {
+            table: TableKind::SnapshotChanges,
+            cells: snapshot_changes_row(1, &format!(r#"created_schema:"{name}""#)),
+        });
+        sessions.push((name, tx));
+    }
+
+    let outcomes = futures::future::join_all(
+        sessions
+            .into_iter()
+            .map(|(name, tx)| async move { (name, tx.commit().await) }),
+    )
+    .await;
+
+    let mut winners = Vec::new();
+    for (name, outcome) in &outcomes {
+        match outcome {
+            Ok(id) => {
+                assert_eq!(id.get(), 1, "the winner mints head + 1");
+                winners.push(name.clone());
+            }
+            Err(err @ Error::CommitConflict(_)) => {
+                assert!(
+                    err.to_string().contains("conflict"),
+                    "loser carries `conflict`: {err}"
+                );
+            }
+            Err(other) => panic!("a session neither landed nor conflicted: {other}"),
+        }
+    }
+
+    assert_eq!(winners.len(), 1, "exactly one session wins the fanned slot");
+
+    let head = catalog.snapshot().await.unwrap();
+    assert!(head.schema_by_name(&winners[0]).is_some());
+    for (name, outcome) in &outcomes {
+        if outcome.is_err() {
+            assert!(
+                head.schema_by_name(name).is_none(),
+                "loser {name} left no trace in the store"
+            );
+        }
+    }
+}
+
+/// Under re-drive — DuckLake's response to `CommitConflict` — N contending
+/// staged sessions all land, and their minted snapshot ids stay dense with no
+/// collision: only the winner of each slot mints `head + 1`, and every loser
+/// re-reads the head the winner produced and authors against it. Asserted over
+/// the outcome mix (each attempt lands or conflicts, nothing else), never a
+/// fixed order.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_staged_sessions_redrive_to_dense_snapshot_ids() {
+    const SESSIONS: u64 = 8;
+    let catalog = open().await;
+
+    let landed = futures::future::join_all((0..SESSIONS).map(|i| {
+        let catalog = &catalog;
+        async move {
+            let name = format!("s{i}");
+            loop {
+                let mut tx = catalog.begin_staged(None, String::new()).await.unwrap();
+
+                // Read the head through this session's own pinned view, exactly
+                // as DuckLake reads counters through its connection: the highest
+                // visible snapshot and the catalog-id counter it carries.
+                let head_snapshot = tx
+                    .visible_snapshots()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .max_by_key(|snapshot| snapshot.snapshot_id)
+                    .expect("the bootstrap snapshot is always visible");
+                let new_snapshot = head_snapshot.snapshot_id + 1;
+                let schema_id = head_snapshot.next_catalog_id;
+
+                tx.stage(RowOperation::Insert {
+                    table: TableKind::Schema,
+                    cells: schema_row(schema_id, &name, new_snapshot),
+                });
+                tx.stage(RowOperation::Insert {
+                    table: TableKind::Snapshot,
+                    cells: snapshot_row(new_snapshot, new_snapshot, schema_id + 1),
+                });
+                tx.stage(RowOperation::Insert {
+                    table: TableKind::SnapshotChanges,
+                    cells: snapshot_changes_row(
+                        new_snapshot,
+                        &format!(r#"created_schema:"{name}""#),
+                    ),
+                });
+
+                match tx.commit().await {
+                    Ok(id) => return id.get(),
+                    // A lost slot: DuckLake re-drives against the new head.
+                    Err(Error::CommitConflict(_)) => {}
+                    Err(other) => panic!("re-drive saw a non-conflict failure: {other}"),
+                }
+            }
+        }
+    }))
+    .await;
+
+    let mut ids = landed;
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        (1..=SESSIONS).collect::<Vec<_>>(),
+        "every session lands; snapshot ids dense from 1, no collision or gap"
+    );
+
+    let head = catalog.snapshot().await.unwrap();
+    for i in 0..SESSIONS {
+        assert!(
+            head.schema_by_name(&format!("s{i}")).is_some(),
+            "session s{i}'s schema survived"
+        );
+    }
+}
+
+/// A staged session never observes another's uncommitted rows, and a session
+/// pinned before a peer's commit does not observe that commit either: each
+/// stages only into its own buffer and reads through its own pinned head.
+#[tokio::test]
+async fn a_staged_session_does_not_observe_anothers_rows() {
+    let catalog = open().await;
+
+    let mut a = catalog.begin_staged(None, String::new()).await.unwrap();
+    let b = catalog.begin_staged(None, String::new()).await.unwrap();
+
+    // A stages a full snapshot-minting batch but does not commit.
+    a.stage(RowOperation::Insert {
+        table: TableKind::Schema,
+        cells: schema_row(1, "a", 1),
+    });
+    a.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    a.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_schema:"a""#),
+    });
+
+    // B, pinned at the same head, sees only the committed bootstrap snapshot —
+    // never A's staged, uncommitted snapshot 1.
+    let mut seen: Vec<u64> = b
+        .visible_snapshots()
+        .await
+        .unwrap()
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![0],
+        "B sees only the committed bootstrap snapshot"
+    );
+
+    // A commits and wins. B, still pinned at its earlier head, still does not
+    // observe the now-committed snapshot 1 — read-your-pinned-head isolation.
+    a.commit().await.unwrap();
+    let mut seen_after: Vec<u64> = b
+        .visible_snapshots()
+        .await
+        .unwrap()
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
+    seen_after.sort_unstable();
+    assert_eq!(seen_after, vec![0], "B's pinned head predates A's commit");
+}
