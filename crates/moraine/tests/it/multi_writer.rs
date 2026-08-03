@@ -1074,17 +1074,109 @@ async fn folding_reconciles_an_expired_snapshot_to_not_found() {
     assert!(head.schema_by_name("extra").is_some());
 }
 
-/// The point-probe trap made concrete: a peer commits, folds, and truncates
-/// the slot between two of this handle's reads, leaving nothing at the cached
-/// `next_sequence`. A point-probe validity check would call the cache fresh and
-/// serve a head missing that commit; the LIST-based check does not.
-///
-/// Deferred: needs `fold_sprint` and `truncate_folded_slots`, which land after
-/// this task. Task 11 lands the assertion.
+/// Truncation deletes only durably folded slots, and never so far that the
+/// store stops materializing completely. Nothing folded means nothing deleted;
+/// after a fold the count stays at or below the durable cursor (a flush or poll
+/// interval can move it, so the exact count is not asserted), and the head
+/// still carries the unfolded remainder.
 #[tokio::test]
-#[ignore = "needs fold_sprint (Task 10) and truncation (Task 11)"]
+async fn truncation_removes_only_durably_folded_slots() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    for name in ["a", "b", "c"] {
+        catalog
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    // Nothing folded: nothing may be deleted.
+    assert_eq!(catalog.truncate_folded_slots().await.unwrap(), 0);
+
+    catalog.fold_sprint(2).await.unwrap();
+    let removed = catalog.truncate_folded_slots().await.unwrap();
+    assert!(removed <= 2, "never past the durable cursor, got {removed}");
+
+    // The store still materializes completely: folded state plus slot 3.
+    let fresh = open_multi_writer(&store).await.snapshot().await.unwrap();
+    assert!(fresh.schema_by_name("c").is_some());
+    assert_eq!(fresh.current_snapshot().id, SnapshotId::new(3));
+}
+
+/// The healthy-fleet case bound 2 exists for. A reader opened before a peer
+/// folds and truncates lags the fold, so the slots it still must replay are the
+/// only copies of those commits it can see. Bound 2 keeps them: the stale
+/// reader materializes the full catalog — no hole, no `Corruption`, no missing
+/// commit. A fold-cursor-only horizon would delete them and this would fail.
+#[tokio::test]
+async fn a_stale_reader_survives_a_peer_fold_and_truncation() {
+    let store = Arc::new(InMemory::new());
+
+    // B's reader will not poll the fold for the test's duration, and its head
+    // cache stays cold so the first read materializes straight from the tail.
+    let mut stale = CatalogOptions::default();
+    stale.refresh_interval = Duration::from_secs(3600);
+    let b = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, stale).await;
+
+    let a = open_multi_writer(&store).await;
+    for name in ["a", "b", "c", "d"] {
+        a.commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    a.fold_sprint(u64::MAX).await.unwrap();
+    a.truncate_folded_slots().await.unwrap();
+
+    // B still sits at the bootstrap manifest, yet reaches the full head: bound 2
+    // kept every slot B has not folded past.
+    let head = b.snapshot().await.unwrap();
+    assert_eq!(head.current_snapshot().id, SnapshotId::new(4));
+    for name in ["a", "b", "c", "d"] {
+        assert!(head.schema_by_name(name).is_some(), "{name} survived");
+    }
+}
+
+/// The point-probe trap made concrete: a peer commits, folds, and truncates
+/// between two of this handle's reads. The cached handle revalidates by LISTING
+/// from its cached `next_sequence`, so it absorbs the peer's slots (or
+/// re-materializes past a hole) and resolves the full head — never the stale
+/// cached view a point probe on a now-absent frontier slot would serve. The
+/// retention margin guarantees a truncated run always leaves newer slots
+/// visible for that LIST to find.
+#[tokio::test]
 async fn a_cached_head_survives_a_peer_fold_and_truncation() {
-    // TODO(Task 11): commit, fold, and truncate the slot through a peer handle,
-    // then assert the cached handle still resolves the full head — the
-    // point-probe design fails this, the LIST-based one does not.
+    let store = Arc::new(InMemory::new());
+    let cached =
+        open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, zero_refresh()).await;
+    let peer = open_multi_writer(&store).await;
+
+    // Warm the cached handle at the frontier past its own commit.
+    cached
+        .commit(|tx| tx.create_schema("a").map(|_| ()))
+        .await
+        .unwrap();
+    assert!(
+        cached
+            .snapshot()
+            .await
+            .unwrap()
+            .schema_by_name("a")
+            .is_some()
+    );
+
+    // The peer commits more, folds everything, and truncates.
+    for name in ["b", "c"] {
+        peer.commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    peer.fold_sprint(u64::MAX).await.unwrap();
+    peer.truncate_folded_slots().await.unwrap();
+
+    // The cached handle's next read resolves the full head rather than the
+    // stale cached view.
+    let head = cached.snapshot().await.unwrap();
+    assert_eq!(head.current_snapshot().id, SnapshotId::new(3));
+    for name in ["a", "b", "c"] {
+        assert!(head.schema_by_name(name).is_some(), "{name} resolved");
+    }
 }

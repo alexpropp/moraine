@@ -1937,6 +1937,23 @@ impl Catalog {
         folder::fold_if_stalled(store, threshold, delay, limit).await
     }
 
+    /// Deletes slots durably folded into the store, oldest first, and returns
+    /// how many were removed. The horizon is the lower of two bounds: the fold
+    /// cursor as seen by the attach's reader (durable by construction — a
+    /// reader cannot see a memtable), and the fold cursor the oldest live
+    /// reader still sits at, held back by a retention margin. Truncation is
+    /// conservative garbage collection: it never deletes a slot a reader
+    /// still needs to resolve state, so it may remove nothing when readers
+    /// lag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only attach, or a store error.
+    pub async fn truncate_folded_slots(&self) -> Result<u64> {
+        let store = self.folder_store()?;
+        folder::truncate_folded_slots(store).await
+    }
+
     /// The slot store a folder surface runs against, refusing a read-only
     /// attach: folding and the staleness signal are the writer's monopoly.
     fn folder_store(&self) -> Result<&SlotStore> {

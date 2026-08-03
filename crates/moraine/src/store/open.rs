@@ -13,6 +13,7 @@ use slatedb::{
     Db, DbReader,
     config::{DbReaderOptions, ObjectStoreCacheOptions, Settings},
 };
+use uuid::Uuid;
 
 use crate::{
     error::{Error, Result},
@@ -97,24 +98,44 @@ impl<'a> StoreBuilder<'a> {
     /// manifest. A `DbReader` never opens the writer `Db`, so it never fences
     /// a live writer. The flush cadence, if set, is ignored.
     pub(crate) async fn open_reader(self) -> Result<DbReader> {
-        // The checkpoint lifetime must exceed twice the poll interval; keep
-        // SlateDB's default headroom, widening it only for a long interval.
-        let checkpoint_lifetime = self
-            .refresh_interval
-            .saturating_mul(3)
-            .max(Duration::from_secs(10 * 60));
-        let options = DbReaderOptions {
-            manifest_poll_interval: self.refresh_interval,
-            checkpoint_lifetime,
-            object_store_cache_options: self.cache_options(),
-            ..Default::default()
-        };
+        let options = self.reader_options();
         DbReader::builder(self.path, self.object_store)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_options(options)
             .build()
             .await
             .map_err(Error::from)
+    }
+
+    /// Opens the store read-only pinned to `checkpoint_id`: the reader reads
+    /// the manifest that checkpoint references and neither creates nor
+    /// refreshes a checkpoint of its own. Reading a slot log's truncation
+    /// horizon uses this to see the fold cursor exactly as a lagging peer's
+    /// checkpoint does.
+    pub(crate) async fn open_reader_at(self, checkpoint_id: Uuid) -> Result<DbReader> {
+        let options = self.reader_options();
+        DbReader::builder(self.path, self.object_store)
+            .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_options(options)
+            .with_checkpoint_id(checkpoint_id)
+            .build()
+            .await
+            .map_err(Error::from)
+    }
+
+    fn reader_options(&self) -> DbReaderOptions {
+        // The checkpoint lifetime must exceed twice the poll interval; keep
+        // SlateDB's default headroom, widening it only for a long interval.
+        let checkpoint_lifetime = self
+            .refresh_interval
+            .saturating_mul(3)
+            .max(Duration::from_secs(10 * 60));
+        DbReaderOptions {
+            manifest_poll_interval: self.refresh_interval,
+            checkpoint_lifetime,
+            object_store_cache_options: self.cache_options(),
+            ..Default::default()
+        }
     }
 
     /// SlateDB settings for a writer. A zero flush interval flushes

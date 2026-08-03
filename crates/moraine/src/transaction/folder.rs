@@ -23,7 +23,8 @@ use moraine_wal::{
     CursorStore, Envelope, FoldReport, FoldValue, FolderRole, Jitter, drive_fold,
     drive_fold_if_stalled,
 };
-use slatedb::{Db, WriteBatch, config::WriteOptions};
+use slatedb::{Checkpoint, Db, DbReader, WriteBatch, config::WriteOptions};
+use uuid::Uuid;
 
 use crate::{
     catalog::SlotStore,
@@ -224,6 +225,135 @@ pub(crate) async fn unfolded_tail(store: &SlotStore) -> Result<u64> {
         tracing::warn!(error = %err, "could not close the reader opened for the unfolded-tail probe");
     }
     unfolded
+}
+
+/// Slots kept below the horizon regardless of the two bounds, so a reader whose
+/// checkpoint advances between the manifest read and the delete still finds the
+/// run it is about to replay. Mirrors the min-age SlateDB's own WAL GC keeps
+/// alongside checkpoint references; slot envelopes are small, so over-retention
+/// costs storage while under-retention costs a committed slot.
+const TRUNCATION_RETENTION_MARGIN: u64 = 64;
+
+/// Deletes durably folded slots the fleet no longer needs, oldest first, and
+/// returns how many objects were removed. The horizon is the lower of two
+/// bounds, held back by [`TRUNCATION_RETENTION_MARGIN`]: what is durably folded
+/// (a reader cannot see a memtable, so an unfolded slot — the only copy of its
+/// commit — is never past it), and the fold cursor the oldest live reader still
+/// sits at (or its next materialization finds the slots it must replay
+/// deleted).
+pub(crate) async fn truncate_folded_slots(store: &SlotStore) -> Result<u64> {
+    let reader = reopen_reader(store).await?;
+
+    // One fresh reader answers both bounds: its own fold cursor is the true
+    // durable frontier (not the attach reader's lagged poll), and its manifest
+    // lists every live reader checkpoint.
+    let horizon = async {
+        let durable = fold_cursor(ReadHandle::Reader(&reader)).await?;
+        let reader_floor = oldest_reader_fold_cursor(store, &reader, durable).await?;
+        Ok::<u64, Error>(
+            durable
+                .min(reader_floor)
+                .saturating_sub(TRUNCATION_RETENTION_MARGIN),
+        )
+    }
+    .await;
+
+    if let Err(err) = reader.close().await {
+        tracing::warn!(error = %err, "could not close the reader opened for the truncation horizon");
+    }
+
+    store
+        .slots
+        .truncate_through(horizon?)
+        .await
+        .map_err(Error::from)
+}
+
+/// The fold cursor as of the oldest live reader checkpoint in
+/// `manifest_reader`'s manifest, or `durable` when no live checkpoint
+/// constrains truncation. Every live reader pins its view as a manifest
+/// checkpoint — the mechanism SlateDB's own GC leans on — so the oldest
+/// checkpoint is the reader furthest behind, and the fold cursor read through
+/// it is the deepest a truncation may reach without deleting a slot that reader
+/// still replays. An expired checkpoint (a crashed reader's lapsed pin) does
+/// not hold truncation back.
+async fn oldest_reader_fold_cursor(
+    store: &SlotStore,
+    manifest_reader: &DbReader,
+    durable: u64,
+) -> Result<u64> {
+    let Some(checkpoint_id) = oldest_live_checkpoint(manifest_reader.manifest().checkpoints())
+    else {
+        // No live reader pins anything, so only the durable frontier bounds us.
+        return Ok(durable);
+    };
+
+    match fold_cursor_as_of(store, checkpoint_id).await {
+        Ok(cursor) => Ok(cursor),
+        // A reader churning its checkpoint can delete the one just listed before
+        // it is opened, and a checkpoint can expire mid-open. Either way this
+        // round retains rather than truncate past a reader it could not inspect;
+        // the next pass re-reads the manifest and makes progress.
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "could not read the oldest reader checkpoint; retaining all slots this pass"
+            );
+            Ok(0)
+        }
+    }
+}
+
+/// The id of the live checkpoint referencing the oldest manifest, if any.
+fn oldest_live_checkpoint(checkpoints: &[Checkpoint]) -> Option<Uuid> {
+    let now = unix_seconds_now();
+    checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint_is_live(checkpoint, now))
+        .min_by_key(|checkpoint| checkpoint.manifest_id)
+        .map(|checkpoint| checkpoint.id)
+}
+
+/// Whether `checkpoint`'s pin still holds: an absent expiry never lapses, and a
+/// future one has not yet.
+fn checkpoint_is_live(checkpoint: &Checkpoint, now_seconds: i64) -> bool {
+    match checkpoint.expire_time {
+        Some(expire) => expire.timestamp() > now_seconds,
+        None => true,
+    }
+}
+
+/// Seconds since the Unix epoch; 0 if the clock is unreadable, which retains
+/// rather than truncates.
+fn unix_seconds_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+/// The fold cursor read through a reader pinned to `checkpoint_id`: the store
+/// view the checkpoint's owner currently holds.
+async fn fold_cursor_as_of(store: &SlotStore, checkpoint_id: Uuid) -> Result<u64> {
+    let reader = StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
+        .cache_dir(store.options.cache_dir.clone())
+        .open_reader_at(checkpoint_id)
+        .await?;
+    let cursor = fold_cursor(ReadHandle::Reader(&reader)).await;
+
+    if let Err(err) = reader.close().await {
+        tracing::warn!(error = %err, "could not close the checkpoint-pinned reader");
+    }
+    cursor
+}
+
+/// A reader at the manifest as it stands now, for discovering live checkpoints.
+async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
+    StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
+        .cache_dir(store.options.cache_dir.clone())
+        .open_reader()
+        .await
 }
 
 /// The self-appointment rule over the real log: if the unfolded tail exceeds
