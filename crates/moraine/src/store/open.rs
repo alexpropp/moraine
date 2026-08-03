@@ -37,6 +37,7 @@ pub(crate) struct StoreBuilder<'a> {
     object_store: Arc<dyn ObjectStore>,
     flush_interval: Duration,
     refresh_interval: Duration,
+    wal_enabled: bool,
     cache_dir: Option<PathBuf>,
 }
 
@@ -49,6 +50,7 @@ impl<'a> StoreBuilder<'a> {
             object_store,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            wal_enabled: true,
             cache_dir: None,
         }
     }
@@ -71,6 +73,17 @@ impl<'a> StoreBuilder<'a> {
     /// for less fold lag. Reader only — a writer follows its own cadence.
     pub(crate) fn refresh_interval(mut self, refresh_interval: Duration) -> Self {
         self.refresh_interval = refresh_interval;
+        self
+    }
+
+    /// Enables or disables SlateDB's write-ahead log for this writer. Disabling
+    /// it writes straight into the memtable, so durability arrives only at an
+    /// L0 flush — a caller that disables the WAL must force [`Db::flush`]
+    /// before close, since no WAL and a size-triggered flush that rarely
+    /// fires leave nothing else to make writes durable. Writer only; a
+    /// reader never writes.
+    pub(crate) fn wal_enabled(mut self, wal_enabled: bool) -> Self {
+        self.wal_enabled = wal_enabled;
         self
     }
 
@@ -144,6 +157,7 @@ impl<'a> StoreBuilder<'a> {
     fn settings(&self) -> Settings {
         Settings {
             flush_interval: Some(self.flush_interval),
+            wal_enabled: self.wal_enabled,
             object_store_cache_options: self.cache_options(),
             ..Default::default()
         }

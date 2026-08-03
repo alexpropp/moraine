@@ -46,7 +46,7 @@ pub(crate) async fn with_folder<T, F>(store: &SlotStore, body: F) -> Result<T>
 where
     F: AsyncFnOnce(&Db) -> Result<T>,
 {
-    let db = open_folder_writer(store).await?;
+    let db = open_folder_writer(store, true).await?;
 
     let outcome = body(&db).await;
 
@@ -58,9 +58,13 @@ where
     }
 }
 
-/// Opens the fenced writer `Db` over the store's retained builder shape.
-async fn open_folder_writer(store: &SlotStore) -> Result<Db> {
+/// Opens the fenced writer `Db` over the store's retained builder shape. A
+/// `wal_enabled` of `false` folds straight into the memtable, leaving
+/// [`SlateDbCursorStore::finish`]'s explicit flush as the only durability
+/// barrier the sprint has.
+async fn open_folder_writer(store: &SlotStore, wal_enabled: bool) -> Result<Db> {
     StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
+        .wal_enabled(wal_enabled)
         .cache_dir(store.options.cache_dir.clone())
         .open_writer()
         .await
@@ -170,19 +174,26 @@ impl CursorStore for SlateDbCursorStore {
     }
 
     async fn finish(&mut self) -> Result<()> {
-        // One durability barrier so the sprint's progress survives the writer's
-        // close: the per-apply batches were written non-durable. Truncation
-        // stays safe even if this fails, since its horizon is what a reader can
-        // see, so a barrier that lost the folds costs retained slots, never a
-        // deleted one.
+        // The sprint's only durability barrier: with the writer's WAL off, the
+        // per-apply batches sit in the memtable, and no WAL timer or (64 MiB) L0
+        // size trigger will flush a catalog-sized sprint, so this explicit flush
+        // to a durable L0 SST is what makes the fold cursor survive close. A
+        // sprint killed before it costs no correctness — the memtable folds are
+        // lost, the log still holds those slots, and the successor re-folds them.
+        // Truncation stays safe even if this fails, since its horizon is what a
+        // reader can see, so a barrier that lost the folds costs retained slots,
+        // never a deleted one.
         self.db.flush().await.map_err(Error::from)
     }
 }
 
-/// One bounded fold pass: opens the fenced writer, applies up to `limit`
-/// unfolded slots (each as one atomic batch advancing the fold cursor), and
-/// closes. The attach's reader is undisturbed; resume-after-crash is the
-/// driver's contract, honored by the batch atomicity above.
+/// One bounded fold pass: opens the fenced writer with its WAL off, applies up
+/// to `limit` unfolded slots (each as one atomic batch advancing the fold
+/// cursor), flushes, and closes. The attach's reader is undisturbed. With the
+/// WAL off the folds are durable only once [`SlateDbCursorStore::finish`]
+/// flushes, so a sprint killed before that loses its memtable folds and the
+/// successor re-folds those slots from the log — the cursor never advances past
+/// what is durable, so no slot is ever double-applied.
 ///
 /// `limit` bounds the applies, not the listing: `drive_fold` reads the whole
 /// contiguous tail every pass, because hole detection needs the full run. A
@@ -190,7 +201,7 @@ impl CursorStore for SlateDbCursorStore {
 /// memory even under a small `limit` — the bound paces the writes, not the
 /// read.
 pub(crate) async fn fold_sprint(store: &SlotStore, limit: u64) -> Result<FoldReport> {
-    let db = Arc::new(open_folder_writer(store).await?);
+    let db = Arc::new(open_folder_writer(store, false).await?);
     let mut session = SlateDbCursorStore::new(Arc::clone(&db));
     let report = drive_fold(&store.slots, &mut session, limit).await;
     drop(session);
@@ -410,7 +421,7 @@ impl FolderRole for SlotFolder<'_> {
     }
 
     async fn open(&self) -> Result<SlateDbCursorStore> {
-        let db = Arc::new(open_folder_writer(self.store).await?);
+        let db = Arc::new(open_folder_writer(self.store, true).await?);
         *self.opened.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&db));
         Ok(SlateDbCursorStore::new(db))
     }
@@ -422,4 +433,114 @@ async fn fold_cursor(handle: ReadHandle<'_>) -> Result<u64> {
     Ok(read::read_fold(handle)
         .await?
         .map_or(0, |fold| fold.folded_sequence))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use moraine_wal::{CursorStore, SlotLog};
+    use object_store::{ObjectStore, memory::InMemory};
+
+    use super::SlateDbCursorStore;
+    use crate::{
+        catalog::{Catalog, CatalogOptions},
+        store::open::StoreBuilder,
+    };
+
+    #[allow(clippy::unwrap_used)]
+    async fn open_catalog(store: &Arc<InMemory>) -> Catalog {
+        Catalog::open(
+            store.clone() as Arc<dyn ObjectStore>,
+            CatalogOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[allow(clippy::unwrap_used)]
+    async fn commit_schemas(catalog: &Catalog, names: &[&str]) {
+        for name in names {
+            catalog
+                .commit(|tx| tx.create_schema(name).map(|_| ()))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The head snapshot id plus the sorted schema names, read through a fresh
+    /// attach so the folded store — not a lagging reader — is what it
+    /// reconstructs.
+    #[allow(clippy::unwrap_used)]
+    async fn logical_state(store: &Arc<InMemory>) -> (u64, Vec<String>) {
+        let catalog = open_catalog(store).await;
+        let snapshot = catalog.snapshot().await.unwrap();
+        let mut schemas: Vec<String> = snapshot
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
+        schemas.sort();
+        (snapshot.current_snapshot().id.get(), schemas)
+    }
+
+    /// With the WAL off, a sprint killed before `finish()` flushes loses its
+    /// memtable folds — the log has no WAL to recover them — so the reopened
+    /// store still counts every slot as unfolded, and a full sprint re-folds
+    /// them from the log to the same state a never-interrupted fold reaches.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn a_killed_wal_off_sprint_loses_memtable_folds_and_reconverges() {
+        let store = Arc::new(InMemory::new());
+        let object_store = store.clone() as Arc<dyn ObjectStore>;
+        let names = ["a", "b", "c", "d"];
+
+        let catalog = open_catalog(&store).await;
+        commit_schemas(&catalog, &names).await;
+        assert_eq!(catalog.unfolded_tail().await.unwrap(), 4);
+
+        // A killed sprint: open the fold writer exactly as `fold_sprint` does
+        // (WAL off), apply the first slot into the memtable, then drop the
+        // writer without `finish()`'s flush or `close()` — a process kill.
+        {
+            let db = StoreBuilder::new("", object_store.clone())
+                .wal_enabled(false)
+                .open_writer()
+                .await
+                .unwrap();
+            let mut session = SlateDbCursorStore::new(Arc::new(db));
+            let slots = SlotLog::new(object_store.clone(), "");
+            let tail = slots.read_tail(1).await.unwrap();
+            let (sequence, envelope) = &tail.slots[0];
+            session.apply(*sequence, envelope).await.unwrap();
+            drop(session);
+        }
+
+        // The killed fold left nothing durable: the reopened store still counts
+        // every slot as unfolded.
+        let reopened = open_catalog(&store).await;
+        assert_eq!(
+            reopened.unfolded_tail().await.unwrap(),
+            4,
+            "a killed WAL-off sprint's memtable fold is lost, not recovered"
+        );
+
+        // A full sprint re-folds every slot from the log and drains the tail.
+        let report = reopened.fold_sprint(u64::MAX).await.unwrap();
+        assert_eq!(report.slots_folded, 4, "every slot re-folded from the log");
+        assert_eq!(reopened.unfolded_tail().await.unwrap(), 0);
+
+        // Convergence: the killed-then-refolded store matches a never-interrupted
+        // fold of the identical workload.
+        let reference_store = Arc::new(InMemory::new());
+        let reference = open_catalog(&reference_store).await;
+        commit_schemas(&reference, &names).await;
+        reference.fold_sprint(u64::MAX).await.unwrap();
+
+        assert_eq!(
+            logical_state(&store).await,
+            logical_state(&reference_store).await,
+            "a killed-then-refolded store converges to the never-interrupted state"
+        );
+    }
 }
