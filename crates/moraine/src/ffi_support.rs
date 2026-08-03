@@ -24,8 +24,8 @@ use crate::{
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            MacroValue, MappingValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
-            TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+            HeadValue, MacroValue, MappingValue, PartitionValue, SchemaValue, SnapshotValue,
+            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
         read::{
             EntityRecord, read_head, scan_current_entities, scan_history_entities,
@@ -36,8 +36,8 @@ use crate::{
 
 /// The head snapshot id inside an open read session, or `None` on a
 /// store that has no head yet (mid-bootstrap).
-async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Option<u64>> {
-    Ok(read_head(session.handle()).await?.map(|h| h.snapshot_id))
+async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Option<HeadValue>> {
+    read_head(session.handle()).await
 }
 
 /// Locks the shared projection state for reading, recovering a poisoned
@@ -78,15 +78,15 @@ async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
 
-    let cache_at = match (catalog.maintains_projections(), head) {
-        (true, Some(head)) => {
-            if let Some(records) = projections_read(catalog).entities_at(head) {
+    let cache_at = match head {
+        Some(head) => {
+            if let Some(records) = projections_read(catalog).entities_at(&head) {
                 session.finish();
                 return Ok(records);
             }
             Some(head)
         }
-        _ => None,
+        None => None,
     };
 
     let handle = session.handle();
@@ -254,22 +254,25 @@ pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
 /// and a scan on a miss installs them for the next call.
 async fn dump_projected_current<T: Clone>(
     catalog: &Catalog,
-    read: impl Fn(&ProjectionCache, u64) -> Option<Vec<T>>,
-    install: impl Fn(&mut ProjectionCache, u64, Vec<T>),
+    read: impl Fn(&ProjectionCache, &HeadValue) -> Option<Vec<T>>,
+    install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
 
-    let cache_at = match (catalog.maintains_projections(), head) {
-        (true, Some(head)) => {
-            if let Some(rows) = read(&projections_read(catalog), head) {
+    // Readers serve from this too: each of these dumps scans the whole of
+    // `current`, so rescanning per call costs a reader exactly what the
+    // entity projection costs it.
+    let cache_at = match head {
+        Some(head) => {
+            if let Some(rows) = read(&projections_read(catalog), &head) {
                 session.finish();
                 return Ok(rows);
             }
             Some(head)
         }
-        _ => None,
+        None => None,
     };
 
     let current = scan_current_entities(session.handle()).await;
@@ -336,8 +339,8 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
-    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).snapshots_at(head) {
+    if let Some(head) = head {
+        if let Some(rows) = projections_read(catalog).snapshots_at(&head) {
             session.finish();
             return Ok(rows);
         }

@@ -384,12 +384,29 @@ principle as committer read-your-writes:
   degrades to a rescan, never to wrong rows.
 - The serving contract is row-faithfulness: a maintained projection is equal
   to a fresh scan at the same head, always.
-- Scope: read-write catalogs only. A read-only catalog (`DbReader`) has no
-  local deltas to fold, so these three keep the scan-per-serve path.
-  (Its `CatalogSnapshot` *is* cached and refreshed — see above; what is not
-  extended to it is this fold-forward projection state.) A reader's scan
-  runs under the same validated cut every read-only pass does, so the two
-  scans of the entity dump observe one store state.
+- Scope: **both**, on one key. A read-write handle folds each batch forward
+  and a read-only one folds nothing, but folding is not what decides whether
+  a projection may be served — the head stamp is, and a reader reads the
+  same stamp the writer wrote. So every projection here is keyed on the
+  whole stamp rather than the snapshot id, and a reader serves from it on a
+  match and rescans on a miss.
+  The distinction is load-bearing rather than pedantic: a maintenance batch
+  reuses the snapshot id while changing what a scan finds, so an id-keyed
+  projection would serve a reader the state that batch reclaimed. A writer
+  never noticed, because it folds every batch and is therefore never stale.
+  Keying on the stamp is what makes the reader's case safe, and once it is
+  safe there is no reason left to withhold it — each of these dumps scans
+  the whole of `current`, so a reader rescanning per call pays for it on
+  every query, not once at attach. A reader's scan runs under the same
+  validated cut every read-only pass does, so the two scans of the entity
+  dump observe one store state.
+- The fold reads its stamp out of the batch it is folding. Every batch
+  writes `sys/head` (RFC 0004), so the head record is among the staged
+  writes, and taking it from there rather than being told alongside them
+  makes it impossible for the two to disagree. A batch arriving without one
+  cannot be attributed to a state, so it clears the projections rather than
+  advancing them — unreachable by construction, and a guard rather than a
+  path.
 
 - The dumps clone only what they return. The record set behind them is
   shared, and a per-kind dump filters it by reference rather than copying

@@ -24,8 +24,8 @@ use std::{
 };
 
 use moraine::{
-    Catalog, CatalogOptions, ColumnId, DataFile, FileIndexEntry, IndexDef, IndexEntry,
-    IndexKeyValue, IntWidth, MaintenanceRequest,
+    Catalog, CatalogOptions, CensusRequest, ColumnId, DataFile, FileIndexEntry, IndexDef,
+    IndexEntry, IndexKeyValue, IntWidth, MaintenanceRequest, SubspaceName,
 };
 use object_store::{
     memory::InMemory,
@@ -54,6 +54,15 @@ impl Stats {
             max_ms: ms(samples[samples.len() - 1]),
         }
     }
+}
+
+/// A read-only handle: it opens no writer, so it neither fences nor runs a
+/// compactor that would move the state a measurement is holding still.
+#[allow(clippy::unwrap_used)]
+async fn open_reader(store: Arc<InMemory>) -> Catalog {
+    Catalog::open_read_only(store, CatalogOptions::default())
+        .await
+        .unwrap()
 }
 
 #[allow(clippy::unwrap_used)]
@@ -148,6 +157,397 @@ async fn measure_materialization_by_catalog_size() {
         println!(
             "{tables:>7}  {entities:>10}  {:>11.3}  {:>9.3}  {:>9.3}  {us_per_1k:>12.1}",
             stats.median_ms, stats.min_ms, stats.max_ms
+        );
+    }
+    println!();
+}
+
+/// 0021 — cold attach cost against the physical bytes `current` holds.
+///
+/// The claim the store census and the store merge rest on: a cold attach
+/// scans `current`, and it reads through every superseded version those
+/// SSTs still hold, so its cost tracks the subspace's *physical* size
+/// rather than its live entity count. This sweep holds the live catalog
+/// fixed and rewrites it, so live entities are constant across every row
+/// and only the dead fraction grows.
+///
+/// A merge is what collapses those bytes back down (`store::compaction`
+/// pins that it does); this measures what they cost while they stand.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_attach_cost_by_dead_fraction() {
+    const TABLES: usize = 40;
+    const COLS_PER_TABLE: usize = 8;
+    const REPEATS: usize = 7;
+    // Each round rewrites every table's statistics, superseding one
+    // `current` record per table without changing what is live.
+    let rounds = [0usize, 10, 40, 160];
+
+    println!("\n# 0021 cold attach vs. physical `current` bytes (in-memory object_store)");
+    println!(
+        "# {TABLES} tables x {COLS_PER_TABLE} columns, live entities held constant; \
+         each round rewrites every table's stats\n"
+    );
+    println!(
+        "{:>7}  {:>10}  {:>14}  {:>8}  {:>5}  {:>11}  {:>9}",
+        "rounds", "live_keys", "current_bytes", "l0_ssts", "runs", "median_ms", "max_ms"
+    );
+
+    for &rounds in &rounds {
+        let store = Arc::new(InMemory::new());
+        let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+
+        let columns: Vec<_> = (0..COLS_PER_TABLE).map(|c| col(&format!("c{c}"))).collect();
+        let mut tables = Vec::with_capacity(TABLES);
+        for t in 0..TABLES {
+            let columns = columns.clone();
+            let made = std::cell::Cell::new(None);
+            catalog
+                .commit(|tx| {
+                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                    made.set(Some(tx.create_table(schema, &format!("t{t}"), &columns)?));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            tables.push(made.get().unwrap());
+        }
+
+        catalog.close().await.unwrap();
+
+        // Churn: each round supersedes one `current` record per table, and
+        // closes so the memtable is written out. Without the close the
+        // superseded versions stay in memory, never reach an SST, and the
+        // physical size this measures does not move — the first run of this
+        // harness reported exactly that flat line.
+        for round in 0..rounds {
+            let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+            let batch = tables.clone();
+            catalog
+                .commit(move |tx| {
+                    for &table in &batch {
+                        tx.update_table_stats(table, 100 + round as u64, 4_096)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+        }
+
+        // What `current` weighs, live and physical, from the census itself
+        // — read-only, so measuring the store does not compact it.
+        let probe = open_reader(store.clone()).await;
+        let mut request = CensusRequest::default();
+        request.count_live_entries = true;
+        let census = probe.store_census(request).await.unwrap();
+        let current = census
+            .subspaces
+            .iter()
+            .find(|s| s.subspace == SubspaceName::Current)
+            .expect("current is always reported");
+        let live_keys = current.live.expect("the scanning leg was requested").keys;
+        let bytes = current.bytes;
+        let l0_ssts = current.l0_ssts;
+        let runs = current.sorted_runs;
+        // Everything a materialization reads besides `current`, so a cost
+        // this table cannot explain has somewhere to show up.
+        let other: Vec<String> = census
+            .subspaces
+            .iter()
+            .filter(|s| s.subspace != SubspaceName::Current && s.bytes > 0)
+            .map(|s| {
+                format!(
+                    "{}={}B/{}k",
+                    s.subspace,
+                    s.bytes,
+                    s.live.map_or(0, |l| l.keys)
+                )
+            })
+            .collect();
+        probe.close().await.unwrap();
+
+        // A fresh handle per repeat: a warm one serves from the cache and
+        // would report a cold attach as free. Read-only, for two reasons —
+        // it is the attach shape the incident this measures came from, and
+        // a writer starts a compactor that would perturb the very state
+        // being measured between repeats.
+        let mut samples = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let probe = open_reader(store.clone()).await;
+            let start = Instant::now();
+            let view = probe.snapshot().await.unwrap();
+            samples.push(start.elapsed());
+            std::hint::black_box(&view);
+            probe.close().await.unwrap();
+        }
+
+        let stats = Stats::of(samples);
+        println!(
+            "{rounds:>7}  {live_keys:>10}  {bytes:>14}  {l0_ssts:>8}  {runs:>5}  {:>11.3}  {:>9.3}   {}",
+            stats.median_ms,
+            stats.max_ms,
+            other.join(" ")
+        );
+    }
+    println!();
+}
+
+/// Seeds `tables` and then rewrites every one of their statistics records
+/// `rounds` times, closing after each round.
+///
+/// The close is load-bearing: without it the superseded versions stay in
+/// the memtable, never reach an SST, and cost nobody a GET.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn churn_into_ssts(store: &Arc<InMemory>, tables: usize, columns: usize, rounds: usize) {
+    let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+    let columns: Vec<_> = (0..columns).map(|c| col(&format!("c{c}"))).collect();
+    let mut made_tables = Vec::with_capacity(tables);
+    for t in 0..tables {
+        let columns = columns.clone();
+        let made = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                made.set(Some(tx.create_table(schema, &format!("t{t}"), &columns)?));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        made_tables.push(made.get().unwrap());
+    }
+    catalog.close().await.unwrap();
+
+    for round in 0..rounds {
+        let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+        let batch = made_tables.clone();
+        catalog
+            .commit(move |tx| {
+                for &table in &batch {
+                    tx.update_table_stats(table, 100 + round as u64, 4_096)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+    }
+}
+
+/// 0021 — what a store merge is worth once a GET costs what S3 charges.
+///
+/// The companion to the sweep above, and the one that reaches the regime
+/// the production incident sat in. That incident was IO-bound — ~5.3 MB/s
+/// effective, a read pulling the whole store across the network — so the
+/// term that matters is not bytes decoded but **object-store GETs issued**,
+/// and GETs scale with how many SSTs a scan must open rather than how much
+/// they hold. An in-memory store measures the wrong term however large it
+/// grows; injected per-GET latency measures the right one at any size.
+///
+/// Sweeping latency for a fixed store makes the GET count readable off the
+/// slope: attach time is roughly `GETs x latency + decode`, so the gradient
+/// is the GET count and the intercept is the compute floor. Doing it for a
+/// churned store and again after `compact_store` prices the merge.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_attach_cost_under_get_latency() {
+    const TABLES: usize = 40;
+    const COLS_PER_TABLE: usize = 8;
+    const ROUNDS: usize = 160;
+    const REPEATS: usize = 5;
+    let latencies = [0u64, 2, 5, 10];
+
+    println!("\n# 0021 cold read-only attach vs. injected per-GET latency");
+    println!(
+        "# {TABLES} tables x {COLS_PER_TABLE} columns, {ROUNDS} churn rounds, \
+         live set constant; median of {REPEATS}\n"
+    );
+
+    let store = Arc::new(InMemory::new());
+    churn_into_ssts(&store, TABLES, COLS_PER_TABLE, ROUNDS).await;
+
+    for merged in [false, true] {
+        if merged {
+            let writer = open_with(store.clone(), SEED_FLUSH_MS).await;
+            let mut request = moraine::CompactStoreRequest::default();
+            request.wait = Some(Duration::from_secs(60));
+            let report = writer.compact_store(request).await.unwrap();
+            let completed = report
+                .merges
+                .iter()
+                .filter(|m| m.outcome == moraine::MergeOutcome::Completed)
+                .count();
+            writer.close().await.unwrap();
+            println!("\n## after compact_store — {completed} subspaces merged\n");
+        } else {
+            println!("## churned, unmerged\n");
+        }
+
+        // What the reader will have to open, before timing anything.
+        let probe = open_reader(store.clone()).await;
+        let census = probe.store_census(CensusRequest::default()).await.unwrap();
+        let ssts: u32 = census
+            .subspaces
+            .iter()
+            .map(|s| s.l0_ssts + s.sorted_run_ssts)
+            .sum();
+        let bytes = census.total_bytes();
+        probe.close().await.unwrap();
+        println!("   store: {ssts} SSTs, {bytes} bytes");
+        println!(
+            "{:>12}  {:>11}  {:>9}",
+            "get_latency", "median_ms", "max_ms"
+        );
+
+        for &latency_ms in &latencies {
+            let config = ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(latency_ms),
+                ..ThrottleConfig::default()
+            };
+            let throttled = Arc::new(ThrottledStore::new((*store).clone(), config));
+
+            let mut samples = Vec::with_capacity(REPEATS);
+            for _ in 0..REPEATS {
+                let probe = Catalog::open_read_only(throttled.clone(), CatalogOptions::default())
+                    .await
+                    .unwrap();
+                let start = Instant::now();
+                let view = probe.snapshot().await.unwrap();
+                samples.push(start.elapsed());
+                std::hint::black_box(&view);
+                probe.close().await.unwrap();
+            }
+
+            let stats = Stats::of(samples);
+            println!(
+                "{latency_ms:>10} ms  {:>11.3}  {:>9.3}",
+                stats.median_ms, stats.max_ms
+            );
+        }
+    }
+    println!();
+}
+
+/// 0021 — does a cold attach pay for the `index` subspace it never scans?
+///
+/// A production store measured 3.364 GB in `index` (75.6M live entries)
+/// against ~13 MB across every subspace a reader touches, and still took
+/// minutes to attach read-only. Materialization scans `current` and point-
+/// reads `sys`/`snapshot`, so on the design nothing should read `index` at
+/// all — this holds the reader-visible subspaces fixed and grows `index`
+/// alone to find out whether that holds in fact.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn measure_attach_cost_by_index_size() {
+    const BATCH: u64 = 8_192;
+    const REPEATS: usize = 5;
+    let commit_ladder = [0usize, 8, 32, 128];
+
+    println!("\n# 0021 cold read-only attach vs. `index` subspace size");
+    println!("# reader-visible subspaces held fixed; only `index` grows\n");
+    println!(
+        "{:>8}  {:>11}  {:>10}  {:>9}  {:>13}  {:>9}  {:>9}",
+        "entries", "index_bytes", "index_ssts", "all_ssts", "manifest_bytes", "open_ms", "view_ms"
+    );
+
+    for &commits in &commit_ladder {
+        let store = Arc::new(InMemory::new());
+        let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+
+        let created = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, "t", &[col("a")])?;
+                let def = IndexDef {
+                    name: "idx".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                };
+                created.set(Some((table, tx.create_index(table, &def, &[])?)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (table, index) = created.get().expect("index created");
+
+        // Every commit registers one data file — one `current` row — and
+        // BATCH index entries. `current` therefore grows by one row per
+        // commit while `index` grows by thousands, which is the production
+        // store's shape in miniature.
+        catalog.close().await.unwrap();
+        for k in 0..commits {
+            let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+            let k = k as u64;
+            let entries: Vec<FileIndexEntry> = (0..BATCH)
+                .map(|ordinal| FileIndexEntry {
+                    index,
+                    ordinal,
+                    values: vec![Some(IndexKeyValue::Int {
+                        value: i128::from(k * BATCH + ordinal),
+                        width: IntWidth::I64,
+                    })],
+                })
+                .collect();
+            catalog
+                .commit(move |tx| {
+                    let file = DataFile {
+                        path: format!("f{k}.parquet"),
+                        ..datafile(BATCH)
+                    };
+                    tx.register_data_file(table, file, &entries)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+        }
+
+        let probe = open_reader(store.clone()).await;
+        let census = probe.store_census(CensusRequest::default()).await.unwrap();
+        let weight = |name: &SubspaceName| {
+            census
+                .subspaces
+                .iter()
+                .find(|s| &s.subspace == name)
+                .map_or((0, 0), |s| (s.bytes, s.l0_ssts + s.sorted_run_ssts))
+        };
+        let (index_bytes, index_ssts) = weight(&SubspaceName::Index);
+        let all_ssts: u32 = census
+            .subspaces
+            .iter()
+            .map(|s| s.l0_ssts + s.sorted_run_ssts)
+            .sum();
+        // The manifest lists every SST in every segment and is read whole
+        // on every attach, before any segment routing applies.
+        let manifest_bytes = census.objects.map_or(0, |o| o.manifest_bytes);
+        probe.close().await.unwrap();
+
+        // Open and first view are timed apart: the design says neither
+        // should touch `index`, and if one of them does this says which.
+        let mut opens = Vec::with_capacity(REPEATS);
+        let mut views = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            let probe = open_reader(store.clone()).await;
+            opens.push(start.elapsed());
+
+            let start = Instant::now();
+            let view = probe.snapshot().await.unwrap();
+            views.push(start.elapsed());
+            std::hint::black_box(&view);
+            probe.close().await.unwrap();
+        }
+
+        println!(
+            "{:>8}  {index_bytes:>11}  {index_ssts:>10}  {all_ssts:>9}  {manifest_bytes:>13}  \
+             {:>9.3}  {:>9.3}",
+            commits as u64 * BATCH,
+            Stats::of(opens).median_ms,
+            Stats::of(views).median_ms
         );
     }
     println!();

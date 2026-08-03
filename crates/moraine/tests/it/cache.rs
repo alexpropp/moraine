@@ -6,7 +6,192 @@ use std::sync::Arc;
 use moraine::{Catalog, CatalogOptions, SnapshotId};
 use object_store::memory::InMemory;
 
-use crate::fixtures::{col, datafile, seeded};
+use crate::{
+    counting_store::CountingStore,
+    fixtures::{col, datafile, seeded},
+};
+
+/// A read-only handle materializes the catalog **once** and serves every
+/// later read from the cache.
+///
+/// This is the incident's shape as a test. A handle that rebuilds per read
+/// returns the right answer every time and differs only in traffic, so the
+/// assertion counts object-store reads rather than timing anything: after
+/// the first view, repeated reads must cost a bounded handful of reads —
+/// the head point read and its neighbours — not another scan of `current`.
+#[tokio::test]
+async fn a_read_only_handle_materializes_once() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..64 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(object_store));
+    let reader = Catalog::open_read_only(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // The first view is the materialization, and is allowed to read.
+    let first = reader.snapshot().await.unwrap();
+    let cold = counting.take_reads();
+    assert!(cold > 0, "a cold view read nothing");
+
+    // Every later view serves the same catalog for a small, constant cost.
+    for _ in 0..8 {
+        let view = reader.snapshot().await.unwrap();
+        assert_eq!(view.schemas().len(), first.schemas().len());
+    }
+    let warm = counting.take_reads();
+
+    assert!(
+        warm < cold,
+        "warm reads cost as much as the cold one ({warm} vs {cold}): the handle is \
+         rebuilding the catalog per read"
+    );
+}
+
+/// A whole-subspace scan reads ahead rather than paying a round trip per
+/// block.
+///
+/// SlateDB's scan default is one block, fetched serially — invisible on
+/// local storage and ruinous on remote, where a 12.8 MB subspace measured
+/// 276 s at ~46 KB/s, which is 3 200 sequential fetches and nothing else.
+/// The assertion counts reads rather than timing them, because on an
+/// in-memory store the defect costs nothing observable.
+#[tokio::test]
+async fn a_materialization_reads_ahead_rather_than_block_by_block() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // Enough live rows that `current` spans many blocks: a scan that
+    // fetches one at a time issues an order more reads than one that does
+    // not, whatever the block size turns out to be.
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..4_000 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(object_store));
+    let reader = Catalog::open_read_only(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    counting.take_reads();
+
+    let view = reader.snapshot().await.unwrap();
+    let reads = counting.take_reads();
+    let files = view
+        .tables_in(view.schemas()[0].id)
+        .first()
+        .map(|table| view.data_files_of(table.id).len())
+        .unwrap_or_default();
+
+    assert!(files >= 4_000, "seed did not land: {files} files");
+    // One round trip per 4 KiB block would be in the thousands here. The
+    // bound is deliberately loose: it catches the defect's order of
+    // magnitude without pinning SlateDB's block size or layout.
+    // Measured: 5 reads with read-ahead, 89 without, on this seed. The
+    // bound sits between them with headroom, so it catches the defect's
+    // order of magnitude without pinning SlateDB's block size or layout.
+    assert!(
+        reads < 20,
+        "materialization issued {reads} reads for {files} files — scanning block by block"
+    );
+}
+
+/// A read-only handle scans once for a whole population of DuckLake's
+/// metadata tables, not once per `dump_*` call.
+///
+/// DuckLake issues roughly two dozen dumps to populate its metadata, and
+/// each one used to rescan `current` *and* `history` on a reader — the
+/// entity projection was gated on holding the writer. That is the cost a
+/// query pays on every execution, not just at attach.
+#[tokio::test]
+async fn a_read_only_handle_scans_once_for_many_dumps() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..2_000 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(object_store));
+    let reader = Catalog::open_read_only(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // The first dump scans; it is the one that installs the projection.
+    let first = moraine::ffi_support::dump_data_files(&reader)
+        .await
+        .unwrap();
+    let cold = counting.take_reads();
+    assert!(!first.is_empty(), "seed did not land");
+    assert!(cold > 0, "a cold dump read nothing");
+
+    // A population's worth of further dumps must not rescan.
+    for _ in 0..12 {
+        let again = moraine::ffi_support::dump_data_files(&reader)
+            .await
+            .unwrap();
+        assert_eq!(again.len(), first.len());
+    }
+    let warm = counting.take_reads();
+
+    assert!(
+        warm < cold,
+        "twelve further dumps cost {warm} reads against {cold} for one: the reader is \
+         rescanning per dump"
+    );
+}
 
 /// A second read is served from the cache after a commit moved head. It
 /// must show the commit — a cache that serves a stale head is worse than

@@ -357,9 +357,6 @@ impl Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subspace {
     /// Store-level singletons.
-    // System keys are read/written by exact key today; no caller prefix-scans
-    // the whole subspace yet.
-    #[allow(dead_code)]
     System,
     /// Snapshot records.
     Snapshot,
@@ -368,24 +365,29 @@ pub(crate) enum Subspace {
     /// Ended entity versions.
     History,
     /// Inlined data.
-    // Data inlining is not implemented yet.
-    #[allow(dead_code)]
     Inline,
     /// Equality-index entries.
-    // Entries are read by exact key or per-index prefix, not by a
-    // whole-subspace scan yet.
-    #[allow(dead_code)]
     Index,
     /// Per-table schema-version records.
     SchemaVersion,
     /// Per-commit changelogs.
-    // Read by exact key, one per snapshot in a refresh's gap; no caller
-    // scans the whole subspace.
-    #[allow(dead_code)]
     Changelog,
 }
 
 impl Subspace {
+    /// Every subspace, in discriminant order. A census walks this, so a
+    /// subspace added to [`Key`] and left out here goes unreported.
+    pub(crate) const ALL: [Self; 8] = [
+        Self::System,
+        Self::Snapshot,
+        Self::Current,
+        Self::History,
+        Self::Inline,
+        Self::Index,
+        Self::SchemaVersion,
+        Self::Changelog,
+    ];
+
     /// A minimal key inside this subspace, for prefix derivation.
     const fn sample(self) -> Key {
         match self {

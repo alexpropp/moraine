@@ -128,13 +128,54 @@
 //! Deciding what is dead rests on catalog ids never being reused, so a
 //! sweep can run alongside a live writer without coordinating with it.
 //!
-//! This is the *only* reclamation moraine owns. Snapshot expiry, file
-//! cleanup, and compaction belong to DuckLake and run through its own
-//! functions; the SlateDB store collects its superseded objects itself,
-//! unprompted. A host embedding this crate calls `maintain` on whatever
-//! cadence it likes — the crate spawns no threads and schedules nothing.
-//! Under the DuckDB extension, all of it is sequenced for you; see that
-//! crate's docs for `moraine_maintenance`.
+//! Beneath the catalog, the store itself accumulates. Every key lives in
+//! a subspace, each subspace is its own tree, and overwriting a key leaves
+//! the old version readable-through until a merge rewrites the SSTs
+//! holding it — which the substrate's own scheduler only does under write
+//! pressure, so a store that goes quiet keeps its dead weight
+//! indefinitely. [`Catalog::store_census`] says where the weight is, from
+//! the store's manifest alone:
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use moraine::{Catalog, CatalogOptions, CensusRequest, CompactStoreRequest, SubspaceName};
+//! # use object_store::memory::InMemory;
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+//! let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+//! catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+//!
+//! let census = catalog.store_census(CensusRequest::default()).await?;
+//! // Every subspace is reported, so two censuses compare row by row.
+//! assert!(census.subspaces.iter().any(|s| s.subspace == SubspaceName::Current));
+//!
+//! // ...and the merge collapses a subspace's sorted runs into one.
+//! let report = catalog.compact_store(CompactStoreRequest::default()).await?;
+//! assert!(!report.merges.is_empty());
+//! # Ok::<(), moraine::Error>(()) }).unwrap();
+//! ```
+//!
+//! The census costs a manifest read plus one listing and is available
+//! read-only; its per-subspace figures count SSTs that have been written
+//! out, so a commit still in the write-ahead log is in none of them. The
+//! listing is what catches the rest: [`StoreCensus::unaccounted_bytes`]
+//! reports what the object store holds outside those SSTs, and a large
+//! figure there means a slow attach no merge will fix — an unpinned reader
+//! replays the log before it materializes anything. Ask for
+//! `CensusRequest::count_live_entries` and it also scans, which costs a
+//! full read of the store and is the only way to learn what fraction of a
+//! subspace is live. [`Catalog::compact_store`] then merges: moraine picks
+//! no sources and no destination, and the plan the substrate makes for a
+//! whole tree is what permits dropping a tombstone rather than carrying it
+//! forward. It needs the writer, since the compactor that executes a merge
+//! runs inside it.
+//!
+//! Snapshot expiry, file cleanup, and data-file compaction all belong to
+//! DuckLake and run through its own functions; the SlateDB store collects
+//! its superseded objects itself, unprompted. A host embedding this crate
+//! calls these verbs on whatever cadence it likes — the crate spawns no
+//! threads and schedules nothing. Under the DuckDB extension, all of it is
+//! sequenced for you; see that crate's docs for `moraine_maintenance`,
+//! `moraine_store_census`, and `moraine_compact_store`.
 //!
 //! # Format migration
 //!
@@ -194,15 +235,17 @@ mod store;
 mod transaction;
 
 pub use catalog::{
-    Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
-    ColumnOrder, ColumnStats, CommitMember, DataFile, DataFileId, DataFileInfo, DeleteFile,
-    DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
-    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, MacroId,
-    MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
-    MappingId, MappingInfo, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
-    PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
+    Catalog, CatalogOptions, CatalogSnapshot, CensusRequest, ColumnAlteration, ColumnDef, ColumnId,
+    ColumnInfo, ColumnOrder, ColumnStats, CommitMember, CompactStoreReport, CompactStoreRequest,
+    CompactionTarget, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
+    FileColumnStats, FileIndexEntry, FileIndexRemoval, FlushedDataFile, IndexDef, IndexEntry,
+    IndexId, IndexInfo, IndexState, InlineChunk, LiveCount, MacroId, MacroImplementationDef,
+    MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest, MappingId, MappingInfo,
+    MergeOutcome, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId,
+    PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo,
+    SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus, StoreObjects,
+    SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry,
+    TagTarget, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 /// Crash-injection seams, for tests that drive a migration to a named

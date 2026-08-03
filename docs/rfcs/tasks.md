@@ -114,12 +114,6 @@ deliberately not itemized here.
 
 ## 0009 — Reader consistency and snapshot caching
 
-- **DEFERRED** — Extend the three fold-forward *served projections*
-  (snapshots, table stats, table column stats) to read-only catalogs, which
-  rescan per serve. A reader has no local batch to fold, so it would advance
-  them by the same changelog replay the view already uses. Deferred until
-  reader-side serve cost is shown to matter; the view cache, which is the
-  expensive one, is no longer waiting on anything.
 - **DEFERRED** — Partial or lazy materialization to bound memory for an
   unusually large live catalog. Deferred until profiling shows the full
   in-memory view is a problem. This is the same decision as server-side filter
@@ -300,10 +294,31 @@ deliberately not itemized here.
   sequence today.
 - **DEFERRED** — Collapse the batched sweep into one range-delete per dead
   index if SlateDB exposes a range delete. Shared with 0016.
-- **DEFERRED** — File or pursue an upstream SlateDB compact-now-and-wait
-  primitive, the residual want after rejecting in-pass forced compaction.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
+- **MEASURE** — The absolute number against a real endpoint. Both halves of
+  the model are measured and recorded (`BENCHMARK.md`): attach cost tracks
+  the physical bytes a read touches, and under injected per-GET latency it
+  tracks the GET count, which a merge cuts. Both are linear, so the
+  production regime extrapolates — what is missing is only the endpoint's
+  own latency term, which `object_storage.rs` needs a real bucket to see,
+  exactly as the 0004 commit-latency row does.
+- **MEASURE** — Re-time the attach that prompted the read-ahead fix. It was
+  833 s with one materialization costing 276.7 s of it, at ~46 KB/s over
+  S3; the scan now reads 4 MiB ahead with 8 fetches in flight, and what
+  that is worth against real latency is unrecorded.
+- **DECISION** — Whether the read-ahead and fetch-concurrency figures
+  (4 MiB, 8) deserve to be attach options. They are moraine's choice today,
+  picked to make a scan latency-insensitive rather than measured against a
+  ladder, and the right values plainly differ between a local store and S3.
+- **DECISION** — Whether `Catalog` is safe to drive from a multi-threaded
+  tokio runtime under repeated open/close. A measurement that opened the
+  catalog 161 times in a loop deadlocked with every thread parked at zero
+  CPU under `#[tokio::test(flavor = "multi_thread")]` and ran in 8 s on a
+  current-thread runtime; four other multi-threaded measurements are
+  unaffected, so this is not a blanket incompatibility and the cause is
+  unknown. moraine is a library, and embedders will use multi-threaded
+  runtimes.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.

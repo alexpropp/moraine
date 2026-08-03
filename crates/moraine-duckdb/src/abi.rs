@@ -21,6 +21,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Arc,
+    time::Duration,
 };
 
 pub use checkpoints::*;
@@ -2000,6 +2001,360 @@ pub unsafe extern "C" fn moraine_maintain(
     }
 }
 
+/// One subspace's row of a store census, as returned by
+/// [`moraine_store_census`].
+#[repr(C)]
+pub struct MoraineSubspaceCensus {
+    /// The subspace's name, owned — free via [`moraine_store_census_free`].
+    pub subspace: *mut c_char,
+    /// Physical bytes across its SSTs.
+    pub bytes: u64,
+    /// SSTs not yet merged into a sorted run.
+    pub l0_ssts: u32,
+    /// Sorted runs. A merge collapses these to one.
+    pub sorted_runs: u32,
+    /// SSTs across those runs.
+    pub sorted_run_ssts: u32,
+    /// Whether the live fields carry a count; false unless the census was
+    /// asked to scan.
+    pub has_live: bool,
+    /// Live keys a reader would see.
+    pub live_keys: u64,
+    /// Encoded bytes of those keys.
+    pub live_key_bytes: u64,
+    /// Encoded bytes of their values.
+    pub live_value_bytes: u64,
+    /// Deletion-schedule entries among the live keys.
+    pub scheduled_files: u64,
+}
+
+/// Store-wide object totals, as returned by [`moraine_store_census`].
+#[repr(C)]
+pub struct MoraineStoreObjects {
+    /// Whether the store could be listed at all. False leaves every other
+    /// field zero — read-only credentials often grant `GetObject` without
+    /// `ListBucket`.
+    pub listed: bool,
+    /// Every object under the store's prefix.
+    pub total_objects: u64,
+    /// Bytes across all of them.
+    pub total_bytes: u64,
+    /// Write-ahead log objects, replayed by an unpinned read attach.
+    pub wal_objects: u64,
+    /// Bytes across those.
+    pub wal_bytes: u64,
+    /// Manifest versions.
+    pub manifest_objects: u64,
+    /// Bytes across those.
+    pub manifest_bytes: u64,
+    /// Sorted-string tables — the only bytes a merge reclaims.
+    pub sst_objects: u64,
+    /// Bytes across those.
+    pub sst_bytes: u64,
+    /// Everything else the layout carries.
+    pub other_objects: u64,
+    /// Bytes across those.
+    pub other_bytes: u64,
+}
+
+/// Measures the store, one row per subspace, and writes the manifest
+/// version measured to `*out_manifest_id` and the store-wide object totals
+/// to `*out_objects`.
+///
+/// `count_live_entries` adds a scan of every subspace, which costs a full
+/// read of the store; without it the call reads the manifest alone.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; the out-parameters
+/// must be writable, and `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_store_census(
+    handle: *mut MoraineCatalogHandle,
+    count_live_entries: bool,
+    out_items: *mut *mut MoraineSubspaceCensus,
+    out_len: *mut usize,
+    out_manifest_id: *mut u64,
+    out_objects: *mut MoraineStoreObjects,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce =
+        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceCensus>, AbiError> {
+            // `CensusRequest` is `#[non_exhaustive]`, so it is built
+            // through `default()` and field assignment.
+            let mut request = moraine::CensusRequest::default();
+            request.count_live_entries = count_live_entries;
+
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            let census = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.store_census(request),
+                )
+            }?;
+
+            if !out_manifest_id.is_null() {
+                // SAFETY: caller contract — non-null means writable.
+                unsafe { *out_manifest_id = census.manifest_id };
+            }
+            if !out_objects.is_null() {
+                let objects = census.objects.unwrap_or_default();
+                // SAFETY: caller contract — non-null means writable.
+                unsafe {
+                    *out_objects = MoraineStoreObjects {
+                        listed: census.objects.is_some(),
+                        total_objects: objects.total_objects,
+                        total_bytes: objects.total_bytes,
+                        wal_objects: objects.wal_objects,
+                        wal_bytes: objects.wal_bytes,
+                        manifest_objects: objects.manifest_objects,
+                        manifest_bytes: objects.manifest_bytes,
+                        sst_objects: objects.sst_objects,
+                        sst_bytes: objects.sst_bytes,
+                        other_objects: objects.other_objects,
+                        other_bytes: objects.other_bytes,
+                    };
+                }
+            }
+
+            // Owned-first: no raw pointers until every string converts.
+            let owned: Vec<(CString, &moraine::SubspaceCensus)> = census
+                .subspaces
+                .iter()
+                .map(|subspace| Ok((to_c_string(&subspace.subspace.to_string())?, subspace)))
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(name, subspace)| {
+                    let live = subspace.live.unwrap_or_default();
+                    MoraineSubspaceCensus {
+                        subspace: name.into_raw(),
+                        bytes: subspace.bytes,
+                        l0_ssts: subspace.l0_ssts,
+                        sorted_runs: subspace.sorted_runs,
+                        sorted_run_ssts: subspace.sorted_run_ssts,
+                        has_live: subspace.live.is_some(),
+                        live_keys: live.keys,
+                        live_key_bytes: live.key_bytes,
+                        live_value_bytes: live.value_bytes,
+                        scheduled_files: live.scheduled_files,
+                    }
+                })
+                .collect())
+        };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_store_census`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_store_census`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_store_census_free(items: *mut MoraineSubspaceCensus, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |row| free_c_string(row.subspace));
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// One subspace's merge, as returned by [`moraine_compact_store`].
+#[repr(C)]
+pub struct MoraineSubspaceMerge {
+    /// The subspace merged, owned — free via [`moraine_compact_store_free`].
+    pub subspace: *mut c_char,
+    /// `"completed"`, `"failed"`, `"pending"`, or `"skipped"`, owned.
+    pub outcome: *mut c_char,
+    /// The failure message or the skip reason; empty otherwise. Owned.
+    pub detail: *mut c_char,
+    /// Physical bytes before the merge was submitted.
+    pub bytes_before: u64,
+    /// Whether `bytes_after` carries a measurement; false unless the merge
+    /// committed.
+    pub has_bytes_after: bool,
+    /// Physical bytes after it committed.
+    pub bytes_after: u64,
+}
+
+/// Merges each targeted subspace's sorted runs into one.
+///
+/// `subspace` names one subspace, or is null for every one. `wait_ms` of 0
+/// returns as soon as the merges are submitted; otherwise the call waits
+/// that long for each to commit, and a merge that outlives the wait keeps
+/// running and is reported pending.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; the out-parameters
+/// must be writable, and `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_compact_store(
+    handle: *mut MoraineCatalogHandle,
+    subspace: *const c_char,
+    wait_ms: u64,
+    out_items: *mut *mut MoraineSubspaceMerge,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce =
+        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceMerge>, AbiError> {
+            // `CompactStoreRequest` is `#[non_exhaustive]`, so it is built
+            // through `default()` and field assignment.
+            let mut request = moraine::CompactStoreRequest::default();
+            if !subspace.is_null() {
+                // SAFETY: caller contract for the string pointer.
+                let name = unsafe { borrow_str(subspace, "subspace") }?;
+                request.target = moraine::CompactionTarget::Subspace(parse_subspace(name)?);
+            }
+            if wait_ms > 0 {
+                request.wait = Some(Duration::from_millis(wait_ms));
+            }
+
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            let report = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.compact_store(request),
+                )
+            }?;
+
+            // Owned-first: no raw pointers until every string converts.
+            let owned: Vec<(CString, CString, CString, &moraine::SubspaceMerge)> = report
+                .merges
+                .iter()
+                .map(|merge| {
+                    let (outcome, detail) = match &merge.outcome {
+                        moraine::MergeOutcome::Completed => ("completed", String::new()),
+                        moraine::MergeOutcome::Failed(why) => ("failed", why.clone()),
+                        moraine::MergeOutcome::Pending => ("pending", String::new()),
+                        moraine::MergeOutcome::Skipped(why) => ("skipped", (*why).to_string()),
+                        // `MergeOutcome` is `#[non_exhaustive]`: a variant
+                        // this build does not know still gets a row.
+                        _ => ("unknown", String::new()),
+                    };
+                    Ok((
+                        to_c_string(&merge.subspace.to_string())?,
+                        to_c_string(outcome)?,
+                        to_c_string(&detail)?,
+                        merge,
+                    ))
+                })
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(subspace, outcome, detail, merge)| MoraineSubspaceMerge {
+                    subspace: subspace.into_raw(),
+                    outcome: outcome.into_raw(),
+                    detail: detail.into_raw(),
+                    bytes_before: merge.bytes_before,
+                    has_bytes_after: merge.bytes_after.is_some(),
+                    bytes_after: merge.bytes_after.unwrap_or(0),
+                })
+                .collect())
+        };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_compact_store`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_compact_store`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_compact_store_free(items: *mut MoraineSubspaceMerge, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |row| {
+                free_c_string(row.subspace);
+                free_c_string(row.outcome);
+                free_c_string(row.detail);
+            });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Whether `name` is a subspace a merge can target.
+///
+/// Exposed separately from [`moraine_compact_store`] because an attach
+/// validates its options before any catalog is open: a name checked only
+/// when a pass runs would let a typo attach cleanly and then fail every
+/// scheduled pass, unattended, for as long as it stood.
+///
+/// # Safety
+///
+/// `name`, if non-null, must be a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_subspace_is_known(name: *const c_char) -> bool {
+    let attempt = || {
+        if name.is_null() {
+            return false;
+        }
+        // SAFETY: caller contract for `name`.
+        let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return false;
+        };
+        parse_subspace(name).is_ok()
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(false)
+}
+
+/// The subspaces a merge can target, comma-separated, for an error
+/// message. Owned — free via `moraine_error_free`; null if allocation
+/// fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn moraine_subspace_names() -> *mut c_char {
+    let attempt = || {
+        let names: Vec<String> = KNOWN_SUBSPACES.iter().map(ToString::to_string).collect();
+        to_c_string(&names.join(", ")).map_or(ptr::null_mut(), CString::into_raw)
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(ptr::null_mut())
+}
+
+/// The subspace `name` refers to, by the name a census prints.
+fn parse_subspace(name: &str) -> Result<moraine::SubspaceName, AbiError> {
+    KNOWN_SUBSPACES
+        .iter()
+        .find(|known| known.to_string() == name)
+        .cloned()
+        .ok_or_else(|| {
+            let known: Vec<String> = KNOWN_SUBSPACES.iter().map(ToString::to_string).collect();
+            AbiError::invalid_argument(format!(
+                "unknown subspace \"{name}\"; known subspaces are: {}",
+                known.join(", ")
+            ))
+        })
+}
+
+/// The subspaces a merge target may name. An unknown segment addresses no
+/// keys, so it is deliberately absent.
+const KNOWN_SUBSPACES: [moraine::SubspaceName; 8] = [
+    moraine::SubspaceName::System,
+    moraine::SubspaceName::Snapshot,
+    moraine::SubspaceName::Current,
+    moraine::SubspaceName::History,
+    moraine::SubspaceName::Inline,
+    moraine::SubspaceName::Index,
+    moraine::SubspaceName::SchemaVersion,
+    moraine::SubspaceName::Changelog,
+];
+
 /// Lists a table's live equality indexes.
 ///
 /// # Safety
@@ -3178,6 +3533,188 @@ mod tests {
             )
         };
         assert_eq!(code, codes::OK, "maintain with null out-params failed");
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The census ABI names every subspace, writes the manifest version
+    /// through its slot, and carries the live counts only when asked.
+    #[test]
+    fn census_reports_every_subspace_through_the_abi() {
+        let dir = TempDir::new("census-abi");
+        seed(dir.path());
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "attach failed");
+
+        for count_live in [false, true] {
+            let mut items: *mut MoraineSubspaceCensus = ptr::null_mut();
+            let mut len = 0usize;
+            let mut manifest_id = u64::MAX;
+            let mut objects = MoraineStoreObjects {
+                listed: false,
+                total_objects: 0,
+                total_bytes: 0,
+                wal_objects: 0,
+                wal_bytes: 0,
+                manifest_objects: 0,
+                manifest_bytes: 0,
+                sst_objects: 0,
+                sst_bytes: 0,
+                other_objects: 0,
+                other_bytes: 0,
+            };
+            // SAFETY: `handle` is live; every slot is a writable local.
+            let code = unsafe {
+                moraine_store_census(
+                    handle,
+                    count_live,
+                    &raw mut items,
+                    &raw mut len,
+                    &raw mut manifest_id,
+                    &raw mut objects,
+                    None,
+                    ptr::null_mut(),
+                    &raw mut err,
+                )
+            };
+            assert_eq!(code, codes::OK, "census failed");
+            assert!(len >= KNOWN_SUBSPACES.len(), "only {len} subspaces");
+            assert_ne!(manifest_id, u64::MAX, "manifest version not written");
+            // A local store lists fine, and a store that has been written
+            // holds at least a manifest.
+            assert!(objects.listed, "store not listed");
+            assert!(objects.total_objects > 0, "no objects counted");
+            assert!(objects.manifest_objects > 0, "no manifest counted");
+
+            // SAFETY: `items`/`len` are what the call just wrote.
+            let rows = unsafe { std::slice::from_raw_parts(items, len) };
+            for row in rows {
+                // SAFETY: every row owns a valid C string.
+                let name = unsafe { CStr::from_ptr(row.subspace) };
+                assert!(!name.to_bytes().is_empty());
+                assert_eq!(row.has_live, count_live, "{name:?}");
+            }
+            assert!(
+                rows.iter().any(|row| {
+                    // SAFETY: as above.
+                    unsafe { CStr::from_ptr(row.subspace) }.to_bytes() == b"current"
+                }),
+                "no `current` row"
+            );
+
+            // SAFETY: freed exactly once, with the matching length.
+            unsafe { moraine_store_census_free(items, len) };
+        }
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The merge ABI reports one row per subspace, and refuses a subspace
+    /// name it does not know rather than merging the wrong tree.
+    #[test]
+    fn compact_store_reports_rows_and_refuses_unknown_subspaces() {
+        let dir = TempDir::new("compact-abi");
+        seed(dir.path());
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "attach failed");
+
+        // A seeded store has no sorted runs, so every subspace is skipped
+        // and none reports bytes after.
+        let mut items: *mut MoraineSubspaceMerge = ptr::null_mut();
+        let mut len = 0usize;
+        // SAFETY: `handle` is live; every slot is a writable local.
+        let code = unsafe {
+            moraine_compact_store(
+                handle,
+                ptr::null(),
+                1_000,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "compact_store failed");
+        assert_eq!(len, KNOWN_SUBSPACES.len());
+
+        // SAFETY: `items`/`len` are what the call just wrote.
+        let rows = unsafe { std::slice::from_raw_parts(items, len) };
+        for row in rows {
+            // SAFETY: every row owns valid C strings.
+            let outcome = unsafe { CStr::from_ptr(row.outcome) };
+            assert_eq!(outcome.to_bytes(), b"skipped");
+            assert!(!row.has_bytes_after);
+            // SAFETY: as above.
+            let detail = unsafe { CStr::from_ptr(row.detail) };
+            assert!(!detail.to_bytes().is_empty(), "a skip states its reason");
+        }
+        // SAFETY: freed exactly once, with the matching length.
+        unsafe { moraine_compact_store_free(items, len) };
+
+        let unknown = CString::new("gcfile").expect("no interior nul");
+        // SAFETY: `handle` is live; the name is a valid C string.
+        let code = unsafe {
+            moraine_compact_store(
+                handle,
+                unknown.as_ptr(),
+                0,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INVALID_ARGUMENT);
+        if !err.message.is_null() {
+            // SAFETY: the guard wrote an owned message.
+            unsafe { moraine_error_free(err.message) };
+        }
 
         // SAFETY: freed exactly once.
         unsafe { moraine_detach(handle) };

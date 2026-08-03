@@ -209,6 +209,149 @@ batch — the entries are tombstoned idempotently, so only the last batch needs
 to be durable. The second lever makes batch size almost irrelevant and is the
 better fix; recorded as a follow-up in `docs/rfcs/tasks.md` under 0021.
 
+### Cold attach cost vs. the physical bytes a read touches
+
+The claim the store census and the store merge rest on: a cold attach reads
+through every superseded version the store still holds, so it costs what the
+store *physically* weighs rather than what it lives. 40 tables x 8 columns,
+the live set held identical across every row — each round rewrites every
+table's statistics and closes, superseding one record per table without
+changing what a reader sees. Median of 7 **read-only** attaches, a fresh
+handle each:
+
+| churn rounds | live keys | `current` bytes | L0 | runs | `snapshot` bytes | median attach |
+|---|---|---|---|---|---|---|
+| 0 | 402 | 21 069 | 1 | 0 | 3 018 | 0.96 ms |
+| 10 | 402 | 26 925 | 3 | 2 | 3 700 | 1.37 ms |
+| 40 | 402 | 31 447 | 5 | 3 | 5 144 | 1.48 ms |
+| 160 | 402 | 31 447 | 5 | 3 | 10 465 | 1.82 ms |
+
+Live entities never move; attach cost nearly doubles. That is the shape
+behind a 3.4 GB store serving one snapshot at a 642 s attach — the cost is in
+the dead versions, and `Catalog::compact_store` is what removes them.
+
+**Two subspaces drive it, not one.** A materialization scans `current` and
+point-reads `sys/head` and the head `snapshot` record, so its cost tracks the
+physical size of all three. Rows 1–3 grow `current`; the last two rows have a
+byte-identical `current` (same 5 L0 SSTs, same 3 sorted runs) and still
+differ by ~17%, because `snapshot` doubled — one record per commit, and 160
+rounds is 160 more commits. Point reads are not free when the segment holding
+them has more SSTs to probe. So "attach cost tracks physical bytes" is right,
+provided *bytes* means every subspace a read touches rather than `current`
+alone. A merge targets each subspace independently, so both are reclaimable.
+
+**What this does not reach.** The production store was 3.4 GB and this tops
+out at ~43 KB. Building a genuinely large one means many SSTs, and SlateDB
+writes one only when its in-memory buffer fills, at a 64 MB default — so
+~50 SSTs the natural way is ~3 GB pushed through the catalog, far too slow
+for a test. Closing the handle forces an early flush, which is how the rows
+above were produced, but those SSTs are all tiny: the harness can vary SST
+*count* or *size*, not both. Reaching the production regime needs either a
+real bloated store or an `l0_sst_size` knob on `CatalogOptions`, which is
+not exposed today.
+
+### What a store merge is worth once a GET costs what S3 charges
+
+The table above runs in memory, so it prices decode. The production
+incident did not: ~5.3 MB/s effective, a read pulling the store across the
+network. There the term that matters is **object-store GETs issued**, and
+GETs scale with how many SSTs a scan opens rather than how much they hold —
+so an in-memory store measures the wrong term however large it grows, while
+injected per-GET latency measures the right one at any size.
+
+Sweeping latency for a fixed store makes the GET count readable off the
+slope, since attach time is roughly `GETs x latency + decode`. Same shape as
+above (40 tables, 160 churn rounds, live set constant), read-only probes,
+median of 5:
+
+| per-GET latency | churned (37 SSTs) | after merge (25 SSTs) |
+|---|---|---|
+| 0 ms | 1.93 ms | 1.80 ms |
+| 2 ms | 42.0 ms | 35.4 ms |
+| 5 ms | 81.5 ms | 69.4 ms |
+| 10 ms | 146.9 ms | 124.6 ms |
+| **slope (GETs)** | **14.5** | **12.3** |
+
+Two things to read off it. **IO dominates completely** once latency is
+realistic: at 10 ms/GET the same attach costs 147 ms against 1.9 ms
+unthrottled, ~75x, so any measurement that leaves latency out is answering a
+different question. And **the merge pays**, cutting the GET count 14.5 to
+12.3 and attach time ~15%.
+
+Note the merge cut SSTs by 32% but GETs by only 15%: a materialization
+opens SSTs in the subspaces it actually reads, so merging `index` — which no
+scan touches — costs GETs nothing. That is the same asymmetry the census
+exists to expose before an operator spends a merge on the wrong subspace.
+
+The relationship is linear in both terms, so the production regime
+extrapolates: a store with N times the SSTs in the read path costs N times
+the GETs, at whatever the endpoint's latency is. That is what turns 1.9 ms
+into 642 s without needing 3.4 GB on hand to see it.
+
+**How this was arrived at matters.** The first revision of this harness
+reported a flat line — churn that never leaves the memtable never reaches
+the manifest, so closing per round is what writes it out. The second opened
+a writer per repeat, whose compactor moved the state between repeats. And
+the merged column read `0 subspaces merged` until the run exposed that a
+merge asked for straight after an attach found every tree already being
+merged by the writer's own compactor and skipped them all; adopting the
+in-flight merge instead is what makes this column mean anything.
+
+### Does a cold attach pay for the `index` subspace?
+
+A production store measured 3.364 GB in `index` — 75.6M live entries, 99.6%
+of the store — against ~13 MB across every subspace a reader touches, and
+still attached slowly. Materialization scans `current` and point-reads
+`sys`/`snapshot`, so by the segment routing nothing should read `index` at
+all. This holds the reader-visible subspaces fixed and grows `index` alone,
+timing the reader open and the first view apart so a cost names its phase.
+
+| entries | `index` bytes | index SSTs | all SSTs | manifest bytes | open | first view |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 0 | 5 | 5 KB | 0.51 ms | 0.19 ms |
+| 65 536 | 2.4 MB | 8 | 33 | 183 KB | 0.54 ms | 0.25 ms |
+| 262 144 | 9.5 MB | 20 | 45 | 1.3 MB | 0.68 ms | 0.31 ms |
+| 1 048 576 | 37.8 MB | 20 | 54 | 8.0 MB | 1.24 ms | 1.00 ms |
+
+**One channel exists, and it is small.** The manifest lists every SST in
+every segment and is read whole before any segment routing applies, so an
+open costs roughly **15 µs per SST across the whole store** — the index
+segment included. An earlier revision of this sweep grew `index` to 37.8 MB
+while holding SST count at one or two and measured a perfectly flat open,
+which is the other half of the result: it is the SST *count* that reaches
+the attach, never the bytes.
+
+The constant is what matters for sizing. Measured on the store that
+prompted this: every segment carries a single L0 SST and at most one sorted
+run, ~10 SSTs across the whole store, 3.34 GB of which sits in one `index`
+run. This term is ~0.2 ms there; it would take on the order of a million
+SSTs to cost minutes. An attach that is slow against a large `index` is
+therefore not slow *because of* it.
+
+What remained was `current`'s **live** bytes — 12.8 MB on that store — and
+what a read did with them, which turned out to be the whole answer.
+
+SlateDB's `ScanOptions::default()` is `read_ahead_bytes: 1`, rounding up to
+one block, with `max_fetch_tasks: 1`. Every whole-subspace scan took it, so
+a materialization paid one object-store round trip per block. The
+instrumented attach measured a single materialization — the view cache was
+working, `materializations=1` — at **276.7 s** for 12.8 MB. That is
+~46 KB/s, which is not a throughput figure at all: it is the latency of
+~3 200 sequential 4 KB fetches, against 6.9 s of user CPU across the whole
+833 s attach. Reading 4 MiB ahead with 8 fetches in flight is the fix; the
+same scan costs 5 object-store reads instead of 89 on an in-memory store,
+where the latency this hid behind is nil.
+
+The order of the refutations is worth keeping. Dead versions were refuted by
+a full-store merge reclaiming 0.08%; index bulk in the scan path by the
+segment routing; index bulk via the manifest by ~15 µs per SST against a
+store carrying ~10 of them; and repeated uncached materialization by an
+attach that was still slow on a build carrying the cache. Every one of those
+was a property of the *store*, and the cause was a property of how a scan
+was configured to read it — which no measurement of the store could have
+found, and which the attach named in one run once it was asked to report on
+itself.
+
 ### Materialization cost vs. catalog size
 
 This is the cost of a *cold* read — one whose handle holds no cached view.

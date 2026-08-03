@@ -3,6 +3,7 @@
 //! This layer never performs store I/O itself; the commit protocol in
 //! [`crate::transaction`] drives it.
 
+mod census;
 mod handle;
 pub(crate) mod index_policy;
 pub(crate) mod inline;
@@ -12,6 +13,10 @@ pub(crate) mod scoped_read;
 mod snapshot;
 mod types;
 
+pub use census::{
+    CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
+    MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
+};
 pub use handle::{
     Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest, MigrationRequest,
 };

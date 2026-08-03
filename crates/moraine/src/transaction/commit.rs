@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
@@ -268,7 +268,14 @@ pub(crate) async fn open_initialized(
     encrypted: bool,
     data_path: Option<&str>,
 ) -> Result<Db> {
+    // Timed for the same reason the read-only open is: a writer open reads
+    // the manifest and replays the log before any catalog work begins.
+    let started = Instant::now();
     let db = store.open_writer().await?;
+    info!(
+        writer_open_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "opened the store read-write"
+    );
     let tx = db
         .begin(IsolationLevel::Snapshot)
         .await
@@ -322,8 +329,22 @@ pub(crate) async fn open_initialized(
 /// bootstraps — a read-only attach against an uninitialized store is refused
 /// (there is nothing committed to read).
 pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<DbReader> {
+    // The substrate open is timed on its own: it reads the manifest, takes
+    // a checkpoint, and — unless pinned to one — replays the write-ahead
+    // log, none of which any per-subspace measurement can see.
+    let started = Instant::now();
     let reader = store.open_reader().await?;
-    match validate_format(ReadHandle::Reader(&reader)).await? {
+    let opened = started.elapsed();
+
+    let started = Instant::now();
+    let format = validate_format(ReadHandle::Reader(&reader)).await?;
+    info!(
+        reader_open_ms = opened.as_secs_f64() * 1_000.0,
+        validate_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "opened the store read-only"
+    );
+
+    match format {
         Some(_) => Ok(reader),
         None => Err(Error::Corruption(
             "store is not an initialized moraine catalog; a read-only attach \
@@ -429,11 +450,23 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         refuse_mid_migration(tx).await?;
         let head = read_head_value(tx).await?;
         let (target, snapshot) = resolve_below(tx, at, head.snapshot_id).await?;
+
+        // Timed apart from the decode that follows: a materialization that
+        // is slow is either fetching `current` or building from it, and the
+        // remedies differ entirely.
+        let started = Instant::now();
         let current = read::scan_current_entities(tx).await?;
+        let scanned = started.elapsed();
         let history = match at {
             Some(_) => read::scan_history_entities(tx).await?,
             None => Vec::new(),
         };
+        info!(
+            records = current.len(),
+            scan_ms = scanned.as_secs_f64() * 1_000.0,
+            history_records = history.len(),
+            "scanned `current`"
+        );
 
         let mut view = CatalogSnapshot::build(snapshot, current, history, at.map(|_| target));
         // A head view stands at the store state the head record names; a

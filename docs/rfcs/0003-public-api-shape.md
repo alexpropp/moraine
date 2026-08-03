@@ -295,7 +295,7 @@ semantics and the entities RFC 0002 maps:
 | **Tags** | `set_tag`, `remove_tag` (on a schema, table, or view; column tags travel on the column record and have no verb) |
 | **Options** | `set_option`, `unset_option` (global / schema / table scopes) |
 | **Inlined data** (RFC 0005) | `inline_insert`, `inline_delete`, `flush_inlined_data` |
-| **Maintenance** (RFC 0021) | `maintain` — reclaims the entry ranges of indexes no longer live; not a `Transaction` mutator but a `Catalog` verb, since it mints no snapshot |
+| **Maintenance** (RFC 0021) | `maintain` — reclaims the entry ranges of indexes no longer live; `store_census` — what each subspace weighs, from the manifest, plus an opt-in live count; `compact_store` — merges a subspace's sorted runs into one, reclaiming superseded versions and tombstones. None is a `Transaction` mutator: all three are `Catalog` verbs, since none mints a snapshot. `store_census` is the one maintenance verb a read-only catalog serves — it reads, and the compactor that executes a merge runs inside the writer |
 | **Format migration** (RFC 0015) | `migrate` — rewrites the store to the newest structural format the binary understands. Not a `Transaction` mutator and not even a `Catalog` method: an associated function taking the object store, because the stores it exists to act on are the ones an ordinary attach refuses |
 
 Notes:
