@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/morainedb/moraine/compare/v0.4.2...v0.4.3) - 2026-08-03
+
+### Added
+
+- measure and reclaim a store's substrate bytes ([#78](https://github.com/morainedb/moraine/pull/78))
+- close out the RFC 0009 reader-refresh work ([#77](https://github.com/morainedb/moraine/pull/77))
+- close out the RFC 0010 async-sync bridge deferrals ([#76](https://github.com/morainedb/moraine/pull/76))
+- close out the RFC 0003 verb-surface deferrals ([#74](https://github.com/morainedb/moraine/pull/74))
+
 ## [0.4.2](https://github.com/morainedb/moraine/compare/v0.4.1...v0.4.2) - 2026-08-03
 
 ### Fixed
