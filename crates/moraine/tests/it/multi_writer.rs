@@ -1102,6 +1102,68 @@ async fn truncation_removes_only_durably_folded_slots() {
     assert_eq!(fresh.current_snapshot().id, SnapshotId::new(3));
 }
 
+/// Bound 2 as the binding constraint, past the retention margin. A reader is
+/// pinned well below the durable frontier but more than the margin above the
+/// log's base, so the durable cursor alone would licence deleting the slots it
+/// still replays — only bound 2 holds truncation off them. This isolates bound
+/// 2 from the margin: removing bound 2 while keeping the margin deletes into
+/// the reader's required range, which the surviving-slot assertions below
+/// catch.
+///
+/// The lagging reader materializes fully either way — the hole-retry recovers a
+/// truncated-but-folded prefix from the store — so reader materialization is a
+/// sanity check here, not the discriminator; the load-bearing assertion is that
+/// the slots the reader needs are never deleted (prefix-consistency).
+#[tokio::test]
+async fn truncation_holds_the_live_reader_bound_past_the_margin() {
+    use moraine_wal::SlotLog;
+
+    let store = Arc::new(InMemory::new());
+
+    // Commit far past the retention margin so the durable frontier alone would
+    // licence deleting a large prefix.
+    let writer = open_multi_writer(&store).await;
+    for i in 0..140u32 {
+        writer
+            .commit(|tx| tx.create_schema(&format!("s{i}")).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    // Fold to 70 and pin a lagging reader there; with a long refresh it never
+    // polls again, so its checkpoint stays the oldest live one in the manifest.
+    writer.fold_sprint(70).await.unwrap();
+    let mut lagging_opts = CatalogOptions::default();
+    lagging_opts.refresh_interval = Duration::from_secs(3600);
+    let lagging = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, lagging_opts).await;
+
+    // Fold the rest, then drop the committer so the only checkpoints left are
+    // the lagging reader (fold 70) and the truncator's fresh reader (fold 140).
+    writer.fold_sprint(u64::MAX).await.unwrap();
+    writer.close().await.unwrap();
+
+    let truncator = open_multi_writer(&store).await;
+    let removed = truncator.truncate_folded_slots().await.unwrap();
+    // Past the margin regime, a real prefix below the reader floor is reclaimed
+    // (a relation, never an exact count a poll interval could move).
+    assert!(removed > 0, "a prefix below the reader floor is reclaimed");
+
+    // Bound 2 holds the line: every slot the lagging reader still replays
+    // (71..=140) survives, so the durable-minus-margin horizon never reached it.
+    let slots = SlotLog::new(store.clone() as Arc<dyn ObjectStore>, "");
+    for sequence in [71u64, 100, 140] {
+        assert!(
+            slots.read_slot(sequence).await.unwrap().is_some(),
+            "slot {sequence} the lagging reader needs survived truncation"
+        );
+    }
+
+    // Sanity: the lagging reader resolves the full catalog.
+    let head = lagging.snapshot().await.unwrap();
+    assert_eq!(head.current_snapshot().id, SnapshotId::new(140));
+    assert!(head.schema_by_name("s139").is_some());
+}
+
 /// The healthy-fleet case bound 2 exists for. A reader opened before a peer
 /// folds and truncates lags the fold, so the slots it still must replay are the
 /// only copies of those commits it can see. Bound 2 keeps them: the stale
