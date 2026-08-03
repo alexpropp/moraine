@@ -24,19 +24,6 @@ Resolving an item means updating the owning RFC and deleting the entry.
 RFC 0022 (the commit log and the leader role) is wholly unimplemented and is
 deliberately not itemized here.
 
-## Where the weight is
-
-Nothing gates disproportionately much of the list any more; the three that
-did have closed. The crash harness (RFC 0011) drives every case but one:
-`GroupCommit` landed with group commit itself, and `MigrationInterrupted`
-waits on exactly what format migration waits on. Both guarantees moraine
-owns, atomicity and resumability, have driven cases. Format migration (RFC
-0015) has its driver, its verb, and its marker, and waits only on a format
-that actually rewrites a key. Reader refresh (RFC 0009) is closed: it has
-its changelog, its fallbacks, its consistent read-only cut, and a measured
-threshold, and what remains under it is two deferrals with no one waiting
-on them.
-
 ## 0001 — Repository structure and conventions
 
 - **DEFERRED** — A `fuzz/` directory with `cargo-fuzz` targets for the `store`
@@ -293,7 +280,6 @@ on them.
   delete `ducklake_column_mapping` by `table_id`, then sweep orphan
   `ducklake_name_mapping` rows. Served tables stay insert-only until then.
   0007 work.
-
 
 ## 0021 — Maintenance orchestration
 
