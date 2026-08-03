@@ -488,6 +488,7 @@ async fn an_unreachable_leader_times_out_once_then_commits_direct() {
         bind_address: free_addr(),
         advertise_address: "192.0.2.1:9".to_string(),
         max_sessions: 16,
+        supersession_poll: Duration::from_secs(1),
     };
     let leader = RunningLeader::spawn(Arc::clone(&leader_catalog), config).await;
 
@@ -709,6 +710,7 @@ async fn ambiguous_setup(
             bind_address: leader_bind.clone(),
             advertise_address: proxy_addr,
             max_sessions: 16,
+            supersession_poll: Duration::from_secs(1),
         },
     )
     .await;

@@ -13,7 +13,7 @@
 //! an endpoint-absent advert, an explicit withdrawal a peer can tell from a
 //! slot carrying no advert at all. There are no heartbeats.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use moraine_wal::LeaderAdvert;
 use tokio::{
@@ -34,11 +34,25 @@ use crate::{
     transaction::{commit, folder},
 };
 
+/// How often a serving leader re-reads the advert to notice a fresher rival
+/// announcement and stand down. Advisory and coarse — the tail scan is one
+/// LIST, and a duel that resolves a poll late only wastes throughput, never a
+/// commit.
+const SUPERSESSION_POLL: Duration = Duration::from_secs(1);
+
+/// A bound on how long a stand-down waits for admitted sessions to settle
+/// before withdrawing. A durable slot PUT precedes every acknowledgement, so an
+/// idle connection that outlasts this loses no committed work when the drain
+/// gives up.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 mod funnel;
 mod session;
 
 #[cfg(test)]
 mod forward_tests;
+#[cfg(test)]
+mod standdown_tests;
 #[cfg(test)]
 mod tests;
 
@@ -56,6 +70,9 @@ pub struct LeaderConfig {
     pub advertise_address: String,
     /// The most concurrent forwarded sessions this leader serves.
     pub max_sessions: usize,
+    /// How often the serving leader re-reads the advert to notice a fresher
+    /// rival and stand down.
+    pub supersession_poll: Duration,
 }
 
 impl LeaderConfig {
@@ -68,6 +85,7 @@ impl LeaderConfig {
             bind_address: address.clone(),
             advertise_address: address,
             max_sessions,
+            supersession_poll: SUPERSESSION_POLL,
         }
     }
 }
@@ -82,6 +100,7 @@ pub struct Leader {
     listener: TcpListener,
     advertise_address: String,
     max_sessions: usize,
+    supersession_poll: Duration,
 }
 
 impl std::fmt::Debug for Leader {
@@ -138,6 +157,7 @@ impl Leader {
             listener,
             advertise_address: config.advertise_address,
             max_sessions: config.max_sessions,
+            supersession_poll: config.supersession_poll,
         })
     }
 
@@ -164,24 +184,45 @@ impl Leader {
         self.secret
     }
 
-    /// Accepts and serves forwarded sessions until `shutdown` fires, then
-    /// withdraws the advert — a clean stand-down a peer sees at once.
+    /// Accepts and serves forwarded sessions until `shutdown` fires or a
+    /// fresher rival advert supersedes this instance, then drains admitted
+    /// sessions and stands down. The stand-down withdraws only while this
+    /// instance is still the effective leader: a fresher rival advert
+    /// already speaks for the fleet, and a withdrawal riding a later slot
+    /// would shadow it. Supersession and fencing resolve the same way — a
+    /// long-lived successor that takes the folder role announces, and its
+    /// later-slot advert wins.
     ///
     /// # Errors
     ///
     /// Returns an error if the withdrawal cannot be written; a per-session
     /// failure is logged, never propagated.
     pub async fn serve(self, shutdown: Arc<Notify>) -> Result<()> {
-        let sessions = Arc::new(Semaphore::new(self.max_sessions.max(1)));
+        let max_sessions = self.max_sessions.max(1);
+        let sessions = Arc::new(Semaphore::new(max_sessions));
         let context = Arc::new(SessionContext {
             secret: self.secret,
             funnel: Arc::clone(&self.funnel),
             catalog: Arc::clone(&self.catalog),
         });
 
+        let mut monitor = tokio::time::interval(self.supersession_poll);
+        // The interval's first tick is immediate; consume it so the first check
+        // waits a full poll, giving a rival time to announce.
+        monitor.tick().await;
+
         loop {
             tokio::select! {
                 () = shutdown.notified() => break,
+                _ = monitor.tick() => {
+                    if self.superseded_by_rival().await {
+                        info!(
+                            instance = %Uuid::from_bytes(self.instance),
+                            "leader superseded by a fresher advert; standing down"
+                        );
+                        break;
+                    }
+                }
                 accepted = self.listener.accept() => {
                     let (stream, _) = match accepted {
                         Ok(pair) => pair,
@@ -195,6 +236,28 @@ impl Leader {
             }
         }
 
+        // Drain: stop accepting and let admitted sessions settle by reclaiming
+        // every permit. A durable slot PUT precedes every acknowledgement, so an
+        // idle-but-open connection that outlasts the bound loses no committed
+        // work when the drain gives up.
+        let permits = u32::try_from(max_sessions).unwrap_or(u32::MAX);
+        let _ = tokio::time::timeout(
+            DRAIN_TIMEOUT,
+            Arc::clone(&sessions).acquire_many_owned(permits),
+        )
+        .await;
+
+        // Withdraw only while still the effective leader; a fresher rival advert
+        // already names the fleet's leader, and clobbering it would send clients
+        // direct.
+        if self.superseded_by_rival().await {
+            info!(
+                instance = %Uuid::from_bytes(self.instance),
+                "leader stood down without withdrawing; a fresher advert already leads"
+            );
+            return Ok(());
+        }
+
         self.funnel
             .write_advert(LeaderAdvert {
                 instance: self.instance,
@@ -203,6 +266,23 @@ impl Leader {
             .await?;
         info!(instance = %Uuid::from_bytes(self.instance), "leader withdrew");
         Ok(())
+    }
+
+    /// Whether the log's freshest advert is a live announcement from another
+    /// instance — the one signal that stands this leader down. A withdrawal
+    /// (endpoint-absent) or this instance's own advert does not; nor does a
+    /// direct commit above the advert, which carries no advert and proves no
+    /// leader dead. A read blip retains leadership rather than abandon a
+    /// healthy leader on a transient error.
+    async fn superseded_by_rival(&self) -> bool {
+        match current_advert(self.catalog.slot_store()).await {
+            Ok(Some(advert)) => advert.endpoint.is_some() && advert.instance != self.instance,
+            Ok(None) => false,
+            Err(err) => {
+                warn!(error = %err, "leader could not read the advert; retaining leadership this poll");
+                false
+            }
+        }
     }
 }
 
@@ -298,10 +378,8 @@ fn token_bytes(value: &proto::SecretValue) -> Result<[u8; commit::SECRET_LEN]> {
 /// The current leader advert: the freshest advert riding the unfolded tail, or
 /// the folded [`SysKey::Leader`] when the tail carries none. A withdrawal (an
 /// endpoint-absent advert) is returned as such — distinct from `None`, which
-/// says the log names no leader at all.
-// The discovery read the client-side forwarding trigger consumes; exercised
-// here only by the leader's own tests.
-#[cfg_attr(not(test), allow(dead_code))]
+/// says the log names no leader at all. The client-side forwarding trigger and
+/// the serving leader's supersession monitor both read through it.
 pub(crate) async fn current_advert(store: &SlotStore) -> Result<Option<LeaderAdvert>> {
     let handle = ReadHandle::Reader(&store.reader);
     let fold = read::read_fold(handle)
