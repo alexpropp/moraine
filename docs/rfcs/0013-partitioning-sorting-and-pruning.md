@@ -138,7 +138,10 @@ level as alters, but they differ on `schema_version`
 **schema-changing commit** that bumps it, while a sort change does not —
 DuckLake marks the table altered without a bump (source-verified; a sort
 spec never invalidates cross-file compaction). On the staged path moraine
-stores DuckLake's authored `schema_version` verbatim either way. Both
+stores DuckLake's authored `schema_version` verbatim either way; the verb
+path enforces the split itself, `set_partitioning`/`clear_partitioning`
+classifying as schema-changing alters and `set_sorting`/`clear_sorting` as
+alters that are not. Both
 specs are versioned temporally like any entity, and the transitions are
 identical:
 

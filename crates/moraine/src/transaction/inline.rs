@@ -83,6 +83,42 @@ async fn schema_write_if_new(
     }
 }
 
+/// Refuses a commit that tombstones a row its own flush drains.
+///
+/// The flushed file was written before the commit, so it carries that row
+/// as live, and the tombstone's chunk is removed out from under it — the
+/// delete would simply vanish. The way to delete a flushed row in the
+/// commit that flushes it is a delete file against the id
+/// `flush_inlined_data` returns.
+///
+/// Only the verb path enforces this. The staged path carries DuckLake's
+/// own statements, which express a flush as the hard deletes it issues
+/// rather than as this pair.
+fn refuse_tombstones_of_drained_rows(
+    table_id: u64,
+    drained: &HashSet<u64>,
+    ops: &[InlineStage],
+) -> Result<()> {
+    for op in ops {
+        if let InlineStage::Tombstone {
+            table_id: tombstoned_table,
+            row_id,
+            ..
+        } = op
+            && *tombstoned_table == table_id
+            && drained.contains(row_id)
+        {
+            return Err(Error::Constraint(format!(
+                "inline_delete of row {row_id} on table {table_id} in the commit that flushes \
+                 it; the row is live in the flushed file, so delete it with a delete file \
+                 against that file instead"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Translates staged inline mutations into `inline/*` writes.
 ///
 /// `db_tx` is read at its pre-commit state, so a drain sees the store as it
@@ -141,7 +177,7 @@ pub(crate) async fn stage_inline_writes(
                 schema_version,
                 flush_snapshot,
             } => {
-                translate_inline_flush_delete(
+                let drained = translate_inline_flush_delete(
                     db_tx,
                     *table_id,
                     *schema_version,
@@ -149,6 +185,7 @@ pub(crate) async fn stage_inline_writes(
                     &mut writes,
                 )
                 .await?;
+                refuse_tombstones_of_drained_rows(*table_id, &drained, ops)?;
             }
         }
     }

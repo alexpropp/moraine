@@ -12,17 +12,17 @@ use crate::{
         CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnOrder, ColumnStats, DataFile,
         DataFileId, DeleteFile, DeleteFileId, FileIndexEntry, FileIndexRemoval, FlushedDataFile,
         IndexDef, IndexEntry, IndexId, IndexState, InlineChunk, MacroId, MacroImplementationDef,
-        OptionScope, PartitionColumnDef, PartitionId, SchemaId, TableId, TagTarget, ViewId,
-        inline_policy::ensure_inlinable,
+        OptionScope, PartitionColumnDef, PartitionId, SchemaId, SnapshotId, SortId, SortKeyDef,
+        TableId, TagTarget, ViewId, inline_policy::ensure_inlinable,
     },
     error::{Error, Result},
     store::{
         index_encoding::{Direction, NullOrder, encode_ordered_values},
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, IndexValue,
-            MacroImplementation, MacroParameter, MacroValue, PartitionColumn, PartitionValue,
-            SchemaValue, TableColumnStatsValue, TableStatsValue, TableValue, TagEntry, TagValue,
-            ViewValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FilePartitionValue,
+            IndexValue, MacroImplementation, MacroParameter, MacroValue, PartitionColumn,
+            PartitionValue, SchemaValue, SortExpression, SortValue, TableColumnStatsValue,
+            TableStatsValue, TableValue, TagEntry, TagValue, ViewValue,
         },
     },
     transaction::{
@@ -56,6 +56,9 @@ pub struct Transaction {
     /// Next `chunk_seq` per `(table_id, schema_version)`, disambiguating
     /// several chunks this commit inlines under one key prefix.
     chunk_seqs: HashMap<(u64, u64), u64>,
+    /// The row ids a table had allocated before this commit started
+    /// allocating its own, recorded per table the first time it does.
+    inherited_row_ids: HashMap<u64, u64>,
     next_catalog_id: u64,
     next_file_id: u64,
     new_snapshot_id: u64,
@@ -91,6 +94,7 @@ impl Transaction {
             index_entries: Vec::new(),
             inline_ops: Vec::new(),
             chunk_seqs: HashMap::new(),
+            inherited_row_ids: HashMap::new(),
             next_catalog_id,
             next_file_id,
             new_snapshot_id,
@@ -631,6 +635,92 @@ impl Transaction {
         Ok(())
     }
 
+    /// The live sort spec's id for `table`, if it has one.
+    fn live_sort_id(&self, table: TableId) -> Option<u64> {
+        self.state
+            .sorts
+            .get(&table.get())
+            .and_then(|per_table| per_table.keys().next().copied())
+    }
+
+    /// Sets a table's sort spec, replacing any spec already live. The old
+    /// spec ends into history, so a snapshot taken before the change still
+    /// reconstructs the spec in force then.
+    ///
+    /// Expressions, dialects, directions and null orders are stored
+    /// verbatim and never parsed. A sort key names its column inside its
+    /// expression rather than by field id, so — unlike a partition key —
+    /// there is no column for the verb to resolve or to keep valid across
+    /// a rename.
+    ///
+    /// Setting a sort spec is not a schema change: it marks the table
+    /// altered without bumping the catalog's schema version, matching
+    /// DuckLake, for which a sort spec never invalidates a cross-file
+    /// compaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table is not live, or
+    /// [`Error::Constraint`] if `keys` is empty (use
+    /// [`Self::clear_sorting`]).
+    pub fn set_sorting(&mut self, table: TableId, keys: &[SortKeyDef]) -> Result<SortId> {
+        self.live_table(table)?;
+        if keys.is_empty() {
+            return Err(Error::Constraint(format!(
+                "sort spec for table {table} needs at least one key; \
+                 use clear_sorting to unsort"
+            )));
+        }
+
+        if let Some(sort_id) = self.live_sort_id(table) {
+            self.state.delete_sort(table.get(), sort_id);
+        }
+        let sort_id = self.alloc_catalog_id();
+        self.state.put_sort(SortValue {
+            sort_id,
+            table_id: table.get(),
+            begin_snapshot: self.new_snapshot_id,
+            end_snapshot: None,
+            expressions: keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| SortExpression {
+                    sort_key_index: index as u64,
+                    expression: key.expression.clone(),
+                    dialect: key.dialect.clone(),
+                    sort_direction: key.sort_direction.clone(),
+                    null_order: key.null_order.clone(),
+                })
+                .collect(),
+        });
+        self.ops.push(Operation::AlterTableSorting {
+            table_id: table.get(),
+        });
+
+        Ok(SortId::new(sort_id))
+    }
+
+    /// Unsorts a table: its live spec ends into history and nothing takes
+    /// its place, which is what DuckLake's `RESET SORTED BY` does — unlike
+    /// the partition reset, which lands a live spec with no columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the table does not exist or carries
+    /// no live sort spec.
+    pub fn clear_sorting(&mut self, table: TableId) -> Result<()> {
+        self.live_table(table)?;
+        let sort_id = self
+            .live_sort_id(table)
+            .ok_or_else(|| Error::NotFound(format!("sort spec of table {table}")))?;
+        self.state.delete_sort(table.get(), sort_id);
+        self.ops.push(Operation::AlterTableSorting {
+            table_id: table.get(),
+        });
+
+        Ok(())
+    }
+
     fn index_name_free(&self, table: TableId, name: &str) -> Result<()> {
         let taken = self
             .state
@@ -966,9 +1056,71 @@ impl Transaction {
             .ok_or_else(|| Error::Corruption(format!("table {table} has no statistics record")))
     }
 
+    /// The first row id `table` has left to mint, recording the mark its
+    /// counter stood at before this commit touched it. The caller advances
+    /// the counter as part of the statistics it writes; every verb that
+    /// mints row ids takes its start from here, so the mark is the whole
+    /// commit's rather than one verb's.
+    fn allocate_row_ids(&mut self, table: TableId, tstat: &TableStatsValue) -> u64 {
+        self.inherited_row_ids
+            .entry(table.get())
+            .or_insert(tstat.next_row_id);
+
+        tstat.next_row_id
+    }
+
+    /// The row ids `table` had allocated before this commit ran — the
+    /// ceiling a flushed file's rows must stay under. A file the caller
+    /// wrote before calling `commit` cannot carry a row this commit mints,
+    /// so claiming one would count that row twice.
+    fn inherited_row_ids(&self, table: TableId, tstat: &TableStatsValue) -> u64 {
+        self.inherited_row_ids
+            .get(&table.get())
+            .copied()
+            .unwrap_or(tstat.next_row_id)
+    }
+
+    /// The live partition spec a file registered now falls under, after
+    /// checking it carries one value per key. An unpartitioned table takes
+    /// no values and names no spec.
+    fn resolve_file_partition(&self, table: TableId, values: &[String]) -> Result<Option<u64>> {
+        let live = self
+            .state
+            .partitions
+            .get(&table.get())
+            .and_then(|per_table| per_table.values().next());
+        let Some(spec) = live else {
+            if !values.is_empty() {
+                return Err(Error::Constraint(format!(
+                    "register_data_file: {} partition values on table {table}, which has no live \
+                     partition spec",
+                    values.len()
+                )));
+            }
+            return Ok(None);
+        };
+        if values.len() != spec.columns.len() {
+            return Err(Error::Constraint(format!(
+                "register_data_file: {} partition values on table {table}, whose live spec has \
+                 {} keys",
+                values.len(),
+                spec.columns.len()
+            )));
+        }
+
+        Ok(Some(spec.partition_id))
+    }
+
     /// Registers a data file, allocating its dense row-id range from the
     /// table's row-id counter and folding its size into the table's
     /// statistics.
+    ///
+    /// A partitioned table's file carries `file.partition_values`, one per
+    /// key of the live spec in key order, and the record names that spec.
+    /// The spec is resolved rather than passed: a file is written under
+    /// the one in force, and a commit that raced a repartition conflicts
+    /// as append-versus-alter rather than landing values against a spec
+    /// that has moved.
     ///
     /// # Errors
     ///
@@ -979,8 +1131,9 @@ impl Transaction {
     /// Returns [`Error::Constraint`] if the table has live indexes and a
     /// non-empty file supplies no `index_entries` (a silently under-covered
     /// index is a lie), an entry's `ordinal` is outside the file's rows, a
-    /// supplied indexed value exceeds the size cap, or the entries duplicate
-    /// a unique value.
+    /// supplied indexed value exceeds the size cap, the entries duplicate
+    /// a unique value, or the file's partition values do not match the
+    /// live spec's keys one for one.
     /// Returns [`Error::Corruption`] if the table has no statistics
     /// record (impossible for a table created by [`Self::create_table`],
     /// which always mints one).
@@ -1016,9 +1169,11 @@ impl Transaction {
                 )));
             }
         }
+        let partition_id = self.resolve_file_partition(table, &file.partition_values)?;
+
         let data_file_id = self.alloc_file_id();
         let tstat = self.live_table_stats(table)?;
-        let row_id_start = tstat.next_row_id;
+        let row_id_start = self.allocate_row_ids(table, &tstat);
         self.state.put_table_stats(TableStatsValue {
             next_row_id: tstat.next_row_id.saturating_add(file.record_count),
             record_count: tstat.record_count.saturating_add(file.record_count),
@@ -1038,11 +1193,11 @@ impl Transaction {
             file_size_bytes: file.file_size_bytes,
             footer_size: file.footer_size,
             row_id_start: Some(row_id_start),
-            partition_id: None,
+            partition_id,
             encryption_key: file.encryption_key,
             mapping_id: None,
             partial_max: None,
-            partition_values: vec![],
+            partition_values: file_partition_values(&file.partition_values),
         });
         for entry in file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -1830,7 +1985,7 @@ impl Transaction {
         }
 
         let tstat = self.live_table_stats(table)?;
-        let row_id_start = tstat.next_row_id;
+        let row_id_start = self.allocate_row_ids(table, &tstat);
         self.state.put_table_stats(TableStatsValue {
             next_row_id: tstat.next_row_id.saturating_add(chunk.row_count),
             record_count: tstat.record_count.saturating_add(chunk.row_count),
@@ -1941,15 +2096,21 @@ impl Transaction {
     /// Passing no files drains the chunks alone — the shape a flush of
     /// wholly tombstoned rows takes.
     ///
+    /// A commit may inline into the same table it flushes. The drain reads
+    /// the store as it stood before this commit, so the chunk this commit
+    /// stages is not one of the chunks it drains: those rows stay inlined
+    /// for the next flush to take. They are also outside what a flushed
+    /// file may claim — the caller wrote its Parquet before the commit, so
+    /// a file naming a row id this commit minted is refused rather than
+    /// counted in both places.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the table is not live or a file's
     /// column statistics name a column that is not.
-    /// Returns [`Error::Constraint`] if this transaction also inlined into
-    /// the table (the new chunk would survive the drain while its rows were
-    /// also written to a file), if a file's backdated snapshot is not below
-    /// this commit's, or if a file's row-id range runs past the ids the
-    /// table has allocated.
+    /// Returns [`Error::Constraint`] if a file's backdated snapshot is not
+    /// below this commit's, or if a file's row-id range runs past the ids
+    /// the table had allocated when this commit began.
     pub fn flush_inlined_data(
         &mut self,
         table: TableId,
@@ -1957,19 +2118,12 @@ impl Transaction {
         flushed: &[FlushedDataFile],
     ) -> Result<Vec<DataFileId>> {
         self.live_table(table)?;
-        if self.inline_ops.iter().any(
-            |op| matches!(op, InlineStage::Insert { table_id, .. } if *table_id == table.get()),
-        ) {
-            return Err(Error::Constraint(format!(
-                "flush_inlined_data on table {table} in the same commit that inlined into it; \
-                 the drain reads the store as it stood before this commit"
-            )));
-        }
 
         let tstat = self.live_table_stats(table)?;
+        let ceiling = self.inherited_row_ids(table, &tstat);
         let mut ids = Vec::with_capacity(flushed.len());
         for flush in flushed {
-            ids.push(self.register_flushed_file(table, flush, tstat.next_row_id)?);
+            ids.push(self.register_flushed_file(table, flush, ceiling)?);
         }
 
         self.inline_ops.push(InlineStage::Flush {
@@ -1986,16 +2140,26 @@ impl Transaction {
 
     /// Registers one flushed file: row ids preserved, record backdated, and
     /// only the file's bytes folded into the table's statistics.
+    /// `inherited_row_ids` is the ceiling its rows must stay under.
     fn register_flushed_file(
         &mut self,
         table: TableId,
         flush: &FlushedDataFile,
-        allocated_row_ids: u64,
+        inherited_row_ids: u64,
     ) -> Result<DataFileId> {
         if flush.begin_snapshot.get() >= self.new_snapshot_id {
             return Err(Error::Constraint(format!(
                 "flush_inlined_data: file {} is backdated to snapshot {}, which is not below \
                  this commit's {} — the rows it carries were inlined before it",
+                flush.file.path, flush.begin_snapshot, self.new_snapshot_id
+            )));
+        }
+        if let Some(partial_max) = flush.partial_max
+            && !(flush.begin_snapshot..SnapshotId::new(self.new_snapshot_id)).contains(&partial_max)
+        {
+            return Err(Error::Constraint(format!(
+                "flush_inlined_data: file {}'s partial_max {partial_max} is outside the \
+                 snapshots its rows were inlined at ({} to below {})",
                 flush.file.path, flush.begin_snapshot, self.new_snapshot_id
             )));
         }
@@ -2008,16 +2172,17 @@ impl Transaction {
                     flush.file.path
                 ))
             })?;
-        if end > allocated_row_ids {
+        if end > inherited_row_ids {
             return Err(Error::Constraint(format!(
-                "flush_inlined_data: file {} covers row ids up to {end}, past the {allocated_row_ids} \
-                 table {table} has allocated",
+                "flush_inlined_data: file {} covers row ids up to {end}, past the \
+                 {inherited_row_ids} table {table} had allocated when this commit began",
                 flush.file.path
             )));
         }
         for entry in &flush.file.column_stats {
             self.live_column(table, entry.column_id)?;
         }
+        let partition_id = self.resolve_file_partition(table, &flush.file.partition_values)?;
 
         let data_file_id = self.alloc_file_id();
         let tstat = self.live_table_stats(table)?;
@@ -2040,11 +2205,11 @@ impl Transaction {
             file_size_bytes: flush.file.file_size_bytes,
             footer_size: flush.file.footer_size,
             row_id_start: Some(flush.row_id_start),
-            partition_id: None,
+            partition_id,
             encryption_key: flush.file.encryption_key.clone(),
             mapping_id: None,
-            partial_max: None,
-            partition_values: vec![],
+            partial_max: flush.partial_max.map(SnapshotId::get),
+            partition_values: file_partition_values(&flush.file.partition_values),
         });
         for entry in &flush.file.column_stats {
             self.state.put_file_column_stats(FileColumnStatsValue {
@@ -2102,6 +2267,18 @@ fn path_safe_name(what: &str, name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// A file's partition values as stored records, indexed by key position.
+fn file_partition_values(values: &[String]) -> Vec<FilePartitionValue> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| FilePartitionValue {
+            partition_key_index: index as u64,
+            partition_value: value.clone(),
+        })
+        .collect()
 }
 
 fn new_column(
@@ -2472,6 +2649,7 @@ mod tests {
             file_size_bytes: rows * 10,
             footer_size: 4,
             encryption_key: None,
+            partition_values: vec![],
             column_stats: stats,
         }
     }
