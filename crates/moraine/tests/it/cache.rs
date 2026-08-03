@@ -6,7 +6,67 @@ use std::sync::Arc;
 use moraine::{Catalog, CatalogOptions, SnapshotId};
 use object_store::memory::InMemory;
 
-use crate::fixtures::{col, datafile, seeded};
+use crate::{
+    counting_store::CountingStore,
+    fixtures::{col, datafile, seeded},
+};
+
+/// A read-only handle materializes the catalog **once** and serves every
+/// later read from the cache.
+///
+/// This is the incident's shape as a test. A handle that rebuilds per read
+/// returns the right answer every time and differs only in traffic, so the
+/// assertion counts object-store reads rather than timing anything: after
+/// the first view, repeated reads must cost a bounded handful of reads —
+/// the head point read and its neighbours — not another scan of `current`.
+#[tokio::test]
+async fn a_read_only_handle_materializes_once() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..64 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(object_store));
+    let reader = Catalog::open_read_only(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // The first view is the materialization, and is allowed to read.
+    let first = reader.snapshot().await.unwrap();
+    let cold = counting.take_reads();
+    assert!(cold > 0, "a cold view read nothing");
+
+    // Every later view serves the same catalog for a small, constant cost.
+    for _ in 0..8 {
+        let view = reader.snapshot().await.unwrap();
+        assert_eq!(view.schemas().len(), first.schemas().len());
+    }
+    let warm = counting.take_reads();
+
+    assert!(
+        warm < cold,
+        "warm reads cost as much as the cold one ({warm} vs {cold}): the handle is \
+         rebuilding the catalog per read"
+    );
+}
 
 /// A second read is served from the cache after a commit moved head. It
 /// must show the commit — a cache that serves a stale head is worse than

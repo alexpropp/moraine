@@ -4,8 +4,11 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::Bound,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use object_store::{ObjectStore, path::Path};
@@ -166,6 +169,39 @@ pub struct MaintenanceReport {
     pub index_entries_reclaimed: u64,
 }
 
+/// How a handle has served its reads, for the diagnostics a slow attach
+/// needs.
+///
+/// A materialization is meant to be rare — one per handle, then the cache
+/// serves — so the count is the diagnostic: a handle reporting hundreds is
+/// rebuilding the catalog per read, which no amount of reclaiming the store
+/// would fix.
+#[derive(Debug, Default)]
+struct ReadTally {
+    materializations: AtomicU64,
+    refreshes: AtomicU64,
+    cache_hits: AtomicU64,
+    materialize_micros: AtomicU64,
+}
+
+impl ReadTally {
+    /// Records a full rebuild and reports it, with the running totals that
+    /// make one attach's behaviour legible in a log.
+    fn materialized(&self, elapsed: Duration) {
+        let count = self.materializations.fetch_add(1, Ordering::Relaxed) + 1;
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let total = self.materialize_micros.fetch_add(micros, Ordering::Relaxed) + micros;
+        info!(
+            elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+            materializations = count,
+            total_micros = total,
+            cache_hits = self.cache_hits.load(Ordering::Relaxed),
+            refreshes = self.refreshes.load(Ordering::Relaxed),
+            "materialized the catalog from `current`"
+        );
+    }
+}
+
 /// Where a store lives, for the admin-surface verbs that address it by
 /// path rather than through the open handle.
 struct StoreLocation {
@@ -286,6 +322,8 @@ pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 #[derive(Clone)]
 pub struct Catalog {
     store: Arc<Store>,
+    // Shared across handle clones: how this attach has served its reads.
+    reads: Arc<ReadTally>,
     // Where the store lives. Retained because the census and the store
     // merge reach SlateDB's admin surface, which addresses a store by path
     // rather than through an open handle.
@@ -356,6 +394,7 @@ impl Catalog {
                 path: options.path,
                 object_store: located,
             }),
+            reads: Arc::new(ReadTally::default()),
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
         })
@@ -431,6 +470,7 @@ impl Catalog {
                 path: options.path,
                 object_store: located,
             }),
+            reads: Arc::new(ReadTally::default()),
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
         })
@@ -828,8 +868,12 @@ impl Catalog {
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
         if at.is_some() {
             let session = self.begin_read().await?;
+            let started = Instant::now();
             let view = commit::materialize(session.handle(), at).await;
             session.finish();
+            if view.is_ok() {
+                self.reads.materialized(started.elapsed());
+            }
 
             return view.map(Arc::new);
         }
@@ -855,16 +899,22 @@ impl Catalog {
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
         let head = commit::read_head_value(handle).await?;
         if let Some(cached) = cached_head_view(&self.projections, &head) {
+            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
 
         if let Some(behind) = held_head_view(&self.projections)
             && let Some(refreshed) = commit::refresh(handle, &behind).await?
         {
+            self.reads.refreshes.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(refreshed));
         }
 
-        Ok(Arc::new(commit::materialize(handle, None).await?))
+        let started = Instant::now();
+        let view = commit::materialize(handle, None).await?;
+        self.reads.materialized(started.elapsed());
+
+        Ok(Arc::new(view))
     }
 
     /// Resolves an equality lookup to the rows currently holding `values`.
