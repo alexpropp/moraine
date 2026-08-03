@@ -209,6 +209,36 @@ batch — the entries are tombstoned idempotently, so only the last batch needs
 to be durable. The second lever makes batch size almost irrelevant and is the
 better fix; recorded as a follow-up in `docs/rfcs/tasks.md` under 0021.
 
+### Cold attach cost vs. physical `current` bytes
+
+The claim the store census and the store merge rest on: a cold attach scans
+`current`, reads through every superseded version those SSTs still hold, and
+so costs what the subspace *physically* weighs rather than what it lives.
+40 tables x 8 columns, the live set held identical across every row — each
+round rewrites every table's statistics and closes, superseding one record
+per table without changing what a reader sees. Median of 7 **read-only**
+attaches, a fresh handle each:
+
+| churn rounds | live keys | `current` bytes | L0 SSTs | runs | median attach |
+|---|---|---|---|---|---|
+| 0 | 402 | 21 069 | 1 | 0 | 0.94 ms |
+| 10 | 402 | 26 925 | 3 | 2 | 1.26 ms |
+| 40 | 402 | 31 447 | 5 | 3 | 1.54 ms |
+| 160 | 402 | 31 447 | 5 | 3 | 1.80 ms |
+
+Live entities never move; attach cost nearly doubles. That is the shape
+behind a 3.4 GB store serving one snapshot at a 642 s attach — the cost is
+in the dead versions, and `Catalog::compact_store` is what removes them.
+
+Two honest limits. The probes are read-only on purpose: an earlier revision
+opened a writer per repeat, whose compactor moved the state between repeats
+and produced a row whose time contradicted its own recorded manifest. And
+the last two rows share a manifest state yet differ by ~17%, so bytes and
+SST count do not explain the tail on their own — 160 close-and-reopen cycles
+leave more behind than the `current` tree alone. Scaling this to the
+gigabyte regime needs a store whose L0 flushes are reachable without writing
+64 MB per SST, which the public API cannot ask for today.
+
 ### Materialization cost vs. catalog size
 
 This is the cost of a *cold* read — one whose handle holds no cached view.

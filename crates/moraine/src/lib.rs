@@ -170,8 +170,8 @@
 //! its superseded objects itself, unprompted. A host embedding this crate
 //! calls these verbs on whatever cadence it likes — the crate spawns no
 //! threads and schedules nothing. Under the DuckDB extension, all of it is
-//! sequenced for you; see that crate's docs for `moraine_maintenance` and
-//! `moraine_store_census`.
+//! sequenced for you; see that crate's docs for `moraine_maintenance`,
+//! `moraine_store_census`, and `moraine_compact_store`.
 //!
 //! # Format migration
 //!

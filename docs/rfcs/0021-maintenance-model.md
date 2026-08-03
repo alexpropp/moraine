@@ -363,6 +363,18 @@ needs a deterministic way to run a pass without waiting on wall-clock, and
 an operator needs a way to run one before a backup or after a bulk load
 without re-attaching.
 
+**The store merge gets a trigger of its own**, `CALL
+moraine_compact_store('lake')`, taking an optional `subspace` and `timeout`.
+This is the one place a second configuration surface is worth its cost: the
+case that motivated the merge is a store that bloated once and needs merging
+once, and reaching it only through the pass would mean re-attaching a live
+application's catalog to change a maintenance option. That is not a
+configuration an operator wants to keep — it is a single action. The pass
+remains the scheduled form; both call the same core verb, so neither can
+drift from the other. Its two parameters are its own rather than a copy of
+the pass's, because the pass configures eight steps and this configures one
+merge.
+
 `CALL moraine_store_census('lake')` is a separate table function, not a
 trigger and not a step. It takes one named parameter, `live`, for the
 scanning leg, issues no SQL, mutates nothing, and is available on a
@@ -465,10 +477,21 @@ queue work nothing would run and then wait out its timeout, so it refuses
 with `Constraint`, like every other write-path verb.
 
 A tree with no compacted sorted runs is reported skipped rather than failed —
-what `Full` does silently, and what a store whose bulk is still in L0 will
-report. Naming such a subspace explicitly is an upstream error; the verb
-reports it the same way, so the whole-store and single-subspace forms read
-alike.
+what `Full` does silently. Naming such a subspace explicitly is an upstream
+error; the verb reports it the same way, so the whole-store and
+single-subspace forms read alike.
+
+**A store whose bulk sits in L0 is skipped, and that is the answer**, not a
+gap. L0 holds what recent flushes wrote, so a tree with bytes there and no
+sorted runs has never been compacted at all — the size-tiered scheduler has
+not yet fired, and it will as soon as the tier fills. Merging L0 here would
+mean moraine choosing sources, which is the policy line this design draws,
+and it would claim those SSTs for the duration of the merge, stalling the
+writer once L0 reached `l0_max_ssts`. The census already tells the operator
+which case they are in — `l0_ssts` against `sorted_runs`, per subspace — so
+a skip is legible rather than mysterious. The store this design exists for
+is the opposite shape: bytes long since merged into runs the scheduler will
+never revisit because the writes stopped.
 
 ### The store census
 

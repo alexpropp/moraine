@@ -739,6 +739,97 @@ fn maintenance_merges_the_store_when_configured() {
     );
 }
 
+/// The store merge has a trigger of its own, so merging once needs no
+/// re-attach: it reports a row per subspace, refuses a name it does not
+/// know, and moves nothing a query can observe.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn compact_store_merges_on_demand() {
+    let store = TempDir::new("compact-now-store");
+    let data = TempDir::new("compact-now-data");
+
+    // No MAINTENANCE_* option anywhere: the point of the trigger is that a
+    // one-off merge needs no attach-time configuration.
+    let rows = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(50) t(i);\
+         SELECT subspace, outcome FROM moraine_compact_store('lake') ORDER BY subspace;",
+    ));
+    let names: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+    for subspace in ["current", "history", "index", "snapshot"] {
+        assert!(names.contains(&subspace), "no `{subspace}` row: {rows:?}");
+    }
+    // A store this small has no sorted runs, so every tree is skipped —
+    // reported rather than omitted, so two calls stay comparable.
+    assert!(
+        rows.iter().all(|row| row[1] == "skipped"),
+        "unexpected outcome: {rows:?}"
+    );
+
+    // Narrowing to one subspace reports only that one.
+    let one = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT subspace FROM moraine_compact_store('lake', subspace := 'current');",
+    ));
+    assert_eq!(one, vec![vec!["current".to_string()]]);
+
+    let unknown = run_ducklake_sql_expect_err(
+        store.path(),
+        data.path(),
+        "SELECT * FROM moraine_compact_store('lake', subspace := 'gcfile');",
+    );
+    assert!(
+        unknown.contains("no subspace named") && unknown.contains("current"),
+        "got: {unknown}"
+    );
+
+    // The merge mints no snapshot and moves no rows.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT count(*), sum(a) FROM lake.main.t;"
+        )),
+        vec![vec!["50".to_string(), "1225".to_string()]]
+    );
+}
+
+/// The merge runs inside the writer, so a read-only attach refuses it
+/// while still serving the census.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn compact_store_refuses_a_read_only_attach() {
+    let store = TempDir::new("compact-ro-store");
+    let data = TempDir::new("compact-ro-data");
+
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT); INSERT INTO lake.main.t VALUES (1);",
+    );
+
+    // The census serves a reader; the merge does not.
+    let census = csv_rows(&run_ducklake_read_only_sql(
+        store.path(),
+        data.path(),
+        "SELECT count(*) FROM moraine_store_census('lake');",
+    ));
+    assert!(census[0][0].parse::<usize>().expect("a count") > 0);
+
+    let refused = run_ducklake_read_only_sql_expect_err(
+        store.path(),
+        data.path(),
+        "SELECT * FROM moraine_compact_store('lake');",
+    );
+    assert!(
+        refused.contains("read-only") && refused.contains("writer"),
+        "got: {refused}"
+    );
+}
+
 /// A merge step disabled while one of its own parameters is supplied is
 /// two contradictory instructions, and fails at bind rather than
 /// resolving silently.

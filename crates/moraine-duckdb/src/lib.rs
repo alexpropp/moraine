@@ -53,7 +53,8 @@
 //! at `ATTACH`, through `META_MAINTENANCE_*` options; an interval starts a
 //! timer thread that runs the same pass unattended, and
 //! `moraine_maintenance_status` serves the recent passes so an unattended
-//! failure stays visible.
+//! failure stays visible. `moraine_compact_store` runs the merge alone, for
+//! a store that needs it once rather than on a cadence.
 //!
 //! `CALL moraine_store_census('lake')` measures the store itself rather
 //! than the lake: one row per keyspace subspace, carrying physical bytes,
@@ -69,13 +70,15 @@
 //! SELECT subspace, bytes, sorted_runs FROM moraine_store_census('lake')
 //! ORDER BY bytes DESC;
 //!
-//! -- Reclaim it: merge each subspace's sorted runs into one.
+//! -- Reclaim it, once, without re-attaching.
+//! SELECT * FROM moraine_compact_store('lake', timeout := INTERVAL 10 MINUTES);
+//!
+//! -- ...or on a cadence, as step 8 of the maintenance pass.
 //! ATTACH 'ducklake:moraine:s3://bucket/catalog' AS lake (
 //!   DATA_PATH 's3://bucket/data',
-//!   META_MAINTENANCE_COMPACT_STORE true,
-//!   META_MAINTENANCE_COMPACT_STORE_TIMEOUT INTERVAL 10 MINUTES
+//!   META_MAINTENANCE_INTERVAL INTERVAL 1 HOUR,
+//!   META_MAINTENANCE_COMPACT_STORE true
 //! );
-//! SELECT step, status, detail FROM moraine_maintenance('lake');
 //! ```
 //!
 //! # Diagnostics

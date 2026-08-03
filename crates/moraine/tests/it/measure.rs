@@ -24,8 +24,8 @@ use std::{
 };
 
 use moraine::{
-    Catalog, CatalogOptions, ColumnId, DataFile, FileIndexEntry, IndexDef, IndexEntry,
-    IndexKeyValue, IntWidth, MaintenanceRequest,
+    Catalog, CatalogOptions, CensusRequest, ColumnId, DataFile, FileIndexEntry, IndexDef,
+    IndexEntry, IndexKeyValue, IntWidth, MaintenanceRequest, SubspaceName,
 };
 use object_store::{
     memory::InMemory,
@@ -54,6 +54,15 @@ impl Stats {
             max_ms: ms(samples[samples.len() - 1]),
         }
     }
+}
+
+/// A read-only handle: it opens no writer, so it neither fences nor runs a
+/// compactor that would move the state a measurement is holding still.
+#[allow(clippy::unwrap_used)]
+async fn open_reader(store: Arc<InMemory>) -> Catalog {
+    Catalog::open_read_only(store, CatalogOptions::default())
+        .await
+        .unwrap()
 }
 
 #[allow(clippy::unwrap_used)]
@@ -148,6 +157,121 @@ async fn measure_materialization_by_catalog_size() {
         println!(
             "{tables:>7}  {entities:>10}  {:>11.3}  {:>9.3}  {:>9.3}  {us_per_1k:>12.1}",
             stats.median_ms, stats.min_ms, stats.max_ms
+        );
+    }
+    println!();
+}
+
+/// 0021 — cold attach cost against the physical bytes `current` holds.
+///
+/// The claim the store census and the store merge rest on: a cold attach
+/// scans `current`, and it reads through every superseded version those
+/// SSTs still hold, so its cost tracks the subspace's *physical* size
+/// rather than its live entity count. This sweep holds the live catalog
+/// fixed and rewrites it, so live entities are constant across every row
+/// and only the dead fraction grows.
+///
+/// A merge is what collapses those bytes back down (`store::compaction`
+/// pins that it does); this measures what they cost while they stand.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_attach_cost_by_dead_fraction() {
+    const TABLES: usize = 40;
+    const COLS_PER_TABLE: usize = 8;
+    const REPEATS: usize = 7;
+    // Each round rewrites every table's statistics, superseding one
+    // `current` record per table without changing what is live.
+    let rounds = [0usize, 10, 40, 160];
+
+    println!("\n# 0021 cold attach vs. physical `current` bytes (in-memory object_store)");
+    println!(
+        "# {TABLES} tables x {COLS_PER_TABLE} columns, live entities held constant; \
+         each round rewrites every table's stats\n"
+    );
+    println!(
+        "{:>7}  {:>10}  {:>14}  {:>8}  {:>5}  {:>11}  {:>9}",
+        "rounds", "live_keys", "current_bytes", "l0_ssts", "runs", "median_ms", "max_ms"
+    );
+
+    for &rounds in &rounds {
+        let store = Arc::new(InMemory::new());
+        let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+
+        let columns: Vec<_> = (0..COLS_PER_TABLE).map(|c| col(&format!("c{c}"))).collect();
+        let mut tables = Vec::with_capacity(TABLES);
+        for t in 0..TABLES {
+            let columns = columns.clone();
+            let made = std::cell::Cell::new(None);
+            catalog
+                .commit(|tx| {
+                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                    made.set(Some(tx.create_table(schema, &format!("t{t}"), &columns)?));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            tables.push(made.get().unwrap());
+        }
+
+        catalog.close().await.unwrap();
+
+        // Churn: each round supersedes one `current` record per table, and
+        // closes so the memtable is written out. Without the close the
+        // superseded versions stay in memory, never reach an SST, and the
+        // physical size this measures does not move — the first run of this
+        // harness reported exactly that flat line.
+        for round in 0..rounds {
+            let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+            let batch = tables.clone();
+            catalog
+                .commit(move |tx| {
+                    for &table in &batch {
+                        tx.update_table_stats(table, 100 + round as u64, 4_096)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+        }
+
+        // What `current` weighs, live and physical, from the census itself
+        // — read-only, so measuring the store does not compact it.
+        let probe = open_reader(store.clone()).await;
+        let mut request = CensusRequest::default();
+        request.count_live_entries = true;
+        let census = probe.store_census(request).await.unwrap();
+        let current = census
+            .subspaces
+            .iter()
+            .find(|s| s.subspace == SubspaceName::Current)
+            .expect("current is always reported");
+        let live_keys = current.live.expect("the scanning leg was requested").keys;
+        let bytes = current.bytes;
+        let l0_ssts = current.l0_ssts;
+        let runs = current.sorted_runs;
+        probe.close().await.unwrap();
+
+        // A fresh handle per repeat: a warm one serves from the cache and
+        // would report a cold attach as free. Read-only, for two reasons —
+        // it is the attach shape the incident this measures came from, and
+        // a writer starts a compactor that would perturb the very state
+        // being measured between repeats.
+        let mut samples = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let probe = open_reader(store.clone()).await;
+            let start = Instant::now();
+            let view = probe.snapshot().await.unwrap();
+            samples.push(start.elapsed());
+            std::hint::black_box(&view);
+            probe.close().await.unwrap();
+        }
+
+        let stats = Stats::of(samples);
+        println!(
+            "{rounds:>7}  {live_keys:>10}  {bytes:>14}  {l0_ssts:>8}  {runs:>5}  {:>11.3}  {:>9.3}",
+            stats.median_ms, stats.max_ms
         );
     }
     println!();

@@ -602,6 +602,154 @@ void MaintenanceImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, 
 	output.SetCardinality(count);
 }
 
+// moraine_compact_store: step 8 on its own, for a store that needs
+// merging once rather than on a cadence. The pass is the scheduled form;
+// this is the form an operator reaches for after a census says where the
+// weight is, without re-attaching a live application's catalog.
+
+struct CompactBindData : public duckdb::FunctionData {
+	std::string catalog_name;
+	// Empty merges every subspace holding sorted runs.
+	std::string subspace;
+	// Zero returns as soon as the merges are submitted.
+	uint64_t timeout_ms = 0;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<CompactBindData>();
+		*result = *this;
+		return std::move(result);
+	}
+	bool Equals(const duckdb::FunctionData &other_p) const override {
+		auto &other = other_p.Cast<CompactBindData>();
+		return catalog_name == other.catalog_name && subspace == other.subspace &&
+		       timeout_ms == other.timeout_ms;
+	}
+};
+
+// One merged subspace. Held on the global state rather than the bind
+// data: these are what this run did, and bind data is shared and const.
+struct CompactRow {
+	std::string subspace;
+	std::string outcome;
+	std::string detail;
+	uint64_t bytes_before;
+	bool has_bytes_after;
+	uint64_t bytes_after;
+};
+
+duckdb::unique_ptr<duckdb::FunctionData> CompactBind(duckdb::ClientContext &,
+                                                     duckdb::TableFunctionBindInput &input,
+                                                     duckdb::vector<duckdb::LogicalType> &return_types,
+                                                     duckdb::vector<duckdb::string> &names) {
+	auto bind_data = duckdb::make_uniq<CompactBindData>();
+	if (input.inputs[0].IsNull()) {
+		throw duckdb::BinderException("moraine_compact_store: the lake name must not be NULL");
+	}
+	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+
+	auto subspace = input.named_parameters.find("subspace");
+	if (subspace != input.named_parameters.end() && !subspace->second.IsNull()) {
+		bind_data->subspace = subspace->second.GetValue<std::string>();
+		// Checked here for the same reason the attach option is: a name
+		// this build does not know names no tree, so there is nothing to
+		// merge and nothing sensible to report.
+		if (!moraine_subspace_is_known(bind_data->subspace.c_str())) {
+			auto known = moraine_subspace_names();
+			std::string list = known != nullptr ? std::string(known) : "";
+			if (known != nullptr) {
+				moraine_error_free(known);
+			}
+			throw duckdb::BinderException("moraine_compact_store: no subspace named \"%s\"; known subspaces "
+			                              "are: %s",
+			                              bind_data->subspace, list);
+		}
+	}
+
+	auto timeout = input.named_parameters.find("timeout");
+	if (timeout != input.named_parameters.end() && !timeout->second.IsNull()) {
+		if (timeout->second.type().id() == duckdb::LogicalTypeId::INTERVAL) {
+			auto interval = timeout->second.GetValue<duckdb::interval_t>();
+			bind_data->timeout_ms = static_cast<uint64_t>(duckdb::Interval::GetMicro(interval) / 1000);
+		} else {
+			bind_data->timeout_ms = timeout->second.GetValue<uint64_t>() * 1000;
+		}
+		if (bind_data->timeout_ms == 0) {
+			throw duckdb::BinderException("moraine_compact_store: timeout must be a positive duration");
+		}
+	}
+
+	using duckdb::LogicalType;
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
+	                LogicalType::UBIGINT};
+	names = {"subspace", "outcome", "detail", "bytes_before", "bytes_after"};
+	return std::move(bind_data);
+}
+
+struct CompactGlobalState : public duckdb::GlobalTableFunctionState {
+	std::vector<CompactRow> rows;
+	duckdb::idx_t offset = 0;
+	duckdb::idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+// The merge is submitted once, at execution start — not at bind, which
+// planning may repeat.
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> CompactInitGlobal(duckdb::ClientContext &context,
+                                                                       duckdb::TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<CompactBindData>();
+	auto &catalog = ResolveMoraineCatalog(context, bind_data.catalog_name);
+	if (catalog.GetAttached().IsReadOnly()) {
+		// Submitting needs no writer, but executing does: the compactor
+		// that promotes a submission runs inside the writer, so a reader
+		// would queue work nothing would run and then wait it out.
+		throw duckdb::CatalogException(
+		    "moraine_compact_store: \"%s\" is attached read-only; the merge runs inside the writer",
+		    bind_data.catalog_name);
+	}
+
+	OwnedArray<MoraineSubspaceMerge> merges(moraine_compact_store_free);
+	MoraineError err {};
+	auto code = moraine_compact_store(catalog.Handle(), bind_data.subspace.empty() ? nullptr
+	                                                                               : bind_data.subspace.c_str(),
+	                                  bind_data.timeout_ms, merges.OutItems(), merges.OutLen(),
+	                                  moraine_shim_is_interrupted, &context, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+
+	auto state = duckdb::make_uniq<CompactGlobalState>();
+	for (auto &merge : merges) {
+		state->rows.push_back({std::string(merge.subspace), std::string(merge.outcome),
+		                       merge.detail != nullptr ? std::string(merge.detail) : std::string(),
+		                       merge.bytes_before, merge.has_bytes_after, merge.bytes_after});
+	}
+	return std::move(state);
+}
+
+void CompactImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &state = data.global_state->Cast<CompactGlobalState>();
+	if (state.offset >= state.rows.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, state.rows.size() - state.offset);
+	for (duckdb::idx_t i = 0; i < count; i++) {
+		auto &row = state.rows[state.offset + i];
+		output.SetValue(0, i, duckdb::Value(row.subspace));
+		output.SetValue(1, i, duckdb::Value(row.outcome));
+		output.SetValue(2, i, duckdb::Value(row.detail));
+		output.SetValue(3, i, duckdb::Value::UBIGINT(row.bytes_before));
+		// NULL rather than zero unless the merge committed: a subspace
+		// that reclaimed nothing and one that never ran differ.
+		output.SetValue(4, i,
+		                row.has_bytes_after ? duckdb::Value::UBIGINT(row.bytes_after)
+		                                    : duckdb::Value(duckdb::LogicalType::UBIGINT));
+	}
+	state.offset += count;
+	output.SetCardinality(count);
+}
+
 } // namespace
 
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
@@ -612,6 +760,12 @@ void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
 	duckdb::TableFunction status("moraine_maintenance_status", {duckdb::LogicalType::VARCHAR}, MaintenanceImpl,
 	                             StatusBind, MaintenanceInitGlobal);
 	loader.RegisterFunction(status);
+
+	duckdb::TableFunction compact("moraine_compact_store", {duckdb::LogicalType::VARCHAR}, CompactImpl,
+	                              CompactBind, CompactInitGlobal);
+	compact.named_parameters["subspace"] = duckdb::LogicalType::VARCHAR;
+	compact.named_parameters["timeout"] = duckdb::LogicalType::ANY;
+	loader.RegisterFunction(compact);
 }
 
 } // namespace moraine_duckdb

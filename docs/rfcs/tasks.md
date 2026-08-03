@@ -300,22 +300,15 @@ deliberately not itemized here.
   sequence today.
 - **DEFERRED** — Collapse the batched sweep into one range-delete per dead
   index if SlateDB exposes a range delete. Shared with 0016.
-- **DECISION** — Whether the store merge deserves an on-demand trigger of
-  its own. It is reachable only through a pass today, so merging once
-  against a lake whose attach did not configure step 8 means re-attaching.
-  The census has a function; the merge deliberately does not, on the
-  argument that a one-off merge is rare and re-attaching is cheap.
-- **MEASURE** — Attach cost against `current`-subspace physical bytes,
-  before and after a merge, on a store churned into a large dead fraction.
-  The 642 s production attach is the only data point and it has no
-  controlled counterpart.
-- **DEFERRED** — File or pursue an upstream SlateDB compact-now-and-wait
-  completion signal, so step 8 can stop polling `read_compaction`.
-- **DECISION** — Whether a store whose bulk sits in L0 rather than in sorted
-  runs deserves better than `skipped`. A full-tree plan excludes L0 by
-  upstream design, so such a store gets a correct report and no reclaim.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
+- **MEASURE** — Cold attach cost in the gigabyte regime. The shape is
+  measured and recorded (`BENCHMARK.md` -> Cold attach cost vs. physical
+  `current` bytes: cost nearly doubles while live entities hold constant),
+  which is the claim the merge rests on. What it cannot reach is the scale
+  the production incident sat at, because forcing L0 flushes through the
+  public API means writing 64 MB per SST; closing the gap needs either a
+  real bloated store or an `l0_sst_size` knob on `CatalogOptions`.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.

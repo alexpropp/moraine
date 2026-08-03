@@ -608,6 +608,31 @@ pub fn run_ducklake_read_only_sql(store_dir: &Path, data_path: &Path, sql: &str)
     assert_session_ok(output, "read-only ducklake attach", sql)
 }
 
+/// As [`run_ducklake_read_only_sql`], but for a statement that must fail
+/// on a reader: returns the CLI's combined output for the caller to assert
+/// on.
+pub fn run_ducklake_read_only_sql_expect_err(
+    store_dir: &Path,
+    data_path: &Path,
+    sql: &str,
+) -> String {
+    let output = run_session(
+        &Attach::Moraine {
+            store_dir,
+            data_path,
+            options: "",
+            read_only: true,
+        },
+        sql,
+    );
+    assert!(
+        !output.status.success(),
+        "`{sql}` unexpectedly succeeded on a read-only attach:\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    combined_output(&output)
+}
+
 /// As [`run_ducklake_sql`], but returns combined stdout+stderr without
 /// asserting success — for statements expected to raise a moraine error.
 pub fn run_ducklake_sql_capturing(store_dir: &Path, data_path: &Path, sql: &str) -> String {
