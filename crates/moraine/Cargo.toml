@@ -31,10 +31,12 @@ protox = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+moraine-wal = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

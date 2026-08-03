@@ -290,6 +290,72 @@ pub(crate) async fn materialize_slot_view_at(
     outcome
 }
 
+/// Resolves whether `transaction_id` committed, and at which snapshot: the
+/// folded snapshot records above `floor`, then the unfolded tail. A hole in
+/// the scanned tail surfaces as [`Error::Corruption`] rather than a false
+/// `None` — reporting a possibly-committed transaction absent is the one wrong
+/// answer.
+///
+/// The reader is opened at the current manifest, so a just-folded snapshot
+/// record the handle's shared reader has not yet polled is still seen.
+pub(crate) async fn transaction_outcome(
+    store: &SlotStore,
+    transaction_id: [u8; 16],
+    floor: u64,
+) -> Result<Option<u64>> {
+    let reader = reopen_reader(store).await?;
+    let handle = ReadHandle::Reader(&reader);
+
+    let outcome = async {
+        if let Some(snapshot_id) =
+            read::snapshot_of_transaction(handle, floor, &transaction_id).await?
+        {
+            return Ok(Some(snapshot_id));
+        }
+
+        let fold = fold_cursor(handle).await?;
+        match store
+            .slots
+            .find_transaction(fold.saturating_add(1), transaction_id)
+            .await?
+        {
+            Some(sequence) => Ok(Some(
+                tail_minted_snapshot(&store.slots, sequence, transaction_id).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+    .await;
+
+    release_reader(Some(&reader)).await;
+    outcome
+}
+
+/// The snapshot a committed transaction minted, read from the slot the tail
+/// scan found it in: the carrying commit's validated head plus one.
+async fn tail_minted_snapshot(
+    slots: &SlotLog,
+    sequence: u64,
+    transaction_id: [u8; 16],
+) -> Result<u64> {
+    let envelope = slots.read_slot(sequence).await?.ok_or_else(|| {
+        Error::Corruption(format!(
+            "slot {sequence} carried a transaction on the tail scan but reads absent"
+        ))
+    })?;
+
+    envelope
+        .commits
+        .iter()
+        .find(|commit| commit.transaction_id == transaction_id)
+        .map(|commit| commit.payload.validated_head.saturating_add(1))
+        .ok_or_else(|| {
+            Error::Corruption(format!(
+                "slot {sequence} was reported to carry a transaction it does not hold"
+            ))
+        })
+}
+
 /// Replays the tail, telling a truncated prefix this reader is behind from a
 /// destroyed slot. A hole is never served as a head: continuing past it would
 /// hide committed state and let the next committer re-win that sequence.
@@ -1009,6 +1075,106 @@ mod tests {
         );
         let bootstrapped = second.snapshot_at(SnapshotId::new(0)).await.unwrap();
         assert_eq!(bootstrapped.schemas().len(), 1);
+    }
+
+    /// A committing transaction resolves to the snapshot it minted straight
+    /// from the unfolded tail — no fold has run — and one that never raced a
+    /// slot is definitively absent.
+    #[tokio::test]
+    async fn transaction_outcome_resolves_an_unfolded_tail_hit() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = bootstrap(Arc::clone(&object_store)).await;
+        store
+            .slots
+            .put_slot(1, &schema_slot(7, 1, "sales", 0))
+            .await
+            .unwrap();
+
+        let landed = transaction_outcome(&store, [7; 16], 0).await.unwrap();
+        assert_eq!(landed, Some(1));
+
+        let absent = transaction_outcome(&store, [9; 16], 0).await.unwrap();
+        assert_eq!(absent, None);
+    }
+
+    /// A committed-and-folded transaction resolves from its snapshot record
+    /// above the floor. A floor at the transaction's own snapshot excludes it
+    /// — the false-safe `None` a caller avoids by passing a floor at or below
+    /// the head the attempt validated against.
+    #[tokio::test]
+    async fn transaction_outcome_resolves_a_folded_hit_above_the_floor() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = bootstrap(Arc::clone(&object_store)).await;
+        seed_folded_snapshot(&object_store, &store.options, 3, [5; 16], 3).await;
+
+        assert_eq!(
+            transaction_outcome(&store, [5; 16], 2).await.unwrap(),
+            Some(3)
+        );
+        assert_eq!(transaction_outcome(&store, [5; 16], 3).await.unwrap(), None);
+    }
+
+    /// A hole below the searched-for transaction cannot rule it out, so the
+    /// scan surfaces [`Error::Corruption`] rather than a false `None`.
+    #[tokio::test]
+    async fn transaction_outcome_surfaces_a_tail_hole_as_corruption() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = bootstrap(Arc::clone(&object_store)).await;
+        store
+            .slots
+            .put_slot(1, &schema_slot(1, 1, "sales", 0))
+            .await
+            .unwrap();
+        // Slot 2 was destroyed; slot 3 exists above the hole.
+        store
+            .slots
+            .put_slot(3, &schema_slot(3, 3, "archive", 2))
+            .await
+            .unwrap();
+
+        let err = transaction_outcome(&store, [3; 16], 0).await.unwrap_err();
+        assert!(matches!(err, Error::Corruption(_)), "{err}");
+    }
+
+    /// Writes one snapshot record carrying `transaction_id` straight into the
+    /// folded store and advances the fold cursor, the state a completed fold
+    /// leaves — so a folded hit can be resolved before a fold implementation
+    /// lands.
+    async fn seed_folded_snapshot(
+        object_store: &Arc<dyn ObjectStore>,
+        options: &CatalogOptions,
+        snapshot_id: u64,
+        transaction_id: [u8; 16],
+        through: u64,
+    ) {
+        let db = StoreBuilder::new(&options.path, Arc::clone(object_store))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(slatedb::IsolationLevel::Snapshot).await.unwrap();
+        tx.put(
+            Key::Snapshot { snapshot_id }.encode(),
+            value::encode_value(&proto::SnapshotValue {
+                snapshot_id,
+                transaction_id: Some(transaction_id.to_vec()),
+                ..proto::SnapshotValue::default()
+            }),
+        )
+        .unwrap();
+        tx.put(
+            Key::Sys(SysKey::Head).encode(),
+            value::encode_value(&proto::HeadValue { snapshot_id }),
+        )
+        .unwrap();
+        tx.put(
+            Key::Sys(SysKey::Fold).encode(),
+            value::encode_value(&moraine_wal::FoldValue {
+                folded_sequence: through,
+            }),
+        )
+        .unwrap();
+        tx.commit_with_options(&commit::durable()).await.unwrap();
+        db.close().await.unwrap();
     }
 
     /// Reopens the store's reader against the current manifest, so a test sees

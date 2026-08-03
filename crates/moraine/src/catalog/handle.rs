@@ -1857,6 +1857,36 @@ impl Catalog {
         let Store::Slots(store) = self.store.as_ref();
         store.coalescer.commit(store, &f).await
     }
+
+    /// Resolves whether `transaction_id` committed, and at which snapshot: the
+    /// exactly-once recovery surface for a committer that crashed mid-commit
+    /// and must not double-apply. Scans the unfolded slot tail and the folded
+    /// snapshot records above `floor`.
+    ///
+    /// `Some(snapshot)` is the snapshot the transaction committed at. `None`
+    /// means the commit never landed and a retry is safe — but only when
+    /// `floor` is at or below the head the original attempt validated against
+    /// and no truncation has passed it; a `floor` above the truncation horizon
+    /// could yield a false `None`. Both scans are bounded by truncation
+    /// retention and slot expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if the scanned tail has a hole below the
+    /// transaction — a possibly-committed transaction cannot be ruled out past
+    /// a destroyed slot — or a store error if a scan fails.
+    pub async fn transaction_outcome(
+        &self,
+        transaction_id: uuid::Uuid,
+        floor: SnapshotId,
+    ) -> Result<Option<SnapshotId>> {
+        let Store::Slots(store) = self.store.as_ref();
+        Ok(
+            slot_commit::transaction_outcome(store, transaction_id.into_bytes(), floor.get())
+                .await?
+                .map(SnapshotId::new),
+        )
+    }
 }
 
 /// Maps a value window onto the byte bounds one index scan answers, refusing

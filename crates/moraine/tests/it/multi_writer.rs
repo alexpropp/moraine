@@ -501,6 +501,56 @@ async fn a_cancelled_leader_hands_off_and_keeps_the_handle_live() {
     assert!(snapshot.schema_by_name("leader").is_none());
 }
 
+/// A coalesced commit's ambiguous outcome resolves through the public
+/// recovery surface: its transaction id, read back from the shared multi-commit
+/// envelope, resolves to the snapshot it minted — the exactly-once answer a
+/// crashed committer needs — while a transaction that never committed resolves
+/// to a definitive `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coalesced_commits_id_resolves_via_transaction_outcome() {
+    use moraine_wal::SlotLog;
+    use uuid::Uuid;
+
+    let store = Arc::new(InMemory::new());
+    let mut options = CatalogOptions::default();
+    options.commit_batch_window = Duration::from_millis(80);
+    let catalog = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, options).await;
+
+    // Three commits joined into one batch coalesce into a single shared
+    // envelope.
+    let (r0, r1, r2) = tokio::join!(
+        catalog.commit(|tx| tx.create_schema("c0").map(|_| ())),
+        catalog.commit(|tx| tx.create_schema("c1").map(|_| ())),
+        catalog.commit(|tx| tx.create_schema("c2").map(|_| ())),
+    );
+    r0.unwrap();
+    r1.unwrap();
+    r2.unwrap();
+
+    // The shared envelope carries every member's transaction id.
+    let slots = SlotLog::new(store.clone() as Arc<dyn ObjectStore>, "");
+    let envelope = slots.read_slot(1).await.unwrap().expect("the batch's slot");
+    assert!(
+        envelope.commits.len() > 1,
+        "the commits coalesced into one envelope"
+    );
+
+    let member = &envelope.commits[1];
+    let id = Uuid::from_bytes(member.transaction_id);
+    let expected = SnapshotId::new(member.payload.validated_head + 1);
+    let resolved = catalog
+        .transaction_outcome(id, SnapshotId::new(0))
+        .await
+        .unwrap();
+    assert_eq!(resolved, Some(expected));
+
+    let unknown = catalog
+        .transaction_outcome(Uuid::from_bytes([0xAB; 16]), SnapshotId::new(0))
+        .await
+        .unwrap();
+    assert_eq!(unknown, None);
+}
+
 /// Once a read has materialized the head, further reads within the refresh
 /// window serve the cached head: no `current`-scan GETs and no slot listing.
 /// This is the whole point of the cache — a repeated `snapshot()` used to pay

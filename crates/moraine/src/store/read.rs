@@ -197,6 +197,33 @@ pub(crate) async fn read_snapshot(
     read_singleton(handle, Key::Snapshot { snapshot_id }).await
 }
 
+/// The snapshot id a transaction committed at, scanning the snapshot subspace
+/// ascending from `floor + 1` for the record carrying `transaction_id`; `None`
+/// when no record above `floor` carries it. Forward-only: transaction ids are
+/// unique, so the first match settles it.
+pub(crate) async fn snapshot_of_transaction(
+    handle: ReadHandle<'_>,
+    floor: u64,
+    transaction_id: &[u8],
+) -> Result<Option<u64>> {
+    let prefix = subspace_prefix(Subspace::Snapshot);
+    let start = Key::Snapshot {
+        snapshot_id: floor.saturating_add(1),
+    }
+    .encode();
+    let suffix = start[prefix.len()..].to_vec();
+
+    let mut iter = handle.scan_prefix(prefix, suffix..).await?;
+    while let Some(entry) = iter.next().await? {
+        let snapshot: SnapshotValue = value::decode_value(&entry.value)?;
+        if snapshot.transaction_id.as_deref() == Some(transaction_id) {
+            return Ok(Some(snapshot.snapshot_id));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Decodes one entry of a `ducklake_snapshot` scan.
 fn extract_snapshot(key: Key, bytes: &[u8]) -> Result<SnapshotValue> {
     match key {
