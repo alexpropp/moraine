@@ -29,6 +29,7 @@ mod ddl;
 mod index;
 mod inline;
 mod maintenance;
+mod multi_writer;
 mod partitioning;
 mod time_travel;
 mod types;
