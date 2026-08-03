@@ -309,6 +309,12 @@ deliberately not itemized here.
   production regime extrapolates — what is missing is only the endpoint's
   own latency term, which `object_storage.rs` needs a real bucket to see,
   exactly as the 0004 commit-latency row does.
+- **VALIDATE** — Whether a slow read attach is repeated materialization, on
+  the store that prompted this. The instrumentation exists — each rebuild
+  logs its elapsed time and the handle's running count — and the log volume
+  is the reading: one line per attach is the design, a stream of them is the
+  defect. Closed by attaching that store from a build carrying RFC 0009's
+  caching and recording what it reports.
 - **DECISION** — Whether `Catalog` is safe to drive from a multi-threaded
   tokio runtime under repeated open/close. A measurement that opened the
   catalog 161 times in a loop deadlocked with every thread parked at zero

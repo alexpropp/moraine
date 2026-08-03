@@ -20,11 +20,19 @@ computes no retention policy: **every interval and every step is configured
 at attach**, and an attach that configures nothing schedules nothing.
 
 The substrate step and its companion measurement — `moraine_store_census`,
-which reports physical bytes per subspace from the manifest alone — were
-added after a production store reached 3.4 GB of objects while serving a
-single live snapshot, with a read-only attach against it taking 642 s.
-SlateDB's own collector does not close that gap: it deletes objects nothing
+which reports what a store weighs subspace by subspace — were added after a
+production store reached 3.4 GB of objects while serving a single live
+snapshot, with a read-only attach against it taking 642 s. SlateDB's own
+collector does not close the reclamation gap: it deletes objects nothing
 references, and superseded versions inside a referenced SST are not that.
+
+**The census adjudicated that incident against the step it arrived with**,
+which is what a measurement is for. It found the store ~100% live — 3.36 GB
+of equality-index entries, 99.6% of the whole — and a full-store merge
+reclaimed 0.08%. So the merge is a standing capability for the store that
+*has* dead weight, not that store's remedy, and the census earned its keep
+by saying so before an operator spent a rewrite of the store finding out.
+The attach cost proved to be live cost, addressed by RFC 0009's caching.
 
 ## Goals
 
@@ -58,9 +66,12 @@ Non-goals:
 - **A moraine-side merge engine.** SlateDB executes; moraine submits.
 - **Repairing the read-only read path.** RFC 0009's caching and incremental
   refresh remove the *repeat* cost of a read-only read; they do not remove
-  the one full `current` materialization a cold attach pays, which is
-  proportional to the physical bytes of that subspace and is the cost step 8
-  reduces. The two are complements, and neither substitutes for the other.
+  the one full `current` materialization a cold attach pays. That
+  materialization is proportional to `current`'s **live** entities, which no
+  merge reduces — a store measured ~100% live reclaimed 0.08% — so the two
+  are complements only in the sense that they address different costs, and
+  for a slow attach RFC 0009's is usually the one that matters. Step 8
+  reduces dead bytes, and a store may have none.
 - **Checkpoint lifecycle** — an RFC 0017 / RFC 0006 concern; if it lands it
   becomes a consumer of this surface.
 
@@ -113,9 +124,22 @@ subspaces, at any level, under any compaction backlog. Reads are routed to
 the overlapping segments only (`reader.rs:156-175`, `manifest/mod.rs:756`),
 so a scan of `current` — which is all a materialization does
 (`transaction/commit.rs:396`) — opens `current`-segment SSTs and nothing
-else. Two consequences follow. Whatever the `index` subspace weighs cannot
-cost a catalog scan anything. And the manifest's per-segment sizes *are* a
-per-subspace census, available without reading the data.
+else. Two consequences follow. A subspace no materialization reads — `index`
+above all — costs a catalog **scan** nothing, whatever it weighs. And the
+manifest's per-segment sizes *are* a per-subspace census, available without
+reading the data.
+
+**Routing isolates scans; it does not isolate an attach.** The claim above is
+about the scan, and generalizing it to the whole attach would be wrong: the
+manifest lists every SST in every segment and is read whole before any
+routing applies, so an open does pay for a large subspace — through the SST
+*count* it contributes, never its bytes. That term is measured
+(`BENCHMARK.md`) at ~15 µs per SST across the store, with a sweep that grew
+`index` to 37.8 MB at a fixed SST count and saw a perfectly flat open. On a
+store carrying one L0 SST and at most one run per segment — 3.36 GB of
+`index` in a single run — it is ~0.2 ms. It would take on the order of a
+million SSTs to matter, so the isolation holds in practice while resting on
+a narrower claim than "cannot cost anything".
 
 **moraine** owns one reclamation duty and does not discharge it. RFC 0016's
 `index` subspace holds one entry per indexed row. `drop_index` ends the
