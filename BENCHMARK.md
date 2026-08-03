@@ -297,6 +297,46 @@ merge asked for straight after an attach found every tree already being
 merged by the writer's own compactor and skipped them all; adopting the
 in-flight merge instead is what makes this column mean anything.
 
+### Does a cold attach pay for the `index` subspace?
+
+A production store measured 3.364 GB in `index` — 75.6M live entries, 99.6%
+of the store — against ~13 MB across every subspace a reader touches, and
+still attached slowly. Materialization scans `current` and point-reads
+`sys`/`snapshot`, so by the segment routing nothing should read `index` at
+all. This holds the reader-visible subspaces fixed and grows `index` alone,
+timing the reader open and the first view apart so a cost names its phase.
+
+| entries | `index` bytes | index SSTs | all SSTs | manifest bytes | open | first view |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 0 | 5 | 5 KB | 0.51 ms | 0.19 ms |
+| 65 536 | 2.4 MB | 8 | 33 | 183 KB | 0.54 ms | 0.25 ms |
+| 262 144 | 9.5 MB | 20 | 45 | 1.3 MB | 0.68 ms | 0.31 ms |
+| 1 048 576 | 37.8 MB | 20 | 54 | 8.0 MB | 1.24 ms | 1.00 ms |
+
+**One channel exists, and it is small.** The manifest lists every SST in
+every segment and is read whole before any segment routing applies, so an
+open costs roughly **15 µs per SST across the whole store** — the index
+segment included. An earlier revision of this sweep grew `index` to 37.8 MB
+while holding SST count at one or two and measured a perfectly flat open,
+which is the other half of the result: it is the SST *count* that reaches
+the attach, never the bytes.
+
+The constant is what matters for sizing. Measured on the store that
+prompted this: every segment carries a single L0 SST and at most one sorted
+run, ~10 SSTs across the whole store, 3.34 GB of which sits in one `index`
+run. This term is ~0.2 ms there; it would take on the order of a million
+SSTs to cost minutes. An attach that is slow against a large `index` is
+therefore not slow *because of* it.
+
+What remains is `current`'s **live** bytes — 12.8 MB on that store — and
+what a read does with them. Materialization costs ~5-7 µs per live entity
+(below), and before RFC 0009's caching landed a read-only catalog
+rematerialized on *every* read while `dump_entities` cloned the whole record
+set per call. At ~2.4 s per rescan over the network, a 642 s attach is on the
+order of a couple of hundred rematerializations — which is what a
+population that reads the metadata tables repeatedly costs when none of them
+are cached. The lever is caching the view, not shrinking the store.
+
 ### Materialization cost vs. catalog size
 
 This is the cost of a *cold* read — one whose handle holds no cached view.

@@ -430,6 +430,129 @@ async fn measure_attach_cost_under_get_latency() {
     println!();
 }
 
+/// 0021 — does a cold attach pay for the `index` subspace it never scans?
+///
+/// A production store measured 3.364 GB in `index` (75.6M live entries)
+/// against ~13 MB across every subspace a reader touches, and still took
+/// minutes to attach read-only. Materialization scans `current` and point-
+/// reads `sys`/`snapshot`, so on the design nothing should read `index` at
+/// all — this holds the reader-visible subspaces fixed and grows `index`
+/// alone to find out whether that holds in fact.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn measure_attach_cost_by_index_size() {
+    const BATCH: u64 = 8_192;
+    const REPEATS: usize = 5;
+    let commit_ladder = [0usize, 8, 32, 128];
+
+    println!("\n# 0021 cold read-only attach vs. `index` subspace size");
+    println!("# reader-visible subspaces held fixed; only `index` grows\n");
+    println!(
+        "{:>8}  {:>11}  {:>10}  {:>9}  {:>13}  {:>9}  {:>9}",
+        "entries", "index_bytes", "index_ssts", "all_ssts", "manifest_bytes", "open_ms", "view_ms"
+    );
+
+    for &commits in &commit_ladder {
+        let store = Arc::new(InMemory::new());
+        let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+
+        let created = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, "t", &[col("a")])?;
+                let def = IndexDef {
+                    name: "idx".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                };
+                created.set(Some((table, tx.create_index(table, &def, &[])?)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (table, index) = created.get().expect("index created");
+
+        // Every commit registers one data file — one `current` row — and
+        // BATCH index entries. `current` therefore grows by one row per
+        // commit while `index` grows by thousands, which is the production
+        // store's shape in miniature.
+        catalog.close().await.unwrap();
+        for k in 0..commits {
+            let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+            let k = k as u64;
+            let entries: Vec<FileIndexEntry> = (0..BATCH)
+                .map(|ordinal| FileIndexEntry {
+                    index,
+                    ordinal,
+                    values: vec![Some(IndexKeyValue::Int {
+                        value: i128::from(k * BATCH + ordinal),
+                        width: IntWidth::I64,
+                    })],
+                })
+                .collect();
+            catalog
+                .commit(move |tx| {
+                    let file = DataFile {
+                        path: format!("f{k}.parquet"),
+                        ..datafile(BATCH)
+                    };
+                    tx.register_data_file(table, file, &entries)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+        }
+
+        let probe = open_reader(store.clone()).await;
+        let census = probe.store_census(CensusRequest::default()).await.unwrap();
+        let weight = |name: &SubspaceName| {
+            census
+                .subspaces
+                .iter()
+                .find(|s| &s.subspace == name)
+                .map_or((0, 0), |s| (s.bytes, s.l0_ssts + s.sorted_run_ssts))
+        };
+        let (index_bytes, index_ssts) = weight(&SubspaceName::Index);
+        let all_ssts: u32 = census
+            .subspaces
+            .iter()
+            .map(|s| s.l0_ssts + s.sorted_run_ssts)
+            .sum();
+        // The manifest lists every SST in every segment and is read whole
+        // on every attach, before any segment routing applies.
+        let manifest_bytes = census.objects.map_or(0, |o| o.manifest_bytes);
+        probe.close().await.unwrap();
+
+        // Open and first view are timed apart: the design says neither
+        // should touch `index`, and if one of them does this says which.
+        let mut opens = Vec::with_capacity(REPEATS);
+        let mut views = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            let probe = open_reader(store.clone()).await;
+            opens.push(start.elapsed());
+
+            let start = Instant::now();
+            let view = probe.snapshot().await.unwrap();
+            views.push(start.elapsed());
+            std::hint::black_box(&view);
+            probe.close().await.unwrap();
+        }
+
+        println!(
+            "{:>8}  {index_bytes:>11}  {index_ssts:>10}  {all_ssts:>9}  {manifest_bytes:>13}  \
+             {:>9.3}  {:>9.3}",
+            commits as u64 * BATCH,
+            Stats::of(opens).median_ms,
+            Stats::of(views).median_ms
+        );
+    }
+    println!();
+}
+
 /// 0004 — durable-commit latency versus flush interval.
 ///
 /// `Catalog::commit` awaits durability, and on the in-memory store the WAL
