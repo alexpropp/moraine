@@ -24,8 +24,8 @@ use crate::{
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            MacroValue, MappingValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
-            TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+            HeadValue, MacroValue, MappingValue, PartitionValue, SchemaValue, SnapshotValue,
+            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
         },
         read::{
             EntityRecord, read_head, scan_current_entities, scan_history_entities,
@@ -36,9 +36,7 @@ use crate::{
 
 /// The head snapshot id inside an open read session, or `None` on a
 /// store that has no head yet (mid-bootstrap).
-async fn session_head(
-    session: &crate::store::handle::ReadSession,
-) -> Result<Option<crate::store::proto::HeadValue>> {
+async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Option<HeadValue>> {
     read_head(session.handle()).await
 }
 
@@ -80,12 +78,6 @@ async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
 
-    // Read-only catalogs cache this too. They have no batch of their own to
-    // fold forward, which is why they once could not, but the head stamp
-    // decides the question without folding anything: a scan is reusable
-    // exactly while both halves of it stand. Without this a reader rescans
-    // per `dump_*` call, and populating DuckLake's metadata tables issues
-    // two dozen of them.
     let cache_at = match head {
         Some(head) => {
             if let Some(records) = projections_read(catalog).entities_at(&head) {
@@ -262,22 +254,25 @@ pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
 /// and a scan on a miss installs them for the next call.
 async fn dump_projected_current<T: Clone>(
     catalog: &Catalog,
-    read: impl Fn(&ProjectionCache, u64) -> Option<Vec<T>>,
-    install: impl Fn(&mut ProjectionCache, u64, Vec<T>),
+    read: impl Fn(&ProjectionCache, &HeadValue) -> Option<Vec<T>>,
+    install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
 
-    let cache_at = match (catalog.maintains_projections(), head) {
-        (true, Some(head)) => {
-            if let Some(rows) = read(&projections_read(catalog), head.snapshot_id) {
+    // Readers serve from this too: each of these dumps scans the whole of
+    // `current`, so rescanning per call costs a reader exactly what the
+    // entity projection costs it.
+    let cache_at = match head {
+        Some(head) => {
+            if let Some(rows) = read(&projections_read(catalog), &head) {
                 session.finish();
                 return Ok(rows);
             }
-            Some(head.snapshot_id)
+            Some(head)
         }
-        _ => None,
+        None => None,
     };
 
     let current = scan_current_entities(session.handle()).await;
@@ -344,15 +339,15 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
-    if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).snapshots_at(head.snapshot_id) {
+    if let Some(head) = head {
+        if let Some(rows) = projections_read(catalog).snapshots_at(&head) {
             session.finish();
             return Ok(rows);
         }
         let result = scan_snapshots(session.handle()).await;
         session.finish();
         let rows = result?;
-        projections_write(catalog).install_snapshots(head.snapshot_id, rows.clone());
+        projections_write(catalog).install_snapshots(head, rows.clone());
         return Ok(rows);
     }
     let result = scan_snapshots(session.handle()).await;

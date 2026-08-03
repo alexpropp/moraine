@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::{
     catalog::CatalogSnapshot,
     store::{
-        key::{CurrentKey, EntityKey, Key},
+        key::{CurrentKey, EntityKey, Key, SysKey},
         proto::{HeadValue, SnapshotValue, TableColumnStatsValue, TableStatsValue},
         read::EntityRecord,
         value,
@@ -21,8 +21,29 @@ use crate::{
 /// id they are valid at. `head: None` means not installed — serves refuse
 /// and folds skip until a fresh scan installs it.
 struct Maintained<K: Ord, V> {
-    head: Option<u64>,
+    // The whole head stamp, not the snapshot id alone. A writer folds every
+    // batch forward so an id would serve it correctly, but a reader folds
+    // nothing and can only compare what the store told it — and a
+    // maintenance batch reuses the id while changing what a scan finds.
+    head: Option<HeadValue>,
     rows: BTreeMap<K, V>,
+}
+
+/// The head record a batch wrote, if it wrote one. Every catalog batch
+/// does.
+fn head_stamp(writes: &[StagedWrite]) -> Option<HeadValue> {
+    let head_key = Key::Sys(SysKey::Head).encode();
+    writes.iter().find_map(|(key, bytes)| {
+        (key == &head_key)
+            .then_some(bytes.as_ref())
+            .flatten()
+            .and_then(|bytes| value::decode_value::<HeadValue>(bytes).ok())
+    })
+}
+
+/// Whether two head records name the same store state.
+fn same_head(a: &HeadValue, b: &HeadValue) -> bool {
+    a.snapshot_id == b.snapshot_id && a.batch_seq == b.batch_seq
 }
 
 impl<K: Ord, V> Maintained<K, V> {
@@ -33,7 +54,7 @@ impl<K: Ord, V> Maintained<K, V> {
         }
     }
 
-    fn install(&mut self, head: u64, rows: BTreeMap<K, V>) {
+    fn install(&mut self, head: HeadValue, rows: BTreeMap<K, V>) {
         self.head = Some(head);
         self.rows = rows;
     }
@@ -43,17 +64,20 @@ impl<K: Ord, V> Maintained<K, V> {
         self.rows.clear();
     }
 
-    fn advance(&mut self, new_head: u64) {
+    fn advance(&mut self, new_head: HeadValue) {
         if self.head.is_some() {
             self.head = Some(new_head);
         }
     }
 
-    fn serve(&self, expected_head: u64) -> Option<Vec<V>>
+    fn serve(&self, expected: &HeadValue) -> Option<Vec<V>>
     where
         V: Clone,
     {
-        (self.head == Some(expected_head)).then(|| self.rows.values().cloned().collect())
+        self.head
+            .as_ref()
+            .is_some_and(|head| same_head(head, expected))
+            .then(|| self.rows.values().cloned().collect())
     }
 
     /// Applies one folded write; on an undecodable put, clears — the
@@ -237,25 +261,24 @@ impl ProjectionCache {
     /// halves of the stamp, so a maintenance batch that reused the
     /// snapshot id invalidates it like any other.
     pub(crate) fn entities_at(&self, expected: &HeadValue) -> Option<Arc<Vec<EntityRecord>>> {
-        self.entities.as_ref().and_then(|(head, records)| {
-            (head.snapshot_id == expected.snapshot_id && head.batch_seq == expected.batch_seq)
-                .then(|| Arc::clone(records))
-        })
+        self.entities
+            .as_ref()
+            .and_then(|(head, records)| same_head(head, expected).then(|| Arc::clone(records)))
     }
 
-    pub(crate) fn install_snapshots(&mut self, head: u64, rows: Vec<SnapshotValue>) {
+    pub(crate) fn install_snapshots(&mut self, head: HeadValue, rows: Vec<SnapshotValue>) {
         self.snapshots
             .install(head, rows.into_iter().map(|r| (r.snapshot_id, r)).collect());
     }
 
-    pub(crate) fn install_table_stats(&mut self, head: u64, rows: Vec<TableStatsValue>) {
+    pub(crate) fn install_table_stats(&mut self, head: HeadValue, rows: Vec<TableStatsValue>) {
         self.table_stats
             .install(head, rows.into_iter().map(|r| (r.table_id, r)).collect());
     }
 
     pub(crate) fn install_table_column_stats(
         &mut self,
-        head: u64,
+        head: HeadValue,
         rows: Vec<TableColumnStatsValue>,
     ) {
         self.table_column_stats.install(
@@ -267,25 +290,29 @@ impl ProjectionCache {
     }
 
     /// Serves the snapshot projection if it is exactly at `expected_head`.
-    pub(crate) fn snapshots_at(&self, expected_head: u64) -> Option<Vec<SnapshotValue>> {
-        self.snapshots.serve(expected_head)
+    pub(crate) fn snapshots_at(&self, expected: &HeadValue) -> Option<Vec<SnapshotValue>> {
+        self.snapshots.serve(expected)
     }
 
-    pub(crate) fn table_stats_at(&self, expected_head: u64) -> Option<Vec<TableStatsValue>> {
-        self.table_stats.serve(expected_head)
+    pub(crate) fn table_stats_at(&self, expected: &HeadValue) -> Option<Vec<TableStatsValue>> {
+        self.table_stats.serve(expected)
     }
 
     pub(crate) fn table_column_stats_at(
         &self,
-        expected_head: u64,
+        expected: &HeadValue,
     ) -> Option<Vec<TableColumnStatsValue>> {
-        self.table_column_stats.serve(expected_head)
+        self.table_column_stats.serve(expected)
     }
 
     /// Folds one committed batch, stamping every installed projection with
-    /// `new_head` (unchanged for maintenance commits, which pass the old
-    /// head). An undecodable key clears everything: the batch cannot be
-    /// attributed, so no projection may claim the new head.
+    /// the head record the batch itself wrote. Every batch writes
+    /// `sys/head` — a maintenance one reuses the snapshot id and still
+    /// moves the batch count — so the stamp is read out of `writes` rather
+    /// than passed alongside them, which keeps it impossible for the two to
+    /// disagree. An undecodable key, or a batch with no head write, clears
+    /// everything: the batch cannot be attributed, so no projection may
+    /// claim the state it left.
     pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
         self.entities = None;
         for (encoded_key, write) in writes {
@@ -308,9 +335,19 @@ impl ProjectionCache {
                 }
             }
         }
-        self.snapshots.advance(new_head);
-        self.table_stats.advance(new_head);
-        self.table_column_stats.advance(new_head);
+        let Some(stamp) = head_stamp(writes) else {
+            self.snapshots.clear();
+            self.table_stats.clear();
+            self.table_column_stats.clear();
+            return;
+        };
+        debug_assert_eq!(
+            stamp.snapshot_id, new_head,
+            "head write disagrees with the batch"
+        );
+        self.snapshots.advance(stamp);
+        self.table_stats.advance(stamp);
+        self.table_column_stats.advance(stamp);
     }
 }
 
@@ -376,6 +413,17 @@ mod tests {
         assert!(cached_head_view(&cache, &head_at(7)).is_some());
     }
 
+    /// The store's head record, which is what the projections key on.
+    async fn current_head(catalog: &Catalog) -> HeadValue {
+        let session = catalog.begin_read().await.unwrap();
+        let head = crate::store::read::read_head(session.handle())
+            .await
+            .unwrap()
+            .expect("an initialized store has a head");
+        session.finish();
+        head
+    }
+
     /// Snapshot rows read directly from the store, bypassing the cache.
     async fn scanned_snapshots(catalog: &Catalog) -> Vec<SnapshotValue> {
         let session = catalog.begin_read().await.unwrap();
@@ -424,17 +472,17 @@ mod tests {
             let served = dump_snapshots(&catalog).await.unwrap();
             assert_eq!(served, scanned_snapshots(&catalog).await, "round {round}");
 
-            let head = served.last().unwrap().snapshot_id;
+            let head = current_head(&catalog).await;
             let cache_current = {
                 let guard = catalog
                     .projections()
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.snapshots_at(head).is_some()
+                guard.snapshots_at(&head).is_some()
             };
             assert!(
                 cache_current,
-                "cache must be current at head {head} after serving"
+                "cache must be current at head {head:?} after serving"
             );
 
             let _ = dump_table_stats(&catalog).await.unwrap();
@@ -479,11 +527,28 @@ mod tests {
         }
     }
 
+    /// A head stamp, as the projections key on.
+    fn stamp(snapshot_id: u64, batch_seq: u64) -> HeadValue {
+        HeadValue {
+            snapshot_id,
+            batch_seq,
+        }
+    }
+
+    /// The `sys/head` write every batch carries. `apply_batch` reads the
+    /// stamp out of it rather than being told separately.
+    fn head_write(snapshot_id: u64, batch_seq: u64) -> StagedWrite {
+        (
+            Key::Sys(SysKey::Head).encode(),
+            Some(encode_value(&stamp(snapshot_id, batch_seq))),
+        )
+    }
+
     fn installed_at_three() -> ProjectionCache {
         let mut cache = ProjectionCache::empty();
-        cache.install_snapshots(3, (0..=3).map(snapshot_value).collect());
-        cache.install_table_stats(3, vec![stats_value(7, 10)]);
-        cache.install_table_column_stats(3, vec![column_stats_value(7, 1)]);
+        cache.install_snapshots(stamp(3, 3), (0..=3).map(snapshot_value).collect());
+        cache.install_table_stats(stamp(3, 3), vec![stats_value(7, 10)]);
+        cache.install_table_column_stats(stamp(3, 3), vec![column_stats_value(7, 1)]);
         cache
     }
 
@@ -500,18 +565,20 @@ mod tests {
                 Key::current(EntityKey::TableStats { table_id: 7 }).encode(),
                 Some(encode_value(&stats_value(7, 11))),
             ),
+            head_write(4, 4),
         ];
         cache.apply_batch(&writes, 4);
 
-        let snapshots = cache.snapshots_at(4).unwrap();
+        let at = stamp(4, 4);
+        let snapshots = cache.snapshots_at(&at).unwrap();
         assert_eq!(snapshots.len(), 5);
         assert_eq!(snapshots.last().unwrap().snapshot_id, 4);
 
-        let stats = cache.table_stats_at(4).unwrap();
+        let stats = cache.table_stats_at(&at).unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].record_count, 11);
 
-        assert_eq!(cache.table_column_stats_at(4).unwrap().len(), 1);
+        assert_eq!(cache.table_column_stats_at(&at).unwrap().len(), 1);
     }
 
     #[test]
@@ -528,70 +595,106 @@ mod tests {
                 .encode(),
                 None,
             ),
+            // Head-preserving, as a maintenance batch is: the snapshot id
+            // stands and the batch count moves.
+            head_write(3, 4),
         ];
         cache.apply_batch(&writes, 3);
 
-        let snapshots = cache.snapshots_at(3).unwrap();
+        let at = stamp(3, 4);
+        let snapshots = cache.snapshots_at(&at).unwrap();
         assert_eq!(snapshots.len(), 3);
         assert!(snapshots.iter().all(|s| s.snapshot_id != 2));
-        assert!(cache.table_column_stats_at(3).unwrap().is_empty());
+        assert!(cache.table_column_stats_at(&at).unwrap().is_empty());
+        // And the state it replaced is no longer served, though its
+        // snapshot id is unchanged — the reason the key is the whole stamp.
+        assert!(cache.snapshots_at(&stamp(3, 3)).is_none());
     }
 
     #[test]
     fn serve_refuses_a_mismatched_head() {
         let cache = installed_at_three();
-        assert!(cache.snapshots_at(4).is_none());
-        assert!(cache.table_stats_at(2).is_none());
+        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
+        assert!(cache.table_stats_at(&stamp(2, 2)).is_none());
+        // Same snapshot id, different batch: a maintenance commit's shape.
+        assert!(cache.snapshots_at(&stamp(3, 4)).is_none());
     }
 
     #[test]
     fn fold_on_an_empty_cache_is_a_noop() {
         let mut cache = ProjectionCache::empty();
         cache.apply_batch(
-            &[(
-                Key::Snapshot { snapshot_id: 1 }.encode(),
-                Some(encode_value(&snapshot_value(1))),
-            )],
+            &[
+                (
+                    Key::Snapshot { snapshot_id: 1 }.encode(),
+                    Some(encode_value(&snapshot_value(1))),
+                ),
+                head_write(1, 1),
+            ],
             1,
         );
-        assert!(cache.snapshots_at(1).is_none());
+        assert!(cache.snapshots_at(&stamp(1, 1)).is_none());
     }
 
     #[test]
     fn an_undecodable_value_clears_only_the_touched_projection() {
         let mut cache = installed_at_three();
         cache.apply_batch(
-            &[(
-                Key::Snapshot { snapshot_id: 4 }.encode(),
-                Some(vec![0xff, 0xff, 0xff, 0xff]),
-            )],
+            &[
+                (
+                    Key::Snapshot { snapshot_id: 4 }.encode(),
+                    Some(vec![0xff, 0xff, 0xff, 0xff]),
+                ),
+                head_write(4, 4),
+            ],
             4,
         );
         // Snapshots degrade to a rescan; the untouched stats fold forward.
-        assert!(cache.snapshots_at(4).is_none());
-        assert!(cache.table_stats_at(4).is_some());
+        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
+        assert!(cache.table_stats_at(&stamp(4, 4)).is_some());
     }
 
     #[test]
     fn an_undecodable_key_clears_everything() {
         let mut cache = installed_at_three();
-        cache.apply_batch(&[(vec![0xff, 0xee], Some(vec![]))], 4);
-        assert!(cache.snapshots_at(4).is_none());
-        assert!(cache.table_stats_at(4).is_none());
-        assert!(cache.table_column_stats_at(4).is_none());
+        cache.apply_batch(&[(vec![0xff, 0xee], Some(vec![])), head_write(4, 4)], 4);
+        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
+        assert!(cache.table_stats_at(&stamp(4, 4)).is_none());
+        assert!(cache.table_column_stats_at(&stamp(4, 4)).is_none());
     }
 
     #[test]
     fn irrelevant_keys_still_advance_the_head() {
         let mut cache = installed_at_three();
         cache.apply_batch(
+            &[
+                (
+                    Key::current(EntityKey::Schema { schema_id: 9 }).encode(),
+                    Some(vec![1, 2, 3]),
+                ),
+                head_write(4, 4),
+            ],
+            4,
+        );
+        assert_eq!(cache.snapshots_at(&stamp(4, 4)).unwrap().len(), 4);
+        assert!(cache.snapshots_at(&stamp(3, 3)).is_none());
+    }
+
+    /// A batch with no head write cannot be attributed to a state, so
+    /// nothing may keep claiming one. Every catalog batch writes the head,
+    /// so this is a corruption guard rather than a live path.
+    #[test]
+    fn a_batch_without_a_head_write_clears_everything() {
+        let mut cache = installed_at_three();
+        cache.apply_batch(
             &[(
-                Key::current(EntityKey::Schema { schema_id: 9 }).encode(),
-                Some(vec![1, 2, 3]),
+                Key::Snapshot { snapshot_id: 4 }.encode(),
+                Some(encode_value(&snapshot_value(4))),
             )],
             4,
         );
-        assert_eq!(cache.snapshots_at(4).unwrap().len(), 4);
-        assert!(cache.snapshots_at(3).is_none());
+        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
+        assert!(cache.snapshots_at(&stamp(3, 3)).is_none());
+        assert!(cache.table_stats_at(&stamp(3, 3)).is_none());
     }
 }
