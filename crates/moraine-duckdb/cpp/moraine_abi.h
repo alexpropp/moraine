@@ -200,6 +200,49 @@ typedef struct MoraineDataFileDesc {
   uint64_t footer_size;
 } MoraineDataFileDesc;
 
+// One subspace's row of a store census, as returned by
+// [`moraine_store_census`].
+typedef struct MoraineSubspaceCensus {
+  // The subspace's name, owned — free via [`moraine_store_census_free`].
+  char *subspace;
+  // Physical bytes across its SSTs.
+  uint64_t bytes;
+  // SSTs not yet merged into a sorted run.
+  uint32_t l0_ssts;
+  // Sorted runs. A merge collapses these to one.
+  uint32_t sorted_runs;
+  // SSTs across those runs.
+  uint32_t sorted_run_ssts;
+  // Whether the live fields carry a count; false unless the census was
+  // asked to scan.
+  bool has_live;
+  // Live keys a reader would see.
+  uint64_t live_keys;
+  // Encoded bytes of those keys.
+  uint64_t live_key_bytes;
+  // Encoded bytes of their values.
+  uint64_t live_value_bytes;
+  // Deletion-schedule entries among the live keys.
+  uint64_t scheduled_files;
+} MoraineSubspaceCensus;
+
+// One subspace's merge, as returned by [`moraine_compact_store`].
+typedef struct MoraineSubspaceMerge {
+  // The subspace merged, owned — free via [`moraine_compact_store_free`].
+  char *subspace;
+  // `"completed"`, `"failed"`, `"pending"`, or `"skipped"`, owned.
+  char *outcome;
+  // The failure message or the skip reason; empty otherwise. Owned.
+  char *detail;
+  // Physical bytes before the merge was submitted.
+  uint64_t bytes_before;
+  // Whether `bytes_after` carries a measurement; false unless the merge
+  // committed.
+  bool has_bytes_after;
+  // Physical bytes after it committed.
+  uint64_t bytes_after;
+} MoraineSubspaceMerge;
+
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -1247,6 +1290,61 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          MoraineInterruptProbe probe,
                          void *probe_ctx,
                          struct MoraineError *err);
+
+// Measures the store, one row per subspace, and writes the manifest
+// version measured to `*out_manifest_id`.
+//
+// `count_live_entries` adds a scan of every subspace, which costs a full
+// read of the store; without it the call reads the manifest alone.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; the out-parameters
+// must be writable, and `err`, if non-null, must be writable.
+int32_t moraine_store_census(struct MoraineCatalogHandle *handle,
+                             bool count_live_entries,
+                             struct MoraineSubspaceCensus **out_items,
+                             size_t *out_len,
+                             uint64_t *out_manifest_id,
+                             MoraineInterruptProbe probe,
+                             void *probe_ctx,
+                             struct MoraineError *err);
+
+// Frees the array a [`moraine_store_census`] call returned.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a
+// matching [`moraine_store_census`] call, not yet freed.
+void moraine_store_census_free(struct MoraineSubspaceCensus *items, size_t len);
+
+// Merges each targeted subspace's sorted runs into one.
+//
+// `subspace` names one subspace, or is null for every one. `wait_ms` of 0
+// returns as soon as the merges are submitted; otherwise the call waits
+// that long for each to commit, and a merge that outlives the wait keeps
+// running and is reported pending.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; the out-parameters
+// must be writable, and `err`, if non-null, must be writable.
+int32_t moraine_compact_store(struct MoraineCatalogHandle *handle,
+                              const char *subspace,
+                              uint64_t wait_ms,
+                              struct MoraineSubspaceMerge **out_items,
+                              size_t *out_len,
+                              MoraineInterruptProbe probe,
+                              void *probe_ctx,
+                              struct MoraineError *err);
+
+// Frees the array a [`moraine_compact_store`] call returned.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a
+// matching [`moraine_compact_store`] call, not yet freed.
+void moraine_compact_store_free(struct MoraineSubspaceMerge *items, size_t len);
 
 // Lists a table's live equality indexes.
 //

@@ -300,19 +300,10 @@ deliberately not itemized here.
   sequence today.
 - **DEFERRED** — Collapse the batched sweep into one range-delete per dead
   index if SlateDB exposes a range delete. Shared with 0016.
-- **IMPL** — `Catalog::store_census`: per-subspace bytes, SST counts, and
-  sorted-run counts from the latest manifest, plus the opt-in scanning leg
-  for live keys and the `current` breakdown by `CurrentKey` variant. Nothing
-  exists.
-- **IMPL** — `Catalog::compact_store`: submit SlateDB's own full-tree plan
-  per subspace and poll to a terminal status. Nothing exists.
-- **IMPL** — The shim surface for both: step 8 and its three attach options,
-  and the `moraine_store_census` table function, which must serve a
-  read-only attach.
-- **VALIDATE** — That a full-tree merge actually drops tombstones and
-  superseded versions end to end. `is_dest_last_run` is satisfied by
-  construction on paper (`compaction_worker.rs:637`); no test has watched
-  the bytes fall.
+- **IMPL** — The DuckDB surface for both verbs: step 8 and its three attach
+  options, and the `moraine_store_census` table function, which must serve a
+  read-only attach. The core verbs and the C ABI beneath them exist; nothing
+  in `cpp/` calls them yet, so an operator can reach neither from SQL.
 - **MEASURE** — Attach cost against `current`-subspace physical bytes,
   before and after a merge, on a store churned into a large dead fraction.
   The 642 s production attach is the only data point and it has no

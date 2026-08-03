@@ -473,6 +473,13 @@ the latest manifest through `Admin::read_compactor_state_view`
 per-segment `l0()` / `compacted()` (`manifest/mod.rs:191,196`) →
 `estimate_size()` (`db_state.rs:238,472`).
 
+Every subspace is reported, whether or not the manifest carries a segment
+for it: a subspace absent from the manifest is one whose writes have not
+been written out, which is a measurement rather than a reason to omit the
+row, and two censuses of one store are then comparable row by row. The
+physical figures likewise count only what has been written out — a commit
+still in the write-ahead log is in none of them.
+
 That default costs two object reads and is independent of store size. It is
 enough to answer the question a bloated store poses — *is the bulk `index`,
 which no scan touches, or `current`, which every attach reads?* — because
