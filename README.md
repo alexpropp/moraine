@@ -16,6 +16,18 @@ catalog database.
 > validated against real DuckDB in CI. Most of the v0.1 feature set (below)
 > is in. Released on crates.io; APIs may still change before 1.0.
 
+## Upgrading
+
+Attaching read-write with the release that lands the fleet commit log
+([RFC 0022](docs/rfcs/0022-commit-log-and-leader-role.md)) migrates an
+existing store once, irreversibly, to format 4. Data is unaffected —
+schemas, tables, and history read exactly as before — but the migration
+fences any still-running older-binary writer, and an older binary refuses
+the store afterward. Read-only attaches never migrate: an unmigrated
+store keeps serving read-only exactly as it always has. There is no
+separate migration step — the first read-write attach performs it as one
+atomic batch.
+
 ## Why
 
 DuckLake keeps table data in object storage but stores its catalog — the

@@ -32,6 +32,26 @@ clients configure nothing.
 
 Safety never depends on clocks, leases, leadership, or any node's disk.
 
+**Implemented, except the leader role.** The log, the folder, and
+truncation are live: every commit races a conditional put against
+`commits/<seq>`; a single fenced folder tails the log and applies each
+slot as one atomic `WriteBatch` that also advances `sys/fold`, with the
+store's WAL disabled; slots truncate oldest-first, bounded by the durable
+flush horizon and by live-reader checkpoints past a retention margin.
+Old-format stores migrate on their first read-write attach in one atomic
+batch (`sys/format = 4`, `sys/fold = 0`), fencing any incumbent
+old-binary writer; a too-new format refuses. Group commit runs through
+in-process coalescing (`CatalogOptions::commit_batch_window`); a
+committer that crashes with an ambiguous PUT resolves its outcome by
+scanning for its transaction id (`Catalog::transaction_outcome`).
+Verified live over real SlateDB on in-memory `object_store`:
+prefix-consistent truncation past the retention margin
+(`truncation_holds_the_live_reader_bound_past_the_margin`), a stale
+reader surviving a peer's fold and truncation
+(`a_stale_reader_survives_a_peer_fold_and_truncation`), and migration
+(`a_legacy_store_migrates_on_first_write_attach_and_serves_its_data`).
+The leader role (below) is not yet built.
+
 ## Goals
 
 - **Fleet multi-writer.** N independent DuckDB processes commit
@@ -239,10 +259,23 @@ copy of a commit, so it has **two** bounds:
 > durably flushed** — the flush horizon, not the memtable — **and** no
 > live reader still needs tail replay across it.
 
-The second bound is not optional. Readers lag by their manifest poll
-interval, so a truncator with a fresh view can delete slots a peer at an
-older fold cursor still needs — and the only other copy is the slot just
-deleted.
+The first bound alone already makes deletion safe: a slot folds into the
+store, durably, strictly before it becomes eligible for deletion, so the
+store holds every truncated slot's content at the flush horizon. A reader
+whose tail replay lags behind a truncation and lands on a
+truncated-but-folded hole recovers by the mechanism the Integrity section
+above specifies for a benign hole: re-reading the fold cursor through a
+fresh reader finds it has advanced past the hole, and the reader
+re-materializes from the fresher folded state.
+
+The second bound is a cost and consistency guarantee layered on top, not
+a correctness requirement. Without it, every reader whose replay crosses
+a truncated range pays that re-materialization on its own, independently,
+each time it happens — safe, but a repeated, per-reader cost that
+compounds across a fleet. Respecting live readers instead keeps tail
+replay prefix-consistent (stale-but-consistent) for every reader at once,
+turning the re-materialization from a recurring cost into one that need
+never happen.
 
 Live readers are discoverable because SlateDB already keeps the registry:
 a latest-mode `DbReader` writes a checkpoint into the manifest, which is
@@ -251,7 +284,7 @@ of the oldest live checkpoint. Checkpoints expire, so a crashed reader's
 pin lapses. Add a retention margin on top (mirroring the minimum age
 SlateDB's WAL GC applies), so the common case never depends on timing.
 Envelopes are small: over-retention costs storage, under-retention costs
-correctness.
+consistency.
 
 Slot GC and orphaned-payload GC ride RFC 0007's expiry machinery; an
 orphaned payload — a data file whose commit never won a slot — is the
@@ -393,6 +426,14 @@ reader's cached view previously cost nothing. Both are bounded by a
 willingness-to-wait knob, the same bargain SlateDB's flush and poll
 intervals make: a coalescing window on the write side, a refresh interval
 on the read side.
+
+Measured over the coalescing bench (50 single-statement commits, real
+SlateDB on in-memory `object_store`): the slot path costs 1.00 PUT/commit
+serial (LIST 1.02/commit, GET 25.60/commit before the head-materialization
+cache) and 0.02 PUT/commit concurrent, identical at a zero and a 5ms
+coalescing window. The head cache holds serial GET at 0.12/commit instead
+of 25.60/commit. Folding amortizes further: many slots land in one L0
+SST. These figures sit inside the accepted band.
 
 ### Format and compatibility
 

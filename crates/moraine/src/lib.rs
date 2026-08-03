@@ -3,12 +3,20 @@
 //! transactional KV store over object storage, instead of the usual
 //! relational catalog database.
 //!
-//! Exactly one process holds a read-write [`Catalog`] per store at a time
-//! (opening a second fences the first); any number of processes may read
-//! snapshots concurrently. Schemas, tables, views, data files, and
-//! statistics all commit through the same transaction; catalog options
-//! live outside the snapshot protocol (last-write-wins, no snapshot
-//! minted).
+//! Every commit races a conditional put against an object-storage commit
+//! log, so any number of processes may open a [`Catalog`] read-write and
+//! commit concurrently — the bucket is the only thing coordinating them.
+//! The one fenced SlateDB writer belongs to the **folder** role, not the
+//! commit path: it tails the log and applies each won commit into SlateDB
+//! as a derived index, so a dead folder cannot lose a commit, only lengthen
+//! the tail a reader replays past. Folding is host-driven — this crate
+//! spawns no threads — through [`Catalog::fold_sprint`] and
+//! [`Catalog::fold_if_stalled`]. A large fleet of readers should open
+//! against one shared, existing checkpoint id rather than each minting its
+//! own — traffic hygiene, not correctness. Schemas, tables, views, data
+//! files, and statistics all commit through the same transaction; catalog
+//! options live outside the snapshot protocol (last-write-wins, no
+//! snapshot minted).
 //!
 //! # A worked example
 //!
@@ -85,8 +93,13 @@
 //! functions; the SlateDB store collects its superseded objects itself,
 //! unprompted. A host embedding this crate calls `maintain` on whatever
 //! cadence it likes — the crate spawns no threads and schedules nothing.
-//! Under the DuckDB extension, all of it is sequenced for you; see that
-//! crate's docs for `moraine_maintenance`.
+//! Folding the commit log into SlateDB is the same kind of host-driven
+//! work: nothing here opens the fenced writer unasked, so an embedder
+//! chooses when to fold and how — one bounded pass
+//! ([`Catalog::fold_sprint`]) or a standing appointment
+//! ([`Catalog::fold_if_stalled`]) that stands down the moment a peer is
+//! already folding. Under the DuckDB extension, index reclamation is
+//! sequenced for you; see that crate's docs for `moraine_maintenance`.
 //!
 //! # Diagnostics
 //!

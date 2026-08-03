@@ -569,6 +569,13 @@ normal path. Ordering within a chain is the author's choice; conflicts
 *within* a chain are impossible because its author validates and serializes
 each member locally before racing the slot.
 
+**In-process coalescing implemented.** A process holding several pending
+commits chains them into one slot, bounded by
+`CatalogOptions::commit_batch_window`. Verified live over real SlateDB on
+in-memory `object_store` (`concurrent_commits_coalesce_into_few_slots`);
+the leader role that chains commits forwarded across processes is RFC
+0022's to build.
+
 ### Reader visibility after commit
 
 Step 4 makes a commit **durable** the instant the slot PUT is acked
