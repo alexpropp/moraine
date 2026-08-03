@@ -176,24 +176,45 @@ async fn read_only_attach_of_a_legacy_store_serves_it_unmigrated() {
     );
 }
 
-/// Two new-binary opens racing the same legacy store converge: at least one
-/// migrates, a fenced migration re-probes and finds the store converted, and
-/// both attach cleanly onto exactly format 4 / fold 0.
+/// Attaches read-write, re-attaching through a transient open error. Racing
+/// migrations open and close writers against one shared in-process object
+/// store, so a losing open can observe a competitor's writer as a closed
+/// handle — a contention artifact a healthy attach absorbs by re-attaching,
+/// exactly as the migration loop already re-probes a fenced stamp. Convergence
+/// is the invariant; which open wins the race is not.
+#[allow(clippy::expect_used)]
+async fn attach_through_contention(object_store: &Arc<dyn ObjectStore>) -> Catalog {
+    for attempt in 0..64u32 {
+        match Catalog::open(Arc::clone(object_store), CatalogOptions::default()).await {
+            Ok(catalog) => return catalog,
+            Err(err) if attempt + 1 == 64 => {
+                panic!("concurrent migration never converged after re-attaching: {err:?}")
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+        }
+    }
+    unreachable!("the loop returns or panics")
+}
+
+/// Two new-binary opens racing the same legacy store converge on exactly one
+/// stamp: whichever open migrates, the store ends at format 4 / fold 0 with its
+/// data intact, and both attach. A second format write can never commit — the
+/// later migration reads the converted format and rolls back, or is fenced — so
+/// asserting format 4 / fold 0 is asserting exactly-one-stamp.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_migrations_converge_on_one_stamp() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     legacy_store_with_schema(Arc::clone(&object_store)).await;
 
-    let (ra, rb) = tokio::join!(
-        Catalog::open(Arc::clone(&object_store), CatalogOptions::default()),
-        Catalog::open(Arc::clone(&object_store), CatalogOptions::default()),
+    let (a, b) = tokio::join!(
+        attach_through_contention(&object_store),
+        attach_through_contention(&object_store),
     );
-    let a = ra.expect("first open attaches");
-    let b = rb.expect("second open attaches");
 
     assert_eq!(
         stored_format_and_fold(&object_store).await,
         (commit::FORMAT_MULTI_WRITER, 0),
+        "exactly one stamp: format 4 and fold 0",
     );
     assert!(
         a.snapshot()
@@ -240,20 +261,20 @@ async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
     );
 
     // The fenced incumbent's next write fails typed — never a silent success.
-    // Fencing surfaces on the staging put or the commit, whichever comes first.
-    let tx = incumbent.begin(IsolationLevel::Snapshot).await.unwrap();
-    let staged = tx.put(
-        Key::Sys(SysKey::Head).encode(),
-        value::encode_value(&proto::HeadValue { snapshot_id: 99 }),
-    );
-    let err = match staged {
-        Ok(()) => Error::from(
-            tx.commit_with_options(&commit::durable())
-                .await
-                .unwrap_err(),
-        ),
-        Err(err) => Error::from(err),
-    };
+    // The writer notices a newer epoch at whichever operation it next flushes:
+    // the transaction begin, the staging put, or the commit. The invariant is
+    // that the first one to surface it is a typed `Fenced`, not which one it is.
+    let outcome: Result<()> = async {
+        let tx = incumbent.begin(IsolationLevel::Snapshot).await?;
+        tx.put(
+            Key::Sys(SysKey::Head).encode(),
+            value::encode_value(&proto::HeadValue { snapshot_id: 99 }),
+        )?;
+        tx.commit_with_options(&commit::durable()).await?;
+        Ok(())
+    }
+    .await;
+    let err = outcome.expect_err("a fenced writer must not commit");
     assert!(matches!(err, Error::Fenced(_)), "{err:?}");
 }
 

@@ -1242,3 +1242,391 @@ async fn a_cached_head_survives_a_peer_fold_and_truncation() {
         assert!(head.schema_by_name(name).is_some(), "{name} resolved");
     }
 }
+
+/// How many slot objects the log holds.
+async fn slot_count(store: &Arc<InMemory>) -> usize {
+    objects_under(store, "commits").await
+}
+
+/// Crash between payload and slot resolves to "never happened". A committer
+/// that assembled its payload but died before the slot PUT landed leaves no
+/// trace: its transaction id is unknown to the log, the head does not move, and
+/// no phantom slot appears. This is Task 8's `Prepared` value simply dropped.
+#[tokio::test]
+async fn a_crash_between_payload_and_slot_leaves_no_trace() {
+    use uuid::Uuid;
+
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    catalog
+        .commit(|tx| tx.create_schema("real").map(|_| ()))
+        .await
+        .unwrap();
+    let head_before = catalog.snapshot().await.unwrap().current_snapshot().id;
+    let slots_before = slot_count(&store).await;
+
+    // The lost committer's transaction never reached a slot, so it resolves to a
+    // definitive `None` — a retry is safe because nothing committed.
+    let lost = Uuid::from_bytes([0x5A; 16]);
+    assert_eq!(
+        catalog
+            .transaction_outcome(lost, SnapshotId::new(0))
+            .await
+            .unwrap(),
+        None,
+        "a payload with no slot never committed"
+    );
+
+    // A fresh attach sees the baseline head only.
+    let fresh = open_multi_writer(&store).await;
+    assert_eq!(
+        fresh.snapshot().await.unwrap().current_snapshot().id,
+        head_before,
+        "the head did not move"
+    );
+    assert_eq!(
+        slot_count(&store).await,
+        slots_before,
+        "no phantom slot was left behind"
+    );
+}
+
+/// Crash after the slot, before the ack, resolves to "durable and
+/// discoverable". A winner's envelope written straight through the log — a
+/// committer that PUT its slot and died before returning — is committed: a
+/// fresh attach serves it and `transaction_outcome` reports the snapshot it
+/// minted. Recovery re-applies nothing, so the slot count does not grow and a
+/// retry never double-applies.
+#[tokio::test]
+async fn a_slot_that_landed_before_the_ack_is_durable_and_discoverable() {
+    use moraine_wal::SlotLog;
+    use uuid::Uuid;
+
+    // A source store mints one real envelope through an ordinary commit.
+    let source_store = Arc::new(InMemory::new());
+    let source = open_multi_writer(&source_store).await;
+    source
+        .commit(|tx| tx.create_schema("sales").map(|_| ()))
+        .await
+        .unwrap();
+    let source_slots = SlotLog::new(source_store.clone() as Arc<dyn ObjectStore>, "");
+    let envelope = source_slots
+        .read_slot(1)
+        .await
+        .unwrap()
+        .expect("the source commit's slot");
+    let id = Uuid::from_bytes(envelope.commits[0].transaction_id);
+
+    // A destination store, bootstrapped identically, receives that slot straight
+    // through the log: the winner PUT it and died before any handle acked it.
+    let store = Arc::new(InMemory::new());
+    open_multi_writer(&store).await;
+    let slots = SlotLog::new(store.clone() as Arc<dyn ObjectStore>, "");
+    slots.put_slot(1, &envelope).await.unwrap();
+
+    // A fresh attach resolves the crash the exactly-once way and serves it.
+    let fresh = open_multi_writer(&store).await;
+    assert_eq!(
+        fresh
+            .transaction_outcome(id, SnapshotId::new(0))
+            .await
+            .unwrap(),
+        Some(SnapshotId::new(1)),
+        "the dead winner's transaction committed at snapshot 1"
+    );
+    let view = fresh.snapshot().await.unwrap();
+    assert_eq!(view.current_snapshot().id, SnapshotId::new(1));
+    assert!(view.schema_by_name("sales").is_some());
+
+    // Resolution wrote no second slot: a retry guided by the outcome never
+    // double-applies.
+    assert_eq!(slot_count(&store).await, 1, "recovery re-applied nothing");
+}
+
+/// Duelling folders waste work but never corrupt. Two catalogs sprint the same
+/// tail concurrently; each outcome is `Ok` or a typed `Fenced`, never anything
+/// else, and at least one advances the cursor. The folded state equals the
+/// pre-fold tail-replay state, and a fresh attach materializes it without
+/// corruption — proof `sys/fold` never ran past the last real slot, since an
+/// over-fold would surface as a replay corruption.
+#[tokio::test(flavor = "multi_thread")]
+async fn duelling_folders_waste_but_never_corrupt() {
+    let store = Arc::new(InMemory::new());
+    let setup = open_multi_writer(&store).await;
+    for name in ["a", "b", "c", "d"] {
+        setup
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+    let before = open_multi_writer(&store).await.snapshot().await.unwrap();
+    let head_before = before.current_snapshot().id;
+
+    let a = open_multi_writer(&store).await;
+    let b = open_multi_writer(&store).await;
+    let (ra, rb) = tokio::join!(a.fold_sprint(u64::MAX), b.fold_sprint(u64::MAX));
+
+    for r in [&ra, &rb] {
+        assert!(
+            matches!(r, Ok(_) | Err(Error::Fenced(_))),
+            "a folder duel wastes or fences, never corrupts: {r:?}"
+        );
+    }
+    assert!(
+        ra.is_ok() || rb.is_ok(),
+        "at least one folder made progress: {ra:?} / {rb:?}"
+    );
+
+    // The folded state equals the pre-fold replay state, materialized cleanly.
+    let after = open_multi_writer(&store).await.snapshot().await.unwrap();
+    assert_eq!(
+        after.current_snapshot().id,
+        head_before,
+        "folding preserved the head exactly"
+    );
+    for name in ["a", "b", "c", "d"] {
+        assert!(
+            after.schema_by_name(name).is_some(),
+            "{name} survived the duel"
+        );
+    }
+}
+
+/// Counter and id invariants hold under contention. Many tasks create tables
+/// into one schema concurrently; every commit lands, the head advances once per
+/// commit, snapshot ids are dense from bootstrap, and no two tables share an
+/// id. Invariants over the outcome, never a fixed ordering.
+#[tokio::test(flavor = "multi_thread")]
+async fn counter_and_id_invariants_hold_under_contention() {
+    const TASKS: u64 = 4;
+    const PER: u64 = 5;
+
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    catalog
+        .commit(|tx| tx.create_schema("s").map(|_| ()))
+        .await
+        .unwrap();
+    let s = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .schema_by_name("s")
+        .unwrap()
+        .id;
+
+    let mut handles = Vec::new();
+    for task in 0..TASKS {
+        let catalog = catalog.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..PER {
+                let name = format!("t_{task}_{i}");
+                catalog
+                    .commit(move |tx| tx.create_table(s, &name, &[col("x")]).map(|_| ()))
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let head = catalog.snapshot().await.unwrap();
+    // The schema commit is snapshot 1; each of the TASKS*PER table commits mints
+    // the next snapshot, so the head is exactly one past them all.
+    assert_eq!(
+        head.current_snapshot().id,
+        SnapshotId::new(1 + TASKS * PER),
+        "the head advanced once per commit"
+    );
+
+    let tables = head.tables_in(s);
+    assert_eq!(tables.len() as u64, TASKS * PER, "every table landed");
+    let mut ids: Vec<u64> = tables.iter().map(|t| t.id.get()).collect();
+    ids.sort_unstable();
+    let distinct = ids.len();
+    ids.dedup();
+    assert_eq!(ids.len(), distinct, "no table id collided");
+
+    let mut snapshots: Vec<u64> = moraine::ffi_support::dump_snapshots(&catalog)
+        .await
+        .unwrap()
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
+    snapshots.sort_unstable();
+    assert_eq!(
+        snapshots,
+        (0..=1 + TASKS * PER).collect::<Vec<_>>(),
+        "snapshot ids are dense from bootstrap"
+    );
+}
+
+/// `fold_if_stalled` stands down when a peer folds during its delay. This
+/// handle appoints itself past the threshold and sleeps a generous delay; a
+/// peer folds the whole tail meanwhile, so the recheck sees the advanced cursor
+/// and returns `Ok(None)` rather than opening a redundant fenced writer. A zero
+/// reader poll interval makes the peer's fold visible at the recheck.
+#[tokio::test(flavor = "multi_thread")]
+async fn fold_if_stalled_stands_down_when_a_peer_folds() {
+    let store = Arc::new(InMemory::new());
+    let a = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, zero_refresh()).await;
+    let b = open_multi_writer_over(store.clone() as Arc<dyn ObjectStore>, zero_refresh()).await;
+    for name in ["a", "b", "c", "d"] {
+        a.commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    let appointment = {
+        let a = a.clone();
+        tokio::spawn(async move { a.fold_if_stalled(1, Duration::from_secs(1), u64::MAX).await })
+    };
+
+    // The peer folds well inside A's delay, advancing the cursor A rechecks.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    b.fold_sprint(u64::MAX).await.unwrap();
+
+    let outcome = appointment.await.unwrap().unwrap();
+    assert!(
+        outcome.is_none(),
+        "A stood down for the peer that folded: {outcome:?}"
+    );
+    assert_eq!(
+        a.unfolded_tail().await.unwrap(),
+        0,
+        "the peer's fold drained the tail"
+    );
+}
+
+/// A fold and repeated truncation racing under a stream of commits never
+/// corrupt and never strand a needed slot. The folder never errors on a
+/// truncated-away slot — the horizon rule keeps truncation at or below the
+/// durable cursor, so every slot it deletes was already folded — and every
+/// fresh attach materializes the complete catalog afterward.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fold_and_truncation_race_never_strands_a_slot() {
+    let store = Arc::new(InMemory::new());
+    let writer = open_multi_writer(&store).await;
+    for i in 0..30u32 {
+        writer
+            .commit(|tx| tx.create_schema(&format!("s{i}")).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    let folder = open_multi_writer(&store).await;
+    let truncator = open_multi_writer(&store).await;
+
+    let fold = {
+        let folder = folder.clone();
+        tokio::spawn(async move { folder.fold_sprint(u64::MAX).await })
+    };
+    let truncate = {
+        let truncator = truncator.clone();
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                truncator.truncate_folded_slots().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let commit = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            for i in 30..40u32 {
+                writer
+                    .commit(|tx| tx.create_schema(&format!("s{i}")).map(|_| ()))
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+
+    let fold_report = fold.await.unwrap();
+    truncate.await.unwrap();
+    commit.await.unwrap();
+    assert!(
+        fold_report.is_ok(),
+        "the folder never errored on a truncated-away slot: {fold_report:?}"
+    );
+
+    // Every fresh attach materializes the complete state, folded, truncated, and
+    // freshly committed slots reconciled.
+    let head = open_multi_writer(&store).await.snapshot().await.unwrap();
+    assert_eq!(head.current_snapshot().id, SnapshotId::new(40));
+    for i in 0..40u32 {
+        assert!(
+            head.schema_by_name(&format!("s{i}")).is_some(),
+            "s{i} survived"
+        );
+    }
+}
+
+/// A destroyed slot fails loudly. Deleting a slot beneath a present one, behind
+/// the protocol's back, is a hole no truncation could explain: materializing
+/// refuses with `Corruption` naming the destroyed sequence, never a served
+/// prefix, and a fresh commit cannot re-win the hole.
+#[tokio::test]
+async fn a_destroyed_slot_fails_loudly() {
+    use moraine_wal::SlotLog;
+
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    for name in ["one", "two", "three"] {
+        catalog
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    // Delete slot 2 straight through the log, beneath the present slot 3.
+    let slots = SlotLog::new(store.clone() as Arc<dyn ObjectStore>, "");
+    slots.delete_slot(2).await.unwrap();
+
+    let fresh = open_multi_writer(&store).await;
+    let err = fresh.snapshot().await.unwrap_err();
+    assert!(matches!(err, Error::Corruption(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("slot 2"),
+        "names the destroyed sequence: {err}"
+    );
+
+    // No fresh commit re-wins the hole: the commit premise hits the same hole.
+    let err = fresh
+        .commit(|tx| tx.create_schema("four").map(|_| ()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Corruption(_)), "{err:?}");
+}
+
+/// A substituted slot fails loudly. Overwriting slot 2 with slot 3's bytes,
+/// straight through the object store and bypassing create-if-absent, stages a
+/// commit against a head the replay has not reached: materialization refuses
+/// with `Corruption` on the validated-head mismatch rather than applying it.
+#[tokio::test]
+async fn a_substituted_slot_fails_loudly() {
+    let store = Arc::new(InMemory::new());
+    let catalog = open_multi_writer(&store).await;
+    for name in ["one", "two", "three"] {
+        catalog
+            .commit(|tx| tx.create_schema(name).map(|_| ()))
+            .await
+            .unwrap();
+    }
+
+    // Overwrite slot 2 with slot 3's exact bytes, behind the protocol's back.
+    let slot2 = Path::from("commits/00000000000000000002");
+    let slot3 = Path::from("commits/00000000000000000003");
+    let bytes = store.get(&slot3).await.unwrap().bytes().await.unwrap();
+    store.put(&slot2, bytes.into()).await.unwrap();
+
+    let fresh = open_multi_writer(&store).await;
+    let err = fresh.snapshot().await.unwrap_err();
+    assert!(matches!(err, Error::Corruption(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("slot 2"),
+        "names the substituted sequence: {err}"
+    );
+}
