@@ -275,7 +275,11 @@ an unknown option, an unknown parameter for a known step, an unknown subspace
 name, a non-positive interval, batch size, or timeout, and a step disabled
 while one of its own parameters is supplied are all `BinderException`s, so a
 misconfigured attach fails rather than starting a scheduler that quietly
-does the wrong thing.
+does the wrong thing. The subspace name is the one option whose vocabulary
+the shim does not own, so it asks the core rather than keeping a second
+copy — and it asks at bind, because a name checked only when a pass runs
+would let a typo attach cleanly and then fail every scheduled pass,
+unattended, for as long as it stood.
 
 **Defaults are the safe floor.** Steps 1–6 mutate the lake — writing
 Parquet, minting snapshots, or deleting bytes — so none has a default. Step 8

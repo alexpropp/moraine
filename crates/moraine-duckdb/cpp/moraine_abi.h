@@ -1346,6 +1346,23 @@ int32_t moraine_compact_store(struct MoraineCatalogHandle *handle,
 // matching [`moraine_compact_store`] call, not yet freed.
 void moraine_compact_store_free(struct MoraineSubspaceMerge *items, size_t len);
 
+// Whether `name` is a subspace a merge can target.
+//
+// Exposed separately from [`moraine_compact_store`] because an attach
+// validates its options before any catalog is open: a name checked only
+// when a pass runs would let a typo attach cleanly and then fail every
+// scheduled pass, unattended, for as long as it stood.
+//
+// # Safety
+//
+// `name`, if non-null, must be a valid C string.
+bool moraine_subspace_is_known(const char *name);
+
+// The subspaces a merge can target, comma-separated, for an error
+// message. Owned — free via `moraine_error_free`; null if allocation
+// fails.
+char *moraine_subspace_names(void);
+
 // Lists a table's live equality indexes.
 //
 // # Safety

@@ -2240,6 +2240,43 @@ pub unsafe extern "C" fn moraine_compact_store_free(items: *mut MoraineSubspaceM
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// Whether `name` is a subspace a merge can target.
+///
+/// Exposed separately from [`moraine_compact_store`] because an attach
+/// validates its options before any catalog is open: a name checked only
+/// when a pass runs would let a typo attach cleanly and then fail every
+/// scheduled pass, unattended, for as long as it stood.
+///
+/// # Safety
+///
+/// `name`, if non-null, must be a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_subspace_is_known(name: *const c_char) -> bool {
+    let attempt = || {
+        if name.is_null() {
+            return false;
+        }
+        // SAFETY: caller contract for `name`.
+        let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return false;
+        };
+        parse_subspace(name).is_ok()
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(false)
+}
+
+/// The subspaces a merge can target, comma-separated, for an error
+/// message. Owned — free via `moraine_error_free`; null if allocation
+/// fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn moraine_subspace_names() -> *mut c_char {
+    let attempt = || {
+        let names: Vec<String> = KNOWN_SUBSPACES.iter().map(ToString::to_string).collect();
+        to_c_string(&names.join(", ")).map_or(ptr::null_mut(), CString::into_raw)
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(ptr::null_mut())
+}
+
 /// The subspace `name` refers to, by the name a census prints.
 fn parse_subspace(name: &str) -> Result<moraine::SubspaceName, AbiError> {
     KNOWN_SUBSPACES

@@ -592,6 +592,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             "cleanup_old_files",
             "delete_orphaned_files",
             "sweep_indexes",
+            "compact_store",
         ],
         "steps must report in sequence order"
     );
@@ -667,7 +668,7 @@ fn store_census_reports_every_subspace() {
     // Without the scanning leg the live columns are NULL, not zero: a
     // subspace with no live keys and one nobody counted differ.
     assert!(
-        rows.iter().all(|row| row[1].is_empty()),
+        rows.iter().all(|row| row[1] == "NULL"),
         "unrequested live counts: {rows:?}"
     );
 
@@ -716,8 +717,15 @@ fn maintenance_merges_the_store_when_configured() {
     ));
     assert_eq!(rows[0][1], "ran", "{rows:?}");
     // Every subspace is accounted for, whether it had runs to merge or
-    // not, so two passes stay comparable.
-    assert!(rows[0][2].contains("current"), "{rows:?}");
+    // not, so two passes stay comparable. The detail is one clause per
+    // subspace, which CSV splits across fields.
+    let detail = rows[0][2..].join(",");
+    for subspace in ["current", "history", "index", "snapshot"] {
+        assert!(
+            detail.contains(subspace),
+            "no `{subspace}` clause: {rows:?}"
+        );
+    }
 
     // The merge mints no snapshot and moves no rows.
     assert_eq!(
@@ -751,14 +759,17 @@ fn maintenance_rejects_a_contradictory_merge_configuration() {
         "got: {contradictory}"
     );
 
+    // A subspace name is checked at attach rather than when a pass runs:
+    // a typo caught only at pass time would attach cleanly and then fail
+    // every scheduled pass, unattended, for as long as it stood.
     let unknown_subspace = run_ducklake_sql_expect_err_with_options(
         store.path(),
         data.path(),
         ", META_MAINTENANCE_COMPACT_STORE_SUBSPACE 'gcfile'",
-        "SELECT step, status, detail FROM moraine_maintenance('lake');",
+        "SELECT 1;",
     );
     assert!(
-        unknown_subspace.contains("unknown subspace") || unknown_subspace.contains("gcfile"),
+        unknown_subspace.contains("names no subspace") && unknown_subspace.contains("current"),
         "got: {unknown_subspace}"
     );
 }

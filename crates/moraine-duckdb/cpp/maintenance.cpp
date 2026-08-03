@@ -106,11 +106,20 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			continue;
 		}
 		if (rest == "compact_store_subspace") {
-			// Validated by the core, which owns the subspace vocabulary;
-			// only emptiness is a shim-level mistake.
 			config.compact_store_subspace = option.second.GetValue<std::string>();
-			if (config.compact_store_subspace.empty()) {
-				throw duckdb::BinderException("MAINTENANCE_COMPACT_STORE_SUBSPACE must name a subspace");
+			// Checked here rather than when a pass runs: a name validated
+			// only at pass time would let a typo attach cleanly and then
+			// fail every scheduled pass, unattended, for as long as it
+			// stood. The vocabulary stays the core's — this asks it.
+			if (!moraine_subspace_is_known(config.compact_store_subspace.c_str())) {
+				auto known = moraine_subspace_names();
+				std::string list = known != nullptr ? std::string(known) : "";
+				if (known != nullptr) {
+					moraine_error_free(known);
+				}
+				throw duckdb::BinderException(
+				    "MAINTENANCE_COMPACT_STORE_SUBSPACE names no subspace \"%s\"; known subspaces are: %s",
+				    config.compact_store_subspace, list);
 			}
 			// Supplying a parameter enables its step.
 			compact_store_parameter_given = true;
