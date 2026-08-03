@@ -146,6 +146,7 @@ Accessors (all in-memory, name→id resolved internally):
 | `views_in(schema)` / `view_by_name` / `view_by_id` | views |
 | `columns_of(table)` | ordered columns (tags embedded) |
 | `partitioning_of(table)` | partition spec, if any |
+| `sorting_of(table)` | sort spec, if any |
 | `data_files_of(table)` | live data files (incl. inlined chunks, RFC 0005) |
 | `delete_files_of(table)` | live delete files (incl. inlined deletes) |
 | `table_stats(table)` / `column_stats(table, column)` | statistics |
@@ -156,8 +157,12 @@ Reads issue no store I/O after the snapshot is built — a `CatalogSnapshot` is 
 value, not a cursor.
 
 Inlined rows (RFC 0005) are the one read the snapshot does **not** serve.
-`recent_rows(table)` and `recent_row(table, row_id)` are `Catalog` methods,
-each one contiguous range scan of the `inline` subspace at head. They are row
+`recent_rows(table)`, `recent_rows_at(table, snapshot)` and
+`recent_row(table, row_id)` are `Catalog` methods, each one contiguous range
+scan of the `inline` subspace — at head, or, for `recent_rows_at`, at the
+snapshot named. That id resolves through the rule `snapshot_at` uses, so an
+unminted id and an expired one are refused the same way whichever read is
+asking. They are row
 data, not catalog metadata: an inlined chunk carries the table's actual values
 as an Arrow IPC body, so materializing them into every `CatalogSnapshot` would
 put unbounded row bytes behind an accessor the whole catalog shares and break
@@ -257,11 +262,11 @@ The public surface is hand-written domain types, decoupled from the
 
 - **Newtype ids** (wrapping the DuckLake-allocated `u64`s of RFC 0002):
   `SchemaId`, `TableId`, `ViewId`, `MacroId`, `MappingId`, `ColumnId`,
-  `DataFileId`, `DeleteFileId`, `PartitionId`, `SnapshotId`.
+  `DataFileId`, `DeleteFileId`, `PartitionId`, `SortId`, `SnapshotId`.
 - **Value structs:** `TableInfo`, `ViewInfo`, `MacroInfo`, `MappingInfo`,
   `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `PartitionColumnDef`,
-  `ColumnStats`, `TableStats`, `OptionScope`, `TagTarget`, `InlineChunk`,
-  `FlushedDataFile`, `RecentRow`.
+  `SortSpec`, `SortKeyDef`, `ColumnStats`, `TableStats`, `OptionScope`,
+  `TagTarget`, `InlineChunk`, `FlushedDataFile`, `RecentRow`.
 
 Keeping these separate from the wire types is what lets RFC 0002's protobuf
 field evolution stay an internal change instead of a public breaking one.
@@ -281,6 +286,7 @@ semantics and the entities RFC 0002 maps:
 | **Macros** (RFC 0019) | `create_macro`, `drop_macro` (no alter verb — DuckLake models macro replacement as drop + create under a fresh `macro_id`; macro names collide with live macros in the schema only, not with tables/views) |
 | **Columns** | `add_column`, `rename_column`, `alter_column` (type / default / nullability), `drop_column` |
 | **Partitioning** | `set_partitioning`, `clear_partitioning` |
+| **Sorting** (RFC 0013) | `set_sorting`, `clear_sorting` |
 | **Data files** | `register_data_file` (carries its file column stats), `expire_data_file` |
 | **Delete files** | `register_delete_file`, `expire_delete_file` |
 | **Statistics** | `update_table_stats`, `update_column_stats` |
@@ -301,6 +307,17 @@ Notes:
 - `alter_column` is one verb taking an optional change per attribute, rather
   than three verbs, because DuckLake models a column alteration as a single
   new column version regardless of which attributes changed.
+- Sorting and partitioning are twins in shape and differ in two ways the
+  verbs must carry. A sort change marks the table altered without bumping
+  the schema version — a sort spec constrains writes and never invalidates
+  a cross-file compaction, so DuckLake does not bump, and neither does the
+  verb path. And a sort key names its column inside a verbatim SQL
+  expression rather than by field id, so `set_sorting` has no column to
+  resolve and validates none: what a rename or a drop does to a sorted
+  column is DuckLake's binder's business, and moraine records what
+  committed (RFC 0013). `clear_sorting` is a genuine clear, unlike
+  `clear_partitioning`, whose DuckLake counterpart lands a live spec with
+  no columns.
 - Every verb that puts a column type into the catalog — `create_table`,
   `add_column`, `alter_column` — enforces the RFC 0005 type policy and raises
   `Unsupported` for a type moraine cannot store. The rule is the core's, and
@@ -311,19 +328,59 @@ Notes:
   while flushing the `CREATE TABLE`, *before* the `ducklake_column` rows the
   core validates reach a commit, so removing it leaves the user with DuckDB's
   bare "Unsupported Arrow type VARIANT". Measured by deleting it and running
-  the e2e suite.
+  the e2e suite. This is also why `register_data_file` carries no variant
+  statistics: `ducklake_file_variant_stats` describes the shredded paths of
+  a `VARIANT` column, and no such column can reach the catalog to have any.
+  The field stays in the stored record for row-faithfulness, and arrives on
+  the verb surface with `VARIANT` support or not at all.
 - `flush_inlined_data` registers the files it drains into, rather than leaving
   them to `register_data_file`. A flushed file is not an ordinary
   registration: its rows keep the ids they were inlined under and its record
   is backdated to the earliest snapshot among them, neither of which
-  `register_data_file` can express. Keeping that inside the flush verb is what
-  lets the general row-id-preserving registration stay deferred to the
-  compaction surface.
-- Column/name mappings (RFC 0018) have **no verb**: DuckLake creates them
-  only as a side effect of `ducklake_add_data_files`, and the embedding API
-  has no consumer registering foreign Parquet today. `register_data_file`
-  leaves `mapping_id` unset on the verb path; the staged path carries it
-  verbatim. A verb is added if an embedding use case appears (additive).
+  `register_data_file` can express. Keeping that inside the flush verb is why
+  the core needs no general row-id-preserving registration: compaction is the
+  only other operation of that shape, and it is DuckLake's own — it reaches
+  the store through the staged-row path, never through this surface. A verb
+  is added if an embedding consumer ever writes a rewritten file itself
+  (additive).
+- A registered file carries the partition it falls in — one value per key
+  of the table's live spec, in key order, verbatim text. The spec is
+  resolved rather than named by the caller: a file is written under the one
+  in force, and a registration racing a repartition already conflicts as
+  append-versus-alter, so passing an id could only ever name the spec the
+  commit is about to be arbitrated against. A partitioned table requires
+  its values and an unpartitioned one refuses any, on the same reasoning as
+  the index-entry rule — a file silently landing in no partition is a file
+  no pruning scan can place.
+- A flushed file additionally carries `partial_max`, the newest snapshot
+  among its rows, whenever a drain sweeps up rows inlined at several. Both
+  bounds are needed and neither is derivable from the other: the record is
+  live from the earliest so pre-flush time travel finds it, and a reader at
+  a snapshot inside the span filters the file's rows per row against its
+  own snapshot column rather than taking all of them. It is validated to
+  sit at or above the backdated snapshot and below this commit's, the same
+  window the backdating check enforces from the other side.
+- One commit may both inline into a table and flush it. The drain reads the
+  store as it stood before the commit, so the chunk the commit stages is not
+  among the chunks it drains — those rows stay inlined for the next flush.
+  What the drain reads is also what bounds the file: a flushed file's rows
+  must lie below the row ids the table had allocated when the commit began,
+  since the caller wrote its Parquet before calling `commit` and so cannot
+  have put a row this commit mints into it. The pairing that does *not*
+  compose is tombstoning a row the same commit flushes: the file carries that
+  row as live and the drain removes the chunk the tombstone hangs off, so the
+  delete would vanish. It is refused, and a delete file against the id
+  `flush_inlined_data` returns expresses it instead.
+- Column/name mappings (RFC 0018) have **no verb**, and this is settled
+  rather than deferred. A mapping exists only to resolve the columns of
+  *foreign* Parquet — a file written without DuckLake's field ids — and
+  moraine does not expect to serve one. DuckLake creates mappings as a side
+  effect of `ducklake_add_data_files`, which a user can still issue through
+  the extension; the staged path carries those rows verbatim and always
+  will. What is settled is the verb surface: no `create_mapping`, and
+  `register_data_file` leaves `mapping_id` unset, because a file this
+  surface registers is one the host wrote against the table's own
+  columns.
 - Snapshot expiry / `history` GC has no verb (deferred, per non-goals).
   RFC 0021's `maintain` is not one: it reclaims moraine's own orphaned
   index entries and nothing else — it computes no retention policy, and
@@ -331,9 +388,13 @@ Notes:
   objects unprompted. RFC 0021 *does* orchestrate DuckLake's expiry and
   cleanup functions, but from the DuckDB shim, which can issue SQL — never
   from this surface, which cannot.
-- This table covers the entities the core models today. As the DuckLake v1.0
-  spec's remaining tables and the extension contract (RFC 0005) are reached in
-  e2e, operations are added here — this RFC is updated, not diverged from.
+- This table covers the entities the core models today. The extension
+  contract that once gated the full set is settled: RFC 0005 maps every
+  DuckLake statement the shim issues onto a store record, and none of them
+  needs a verb this table lacks — the extension rides the staged-row path,
+  not this surface. What is left is the DuckLake v1.0 spec's remaining
+  tables; as e2e reaches them, operations are added here — this RFC is
+  updated, not diverged from.
 
 ### Testing obligations
 
@@ -388,5 +449,6 @@ Per RFC 0001:
 - **Structural-shape-only scope** (define the types and models, leave the
   operation set to fill in later): considered and rejected in favor of the
   full enumeration above, grounding the operation set in DuckLake v1.0
-  semantics rather than the still-unresolved extension contract, so the
-  surface is legible now and updated (not redesigned) as e2e reveals detail.
+  semantics rather than in the extension contract, which was unresolved when
+  this was written. The bet paid: the contract settled (RFC 0005) without
+  moving a verb, and the surface was legible throughout.

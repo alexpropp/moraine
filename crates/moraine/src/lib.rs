@@ -60,7 +60,8 @@
 //! stores a chunk of rows in the catalog itself — Arrow IPC bytes the caller
 //! encodes, carried by the same single write the commit already performs —
 //! and the rows draw ids from the table's row-id counter exactly as a
-//! registered file's do. [`Catalog::recent_rows`] reads them back,
+//! registered file's do. [`Catalog::recent_rows`] reads them back — or
+//! [`Catalog::recent_rows_at`], for the rows a past snapshot saw —
 //! [`Transaction::inline_delete`] tombstones one, and
 //! [`Transaction::flush_inlined_data`] drains them into a data file the
 //! caller wrote, preserving their ids and backdating the file's record so
@@ -200,8 +201,8 @@ pub use catalog::{
     MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
     MappingId, MappingInfo, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
     PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, TagTarget,
-    ViewId, ViewInfo,
+    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo,
+    TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 /// Crash-injection seams, for tests that drive a migration to a named

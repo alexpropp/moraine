@@ -34,13 +34,15 @@ impl ChunkSeqAllocator {
 /// those chunks' rows consumed. Reads `db_tx`'s current (pre-commit)
 /// inline records — the flush op only ever names the table and snapshot,
 /// never the keys to remove.
+///
+/// Returns the row ids drained, which the flushed file now carries.
 pub(crate) async fn translate_inline_flush_delete(
     db_tx: &DbTransaction,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
-) -> Result<()> {
+) -> Result<HashSet<u64>> {
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
     let inline_deletes =
         store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
@@ -64,7 +66,9 @@ pub(crate) async fn translate_inline_flush_delete(
     // ones (`ForFlush`) — their `inline/inline_delete` records become orphaned
     // once the owning chunk is gone above, and must go with it.
     let rows = materialize_inline_rows(&scoped, &inline_deletes);
+    let mut drained = HashSet::new();
     for row in InlineScanKind::ForFlush.select(&rows, flush_snapshot, 0) {
+        drained.insert(row.row_id);
         if row.end_snapshot.is_some() {
             writes.push((
                 Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
@@ -77,7 +81,7 @@ pub(crate) async fn translate_inline_flush_delete(
         }
     }
 
-    Ok(())
+    Ok(drained)
 }
 
 /// Removes the named live `inline/file_delete` records, refusing any the

@@ -71,26 +71,6 @@ key.
   it: the interrupt path is 0010's shielding work. Wire the core to raise it
   as that path lands. `Unsupported`, `SnapshotExpired` and `Migration` are
   raised.
-- **DEFERRED** — A general verb for registering a row-id-preserving (rewrite)
-  data file. Owned by a future RFC covering the compaction surface (0016).
-  `flush_inlined_data` carries its own registration, so the inline path does
-  not wait on this.
-- **DEFERRED** — A time-travelling inline read. `recent_rows` serves head;
-  the selection underneath it takes any snapshot (it is what the extension's
-  four scan variants ride), so a `recent_rows_at` is a signature away. No
-  embedding consumer needs one yet.
-- **DEFERRED** — Let one commit both inline into a table and flush it. The
-  drain reads the store as it stood before the commit, so a chunk staged in
-  the same commit would survive its own flush; the verb refuses the
-  combination rather than double-count. Lifting it means resolving the drain
-  against the transaction's own staged chunks as well as the store's.
-- **DEFERRED** — A `create_mapping` verb, if an embedding consumer
-  materializes (0018).
-- **DEFERRED** — A snapshot-expiry verb (0007).
-- **DEFERRED** — Verbs for the DuckLake v1.0 spec's remaining tables, as the
-  e2e suite reaches them.
-- **DECISION** — The extension-contract question in 0005 still gates knowing
-  the full set of operations the core must expose.
 
 ## 0004 — Commit and transaction protocol
 

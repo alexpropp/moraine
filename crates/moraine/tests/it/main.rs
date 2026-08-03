@@ -16,6 +16,7 @@ mod inline_data;
 mod macros;
 mod measure;
 mod partitioning;
+mod sorting;
 mod staged_index_build;
 mod tags;
 mod views_options;

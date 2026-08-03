@@ -353,12 +353,15 @@ pub(crate) async fn read_head_id(tx: ReadHandle<'_>) -> Result<u64> {
         .snapshot_id)
 }
 
-/// Materializes a catalog view through an open transaction, so the view
-/// and any staged writes share one read point. `at: None` reads the head
-/// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
-/// entities live at `s`.
-pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
-    refuse_mid_migration(tx).await?;
+/// Resolves a requested read point to the snapshot it reads at and that
+/// snapshot's record. `at: None` resolves to head.
+///
+/// Every read that takes a snapshot id resolves it here, so catalog views
+/// and inlined-row reads refuse the same ids for the same reasons.
+pub(crate) async fn resolve_read_snapshot(
+    tx: ReadHandle<'_>,
+    at: Option<u64>,
+) -> Result<(u64, proto::SnapshotValue)> {
     let head = read_head_id(tx).await?;
     let target = match at {
         Some(requested) if requested > head => {
@@ -379,6 +382,17 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
              re-resolve from head"
         ))
     })?;
+
+    Ok((target, snapshot))
+}
+
+/// Materializes a catalog view through an open transaction, so the view
+/// and any staged writes share one read point. `at: None` reads the head
+/// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
+/// entities live at `s`.
+pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
+    refuse_mid_migration(tx).await?;
+    let (target, snapshot) = resolve_read_snapshot(tx, at).await?;
     let current = read::scan_current_entities(tx).await?;
     let history = match at {
         Some(_) => read::scan_history_entities(tx).await?,

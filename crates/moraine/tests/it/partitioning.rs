@@ -1,9 +1,10 @@
 //! Partition specs through the verb surface: setting, replacing, clearing,
-//! and reading one back — at head and by time travel.
+//! reading one back — at head and by time travel — and registering a data
+//! file into the partition it falls in.
 
-use moraine::{Error, PartitionColumnDef, TableId};
+use moraine::{DataFile, Error, PartitionColumnDef, TableId};
 
-use crate::fixtures::{col, seeded};
+use crate::fixtures::{col, datafile, seeded};
 
 fn key(column: moraine::ColumnId, transform: &str) -> PartitionColumnDef {
     PartitionColumnDef {
@@ -235,4 +236,194 @@ async fn setting_a_spec_bumps_the_schema_version() {
         .current_snapshot()
         .schema_version;
     assert_eq!(after, before + 1);
+}
+
+/// A file registered into a partitioned table records the values it falls
+/// under and the spec they belong to, and reads back in key order —
+/// through the accessor and through the `ducklake_file_partition_value`
+/// projection the extension serves.
+#[tokio::test]
+async fn a_registered_file_carries_the_partition_it_falls_in() {
+    let (catalog, _, table, _) = seeded().await;
+    catalog
+        .commit(|tx| {
+            tx.add_column(table, &col("y"))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let columns = catalog.snapshot().await.unwrap().columns_of(table);
+    let (x, y) = (columns[0].id, columns[1].id);
+
+    catalog
+        .commit(move |tx| {
+            tx.set_partitioning(table, &[key(x, "identity"), key(y, "year")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let spec_id = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .partitioning_of(table)
+        .unwrap()
+        .id;
+
+    catalog
+        .commit(move |tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    partition_values: vec!["eu-west".into(), "2026".into()],
+                    ..datafile(3)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let files = catalog.snapshot().await.unwrap().data_files_of(table);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].partition_id, Some(spec_id));
+    assert_eq!(files[0].partition_values, vec!["eu-west", "2026"]);
+
+    let rows = moraine::ffi_support::dump_file_partition_value_rows(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.partition_key_index, row.partition_value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "eu-west"), (1, "2026")]
+    );
+}
+
+/// The values must match the live spec's keys one for one: too few or too
+/// many would leave the file in a partition no reader can reconstruct.
+#[tokio::test]
+async fn a_file_must_carry_one_value_per_partition_key() {
+    let (catalog, _, table, _) = seeded().await;
+    let x = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    catalog
+        .commit(move |tx| {
+            tx.set_partitioning(table, &[key(x, "identity")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    for values in [vec![], vec!["a".to_string(), "b".to_string()]] {
+        let err = catalog
+            .commit(move |tx| {
+                tx.register_data_file(
+                    table,
+                    DataFile {
+                        partition_values: values.clone(),
+                        ..datafile(1)
+                    },
+                    &[],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn an_unpartitioned_table_refuses_a_file_carrying_values() {
+    let (catalog, _, table, _) = seeded().await;
+    let err = catalog
+        .commit(move |tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    partition_values: vec!["eu-west".into()],
+                    ..datafile(1)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+}
+
+/// Repartitioning does not disturb files already registered: each keeps
+/// the spec it was written under and the values it was written with, which
+/// is what lets files under different specs coexist.
+#[tokio::test]
+async fn a_file_keeps_its_own_spec_across_a_repartition() {
+    let (catalog, _, table, _) = seeded().await;
+    let x = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    catalog
+        .commit(move |tx| {
+            tx.set_partitioning(table, &[key(x, "identity")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let first_spec = catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .partitioning_of(table)
+        .unwrap()
+        .id;
+    catalog
+        .commit(move |tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    partition_values: vec!["old".into()],
+                    ..datafile(1)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .commit(move |tx| {
+            tx.set_partitioning(table, &[key(x, "year")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    catalog
+        .commit(move |tx| {
+            tx.register_data_file(
+                table,
+                DataFile {
+                    partition_values: vec!["new".into()],
+                    ..datafile(2)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    let second_spec = head.partitioning_of(table).unwrap().id;
+    let files = head.data_files_of(table);
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| (file.partition_id, file.partition_values.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(first_spec), vec!["old".to_string()]),
+            (Some(second_spec), vec!["new".to_string()]),
+        ]
+    );
 }

@@ -915,6 +915,7 @@ mod tests {
                         file_size_bytes: 1024,
                         footer_size: 64,
                         encryption_key: None,
+                        partition_values: vec![],
                         column_stats: vec![FileColumnStats {
                             column_id: column,
                             column_size_bytes: 100,

@@ -46,6 +46,15 @@ pub(crate) enum Operation {
         /// The mutated table's id.
         table_id: u64,
     },
+    /// A table's sort spec was set, changed, or cleared. Classifies as an
+    /// alter — it races a concurrent drop or another spec change — but is
+    /// not schema-changing: DuckLake marks the table altered without
+    /// bumping the schema version, a sort spec never invalidating a
+    /// cross-file compaction.
+    AlterTableSorting {
+        /// The re-sorted table's id.
+        table_id: u64,
+    },
     /// A table was dropped.
     DropTable {
         /// The dropped table's id.
@@ -161,7 +170,8 @@ impl Operation {
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
             | Operation::DropMacro { .. } => true,
-            Operation::RegisterDataFile { .. }
+            Operation::AlterTableSorting { .. }
+            | Operation::RegisterDataFile { .. }
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
             | Operation::ExpireDeleteFile { .. }
@@ -188,6 +198,7 @@ impl Operation {
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
             | Operation::AlterSchema { .. }
+            | Operation::AlterTableSorting { .. }
             | Operation::DropTable { .. }
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
@@ -367,7 +378,7 @@ impl ChangeSet {
                         .insert((schema_name.clone(), table_name.clone()));
                     set.created_table_schema_ids.insert(*schema_id);
                 }
-                Operation::AlterTable { table_id } => {
+                Operation::AlterTable { table_id } | Operation::AlterTableSorting { table_id } => {
                     set.altered_tables.insert(*table_id);
                 }
                 Operation::DropTable { table_id } => {
@@ -1217,5 +1228,29 @@ mod tests {
         assert!(!Operation::ExpireDataFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::ExpireDeleteFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::UpdateStats { table_id: 0 }.is_schema_changing());
+    }
+
+    /// A sort change is the one table alter that is not schema-changing,
+    /// and it still conflicts with everything an alter conflicts with.
+    #[test]
+    fn a_sort_change_alters_the_table_without_changing_its_schema() {
+        let sorting = Operation::AlterTableSorting { table_id: 1 };
+        assert!(!sorting.is_schema_changing());
+        assert_eq!(sorting.schema_changed_table_id(), None);
+
+        let sorted = ChangeSet::from_operations(&[sorting]);
+        let dropped = ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]);
+        let altered = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
+        assert!(conflicts(&sorted, &dropped));
+        assert!(conflicts(&sorted, &altered));
+        assert!(conflicts(&sorted, &sorted));
+
+        // An append conflicts with it, as with any alter — DuckLake's
+        // matrix, not a rule sorting gets to soften.
+        let appended = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        assert!(conflicts(&sorted, &appended));
+
+        let elsewhere = ChangeSet::from_operations(&[Operation::AlterTableSorting { table_id: 2 }]);
+        assert!(!conflicts(&sorted, &elsewhere));
     }
 }

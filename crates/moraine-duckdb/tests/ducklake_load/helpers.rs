@@ -113,6 +113,7 @@ pub fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
                         file_size_bytes,
                         footer_size,
                         encryption_key: None,
+                        partition_values: vec![],
                         column_stats: vec![],
                     },
                     &[],

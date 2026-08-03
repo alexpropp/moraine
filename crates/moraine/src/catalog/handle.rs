@@ -607,7 +607,35 @@ impl Catalog {
     /// ```
     pub async fn recent_rows(&self, table: TableId) -> Result<Vec<RecentRow>> {
         let session = self.begin_read().await?;
-        let outcome = self.scan_recent_rows(&session, table).await;
+        let outcome = self.scan_recent_rows(&session, table, None).await;
+        session.finish();
+
+        outcome
+    }
+
+    /// A table's inlined rows as of `snapshot` (time travel): the rows whose
+    /// insert had landed by then and whose tombstone had not.
+    ///
+    /// Only rows still inlined are found. A flush drains the chunks it
+    /// consumes, so past snapshots of flushed rows read from the backdated
+    /// data file [`CatalogSnapshot::data_files_of`] serves, never from here
+    /// — which is what keeps the rows in exactly one place at every
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::recent_rows`], plus [`Error::NotFound`] if `snapshot` is
+    /// beyond the head and [`Error::SnapshotExpired`] if it has fallen below
+    /// the retention horizon.
+    pub async fn recent_rows_at(
+        &self,
+        table: TableId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<RecentRow>> {
+        let session = self.begin_read().await?;
+        let outcome = self
+            .scan_recent_rows(&session, table, Some(snapshot.get()))
+            .await;
         session.finish();
 
         outcome
@@ -627,21 +655,30 @@ impl Catalog {
             .find(|row| row.row_id == row_id))
     }
 
-    /// The live-at-head inline rows of `table`, read through an open
-    /// session.
+    /// The inline rows of `table` live at `at` (head, when `None`), read
+    /// through an open session.
     async fn scan_recent_rows(
         &self,
         session: &ReadSession,
         table: TableId,
+        at: Option<u64>,
     ) -> Result<Vec<RecentRow>> {
         let handle = session.handle();
         commit::refuse_mid_migration(handle).await?;
-        let head = commit::read_head_id(handle).await?;
+        // Head takes no id and so needs no resolution; a requested snapshot
+        // is resolved exactly as `snapshot_at` resolves one.
+        let read_at = match at {
+            Some(_) => commit::resolve_read_snapshot(handle, at).await?.0,
+            None => commit::read_head_id(handle).await?,
+        };
         let chunks = store_inline::scan_inline_chunks(handle, table.get()).await?;
         let tombstones = store_inline::scan_inline_inline_deletes(handle, table.get()).await?;
 
-        let live =
-            InlineScanKind::Table.select(&materialize_inline_rows(&chunks, &tombstones), head, 0);
+        let live = InlineScanKind::Table.select(
+            &materialize_inline_rows(&chunks, &tombstones),
+            read_at,
+            0,
+        );
         // One body per referenced chunk and one schema per referenced
         // version, however many rows point at them.
         let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
