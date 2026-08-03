@@ -1,9 +1,12 @@
 //! The read cache through the public API: repeated reads must serve the
 //! same catalog a cold read would build, whatever the cache did in between.
 
-use moraine::SnapshotId;
+use std::sync::Arc;
 
-use crate::fixtures::{col, datafile, open_memory, seeded};
+use moraine::{Catalog, CatalogOptions, SnapshotId};
+use object_store::memory::InMemory;
+
+use crate::fixtures::{col, datafile, seeded};
 
 /// A second read is served from the cache after a commit moved head. It
 /// must show the commit — a cache that serves a stale head is worse than
@@ -125,12 +128,56 @@ async fn a_cached_read_matches_a_cold_reopen() {
     catalog.close().await.unwrap();
 }
 
-/// A read-only catalog keeps no cache, so its reads must still resolve the
-/// writer's commits from the store on every call.
+/// A held view is a value, not a cursor: commits after it was built must
+/// leave it exactly as it was, however many land and whatever they touch.
 #[tokio::test]
-async fn a_read_only_catalog_reads_through() {
-    let catalog = open_memory().await;
-    catalog
+async fn a_held_view_is_unmoved_by_later_commits() {
+    let (catalog, schema, table_a, table_b) = seeded().await;
+
+    let held = catalog.snapshot().await.unwrap();
+    let at = held.current_snapshot().id.get();
+    let tables_before = held.tables_in(schema).len();
+    let files_before = held.data_files_of(table_a).len();
+
+    for round in 0..4u64 {
+        catalog
+            .commit(|tx| {
+                tx.register_data_file(table_a, datafile(round), &[])?;
+                tx.create_table(schema, &format!("later{round}"), &[col("x")])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    catalog.commit(|tx| tx.drop_table(table_b)).await.unwrap();
+
+    assert_eq!(held.current_snapshot().id.get(), at);
+    assert_eq!(held.tables_in(schema).len(), tables_before);
+    assert_eq!(held.data_files_of(table_a).len(), files_before);
+    assert!(held.table_by_name(schema, "later0").is_none());
+    assert!(held.table_by_name(schema, "b").is_some());
+
+    // The same view, rebuilt from `history` at the same snapshot, agrees —
+    // so what the held value shows is the catalog at `at`, not a stale
+    // accident of how it was built.
+    let travelled = catalog.snapshot_at(SnapshotId::new(at)).await.unwrap();
+    assert_eq!(travelled.tables_in(schema).len(), tables_before);
+    assert_eq!(travelled.data_files_of(table_a).len(), files_before);
+
+    catalog.close().await.unwrap();
+}
+
+/// A read-only catalog caches its view as a writer does. It has no commits
+/// of its own to fold, so what the cache must never do is drift: a second
+/// read has to answer exactly what the first one did and exactly what the
+/// store holds.
+#[tokio::test]
+async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let writer = Catalog::open(object_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
         .commit(|tx| {
             let schema = tx.create_schema("s")?;
             tx.create_table(schema, "t", &[col("x")])?;
@@ -139,9 +186,36 @@ async fn a_read_only_catalog_reads_through() {
         .await
         .unwrap();
 
-    let snapshot = catalog.snapshot().await.unwrap();
-    let schema = snapshot.schema_by_name("s").unwrap().id;
-    assert!(snapshot.table_by_name(schema, "t").is_some());
+    // A reader opened after `commit` returns resolves that commit.
+    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let first = reader.snapshot().await.unwrap();
+    let schema = first.schema_by_name("s").unwrap().id;
+    assert!(first.table_by_name(schema, "t").is_some());
 
-    catalog.close().await.unwrap();
+    // The second read is served from the cache and must not drift.
+    let second = reader.snapshot().await.unwrap();
+    assert_eq!(
+        first.current_snapshot().id.get(),
+        second.current_snapshot().id.get()
+    );
+    assert_eq!(
+        second.tables_in(schema).len(),
+        first.tables_in(schema).len()
+    );
+    assert!(second.table_by_name(schema, "t").is_some());
+
+    // And it matches what a rebuild from the store at the same snapshot
+    // shows, so the cache is not the only thing that believes it.
+    let scanned = reader
+        .snapshot_at(SnapshotId::new(first.current_snapshot().id.get()))
+        .await
+        .unwrap();
+    assert_eq!(
+        scanned.tables_in(schema).len(),
+        first.tables_in(schema).len()
+    );
+
+    writer.close().await.unwrap();
 }

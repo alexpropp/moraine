@@ -39,7 +39,7 @@ use crate::{
         handle::ReadHandle,
         index_encoding::encode_ordered_values,
         inline as store_inline,
-        key::{EntityKey, InlineKey, InlineOperation, Key, SysKey},
+        key::{EntityKey, InlineKey, InlineOperation, Key},
         proto, read, value,
     },
     transaction::{
@@ -542,6 +542,9 @@ impl StagedTransaction {
 
         let translated = if mints_snapshot {
             translate(base_ref, &ops, &poisoned).map(|(new_id, mut writes, snap)| {
+                // Derived before the snapshot record joins the batch: the
+                // changelog names `current` keys, and that record is not.
+                let changelog = commit::changelog_writes(new_id, &writes);
                 writes.push((
                     Key::Snapshot {
                         snapshot_id: new_id,
@@ -549,12 +552,7 @@ impl StagedTransaction {
                     .encode(),
                     Some(value::encode_value(&snap)),
                 ));
-                writes.push((
-                    Key::Sys(SysKey::Head).encode(),
-                    Some(value::encode_value(&proto::HeadValue {
-                        snapshot_id: new_id,
-                    })),
-                ));
+                writes.extend(changelog);
                 (new_id, writes)
             })
         } else {
@@ -564,6 +562,18 @@ impl StagedTransaction {
 
         match translated {
             Ok((result_id, mut writes)) => {
+                // Every batch stamps the head — a maintenance one included,
+                // where it reuses the standing snapshot id and only the
+                // batch count moves. That makes `sys/head` the one conflict
+                // anchor every batch shares, and the stamp a reader
+                // validates its cut against.
+                match commit::head_write(&db_tx, result_id).await {
+                    Ok(head) => writes.push(head),
+                    Err(err) => {
+                        db_tx.rollback();
+                        return Err(err);
+                    }
+                }
                 writes.extend(inline_writes);
                 if let Err(err) = commit::stage_writes(&db_tx, &writes) {
                     db_tx.rollback();

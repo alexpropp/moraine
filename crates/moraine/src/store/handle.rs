@@ -33,6 +33,14 @@ impl ReadHandle<'_> {
         }
     }
 
+    /// Whether one pass of several reads through this handle observes a
+    /// single store state on its own. A transaction reads at its own start
+    /// sequence, so it does; a reader follows the manifest and advances
+    /// between calls, so it does not.
+    pub(crate) fn is_isolated(&self) -> bool {
+        matches!(self, Self::Tx(_))
+    }
+
     /// Scan keys sharing `prefix`, restricted to `subrange`.
     pub(crate) async fn scan_prefix<P, T>(
         &self,

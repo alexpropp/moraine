@@ -10,7 +10,7 @@ use crate::{
     catalog::CatalogSnapshot,
     store::{
         key::{CurrentKey, EntityKey, Key},
-        proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
+        proto::{HeadValue, SnapshotValue, TableColumnStatsValue, TableStatsValue},
         read::EntityRecord,
         value,
     },
@@ -94,15 +94,28 @@ pub(crate) fn fold_committed_batch(
         .apply_batch(writes, new_head);
 }
 
-/// The cached head view iff it is exactly at `expected_head`.
+/// The cached head view iff it stands at exactly the state `expected`
+/// names.
 pub(crate) fn cached_head_view(
     cache: &std::sync::RwLock<ProjectionCache>,
-    expected_head: u64,
+    expected: &HeadValue,
 ) -> Option<Arc<CatalogSnapshot>> {
     cache
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .head_view(expected_head)
+        .head_view(expected)
+}
+
+/// The cached head view whatever state it stands at — the base an
+/// incremental refresh advances when it has fallen behind.
+pub(crate) fn held_head_view(
+    cache: &std::sync::RwLock<ProjectionCache>,
+) -> Option<Arc<CatalogSnapshot>> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .head_view
+        .clone()
 }
 
 pub(crate) fn install_head_view(
@@ -180,11 +193,17 @@ impl ProjectionCache {
         }
     }
 
-    /// The head view iff it is exactly at `expected_head`.
-    pub(crate) fn head_view(&self, expected_head: u64) -> Option<Arc<CatalogSnapshot>> {
+    /// The head view iff it stands at exactly the state `expected` names.
+    /// Both halves of the stamp are checked: a maintenance batch reuses the
+    /// snapshot id, so the id alone would let a view of the state it
+    /// reclaimed keep serving.
+    pub(crate) fn head_view(&self, expected: &HeadValue) -> Option<Arc<CatalogSnapshot>> {
         self.head_view
             .as_ref()
-            .filter(|view| view.snapshot.snapshot_id == expected_head)
+            .filter(|view| {
+                view.snapshot.snapshot_id == expected.snapshot_id
+                    && view.batch_seq == expected.batch_seq
+            })
             .cloned()
     }
 
@@ -318,6 +337,14 @@ mod tests {
         })
     }
 
+    /// The head record naming the state `view_at` builds a view of.
+    fn head_at(snapshot_id: u64) -> HeadValue {
+        HeadValue {
+            snapshot_id,
+            batch_seq: 0,
+        }
+    }
+
     /// A reader pins its handle and then reads, so an invalidation can land
     /// mid-read. Installing afterwards must not resurrect the view that
     /// invalidation existed to discard.
@@ -329,7 +356,7 @@ mod tests {
         invalidate_head_view(&cache);
         install_head_view_at(&cache, epoch, view_at(7));
 
-        assert!(cached_head_view(&cache, 7).is_none());
+        assert!(cached_head_view(&cache, &head_at(7)).is_none());
     }
 
     /// Without an intervening invalidation the same install must land, or
@@ -341,7 +368,7 @@ mod tests {
         let epoch = cache_epoch(&cache);
         install_head_view_at(&cache, epoch, view_at(7));
 
-        assert!(cached_head_view(&cache, 7).is_some());
+        assert!(cached_head_view(&cache, &head_at(7)).is_some());
     }
 
     /// Snapshot rows read directly from the store, bypassing the cache.

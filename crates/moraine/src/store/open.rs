@@ -26,6 +26,11 @@ use crate::{
 /// The default WAL flush cadence when none is configured.
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How often a read-only handle polls for new state when none is
+/// configured — SlateDB's own default, kept so an unconfigured reader
+/// costs exactly what it always has.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Creates a checkpoint of everything `db` has committed, expiring after
 /// `lifetime` (never, if `None`), and reports its id. The scope is every
 /// write the handle has taken, not only the already-durable ones, so a
@@ -52,6 +57,7 @@ pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
     flush_interval: Duration,
+    poll_interval: Duration,
     cache_dir: Option<PathBuf>,
     checkpoint: Option<Uuid>,
 }
@@ -64,9 +70,17 @@ impl<'a> StoreBuilder<'a> {
             path,
             object_store,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
             checkpoint: None,
         }
+    }
+
+    /// Sets how often a read-only handle polls for new state. Reader only —
+    /// a writer reads its own writes.
+    pub(crate) fn poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
     }
 
     /// Sets the WAL flush cadence. Durable commits wait for the next flush,
@@ -120,6 +134,7 @@ impl<'a> StoreBuilder<'a> {
     pub(crate) async fn open_reader(&self) -> Result<DbReader> {
         let options = DbReaderOptions {
             object_store_cache_options: self.cache_options(),
+            manifest_poll_interval: self.poll_interval,
             ..Default::default()
         };
         let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))

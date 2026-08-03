@@ -7,10 +7,11 @@ use crate::{
         handle::ReadHandle,
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
-            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
-            GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
-            OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue, SnapshotValue,
-            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
+            ChangelogValue, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
+            FormatValue, GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue,
+            MigrationValue, OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue,
+            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
+            ViewValue,
         },
         value,
     },
@@ -129,9 +130,62 @@ pub(crate) async fn read_migration(handle: ReadHandle<'_>) -> Result<Option<Migr
     read_singleton(handle, Key::Sys(SysKey::Migration)).await
 }
 
-/// The head pointer: the latest committed snapshot id.
+/// The head pointer: the latest committed snapshot id and batch count.
 pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue>> {
     read_singleton(handle, Key::Sys(SysKey::Head)).await
+}
+
+/// How many times a read-only pass is re-run before its instability is
+/// reported. A reader's state advances only when its manifest poller runs,
+/// not on every commit, so a pass that straddles one refresh is very
+/// unlikely to straddle the next.
+const STABLE_READ_ATTEMPTS: usize = 8;
+
+/// Runs `read` so that everything it observes belongs to one store state.
+///
+/// A transaction handle reads at its own start sequence, so it already
+/// does and `read` runs once. A read-only reader follows the manifest:
+/// its state advances between calls, and a pass of several reads can
+/// straddle a commit and return a mix of before and after. Every batch
+/// writes the head record and moves its batch count — a maintenance batch
+/// that reuses the snapshot id included — so reading that record before
+/// and after the pass detects any state the pass could have straddled.
+/// A pass that saw it move is discarded and re-run, never returned.
+///
+/// # Errors
+///
+/// Returns [`Error::RetryBudgetExhausted`] if the store moved under every
+/// attempt, or whatever `read` itself returns.
+pub(crate) async fn consistent<T, F, Fut>(handle: ReadHandle<'_>, read: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    if handle.is_isolated() {
+        return read().await;
+    }
+
+    for _ in 0..STABLE_READ_ATTEMPTS {
+        let before = read_head(handle).await?;
+        let value = read().await?;
+        if read_head(handle).await? == before {
+            return Ok(value);
+        }
+    }
+
+    Err(Error::RetryBudgetExhausted(format!(
+        "a read-only pass could not observe a single store state in \
+         {STABLE_READ_ATTEMPTS} attempts; the catalog is committing faster than it reads"
+    )))
+}
+
+/// One commit's changelog, absent once it falls out of the retained
+/// window (or if the commit recorded none).
+pub(crate) async fn read_changelog(
+    handle: ReadHandle<'_>,
+    snapshot_id: u64,
+) -> Result<Option<ChangelogValue>> {
+    read_singleton(handle, Key::Changelog { snapshot_id }).await
 }
 
 /// One snapshot record.
@@ -272,7 +326,10 @@ mod tests {
             .await
             .unwrap();
 
-        let head = HeadValue { snapshot_id: 3 };
+        let head = HeadValue {
+            snapshot_id: 3,
+            batch_seq: 1,
+        };
         let schema = SchemaValue {
             schema_id: 1,
             schema_uuid: "u".into(),

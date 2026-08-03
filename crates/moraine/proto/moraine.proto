@@ -337,6 +337,16 @@ message SnapshotValue {
   repeated uint64 deleted_data_file_ids = 12;
 }
 
+// changelog/<snapshot_id>: the `current` keys one commit's batch wrote,
+// encoded and sorted. A reader holding a view at an older snapshot
+// advances it by re-reading exactly these keys instead of rescanning
+// `current`, so the changelog a refresh needs is the one the commit
+// already produced. Only a refresh reads these — one point read per
+// snapshot in its gap — so they cost the serve path nothing.
+message ChangelogValue {
+  repeated bytes keys = 1;
+}
+
 // schema_version/<table_id>/<begin_snapshot>: the catalog schema version
 // the snapshot minted. The key carries the other two columns of the
 // ducklake_schema_versions row.
@@ -359,9 +369,14 @@ message FormatValue {
   string writer_version = 2;
 }
 
-// sys/head: latest committed snapshot id.
+// sys/head: latest committed snapshot id, and the count of batches that
+// have landed. Every batch writes this record and increments the count,
+// including a maintenance batch that reuses the snapshot id, so the pair
+// changes whenever any committed state does — which is what lets a
+// read-only reader tell a consistent cut from a torn one.
 message HeadValue {
   uint64 snapshot_id = 1;
+  uint64 batch_seq = 2;
 }
 
 // sys/migration: structural-migration marker. Present only
