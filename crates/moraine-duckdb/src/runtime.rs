@@ -172,13 +172,79 @@ impl MoraineSnapshotHandle {
     }
 }
 
+/// The fewest workers an attached catalog's runtime may have.
+///
+/// Two, not one: a CPU-bound poll (an SST decode on a large catalog) holds
+/// its worker to completion, and SlateDB's flush and compaction must
+/// progress while it does or durability stalls behind a scan. That is the
+/// same reason the runtime is multi-threaded at all, so it is the floor
+/// rather than a tuning knob.
+const MIN_WORKER_THREADS: usize = 2;
+
+/// The most workers an attached catalog's runtime may have, however many
+/// threads the host asks for.
+///
+/// The pool's work is object-store round trips, which yield their worker
+/// at every await: a four-worker runtime absorbs thirty-two concurrent
+/// materializations with a flat batch time (`BENCHMARK.md` → Core
+/// measurements). Past a handful, further workers only park — and they
+/// park in addition to the host's own threads, on cores the host already
+/// sized itself to.
+const MAX_WORKER_THREADS: usize = 8;
+
+/// The worker count for a host that asks for `requested` threads of its
+/// own, or the [floor](MIN_WORKER_THREADS) if it asks for nothing.
+///
+/// The host's thread setting is the only number in the process that says
+/// how much parallelism the operator wanted, so a session pinned to one
+/// thread does not get a catalog pool sized to the machine.
+pub(crate) fn worker_threads(requested: usize) -> usize {
+    requested.clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS)
+}
+
 /// Builds the one multi-threaded tokio runtime an attached catalog owns
-/// for the lifetime of its handle. Worker threads exist only to run that
-/// handle's work, so each is tagged with `log_id` at spawn — every event
-/// they emit routes to the handle's log sink.
-pub(crate) fn new_runtime(log_id: HandleId) -> std::io::Result<Runtime> {
+/// for the lifetime of its handle, sized for a host running `requested`
+/// threads of its own (`0` when the host does not say). Worker threads
+/// exist only to run that handle's work, so each is tagged with `log_id`
+/// at spawn — every event they emit routes to the handle's log sink.
+///
+/// The size is fixed at attach. A host that changes its own thread count
+/// later keeps the pool it attached with, which is the trade for never
+/// rebuilding a runtime that owns live background tasks.
+pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result<Runtime> {
     Builder::new_multi_thread()
+        .worker_threads(worker_threads(requested))
         .enable_all()
         .on_thread_start(move || tag_thread_for_handle(log_id))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_WORKER_THREADS, MIN_WORKER_THREADS, worker_threads};
+
+    /// The pool tracks the host between the floor and the ceiling, and is
+    /// never single-threaded — a one-worker runtime would let a CPU-bound
+    /// poll stall SlateDB's flush, which is the whole reason the runtime
+    /// is multi-threaded.
+    #[test]
+    fn the_worker_pool_tracks_the_host_between_its_floor_and_ceiling() {
+        assert_eq!(
+            worker_threads(0),
+            MIN_WORKER_THREADS,
+            "a host that says nothing takes the floor"
+        );
+        assert_eq!(
+            worker_threads(1),
+            MIN_WORKER_THREADS,
+            "`SET threads=1` still gets a background worker"
+        );
+        assert_eq!(worker_threads(4), 4, "in range, the host's setting stands");
+        assert_eq!(
+            worker_threads(128),
+            MAX_WORKER_THREADS,
+            "a huge host thread count is capped"
+        );
+        const { assert!(MIN_WORKER_THREADS >= 2) };
+    }
 }

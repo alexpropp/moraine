@@ -791,6 +791,49 @@ pub(crate) async fn commit_batch(
     }
 }
 
+/// Runs [`commit_batch`] on a task of its own, putting the durable write
+/// out of reach of the caller's cancellation.
+///
+/// Everything before this call is staged in memory and freely droppable;
+/// the write is the point of no return, and dropping a future parked
+/// inside it cannot retract a batch already issued. Spawning moves it off
+/// the cancellable future, so an interrupt races the *wait*, never the
+/// write.
+pub(crate) fn spawn_commit_batch(
+    db_tx: DbTransaction,
+    head_before: u64,
+    head: u64,
+    writes: Vec<StagedWrite>,
+    base: Arc<CatalogSnapshot>,
+    projections: Arc<std::sync::RwLock<ProjectionCache>>,
+) -> tokio::task::JoinHandle<Result<Landed>> {
+    tokio::spawn(async move {
+        commit_batch(db_tx, head_before, head, &writes, &base, &projections).await
+    })
+}
+
+/// Waits for a spawned durable write to report back.
+///
+/// A task that never reports — cancelled with the runtime, or lost to a
+/// panic — leaves the write's fate unknown, which is the one answer a
+/// caller must not read as "nothing landed". It surfaces as
+/// [`Error::Interrupted`] so the caller re-resolves head instead of
+/// re-driving a commit that may already be durable.
+pub(crate) async fn join_commit_batch(
+    handle: tokio::task::JoinHandle<Result<Landed>>,
+) -> Result<Landed> {
+    match handle.await {
+        Ok(landed) => landed,
+        Err(err) => {
+            warn!(error = %err, "the durable write did not report back; its outcome is unknown");
+            Err(Error::Interrupted(format!(
+                "the durable write did not report back ({err}); it may or may not have \
+                 landed — re-resolve head before re-driving"
+            )))
+        }
+    }
+}
+
 /// Commits a group of closures as one batch, retrying benign races with a
 /// full re-run — fresh snapshot, closures, ids — so every member's premise
 /// re-validates against the state that won. A true conflict surfaces as

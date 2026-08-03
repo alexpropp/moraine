@@ -60,10 +60,15 @@ pub enum Error {
     SnapshotExpired(String),
 
     /// A host interrupt cancelled the operation before its point of no
-    /// return. Distinct from a store failure so the bridge can raise
+    /// return, or a durable write past that point never reported its
+    /// outcome. Distinct from a store failure so the bridge can raise
     /// DuckDB's interrupt, and free of retry substrings — an interrupted
     /// commit whose durability is ambiguous must never be re-driven as a
     /// conflict.
+    ///
+    /// The two cases differ only in what the caller must do next: nothing
+    /// after a clean pre-write cancellation, and a re-resolve of head
+    /// after an unreported write, which may or may not have landed.
     #[error("interrupted: {0}")]
     Interrupted(String),
 

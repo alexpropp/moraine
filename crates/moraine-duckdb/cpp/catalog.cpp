@@ -756,10 +756,15 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	MoraineS3Config s3 {};
 	S3SecretStrings s3_strings;
 	bool is_s3 = ResolveS3Config(context, info.path, s3, s3_strings);
+	// DuckDB's own execution-thread count sizes the catalog's worker pool,
+	// so a session pinned with `SET threads=1` does not get one sized to
+	// the machine on top of DuckDB's. The ABI clamps it; read once here,
+	// since the pool is fixed for the attach's life.
+	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
 	                           data_path.empty() ? nullptr : data_path.c_str(),
-	                           checkpoint.empty() ? nullptr : checkpoint.c_str(),
+	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)
 	// would otherwise sit buffered until some later commit — or forever, on

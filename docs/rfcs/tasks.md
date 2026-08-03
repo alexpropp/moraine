@@ -65,13 +65,6 @@ key.
   using the established conventions (own kind, embedded child, or merged 1:1
   side table) by updating the RFC rather than diverging.
 
-## 0003 — Public API shape of the core
-
-- **IMPL** — `Error::Interrupted` is bridged but nothing in the core raises
-  it: the interrupt path is 0010's shielding work. Wire the core to raise it
-  as that path lands. `Unsupported`, `SnapshotExpired` and `Migration` are
-  raised.
-
 ## 0004 — Commit and transaction protocol
 
 - **DEFERRED** — Let the staged-row path join a batch. Both front doors now
@@ -199,33 +192,12 @@ key.
 
 ## 0010 — Async↔sync bridge
 
-- **IMPL** — Split the commit at the point of no return: pre-write phases
-  inside the `select!`, the durable batch write via `Handle::spawn`, the FFI
-  thread awaiting the join handle while still racing the token. No `spawn`
-  exists in either crate, so an interrupt arriving mid-commit drops the
-  durable-write future.
-- **IMPL** — Document the ambiguous interrupted-but-landed outcome on the FFI
-  commit entry point.
-- **DECISION** — Pin exactly how DuckDB hands an interrupt to a C-ABI
-  extension — pollable flag, callback, or cancellation handle — which
-  determines whether the token is polled or signal-driven.
-- **DECISION** — The runtime's default worker-thread count, likely derived from
-  DuckDB's own thread setting to avoid core oversubscription.
 - **DEFERRED** — Share one runtime across many attached catalogs in a single
   process, if many-catalog processes prove common.
 - **DEFERRED** — Track DuckDB's extension API for a future async catalog or
   operator contract, without pre-building for it.
 - **DEFERRED** — A commit-funnel dispatcher serializing a many-connection
   process through a single committer, if a many-committer process appears.
-- **MEASURE** — Whether CPU-bound SST decode monopolizes a worker under a
-  decode-heavy scan — the one axis where a `spawn_blocking` discipline might
-  help. IO latency is settled: it does not starve the pool (`BENCHMARK.md` →
-  Core measurements), so this is the only remaining part of the question.
-- **VALIDATE** — Interrupt coverage: before the commit write, head unchanged
-  with no partial records; during the shielded write, prompt return while the
-  write completes untorn and head is exactly `N` or `N+1`; after the durable
-  write, the committed snapshot still reported; an interrupted materialization
-  releases its read-snapshot with no durable effect.
 
 ## 0011 — Crash recovery
 
