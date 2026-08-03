@@ -1767,6 +1767,114 @@ pub unsafe extern "C" fn moraine_maintain(
     }
 }
 
+/// Runs one bounded fold pass: applies up to `limit` unfolded slots into
+/// the store, advancing the durable fold cursor, and writes the count
+/// applied to `*out_slots_folded` and the slots still unfolded to
+/// `*out_tail_remaining`. `limit` of 0 folds nothing and only reports the
+/// tail.
+///
+/// Folding is invisible to readers — the served state is byte-identical
+/// before and after — so a pass may run whenever. A read-only attach is
+/// refused with [`codes::CONSTRAINT`]; a concurrent folder fencing this
+/// session surfaces as [`codes::FENCED`], which the caller treats as
+/// wasted work rather than an error.
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`]. The
+/// out-parameters, if non-null, must be writable, and `err`, if non-null,
+/// must be writable. All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_fold_sprint(
+    handle: *mut MoraineCatalogHandle,
+    limit: u64,
+    out_slots_folded: *mut u64,
+    out_tail_remaining: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        // The scheduler drives this on its own thread, which stops through
+        // the stop flag rather than a query interrupt, so no probe.
+        // SAFETY: a `None` probe polls nothing.
+        let report = unsafe {
+            handle_ref.block_on_cancellable(
+                None,
+                ptr::null_mut(),
+                handle_ref.catalog.fold_sprint(limit),
+            )
+        }?;
+
+        if !out_slots_folded.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_slots_folded = report.slots_folded };
+        }
+        if !out_tail_remaining.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_tail_remaining = report.tail_remaining };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Deletes slots durably folded into the store, oldest first, and writes
+/// the count removed to `*out_slots_removed`. The horizon is bounded by
+/// both the durable fold cursor and what live readers still need, so a
+/// pass may remove nothing when readers lag. A read-only attach is refused
+/// with [`codes::CONSTRAINT`].
+///
+/// # Safety
+///
+/// `handle` must be a live handle from [`moraine_attach`].
+/// `out_slots_removed`, if non-null, must be writable, and `err`, if
+/// non-null, must be writable. All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_truncate_slots(
+    handle: *mut MoraineCatalogHandle,
+    out_slots_removed: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        // SAFETY: a `None` probe polls nothing.
+        let removed = unsafe {
+            handle_ref.block_on_cancellable(
+                None,
+                ptr::null_mut(),
+                handle_ref.catalog.truncate_folded_slots(),
+            )
+        }?;
+
+        if !out_slots_removed.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_slots_removed = removed };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
 /// Lists a table's live equality indexes.
 ///
 /// # Safety

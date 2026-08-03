@@ -54,6 +54,8 @@ struct MaintenanceConfig {
 	// Zero takes the core's own batch default.
 	uint64_t batch_size = 0;
 	bool sweep_indexes = true;
+	bool fold_slots = true;
+	bool truncate_slots = true;
 	std::vector<DuckLakeStep> ducklake_steps;
 };
 
@@ -105,6 +107,12 @@ private:
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
 	                                const DuckLakeStep &step);
 	MaintenanceStep RunSweep();
+	// Folds unfolded slots into the store so the sweep sees folded drops.
+	// A `Fenced` result is a duelling folder — recorded and skipped, never
+	// fatal.
+	MaintenanceStep RunFold();
+	// Removes durably folded slots, oldest first.
+	MaintenanceStep RunTruncate();
 	// The DuckLake catalog sitting above this metadata catalog, found by
 	// matching attached databases on path. DuckLake's own maintenance
 	// functions take that name, not this catalog's.

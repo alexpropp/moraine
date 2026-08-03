@@ -1134,6 +1134,44 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          void *probe_ctx,
                          struct MoraineError *err);
 
+// Runs one bounded fold pass: applies up to `limit` unfolded slots into
+// the store, advancing the durable fold cursor, and writes the count
+// applied to `*out_slots_folded` and the slots still unfolded to
+// `*out_tail_remaining`. `limit` of 0 folds nothing and only reports the
+// tail.
+//
+// Folding is invisible to readers — the served state is byte-identical
+// before and after — so a pass may run whenever. A read-only attach is
+// refused with [`codes::CONSTRAINT`]; a concurrent folder fencing this
+// session surfaces as [`codes::FENCED`], which the caller treats as
+// wasted work rather than an error.
+//
+// # Safety
+//
+// `handle` must be a live handle from [`moraine_attach`]. The
+// out-parameters, if non-null, must be writable, and `err`, if non-null,
+// must be writable. All for the duration of this call.
+int32_t moraine_fold_sprint(struct MoraineCatalogHandle *handle,
+                            uint64_t limit,
+                            uint64_t *out_slots_folded,
+                            uint64_t *out_tail_remaining,
+                            struct MoraineError *err);
+
+// Deletes slots durably folded into the store, oldest first, and writes
+// the count removed to `*out_slots_removed`. The horizon is bounded by
+// both the durable fold cursor and what live readers still need, so a
+// pass may remove nothing when readers lag. A read-only attach is refused
+// with [`codes::CONSTRAINT`].
+//
+// # Safety
+//
+// `handle` must be a live handle from [`moraine_attach`].
+// `out_slots_removed`, if non-null, must be writable, and `err`, if
+// non-null, must be writable. All for the duration of this call.
+int32_t moraine_truncate_slots(struct MoraineCatalogHandle *handle,
+                               uint64_t *out_slots_removed,
+                               struct MoraineError *err);
+
 // Lists a table's live equality indexes.
 //
 // # Safety

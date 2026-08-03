@@ -97,6 +97,14 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			config.sweep_indexes = option.second.GetValue<bool>();
 			continue;
 		}
+		if (rest == "fold_slots") {
+			config.fold_slots = option.second.GetValue<bool>();
+			continue;
+		}
+		if (rest == "truncate_slots") {
+			config.truncate_slots = option.second.GetValue<bool>();
+			continue;
+		}
 
 		// Longest-match the step name, then treat any remainder as one of
 		// that step's own parameters. Both contain underscores, so the
@@ -281,6 +289,14 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	duckdb::Connection connection(db_);
 	auto lake = ResolveLakeName(connection);
 
+	// Fold leads the pass. The reclaim sweep reads the folded store, but a
+	// dropped index's definition rides an unfolded slot until folded — so
+	// without this first, the sweep cannot see the drop and reclaims
+	// nothing. Truncation's horizon is the durable fold cursor, which
+	// folding just advanced, so it too runs on what folding left behind.
+	report.push_back(config_.fold_slots ? RunFold()
+	                                     : MaintenanceStep {"fold_slots", "skipped", "disabled at attach"});
+
 	// A failed step abandons the rest of the *DuckLake* sequence, whose
 	// steps depend on each other — cleanup drains what merge scheduled,
 	// so running it after a failed merge does partial work on a premise
@@ -314,6 +330,11 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	report.push_back(config_.sweep_indexes
 	                     ? RunSweep()
 	                     : MaintenanceStep {"sweep_indexes", "skipped", "disabled at attach"});
+
+	// Truncation closes the pass, on the fold cursor folding advanced.
+	report.push_back(config_.truncate_slots
+	                     ? RunTruncate()
+	                     : MaintenanceStep {"truncate_slots", "skipped", "disabled at attach"});
 
 	{
 		std::lock_guard<std::mutex> guard(report_lock_);
@@ -379,6 +400,50 @@ MaintenanceStep MaintenanceScheduler::RunSweep() {
 	                        "reclaimed " + std::to_string(entries) + (entries == 1 ? " entry" : " entries") +
 	                            " from " + std::to_string(indexes) +
 	                            (indexes == 1 ? " dropped index" : " dropped indexes")};
+}
+
+MaintenanceStep MaintenanceScheduler::RunFold() {
+	uint64_t folded = 0;
+	uint64_t remaining = 0;
+	MoraineError err {};
+	// UINT64_MAX folds the whole unfolded tail this pass, so the sweep that
+	// follows sees every drop. No interrupt probe: the pass runs on the
+	// scheduler's own thread.
+	auto code = moraine_fold_sprint(handle_, UINT64_MAX, &folded, &remaining, &err);
+	if (code == MORAINE_FENCED) {
+		// A duelling folder already holds the writer and is advancing the
+		// cursor. Its work stands in for this pass's; wasted effort, not an
+		// error, so the pass records it and moves on.
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"fold_slots", "skipped", "another session holds the folder"};
+	}
+	if (code != MORAINE_OK) {
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"fold_slots", "failed", message};
+	}
+	return MaintenanceStep {"fold_slots", "ran",
+	                        "folded " + std::to_string(folded) + (folded == 1 ? " slot, " : " slots, ") +
+	                            std::to_string(remaining) + " remaining"};
+}
+
+MaintenanceStep MaintenanceScheduler::RunTruncate() {
+	uint64_t removed = 0;
+	MoraineError err {};
+	auto code = moraine_truncate_slots(handle_, &removed, &err);
+	if (code != MORAINE_OK) {
+		std::string message = err.message != nullptr ? std::string(err.message) : "unknown error";
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return MaintenanceStep {"truncate_slots", "failed", message};
+	}
+	return MaintenanceStep {"truncate_slots", "ran",
+	                        "removed " + std::to_string(removed) + (removed == 1 ? " slot" : " slots")};
 }
 
 namespace {

@@ -499,6 +499,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
     assert_eq!(
         order,
         vec![
+            "fold_slots",
             "expire_snapshots",
             "flush_inlined_data",
             "merge_adjacent_files",
@@ -506,6 +507,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             "cleanup_old_files",
             "delete_orphaned_files",
             "sweep_indexes",
+            "truncate_slots",
         ],
         "steps must report in sequence order"
     );

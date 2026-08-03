@@ -1733,26 +1733,33 @@ impl Catalog {
     /// The lowest index id at or after `from` holding an entry of `kind`,
     /// or `None` past the last one. One seek per distinct index present —
     /// the scan stops at the first key rather than walking the range.
+    ///
+    /// Scanned through a reader opened for this call, not the handle's
+    /// follower reader: a fold earlier in the same maintenance pass may have
+    /// just landed a dropped index's entry range in the store, and the
+    /// follower lags the store by its poll interval — reading it would miss
+    /// the range and reclaim nothing.
     pub(crate) async fn first_index_id_from(
         &self,
         kind: IndexKind,
         from: u64,
     ) -> Result<Option<u64>> {
+        let Store::Slots(store) = self.store.as_ref();
         let kind_prefix = index_kind_prefix(kind);
         let start = index_index_prefix(kind, from);
         // `scan_prefix` takes its bounds as a suffix of the prefix.
         let suffix = start[kind_prefix.len()..].to_vec();
 
-        let session = self.begin_read();
-        let first = session
-            .handle()
+        let head = slot_commit::materialize_slot_head_fresh(store).await?;
+        let first = head
+            .handle(ReadHandle::Reader(&store.reader))
             .scan_prefix(kind_prefix, suffix..)
             .await
             .map_err(Error::from)?
             .next()
             .await
             .map_err(Error::from)?;
-        session.finish();
+        slot_commit::release_reader(head.reader.as_ref()).await;
 
         let Some(entry) = first else {
             return Ok(None);
