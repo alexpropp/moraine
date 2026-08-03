@@ -1,11 +1,20 @@
 //! Opaque handles owned across the FFI boundary, and the sync↔async
 //! bridge: one tokio multi-threaded runtime per attached catalog.
 
-use std::{ffi::c_void, future::Future, sync::Arc, time::Duration};
+use std::{
+    ffi::c_void,
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use moraine::{Catalog, CatalogSnapshot};
+use moraine::{Catalog, CatalogSnapshot, LeaderStats};
 use object_store::ObjectStore;
-use tokio::runtime::{Builder, Runtime};
+use tokio::{
+    runtime::{Builder, Runtime},
+    sync::Notify,
+    task::JoinHandle,
+};
 
 use crate::{
     error::AbiError,
@@ -46,6 +55,19 @@ pub struct MoraineCatalogHandle {
     /// The bucket-relative key prefix of `DATA_PATH` (empty for a local or
     /// bare-bucket store), prepended to a data file's stored path.
     pub(crate) data_prefix: String,
+    /// The leader role, once `moraine_leader_start` has opened it — the
+    /// serving task, its shutdown signal, and the live counters the status
+    /// surface reads. Absent until started, and after a stop.
+    pub(crate) leader: Mutex<Option<LeaderHost>>,
+}
+
+/// A serving leader owned by an attached catalog: the background task, the
+/// signal that stands it down, the counters it publishes, and the address it
+/// advertises.
+pub(crate) struct LeaderHost {
+    pub(crate) shutdown: Arc<Notify>,
+    pub(crate) join: JoinHandle<moraine::Result<()>>,
+    pub(crate) stats: Arc<LeaderStats>,
 }
 
 impl MoraineCatalogHandle {
@@ -56,6 +78,7 @@ impl MoraineCatalogHandle {
             log_id,
             data_store: None,
             data_prefix: String::new(),
+            leader: Mutex::new(None),
         }
     }
 

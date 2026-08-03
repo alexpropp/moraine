@@ -31,6 +31,7 @@ pub(crate) struct SessionContext {
     pub(crate) secret: [u8; TOKEN_LEN],
     pub(crate) funnel: Arc<CommitFunnel>,
     pub(crate) catalog: Arc<Catalog>,
+    pub(crate) stats: Arc<crate::leader::LeaderStats>,
 }
 
 /// Serves one forwarded session to completion. A transport error (a dropped
@@ -40,6 +41,7 @@ pub(crate) async fn serve<S>(mut stream: S, context: &SessionContext) -> Result<
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let _session_gauge = crate::leader::SessionGuard::open(Arc::clone(&context.stats));
     let mut session = Session {
         context,
         authenticated: false,

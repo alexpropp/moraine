@@ -56,6 +56,17 @@ struct MaintenanceConfig {
 	bool sweep_indexes = true;
 	bool fold_slots = true;
 	bool truncate_slots = true;
+	// The leader role: the designated folder binds a listener, announces
+	// through the log, and serves forwarded sessions. Off unless
+	// MAINTENANCE_LEADER is set; a read-only attach never leads.
+	bool leader = false;
+	// The address the listener binds. Required when `leader` is set.
+	std::string leader_address;
+	// The address announced in the log; defaults to the bind address when
+	// unset (they differ behind NAT or in containers).
+	std::string leader_advertise;
+	// The most concurrent forwarded sessions the leader serves.
+	uint64_t leader_max_sessions = 64;
 	std::vector<DuckLakeStep> ducklake_steps;
 };
 

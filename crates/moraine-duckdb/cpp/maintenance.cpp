@@ -105,6 +105,25 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 			config.truncate_slots = option.second.GetValue<bool>();
 			continue;
 		}
+		if (rest == "leader") {
+			config.leader = option.second.GetValue<bool>();
+			continue;
+		}
+		if (rest == "leader_address") {
+			config.leader_address = option.second.GetValue<std::string>();
+			continue;
+		}
+		if (rest == "leader_advertise") {
+			config.leader_advertise = option.second.GetValue<std::string>();
+			continue;
+		}
+		if (rest == "leader_max_sessions") {
+			config.leader_max_sessions = option.second.GetValue<uint64_t>();
+			if (config.leader_max_sessions == 0) {
+				throw duckdb::BinderException("MAINTENANCE_LEADER_MAX_SESSIONS must be positive");
+			}
+			continue;
+		}
 
 		// Longest-match the step name, then treat any remainder as one of
 		// that step's own parameters. Both contain underscores, so the
@@ -172,6 +191,10 @@ MaintenanceConfig ParseMaintenanceOptions(const std::vector<std::pair<std::strin
 		if (step.enabled && !step.explicitly_disabled) {
 			config.ducklake_steps.push_back(DuckLakeStep {StepSpecs()[i].name, step.arguments});
 		}
+	}
+	if (config.leader && config.leader_address.empty()) {
+		throw duckdb::BinderException(
+		    "MAINTENANCE_LEADER needs MAINTENANCE_LEADER_ADDRESS: a leader must bind an address clients can reach");
 	}
 	return config;
 }
@@ -525,6 +548,23 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MaintenanceInitGlobal(duckd
 			for (auto &step : pass.steps) {
 				state->rows.push_back(ReportRow {pass.started_at, pass.trigger, step});
 			}
+		}
+		// The leader role, reported as a synthetic step only while this catalog
+		// holds it — an attach that does not lead adds no row, so the column
+		// schema and the empty-status shape are unchanged. The detail carries
+		// the live session and forwarded-commit counters.
+		bool held = false;
+		uint64_t sessions = 0;
+		uint64_t forwarded = 0;
+		MoraineError err {};
+		auto code = moraine_leader_status(catalog.Handle(), &held, &sessions, &forwarded, &err);
+		if (code == MORAINE_OK && held) {
+			std::string detail = "sessions=" + std::to_string(sessions) +
+			                     " forwarded_commits=" + std::to_string(forwarded);
+			state->rows.push_back(
+			    ReportRow {duckdb::timestamp_t(0), "status", MaintenanceStep {"leader_role", "held", detail}});
+		} else if (err.message != nullptr) {
+			moraine_error_free(err.message);
 		}
 		return std::move(state);
 	}

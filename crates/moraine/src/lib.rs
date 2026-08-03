@@ -151,7 +151,7 @@ pub use catalog::{
 };
 pub use error::{Error, Result};
 #[cfg(feature = "leader")]
-pub use leader::{Leader, LeaderConfig};
+pub use leader::{Leader, LeaderConfig, LeaderStats};
 pub use moraine_wal::FoldReport;
 pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};
 pub use transaction::Transaction;

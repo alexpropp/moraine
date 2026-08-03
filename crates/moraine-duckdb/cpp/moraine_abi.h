@@ -1172,6 +1172,46 @@ int32_t moraine_truncate_slots(struct MoraineCatalogHandle *handle,
                                uint64_t *out_slots_removed,
                                struct MoraineError *err);
 
+// Opens the leader role on this attached catalog: binds `bind_address`,
+// advertises `advertise_address` (its own bind when null), mints or reads the
+// forwarding token, announces through the log, and serves forwarded sessions
+// on the handle's runtime until [`moraine_leader_stop`]. A read-only catalog
+// cannot lead. Starting a second leader on a handle already leading fails.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+// be writable.
+int32_t moraine_leader_start(struct MoraineCatalogHandle *handle,
+                             const char *bind_address,
+                             const char *advertise_address,
+                             uint64_t max_sessions,
+                             struct MoraineError *err);
+
+// Stands the leader down: signals a clean withdrawal and waits a bounded grace
+// for the drain and the withdrawal PUT. A handle not leading is a no-op. The
+// runtime the detach that follows drops would abort the task anyway, so this
+// never blocks past the grace.
+//
+// # Safety
+//
+// `handle`, if non-null, must be a live [`moraine_attach`] pointer.
+void moraine_leader_stop(struct MoraineCatalogHandle *handle);
+
+// Reports the leader role: whether this catalog holds it right now, the
+// forwarded sessions open, and the commits landed through the funnel since it
+// bound. A handle not leading reports `false`/`0`/`0`.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+// be writable.
+int32_t moraine_leader_status(struct MoraineCatalogHandle *handle,
+                              bool *out_role_held,
+                              uint64_t *out_sessions,
+                              uint64_t *out_forwarded,
+                              struct MoraineError *err);
+
 // Lists a table's live equality indexes.
 //
 // # Safety

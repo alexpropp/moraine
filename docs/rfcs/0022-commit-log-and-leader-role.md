@@ -32,25 +32,31 @@ clients configure nothing.
 
 Safety never depends on clocks, leases, leadership, or any node's disk.
 
-**Implemented, except the leader role.** The log, the folder, and
-truncation are live: every commit races a conditional put against
-`commits/<seq>`; a single fenced folder tails the log and applies each
-slot as one atomic `WriteBatch` that also advances `sys/fold`, with the
-store's WAL disabled; slots truncate oldest-first, bounded by the durable
-flush horizon and by live-reader checkpoints past a retention margin.
-Old-format stores migrate on their first read-write attach in one atomic
-batch (`sys/format = 4`, `sys/fold = 0`), fencing any incumbent
-old-binary writer; a too-new format refuses. Group commit runs through
-in-process coalescing (`CatalogOptions::commit_batch_window`); a
-committer that crashes with an ambiguous PUT resolves its outcome by
-scanning for its transaction id (`Catalog::transaction_outcome`).
+**Implemented.** The log, the folder, and truncation are live: every
+commit races a conditional put against `commits/<seq>`; a single fenced
+folder tails the log and applies each slot as one atomic `WriteBatch`
+that also advances `sys/fold`, with the store's WAL disabled; slots
+truncate oldest-first, bounded by the durable flush horizon and by
+live-reader checkpoints past a retention margin. Old-format stores
+migrate on their first read-write attach in one atomic batch
+(`sys/format = 4`, `sys/fold = 0`), fencing any incumbent old-binary
+writer; a too-new format refuses. Group commit runs through in-process
+coalescing (`CatalogOptions::commit_batch_window`); a committer that
+crashes with an ambiguous PUT resolves its outcome by scanning for its
+transaction id (`Catalog::transaction_outcome`). The leader role is live
+behind the `leader` feature and the extension's `MAINTENANCE_LEADER`
+attach option: the designated folder binds a listener, mints or reads the
+store-held forwarding token, and announces through the log; a client that
+loses a race forwards its transaction, and the funnel coalesces forwarded
+commits into shared slots and races them hot (near-zero backoff base).
 Verified live over real SlateDB on in-memory `object_store`:
 prefix-consistent truncation past the retention margin
 (`truncation_holds_the_live_reader_bound_past_the_margin`), a stale
 reader surviving a peer's fold and truncation
-(`a_stale_reader_survives_a_peer_fold_and_truncation`), and migration
-(`a_legacy_store_migrates_on_first_write_attach_and_serves_its_data`).
-The leader role (below) is not yet built.
+(`a_stale_reader_survives_a_peer_fold_and_truncation`), migration
+(`a_legacy_store_migrates_on_first_write_attach_and_serves_its_data`),
+and a contended fleet converging onto the leader
+(`two_contending_handles_converge_onto_the_leader`).
 
 ## Goals
 
@@ -434,6 +440,25 @@ cache) and 0.02 PUT/commit concurrent, identical at a zero and a 5ms
 coalescing window. The head cache holds serial GET at 0.12/commit instead
 of 25.60/commit. Folding amortizes further: many slots land in one L0
 SST. These figures sit inside the accepted band.
+
+The leader's relief is measured over the adaptive bench (`adaptive_leader_bench`:
+a fleet of contending committers on one bucket, real SlateDB on in-memory
+`object_store`, PUTs counted per store). Direct racing amplifies with the
+fleet: PUT/commit rises from 1.9 at two committers to 4.2 at sixteen, the
+write amplification the leader exists to relieve. With a leader present the
+fleet forwards and coalesces: at eight committers PUT/commit falls to 0.26
+at a zero coalescing window and 0.13 at a 2 ms window, with a 100% win
+share — every commit lands through the leader, so no committer races a slot
+of its own. Killed mid-run, the survivors degrade to direct racing: a
+bounded spike back toward the direct figure, never a stall, every commit
+still landing. The no-leader figure is the pre-leader path unchanged — with
+no advert on the log a client never forwards — so the role costs nothing
+when absent. The bias strength follows from these numbers: a near-zero
+backoff base converges the whole fleet at eight contenders, so the tip needs
+no strengthening; and widening the coalescing window (zero to 2 ms) halves
+the leader's own slot PUTs, which is the convergence lever the design reaches
+for before any harder backoff asymmetry — it absorbs more per win without
+changing what a client that cannot reach the leader experiences.
 
 ### Format and compatibility
 

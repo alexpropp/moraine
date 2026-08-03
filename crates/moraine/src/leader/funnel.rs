@@ -17,7 +17,10 @@
 
 use std::{sync::Arc, time::Duration};
 
-use moraine_wal::{Commit, CommitOutcome, Envelope, LeaderAdvert, Overlay, SlotLog};
+use moraine_wal::{
+    Commit, CommitDrive, CommitOutcome, Committer, Envelope, LeaderAdvert, Overlay, Race,
+    RetryPolicy, SlotLog, drive_commit,
+};
 use slatedb::DbReader;
 use tokio::sync::{Mutex, Notify, oneshot};
 use uuid::Uuid;
@@ -36,6 +39,50 @@ use crate::{
 /// contended log. A leader is the sole writer on a healthy log, so this is
 /// only reached under heavy foreign contention.
 const ADVERT_RACE_ATTEMPTS: usize = 16;
+
+/// The funnel's retry shape: near-zero backoff so a sustained leader re-races a
+/// contended slot hot, rather than yielding the sequence to a direct client
+/// that backs off the standard jittered step. Both bounds are zero — the
+/// retries this drives are ambiguous puts and contended-slot transport blips,
+/// where a warm re-race costs nothing a starved client feels.
+fn hot_retry() -> RetryPolicy {
+    RetryPolicy {
+        base_delay: Duration::ZERO,
+        max_delay: Duration::ZERO,
+        ..RetryPolicy::default()
+    }
+}
+
+/// Drives the funnel's batch through the commit loop. A forwarded commit is
+/// authored by its client against a fixed head and its rows carry
+/// DuckLake-minted ids, so it cannot rebase onto a foreign winner: a lost race
+/// is always a conflict the members re-forward, never a benign loss the funnel
+/// re-chains. The loop's value here is the ambiguous-put resolution (a batch
+/// whose slot landed while the ack was lost resolves as committed, not
+/// conflicted) and the hot re-race of a contended transport blip.
+struct FunnelCommitter {
+    envelope: Envelope,
+}
+
+impl Committer for FunnelCommitter {
+    type Error = Error;
+
+    async fn assemble(&mut self) -> Result<Option<Envelope>> {
+        if self.envelope.commits.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.envelope.clone()))
+        }
+    }
+
+    fn classify(&self, _winner: &Envelope) -> Race {
+        Race::Conflict
+    }
+
+    fn absorb(&mut self, _sequence: u64, _winner: Envelope) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// A pinned logical head a session reads and authors against.
 pub(crate) struct PinnedHead {
@@ -84,11 +131,17 @@ pub(crate) struct CommitFunnel {
     inner: Mutex<Inner>,
     /// Woken when a flush clears `flushing`, so waiting submits re-check.
     flush_done: Notify,
+    stats: Arc<crate::leader::LeaderStats>,
 }
 
 impl CommitFunnel {
-    /// A funnel over `catalog`, batching within `window`.
-    pub(crate) fn new(catalog: Arc<Catalog>, window: Duration) -> Arc<Self> {
+    /// A funnel over `catalog`, batching within `window`, publishing landed
+    /// commit counts to `stats`.
+    pub(crate) fn new(
+        catalog: Arc<Catalog>,
+        window: Duration,
+        stats: Arc<crate::leader::LeaderStats>,
+    ) -> Arc<Self> {
         let slots = catalog.slot_store().slots.clone();
         Arc::new(Self {
             catalog,
@@ -101,6 +154,7 @@ impl CommitFunnel {
                 flushing: false,
             }),
             flush_done: Notify::new(),
+            stats,
         })
     }
 
@@ -255,15 +309,16 @@ impl CommitFunnel {
         }
 
         let envelope = Envelope::new(round.iter().map(|pending| pending.commit.clone()).collect());
-        let outcome = self.slots.commit_slot(sequence, &envelope).await;
+        let mut committer = FunnelCommitter { envelope };
+        let drive = drive_commit(&self.slots, &mut committer, sequence, &hot_retry()).await;
 
         {
             let mut inner = self.inner.lock().await;
             inner.flushing = false;
-            match &outcome {
-                Ok(CommitOutcome::Won) => {
+            match &drive {
+                Ok(CommitDrive::Committed { sequence: won, .. }) => {
                     if let Some(base) = inner.base.as_mut() {
-                        base.next_sequence = sequence.saturating_add(1);
+                        base.next_sequence = won.saturating_add(1);
                         // The winning envelope holds every admitted client's
                         // commit, and the base already applied each of them, so
                         // recording it keeps the handle's commit cache correct
@@ -282,7 +337,12 @@ impl CommitFunnel {
         }
         self.flush_done.notify_waiters();
 
-        deliver(round, &outcome, sequence);
+        if let Ok(CommitDrive::Committed { .. }) = &drive {
+            self.stats
+                .record_forwarded(u64::try_from(round.len()).unwrap_or(u64::MAX));
+        }
+
+        deliver(round, &drive, sequence);
     }
 
     /// The logical head, materialized from the store on first use and after a
@@ -307,21 +367,39 @@ impl CommitFunnel {
     }
 }
 
-/// Delivers a raced batch's outcome to every member. A member whose receiver
+/// Delivers a driven batch's outcome to every member. A member whose receiver
 /// was dropped (a disconnected client) is skipped; its commit still landed.
-fn deliver(
-    round: Vec<Pending>,
-    outcome: &std::result::Result<CommitOutcome, moraine_wal::Error>,
-    sequence: u64,
-) {
+/// A spent retry budget and an unreachable log both surface as their own error;
+/// a lost race is a conflict the client re-forwards.
+fn deliver(round: Vec<Pending>, drive: &Result<CommitDrive>, sequence: u64) {
     for pending in round {
-        let member = match outcome {
-            Ok(CommitOutcome::Won) => Ok(SnapshotId::new(pending.snapshot_id)),
-            Ok(CommitOutcome::Lost(_)) => Err(Error::CommitConflict(format!(
+        let member = match drive {
+            Ok(CommitDrive::Committed { .. }) => Ok(SnapshotId::new(pending.snapshot_id)),
+            Ok(CommitDrive::Conflict { sequence, .. }) => Err(Error::CommitConflict(format!(
                 "a concurrent commit won slot {sequence}; this forwarded transaction must re-drive"
             ))),
+            Ok(CommitDrive::Exhausted {
+                attempts,
+                last_sequence,
+            }) => Err(Error::RetryBudgetExhausted(format!(
+                "the leader spent {attempts} attempts on lost slot races; last raced slot \
+                 {last_sequence}"
+            ))),
+            Ok(CommitDrive::Unavailable {
+                attempts,
+                last_sequence,
+                last_error,
+            }) => Err(Error::SlotLog(format!(
+                "the leader could not reach the slot log after {attempts} attempts; last raced \
+                 slot {last_sequence}: {last_error}"
+            ))),
+            // Assembly always yields the taken batch, so `Nothing` cannot arise
+            // for a non-empty round; report it rather than silently succeed.
+            Ok(CommitDrive::Nothing) => Err(Error::SlotLog(format!(
+                "the leader funnel assembled nothing for slot {sequence}"
+            ))),
             Err(err) => Err(Error::SlotLog(format!(
-                "the leader could not reach the slot log for slot {sequence}: {err}"
+                "the leader could not drive slot {sequence}: {err}"
             ))),
         };
         let _ = pending.result.send(member);

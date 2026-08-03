@@ -5,7 +5,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -66,6 +66,109 @@ impl ObjectStore for SlotCounter {
     ) -> object_store::Result<PutResult> {
         if location.as_ref().starts_with("commits/") && matches!(opts.mode, PutMode::Create) {
             self.slot_puts.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Wraps [`InMemory`] and, on the Nth commit-bearing slot create, fails the
+/// put once with a transport error while planting nothing — so the read-back
+/// finds the slot absent and the funnel sees an ambiguous transport blip it
+/// must re-race, not a lost slot it must conflict. The advert's empty-envelope
+/// create at bind is create one, so `fail_on` two hits the first commit.
+#[derive(Debug)]
+struct BlipOnce {
+    inner: InMemory,
+    creates: AtomicU64,
+    fail_on: u64,
+    fired: AtomicBool,
+}
+
+impl BlipOnce {
+    fn new(fail_on: u64) -> Self {
+        Self {
+            inner: InMemory::new(),
+            creates: AtomicU64::new(0),
+            fail_on,
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Display for BlipOnce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BlipOnce({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for BlipOnce {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if location.as_ref().starts_with("commits/") && matches!(opts.mode, PutMode::Create) {
+            let nth = self.creates.fetch_add(1, Ordering::SeqCst) + 1;
+            if nth == self.fail_on && !self.fired.swap(true, Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "BlipOnce",
+                    source: "injected transport blip".into(),
+                });
+            }
         }
         self.inner.put_opts(location, payload, opts).await
     }
@@ -461,6 +564,44 @@ async fn sequential_minting_commits_chain_through_the_leader() {
     );
 
     leader.stop().await;
+}
+
+/// The funnel drives its batch through the commit loop with a hot retry, so an
+/// ambiguous slot put — the object store errored the create while planting
+/// nothing — is re-raced rather than surfaced as a hard failure. Under a
+/// single-shot race the same blip would reach the client as a slot-log error;
+/// here the forwarded commit still lands.
+#[tokio::test]
+async fn a_transport_blip_is_re_raced_hot_not_surfaced_as_a_failure() {
+    let blip = Arc::new(BlipOnce::new(2));
+    let store: Arc<dyn ObjectStore> = Arc::clone(&blip) as Arc<dyn ObjectStore>;
+    let catalog = open_catalog(&store, Duration::ZERO).await;
+    let leader = Spawned::bind(Arc::clone(&catalog)).await;
+
+    // The first forwarded commit's slot create is create two (the advert was
+    // one); the blip fires on it and the funnel re-races the same sequence.
+    let committed = commit_session(leader.addr, leader.secret, vec![gc_insert(42)]).await;
+    assert!(
+        matches!(committed, Response::Committed { .. }),
+        "a re-raced blip still commits: {committed:?}"
+    );
+    assert!(blip.fired(), "the injected blip fired");
+
+    leader.stop().await;
+
+    // The commit is durable: the re-race landed the slot the blip dropped.
+    let reopened = Catalog::open(Arc::clone(&store), CatalogOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .snapshot()
+            .await
+            .unwrap()
+            .scheduled_deletions()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

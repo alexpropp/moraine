@@ -13,7 +13,14 @@
 //! an endpoint-absent advert, an explicit withdrawal a peer can tell from a
 //! slot carrying no advert at all. There are no heartbeats.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use moraine_wal::LeaderAdvert;
 use tokio::{
@@ -50,6 +57,8 @@ mod funnel;
 mod session;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod forward_tests;
 #[cfg(test)]
 mod standdown_tests;
@@ -58,6 +67,58 @@ mod tests;
 
 use funnel::CommitFunnel;
 use session::SessionContext;
+
+/// Live counters a serving leader publishes for its host to report: the
+/// forwarded sessions open right now and the commits landed through the funnel
+/// since bind. Shared through an `Arc`; read at any time, lock-free.
+#[derive(Debug, Default)]
+pub struct LeaderStats {
+    active_sessions: AtomicI64,
+    forwarded_commits: AtomicU64,
+}
+
+impl LeaderStats {
+    /// Forwarded sessions open right now.
+    #[must_use]
+    pub fn active_sessions(&self) -> u64 {
+        u64::try_from(self.active_sessions.load(Ordering::Relaxed).max(0)).unwrap_or(0)
+    }
+
+    /// Commits landed through the funnel since this leader bound.
+    #[must_use]
+    pub fn forwarded_commits(&self) -> u64 {
+        self.forwarded_commits.load(Ordering::Relaxed)
+    }
+
+    fn session_opened(&self) {
+        self.active_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn session_closed(&self) {
+        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_forwarded(&self, commits: u64) {
+        self.forwarded_commits.fetch_add(commits, Ordering::Relaxed);
+    }
+}
+
+/// Increments the active-session gauge for the life of a session, decrementing
+/// it however the session ends.
+pub(crate) struct SessionGuard(Arc<LeaderStats>);
+
+impl SessionGuard {
+    pub(crate) fn open(stats: Arc<LeaderStats>) -> Self {
+        stats.session_opened();
+        Self(stats)
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.session_closed();
+    }
+}
 
 /// How a leader binds and advertises itself.
 #[derive(Debug, Clone)]
@@ -101,6 +162,7 @@ pub struct Leader {
     advertise_address: String,
     max_sessions: usize,
     supersession_poll: Duration,
+    stats: Arc<LeaderStats>,
 }
 
 impl std::fmt::Debug for Leader {
@@ -136,7 +198,12 @@ impl Leader {
             .map_err(|err| Error::Configuration(format!("leader could not bind: {err}")))?;
 
         let instance = Uuid::new_v4().into_bytes();
-        let funnel = CommitFunnel::new(Arc::clone(&catalog), store.options.commit_batch_window);
+        let stats = Arc::new(LeaderStats::default());
+        let funnel = CommitFunnel::new(
+            Arc::clone(&catalog),
+            store.options.commit_batch_window,
+            Arc::clone(&stats),
+        );
         funnel
             .write_advert(LeaderAdvert {
                 instance,
@@ -158,7 +225,18 @@ impl Leader {
             advertise_address: config.advertise_address,
             max_sessions: config.max_sessions,
             supersession_poll: config.supersession_poll,
+            stats,
         })
+    }
+
+    /// The live counters this leader publishes — forwarded sessions open now
+    /// and commits landed through the funnel. Cloned out before [`serve`] takes
+    /// the leader by value, so a host keeps reading them while it serves.
+    ///
+    /// [`serve`]: Self::serve
+    #[must_use]
+    pub fn stats(&self) -> Arc<LeaderStats> {
+        Arc::clone(&self.stats)
     }
 
     /// The address the listener actually bound (a `:0` bind resolves here).
@@ -204,6 +282,7 @@ impl Leader {
             secret: self.secret,
             funnel: Arc::clone(&self.funnel),
             catalog: Arc::clone(&self.catalog),
+            stats: Arc::clone(&self.stats),
         });
 
         let mut monitor = tokio::time::interval(self.supersession_poll);

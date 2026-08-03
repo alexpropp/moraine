@@ -21,13 +21,15 @@ use std::{
     sync::Arc,
 };
 
-use moraine::CatalogOptions;
+use moraine::{CatalogOptions, Leader, LeaderConfig};
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::warn;
 
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
-    runtime::{MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle, new_runtime},
+    runtime::{
+        LeaderHost, MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle, new_runtime,
+    },
 };
 
 /// Runs `body`, containing any panic and turning both panics and `Err`
@@ -1864,6 +1866,172 @@ pub unsafe extern "C" fn moraine_truncate_slots(
         if !out_slots_removed.is_null() {
             // SAFETY: caller contract — non-null means writable.
             unsafe { *out_slots_removed = removed };
+        }
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// The bound a leader stop waits for a clean stand-down — the drain plus the
+/// withdrawal PUT — before the detach that follows drops the runtime and
+/// aborts the task.
+const LEADER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Opens the leader role on this attached catalog: binds `bind_address`,
+/// advertises `advertise_address` (its own bind when null), mints or reads the
+/// forwarding token, announces through the log, and serves forwarded sessions
+/// on the handle's runtime until [`moraine_leader_stop`]. A read-only catalog
+/// cannot lead. Starting a second leader on a handle already leading fails.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+/// be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_leader_start(
+    handle: *mut MoraineCatalogHandle,
+    bind_address: *const c_char,
+    advertise_address: *const c_char,
+    max_sessions: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        // SAFETY: caller contract for the string arguments.
+        let bind = unsafe { borrow_str(bind_address, "bind_address") }?;
+        // SAFETY: caller contract; a null or empty advertise means "same as bind".
+        let advertise = unsafe { opt_borrow_str(advertise_address, "advertise_address") }?;
+        let advertise = advertise.unwrap_or(bind).to_string();
+
+        let mut slot = handle_ref
+            .leader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|host| !host.join.is_finished()) {
+            return Err(AbiError::new(
+                codes::CONSTRAINT,
+                "this catalog is already leading; stop it before starting again",
+            ));
+        }
+
+        let sessions = usize::try_from(max_sessions).unwrap_or(usize::MAX).max(1);
+        let mut config = LeaderConfig::new(bind, sessions);
+        config.advertise_address = advertise;
+
+        let catalog = Arc::new(handle_ref.catalog.clone());
+        let leader = handle_ref
+            .block_on(Leader::bind(catalog, config))
+            .map_err(AbiError::from)?;
+        let stats = leader.stats();
+
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let join = handle_ref.runtime.spawn({
+            let shutdown = Arc::clone(&shutdown);
+            async move { leader.serve(shutdown).await }
+        });
+
+        *slot = Some(LeaderHost {
+            shutdown,
+            join,
+            stats,
+        });
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stands the leader down: signals a clean withdrawal and waits a bounded grace
+/// for the drain and the withdrawal PUT. A handle not leading is a no-op. The
+/// runtime the detach that follows drops would abort the task anyway, so this
+/// never blocks past the grace.
+///
+/// # Safety
+///
+/// `handle`, if non-null, must be a live [`moraine_attach`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_leader_stop(handle: *mut MoraineCatalogHandle) {
+    if handle.is_null() {
+        return;
+    }
+    let attempt = || {
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        let host = handle_ref
+            .leader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(host) = host {
+            host.shutdown.notify_one();
+            let _ = handle_ref
+                .block_on(async { tokio::time::timeout(LEADER_STOP_GRACE, host.join).await });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Reports the leader role: whether this catalog holds it right now, the
+/// forwarded sessions open, and the commits landed through the funnel since it
+/// bound. A handle not leading reports `false`/`0`/`0`.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `err`, if non-null, must
+/// be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_leader_status(
+    handle: *mut MoraineCatalogHandle,
+    out_role_held: *mut bool,
+    out_sessions: *mut u64,
+    out_forwarded: *mut u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+
+        let slot = handle_ref
+            .leader
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (held, sessions, forwarded) = match slot.as_ref() {
+            Some(host) if !host.join.is_finished() => (
+                true,
+                host.stats.active_sessions(),
+                host.stats.forwarded_commits(),
+            ),
+            _ => (false, 0, 0),
+        };
+
+        if !out_role_held.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_role_held = held };
+        }
+        if !out_sessions.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_sessions = sessions };
+        }
+        if !out_forwarded.is_null() {
+            // SAFETY: caller contract — non-null means writable.
+            unsafe { *out_forwarded = forwarded };
         }
         Ok(())
     };
