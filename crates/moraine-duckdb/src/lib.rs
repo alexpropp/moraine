@@ -44,6 +44,40 @@
 //! fences the live writer, so any number may attach alongside it. See
 //! `README.md` for the pinned build shape.
 //!
+//! # Maintenance and measurement
+//!
+//! `CALL moraine_maintenance('lake')` runs one pass of the configured
+//! maintenance sequence — DuckLake's own expiry, flush, compaction, and
+//! cleanup functions, then moraine's orphaned-index sweep, then the store
+//! merge — and returns a row per step. Every step but the sweep is opt-in
+//! at `ATTACH`, through `META_MAINTENANCE_*` options; an interval starts a
+//! timer thread that runs the same pass unattended, and
+//! `moraine_maintenance_status` serves the recent passes so an unattended
+//! failure stays visible.
+//!
+//! `CALL moraine_store_census('lake')` measures the store itself rather
+//! than the lake: one row per keyspace subspace, carrying physical bytes,
+//! SST counts, and sorted-run counts read from the store's manifest. It
+//! costs two object reads however large the store is, mutates nothing, and
+//! works on a `READ_ONLY` attach — the shape an operator investigating a
+//! production store has. `live := true` adds a scan that counts live keys,
+//! which costs a full read of the store; without it the live columns are
+//! NULL rather than zero.
+//!
+//! ```sql
+//! -- Where is the weight, and how much of it is dead?
+//! SELECT subspace, bytes, sorted_runs FROM moraine_store_census('lake')
+//! ORDER BY bytes DESC;
+//!
+//! -- Reclaim it: merge each subspace's sorted runs into one.
+//! ATTACH 'ducklake:moraine:s3://bucket/catalog' AS lake (
+//!   DATA_PATH 's3://bucket/data',
+//!   META_MAINTENANCE_COMPACT_STORE true,
+//!   META_MAINTENANCE_COMPACT_STORE_TIMEOUT INTERVAL 10 MINUTES
+//! );
+//! SELECT step, status, detail FROM moraine_maintenance('lake');
+//! ```
+//!
 //! # Diagnostics
 //!
 //! The core emits `tracing` events; this crate consumes them and forwards
