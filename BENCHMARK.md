@@ -243,6 +243,43 @@ the per-op cost falls almost exactly 1/K. The IO awaits yield the worker back
 to the pool, so the latency of 32 reads overlaps into the time of roughly one;
 serialization would have made the batch grow to ~1.6 s. So object-store read
 latency does not starve the pool, and a separate IO-dedicated runtime is
-unnecessary on that axis. This isolates IO latency only: CPU-bound SST decode
-monopolizing a worker is a separate axis this does not probe, and is where a
-`spawn_blocking` discipline would matter if anywhere.
+unnecessary on that axis. This isolates IO latency only; the next section
+takes the compute axis.
+
+### CPU-bound decode under worker pressure
+
+The other half of the same question: a cold materialization decodes every
+live record, and decode does not wait on anything — so does it hold its
+worker long enough to crowd out a latency-sensitive call? This is the one
+place a `spawn_blocking` discipline would earn its complexity.
+
+No throttle here, so every millisecond is compute. K cold materializations
+of a 400-table catalog (10 000 live entities) run concurrently on a fixed
+4-worker runtime, with a small read on a one-table catalog queued alongside
+them. Both catalogs are read through read-only handles, which maintain no
+projection cache, so every read is a full materialization. Measured on an
+**8-core Intel Xeon @ 2.90 GHz, x86-64** — a different machine from the rows
+above, so compare the shape here, not the absolute numbers:
+
+| concurrency | batch | per decode | small read alongside |
+|---|---|---|---|
+| 1 | 24.8 ms | 24.8 ms | 0.19 ms |
+| 2 | 22.9 ms | 11.4 ms | 0.17 ms |
+| 4 | 24.4 ms | 6.1 ms | 0.15 ms |
+| 8 | 58.4 ms | 7.3 ms | 0.43 ms |
+
+The same small read with an idle pool costs 0.11 ms.
+
+Decode does not monopolize a worker. Four concurrent decodes cost what one
+does (24.4 ms against 24.8 ms), so they genuinely overlap across the four
+workers; the batch doubles only past the worker count, which is what CPU
+work is supposed to do. The finding is the last column: the small read never
+approaches a decode's duration. At 8 concurrent decodes — twice the worker
+count — it costs 0.43 ms, ~4× its idle cost and ~1/50th of one decode. A
+monopolized worker would have made it wait a whole decode.
+
+So the decode's awaits yield often enough that a short call still gets
+scheduled promptly, and a `spawn_blocking` discipline buys nothing on this
+axis. Both halves of the worker-pool question are now answered the same
+way: the pool does not need protecting from either IO latency or decode
+compute.

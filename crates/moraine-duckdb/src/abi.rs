@@ -623,6 +623,18 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
 /// empty follows the latest manifest; a non-null value with `read_only`
 /// false is [`codes::INVALID_ARGUMENT`].
 ///
+/// `host_threads` is how many execution threads the calling host runs, and
+/// sizes this handle's worker pool: the host's setting is the only number
+/// in the process that says how much parallelism the operator asked for,
+/// so a session pinned to one thread does not get a pool sized to the
+/// machine. It is clamped to a floor of two (a CPU-bound poll must not be
+/// able to stall SlateDB's flush) and a ceiling of eight (the pool waits
+/// on object storage, which yields its worker at every await, so further
+/// workers only park — on cores the host already sized itself to). `0`
+/// means the host does not say and takes the floor. The size is fixed for
+/// the handle's life; a host that changes its own thread count afterwards
+/// keeps the pool it attached with.
+///
 /// Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
 /// are: the store open is the one long blocking call an attach makes, and
 /// against an unreachable endpoint it is the one worth escaping. A
@@ -647,6 +659,7 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
 /// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 /// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+/// `host_threads` is unconstrained.
 /// `probe`, if non-null, must be safe to call with `probe_ctx` from any
 /// thread. `out` must be a valid, writable `*mut *mut
 /// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -661,6 +674,7 @@ pub unsafe extern "C" fn moraine_attach(
     cache_dir: *const c_char,
     data_path: *const c_char,
     checkpoint: *const c_char,
+    host_threads: u64,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     out: *mut *mut MoraineCatalogHandle,
@@ -704,12 +718,13 @@ pub unsafe extern "C" fn moraine_attach(
         // events (run below on this thread) the same way.
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id).map_err(|e| {
-            AbiError::new(
-                codes::INTERNAL,
-                format!("failed to start tokio runtime: {e}"),
-            )
-        })?;
+        let runtime = new_runtime(log_id, usize::try_from(host_threads).unwrap_or(usize::MAX))
+            .map_err(|e| {
+                AbiError::new(
+                    codes::INTERNAL,
+                    format!("failed to start tokio runtime: {e}"),
+                )
+            })?;
 
         // The DATA_PATH given at this attach (via `META_DATA_PATH`), if any.
         // SAFETY: `data_path` validity is this function's own safety contract;
@@ -943,7 +958,9 @@ pub unsafe extern "C" fn moraine_migrate(
         let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id).map_err(|e| {
+        // A one-shot runtime for one operation, with no host thread
+        // setting to take after: the floor is all it needs.
+        let runtime = new_runtime(log_id, 0).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
                 format!("failed to start tokio runtime: {e}"),
@@ -2543,7 +2560,7 @@ mod tests {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
     };
 
@@ -2551,7 +2568,10 @@ mod tests {
     use object_store::local::LocalFileSystem;
 
     use super::*;
-    use crate::test_support::{TempDir, attach_ok};
+    use crate::{
+        staged::moraine_tx_commit,
+        test_support::{TempDir, attach_ok, begin},
+    };
 
     /// Seeds a catalog directly through the `moraine` API with one
     /// schema, one table with two columns and one data file, and one
@@ -3039,6 +3059,7 @@ mod tests {
                 ptr::null(),
                 c_bad.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut bad_handle,
@@ -3074,6 +3095,7 @@ mod tests {
                 ptr::null(),
                 c_good.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut good_handle,
@@ -3112,6 +3134,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3239,6 +3262,7 @@ mod tests {
                 ptr::null(),
                 c_data.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3276,6 +3300,7 @@ mod tests {
                 ptr::null(),
                 c_safe.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut ok_handle,
@@ -3315,6 +3340,7 @@ mod tests {
                 ptr::null(),
                 c_first.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut first_handle,
@@ -3346,6 +3372,7 @@ mod tests {
                 ptr::null(),
                 c_other.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut other_handle,
@@ -3387,6 +3414,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3433,6 +3461,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3774,6 +3803,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3812,6 +3842,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3869,6 +3900,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -4033,6 +4065,102 @@ mod tests {
         unsafe { moraine_detach(handle) };
     }
 
+    /// An interrupt that arrives once the operation has already produced
+    /// its result changes nothing: there is nothing left to cancel, so the
+    /// result is reported.
+    ///
+    /// This is the third of cancellation's three cases, and the one with
+    /// no ambiguity in it. The probe here fires only after the future's
+    /// last act, which is exactly the ordering the case describes.
+    #[test]
+    fn an_interrupt_after_the_result_is_known_still_reports_it() {
+        unsafe extern "C" fn probe_flag(probe_ctx: *mut c_void) -> bool {
+            // SAFETY: this test passes a valid `AtomicBool` pointer below.
+            unsafe { &*probe_ctx.cast::<AtomicBool>() }.load(Ordering::SeqCst)
+        }
+
+        let dir = TempDir::new("probe-after-result");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let interrupted = AtomicBool::new(false);
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `interrupted` outlives the call; the probe only reads it
+        // atomically.
+        let result: Result<u32, AbiError> = unsafe {
+            handle_ref.block_on_cancellable(
+                Some(probe_flag),
+                (&raw const interrupted).cast_mut().cast(),
+                async {
+                    // The host's interrupt lands here: after the work is
+                    // done, before the bridge has returned.
+                    interrupted.store(true, Ordering::SeqCst);
+                    Ok::<_, moraine::Error>(9u32)
+                },
+            )
+        };
+        assert_eq!(
+            result.unwrap_or(0),
+            9,
+            "an interrupt past the point of no return must not discard a known result"
+        );
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The staged-row commit honors its probe, and a commit refused before
+    /// it ran leaves the catalog exactly where it was.
+    #[test]
+    fn probe_cancels_a_staged_commit_and_nothing_lands() {
+        let dir = TempDir::new("probe-tx-commit");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+        let before = snapshot_id_of(handle);
+
+        let tx = begin(handle);
+        let mut snapshot_id = 0u64;
+        let mut err = MoraineError::default();
+        // SAFETY: `tx` came from `begin` and is consumed exactly once;
+        // the out-params are local slots; `probe_always` accepts a null
+        // context.
+        let code = unsafe {
+            moraine_tx_commit(
+                tx,
+                &raw mut snapshot_id,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        assert_eq!(
+            snapshot_id_of(handle),
+            before,
+            "an interrupted commit must not advance head"
+        );
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The head this handle reports, for the cases that assert a commit
+    /// left it alone.
+    fn snapshot_id_of(handle: *mut MoraineCatalogHandle) -> u64 {
+        // SAFETY: `handle` is attached for the duration of the caller.
+        let handle_ref = unsafe { &*handle };
+        handle_ref
+            .block_on(handle_ref.catalog.snapshot())
+            .expect("read head")
+            .current_snapshot()
+            .id
+            .get()
+    }
+
     /// The pull channel end to end: a probe reporting an interrupt cancels
     /// the snapshot (out-param unwritten), and the same handle with a
     /// quiet probe succeeds right after — the signal is level-triggered
@@ -4178,6 +4306,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 Some(probe_always),
                 ptr::null_mut(),
                 &raw mut handle,

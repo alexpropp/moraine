@@ -673,3 +673,137 @@ async fn measure_index_maintenance_by_store_size() {
     }
     println!();
 }
+
+/// 0010 — whether a CPU-bound decode monopolizes a worker.
+///
+/// `measure_read_concurrency_under_io_latency` settles the IO half: awaits
+/// on object-store latency yield their worker, so slow IO does not starve
+/// the pool. The other half is compute. A cold materialization decodes
+/// every live record, and a decode does not yield: whichever worker polls
+/// it holds that worker until the whole scan is done. If that is enough to
+/// crowd the pool, a small latency-sensitive call queued alongside would
+/// wait behind a whole decode — which is the one place a `spawn_blocking`
+/// discipline would earn its complexity.
+///
+/// The harness runs on a fixed 4-worker runtime over an unthrottled
+/// in-memory store, so every millisecond measured is compute. It reports,
+/// per concurrency level, how long K cold materializations take together
+/// and how long a *small* read issued alongside them takes — against the
+/// same small read with the pool idle. A small read whose latency tracks
+/// the decode's duration is a monopolized worker; one that stays flat is a
+/// pool that keeps its head above the load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_cpu_bound_decode_under_worker_pressure() {
+    const HEAVY_TABLES: usize = 400;
+    const COLS_PER_TABLE: usize = 8;
+    const FILES_PER_TABLE: usize = 16;
+    const REPEATS: usize = 5;
+    let concurrency = [1usize, 2, 4, 8];
+
+    // The decode-heavy catalog, and a tiny one beside it for the
+    // latency-sensitive read. Separate stores, one runtime: the small read
+    // competes for workers, never for locks.
+    let heavy_store = Arc::new(InMemory::new());
+    {
+        let catalog = open_with(heavy_store.clone(), SEED_FLUSH_MS).await;
+        let columns: Vec<_> = (0..COLS_PER_TABLE).map(|c| col(&format!("c{c}"))).collect();
+        for t in 0..HEAVY_TABLES {
+            let columns = columns.clone();
+            catalog
+                .commit(move |tx| {
+                    let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                    let table = tx.create_table(schema, &format!("t{t}"), &columns)?;
+                    for _ in 0..FILES_PER_TABLE {
+                        tx.register_data_file(table, datafile(100), &[])?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        catalog.close().await.unwrap();
+    }
+    let small_store = Arc::new(InMemory::new());
+    {
+        let catalog = open_with(small_store.clone(), SEED_FLUSH_MS).await;
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                tx.create_table(schema, "one", &[col("a")]).map(|_| ())
+            })
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+    }
+
+    // Read-only handles: they maintain no projection cache, so every
+    // `snapshot()` is a full cold materialization rather than a cache hit,
+    // which is the decode this is measuring.
+    let heavy = Catalog::open_read_only(heavy_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let small = Catalog::open_read_only(small_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+
+    // The small read alone, for the load below to be read against.
+    let mut idle = Vec::with_capacity(REPEATS);
+    for _ in 0..REPEATS {
+        let start = Instant::now();
+        std::hint::black_box(small.snapshot().await.unwrap());
+        idle.push(start.elapsed());
+    }
+    let idle = Stats::of(idle);
+
+    println!("\n# 0010 CPU-bound decode under worker pressure (in-memory object_store)");
+    println!(
+        "# {HEAVY_TABLES} tables x ({COLS_PER_TABLE} columns + {FILES_PER_TABLE} files), \
+         4-worker runtime, median of {REPEATS} batches"
+    );
+    println!("# small read with an idle pool: {:.3} ms\n", idle.median_ms);
+    println!(
+        "{:>12}  {:>11}  {:>13}  {:>13}  {:>9}",
+        "concurrency", "batch_ms", "per_decode_ms", "small_read_ms", "vs_idle"
+    );
+
+    for &k in &concurrency {
+        let mut batches = Vec::with_capacity(REPEATS);
+        let mut smalls = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            let decoders: Vec<_> = (0..k)
+                .map(|_| {
+                    let heavy = heavy.clone();
+                    tokio::spawn(async move { heavy.snapshot().await.map(|_| ()) })
+                })
+                .collect();
+            // Queued behind K decodes already in the pool's run queue.
+            let probe = {
+                let small = small.clone();
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    small.snapshot().await.map(|_| ())?;
+                    Ok::<_, moraine::Error>(start.elapsed())
+                })
+            };
+            smalls.push(probe.await.unwrap().unwrap());
+            for decoder in decoders {
+                decoder.await.unwrap().unwrap();
+            }
+            batches.push(start.elapsed());
+        }
+        let batch = Stats::of(batches);
+        let smalls = Stats::of(smalls);
+        let per_decode = batch.median_ms / k as f64;
+        let vs_idle = smalls.median_ms / idle.median_ms;
+        println!(
+            "{k:>12}  {:>11.3}  {per_decode:>13.3}  {:>13.3}  {vs_idle:>9.1}",
+            batch.median_ms, smalls.median_ms
+        );
+    }
+    heavy.close().await.unwrap();
+    small.close().await.unwrap();
+    println!();
+}

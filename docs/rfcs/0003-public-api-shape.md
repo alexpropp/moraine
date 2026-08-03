@@ -56,7 +56,9 @@ core concerns.
 
 SlateDB is async (tokio). The core surface is therefore `async`; the core
 spawns no runtime and no threads of its own — the caller drives it, and the
-DuckDB bridge owns the sync↔async translation.
+DuckDB bridge owns the sync↔async translation. It does spawn *tasks* onto the
+runtime already driving it, which is how a commit's durable write survives its
+caller being cancelled (RFC 0010); that needs no runtime of its own.
 
 RFC 0002 establishes the read model this API exposes: a client builds an
 in-memory catalog by scanning the `current` subspace at attach; the live catalog
@@ -244,7 +246,7 @@ is a verb-path property.
 | `Corruption` | value decode failure or unknown `sys/format` version (RFC 0002) | no |
 | `Unsupported` | a DuckLake feature moraine does not yet implement (e.g. VARIANT inlining, RFC 0005) | no |
 | `SnapshotExpired` | a held/requested snapshot fell below the RFC 0007 retention horizon (RFC 0009) — re-resolve from head | no |
-| `Interrupted` | operation cancelled by a host interrupt before its point of no return (RFC 0010) | no |
+| `Interrupted` | operation cancelled by a host interrupt before its point of no return, or a durable write past that point whose outcome went unreported (RFC 0010) — re-resolve head | no |
 | `Migration` | store requires, is undergoing, or is newer than a structural format the binary supports (RFC 0015) | no |
 
 The conflict split follows from closure-with-retry: transient races

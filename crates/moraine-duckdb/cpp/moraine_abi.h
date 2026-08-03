@@ -895,6 +895,18 @@ extern "C" {
 // empty follows the latest manifest; a non-null value with `read_only`
 // false is [`codes::INVALID_ARGUMENT`].
 //
+// `host_threads` is how many execution threads the calling host runs, and
+// sizes this handle's worker pool: the host's setting is the only number
+// in the process that says how much parallelism the operator asked for,
+// so a session pinned to one thread does not get a pool sized to the
+// machine. It is clamped to a floor of two (a CPU-bound poll must not be
+// able to stall SlateDB's flush) and a ceiling of eight (the pool waits
+// on object storage, which yields its worker at every await, so further
+// workers only park — on cores the host already sized itself to). `0`
+// means the host does not say and takes the floor. The size is fixed for
+// the handle's life; a host that changes its own thread count afterwards
+// keeps the pool it attached with.
+//
 // Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
 // are: the store open is the one long blocking call an attach makes, and
 // against an unreachable endpoint it is the one worth escaping. A
@@ -919,6 +931,7 @@ extern "C" {
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+// `host_threads` is unconstrained.
 // `probe`, if non-null, must be safe to call with `probe_ctx` from any
 // thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -931,6 +944,7 @@ int32_t moraine_attach(const char *path,
                        const char *cache_dir,
                        const char *data_path,
                        const char *checkpoint,
+                       uint64_t host_threads,
                        MoraineInterruptProbe probe,
                        void *probe_ctx,
                        struct MoraineCatalogHandle **out,
@@ -2393,16 +2407,44 @@ int32_t moraine_tx_dump_snapshots(struct MoraineTxHandle *tx,
 // either way; it must not be passed to [`moraine_tx_rollback`]
 // afterward.
 //
+// Cancellable: races the commit against `probe` (polled immediately, then
+// ~100 ms; a null `probe` disables polling). Where the cancellation lands
+// decides what it means, and one of the three outcomes is ambiguous:
+//
+// - **Before the durable write is issued** — translation, index maintenance,
+//   and staging are in-memory only, so cancelling discards them.
+//   [`codes::INTERRUPTED`], catalog unchanged, head where it was.
+// - **While the durable write is in flight** — the write is spawned past the
+//   point of no return and is never dropped mid-batch, so it runs to
+//   completion in the background while this call returns
+//   [`codes::INTERRUPTED`] promptly. **The commit may still land.** The
+//   outcome is therefore ambiguous in exactly the way an unacknowledged
+//   durable write is: the batch is atomic, so head ends at either the old id
+//   or the new one and never in between, but this return does not say which. A
+//   caller that needs to know re-resolves head and reads it — it must not
+//   treat [`codes::INTERRUPTED`] as "nothing landed", and must not re-drive
+//   the rows blind.
+// - **After the write completed** — there is nothing left to cancel, so the
+//   committed snapshot id is reported normally.
+//
+// The interrupt is honored rather than ridden out because the wait it
+// escapes is unbounded: a durable write against an unreachable endpoint
+// is retried beneath moraine indefinitely, and a session with no way out
+// of it is the worse failure.
+//
 // # Safety
 //
 // `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 // and not yet committed or rolled back. `out_snapshot_id` must be a
-// valid, writable `*mut u64`. `err`, if non-null, must be a valid,
+// valid, writable `*mut u64`. `probe`, if non-null, must be safe to call
+// with `probe_ctx` from any thread. `err`, if non-null, must be a valid,
 // writable [`MoraineError`]. All for the duration of this call. The
 // catalog handle `tx` was opened on ([`moraine_tx_begin`]'s contract)
 // must still be attached.
 int32_t moraine_tx_commit(struct MoraineTxHandle *tx,
                           uint64_t *out_snapshot_id,
+                          MoraineInterruptProbe probe,
+                          void *probe_ctx,
                           struct MoraineError *err);
 
 // Discards every staged row without writing anything, consuming `tx`.

@@ -573,14 +573,21 @@ impl StagedTransaction {
                 // one head-race classification, one projection refresh.
                 // This path never retries the loss — DuckLake authored the
                 // rows, so re-driving them is DuckLake's call.
-                let landed = commit::commit_batch(
+                //
+                // Spawned, not awaited inline: everything above is staged
+                // in memory and a dropped future discards it, but the write
+                // below cannot be retracted once issued, so a host
+                // interrupt races the wait for it rather than the write
+                // itself.
+                let head_before = base_ref.snapshot.snapshot_id;
+                let landed = commit::join_commit_batch(commit::spawn_commit_batch(
                     db_tx,
-                    base_ref.snapshot.snapshot_id,
+                    head_before,
                     result_id,
-                    &writes,
-                    base_ref,
-                    &projections,
-                )
+                    writes,
+                    Arc::clone(&base),
+                    projections,
+                ))
                 .await?;
                 match landed {
                     commit::Landed::Committed => {

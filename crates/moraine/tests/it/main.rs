@@ -13,6 +13,7 @@ mod data_files;
 mod group_commit;
 mod index_backfill;
 mod inline_data;
+mod interrupt;
 mod macros;
 mod measure;
 mod partitioning;
