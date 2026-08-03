@@ -6,6 +6,7 @@ mod fixtures;
 
 mod cache;
 mod catalog;
+mod census;
 mod checkpoint;
 mod commit_concurrency;
 mod crash_recovery;

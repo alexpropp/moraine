@@ -194,15 +194,17 @@ mod store;
 mod transaction;
 
 pub use catalog::{
-    Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
-    ColumnOrder, ColumnStats, CommitMember, DataFile, DataFileId, DataFileInfo, DeleteFile,
-    DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
-    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, MacroId,
-    MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
-    MappingId, MappingInfo, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
-    PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo,
-    TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
+    Catalog, CatalogOptions, CatalogSnapshot, CensusRequest, ColumnAlteration, ColumnDef, ColumnId,
+    ColumnInfo, ColumnOrder, ColumnStats, CommitMember, CompactStoreReport, CompactStoreRequest,
+    CompactionTarget, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo,
+    FileColumnStats, FileIndexEntry, FileIndexRemoval, FlushedDataFile, IndexDef, IndexEntry,
+    IndexId, IndexInfo, IndexState, InlineChunk, LiveCount, MacroId, MacroImplementationDef,
+    MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest, MappingId, MappingInfo,
+    MergeOutcome, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId,
+    PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo,
+    SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus, SubspaceCensus,
+    SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry, TagTarget, ViewId,
+    ViewInfo,
 };
 pub use error::{Error, Result};
 /// Crash-injection seams, for tests that drive a migration to a named

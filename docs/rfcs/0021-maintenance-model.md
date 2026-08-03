@@ -1,6 +1,6 @@
 # RFC 0021: Maintenance orchestration
 
-- **Date:** 2026-07-24
+- **Date:** 2026-07-24 (revised 2026-08-03: substrate merge and store census)
 
 ## Summary
 
@@ -11,14 +11,20 @@ the first two by hand in an order nothing documents, and the third does not
 exist — RFC 0016 defers its sweep to "RFC 0007's maintenance posture" and
 RFC 0007 owns no verb to hang it on. This RFC makes maintenance **a
 scheduled pass inside the writer**: a thread the shim starts at `ATTACH`
-issues DuckLake's own maintenance SQL through its own connection and then
-reclaims moraine's orphaned index ranges, in a fixed order, retaining one
-report per pass. It lives in the shim because that is the only layer
-reaching both DuckLake's SQL and moraine's core, a deliberate exception to
-the thin-shim rule. It adds no SlateDB step — the substrate already
-collects itself. moraine computes no retention policy: **every interval and
-every step is configured at attach**, and an attach that configures nothing
-schedules nothing.
+issues DuckLake's own maintenance SQL through its own connection, reclaims
+moraine's orphaned index ranges, and merges the substrate's accumulated
+dead versions, in a fixed order, retaining one report per pass. It lives in
+the shim because that is the only layer reaching both DuckLake's SQL and
+moraine's core, a deliberate exception to the thin-shim rule. moraine
+computes no retention policy: **every interval and every step is configured
+at attach**, and an attach that configures nothing schedules nothing.
+
+The substrate step and its companion measurement — `moraine_store_census`,
+which reports physical bytes per subspace from the manifest alone — were
+added after a production store reached 3.4 GB of objects while serving a
+single live snapshot, with a read-only attach against it taking 642 s.
+SlateDB's own collector does not close that gap: it deletes objects nothing
+references, and superseded versions inside a referenced SST are not that.
 
 ## Goals
 
@@ -31,6 +37,10 @@ schedules nothing.
   reclamation exists (`Catalog::reclaim_index_entries`), but nothing
   discovers *which* indexes are dead or drives the reclamation, so the
   ranges leak in practice.
+- **Substrate bytes are measurable and reclaimable.** An operator can learn
+  which subspace holds a store's bulk without reading the store, and can
+  make a quiet store's dead versions actually go away. Both without taking
+  the writer down.
 - **Safe by construction.** The sweep rests on an invariant (catalog ids
   are never reused), not on running at a quiet moment. Every step is
   idempotent, so an interrupted pass is safe to re-run.
@@ -42,8 +52,15 @@ Non-goals:
 - **Reimplementing any DuckLake maintenance function.** They are called,
   not wrapped. RFC 0007 and RFC 0008 remain the specifications of what they
   do to moraine's keyspace.
-- **A retention policy**, compaction threshold, or grace period.
-- **Forcing SlateDB compaction** — possible, and declined (Design).
+- **A retention policy**, compaction threshold, or grace period. The
+  substrate step names a tree and asks for all of it; which SSTs merge into
+  which sorted run stays SlateDB's decision.
+- **A moraine-side merge engine.** SlateDB executes; moraine submits.
+- **Repairing the read-only read path.** RFC 0009's caching and incremental
+  refresh remove the *repeat* cost of a read-only read; they do not remove
+  the one full `current` materialization a cold attach pays, which is
+  proportional to the physical bytes of that subspace and is the cost step 8
+  reduces. The two are complements, and neither substitutes for the other.
 - **Checkpoint lifecycle** — an RFC 0017 / RFC 0006 concern; if it lands it
   becomes a consumer of this surface.
 
@@ -57,7 +74,9 @@ engine was rejected. This RFC sequences DuckLake's functions; it does not
 replace them.
 
 **SlateDB** already collects its own superseded objects, in every moraine
-writer, with no help from this design. `StoreBuilder::settings`
+writer, with no help from this design — and step 8 is not that, since
+collection deletes whole objects nothing references while step 8 rewrites
+objects the manifest still does. `StoreBuilder::settings`
 (`open.rs:104`) overrides only the flush cadence and cache options, so
 `garbage_collector_options` stays at `Settings::default()`'s
 `Some(GarbageCollectorOptions::default())` (`config.rs:993`), and
@@ -67,12 +86,36 @@ compacted, compactions, detach — every 60s, deleting only what is
 superseded, unreferenced by any active checkpoint, and older than a
 5-minute `min_age`. A size-tiered compactor polls alongside it every 5s.
 
-The steady state therefore needs nothing: expiry's deletes become
-tombstones ordinary compaction removes, the collector reclaims the SSTs
-that compaction supersedes, and `TagSegmentExtractor` (`store/segment.rs`)
-gives each subspace its own segment so `history` churn compacts without
-disturbing `current`. **This RFC adds no substrate step**, because there is
-no gap to fill (Alternatives).
+The steady state needs nothing: expiry's deletes become tombstones ordinary
+compaction removes, the collector reclaims the SSTs that compaction
+supersedes, and `TagSegmentExtractor` (`store/segment.rs`) gives each
+subspace its own segment so `history` churn compacts without disturbing
+`current`.
+
+**The gap is the store that leaves the steady state.** Both mechanisms are
+conditioned on write pressure that a quiet store does not supply. The
+scheduler is size-tiered and proposes per tree as tiers fill
+(`slatedb-0.14.1/src/size_tiered_compaction.rs:179-220`); a tree that stops
+receiving flushes proposes nothing, indefinitely. The collector deletes only
+what nothing references, and an SST full of superseded versions is
+referenced by the manifest. So a store that churned for months and then went
+quiet holds its dead weight permanently, and resuming traffic reclaims the
+top tier long before the bottom. Measured on the store that motivated this:
+71 objects / 3.4 GB, unchanged over fifteen minutes of a fully quiet writer.
+
+**Segmentation is applied at flush, not at merge**, which is what makes a
+per-subspace treatment both possible and precise. SlateDB treats an
+extractor-configured database as mandatorily fully segmented — the root tree
+is empty by construction (`manifest/mod.rs:945`) — and each memtable is split
+into one SST per touched prefix *before upload* (`flush.rs:66-140`,
+`memtable_flusher/uploader.rs:195-206`). No SST in a moraine store mixes two
+subspaces, at any level, under any compaction backlog. Reads are routed to
+the overlapping segments only (`reader.rs:156-175`, `manifest/mod.rs:756`),
+so a scan of `current` — which is all a materialization does
+(`transaction/commit.rs:396`) — opens `current`-segment SSTs and nothing
+else. Two consequences follow. Whatever the `index` subspace weighs cannot
+cost a catalog scan anything. And the manifest's per-segment sizes *are* a
+per-subspace census, available without reading the data.
 
 **moraine** owns one reclamation duty and does not discharge it. RFC 0016's
 `index` subspace holds one entry per indexed row. `drop_index` ends the
@@ -129,6 +172,7 @@ configure:
 | 5 | Cleanup | `CLEANUP_OLD_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_cleanup_old_files('lake', …)` |
 | 6 | Orphans | `DELETE_ORPHANED_FILES[_OLDER_THAN\|_CLEANUP_ALL]` | `CALL ducklake_delete_orphaned_files('lake', …)` |
 | 7 | Sweep | `SWEEP_INDEXES` (default **true**) | `Catalog::maintain` — core |
+| 8 | Merge store | `COMPACT_STORE[_SUBSPACE\|_TIMEOUT]` | `Catalog::compact_store` — core |
 
 The call syntax is what the e2e suite already exercises against real
 DuckLake (`tests/ducklake_load/maintenance.rs:47,91,150,230,333`).
@@ -140,11 +184,15 @@ later step is served a smaller one. Flush before merge, so its small
 Parquet files are merge input. Merge and rewrite before cleanup, because
 merge schedules its superseded bytes directly (RFC 0008) and cleanup drains
 that schedule in the same pass. Cleanup before orphan detection, so the
-schedule is drained first. The sweep last, because its input is everything
-the earlier steps left behind. The order is a cost preference —
-every step is independently safe and idempotent in any order.
+schedule is drained first. The sweep before the store merge, because its
+input is everything the earlier steps left behind. The store merge last,
+because every step above it writes: expiry tombstones rows and the sweep
+deletes index ranges, and merging first would leave exactly the tombstones
+the pass just created for the next pass to find. The order is a cost
+preference — every step is independently safe and idempotent in any order.
 
-**Compaction is deliberately not placed before expiry.** The tempting
+**DuckLake compaction — steps 3 and 4, not the store merge — is
+deliberately not placed before expiry.** The tempting
 rationale — that expiry would then reclaim what compaction superseded —
 fails for both verbs, for opposite reasons (RFC 0008). *Merge* leaves
 nothing to reclaim: its output backdates `begin_snapshot` to cover every
@@ -216,20 +264,27 @@ functions and the `moraine_index_*` family both go through it, so the
 whole extension resolves lakes identically — the index family previously
 carried its own copy of the prefix assumption and inherited the same bug.
 
-Two options are moraine's own rather than derived, because the sweep is:
-`META_MAINTENANCE_SWEEP_INDEXES` (default true) turns it off, and
-`META_MAINTENANCE_BATCH_SIZE` bounds the deletes per commit. Both are
-validated at bind — an unknown option, an unknown parameter for a known
-step, a non-positive interval or batch size, and a step disabled while one
-of its own parameters is supplied are all `BinderException`s, so a
+Four options are moraine's own rather than derived, because steps 7 and 8
+are: `META_MAINTENANCE_SWEEP_INDEXES` (default true) turns the sweep off and
+`META_MAINTENANCE_BATCH_SIZE` bounds its deletes per commit;
+`META_MAINTENANCE_COMPACT_STORE` (default **false**) enables the store merge,
+`META_MAINTENANCE_COMPACT_STORE_SUBSPACE` narrows it to one named subspace
+rather than every one, and `META_MAINTENANCE_COMPACT_STORE_TIMEOUT` bounds
+how long the pass waits for the merge to commit. All are validated at bind —
+an unknown option, an unknown parameter for a known step, an unknown subspace
+name, a non-positive interval, batch size, or timeout, and a step disabled
+while one of its own parameters is supplied are all `BinderException`s, so a
 misconfigured attach fails rather than starting a scheduler that quietly
 does the wrong thing.
 
 **Defaults are the safe floor.** Steps 1–6 mutate the lake — writing
-Parquet, minting snapshots, or deleting bytes — so none has a default. An
-interval alone schedules only the sweep, which touches nothing
-a query can observe. Destructive steps run unattended only because an
-operator wrote down that they should.
+Parquet, minting snapshots, or deleting bytes — so none has a default. Step 8
+destroys nothing a query can observe, but rewrites gigabytes and pays for
+every byte in object-store traffic, so it defaults off for cost rather than
+for safety. An interval alone schedules only the sweep, which touches
+nothing a query can observe and costs two seeks when nothing was dropped.
+Steps that move bytes run unattended only because an operator wrote down
+that they should.
 
 ### The scheduler
 
@@ -255,7 +310,11 @@ configured, stopped and joined at detach *before* `moraine_detach`
   one. The window is in-memory per attach and bounded so a fast interval
   cannot grow it without limit.
 
-**Read-only attaches never schedule.** A `DbReader` never opens a writer.
+**Read-only attaches never schedule.** A `DbReader` never opens a writer, so
+no step runs — including step 8, whose merge only a writer's compactor could
+execute. The census is the one part of this surface a read-only attach
+reaches, and it reaches it through its own table function rather than
+through a pass.
 
 **A failed step abandons the rest of the DuckLake sequence, but never the
 sweep.** The DuckLake steps depend on each other — cleanup drains what
@@ -300,6 +359,15 @@ needs a deterministic way to run a pass without waiting on wall-clock, and
 an operator needs a way to run one before a backup or after a bulk load
 without re-attaching.
 
+`CALL moraine_store_census('lake')` is a separate table function, not a
+trigger and not a step. It takes one optional boolean for the scanning leg,
+issues no SQL, mutates nothing, and is available on a read-only attach —
+which is the attach shape an operator investigating a production store
+actually has. It is the intended first move against a store whose size is
+unexplained: run the census, read which subspace holds the bulk, and only
+then decide whether the answer is step 8, a `cleanup_old_files` the lake
+never ran, or neither.
+
 **Explicit transactions are refused.** The caller blocks while its own
 second connection writes the catalog, so running inside a user's `BEGIN`
 invites a self-deadlock. Refused unless
@@ -335,10 +403,95 @@ reclaimed has no such failure mode, mirroring RFC 0007's preference for a
 scan-based dead-row rule over maintained reference counts.
 
 **Each batch is a head-preserving maintenance commit** — RFC 0007's shape:
-one `WriteBatch`, no `ducklake_snapshot` insert, no `sys/head` advance.
+one `WriteBatch`, no `ducklake_snapshot` insert, and `sys/head` written at
+the standing snapshot id with its batch count advanced, which is what every
+head-preserving batch does (RFC 0004). The advance is not bookkeeping: it is
+the stamp that tells a reader state moved under an unchanged snapshot id
+(RFC 0009), and it is the single write-write anchor, so a sweep batch racing
+a commit loses or wins that race cleanly instead of interleaving with it.
 Between batches the sweep yields, so a large reclamation never holds the
-writer, and it cannot conflict with one: the only keys it writes are
-deletes under dead index ids, which no live commit touches.
+writer. Beyond the head record the two write disjoint keys — the sweep
+touches only dead index ids — so a lost race costs a retry of one batch and
+never a redo of the scan.
+
+### The store merge
+
+The step names a tree and asks SlateDB to merge all of it. It builds
+SlateDB's own scheduler
+(`SizeTieredCompactionSchedulerSupplier::compaction_scheduler`), calls
+`generate` (`compactor.rs:177`, a provided trait method) with
+`CompactionRequest::Full` or `FullSegment { segment }` (`compactor.rs:245`),
+and submits each returned spec through `Admin::submit_compaction`
+(`admin.rs:200`). It constructs no `CompactionSpec` itself: `plan_full_tree`
+(`compactor.rs:222`) makes every sorted run in the tree a source and the
+tree's lowest sorted-run id the destination, and a later upstream change to
+what "merge this tree fully" means is inherited rather than re-derived.
+
+**The merge is bottom-inclusive by construction**, which is what makes it
+reclaim rather than relocate. Sorted-run ids are globally monotonic
+(`size_tiered_compaction.rs:456`), so a tree's lowest id is its bottom run;
+the worker sets `is_dest_last_run` by comparing the destination against
+`compacted.last()` (`compaction_worker.rs:637`) and hands it to the retention
+iterator (`compactor_executor.rs:409`), which is the flag permitting
+superseded versions and tombstones to be dropped instead of carried forward.
+A full-tree plan satisfies it every time. L0 is deliberately excluded
+upstream so flushes continue during the merge (`compactor.rs:250-256`); the
+residual is bounded by `l0_max_ssts` and is ordinary size-tiered work.
+
+**Submitting is not running, so the step waits.** `submit_compaction`
+persists a `Submitted` entry; the compactor already running inside the writer
+promotes and executes it on its poll tick
+(`compactor.rs:715-721`). The step then polls `Admin::read_compaction`
+(`admin.rs:156`) until each id reaches a terminal `CompactionStatus`
+(`compactor_state.rs:246`) — `Completed` or `Failed` — and re-reads the
+manifest to report the byte delta. On timeout the merge is reported pending
+and **is not cancelled**: it keeps running, and a later census shows the
+result. The poll cadence derives from the compactor's own poll interval
+rather than being configured; a knob there would be a knob about SlateDB's
+scheduler, which RFC 0003 keeps out.
+
+**Read-write only.** Submission alone needs no writer — `Admin` opens no `Db`
+and fences nothing — but execution does, since the compactor that promotes a
+`Submitted` entry lives in the writer process. A read-only catalog would
+queue work nothing would run and then wait out its timeout, so it refuses
+with `Constraint`, like every other write-path verb.
+
+A tree with no compacted sorted runs is reported skipped rather than failed —
+what `Full` does silently, and what a store whose bulk is still in L0 will
+report. Naming such a subspace explicitly is an upstream error; the verb
+reports it the same way, so the whole-store and single-subspace forms read
+alike.
+
+### The store census
+
+Measurement is not a step — it belongs to the on-demand surface, because its
+whole purpose is to be run before deciding whether a merge is worth it.
+`moraine_store_census('lake')` returns one row per subspace: physical bytes,
+L0 SST count, sorted-run count, and SST count across those runs, read from
+the latest manifest through `Admin::read_compactor_state_view`
+(`admin.rs:185`) → `VersionedManifest::segments()` (`manifest/mod.rs:945`) →
+per-segment `l0()` / `compacted()` (`manifest/mod.rs:191,196`) →
+`estimate_size()` (`db_state.rs:238,472`).
+
+That default costs two object reads and is independent of store size. It is
+enough to answer the question a bloated store poses — *is the bulk `index`,
+which no scan touches, or `current`, which every attach reads?* — because
+segmentation is by subspace (Background). Subspace names are moraine's, mapped
+from the segment prefix byte by `store`, the only layer that knows the
+discriminant assignment; a segment whose prefix is not a known discriminant is
+reported as unknown rather than dropped or refused, since a census exists to
+describe a store that has gone wrong.
+
+A boolean argument adds a scanning leg: a read-only pass over every subspace
+counting live keys and their encoded bytes, breaking `current` down by
+`CurrentKey` variant so the deletion schedule (`current/gcfile`, RFC 0007) is
+separated from entity records. It decodes keys, never values. It costs a full
+read of the store, which is why it is opt-in, and it is the only way to say
+what fraction of a subspace is live — that is, how much a merge would
+actually reclaim, and whether the answer is instead a `cleanup_old_files` the
+lake never ran.
+
+The census serves read-only attaches. Both legs read; neither writes.
 
 ### The core verb
 
@@ -359,9 +512,80 @@ impl Catalog {
 }
 ```
 
-Both structs are `#[non_exhaustive]`, so a future leg is additive. No
-`slatedb::` type appears — RFC 0003's substrate rule holds. RFC 0003's
-operation table gains this under a **Maintenance** group.
+Steps 8 and the census are two more `Catalog` verbs, neither a `Transaction`
+mutator and neither minting a snapshot:
+
+```rust
+/// Which trees to merge.
+pub enum CompactionTarget {
+    /// Every subspace holding compacted sorted runs; the rest are skipped.
+    WholeStore,
+    /// One subspace.
+    Subspace(SubspaceName),
+}
+
+pub struct CompactStoreRequest {
+    pub target: CompactionTarget,
+    /// How long to wait for every submitted merge to commit. `None`
+    /// returns as soon as they are submitted.
+    pub wait: Option<Duration>,
+}
+
+pub struct CompactStoreReport {
+    pub merges: Vec<SubspaceMerge>,
+}
+
+pub struct SubspaceMerge {
+    pub subspace: SubspaceName,
+    /// Completed | Failed(String) | Pending | Skipped(&'static str)
+    pub outcome: MergeOutcome,
+    pub bytes_before: u64,
+    pub bytes_after: Option<u64>,
+}
+
+pub struct CensusRequest {
+    /// Add the scanning leg: live keys and bytes per subspace. Costs a
+    /// full read of the store.
+    pub count_live_entries: bool,
+}
+
+pub struct StoreCensus {
+    pub manifest_id: u64,
+    pub subspaces: Vec<SubspaceCensus>,
+}
+
+pub struct SubspaceCensus {
+    pub subspace: SubspaceName,
+    pub bytes: u64,
+    pub l0_ssts: u32,
+    pub sorted_runs: u32,
+    pub sorted_run_ssts: u32,
+    /// `None` unless the request asked for the scanning leg.
+    pub live: Option<LiveCount>,
+}
+
+impl Catalog {
+    pub async fn compact_store(&self, request: CompactStoreRequest)
+        -> Result<CompactStoreReport>;
+    pub async fn store_census(&self, request: CensusRequest)
+        -> Result<StoreCensus>;
+}
+```
+
+`SubspaceName` names each subspace RFC 0002 defines — `changelog`
+(RFC 0009) included, whose window bounds it but whose physical bytes still
+accumulate between merges — plus an unknown discriminant. Every struct is
+`#[non_exhaustive]`, so a future leg is additive.
+
+No `slatedb::` type appears in any signature — RFC 0003's substrate
+rule holds, and it is why the census reports bytes and counts per subspace
+rather than SST ids, key ranges, and run sizes: the latter is the substrate's
+vocabulary, and nothing an operator can act on. RFC 0003's operation table
+gains all three under a **Maintenance** group.
+
+`Catalog` today holds only the store handle; `Admin` needs the path and the
+object store. Both are retained at open alongside the handle, and are not
+otherwise observable.
 
 ### The `DATA_PATH` overlap guard
 
@@ -398,8 +622,9 @@ Core:
   both indexes of a two-index table; a later scan of `index` finds nothing.
 - **Sweep spares live indexes** interleaved by id; lookups unchanged. A
   second `maintain` then reports zero and writes nothing.
-- **Batching is bounded**, each batch head-preserving — `sys/head`
-  unchanged across the whole sweep.
+- **Batching is bounded**, each batch head-preserving — the head snapshot id
+  unchanged across the whole sweep while its batch count advances once per
+  batch, and no `ducklake_snapshot` record written.
 - **No writer conflict.** A sweep interleaved with commits landing entries
   for a *live* index completes, and both ranges end up correct.
 - **Discovery seeks by id.** From any starting id, the scan returns the
@@ -409,6 +634,35 @@ Core:
   whole pass.
 - **Key ordering.** Index prefixes sort ascending within a kind and the two
   kinds occupy disjoint ranges, so the skip-scan's seek target is sound.
+- **The census names the subspaces the store wrote.** A catalog with
+  committed history, inlined chunks, and index entries reports non-zero
+  bytes for exactly those subspaces and zero for the untouched ones.
+- **The census is manifest-only by default**, pinned by an instrumented
+  object store: its read count must not scale with the number of committed
+  rows. With the scanning leg it does.
+- **The live leg counts what is live.** After *n* commits and *k* deletes
+  the live count matches an independent scan, and `current` separates
+  entity records from `current/gcfile`.
+- **An unrecognized segment is reported, not refused.**
+- **A merge reclaims.** A subspace churned into several sorted runs reports
+  fewer runs and fewer bytes after a merge, and every key reads back
+  identically.
+- **Superseded versions and tombstones drop.** A key written *n* times plus
+  one deleted key leave one live version and no tombstone after a full merge
+  of that subspace — asserted through the census's byte and count deltas,
+  not through SlateDB internals.
+- **Only the named subspace merges.** Merging `current` leaves `index`'s run
+  and SST counts untouched.
+- **A tree with nothing to merge is skipped**, for both targets, with the
+  reason reported.
+- **`wait: None` returns without blocking** and the merge still commits; a
+  later census shows the reduction.
+- **A read-only catalog refuses `compact_store`** and serves `store_census`.
+- **The merge does not disturb the catalog.** The head stamp is unchanged
+  across it, no snapshot is minted, and a materialization before and after
+  is identical.
+- **A commit landing during a merge succeeds**, and both the committed rows
+  and the merged ones read back correctly.
 
 Live (e2e):
 
@@ -446,6 +700,11 @@ Live (e2e):
 - **Detach during a running pass completes**, rather than hanging on the
   join or failing.
 - **Path overlap refused**; sibling locations attach normally.
+- **The census table function** reports one row per subspace on a lake with
+  data, from a read-write and a read-only attach alike.
+- **A configured pass merges** and reports step 8 `ran`; an unconfigured one
+  reports it `skipped`; a pass whose merge fails reports `failed` and leaves
+  the lake queryable.
 
 The timer tests hold one session open across a real pause: the retained
 window is per-attach and in memory, so a second session would observe a
@@ -493,9 +752,12 @@ and sibling-versus-nested prefixes without needing a lake.
   lifecycle it did not have.
 
 - **A substrate-collection step** running `Admin::run_gc_once` in the pass,
-  to reclaim without waiting for the background cadence. Carried through
-  several drafts and cut on checking the defaults: moraine already runs
-  that exact collector, all six tasks, every 60 seconds
+  to reclaim without waiting for the background cadence. This is *not* step
+  8 under another name: collection deletes objects nothing references, and
+  the bytes step 8 exists for are inside objects the manifest still
+  references. Carried through several drafts and cut on checking the
+  defaults: moraine already runs that exact collector, all six tasks, every
+  60 seconds
   (Background). A pass scheduled at minutes-to-hours cadence gains nothing
   by saving up to a minute, and `Admin::run_gc_once` would build a *second*
   collector racing the built-in one — including a second
@@ -505,21 +767,48 @@ and sibling-versus-nested prefixes without needing a lake.
   returns `()`, so a wholly failed pass is indistinguishable from a clean
   one. Redundant, mildly racy, and unobservable.
 
-- **Forcing SlateDB compaction**, so a bulk expiry's tombstones reach the
-  last sorted run promptly rather than on the size-tiered scheduler's own
-  timing. The motivation is real and the APIs are all public at the pinned
-  version (`read_compactor_state_view`'s `VersionedManifest` exposes `l0()`
-  and `compacted()`; `SsTableView::id` and `SortedRun::id` are public
-  fields, `db_state.rs:67,465`; `SourceId`, `CompactionSpec::new` /
-  `for_segment` / `drain_segment`, and `submit_compaction` likewise) — so
-  this is a choice, not a limitation. Rejected because choosing which
-  sources merge into which destination *is* the compaction policy
-  SlateDB's scheduler exists to make; because `TagSegmentExtractor` gives
-  each subspace its own tree, making a correct spec per-segment and a
-  substrate detail RFC 0003 keeps out; and because `submit_compaction` only
-  queues work for a worker, so it would not even deliver the synchronous
-  reclaim that motivates it. The residual want is a "compact now and wait"
-  primitive — an upstream request.
+- **Declining a forced-compaction lever**, as an earlier revision of this
+  RFC did. It gave three reasons and each has since proved false. *Choosing
+  which sources merge into which destination is SlateDB's policy to make* —
+  true, and `CompactionRequest::Full` / `FullSegment` make it upstream, so
+  the caller names a tree and nothing else. *A per-segment spec is a
+  substrate detail RFC 0003 keeps out* — the target is a **subspace**, which
+  is moraine's own vocabulary; the segment is how it is implemented, not
+  what is exposed. *`submit_compaction` only queues, so it cannot deliver a
+  synchronous reclaim* — `read_compaction` plus `CompactionStatus`'s
+  terminal states make waiting a poll loop, which is what step 8 does. The
+  residual upstream want is narrower than that revision recorded: a
+  completion signal instead of a poll. The measurement that forced the
+  reversal is in Background — a quiet store holding 3.4 GB indefinitely,
+  which no shipped mechanism touches.
+
+- **A census by prefix scan only.** Rejected as the default: it costs a full
+  read of the store, which is the very cost being investigated, where the
+  manifest answers the composition question in two object reads. Kept as an
+  opt-in leg, since it is the only source for live-versus-dead *within* a
+  subspace — and therefore the only way to distinguish dead weight a merge
+  reclaims from a `current/gcfile` schedule only `cleanup_old_files` drains.
+
+- **A standalone census/compaction binary** instead of catalog verbs.
+  Tempting, since `Admin` fences nothing and an operator would rather not
+  attach at all. Rejected for the merge: nothing executes a submitted
+  compaction unless a writer happens to be attached, so the binary's
+  behaviour would depend on state it cannot observe. The census has no such
+  problem and is reachable from a read-only attach, which covers the
+  investigating-operator case without a second artifact to ship and version.
+
+- **A fresh-store copy and repoint** — open the old store read-only, scan the
+  live keys, batch them into a new store at a fresh prefix, repoint. Provably
+  clean, and the genuine fallback if a merge ever cannot drop everything.
+  Rejected as the primary answer: it needs cutover choreography under the
+  single-writer rules (RFC 0004), it is a one-shot operation rather than a
+  standing capability, and the merge it would replace is bottom-inclusive by
+  construction and so leaves nothing over.
+
+- **Merging before the sweep**, or interleaving the two. Rejected: the
+  sweep's deletes are exactly the tombstones a merge should drop, so a merge
+  that runs first guarantees a second pass is needed to reclaim what the
+  first pass created.
 
 - **A compaction filter that prunes dead history.** SlateDB accepts a
   `CompactionFilterSupplier`, so moraine could drop `history` entries below
