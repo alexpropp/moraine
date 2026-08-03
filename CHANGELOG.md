@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/morainedb/moraine/compare/v0.4.1...v0.4.2) - 2026-08-03
+
+### Fixed
+
+- derive no equality-index entries for a commit that only compacts ([#70](https://github.com/morainedb/moraine/pull/70))
+- leave a row deleted out of the file its commit registers unindexed ([#69](https://github.com/morainedb/moraine/pull/69))
+
+### Other
+
+- fix the two cargo package failures blocking release-plz ([#72](https://github.com/morainedb/moraine/pull/72))
+
 ## [0.4.1](https://github.com/morainedb/moraine/compare/v0.4.0...v0.4.1) - 2026-08-02
 
 ### Added
