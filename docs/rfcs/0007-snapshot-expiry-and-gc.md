@@ -84,8 +84,14 @@ arrive as staged row operations translated into one atomic batch.
 ### What DuckLake actually issues
 
 **`ducklake_expire_snapshots(older_than / versions)`** selects the
-expirable snapshots (never the most recent) and runs, in one metadata
+expirable snapshots `E` (never the most recent) and runs, in one metadata
 transaction (`DeleteSnapshots`):
+
+`E` is an arbitrary set of snapshot ids, not a prefix of history:
+`versions` names interior snapshots directly, leaving later ones live.
+Nothing in the translation below is tail-specific — the dead-row rule asks
+whether *some* surviving snapshot sees a version, never whether the
+survivors form a suffix.
 
 1. `DELETE FROM ducklake_snapshot WHERE snapshot_id IN (E)`; same for
    `ducklake_snapshot_changes`.
