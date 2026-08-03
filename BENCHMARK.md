@@ -74,6 +74,13 @@ throughput. These live as `#[ignore]`d tests, one per question, in
 cargo test -p moraine --test it --release -- --ignored --nocapture measure_
 ```
 
+Two more need crate-internal seams (the refresh path is not public), and
+live in the library's own tests:
+
+```text
+cargo test -p moraine --lib --release -- --ignored --nocapture measure_
+```
+
 Run in `--release`; a debug build's numbers are meaningless. They use the
 in-memory `object_store`, so a durable commit performs no network IO — the
 durable cost measured is moraine's flush poll plus compute, and a real object
@@ -221,6 +228,56 @@ independent, since it is a read. A 20 000-entity catalog costs ~150 ms; a
 100 000-entity catalog would cost most of a second. Readers now serve from
 the cache rather than paying this per read; lazy materialization to bound
 the cold cost on a large catalog stays open.
+
+### Changelog replay vs. rematerialization
+
+A cache that has fallen behind head can replay the `current` keys each
+commit in the gap recorded, or rescan `current` outright. Both build the
+same view, so the choice is pure cost, and moraine declines a replay whose
+churn passes a share of the live catalog. This is where that share comes
+from — the size backstop is lifted so the expensive side stays visible.
+8 columns per table, 4 files per gap commit, median of 9:
+
+| live entities | gap commits | churn | churn / entities | rescan | replay | speedup |
+|---|---|---|---|---|---|---|
+| 503 | 1 | 5 | 0.01 | 0.77 ms | 0.11 ms | 7.2× |
+| 503 | 16 | 80 | 0.16 | 0.86 ms | 0.37 ms | 2.3× |
+| 503 | 32 | 160 | 0.32 | 0.97 ms | 0.70 ms | 1.4× |
+| 503 | 64 | 306 | 0.61 | 1.19 ms | 1.27 ms | 0.94× |
+| 2 003 | 16 | 80 | 0.04 | 3.07 ms | 0.63 ms | 4.9× |
+| 2 003 | 64 | 320 | 0.16 | 3.41 ms | 1.56 ms | 2.2× |
+| 8 003 | 16 | 80 | 0.01 | 12.3 ms | 1.99 ms | 6.2× |
+| 8 003 | 64 | 320 | 0.04 | 12.5 ms | 2.89 ms | 4.3× |
+
+**The crossover is at a churn share of ~0.57**, interpolating the 503-entity
+rows either side of parity — so the shipped backstop of half the live entity
+count declines just before replay stops paying, which is the right side to
+err on. Note the replay is *clone plus churn*, not churn alone: a view is
+immutable and shared, so advancing one copies it first, and that copy is
+linear in catalog size. That floor is what the 8 003-entity rows show at
+~1.6 ms with a churn of five keys — still 6× cheaper than the rescan, but it
+is why the speedup does not keep growing with catalog size at fixed churn.
+
+### What the changelog costs the read path
+
+The changelog first rode in the snapshot record. Measured there — one data
+file per commit over an 8-column table, stats for every column — it grew
+snapshot records **6.8×** (2 985 → 20 346 bytes over 64 commits) and slowed
+their scan **~1.45×**. Snapshot records are what DuckLake re-reads at every
+transaction and what moraine keeps a decoded projection of, so that is a
+cost on the hot path for a benefit only a refresh takes. It lives in its own
+`changelog` subspace now, and the same workload measures:
+
+| commits | snapshot bytes | changelog records | changelog bytes | snapshot scan |
+|---|---|---|---|---|
+| 64 | 2 985 | 64 | 17 344 | 0.09 ms |
+| 256 | 11 884 | 64 | 17 344 | 0.37 ms |
+| 1 024 | 47 980 | 64 | 17 344 | 1.37 ms |
+
+Snapshot records and their scan are back to exactly what they were without
+the changelog, and the changelog subspace is flat: each commit deletes the
+record 64 snapshots back, so a sliding window bounds it whatever the commit
+count and nothing else has to reclaim it.
 
 ### Read concurrency under IO latency
 

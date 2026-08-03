@@ -32,6 +32,11 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
     pub(crate) snapshot: SnapshotValue,
+    /// The head record's batch count when this view was built, zero for a
+    /// time-travel view. A maintenance batch changes committed state
+    /// without minting a snapshot, so the snapshot id alone does not say
+    /// which store state a head view stands at; this does.
+    pub(crate) batch_seq: u64,
     pub(crate) schemas: BTreeMap<u64, SchemaValue>,
     pub(crate) tables: BTreeMap<u64, TableValue>,
     pub(crate) views: BTreeMap<u64, ViewValue>,
@@ -167,6 +172,33 @@ impl CatalogSnapshot {
             view.put_record(record);
         }
         view
+    }
+
+    /// How many `current` records this view holds — the size a full
+    /// rematerialization would have to read and decode, and so the scale an
+    /// incremental refresh's churn is weighed against.
+    pub(crate) fn live_entity_count(&self) -> usize {
+        fn nested<K, V>(map: &BTreeMap<u64, BTreeMap<K, V>>) -> usize {
+            map.values().map(BTreeMap::len).sum()
+        }
+
+        self.schemas.len()
+            + self.tables.len()
+            + self.views.len()
+            + self.macros.len()
+            + nested(&self.columns)
+            + nested(&self.data_files)
+            + nested(&self.delete_files)
+            + nested(&self.partitions)
+            + nested(&self.sorts)
+            + nested(&self.mappings)
+            + nested(&self.indexes)
+            + self.table_stats.len()
+            + nested(&self.table_column_stats)
+            + nested(&self.file_column_stats)
+            + self.options.len()
+            + self.tags.len()
+            + self.gc_files.len()
     }
 
     /// Inserts one decoded record into the maps it belongs to, keeping the

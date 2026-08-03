@@ -335,6 +335,21 @@ message SnapshotValue {
   // it checks at file grain. Empty on a DuckLake-authored snapshot, which
   // is read back as "deletes from the whole table".
   repeated uint64 deleted_data_file_ids = 12;
+  // Fields 13 and 14 briefly held the refresh changelog. It lives in the
+  // `changelog` subspace now: snapshot records are scanned in full on a
+  // read path DuckLake takes every transaction, and the changelog is
+  // several times their size. Reserved so they are never reused.
+  reserved 13, 14;
+}
+
+// changelog/<snapshot_id>: the `current` keys one commit's batch wrote,
+// encoded and sorted. A reader holding a view at an older snapshot
+// advances it by re-reading exactly these keys instead of rescanning
+// `current`, so the changelog a refresh needs is the one the commit
+// already produced. Only a refresh reads these — one point read per
+// snapshot in its gap — so they cost the serve path nothing.
+message ChangelogValue {
+  repeated bytes keys = 1;
 }
 
 // schema_version/<table_id>/<begin_snapshot>: the catalog schema version
@@ -359,9 +374,14 @@ message FormatValue {
   string writer_version = 2;
 }
 
-// sys/head: latest committed snapshot id.
+// sys/head: latest committed snapshot id, and the count of batches that
+// have landed. Every batch writes this record and increments the count,
+// including a maintenance batch that reuses the snapshot id, so the pair
+// changes whenever any committed state does — which is what lets a
+// read-only reader tell a consistent cut from a torn one.
 message HeadValue {
   uint64 snapshot_id = 1;
+  uint64 batch_seq = 2;
 }
 
 // sys/migration: structural-migration marker. Present only

@@ -52,6 +52,7 @@ pub(crate) fn fold_batch(view: &mut CatalogSnapshot, writes: &[StagedWrite]) -> 
                 if let Some(bytes) = bytes {
                     let head: HeadValue = value::decode_value(bytes)?;
                     new_head = Some(head.snapshot_id);
+                    view.batch_seq = head.batch_seq;
                 }
             }
             // History mirrors, index entries, inline data, and the format

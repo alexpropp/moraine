@@ -26,19 +26,16 @@ deliberately not itemized here.
 
 ## Where the weight is
 
-One thing gates disproportionately much of the list, the other two having
-closed. The crash harness (RFC 0011) drives every case but one: `GroupCommit`
-landed with group commit itself, and `MigrationInterrupted` waits on exactly
-what format migration waits on. Both guarantees moraine owns, atomicity and
-resumability, have driven cases. Format migration (RFC 0015) has its driver,
-its verb, and its marker, and waits only on a format that actually rewrites a
-key.
-
-- **Reader refresh** (RFC 0009). Reads now serve from the cache, so a warm
-  read costs one point read. What is missing is *incremental* refresh: a
-  cache that has fallen behind head rematerializes wholesale rather than
-  replaying the gap. Its main beneficiary would be read-only catalogs, which
-  cache nothing at all pending the read-snapshot pin below.
+Nothing gates disproportionately much of the list any more; the three that
+did have closed. The crash harness (RFC 0011) drives every case but one:
+`GroupCommit` landed with group commit itself, and `MigrationInterrupted`
+waits on exactly what format migration waits on. Both guarantees moraine
+owns, atomicity and resumability, have driven cases. Format migration (RFC
+0015) has its driver, its verb, and its marker, and waits only on a format
+that actually rewrites a key. Reader refresh (RFC 0009) is closed: it has
+its changelog, its fallbacks, its consistent read-only cut, and a measured
+threshold, and what remains under it is two deferrals with no one waiting
+on them.
 
 ## 0001 — Repository structure and conventions
 
@@ -130,65 +127,20 @@ key.
 
 ## 0009 — Reader consistency and snapshot caching
 
-- **IMPL** — Incremental refresh: pin a fresh read-snapshot, check `sys/head`
-  and the migration marker, scan `snap/{S+1..head}` under the same handle, and
-  re-read or drop just the entities each record's `snapshot_changes` names.
-  Nothing exists; the only forward-folding applies the committer's own batch.
-- **IMPL** — Fall back to full rematerialization when `S` has fallen below the
-  horizon `H` and the gap's `snapshot` records may have been reclaimed.
-- **IMPL** — A churn-versus-catalog-size threshold that falls back to a full
-  `current` rescan when replaying the changelog would cost more.
-- **DECISION** — The churn ratio for that threshold. Full-materialization cost
-  is measured (`BENCHMARK.md` → Core measurements: ~5–7 µs per live entity,
-  linear); the crossover it trades against needs incremental refresh built to
-  measure the other side.
-- **DECISION** — How a read-only handle gets a cut that is both live and
-  consistent. `DbReader` exposes no `snapshot()`, and SlateDB offers only two
-  modes: an explicit `checkpoint_id`, which is consistent but stops polling
-  entirely (it never sees new commits), or no checkpoint, which follows the
-  manifest but gives no consistent cut. Neither is what a reader needs.
-  `DbReader::manifest()` returning a public `VersionedManifest::id()` suggests
-  an optimistic validate — capture the id, read, re-check, retry on change —
-  but that is unverified against the reestablish path.
-- **IMPL** — Pin an explicit read-snapshot on the read-only path, per the
-  decision above. Until it lands, a read-only materialization is not
-  snapshot-isolated the way the read-write path is, which is also why
-  read-only catalogs must not cache: a torn view would persist and compound
-  instead of being discarded with the read that built it.
-- **IMPL** — Return `SnapshotExpired` for a view driven past the retention
-  window, so a reader re-resolves from head instead of dereferencing reclaimed
-  files. Depends on the 0003 error variants.
-- **IMPL** — Stop cloning the whole entity set to serve one kind.
-  `ffi_support::dump_entities` takes its extractor by value, so it clones every
-  record in the cached `Arc<Vec<EntityRecord>>` and then discards the kinds it
-  was not asked for. Fourteen `dump_*` functions route through it and populating
-  DuckLake's metadata tables issues roughly two dozen calls, so one population
-  clones the catalog over and over — each clone heap-allocating, since the
-  records hold strings and vectors. Taking the extractor by reference and
-  cloning only the matched record confines the cost to what is returned. The
-  uncached branch already moves rather than clones, so the waste falls
-  exclusively on the path the cache exists to make cheap.
-- **DEFERRED** — Extend caching and changelog-based incremental refresh to
-  read-only catalogs, which today rematerialize on every read. Blocked on the
-  read-snapshot pin above, not on cost: a reader cannot fold its own commits
-  forward (it has none), so replay is the only way to advance its cache, and
-  caching a non-isolated view would be worse than not caching.
+- **DEFERRED** — Extend the three fold-forward *served projections*
+  (snapshots, table stats, table column stats) to read-only catalogs, which
+  rescan per serve. A reader has no local batch to fold, so it would advance
+  them by the same changelog replay the view already uses. Deferred until
+  reader-side serve cost is shown to matter; the view cache, which is the
+  expensive one, is no longer waiting on anything.
 - **DEFERRED** — Partial or lazy materialization to bound memory for an
   unusually large live catalog. Deferred until profiling shows the full
   in-memory view is a problem. This is the same decision as server-side filter
   pushdown (0002, 0006, 0013): lazy materialization needs predicates to know
   what to fetch, and pushdown buys nothing while the whole view is resident.
-  Whichever is taken first pulls the other with it.
-- **DECISION** — Does DuckLake hold one catalog snapshot per `BEGIN…COMMIT`, or
-  re-resolve per statement? This sets how tight the retention window must be.
-- **VALIDATE** — The refresh test suite: a commit landing mid-materialization
-  yields an entirely pre- or entirely post-commit view, never torn; a view
-  built at `S` still returns the `S` view after `k` commits; an incremental
-  refresh to head is byte-identical to a full rematerialization; a reader below
-  the horizon rematerializes while an expired request errors; a
-  materialization under `sys/migration` returns the typed error and never a
-  partial view; a commit landing between a commit attempt's materialization
-  and its batch write is always detected.
+  Whichever is taken first pulls the other with it. A replay's base-view
+  copy is the one part of a refresh that scales with catalog size
+  (`BENCHMARK.md`), so this would bound that too.
 
 ## 0011 — Crash recovery
 

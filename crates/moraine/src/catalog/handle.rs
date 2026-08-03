@@ -18,7 +18,9 @@ use crate::{
         IndexEntry, IndexId, IndexInfo, IndexState, RecentRow, RowHolder, RowLocation, SnapshotId,
         TableId,
         inline::{InlineScanKind, materialize_inline_rows},
-        projection::{ProjectionCache, cache_epoch, cached_head_view, install_head_view_at},
+        projection::{
+            ProjectionCache, cache_epoch, cached_head_view, held_head_view, install_head_view_at,
+        },
         scoped_read,
     },
     error::{Error, Result},
@@ -161,6 +163,17 @@ pub struct CatalogOptions {
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
+    /// How often a **read-only** catalog polls object storage for state a
+    /// writer has committed since it last looked.
+    ///
+    /// This is a reader's freshness bound: nothing pushes a commit to it,
+    /// so a read-only catalog can be one poll interval behind the writer,
+    /// and its cached view is served for exactly that long. Shorter means
+    /// fresher reads and more (on S3, billed) manifest and WAL listings.
+    /// Defaults to 10 seconds. Ignored by [`Catalog::open`], which reads
+    /// its own writes, and by a catalog pinned to a
+    /// [`checkpoint`](Self::checkpoint), which polls for nothing.
+    pub reader_poll_interval: Duration,
     /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
     /// as reported by [`Catalog::create_checkpoint`].
     ///
@@ -181,6 +194,7 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
             data_path: None,
+            reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
         }
     }
@@ -330,6 +344,7 @@ impl Catalog {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
+            .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
         let reader = commit::open_reader_initialized(store).await?;
         info!(
@@ -728,10 +743,14 @@ impl Catalog {
 
     /// Time travel always materializes: the cache holds head views only, and
     /// a past snapshot is reconstructed from `history` rather than advanced
-    /// from a newer state. A read-only catalog also materializes — it has no
-    /// local commits, so nothing ever populates a cache for it to serve.
+    /// from a newer state.
+    ///
+    /// A read-only catalog caches too. It folds no batch of its own — it has
+    /// none — so it advances by replaying the changelog of the commits it
+    /// missed, and the head stamp its cached view carries tells it exactly
+    /// which store state it stands at.
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
-        if at.is_some() || !self.maintains_projections() {
+        if at.is_some() {
             let session = self.begin_read().await?;
             let view = commit::materialize(session.handle(), at).await;
             session.finish();
@@ -752,13 +771,21 @@ impl Catalog {
         Ok(view)
     }
 
-    /// The cached view when it already stands at head, else a fresh one. A
-    /// reader polling a quiet catalog pays one point read and no copy: the
-    /// committer folds each batch forward, so the cache is normally current.
+    /// The cached view when it already stands at head, a view refreshed
+    /// across the gap when it has fallen behind and the gap is replayable,
+    /// else a fresh materialization. A reader polling a quiet catalog pays
+    /// one point read and no copy: the committer folds each batch forward,
+    /// so the cache is normally current.
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
-        let head = commit::read_head_id(handle).await?;
-        if let Some(cached) = cached_head_view(&self.projections, head) {
+        let head = commit::read_head_value(handle).await?;
+        if let Some(cached) = cached_head_view(&self.projections, &head) {
             return Ok(cached);
+        }
+
+        if let Some(behind) = held_head_view(&self.projections)
+            && let Some(refreshed) = commit::refresh(handle, &behind).await?
+        {
+            return Ok(Arc::new(refreshed));
         }
 
         Ok(Arc::new(commit::materialize(handle, None).await?))

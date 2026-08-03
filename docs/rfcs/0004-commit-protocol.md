@@ -162,7 +162,7 @@ operation and rides the same machinery. On open, the catalog reads
   `sys/format` (format version 1 plus the writing moraine version),
   snapshot `0` (empty catalog: no entities, counters at their initial
   values so the first allocation yields id 0, `schema_version` 0, empty
-  `changes_made`), and `sys/head` → `0`, then commit it under the same
+  `changes_made`), and `sys/head` → `0` at batch count `0`, then commit it under the same
   head conflict detection as any commit. A same-process race between two
   bootstrapping opens arbitrates on the head write like any other commit
   — the loser re-reads and finds the initialized store; across processes
@@ -199,10 +199,12 @@ ends, inlined writes) and lands them atomically:
    - the new `snapshot` record `N+1` with advanced global counters,
      `schema_version` (bumped or carried forward per the rule below), and
      merged `snapshot_changes`;
-   - the `sys/head` update `N → N+1`.
+   - the `sys/head` update `N → N+1`, with the batch count incremented.
 4. **Commit under head conflict detection.** The staged writes commit as
    one SlateDB transaction (`begin(IsolationLevel::Snapshot)`) opened at
-   step 1. Every commit writes `sys/head`, so SlateDB's write-write
+   step 1. **Every batch writes `sys/head`** — including a maintenance
+   batch, which mints no snapshot and so reuses the standing id while still
+   moving the batch count (RFC 0002) — so SlateDB's write-write
    conflict detection on that one key *is* the head CAS: if a concurrent
    commit advanced the head since this transaction began, `commit()`
    returns `TransactionConflict` and nothing was written — go to conflict
@@ -498,7 +500,11 @@ data (RFC 0003 verb names):
   one snapshot expiry and file cleanup take. So `CALL
   <lake>.set_option(…)` lands the option and moves nothing else: no
   snapshot, no `schema_version`, no `snapshot_changes` entry, and so
-  nothing for conflict detection to see.
+  nothing for conflict detection to *classify*. It does still write
+  `sys/head` at the standing snapshot id with the batch count advanced, as
+  every head-preserving batch does — that is the anchor a concurrent
+  commit conflicts on, and the stamp that tells a reader the state moved
+  under an unchanged snapshot id.
 
 This classification is source-verified against DuckLake
 (`DuckLakeTransactionState::SchemaChangesMade`, which tests exactly the
