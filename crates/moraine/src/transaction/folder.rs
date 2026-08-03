@@ -58,16 +58,22 @@ where
     }
 }
 
-/// Opens the fenced writer `Db` over the store's retained builder shape. A
-/// `wal_enabled` of `false` folds straight into the memtable, leaving
-/// [`SlateDbCursorStore::finish`]'s explicit flush as the only durability
-/// barrier the sprint has.
+/// Opens the fenced writer `Db` over the store's retained builder shape. The
+/// WAL stays on for a maintenance session and off for folding (`wal_enabled`).
 async fn open_folder_writer(store: &SlotStore, wal_enabled: bool) -> Result<Db> {
     StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .wal_enabled(wal_enabled)
         .cache_dir(store.options.cache_dir.clone())
         .open_writer()
         .await
+}
+
+/// Opens the folder's fenced writer for a fold, WAL off. Every fold — the
+/// explicit sprint and the appointed fold alike — runs the store directly into
+/// the memtable, so [`SlateDbCursorStore::finish`]'s explicit flush is the
+/// fold's only durability barrier.
+async fn open_fold_writer(store: &SlotStore) -> Result<Db> {
+    open_folder_writer(store, false).await
 }
 
 /// The SlateDB store as a fold target: the cursor is `sys/fold`, and applying a
@@ -201,7 +207,7 @@ impl CursorStore for SlateDbCursorStore {
 /// memory even under a small `limit` — the bound paces the writes, not the
 /// read.
 pub(crate) async fn fold_sprint(store: &SlotStore, limit: u64) -> Result<FoldReport> {
-    let db = Arc::new(open_folder_writer(store, false).await?);
+    let db = Arc::new(open_fold_writer(store).await?);
     let mut session = SlateDbCursorStore::new(Arc::clone(&db));
     let report = drive_fold(&store.slots, &mut session, limit).await;
     drop(session);
@@ -421,7 +427,7 @@ impl FolderRole for SlotFolder<'_> {
     }
 
     async fn open(&self) -> Result<SlateDbCursorStore> {
-        let db = Arc::new(open_folder_writer(self.store, true).await?);
+        let db = Arc::new(open_fold_writer(self.store).await?);
         *self.opened.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&db));
         Ok(SlateDbCursorStore::new(db))
     }
