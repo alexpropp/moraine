@@ -3,7 +3,10 @@
 
 use std::{
     cmp::Ordering,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -12,7 +15,7 @@ use slatedb::DbReader;
 use tracing::warn;
 
 use crate::{
-    catalog::{CatalogSnapshot, SlotStore},
+    catalog::{CatalogSnapshot, Contention, SlotStore},
     error::{Error, Result},
     store::{handle::ReadHandle, open::StoreBuilder, read},
     transaction::{
@@ -20,6 +23,45 @@ use crate::{
         operations::{ChangeSet, conflicts},
     },
 };
+
+/// Unfolded-tail length past which a materialized head is warned about: fold
+/// lag has grown enough that every read replays a long tail and truncation
+/// cannot advance. An operator signal, not a limit — commits still proceed.
+pub(crate) const FOLD_STALL_THRESHOLD: u64 = 512;
+
+/// Slot-race and retry counters a slot-backed store accumulates across every
+/// commit through the handle and its clones. A lost race is the signal
+/// contention-triggered forwarding acts on, so `races_lost` is a live counter,
+/// not only a log line.
+#[derive(Debug, Default)]
+pub(crate) struct ContentionCounters {
+    committed: AtomicU64,
+    races_lost: AtomicU64,
+    exhausted: AtomicU64,
+}
+
+impl ContentionCounters {
+    /// Records one commit that won its slot after losing `races_lost` races.
+    pub(crate) fn record_committed(&self, races_lost: u64) {
+        self.committed.fetch_add(1, AtomicOrdering::Relaxed);
+        self.races_lost
+            .fetch_add(races_lost, AtomicOrdering::Relaxed);
+    }
+
+    /// Records one commit that spent its retry budget without winning.
+    pub(crate) fn record_exhausted(&self) {
+        self.exhausted.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// A point-in-time read of the counters for a host or a forwarding client.
+    pub(crate) fn snapshot(&self) -> Contention {
+        Contention {
+            commits: self.committed.load(AtomicOrdering::Relaxed),
+            races_lost: self.races_lost.load(AtomicOrdering::Relaxed),
+            exhaustions: self.exhausted.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
 
 mod coalesce;
 pub(crate) use coalesce::CommitCoalescer;
@@ -546,6 +588,17 @@ fn classify_lost_race(ours: Option<&ChangeSet>, winner: &Envelope) -> Race {
     Race::Benign
 }
 
+/// The unfolded-tail length a head at `next_sequence` materialized against, for
+/// the fold-lag log line. Best-effort through the attach reader: a fold-cursor
+/// read failure reports 0 rather than failing the commit it only narrates, and
+/// a lagged reader over-reports the tail, which is safe for a warning signal.
+pub(super) async fn unfolded_tail_at(store: &SlotStore, next_sequence: u64) -> u64 {
+    let folded = fold_cursor(ReadHandle::Reader(&store.reader))
+        .await
+        .unwrap_or(0);
+    next_sequence.saturating_sub(folded.saturating_add(1))
+}
+
 /// The fold cursor; absent reads as 0, since a store with no cursor has no
 /// folded slots.
 async fn fold_cursor(handle: ReadHandle<'_>) -> Result<u64> {
@@ -572,15 +625,24 @@ async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    };
 
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
     use moraine_wal::{Commit, Envelope, SlotLog, SlotPayload, SlotWrite};
-    use object_store::{ObjectStore, memory::InMemory};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        memory::InMemory, path::Path,
+    };
     use uuid::Uuid;
 
     use super::*;
     use crate::{
-        catalog::{Catalog, CatalogOptions, SlotStore, SnapshotId},
+        catalog::{Catalog, CatalogOptions, ColumnDef, SlotStore, SnapshotId},
         store::{
             key::{EntityKey, Key, SysKey},
             open::StoreBuilder,
@@ -620,6 +682,7 @@ mod tests {
             read_only: false,
             coalescer,
             head_cache: HeadCache::default(),
+            contention: ContentionCounters::default(),
         }
     }
 
@@ -1220,5 +1283,196 @@ mod tests {
         .unwrap();
         tx.commit_with_options(&commit::durable()).await.unwrap();
         db.close().await.unwrap();
+    }
+
+    /// Wraps an [`InMemory`] store and, on the first conditional create of a
+    /// slot object, plants a competing commit at that slot first — so the real
+    /// committer's create loses to a genuine winner it must read back and
+    /// rebase onto. A deterministic two-writer race with a fixed loser.
+    #[derive(Debug)]
+    struct RaceOnceStore {
+        inner: InMemory,
+        competitor: Bytes,
+        planted: AtomicBool,
+    }
+
+    impl RaceOnceStore {
+        fn new(competitor: Bytes) -> Self {
+            Self {
+                inner: InMemory::new(),
+                competitor,
+                planted: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl std::fmt::Display for RaceOnceStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RaceOnceStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RaceOnceStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            let races_slot = location.as_ref().starts_with("commits/")
+                && matches!(opts.mode, PutMode::Create)
+                && !self.planted.swap(true, AtomicOrdering::SeqCst);
+            if races_slot {
+                self.inner
+                    .put_opts(
+                        location,
+                        self.competitor.clone().into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The one column every fixture table needs.
+    fn one_column() -> Vec<ColumnDef> {
+        vec![ColumnDef {
+            name: "id".to_string(),
+            column_type: "BIGINT".to_string(),
+            nulls_allowed: false,
+            default_value: None,
+        }]
+    }
+
+    /// A forced two-writer race: the first slot create loses to a planted
+    /// competitor, so the driver rebases and wins the next slot — a
+    /// `Committed { attempts: 2, races_lost: 1 }` the handle surfaces on its
+    /// contention counter, not merely a log line. Asserting the counter (the
+    /// driver's return, narrated) rather than scraping logs.
+    #[tokio::test]
+    async fn a_forced_two_writer_race_rebases_and_counts_the_lost_race() {
+        // Build a real competing commit — a table created in `main` — by
+        // committing it on a scratch store, then lift the slot's bytes: an
+        // envelope another writer could have raced, never hand-encoded.
+        let scratch: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let scratch_catalog = Catalog::open(Arc::clone(&scratch), multi_writer_options())
+            .await
+            .unwrap();
+        scratch_catalog
+            .commit(|tx| {
+                let main = tx
+                    .state()
+                    .schema_by_name("main")
+                    .expect("bootstrap mints main")
+                    .id;
+                tx.create_table(main, "planted", &one_column()).map(|_| ())
+            })
+            .await
+            .unwrap();
+        let competitor = scratch
+            .get(&Path::from("commits/00000000000000000001"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        // The real store races the planted competitor for its first slot.
+        let race_store: Arc<dyn ObjectStore> = Arc::new(RaceOnceStore::new(competitor));
+        let catalog = Catalog::open(Arc::clone(&race_store), multi_writer_options())
+            .await
+            .unwrap();
+
+        let snapshot = catalog
+            .commit(|tx| {
+                let main = tx
+                    .state()
+                    .schema_by_name("main")
+                    .expect("bootstrap mints main")
+                    .id;
+                tx.create_table(main, "mine", &one_column()).map(|_| ())
+            })
+            .await
+            .unwrap();
+
+        // The competitor won slot 1 (snapshot 1); this commit rebased onto it
+        // and won slot 2 (snapshot 2).
+        assert_eq!(snapshot, SnapshotId::new(2));
+
+        // The lost race is a live counter, so contention-triggered forwarding
+        // can act on it — attempts > 1 shown through the driver's return.
+        let contention = catalog.contention();
+        assert!(
+            contention.races_lost >= 1,
+            "a rebased commit records the race it lost: {contention:?}"
+        );
+        assert_eq!(contention.commits, 1);
+        assert_eq!(contention.exhaustions, 0);
+
+        // Both tables landed: the rebase applied the competitor, then this
+        // commit.
+        let view = catalog.snapshot().await.unwrap();
+        let main = view.schema_by_name("main").unwrap().id;
+        assert!(view.table_by_name(main, "planted").is_some());
+        assert!(view.table_by_name(main, "mine").is_some());
     }
 }

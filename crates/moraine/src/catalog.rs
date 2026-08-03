@@ -12,7 +12,7 @@ mod snapshot;
 mod types;
 
 pub(crate) use handle::SlotStore;
-pub use handle::{Catalog, CatalogOptions, MaintenanceReport, MaintenanceRequest};
+pub use handle::{Catalog, CatalogOptions, Contention, MaintenanceReport, MaintenanceRequest};
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
 pub use types::{

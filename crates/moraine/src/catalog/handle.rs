@@ -314,6 +314,21 @@ pub struct MaintenanceReport {
     pub index_entries_reclaimed: u64,
 }
 
+/// A point-in-time read of a slot-backed store's contention counters,
+/// accumulated across every commit through a handle and its clones. They
+/// measure slot-race pressure; a nonzero `races_lost` is the signal
+/// contention-triggered forwarding reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Contention {
+    /// Commits that won a slot.
+    pub commits: u64,
+    /// Slot races lost on the way to those wins.
+    pub races_lost: u64,
+    /// Commits that spent their retry budget without winning.
+    pub exhaustions: u64,
+}
+
 /// The open store behind a catalog. Every attach — read-write or read-only —
 /// builds [`Store::Slots`].
 enum Store {
@@ -343,6 +358,9 @@ pub(crate) struct SlotStore {
     /// re-materialize from the folded store. Shared by every clone of the
     /// handle; a successful commit updates it in place.
     pub(crate) head_cache: slot_commit::HeadCache,
+    /// Slot-race and retry counters accumulated across commits, shared by every
+    /// clone of the handle through the store's `Arc`.
+    pub(crate) contention: slot_commit::ContentionCounters,
 }
 
 /// Options for opening a catalog.
@@ -465,6 +483,7 @@ impl Catalog {
                 read_only: false,
                 coalescer,
                 head_cache: slot_commit::HeadCache::default(),
+                contention: slot_commit::ContentionCounters::default(),
             }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
@@ -657,6 +676,7 @@ impl Catalog {
                 read_only: true,
                 coalescer,
                 head_cache: slot_commit::HeadCache::default(),
+                contention: slot_commit::ContentionCounters::default(),
             }))),
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
@@ -1857,6 +1877,17 @@ impl Catalog {
     {
         let Store::Slots(store) = self.store.as_ref();
         store.coalescer.commit(store, &f).await
+    }
+
+    /// A snapshot of this store's contention counters — commits, slot races
+    /// lost, and budget exhaustions — accumulated across every commit through
+    /// this handle and its clones. A nonzero `races_lost` is the signal
+    /// contention-triggered forwarding reads; the counts measure slot-race
+    /// pressure over the handle's life. Reads atomics only, never the store.
+    #[must_use]
+    pub fn contention(&self) -> Contention {
+        let Store::Slots(store) = self.store.as_ref();
+        store.contention.snapshot()
     }
 
     /// Resolves whether `transaction_id` committed, and at which snapshot: the

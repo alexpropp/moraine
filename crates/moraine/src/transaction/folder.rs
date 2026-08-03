@@ -36,6 +36,7 @@ use crate::{
         proto::HeadValue,
         read, value,
     },
+    transaction::slot_commit::FOLD_STALL_THRESHOLD,
 };
 
 /// Opens the fenced writer over `store`, runs `body` against it, and closes it.
@@ -212,9 +213,34 @@ pub(crate) async fn fold_sprint(store: &SlotStore, limit: u64) -> Result<FoldRep
     let report = drive_fold(&store.slots, &mut session, limit).await;
     drop(session);
 
+    if let Ok(report) = &report {
+        narrate_fold(report);
+    }
+
     match db.close().await {
         Ok(()) => report,
         Err(err) => report.and(Err(Error::from(err))),
+    }
+}
+
+/// Narrates one fold pass's [`FoldReport`]: the counts a host reads back from
+/// [`fold_sprint`], at `debug`, with a `warn` when the unfolded tail is still
+/// past the fold-stall threshold after the pass. `moraine_maintenance_status`
+/// surfaces the same counts from SQL — `tail_remaining` alongside
+/// `slots_folded` and truncation's `slots_removed`.
+fn narrate_fold(report: &FoldReport) {
+    tracing::debug!(
+        slots_folded = report.slots_folded,
+        folded_through = report.folded_through,
+        tail_remaining = report.tail_remaining,
+        "fold sprint applied slots"
+    );
+    if report.tail_remaining > FOLD_STALL_THRESHOLD {
+        tracing::warn!(
+            tail_remaining = report.tail_remaining,
+            threshold = FOLD_STALL_THRESHOLD,
+            "unfolded slot tail still exceeds the fold-stall threshold after a sprint"
+        );
     }
 }
 
@@ -279,11 +305,13 @@ pub(crate) async fn truncate_folded_slots(store: &SlotStore) -> Result<u64> {
         tracing::warn!(error = %err, "could not close the reader opened for the truncation horizon");
     }
 
-    store
+    let removed = store
         .slots
         .truncate_through(horizon?)
         .await
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+    tracing::debug!(slots_removed = removed, "truncated durably folded slots");
+    Ok(removed)
 }
 
 /// The fold cursor as of the oldest live reader checkpoint in

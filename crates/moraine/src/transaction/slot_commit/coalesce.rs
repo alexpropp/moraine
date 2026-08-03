@@ -21,10 +21,12 @@ use moraine_wal::{
 };
 use slatedb::DbReader;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    Admission, SlotHead, admit, apply, classify_lost_race, release_reader, revalidated_slot_head,
+    Admission, FOLD_STALL_THRESHOLD, SlotHead, admit, apply, classify_lost_race, release_reader,
+    revalidated_slot_head, unfolded_tail_at,
 };
 use crate::{
     catalog::{CatalogSnapshot, SlotStore, SnapshotId},
@@ -171,6 +173,7 @@ impl CommitCoalescer {
         };
         let original_head = head.view.snapshot.snapshot_id;
         let start_sequence = head.next_sequence;
+        let materialized_tail = unfolded_tail_at(store, start_sequence).await;
         let base = Base::from_head(store, head);
 
         let mut committer = CoalescingCommitter {
@@ -199,6 +202,8 @@ impl CommitCoalescer {
         if let Ok(CommitDrive::Committed { sequence, .. }) = &drive {
             committer.cache_committed(store, *sequence);
         }
+
+        narrate_commit(store, &drive, materialized_tail);
 
         let outcome = committer.settle(&drive);
         if committer.base.owns_reader {
@@ -602,6 +607,50 @@ impl Verdict {
             },
             Err(err) => Self::Failed(err.to_string()),
         }
+    }
+}
+
+/// Records one batch's contention on the handle's counters and narrates it. The
+/// driver reports the numbers; moraine emits them, so the protocol crate stays
+/// silent. Per-commit facts go at `debug`; the operator signals — a spent
+/// budget, and fold lag past the stall threshold — go at `warn`.
+fn narrate_commit(store: &SlotStore, drive: &Result<CommitDrive>, materialized_tail: u64) {
+    match drive {
+        Ok(CommitDrive::Committed {
+            sequence,
+            attempts,
+            races_lost,
+        }) => {
+            store.contention.record_committed(*races_lost as u64);
+            debug!(
+                sequence = *sequence,
+                attempts = *attempts,
+                races_lost = *races_lost,
+                materialized_tail,
+                "commit batch won its slot"
+            );
+        }
+        Ok(CommitDrive::Exhausted {
+            attempts,
+            last_sequence,
+        }) => {
+            store.contention.record_exhausted();
+            warn!(
+                attempts = *attempts,
+                last_sequence = *last_sequence,
+                materialized_tail,
+                "commit batch spent its retry budget on lost slot races"
+            );
+        }
+        _ => {}
+    }
+
+    if materialized_tail > FOLD_STALL_THRESHOLD {
+        warn!(
+            materialized_tail,
+            threshold = FOLD_STALL_THRESHOLD,
+            "unfolded slot tail exceeds the fold-stall threshold; folding lags commits"
+        );
     }
 }
 
