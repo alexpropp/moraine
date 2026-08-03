@@ -294,6 +294,142 @@ async fn measure_attach_cost_by_dead_fraction() {
     println!();
 }
 
+/// Seeds `tables` and then rewrites every one of their statistics records
+/// `rounds` times, closing after each round.
+///
+/// The close is load-bearing: without it the superseded versions stay in
+/// the memtable, never reach an SST, and cost nobody a GET.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+async fn churn_into_ssts(store: &Arc<InMemory>, tables: usize, columns: usize, rounds: usize) {
+    let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+    let columns: Vec<_> = (0..columns).map(|c| col(&format!("c{c}"))).collect();
+    let mut made_tables = Vec::with_capacity(tables);
+    for t in 0..tables {
+        let columns = columns.clone();
+        let made = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                made.set(Some(tx.create_table(schema, &format!("t{t}"), &columns)?));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        made_tables.push(made.get().unwrap());
+    }
+    catalog.close().await.unwrap();
+
+    for round in 0..rounds {
+        let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+        let batch = made_tables.clone();
+        catalog
+            .commit(move |tx| {
+                for &table in &batch {
+                    tx.update_table_stats(table, 100 + round as u64, 4_096)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+    }
+}
+
+/// 0021 — what a store merge is worth once a GET costs what S3 charges.
+///
+/// The companion to the sweep above, and the one that reaches the regime
+/// the production incident sat in. That incident was IO-bound — ~5.3 MB/s
+/// effective, a read pulling the whole store across the network — so the
+/// term that matters is not bytes decoded but **object-store GETs issued**,
+/// and GETs scale with how many SSTs a scan must open rather than how much
+/// they hold. An in-memory store measures the wrong term however large it
+/// grows; injected per-GET latency measures the right one at any size.
+///
+/// Sweeping latency for a fixed store makes the GET count readable off the
+/// slope: attach time is roughly `GETs x latency + decode`, so the gradient
+/// is the GET count and the intercept is the compute floor. Doing it for a
+/// churned store and again after `compact_store` prices the merge.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used)]
+async fn measure_attach_cost_under_get_latency() {
+    const TABLES: usize = 40;
+    const COLS_PER_TABLE: usize = 8;
+    const ROUNDS: usize = 160;
+    const REPEATS: usize = 5;
+    let latencies = [0u64, 2, 5, 10];
+
+    println!("\n# 0021 cold read-only attach vs. injected per-GET latency");
+    println!(
+        "# {TABLES} tables x {COLS_PER_TABLE} columns, {ROUNDS} churn rounds, \
+         live set constant; median of {REPEATS}\n"
+    );
+
+    let store = Arc::new(InMemory::new());
+    churn_into_ssts(&store, TABLES, COLS_PER_TABLE, ROUNDS).await;
+
+    for merged in [false, true] {
+        if merged {
+            let writer = open_with(store.clone(), SEED_FLUSH_MS).await;
+            let mut request = moraine::CompactStoreRequest::default();
+            request.wait = Some(Duration::from_secs(60));
+            let report = writer.compact_store(request).await.unwrap();
+            let completed = report
+                .merges
+                .iter()
+                .filter(|m| m.outcome == moraine::MergeOutcome::Completed)
+                .count();
+            writer.close().await.unwrap();
+            println!("\n## after compact_store — {completed} subspaces merged\n");
+        } else {
+            println!("## churned, unmerged\n");
+        }
+
+        // What the reader will have to open, before timing anything.
+        let probe = open_reader(store.clone()).await;
+        let census = probe.store_census(CensusRequest::default()).await.unwrap();
+        let ssts: u32 = census
+            .subspaces
+            .iter()
+            .map(|s| s.l0_ssts + s.sorted_run_ssts)
+            .sum();
+        let bytes = census.total_bytes();
+        probe.close().await.unwrap();
+        println!("   store: {ssts} SSTs, {bytes} bytes");
+        println!(
+            "{:>12}  {:>11}  {:>9}",
+            "get_latency", "median_ms", "max_ms"
+        );
+
+        for &latency_ms in &latencies {
+            let config = ThrottleConfig {
+                wait_get_per_call: Duration::from_millis(latency_ms),
+                ..ThrottleConfig::default()
+            };
+            let throttled = Arc::new(ThrottledStore::new((*store).clone(), config));
+
+            let mut samples = Vec::with_capacity(REPEATS);
+            for _ in 0..REPEATS {
+                let probe = Catalog::open_read_only(throttled.clone(), CatalogOptions::default())
+                    .await
+                    .unwrap();
+                let start = Instant::now();
+                let view = probe.snapshot().await.unwrap();
+                samples.push(start.elapsed());
+                std::hint::black_box(&view);
+                probe.close().await.unwrap();
+            }
+
+            let stats = Stats::of(samples);
+            println!(
+                "{latency_ms:>10} ms  {:>11.3}  {:>9.3}",
+                stats.median_ms, stats.max_ms
+            );
+        }
+    }
+    println!();
+}
+
 /// 0004 — durable-commit latency versus flush interval.
 ///
 /// `Catalog::commit` awaits durability, and on the in-memory store the WAL

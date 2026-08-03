@@ -250,6 +250,53 @@ above were produced, but those SSTs are all tiny: the harness can vary SST
 real bloated store or an `l0_sst_size` knob on `CatalogOptions`, which is
 not exposed today.
 
+### What a store merge is worth once a GET costs what S3 charges
+
+The table above runs in memory, so it prices decode. The production
+incident did not: ~5.3 MB/s effective, a read pulling the store across the
+network. There the term that matters is **object-store GETs issued**, and
+GETs scale with how many SSTs a scan opens rather than how much they hold —
+so an in-memory store measures the wrong term however large it grows, while
+injected per-GET latency measures the right one at any size.
+
+Sweeping latency for a fixed store makes the GET count readable off the
+slope, since attach time is roughly `GETs x latency + decode`. Same shape as
+above (40 tables, 160 churn rounds, live set constant), read-only probes,
+median of 5:
+
+| per-GET latency | churned (37 SSTs) | after merge (25 SSTs) |
+|---|---|---|
+| 0 ms | 1.93 ms | 1.80 ms |
+| 2 ms | 42.0 ms | 35.4 ms |
+| 5 ms | 81.5 ms | 69.4 ms |
+| 10 ms | 146.9 ms | 124.6 ms |
+| **slope (GETs)** | **14.5** | **12.3** |
+
+Two things to read off it. **IO dominates completely** once latency is
+realistic: at 10 ms/GET the same attach costs 147 ms against 1.9 ms
+unthrottled, ~75x, so any measurement that leaves latency out is answering a
+different question. And **the merge pays**, cutting the GET count 14.5 to
+12.3 and attach time ~15%.
+
+Note the merge cut SSTs by 32% but GETs by only 15%: a materialization
+opens SSTs in the subspaces it actually reads, so merging `index` — which no
+scan touches — costs GETs nothing. That is the same asymmetry the census
+exists to expose before an operator spends a merge on the wrong subspace.
+
+The relationship is linear in both terms, so the production regime
+extrapolates: a store with N times the SSTs in the read path costs N times
+the GETs, at whatever the endpoint's latency is. That is what turns 1.9 ms
+into 642 s without needing 3.4 GB on hand to see it.
+
+**How this was arrived at matters.** The first revision of this harness
+reported a flat line — churn that never leaves the memtable never reaches
+the manifest, so closing per round is what writes it out. The second opened
+a writer per repeat, whose compactor moved the state between repeats. And
+the merged column read `0 subspaces merged` until the run exposed that a
+merge asked for straight after an attach found every tree already being
+merged by the writer's own compactor and skipped them all; adopting the
+in-flight merge instead is what makes this column mean anything.
+
 ### Materialization cost vs. catalog size
 
 This is the cost of a *cold* read — one whose handle holds no cached view.

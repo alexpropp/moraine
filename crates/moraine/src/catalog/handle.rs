@@ -19,7 +19,7 @@ use crate::{
         TableId,
         census::{
             CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
-            MergeOutcome, StoreCensus, SubspaceCensus, SubspaceMerge, SubspaceName,
+            MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
         },
         inline::{InlineScanKind, materialize_inline_rows},
         projection::{
@@ -1762,6 +1762,18 @@ impl Catalog {
         Ok(StoreCensus {
             manifest_id: physical.manifest_id,
             subspaces,
+            objects: physical.objects.map(|totals| StoreObjects {
+                total_objects: totals.total_objects,
+                total_bytes: totals.total_bytes,
+                wal_objects: totals.wal_objects,
+                wal_bytes: totals.wal_bytes,
+                manifest_objects: totals.manifest_objects,
+                manifest_bytes: totals.manifest_bytes,
+                sst_objects: totals.sst_objects,
+                sst_bytes: totals.sst_bytes,
+                other_objects: totals.other_objects,
+                other_bytes: totals.other_bytes,
+            }),
         })
     }
 
@@ -1848,13 +1860,13 @@ impl Catalog {
             if !covered || merges.iter().any(|m| m.subspace == measured.subspace) {
                 continue;
             }
+            // The only reason a plan omits a tree: L0 SSTs are not
+            // eligible sources, so a tree without sorted runs has nothing
+            // to merge. A tree already being merged is adopted rather than
+            // omitted, so it never reaches here.
             merges.push(SubspaceMerge {
                 subspace: measured.subspace.clone(),
-                outcome: MergeOutcome::Skipped(if measured.sorted_runs == 0 {
-                    "no sorted runs to merge"
-                } else {
-                    "a merge is already in flight"
-                }),
+                outcome: MergeOutcome::Skipped("no sorted runs to merge"),
                 bytes_before: measured.bytes,
                 bytes_after: None,
             });

@@ -31,7 +31,8 @@ use crate::error::{Error, Result};
 /// compactor takes rather than a cadence of moraine's choosing.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// One submitted merge: the segment it targets and the record to poll it by.
+/// One merge a caller is waiting on: the segment it targets and the record
+/// to poll it by.
 #[derive(Debug, Clone)]
 pub(crate) struct SubmittedMerge {
     pub(crate) segment: Vec<u8>,
@@ -52,10 +53,18 @@ pub(crate) enum MergeEnd {
 /// Plans and submits a full merge of `segment` (of every segment, when
 /// `None`).
 ///
-/// Returns one entry per submitted merge. A tree yields none when it holds
-/// no compacted sorted runs — what SlateDB's whole-store request does
-/// silently, and what a store whose bulk is still in L0 will report — or
-/// when a merge is already in flight over it.
+/// Returns one entry per merge the caller can wait on. A tree yields none
+/// only when it holds no compacted sorted runs — what SlateDB's whole-store
+/// request does silently, and what a store whose bulk is still in L0 will
+/// report.
+///
+/// A tree already being merged is **adopted rather than skipped**: its
+/// in-flight compaction is returned to be waited on. Submitting a second
+/// plan for it would claim a destination the executor refuses, but the
+/// caller asked for a merged tree and one is on its way — and a writer's
+/// own compactor starts proposing the moment it opens, so skipping would
+/// make an on-demand merge reclaim nothing precisely when it is asked for
+/// straight after an attach.
 pub(crate) async fn submit_full_merge(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
@@ -87,17 +96,25 @@ pub(crate) async fn submit_full_merge(
         Err(err) => return Err(Error::from(err)),
     };
 
-    let busy = segments_with_a_merge_in_flight(&state);
+    let busy = merges_in_flight(&state);
 
     let mut submitted = Vec::with_capacity(specs.len());
     for spec in specs {
         let target = spec.segment().to_vec();
         // A full-tree plan destines the tree's lowest sorted-run id, which
         // is what the background scheduler destines when it merges the same
-        // runs. Two jobs claiming one destination is a state the executor
-        // refuses, so a tree already being merged is left alone — it is
-        // being reclaimed anyway.
-        if busy.iter().any(|in_flight| in_flight == &target) {
+        // runs, and two jobs claiming one destination is a state the
+        // executor refuses. So the in-flight one is adopted: the caller
+        // waits on it instead of on a submission that cannot be made.
+        if let Some(in_flight) = busy
+            .iter()
+            .find(|(segment, _)| segment == &target)
+            .map(|(_, compaction)| compaction.clone())
+        {
+            submitted.push(SubmittedMerge {
+                segment: target,
+                compaction: in_flight,
+            });
             continue;
         }
 
@@ -146,9 +163,9 @@ pub(crate) async fn await_merge(
     }
 }
 
-/// The segments carrying a compaction that has not reached a terminal
-/// status.
-fn segments_with_a_merge_in_flight(state: &CompactorStateView) -> Vec<Vec<u8>> {
+/// Every compaction that has not reached a terminal status, by the segment
+/// it targets.
+fn merges_in_flight(state: &CompactorStateView) -> Vec<(Vec<u8>, Compaction)> {
     state
         .compactions()
         .into_iter()
@@ -159,7 +176,7 @@ fn segments_with_a_merge_in_flight(state: &CompactorStateView) -> Vec<Vec<u8>> {
                 CompactionStatus::Completed | CompactionStatus::Failed
             )
         })
-        .map(|compaction| compaction.spec().segment().to_vec())
+        .map(|compaction| (compaction.spec().segment().to_vec(), compaction.clone()))
         .collect()
 }
 
@@ -307,10 +324,15 @@ mod tests {
         assert_eq!(after.segment(&snapshots), Some(&before));
     }
 
-    /// A tree already being merged is left alone rather than submitted a
-    /// second plan claiming the same destination.
+    /// A tree already being merged is adopted rather than skipped: the
+    /// second caller waits on the first caller's merge instead of being
+    /// told there was nothing to do.
+    ///
+    /// Skipping instead would make an on-demand merge reclaim nothing in
+    /// the case it is most often asked for — straight after an attach,
+    /// whose writer starts a compactor that proposes immediately.
     #[tokio::test]
-    async fn a_tree_already_merging_is_skipped() {
+    async fn a_tree_already_merging_is_adopted() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         churned_store("merge/busy", Arc::clone(&store), 8).await;
 
@@ -322,7 +344,9 @@ mod tests {
         let second = submit_full_merge("merge/busy", store, Some(&current_prefix()))
             .await
             .unwrap();
-        assert!(second.is_empty(), "{second:?}");
+        assert_eq!(second.len(), 1, "{second:?}");
+        // The same merge, not a second one claiming its destination.
+        assert_eq!(second[0].compaction.id(), first[0].compaction.id());
     }
 
     fn current_prefix() -> Vec<u8> {
