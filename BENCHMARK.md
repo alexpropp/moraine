@@ -209,35 +209,46 @@ batch — the entries are tombstoned idempotently, so only the last batch needs
 to be durable. The second lever makes batch size almost irrelevant and is the
 better fix; recorded as a follow-up in `docs/rfcs/tasks.md` under 0021.
 
-### Cold attach cost vs. physical `current` bytes
+### Cold attach cost vs. the physical bytes a read touches
 
-The claim the store census and the store merge rest on: a cold attach scans
-`current`, reads through every superseded version those SSTs still hold, and
-so costs what the subspace *physically* weighs rather than what it lives.
-40 tables x 8 columns, the live set held identical across every row — each
-round rewrites every table's statistics and closes, superseding one record
-per table without changing what a reader sees. Median of 7 **read-only**
-attaches, a fresh handle each:
+The claim the store census and the store merge rest on: a cold attach reads
+through every superseded version the store still holds, so it costs what the
+store *physically* weighs rather than what it lives. 40 tables x 8 columns,
+the live set held identical across every row — each round rewrites every
+table's statistics and closes, superseding one record per table without
+changing what a reader sees. Median of 7 **read-only** attaches, a fresh
+handle each:
 
-| churn rounds | live keys | `current` bytes | L0 SSTs | runs | median attach |
-|---|---|---|---|---|---|
-| 0 | 402 | 21 069 | 1 | 0 | 0.94 ms |
-| 10 | 402 | 26 925 | 3 | 2 | 1.26 ms |
-| 40 | 402 | 31 447 | 5 | 3 | 1.54 ms |
-| 160 | 402 | 31 447 | 5 | 3 | 1.80 ms |
+| churn rounds | live keys | `current` bytes | L0 | runs | `snapshot` bytes | median attach |
+|---|---|---|---|---|---|---|
+| 0 | 402 | 21 069 | 1 | 0 | 3 018 | 0.96 ms |
+| 10 | 402 | 26 925 | 3 | 2 | 3 700 | 1.37 ms |
+| 40 | 402 | 31 447 | 5 | 3 | 5 144 | 1.48 ms |
+| 160 | 402 | 31 447 | 5 | 3 | 10 465 | 1.82 ms |
 
 Live entities never move; attach cost nearly doubles. That is the shape
-behind a 3.4 GB store serving one snapshot at a 642 s attach — the cost is
-in the dead versions, and `Catalog::compact_store` is what removes them.
+behind a 3.4 GB store serving one snapshot at a 642 s attach — the cost is in
+the dead versions, and `Catalog::compact_store` is what removes them.
 
-Two honest limits. The probes are read-only on purpose: an earlier revision
-opened a writer per repeat, whose compactor moved the state between repeats
-and produced a row whose time contradicted its own recorded manifest. And
-the last two rows share a manifest state yet differ by ~17%, so bytes and
-SST count do not explain the tail on their own — 160 close-and-reopen cycles
-leave more behind than the `current` tree alone. Scaling this to the
-gigabyte regime needs a store whose L0 flushes are reachable without writing
-64 MB per SST, which the public API cannot ask for today.
+**Two subspaces drive it, not one.** A materialization scans `current` and
+point-reads `sys/head` and the head `snapshot` record, so its cost tracks the
+physical size of all three. Rows 1–3 grow `current`; the last two rows have a
+byte-identical `current` (same 5 L0 SSTs, same 3 sorted runs) and still
+differ by ~17%, because `snapshot` doubled — one record per commit, and 160
+rounds is 160 more commits. Point reads are not free when the segment holding
+them has more SSTs to probe. So "attach cost tracks physical bytes" is right,
+provided *bytes* means every subspace a read touches rather than `current`
+alone. A merge targets each subspace independently, so both are reclaimable.
+
+**What this does not reach.** The production store was 3.4 GB and this tops
+out at ~43 KB. Building a genuinely large one means many SSTs, and SlateDB
+writes one only when its in-memory buffer fills, at a 64 MB default — so
+~50 SSTs the natural way is ~3 GB pushed through the catalog, far too slow
+for a test. Closing the handle forces an early flush, which is how the rows
+above were produced, but those SSTs are all tiny: the harness can vary SST
+*count* or *size*, not both. Reaching the production regime needs either a
+real bloated store or an `l0_sst_size` knob on `CatalogOptions`, which is
+not exposed today.
 
 ### Materialization cost vs. catalog size
 

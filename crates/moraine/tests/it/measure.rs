@@ -251,6 +251,21 @@ async fn measure_attach_cost_by_dead_fraction() {
         let bytes = current.bytes;
         let l0_ssts = current.l0_ssts;
         let runs = current.sorted_runs;
+        // Everything a materialization reads besides `current`, so a cost
+        // this table cannot explain has somewhere to show up.
+        let other: Vec<String> = census
+            .subspaces
+            .iter()
+            .filter(|s| s.subspace != SubspaceName::Current && s.bytes > 0)
+            .map(|s| {
+                format!(
+                    "{}={}B/{}k",
+                    s.subspace,
+                    s.bytes,
+                    s.live.map_or(0, |l| l.keys)
+                )
+            })
+            .collect();
         probe.close().await.unwrap();
 
         // A fresh handle per repeat: a warm one serves from the cache and
@@ -270,8 +285,10 @@ async fn measure_attach_cost_by_dead_fraction() {
 
         let stats = Stats::of(samples);
         println!(
-            "{rounds:>7}  {live_keys:>10}  {bytes:>14}  {l0_ssts:>8}  {runs:>5}  {:>11.3}  {:>9.3}",
-            stats.median_ms, stats.max_ms
+            "{rounds:>7}  {live_keys:>10}  {bytes:>14}  {l0_ssts:>8}  {runs:>5}  {:>11.3}  {:>9.3}   {}",
+            stats.median_ms,
+            stats.max_ms,
+            other.join(" ")
         );
     }
     println!();

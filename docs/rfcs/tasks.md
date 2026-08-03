@@ -303,12 +303,14 @@ deliberately not itemized here.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
 - **MEASURE** — Cold attach cost in the gigabyte regime. The shape is
-  measured and recorded (`BENCHMARK.md` -> Cold attach cost vs. physical
-  `current` bytes: cost nearly doubles while live entities hold constant),
-  which is the claim the merge rests on. What it cannot reach is the scale
-  the production incident sat at, because forcing L0 flushes through the
-  public API means writing 64 MB per SST; closing the gap needs either a
-  real bloated store or an `l0_sst_size` knob on `CatalogOptions`.
+  measured and recorded (`BENCHMARK.md` -> Cold attach cost vs. the physical
+  bytes a read touches: cost nearly doubles while live entities hold
+  constant, driven by `current` and `snapshot` together), which is the claim
+  the merge rests on. What it cannot reach is the scale the production
+  incident sat at: forcing L0 flushes through the public API means either
+  writing 64 MB per SST or closing the handle, which varies SST count or
+  size but not both. Closing the gap needs a real bloated store or an
+  `l0_sst_size` knob on `CatalogOptions`.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.
