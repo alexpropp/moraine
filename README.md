@@ -56,8 +56,10 @@ bucket next to the Parquet files:
   service in the path.
 
 The trade-off is commit latency: a commit is durable only once an
-object-store PUT lands (~5–10 ms on S3 Express One Zone, ~50–100 ms on S3
-Standard). For lakehouse workloads that commit after writing Parquet files
+object-store PUT lands and is acknowledged by redundant, multi-zone storage
+(~50–100 ms on S3 Standard; single-zone classes such as S3 Express One Zone
+cannot back the commit log, since their PUT ack does not mean durable). For
+lakehouse workloads that commit after writing Parquet files
 for seconds, this is noise; small inserts use DuckLake **data inlining** to
 skip the per-commit Parquet-file tax. Workloads needing sub-PUT commit
 latency want a hot server with local state — moraine stays serverless and
