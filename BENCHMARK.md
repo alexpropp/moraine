@@ -330,8 +330,9 @@ therefore not slow *because of* it.
 
 What remained was `current`'s **live** bytes — 12.8 MB on that store — and
 what a read did with them, which turned out to be the whole answer: SlateDB's
-scan default is `read_ahead_bytes: 1` (one block) with `max_fetch_tasks: 1`,
-so a whole-subspace scan paid one object-store round trip per block. The
+scan default is `read_ahead_bytes: 1` (one block) with
+`max_fetch_tasks: 1`, so a whole-subspace scan paid one object-store round
+trip per block. The
 instrumented attach measured a single materialization at **276.7 s** for
 those 12.8 MB — ~46 KB/s, which is the latency of ~3 200 sequential 4 KB
 fetches and nothing else, against 6.9 s of user CPU across the whole 833 s
