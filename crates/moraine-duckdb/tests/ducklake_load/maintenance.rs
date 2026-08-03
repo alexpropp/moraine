@@ -1307,6 +1307,9 @@ fn maintenance_resolves_a_custom_metadata_catalog_name() {
 /// option fails the attach outright, and not only for moraine's options.
 /// DuckLake accepts the same value spelled as a string, so that is how
 /// the parameter is reachable, and it passes through unaltered.
+///
+/// The versions it names are interior, so this also pins that expiry is
+/// not tail-only: snapshots above the expired ones survive untouched.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn maintenance_passes_a_list_parameter_spelled_as_a_string() {

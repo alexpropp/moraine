@@ -38,10 +38,6 @@ deliberately not itemized here.
 
 ## 0002 — SlateDB key encoding for catalog state
 
-- **VALIDATE** — Exercise the segmented-store configuration (one-byte segment
-  extractor) through the crash-recovery cases. The segmented path is
-  less-exercised in SlateDB, and the choice is only free to reverse before the
-  first release.
 - **DEFERRED** — If server-side stats pruning is ever added, it needs
   type-aware min/max comparison rather than lexicographic. A wrong compare
   silently drops rows. Part of the single pushdown deferral tracked under 0009.
@@ -94,8 +90,6 @@ deliberately not itemized here.
   Policy-only for now.
 - **DEFERRED** — A moraine-native maintenance and expiry surface, if a
   non-DuckLake consumer appears. v0.1 targets DuckLake parity.
-- **VALIDATE** — Pin interior (non-tail) snapshot expiry via `versions => […]`,
-  confirming nothing in the translation is tail-specific.
 - **VALIDATE** — A verb-path retry whose base predates a concurrent expiry must
   treat a missing intervening snapshot record as conflict-and-refresh, not
   corruption.
@@ -107,10 +101,6 @@ deliberately not itemized here.
 
 - **DEFERRED** — Finer file-set-grain conflict detection, so two compactions of
   disjoint file sets in one table can run concurrently. Table grain today.
-- **VALIDATE** — Pin that a merge never crosses a partition boundary: files
-  spread over two partition values merge to one file per value, never one
-  combined file. The rule is DuckLake's and recorded in the RFC; the pin
-  guards moraine against a future DuckLake that batches differently.
 
 ## 0009 — Reader consistency and snapshot caching
 
@@ -152,9 +142,6 @@ deliberately not itemized here.
 - **VALIDATE** — A property test that for an arbitrary sequence of column
   operations and an arbitrary snapshot `S`, the reconstructed column set,
   order, and types equal what DuckLake reports. No such proptest exists.
-- **VALIDATE** — After a widening type promotion, reconstruction at a
-  **pre-promotion** snapshot yields the old type. Current coverage asserts
-  promotion at head only.
 - **VALIDATE** — Pin that verb-path `add_column` allocates **nested** field ids
   as DuckLake does, in pre-order. The flat case is pinned on both paths now —
   `column_order_numbers_from_one_and_keeps_gaps` for the verb path and
@@ -172,8 +159,6 @@ deliberately not itemized here.
   0009 records why pushdown cannot pay off while the whole catalog is resident,
   so this revives only alongside that decision. If built it must be
   transform-aware and type-aware, never a naive compare.
-- **VALIDATE** — Capture DuckLake's `SET SORTED BY`, sorted-`INSERT`, and
-  `RESET SORTED BY` round trips in the e2e suite to validate the mapping.
 
 ## 0014 — Catalog and data encryption
 
@@ -322,13 +307,3 @@ deliberately not itemized here.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.
-
-## RFC prose to reconcile
-
-Implementation has diverged from these RFCs. Each is either a code gap or an
-RFC edit, and the RFC is binding until edited.
-
-- **0001** marks the real-object-storage test tier as future and not built. It
-  exists, as an integration test plus an xtask target.
-- **0018** says reject UPDATE and DELETE against the mapping tables. UPDATE is
-  rejected; DELETE is deliberately accepted to serve expiry cleanup.
