@@ -167,10 +167,12 @@ pub(crate) struct ProjectionCache {
     /// The full current+history entity scan at one head: populating
     /// DuckLake's metadata tables issues ~two dozen per-kind dumps, and
     /// this serves them all from one scan pair. Not folded forward —
-    /// Not folded forward —
     /// entity writes are too varied — so any committed batch drops it
     /// and the next dump re-installs it at the new head.
-    entities: Option<(u64, Arc<Vec<EntityRecord>>)>,
+    // Keyed on the whole head stamp, not the snapshot id alone: a
+    // maintenance batch reuses the id while changing what a scan would
+    // find, so an id-keyed entry would serve the state it reclaimed.
+    entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
     /// The materialized head view, folded forward on every commit and
     /// served to the commit path so it stages against known state without
     /// rescanning. Carries its own head (`snapshot.snapshot_id`); a fold
@@ -227,15 +229,18 @@ impl ProjectionCache {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    pub(crate) fn install_entities(&mut self, head: u64, records: Vec<EntityRecord>) {
+    pub(crate) fn install_entities(&mut self, head: HeadValue, records: Vec<EntityRecord>) {
         self.entities = Some((head, Arc::new(records)));
     }
 
-    /// Serves the entity scan if it is exactly at `expected_head`.
-    pub(crate) fn entities_at(&self, expected_head: u64) -> Option<Arc<Vec<EntityRecord>>> {
-        self.entities
-            .as_ref()
-            .and_then(|(head, records)| (*head == expected_head).then(|| Arc::clone(records)))
+    /// Serves the entity scan if it stands at exactly `expected` — both
+    /// halves of the stamp, so a maintenance batch that reused the
+    /// snapshot id invalidates it like any other.
+    pub(crate) fn entities_at(&self, expected: &HeadValue) -> Option<Arc<Vec<EntityRecord>>> {
+        self.entities.as_ref().and_then(|(head, records)| {
+            (head.snapshot_id == expected.snapshot_id && head.batch_seq == expected.batch_seq)
+                .then(|| Arc::clone(records))
+        })
     }
 
     pub(crate) fn install_snapshots(&mut self, head: u64, rows: Vec<SnapshotValue>) {

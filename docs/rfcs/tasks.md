@@ -117,9 +117,10 @@ deliberately not itemized here.
 - **DEFERRED** — Extend the three fold-forward *served projections*
   (snapshots, table stats, table column stats) to read-only catalogs, which
   rescan per serve. A reader has no local batch to fold, so it would advance
-  them by the same changelog replay the view already uses. Deferred until
-  reader-side serve cost is shown to matter; the view cache, which is the
-  expensive one, is no longer waiting on anything.
+  them by the same changelog replay the view already uses, and their head
+  key would have to become the whole stamp as the entity projection's has.
+  The expensive reader-side scans — the view and the full entity set — both
+  cache now, so what is left here is per-kind and comparatively cheap.
 - **DEFERRED** — Partial or lazy materialization to bound memory for an
   unusually large live catalog. Deferred until profiling shows the full
   in-memory view is a problem. This is the same decision as server-side filter

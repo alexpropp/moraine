@@ -132,6 +132,67 @@ async fn a_materialization_reads_ahead_rather_than_block_by_block() {
     );
 }
 
+/// A read-only handle scans once for a whole population of DuckLake's
+/// metadata tables, not once per `dump_*` call.
+///
+/// DuckLake issues roughly two dozen dumps to populate its metadata, and
+/// each one used to rescan `current` *and* `history` on a reader — the
+/// entity projection was gated on holding the writer. That is the cost a
+/// query pays on every execution, not just at attach.
+#[tokio::test]
+async fn a_read_only_handle_scans_once_for_many_dumps() {
+    let object_store = Arc::new(InMemory::new());
+    let writer = Catalog::open(
+        Arc::clone(&object_store) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            let table = tx.create_table(schema, "t", &[col("a")])?;
+            for _ in 0..2_000 {
+                tx.register_data_file(table, datafile(100), &[])?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let counting = Arc::new(CountingStore::new(object_store));
+    let reader = Catalog::open_read_only(
+        Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    // The first dump scans; it is the one that installs the projection.
+    let first = moraine::ffi_support::dump_data_files(&reader)
+        .await
+        .unwrap();
+    let cold = counting.take_reads();
+    assert!(!first.is_empty(), "seed did not land");
+    assert!(cold > 0, "a cold dump read nothing");
+
+    // A population's worth of further dumps must not rescan.
+    for _ in 0..12 {
+        let again = moraine::ffi_support::dump_data_files(&reader)
+            .await
+            .unwrap();
+        assert_eq!(again.len(), first.len());
+    }
+    let warm = counting.take_reads();
+
+    assert!(
+        warm < cold,
+        "twelve further dumps cost {warm} reads against {cold} for one: the reader is \
+         rescanning per dump"
+    );
+}
+
 /// A second read is served from the cache after a commit moved head. It
 /// must show the commit — a cache that serves a stale head is worse than
 /// no cache.

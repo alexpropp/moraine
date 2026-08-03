@@ -36,8 +36,10 @@ use crate::{
 
 /// The head snapshot id inside an open read session, or `None` on a
 /// store that has no head yet (mid-bootstrap).
-async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Option<u64>> {
-    Ok(read_head(session.handle()).await?.map(|h| h.snapshot_id))
+async fn session_head(
+    session: &crate::store::handle::ReadSession,
+) -> Result<Option<crate::store::proto::HeadValue>> {
+    read_head(session.handle()).await
 }
 
 /// Locks the shared projection state for reading, recovering a poisoned
@@ -78,15 +80,21 @@ async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
 
-    let cache_at = match (catalog.maintains_projections(), head) {
-        (true, Some(head)) => {
-            if let Some(records) = projections_read(catalog).entities_at(head) {
+    // Read-only catalogs cache this too. They have no batch of their own to
+    // fold forward, which is why they once could not, but the head stamp
+    // decides the question without folding anything: a scan is reusable
+    // exactly while both halves of it stand. Without this a reader rescans
+    // per `dump_*` call, and populating DuckLake's metadata tables issues
+    // two dozen of them.
+    let cache_at = match head {
+        Some(head) => {
+            if let Some(records) = projections_read(catalog).entities_at(&head) {
                 session.finish();
                 return Ok(records);
             }
             Some(head)
         }
-        _ => None,
+        None => None,
     };
 
     let handle = session.handle();
@@ -263,11 +271,11 @@ async fn dump_projected_current<T: Clone>(
 
     let cache_at = match (catalog.maintains_projections(), head) {
         (true, Some(head)) => {
-            if let Some(rows) = read(&projections_read(catalog), head) {
+            if let Some(rows) = read(&projections_read(catalog), head.snapshot_id) {
                 session.finish();
                 return Ok(rows);
             }
-            Some(head)
+            Some(head.snapshot_id)
         }
         _ => None,
     };
@@ -337,14 +345,14 @@ pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
     if let (true, Some(head)) = (catalog.maintains_projections(), head) {
-        if let Some(rows) = projections_read(catalog).snapshots_at(head) {
+        if let Some(rows) = projections_read(catalog).snapshots_at(head.snapshot_id) {
             session.finish();
             return Ok(rows);
         }
         let result = scan_snapshots(session.handle()).await;
         session.finish();
         let rows = result?;
-        projections_write(catalog).install_snapshots(head, rows.clone());
+        projections_write(catalog).install_snapshots(head.snapshot_id, rows.clone());
         return Ok(rows);
     }
     let result = scan_snapshots(session.handle()).await;
