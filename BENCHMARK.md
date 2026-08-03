@@ -329,21 +329,28 @@ SSTs to cost minutes. An attach that is slow against a large `index` is
 therefore not slow *because of* it.
 
 What remained was `current`'s **live** bytes — 12.8 MB on that store — and
-what a read did with them, which turned out to be the whole answer: SlateDB's
-scan default is `read_ahead_bytes: 1` (one block) with
-`max_fetch_tasks: 1`, so a whole-subspace scan paid one object-store round
-trip per block. The
-instrumented attach measured a single materialization at **276.7 s** for
-those 12.8 MB — ~46 KB/s, which is the latency of ~3 200 sequential 4 KB
-fetches and nothing else, against 6.9 s of user CPU across the whole 833 s
-attach. Reading ahead and fetching concurrently is the fix; on an in-memory
-store the same scan costs 5 reads instead of 89. Materialization costs ~5-7 µs per live entity
-(below), and before RFC 0009's caching landed a read-only catalog
-rematerialized on *every* read while `dump_entities` cloned the whole record
-set per call. At ~2.4 s per rescan over the network, a 642 s attach is on the
-order of a couple of hundred rematerializations — which is what a
-population that reads the metadata tables repeatedly costs when none of them
-are cached. The lever is caching the view, not shrinking the store.
+what a read did with them, which turned out to be the whole answer.
+
+SlateDB's `ScanOptions::default()` is `read_ahead_bytes: 1`, rounding up to
+one block, with `max_fetch_tasks: 1`. Every whole-subspace scan took it, so
+a materialization paid one object-store round trip per block. The
+instrumented attach measured a single materialization — the view cache was
+working, `materializations=1` — at **276.7 s** for 12.8 MB. That is
+~46 KB/s, which is not a throughput figure at all: it is the latency of
+~3 200 sequential 4 KB fetches, against 6.9 s of user CPU across the whole
+833 s attach. Reading 4 MiB ahead with 8 fetches in flight is the fix; the
+same scan costs 5 object-store reads instead of 89 on an in-memory store,
+where the latency this hid behind is nil.
+
+The order of the refutations is worth keeping. Dead versions were refuted by
+a full-store merge reclaiming 0.08%; index bulk in the scan path by the
+segment routing; index bulk via the manifest by ~15 µs per SST against a
+store carrying ~10 of them; and repeated uncached materialization by an
+attach that was still slow on a build carrying the cache. Every one of those
+was a property of the *store*, and the cause was a property of how a scan
+was configured to read it — which no measurement of the store could have
+found, and which the attach named in one run once it was asked to report on
+itself.
 
 ### Materialization cost vs. catalog size
 
