@@ -29,11 +29,17 @@ struct Maintained<K: Ord, V> {
     rows: BTreeMap<K, V>,
 }
 
-/// The head record a batch wrote, if it wrote one. Every catalog batch
-/// does.
+/// The head record a batch leaves behind. Every catalog batch writes one.
+///
+/// Searched from the end: a group commit stages each member's own head
+/// write onto the one batch, each read through the transaction and so
+/// numbered above the last, and the store keeps the final write of a key.
+/// Taking the first would stamp the projections with a state the store
+/// never settled at — a reader matching it would be served rows from a
+/// partial batch.
 fn head_stamp(writes: &[StagedWrite]) -> Option<HeadValue> {
     let head_key = Key::Sys(SysKey::Head).encode();
-    writes.iter().find_map(|(key, bytes)| {
+    writes.iter().rev().find_map(|(key, bytes)| {
         (key == &head_key)
             .then_some(bytes.as_ref())
             .flatten()
@@ -335,16 +341,17 @@ impl ProjectionCache {
                 }
             }
         }
-        let Some(stamp) = head_stamp(writes) else {
+        // A batch with no head write, or one naming a state the caller does
+        // not agree with, cannot be attributed — so nothing may keep
+        // claiming a state. Cleared rather than asserted: this runs under
+        // the projection write lock inside a spawned commit, where a panic
+        // strands the joiner instead of failing the commit.
+        let Some(stamp) = head_stamp(writes).filter(|stamp| stamp.snapshot_id == new_head) else {
             self.snapshots.clear();
             self.table_stats.clear();
             self.table_column_stats.clear();
             return;
         };
-        debug_assert_eq!(
-            stamp.snapshot_id, new_head,
-            "head write disagrees with the batch"
-        );
         self.snapshots.advance(stamp);
         self.table_stats.advance(stamp);
         self.table_column_stats.advance(stamp);
