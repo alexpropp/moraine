@@ -351,6 +351,18 @@ message HeadValue {
   uint64 snapshot_id = 1;
 }
 
+// sys/secret: the forwarding token a leader authenticates sessions against.
+message SecretValue {
+  bytes token = 1;
+}
+
+// sys/leader: the freshest folded leader advert. An absent `endpoint`
+// records a withdrawal.
+message LeaderValue {
+  bytes instance = 1;
+  optional string endpoint = 2;
+}
+
 // sys/migration: structural-migration marker. Present only
 // mid-migration; readers refuse the store while it exists.
 message MigrationValue {

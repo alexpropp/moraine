@@ -749,6 +749,7 @@ mod tests {
         validated_head: u64,
     ) -> Envelope {
         Envelope {
+            leader: None,
             commits: vec![schema_commit(
                 transaction_id,
                 schema_id,
@@ -784,6 +785,7 @@ mod tests {
 
         // Two commits, neither touching table 5: nothing to rebase away from.
         let benign = Envelope {
+            leader: None,
             commits: vec![classified("altered_table:7"), classified("altered_table:9")],
         };
         assert_eq!(classify_lost_race(Some(&ours), &benign), Race::Benign);
@@ -791,6 +793,7 @@ mod tests {
         // The conflict is the winner's *second* commit; a scan that stopped at
         // the first would call this benign and apply over a real conflict.
         let conflicting = Envelope {
+            leader: None,
             commits: vec![classified("altered_table:7"), classified("altered_table:5")],
         };
         assert_eq!(
@@ -801,6 +804,7 @@ mod tests {
         // An unparseable classification parses to an unknown change, which
         // conflicts with anything.
         let unparseable = Envelope {
+            leader: None,
             commits: vec![classified("not a change list at all")],
         };
         assert_eq!(
@@ -810,6 +814,20 @@ mod tests {
 
         // No change set to compare cannot be called benign.
         assert_eq!(classify_lost_race(None, &benign), Race::Conflict);
+    }
+
+    /// Bootstrap mints the 32-byte forwarding token, readable straight back
+    /// through the store — the leader authenticates forwarded sessions against
+    /// it, and a store predating it mints it lazily on first bind.
+    #[tokio::test]
+    async fn bootstrap_mints_a_readable_secret() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = bootstrap(Arc::clone(&object_store)).await;
+        let secret = read::read_secret(ReadHandle::Reader(&store.reader))
+            .await
+            .unwrap()
+            .expect("bootstrap mints a token");
+        assert_eq!(secret.token.len(), 32);
     }
 
     /// The head is the folded store plus the tail: a slot no folder has
@@ -937,6 +955,7 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = bootstrap(Arc::clone(&object_store)).await;
         let envelope = Envelope {
+            leader: None,
             commits: vec![
                 schema_commit(1, 1, "sales", 0),
                 schema_commit(2, 2, "staging", 1),
@@ -960,6 +979,7 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = bootstrap(Arc::clone(&object_store)).await;
         let envelope = Envelope {
+            leader: None,
             commits: vec![
                 schema_commit(1, 1, "sales", 0),
                 // Staged against head 0 as well: it does not chain onto commit 1.

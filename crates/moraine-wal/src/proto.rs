@@ -13,4 +13,6 @@ mod generated {
 // `FoldValue` is public so a cursor store can persist it under its own
 // framing; every other message stays internal to the envelope codec.
 pub use generated::FoldValue;
-pub(crate) use generated::{CommitValue, EnvelopeValue, SlotPayloadValue, SlotWriteValue};
+pub(crate) use generated::{
+    CommitValue, EnvelopeValue, LeaderAdvertValue, SlotPayloadValue, SlotWriteValue,
+};

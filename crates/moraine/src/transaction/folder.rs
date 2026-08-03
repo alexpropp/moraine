@@ -155,6 +155,19 @@ impl CursorStore for SlateDbCursorStore {
             }
         }
 
+        // The freshest advert riding this slot folds into `sys/leader`, so a
+        // leader announcement survives the truncation of the slot that carried
+        // it — an absent-endpoint advert records a withdrawal all the same.
+        if let Some(advert) = &envelope.leader {
+            batch.put(
+                Key::Sys(SysKey::Leader).encode(),
+                value::encode_value(&crate::store::proto::LeaderValue {
+                    instance: advert.instance.to_vec(),
+                    endpoint: advert.endpoint.clone(),
+                }),
+            );
+        }
+
         batch.put(
             Key::Sys(SysKey::Fold).encode(),
             value::encode_value(&FoldValue {

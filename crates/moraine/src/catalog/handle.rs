@@ -687,6 +687,14 @@ impl Catalog {
         &self.projections
     }
 
+    /// The slot-log-backed store behind this handle — the leader role
+    /// materializes heads, mints the secret, and races slots through it.
+    #[cfg(feature = "leader")]
+    pub(crate) fn slot_store(&self) -> &SlotStore {
+        let Store::Slots(store) = self.store.as_ref();
+        store
+    }
+
     /// Whether this catalog maintains served projections. The slot topology
     /// folds no local commits into a served head view, so dumps always scan.
     #[allow(clippy::unused_self)]

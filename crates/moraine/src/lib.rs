@@ -121,12 +121,22 @@
 //! - `transaction` — the commit protocol turning a catalog transaction into an
 //!   atomic store write.
 
+//! # Features
+//!
+//! - `leader` (off by default) — the advisory leader role: a long-lived folder
+//!   opens a network port and becomes a group-commit funnel for forwarded
+//!   sessions, announcing itself through the commit log. Additive: nothing in
+//!   the direct or folder commit path depends on it, and with the feature off
+//!   the whole module is absent and the fleet is purely direct.
+
 #![forbid(unsafe_code)]
 
 mod catalog;
 mod error;
 #[doc(hidden)]
 pub mod ffi_support;
+#[cfg(feature = "leader")]
+mod leader;
 mod store;
 mod transaction;
 
@@ -140,6 +150,8 @@ pub use catalog::{
     SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
+#[cfg(feature = "leader")]
+pub use leader::{Leader, LeaderConfig};
 pub use moraine_wal::FoldReport;
 pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};
 pub use transaction::Transaction;

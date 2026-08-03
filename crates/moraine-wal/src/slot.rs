@@ -472,6 +472,7 @@ mod tests {
 
     fn envelope_with_id(transaction_id: [u8; 16]) -> Envelope {
         Envelope {
+            leader: None,
             commits: vec![commit_with_id(transaction_id)],
         }
     }
@@ -480,7 +481,10 @@ mod tests {
     async fn racing_puts_admit_exactly_one_winner() {
         let store: Arc<InMemory> = Arc::new(InMemory::new());
         let log = SlotLog::new(store, "cat");
-        let envelope = Envelope { commits: vec![] };
+        let envelope = Envelope {
+            leader: None,
+            commits: vec![],
+        };
         let first = log.put_slot(1, &envelope).await.unwrap();
         let second = log.put_slot(1, &envelope).await.unwrap();
         assert!(matches!(first, SlotRace::Won));
@@ -492,6 +496,7 @@ mod tests {
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
         assert!(log.read_slot(1).await.unwrap().is_none());
         let envelope = Envelope {
+            leader: None,
             commits: vec![Commit {
                 transaction_id: [7; 16],
                 payload: SlotPayload {
@@ -551,7 +556,10 @@ mod tests {
     #[tokio::test]
     async fn read_tail_stops_at_the_first_absent_slot_and_reports_a_hole() {
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
-        let envelope = Envelope { commits: vec![] };
+        let envelope = Envelope {
+            leader: None,
+            commits: vec![],
+        };
         for sequence in [1, 2, 4] {
             log.put_slot(sequence, &envelope).await.unwrap();
         }
@@ -576,7 +584,10 @@ mod tests {
     async fn a_truncated_prefix_is_not_a_hole() {
         // Truncation deletes a prefix; reading from above it sees no gap.
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
-        let envelope = Envelope { commits: vec![] };
+        let envelope = Envelope {
+            leader: None,
+            commits: vec![],
+        };
         for sequence in 1..=4 {
             log.put_slot(sequence, &envelope).await.unwrap();
         }
@@ -589,7 +600,10 @@ mod tests {
     #[tokio::test]
     async fn truncate_through_deletes_oldest_first_and_tolerates_gaps() {
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
-        let envelope = Envelope { commits: vec![] };
+        let envelope = Envelope {
+            leader: None,
+            commits: vec![],
+        };
         for sequence in [1, 3, 4] {
             log.put_slot(sequence, &envelope).await.unwrap();
         }
@@ -642,6 +656,7 @@ mod tests {
         );
         // A coalescing winner that carries the attempt is the same answer.
         let coalesced = Envelope {
+            leader: None,
             commits: vec![commit_with_id([8; 16]), commit_with_id([9; 16])],
         };
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
@@ -661,7 +676,13 @@ mod tests {
         log.put_slot(1, &envelope_with_id([1; 16])).await.unwrap();
 
         let err = log
-            .commit_slot(1, &Envelope { commits: vec![] })
+            .commit_slot(
+                1,
+                &Envelope {
+                    leader: None,
+                    commits: vec![],
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Transport(_)), "{err}");
@@ -728,7 +749,13 @@ mod tests {
     async fn an_ambiguous_put_with_no_transaction_id_is_unresolvable() {
         let log = SlotLog::new(Arc::new(FaultyPut::armed(PutFault::LostResponse)), "cat");
         let err = log
-            .commit_slot(1, &Envelope { commits: vec![] })
+            .commit_slot(
+                1,
+                &Envelope {
+                    leader: None,
+                    commits: vec![],
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Transport(_)), "{err}");
@@ -741,7 +768,10 @@ mod tests {
     async fn a_loser_with_no_transaction_id_is_never_told_it_won() {
         let store = Arc::new(FaultyPut::disarmed(PutFault::Unreachable));
         let log = SlotLog::new(store.clone(), "cat");
-        let advert = Envelope { commits: vec![] };
+        let advert = Envelope {
+            leader: None,
+            commits: vec![],
+        };
 
         // Committer A wins slot 1.
         assert_eq!(
@@ -777,6 +807,7 @@ mod tests {
         // An attempt over {6, 7} whose put fails finds only 6 present.
         store.arm();
         let attempt = Envelope {
+            leader: None,
             commits: vec![commit_with_id([6; 16]), commit_with_id([7; 16])],
         };
         let err = log.commit_slot(1, &attempt).await.unwrap_err();
@@ -791,6 +822,7 @@ mod tests {
         let log = SlotLog::new(store.clone(), "cat");
 
         let coalesced = Envelope {
+            leader: None,
             commits: vec![
                 commit_with_id([6; 16]),
                 commit_with_id([7; 16]),
@@ -801,6 +833,7 @@ mod tests {
 
         store.arm();
         let attempt = Envelope {
+            leader: None,
             commits: vec![commit_with_id([7; 16]), commit_with_id([8; 16])],
         };
         assert_eq!(
@@ -834,6 +867,7 @@ mod tests {
     async fn an_ambiguous_put_matches_any_of_a_multi_commit_envelopes_ids() {
         let log = SlotLog::new(Arc::new(FaultyPut::armed(PutFault::LostResponse)), "cat");
         let envelope = Envelope {
+            leader: None,
             commits: vec![commit_with_id([6; 16]), commit_with_id([7; 16])],
         };
 
@@ -868,7 +902,10 @@ mod tests {
     #[tokio::test]
     async fn a_from_below_the_first_sequence_reads_from_the_beginning() {
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
-        let envelope = Envelope { commits: vec![] };
+        let envelope = Envelope {
+            leader: None,
+            commits: vec![],
+        };
         for sequence in 1..=4 {
             log.put_slot(sequence, &envelope).await.unwrap();
         }
@@ -893,7 +930,10 @@ mod tests {
     #[tokio::test]
     async fn truncation_reclaims_a_slot_at_sequence_zero() {
         let log = SlotLog::new(Arc::new(InMemory::new()), "cat");
-        let envelope = Envelope { commits: vec![] };
+        let envelope = Envelope {
+            leader: None,
+            commits: vec![],
+        };
         for sequence in [0, 1, 2] {
             log.put_slot(sequence, &envelope).await.unwrap();
         }
@@ -911,7 +951,10 @@ mod tests {
     async fn a_nested_sequence_shaped_object_is_not_a_slot() {
         let store = Arc::new(InMemory::new());
         let log = SlotLog::new(store.clone(), "cat");
-        let envelope = Envelope { commits: vec![] };
+        let envelope = Envelope {
+            leader: None,
+            commits: vec![],
+        };
         for sequence in [1, 2] {
             log.put_slot(sequence, &envelope).await.unwrap();
         }

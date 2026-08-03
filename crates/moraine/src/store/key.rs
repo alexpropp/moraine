@@ -79,6 +79,10 @@ pub(crate) enum SysKey {
     Migration,
     /// The highest commit-slot sequence folded into the store.
     Fold,
+    /// The freshest leader advert, folded here so it survives truncation.
+    Leader,
+    /// The 32-byte forwarding token a leader authenticates sessions against.
+    Secret,
 }
 
 /// A live record: a temporally versioned entity, or the `current`-only
@@ -688,6 +692,8 @@ mod tests {
         assert_eq!(Key::Sys(SysKey::Head).encode(), vec![0x02, 0x03]);
         assert_eq!(Key::Sys(SysKey::Migration).encode(), vec![0x02, 0x04]);
         assert_eq!(Key::Sys(SysKey::Fold).encode(), vec![0x02, 0x05]);
+        assert_eq!(Key::Sys(SysKey::Leader).encode(), vec![0x02, 0x06]);
+        assert_eq!(Key::Sys(SysKey::Secret).encode(), vec![0x02, 0x07]);
     }
 
     #[test]
@@ -1332,6 +1338,8 @@ mod tests {
             Just(Key::Sys(SysKey::Head)),
             Just(Key::Sys(SysKey::Migration)),
             Just(Key::Sys(SysKey::Fold)),
+            Just(Key::Sys(SysKey::Leader)),
+            Just(Key::Sys(SysKey::Secret)),
             any::<u64>().prop_map(|snapshot_id| Key::Snapshot { snapshot_id }),
             arb_entity().prop_map(Key::current),
             (arb_entity(), any::<u64>()).prop_map(|(entity, end)| Key::history(entity, end)),

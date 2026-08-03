@@ -426,7 +426,7 @@ pub struct FoldReport {
 /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 /// let log = SlotLog::new(Arc::new(InMemory::new()), "catalog");
 /// for (sequence, key) in [(1, b"orders".as_slice()), (2, b"regions")] {
-///     let envelope = Envelope {
+///     let envelope = Envelope { leader: None,
 ///         commits: vec![Commit {
 ///             transaction_id: [sequence as u8; 16],
 ///             payload: SlotPayload {
@@ -603,6 +603,7 @@ mod tests {
             transaction_id[1] = self.assemblies;
 
             Ok(Some(Envelope {
+                leader: None,
                 commits: vec![Commit {
                     transaction_id,
                     payload: SlotPayload {
@@ -638,6 +639,7 @@ mod tests {
         transaction_id[..value.len().min(16)].copy_from_slice(&value[..value.len().min(16)]);
 
         Envelope {
+            leader: None,
             commits: vec![Commit {
                 transaction_id,
                 payload: SlotPayload {

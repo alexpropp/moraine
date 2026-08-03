@@ -62,6 +62,18 @@ pub(crate) fn durable() -> WriteOptions {
     }
 }
 
+/// The width of the store-held forwarding token.
+pub(crate) const SECRET_LEN: usize = 32;
+
+/// Mints a fresh forwarding token from two random UUIDs — 256 token bits over
+/// the process's `getrandom`-backed UUID source, no extra dependency.
+pub(crate) fn mint_secret() -> [u8; SECRET_LEN] {
+    let mut token = [0u8; SECRET_LEN];
+    token[..16].copy_from_slice(&Uuid::new_v4().into_bytes());
+    token[16..].copy_from_slice(&Uuid::new_v4().into_bytes());
+    token
+}
+
 /// Refuses a store this binary must not touch: mid-migration, or a
 /// format newer/older than it understands. `None` format means the store
 /// is empty and needs bootstrap.
@@ -108,6 +120,12 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
     stage(
         Key::Sys(SysKey::Fold),
         value::encode_value(&moraine_wal::FoldValue { folded_sequence: 0 }),
+    )?;
+    stage(
+        Key::Sys(SysKey::Secret),
+        value::encode_value(&proto::SecretValue {
+            token: mint_secret().to_vec(),
+        }),
     )?;
     // Bootstrap's snapshot records minting `main`, byte-identical to the
     // `created_schema:"main"` DuckLake's own initialization writes.

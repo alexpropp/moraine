@@ -10,10 +10,25 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# The advisory leader role: a self-appointed group-commit funnel that opens a
+# network port and serves forwarded sessions. Additive — nothing in the
+# direct/folder commit path depends on it, and with the feature off the whole
+# leader module is absent.
+leader = [
+    "dep:moraine-remote",
+    "dep:constant_time_eq",
+    "tokio/net",
+    "tokio/io-util",
+    "tokio/rt",
+]
+
 [dependencies]
 arrow = { workspace = true, features = ["ipc"] }
 bytes = { workspace = true }
+constant_time_eq = { workspace = true, optional = true }
 futures = { workspace = true }
+moraine-remote = { workspace = true, optional = true }
 moraine-wal = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }

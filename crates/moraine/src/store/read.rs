@@ -9,7 +9,7 @@ use crate::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
             GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
-            OptionScopeValue, PartitionValue, SchemaValue, SnapshotValue, SortValue,
+            OptionScopeValue, PartitionValue, SchemaValue, SecretValue, SnapshotValue, SortValue,
             TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
         },
         value,
@@ -187,6 +187,15 @@ pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue
 /// multi-writer.
 pub(crate) async fn read_fold(handle: ReadHandle<'_>) -> Result<Option<moraine_wal::FoldValue>> {
     read_singleton(handle, Key::Sys(SysKey::Fold)).await
+}
+
+/// Reads the forwarding token; `None` on a store predating it (a leader mints
+/// it lazily on first bind).
+// Read by the leader role and its bootstrap-mint test; the leaderless build
+// still writes it, but reads it back only in the test.
+#[cfg_attr(not(feature = "leader"), allow(dead_code))]
+pub(crate) async fn read_secret(handle: ReadHandle<'_>) -> Result<Option<SecretValue>> {
+    read_singleton(handle, Key::Sys(SysKey::Secret)).await
 }
 
 /// One snapshot record.

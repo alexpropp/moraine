@@ -668,6 +668,7 @@ impl Committer for SimCommitter {
         let changes_made = if self.exclusive { EXCLUSIVE } else { SHARED };
 
         Ok(Some(Envelope {
+            leader: None,
             commits: vec![Commit {
                 transaction_id,
                 payload: SlotPayload {
@@ -1352,7 +1353,10 @@ impl Committer for CoalescingSimCommitter {
             })
             .collect();
 
-        Ok(Some(Envelope { commits }))
+        Ok(Some(Envelope {
+            leader: None,
+            commits,
+        }))
     }
 
     fn classify(&self, _winner: &Envelope) -> Race {

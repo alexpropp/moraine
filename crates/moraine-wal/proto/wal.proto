@@ -13,9 +13,14 @@ package moraine.wal;
 // One commit-slot object: the envelope of the commits that won one slot.
 message EnvelopeValue {
   repeated CommitValue commits = 1;
-  // Field 2 is reserved for the leader advert; encoded absent until
-  // the leader role exists.
-  reserved 2;
+  optional LeaderAdvertValue leader = 2;
+}
+
+// A leader announcement riding a slot. An absent `endpoint` withdraws the
+// role — distinct from an absent advert, which says nothing about leadership.
+message LeaderAdvertValue {
+  bytes instance = 1;
+  optional string endpoint = 2;
 }
 
 // One committed unit inside a slot.

@@ -333,6 +333,7 @@ fn corrupt_row(table: TableKind, detail: impl std::fmt::Display) -> Error {
 
 /// What a staged transaction reads through and commits against: a pinned
 /// slot-log head.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum StagedBacking {
     /// A pinned slot-log head: reads resolve over the reader overlaid with the
     /// unfolded tail, and a commit races one slot at `head.next_sequence`.
@@ -346,6 +347,17 @@ pub(crate) enum StagedBacking {
 }
 
 impl StagedBacking {
+    /// A slot-log backing over a pinned head, for the leader's per-session
+    /// assembly (it races through the leader's funnel, not `commit_slots`).
+    #[cfg(feature = "leader")]
+    pub(crate) fn slots(head: Box<SlotHead>, reader: Arc<DbReader>, slots: SlotLog) -> Self {
+        Self::Slots {
+            head,
+            reader,
+            slots,
+        }
+    }
+
     /// The handle every scan and point read routes through: the reader the
     /// pinned head materialized from, overlaid with the unfolded tail.
     fn scan_handle(&self) -> ReadHandle<'_> {
@@ -510,25 +522,25 @@ impl StagedTransaction {
 }
 
 /// Everything one staged commit assembles before racing its slot.
-struct Assembly {
+pub(crate) struct Assembly {
     /// The snapshot id a successful commit reports: the minted id, or the
     /// unchanged head for a maintenance commit.
-    result_id: u64,
+    pub(crate) result_id: u64,
     /// The full batch to land: entity diff, index entries, inline writes, and
     /// (for a minting commit) the snapshot record and head advance.
-    writes: Vec<StagedWrite>,
+    pub(crate) writes: Vec<StagedWrite>,
     /// The transaction id stamped into the minted snapshot and carried by the
     /// slot envelope.
-    transaction_id: Option<[u8; 16]>,
+    pub(crate) transaction_id: Option<[u8; 16]>,
     /// The commit's classification string, for the slot envelope a lost race
     /// judges against; empty for a maintenance commit.
-    changes_made: String,
+    pub(crate) changes_made: String,
 }
 
 /// Translates every staged row into the atomic batch the slot commit lands.
 /// Reads route through the pinned slot-log head overlaid with its unfolded
 /// tail.
-async fn assemble(
+pub(crate) async fn assemble(
     backing: &StagedBacking,
     ops: &[RowOperation],
     data_store: Option<&Arc<dyn ObjectStore>>,
@@ -639,6 +651,7 @@ async fn commit_slots(
                 .unwrap_or_else(|| uuid::Uuid::new_v4().into_bytes());
             let validated_head = head.view.snapshot.snapshot_id;
             let envelope = Envelope {
+                leader: None,
                 commits: vec![commit_from(
                     transaction_id,
                     validated_head,

@@ -515,7 +515,10 @@ where
             self.last_envelope = None;
             Ok(None)
         } else {
-            let envelope = Envelope { commits };
+            let envelope = Envelope {
+                leader: None,
+                commits,
+            };
             self.last_envelope = Some(envelope.clone());
             Ok(Some(envelope))
         }
@@ -736,6 +739,7 @@ where
                 )));
             }
             let folded = Envelope {
+                leader: None,
                 commits: vec![commit.clone()],
             };
             overlay.absorb(&folded);

@@ -27,7 +27,7 @@
 //!
 //! // One commit: a batch of writes, the head it was validated against, and
 //! // a committer-minted id.
-//! let commit = |id: u8, value: &[u8]| Envelope {
+//! let commit = |id: u8, value: &[u8]| Envelope { leader: None,
 //!     commits: vec![Commit {
 //!         transaction_id: [id; 16],
 //!         payload: SlotPayload {
@@ -158,7 +158,7 @@ pub use driver::{
     CommitDrive, Committer, CursorStore, FoldReport, FolderRole, Jitter, Race, RetryPolicy,
     drive_commit, drive_fold, drive_fold_if_stalled,
 };
-pub use envelope::{Commit, Envelope, Overlay, SlotPayload, SlotWrite};
+pub use envelope::{Commit, Envelope, LeaderAdvert, Overlay, SlotPayload, SlotWrite};
 pub use error::Error;
 pub use proto::FoldValue;
 pub use slot::{CommitOutcome, SlotLog, SlotRace, Tail};

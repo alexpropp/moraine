@@ -685,6 +685,7 @@ mod tests {
     fn tail_writing(writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Overlay {
         let mut overlay = Overlay::default();
         overlay.absorb(&Envelope {
+            leader: None,
             commits: vec![Commit {
                 transaction_id: [1; 16],
                 payload: SlotPayload {
