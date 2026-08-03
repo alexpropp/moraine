@@ -7,7 +7,7 @@ use std::{
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -264,12 +264,12 @@ async fn migrate_stamp(db: &Db) -> Result<()> {
         .await
         .map_err(Error::from)?;
 
-    match validate_format(ReadHandle::Tx(&tx)).await {
+    let from_format = match validate_format(ReadHandle::Tx(&tx)).await {
         Ok(Some(format)) if format.format_version >= FORMAT_MULTI_WRITER => {
             tx.rollback();
             return Ok(());
         }
-        Ok(Some(_)) => {}
+        Ok(Some(format)) => format.format_version,
         Ok(None) => {
             tx.rollback();
             return Err(Error::Corruption(
@@ -280,7 +280,7 @@ async fn migrate_stamp(db: &Db) -> Result<()> {
             tx.rollback();
             return Err(err);
         }
-    }
+    };
 
     let stamp = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
     if let Err(err) = stamp(
@@ -302,7 +302,11 @@ async fn migrate_stamp(db: &Db) -> Result<()> {
 
     match tx.commit_with_options(&durable()).await {
         Ok(_) => {
-            info!("migrated a legacy store to the slot-log topology");
+            warn!(
+                from_format,
+                to_format = FORMAT_MULTI_WRITER,
+                "migrated the catalog store to the slot-log format, fencing any old-binary writer"
+            );
             Ok(())
         }
         // A racing migration committed first: it stamped the same format, so

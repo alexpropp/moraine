@@ -466,3 +466,121 @@ async fn create_index_staged_lands_ready_over_the_slot_log() {
     assert_eq!(info.id, index);
     assert_eq!(info.state, crate::catalog::IndexState::Ready);
 }
+
+/// Collects `tracing` events fired on the current thread as `(level, rendered
+/// message and fields)`, for asserting the migration diagnostic.
+#[derive(Clone, Default)]
+struct CapturedEvents(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Render(String);
+        impl tracing::field::Visit for Render {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, " {}={value:?}", field.name());
+            }
+        }
+        let mut render = Render(String::new());
+        event.record(&mut render);
+        if let Ok(mut events) = self.0.lock() {
+            events.push((*event.metadata().level(), render.0));
+        }
+    }
+}
+
+/// Runs `body` under a subscriber that captures every event fired on this
+/// thread, returning what it captured.
+fn capture_events(body: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let captured = CapturedEvents::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    tracing::subscriber::with_default(subscriber, body);
+    let events = captured.0.lock().unwrap();
+    events.clone()
+}
+
+/// The migration diagnostic: a `warn` naming the slot-log format.
+fn migration_warns(events: &[(tracing::Level, String)]) -> Vec<&(tracing::Level, String)> {
+    events
+        .iter()
+        .filter(|(level, message)| {
+            *level == tracing::Level::WARN && message.contains("slot-log format")
+        })
+        .collect()
+}
+
+/// Migrating a legacy store emits one `warn` event naming the old and new
+/// store formats, so an operator sees the otherwise-silent restamp — the line
+/// the extension's log sink surfaces on a migrating attach.
+#[test]
+fn migration_warns_naming_the_old_and_new_format() {
+    let events = capture_events(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            legacy_store_with_schema(Arc::clone(&object_store)).await;
+            Catalog::open(object_store, CatalogOptions::default())
+                .await
+                .unwrap();
+        });
+    });
+
+    let warns = migration_warns(&events);
+    let warn = warns
+        .first()
+        .unwrap_or_else(|| panic!("no migration warn event in {events:?}"));
+    assert_eq!(warns.len(), 1, "exactly one migration warn: {events:?}");
+    assert!(
+        warn.1
+            .contains(&format!("from_format={}", commit::FORMAT_VERSION)),
+        "the warn names the old format: {}",
+        warn.1
+    );
+    assert!(
+        warn.1
+            .contains(&format!("to_format={}", commit::FORMAT_MULTI_WRITER)),
+        "the warn names the new format: {}",
+        warn.1
+    );
+}
+
+/// The migration warn is bound to an actual format 1–3 → 4 conversion: a fresh
+/// bootstrap and a re-attach of an already-migrated store both restamp nothing
+/// and so must stay silent, or every attach would spam the operator.
+#[test]
+fn bootstrap_and_reattach_do_not_warn() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    let bootstrap = capture_events(|| {
+        runtime.block_on(async {
+            Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+                .await
+                .unwrap();
+        });
+    });
+    assert!(
+        migration_warns(&bootstrap).is_empty(),
+        "a fresh bootstrap migrates nothing and must not warn: {bootstrap:?}"
+    );
+
+    let reattach = capture_events(|| {
+        runtime.block_on(async {
+            Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+                .await
+                .unwrap();
+        });
+    });
+    assert!(
+        migration_warns(&reattach).is_empty(),
+        "re-attaching an already-migrated store must not warn: {reattach:?}"
+    );
+}
