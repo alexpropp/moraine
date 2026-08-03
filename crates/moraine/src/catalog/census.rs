@@ -155,6 +155,41 @@ pub struct SubspaceCensus {
     pub live: Option<LiveCount>,
 }
 
+/// What the object store holds, by the kind of object holding it.
+///
+/// The manifest accounts for SST bytes only, so a store whose weight is in
+/// its write-ahead log reads as nearly empty subspace by subspace while
+/// costing every reader dearly — a read attach replays the log before it
+/// materializes anything, and no merge touches those bytes. Comparing
+/// `sst_bytes` against `total_bytes` is what tells the two apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StoreObjects {
+    /// Every object under the store's prefix.
+    pub total_objects: u64,
+    /// Bytes across all of them.
+    pub total_bytes: u64,
+    /// Write-ahead log objects, replayed by a read attach that is not
+    /// pinned to a checkpoint.
+    pub wal_objects: u64,
+    /// Bytes across those.
+    pub wal_bytes: u64,
+    /// Manifest versions.
+    pub manifest_objects: u64,
+    /// Bytes across those.
+    pub manifest_bytes: u64,
+    /// Sorted-string tables — the only bytes a merge reclaims, and the only
+    /// ones the per-subspace figures account for.
+    pub sst_objects: u64,
+    /// Bytes across those.
+    pub sst_bytes: u64,
+    /// Everything else the layout carries. The four counts sum to
+    /// `total_objects`, so nothing measured goes unattributed.
+    pub other_objects: u64,
+    /// Bytes across those.
+    pub other_bytes: u64,
+}
+
 /// What a store weighs, subspace by subspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -163,9 +198,25 @@ pub struct StoreCensus {
     pub manifest_id: u64,
     /// One entry per subspace the store has written out, in prefix order.
     pub subspaces: Vec<SubspaceCensus>,
+    /// What the object store holds, by kind — `None` when the store could
+    /// not be listed, which read-only credentials granting `GetObject`
+    /// without `ListBucket` produce.
+    pub objects: Option<StoreObjects>,
 }
 
 impl StoreCensus {
+    /// Bytes the object store holds that no subspace accounts for — the
+    /// write-ahead log, the manifest, and anything else. `None` when the
+    /// store could not be listed.
+    ///
+    /// A large figure here is the signature of a slow read attach that a
+    /// merge will not fix: a reader replays the log at open.
+    #[must_use]
+    pub fn unaccounted_bytes(&self) -> Option<u64> {
+        self.objects
+            .map(|objects| objects.total_bytes.saturating_sub(objects.sst_bytes))
+    }
+
     /// Physical bytes across every subspace.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
@@ -266,10 +317,33 @@ mod tests {
         assert_eq!(SubspaceName::SchemaVersion.to_string(), "schema_version");
     }
 
+    /// The bytes no subspace accounts for — the write-ahead log and the
+    /// manifest — are what a merge cannot touch, so a census that omitted
+    /// them would point an operator at the wrong lever.
+    #[test]
+    fn unaccounted_bytes_is_everything_outside_the_ssts() {
+        let mut census = StoreCensus {
+            manifest_id: 1,
+            objects: None,
+            subspaces: Vec::new(),
+        };
+        assert_eq!(census.unaccounted_bytes(), None, "unlisted stays unknown");
+
+        census.objects = Some(StoreObjects {
+            total_bytes: 1_000,
+            sst_bytes: 250,
+            wal_bytes: 700,
+            manifest_bytes: 50,
+            ..StoreObjects::default()
+        });
+        assert_eq!(census.unaccounted_bytes(), Some(750));
+    }
+
     #[test]
     fn total_bytes_sums_every_subspace() {
         let census = StoreCensus {
             manifest_id: 7,
+            objects: None,
             subspaces: vec![
                 SubspaceCensus {
                     subspace: SubspaceName::Current,

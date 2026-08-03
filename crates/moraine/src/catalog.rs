@@ -15,7 +15,7 @@ mod types;
 
 pub use census::{
     CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
-    MergeOutcome, StoreCensus, SubspaceCensus, SubspaceMerge, SubspaceName,
+    MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
 };
 pub use handle::{
     Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest, MigrationRequest,

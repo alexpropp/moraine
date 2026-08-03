@@ -481,6 +481,15 @@ what `Full` does silently. Naming such a subspace explicitly is an upstream
 error; the verb reports it the same way, so the whole-store and
 single-subspace forms read alike.
 
+**A tree already being merged is adopted, not skipped.** Submitting a second
+plan for it would claim a destination the executor refuses, so the step waits
+on the merge already in flight and reports its outcome as the tree's. The
+alternative — reporting it skipped — was measured and is worse than it
+sounds: opening a writer starts SlateDB's compactor, which proposes work
+immediately, so an on-demand merge asked for straight after an attach found
+every eligible tree busy and reclaimed nothing. Adoption satisfies what the
+caller asked for, since the tree ends up merged either way.
+
 **A store whose bulk sits in L0 is skipped, and that is the answer**, not a
 gap. L0 holds what recent flushes wrote, so a tree with bytes there and no
 sorted runs has never been compacted at all — the size-tiered scheduler has
@@ -510,6 +519,20 @@ been written out, which is a measurement rather than a reason to omit the
 row, and two censuses of one store are then comparable row by row. The
 physical figures likewise count only what has been written out — a commit
 still in the write-ahead log is in none of them.
+
+**The manifest is not the whole store, so the census also lists it.** Those
+per-segment figures cover SSTs and nothing else, which would make a store
+whose weight is its write-ahead log read as nearly empty while costing every
+reader dearly — an unpinned read attach replays that log before it
+materializes anything, and no merge touches a byte of it. So a census also
+totals the object store by kind (log, manifest, SST, everything else),
+summing to the whole, and the gap between `sst_bytes` and `total_bytes` is
+what says whether a merge is even the right lever. This is the one part
+whose cost grows with the store — one paginated listing — and the one part
+that can fail on its own: read-only credentials frequently grant
+`GetObject` without `ListBucket`, so a listing that is refused leaves the
+totals absent rather than failing the census, since the operator holding
+those credentials is exactly the one who needs the rest of it.
 
 That default costs two object reads and is independent of store size. It is
 enough to answer the question a bloated store poses — *is the bulk `index`,

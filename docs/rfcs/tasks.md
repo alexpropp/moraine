@@ -302,15 +302,21 @@ deliberately not itemized here.
   index if SlateDB exposes a range delete. Shared with 0016.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
-- **MEASURE** — Cold attach cost in the gigabyte regime. The shape is
-  measured and recorded (`BENCHMARK.md` -> Cold attach cost vs. the physical
-  bytes a read touches: cost nearly doubles while live entities hold
-  constant, driven by `current` and `snapshot` together), which is the claim
-  the merge rests on. What it cannot reach is the scale the production
-  incident sat at: forcing L0 flushes through the public API means either
-  writing 64 MB per SST or closing the handle, which varies SST count or
-  size but not both. Closing the gap needs a real bloated store or an
-  `l0_sst_size` knob on `CatalogOptions`.
+- **MEASURE** — The absolute number against a real endpoint. Both halves of
+  the model are measured and recorded (`BENCHMARK.md`): attach cost tracks
+  the physical bytes a read touches, and under injected per-GET latency it
+  tracks the GET count, which a merge cuts. Both are linear, so the
+  production regime extrapolates — what is missing is only the endpoint's
+  own latency term, which `object_storage.rs` needs a real bucket to see,
+  exactly as the 0004 commit-latency row does.
+- **DECISION** — Whether `Catalog` is safe to drive from a multi-threaded
+  tokio runtime under repeated open/close. A measurement that opened the
+  catalog 161 times in a loop deadlocked with every thread parked at zero
+  CPU under `#[tokio::test(flavor = "multi_thread")]` and ran in 8 s on a
+  current-thread runtime; four other multi-threaded measurements are
+  unaffected, so this is not a blanket incompatibility and the cause is
+  unknown. moraine is a library, and embedders will use multi-threaded
+  runtimes.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.

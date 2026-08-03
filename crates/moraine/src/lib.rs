@@ -154,9 +154,13 @@
 //! # Ok::<(), moraine::Error>(()) }).unwrap();
 //! ```
 //!
-//! The census costs two object reads and is available read-only; its
-//! physical figures count what has been written out, so a commit still in
-//! the write-ahead log is in none of them. Ask for
+//! The census costs a manifest read plus one listing and is available
+//! read-only; its per-subspace figures count SSTs that have been written
+//! out, so a commit still in the write-ahead log is in none of them. The
+//! listing is what catches the rest: [`StoreCensus::unaccounted_bytes`]
+//! reports what the object store holds outside those SSTs, and a large
+//! figure there means a slow attach no merge will fix — an unpinned reader
+//! replays the log before it materializes anything. Ask for
 //! `CensusRequest::count_live_entries` and it also scans, which costs a
 //! full read of the store and is the only way to learn what fraction of a
 //! subspace is live. [`Catalog::compact_store`] then merges: moraine picks
@@ -239,9 +243,9 @@ pub use catalog::{
     MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest, MappingId, MappingInfo,
     MergeOutcome, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId,
     PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo,
-    SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus, SubspaceCensus,
-    SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry, TagTarget, ViewId,
-    ViewInfo,
+    SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, StoreCensus, StoreObjects,
+    SubspaceCensus, SubspaceMerge, SubspaceName, TableId, TableInfo, TableStats, TagEntry,
+    TagTarget, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 /// Crash-injection seams, for tests that drive a migration to a named

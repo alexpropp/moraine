@@ -2028,8 +2028,38 @@ pub struct MoraineSubspaceCensus {
     pub scheduled_files: u64,
 }
 
+/// Store-wide object totals, as returned by [`moraine_store_census`].
+#[repr(C)]
+pub struct MoraineStoreObjects {
+    /// Whether the store could be listed at all. False leaves every other
+    /// field zero — read-only credentials often grant `GetObject` without
+    /// `ListBucket`.
+    pub listed: bool,
+    /// Every object under the store's prefix.
+    pub total_objects: u64,
+    /// Bytes across all of them.
+    pub total_bytes: u64,
+    /// Write-ahead log objects, replayed by an unpinned read attach.
+    pub wal_objects: u64,
+    /// Bytes across those.
+    pub wal_bytes: u64,
+    /// Manifest versions.
+    pub manifest_objects: u64,
+    /// Bytes across those.
+    pub manifest_bytes: u64,
+    /// Sorted-string tables — the only bytes a merge reclaims.
+    pub sst_objects: u64,
+    /// Bytes across those.
+    pub sst_bytes: u64,
+    /// Everything else the layout carries.
+    pub other_objects: u64,
+    /// Bytes across those.
+    pub other_bytes: u64,
+}
+
 /// Measures the store, one row per subspace, and writes the manifest
-/// version measured to `*out_manifest_id`.
+/// version measured to `*out_manifest_id` and the store-wide object totals
+/// to `*out_objects`.
 ///
 /// `count_live_entries` adds a scan of every subspace, which costs a full
 /// read of the store; without it the call reads the manifest alone.
@@ -2045,6 +2075,7 @@ pub unsafe extern "C" fn moraine_store_census(
     out_items: *mut *mut MoraineSubspaceCensus,
     out_len: *mut usize,
     out_manifest_id: *mut u64,
+    out_objects: *mut MoraineStoreObjects,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -2068,6 +2099,25 @@ pub unsafe extern "C" fn moraine_store_census(
             if !out_manifest_id.is_null() {
                 // SAFETY: caller contract — non-null means writable.
                 unsafe { *out_manifest_id = census.manifest_id };
+            }
+            if !out_objects.is_null() {
+                let objects = census.objects.unwrap_or_default();
+                // SAFETY: caller contract — non-null means writable.
+                unsafe {
+                    *out_objects = MoraineStoreObjects {
+                        listed: census.objects.is_some(),
+                        total_objects: objects.total_objects,
+                        total_bytes: objects.total_bytes,
+                        wal_objects: objects.wal_objects,
+                        wal_bytes: objects.wal_bytes,
+                        manifest_objects: objects.manifest_objects,
+                        manifest_bytes: objects.manifest_bytes,
+                        sst_objects: objects.sst_objects,
+                        sst_bytes: objects.sst_bytes,
+                        other_objects: objects.other_objects,
+                        other_bytes: objects.other_bytes,
+                    };
+                }
             }
 
             // Owned-first: no raw pointers until every string converts.
@@ -3522,6 +3572,19 @@ mod tests {
             let mut items: *mut MoraineSubspaceCensus = ptr::null_mut();
             let mut len = 0usize;
             let mut manifest_id = u64::MAX;
+            let mut objects = MoraineStoreObjects {
+                listed: false,
+                total_objects: 0,
+                total_bytes: 0,
+                wal_objects: 0,
+                wal_bytes: 0,
+                manifest_objects: 0,
+                manifest_bytes: 0,
+                sst_objects: 0,
+                sst_bytes: 0,
+                other_objects: 0,
+                other_bytes: 0,
+            };
             // SAFETY: `handle` is live; every slot is a writable local.
             let code = unsafe {
                 moraine_store_census(
@@ -3530,6 +3593,7 @@ mod tests {
                     &raw mut items,
                     &raw mut len,
                     &raw mut manifest_id,
+                    &raw mut objects,
                     None,
                     ptr::null_mut(),
                     &raw mut err,
@@ -3538,6 +3602,11 @@ mod tests {
             assert_eq!(code, codes::OK, "census failed");
             assert!(len >= KNOWN_SUBSPACES.len(), "only {len} subspaces");
             assert_ne!(manifest_id, u64::MAX, "manifest version not written");
+            // A local store lists fine, and a store that has been written
+            // holds at least a manifest.
+            assert!(objects.listed, "store not listed");
+            assert!(objects.total_objects > 0, "no objects counted");
+            assert!(objects.manifest_objects > 0, "no manifest counted");
 
             // SAFETY: `items`/`len` are what the call just wrote.
             let rows = unsafe { std::slice::from_raw_parts(items, len) };

@@ -66,6 +66,13 @@
 //! NULL rather than zero.
 //!
 //! ```sql
+//! -- Is a merge even the right lever? If store_sst_bytes is far below
+//! -- store_total_bytes the weight is in the write-ahead log, which an
+//! -- unpinned read attach replays and no merge reclaims.
+//! SELECT any_value(store_total_bytes), any_value(store_sst_bytes),
+//!        any_value(store_wal_bytes)
+//! FROM moraine_store_census('lake');
+//!
 //! -- Where is the weight, and how much of it is dead?
 //! SELECT subspace, bytes, sorted_runs FROM moraine_store_census('lake')
 //! ORDER BY bytes DESC;

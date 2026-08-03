@@ -23,6 +23,10 @@ struct CensusBindData : public duckdb::FunctionData {
 	// default reads the manifest alone.
 	bool count_live_entries = false;
 	uint64_t manifest_id = 0;
+	// Store-wide, repeated on every row: the object store holds bytes no
+	// subspace accounts for, and a slow attach that no merge will fix is
+	// exactly the case where they dominate.
+	MoraineStoreObjects objects {};
 
 	struct Row {
 		std::string subspace;
@@ -68,7 +72,8 @@ duckdb::unique_ptr<duckdb::FunctionData> CensusBind(duckdb::ClientContext &conte
 	OwnedArray<MoraineSubspaceCensus> measured(moraine_store_census_free);
 	MoraineError err {};
 	auto code = moraine_store_census(handle, bind_data->count_live_entries, measured.OutItems(), measured.OutLen(),
-	                                 &bind_data->manifest_id, moraine_shim_is_interrupted, &context, &err);
+	                                 &bind_data->manifest_id, &bind_data->objects, moraine_shim_is_interrupted,
+	                                 &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
@@ -81,9 +86,12 @@ duckdb::unique_ptr<duckdb::FunctionData> CensusBind(duckdb::ClientContext &conte
 	using duckdb::LogicalType;
 	return_types = {LogicalType::UBIGINT,  LogicalType::VARCHAR,  LogicalType::UBIGINT, LogicalType::UINTEGER,
 	                LogicalType::UINTEGER, LogicalType::UINTEGER, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::UBIGINT,  LogicalType::UBIGINT,  LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                LogicalType::UBIGINT,  LogicalType::UBIGINT};
-	names = {"manifest_id", "subspace",  "bytes",          "l0_ssts",          "sorted_runs",
-	         "sorted_run_ssts", "live_keys", "live_key_bytes", "live_value_bytes", "scheduled_files"};
+	names = {"manifest_id",   "subspace",         "bytes",           "l0_ssts",
+	         "sorted_runs",   "sorted_run_ssts",  "live_keys",       "live_key_bytes",
+	         "live_value_bytes", "scheduled_files", "store_total_bytes", "store_wal_bytes",
+	         "store_manifest_bytes", "store_sst_bytes"};
 	return std::move(bind_data);
 }
 
@@ -125,6 +133,20 @@ void CensusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 		output.SetValue(7, i, live(row.live_key_bytes));
 		output.SetValue(8, i, live(row.live_value_bytes));
 		output.SetValue(9, i, live(row.scheduled_files));
+
+		// Store-wide totals, repeated per row. NULL when the store could
+		// not be listed — read-only credentials commonly grant GetObject
+		// without ListBucket, and zero would read as "no WAL" rather than
+		// "not measured".
+		auto &objects = bind_data.objects;
+		auto store = [&](uint64_t value) {
+			return objects.listed ? duckdb::Value::UBIGINT(value)
+			                      : duckdb::Value(duckdb::LogicalType::UBIGINT);
+		};
+		output.SetValue(10, i, store(objects.total_bytes));
+		output.SetValue(11, i, store(objects.wal_bytes));
+		output.SetValue(12, i, store(objects.manifest_bytes));
+		output.SetValue(13, i, store(objects.sst_bytes));
 	}
 	state.offset += count;
 	output.SetCardinality(count);

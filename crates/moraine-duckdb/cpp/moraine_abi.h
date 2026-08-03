@@ -226,6 +226,34 @@ typedef struct MoraineSubspaceCensus {
   uint64_t scheduled_files;
 } MoraineSubspaceCensus;
 
+// Store-wide object totals, as returned by [`moraine_store_census`].
+typedef struct MoraineStoreObjects {
+  // Whether the store could be listed at all. False leaves every other
+  // field zero — read-only credentials often grant `GetObject` without
+  // `ListBucket`.
+  bool listed;
+  // Every object under the store's prefix.
+  uint64_t total_objects;
+  // Bytes across all of them.
+  uint64_t total_bytes;
+  // Write-ahead log objects, replayed by an unpinned read attach.
+  uint64_t wal_objects;
+  // Bytes across those.
+  uint64_t wal_bytes;
+  // Manifest versions.
+  uint64_t manifest_objects;
+  // Bytes across those.
+  uint64_t manifest_bytes;
+  // Sorted-string tables — the only bytes a merge reclaims.
+  uint64_t sst_objects;
+  // Bytes across those.
+  uint64_t sst_bytes;
+  // Everything else the layout carries.
+  uint64_t other_objects;
+  // Bytes across those.
+  uint64_t other_bytes;
+} MoraineStoreObjects;
+
 // One subspace's merge, as returned by [`moraine_compact_store`].
 typedef struct MoraineSubspaceMerge {
   // The subspace merged, owned — free via [`moraine_compact_store_free`].
@@ -1292,7 +1320,8 @@ int32_t moraine_maintain(struct MoraineCatalogHandle *handle,
                          struct MoraineError *err);
 
 // Measures the store, one row per subspace, and writes the manifest
-// version measured to `*out_manifest_id`.
+// version measured to `*out_manifest_id` and the store-wide object totals
+// to `*out_objects`.
 //
 // `count_live_entries` adds a scan of every subspace, which costs a full
 // read of the store; without it the call reads the manifest alone.
@@ -1306,6 +1335,7 @@ int32_t moraine_store_census(struct MoraineCatalogHandle *handle,
                              struct MoraineSubspaceCensus **out_items,
                              size_t *out_len,
                              uint64_t *out_manifest_id,
+                             struct MoraineStoreObjects *out_objects,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
                              struct MoraineError *err);

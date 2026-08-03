@@ -7,11 +7,13 @@
 
 use std::sync::Arc;
 
-use object_store::ObjectStore;
+use futures::StreamExt;
+use object_store::{ObjectStore, path::Path};
 use slatedb::{
     admin::AdminBuilder,
     manifest::{Segment, SortedRun, SsTableView, VersionedManifest},
 };
+use tracing::warn;
 
 use crate::{
     error::{Error, Result},
@@ -39,11 +41,39 @@ impl SegmentSize {
     }
 }
 
+/// What the object store holds, by the kind of object holding it.
+///
+/// The manifest accounts for SST bytes only, so a store whose weight is in
+/// its write-ahead log reads as nearly empty by segment while costing every
+/// reader dearly — a reader replays the log at open. Counting the objects
+/// is the only way to tell those apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ObjectTotals {
+    pub(crate) total_objects: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) wal_objects: u64,
+    pub(crate) wal_bytes: u64,
+    pub(crate) manifest_objects: u64,
+    pub(crate) manifest_bytes: u64,
+    pub(crate) sst_objects: u64,
+    pub(crate) sst_bytes: u64,
+    /// Everything else the store's layout carries — the compactions file
+    /// and any object a newer layout adds. Counted rather than dropped, so
+    /// the parts always sum to the total.
+    pub(crate) other_objects: u64,
+    pub(crate) other_bytes: u64,
+}
+
 /// Every segment's physical size, at one manifest version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestCensus {
     pub(crate) manifest_id: u64,
     pub(crate) segments: Vec<SegmentSize>,
+    /// `None` when the store could not be listed — read-only credentials
+    /// often grant `GetObject` without `ListBucket`, and a census that
+    /// failed wholesale for that would be useless to the operator most
+    /// likely to be holding them.
+    pub(crate) objects: Option<ObjectTotals>,
 }
 
 impl ManifestCensus {
@@ -74,13 +104,74 @@ pub(crate) async fn read_manifest_census(
     path: &str,
     object_store: Arc<dyn ObjectStore>,
 ) -> Result<ManifestCensus> {
-    let view = AdminBuilder::new(path, object_store)
+    let view = AdminBuilder::new(path, Arc::clone(&object_store))
         .build()
         .read_compactor_state_view()
         .await
         .map_err(Error::from)?;
 
-    Ok(census_of_manifest(view.manifest()))
+    let mut census = census_of_manifest(view.manifest());
+    census.objects = match count_objects(path, object_store).await {
+        Ok(totals) => Some(totals),
+        Err(err) => {
+            warn!(path, error = %err, "store listing failed; census reports segments only");
+            None
+        }
+    };
+
+    Ok(census)
+}
+
+/// Totals every object under the store's prefix, by kind.
+///
+/// One listing, paginated by the object store — the only part of a census
+/// whose cost grows with the store, and the only part that sees bytes the
+/// manifest does not account for.
+async fn count_objects(
+    path: &str,
+    object_store: Arc<dyn ObjectStore>,
+) -> std::result::Result<ObjectTotals, object_store::Error> {
+    let prefix = Path::from(path);
+    let mut listing = object_store.list(Some(&prefix));
+    let mut totals = ObjectTotals::default();
+
+    while let Some(object) = listing.next().await {
+        let object = object?;
+        let size = object.size;
+        totals.total_objects += 1;
+        totals.total_bytes = totals.total_bytes.saturating_add(size);
+
+        // SlateDB lays a store out as `<path>/{wal,compacted,manifest}/…`,
+        // plus the compactions file beside them.
+        match kind_of(&object.location, &prefix).as_deref() {
+            Some("wal") => {
+                totals.wal_objects += 1;
+                totals.wal_bytes = totals.wal_bytes.saturating_add(size);
+            }
+            Some("manifest") => {
+                totals.manifest_objects += 1;
+                totals.manifest_bytes = totals.manifest_bytes.saturating_add(size);
+            }
+            Some("compacted") => {
+                totals.sst_objects += 1;
+                totals.sst_bytes = totals.sst_bytes.saturating_add(size);
+            }
+            // The compactions file, and whatever a layout this build
+            // predates adds beside it.
+            _ => {
+                totals.other_objects += 1;
+                totals.other_bytes = totals.other_bytes.saturating_add(size);
+            }
+        }
+    }
+
+    Ok(totals)
+}
+
+/// The directory directly under the store prefix that `location` sits in.
+fn kind_of(location: &Path, prefix: &Path) -> Option<String> {
+    let mut remainder = location.prefix_match(prefix)?;
+    remainder.next().map(|part| part.as_ref().to_string())
 }
 
 /// The per-segment sizes a manifest records, root tree included.
@@ -110,6 +201,7 @@ fn census_of_manifest(manifest: &VersionedManifest) -> ManifestCensus {
     ManifestCensus {
         manifest_id: manifest.id(),
         segments,
+        objects: None,
     }
 }
 
@@ -260,6 +352,47 @@ mod tests {
             .await
             .unwrap();
         assert!(census.segments.is_empty(), "{census:?}");
+    }
+
+    /// The listing leg counts every object under the prefix, including the
+    /// write-ahead log and the manifest — bytes the per-segment figures do
+    /// not account for and no merge reclaims.
+    #[tokio::test]
+    async fn the_listing_counts_objects_the_manifest_does_not() {
+        let store = memory_store();
+        let db = StoreBuilder::new("census/objects", Arc::clone(&store))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.put(
+            Key::current(EntityKey::Schema { schema_id: 1 }).encode(),
+            b"schema".as_slice(),
+        );
+        db.write(batch).await.unwrap();
+        db.flush().await.unwrap();
+
+        let census = read_manifest_census("census/objects", store).await.unwrap();
+        let objects = census.objects.expect("an in-memory store lists");
+
+        // Every store carries a manifest, and this one's write is still in
+        // the log — so the manifest accounts for no SST bytes at all while
+        // the object store plainly holds some.
+        assert!(objects.manifest_objects > 0, "{objects:?}");
+        assert!(objects.total_bytes > 0, "{objects:?}");
+        assert_eq!(
+            objects.total_objects,
+            objects.wal_objects
+                + objects.manifest_objects
+                + objects.sst_objects
+                + objects.other_objects,
+            "an object was counted in the total but attributed nowhere: {objects:?}"
+        );
+        assert!(
+            objects.total_bytes > objects.sst_bytes,
+            "the log and manifest weigh nothing: {objects:?}"
+        );
     }
 
     /// The live leg counts what a scan finds, and splits `current` into
