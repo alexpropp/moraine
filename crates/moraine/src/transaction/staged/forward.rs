@@ -149,6 +149,8 @@ enum Session {
 /// failure before the commit is sent is `Unreachable`; a drop after it is
 /// `Ambiguous`; a leader-answered error is `Surface` or `LogUnavailable`.
 async fn run_session(forward: &Forward, ops: &[RowOperation], transaction_id: [u8; 16]) -> Session {
+    // An `IP:port` endpoint only; a hostname advert parses as unreachable and is
+    // aged. The operator surface may want hostname support later.
     let Ok(address) = forward.endpoint.parse::<SocketAddr>() else {
         warn!(
             endpoint = forward.endpoint,

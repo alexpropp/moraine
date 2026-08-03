@@ -9,16 +9,22 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use moraine_remote::Request;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::Notify,
+    task::JoinHandle,
+};
 
 use super::{Leader, LeaderConfig};
 use crate::{
@@ -167,6 +173,107 @@ async fn spawn_reachable_leader(catalog: Arc<Catalog>) -> RunningLeader {
 
 fn shared_bucket() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
+}
+
+/// When a fault proxy severs a forwarded session, relative to the leader's slot
+/// PUT — the two shapes of an ambiguous forwarded commit.
+#[derive(Clone, Copy)]
+enum DropWhen {
+    /// Forward the `Commit`, wait for the leader's `Committed` (the slot is
+    /// durable), then drop the ack: the slot **landed** but the client did not
+    /// hear so.
+    AfterLeaderLands,
+    /// Drop on the client's `Commit` before it reaches the leader: the slot
+    /// **never landed**, but the client cannot tell.
+    BeforeLeaderLands,
+}
+
+/// A framed-message proxy between a forwarding client and a real leader that
+/// severs the session at `drop_when`, manufacturing an ambiguous outcome the
+/// client must resolve by identity. The forwarded session is a strict
+/// request/response alternation, so the proxy needs no duplex machinery.
+fn spawn_fault_proxy(proxy: TcpListener, leader_addr: String, drop_when: DropWhen) {
+    tokio::spawn(async move {
+        while let Ok((client, _)) = proxy.accept().await {
+            let leader_addr = leader_addr.clone();
+            tokio::spawn(async move {
+                let _ = proxy_session(client, &leader_addr, drop_when).await;
+            });
+        }
+    });
+}
+
+async fn proxy_session(
+    mut client: TcpStream,
+    leader_addr: &str,
+    drop_when: DropWhen,
+) -> std::io::Result<()> {
+    let mut leader = TcpStream::connect(leader_addr).await?;
+    loop {
+        let request = read_frame(&mut client).await?;
+        let is_commit = matches!(Request::decode(&request), Ok(Request::Commit { .. }));
+
+        if is_commit && matches!(drop_when, DropWhen::BeforeLeaderLands) {
+            // The leader never sees the commit: its session rolls back, nothing
+            // lands.
+            return Ok(());
+        }
+
+        write_frame(&mut leader, &request).await?;
+        let response = read_frame(&mut leader).await?;
+
+        // Only a real landing manufactures the ambiguous-landed shape. A
+        // forwarded commit can lose its slot to a concurrent direct committer
+        // (the leader answers a conflict, nothing landed); that is relayed so the
+        // client re-drives, and the proxy waits for the attempt that actually
+        // commits before dropping its ack.
+        if is_commit {
+            let landed = matches!(
+                moraine_remote::Response::decode(&response),
+                Ok(moraine_remote::Response::Committed { .. })
+            );
+            if landed {
+                return Ok(());
+            }
+        }
+        write_frame(&mut client, &response).await?;
+    }
+}
+
+async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut length = [0u8; 4];
+    reader.read_exact(&mut length).await?;
+    let mut framed = vec![0u8; u32::from_be_bytes(length) as usize];
+    reader.read_exact(&mut framed).await?;
+    Ok(framed)
+}
+
+async fn write_frame<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    framed: &[u8],
+) -> std::io::Result<()> {
+    writer
+        .write_all(
+            &u32::try_from(framed.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        )
+        .await?;
+    writer.write_all(framed).await?;
+    writer.flush().await
+}
+
+/// Commit-bearing slots across the whole tail, read through a fresh attach —
+/// the exactly-once counter (an advert or withdrawal slot carries no commits).
+async fn commit_bearing_slots(inner: &Arc<dyn ObjectStore>) -> usize {
+    let reader = Catalog::open_read_only(Arc::clone(inner), open_options(Duration::ZERO))
+        .await
+        .unwrap();
+    let tail = reader.slot_store().slots.read_tail(1).await.unwrap();
+    tail.slots
+        .iter()
+        .filter(|(_, envelope)| !envelope.commits.is_empty())
+        .count()
 }
 
 fn open_options(window: Duration) -> CatalogOptions {
@@ -391,23 +498,21 @@ async fn an_unreachable_leader_times_out_once_then_commits_direct() {
     let before = client_store.slot_puts();
 
     // The first armed re-drive pays one connect timeout, then commits directly.
-    let first = Instant::now();
     drive_staged(&client, gc_insert(2)).await.unwrap();
-    let first_elapsed = first.elapsed();
     assert!(
         client_store.slot_puts() > before,
         "the retreat committed on the client's own store"
     );
 
-    // The endpoint is aged: a second commit does not pay the timeout again.
-    let second = Instant::now();
-    drive_staged(&client, gc_insert(3)).await.unwrap();
-    let second_elapsed = second.elapsed();
+    // The hint is aged after that one failed probe — a non-timing invariant for
+    // "stops trying": the client will not connect this endpoint again.
     assert!(
-        second_elapsed * 4 < first_elapsed,
-        "the aged hint skips the timeout: first {first_elapsed:?}, second {second_elapsed:?}"
+        client.slot_store().forwarding.is_aged("192.0.2.1:9"),
+        "the unreachable endpoint is aged after one probe"
     );
 
+    // A second commit lands direct with no further probe.
+    drive_staged(&client, gc_insert(3)).await.unwrap();
     assert_eq!(scheduled_ids(&inner).await, vec![1, 2, 3]);
 
     leader.stop().await;
@@ -579,6 +684,114 @@ async fn a_mixed_fleet_holds_one_winner_and_exactly_once() {
     let ids = all_transaction_ids(&leader_catalog).await;
     let unique: std::collections::HashSet<[u8; 16]> = ids.iter().copied().collect();
     assert_eq!(unique.len(), ids.len(), "every committed id is distinct");
+
+    leader.stop().await;
+}
+
+/// Sets up a leader reachable only through a fault proxy that severs the
+/// session at `drop_when`, so a forwarded commit's outcome is ambiguous.
+/// Returns the live leader and a client armed for forwarding.
+async fn ambiguous_setup(
+    leader_store: &Arc<CountingStore>,
+    client_store: &Arc<CountingStore>,
+    drop_when: DropWhen,
+) -> (RunningLeader, Catalog) {
+    let leader_catalog = Arc::new(open_over(leader_store).await);
+    let leader_bind = free_addr();
+    // The proxy binds its own port and the leader advertises it, so the client
+    // discovers the proxy through the log and every forwarded byte flows through
+    // the fault.
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap().to_string();
+    let leader = RunningLeader::spawn(
+        Arc::clone(&leader_catalog),
+        LeaderConfig {
+            bind_address: leader_bind.clone(),
+            advertise_address: proxy_addr,
+            max_sessions: 16,
+        },
+    )
+    .await;
+    spawn_fault_proxy(proxy, leader_bind, drop_when);
+
+    let client = open_over(client_store).await;
+    arm(&client, 1, 2).await;
+    (leader, client)
+}
+
+/// The highest-stakes path: a forwarded commit whose slot **lands** but whose
+/// ack is lost. The client must resolve by identity to `Committed` and must not
+/// retreat — a retreat would double-apply. Asserts the resolution and that the
+/// transaction applied **exactly once**.
+///
+/// Revert check: making `resolve_ambiguous` retreat instead of resolving turns
+/// this into an unbounded land-then-retreat-then-re-forward loop that exhausts
+/// the re-drive budget — `drive_staged` then returns `Err` and the `unwrap`
+/// below panics, and the slot count blows past one. Confirmed failing on that
+/// change; restored.
+#[tokio::test]
+async fn an_ambiguous_landed_commit_resolves_committed_exactly_once() {
+    let inner = shared_bucket();
+    let leader_store = CountingStore::wrap(&inner);
+    let client_store = CountingStore::wrap(&inner);
+    let (leader, client) =
+        ambiguous_setup(&leader_store, &client_store, DropWhen::AfterLeaderLands).await;
+
+    let slots_before = commit_bearing_slots(&inner).await;
+    let client_puts_before = client_store.slot_puts();
+
+    // The forwarded commit lands on the leader; the proxy drops the ack; the
+    // client resolves the ambiguous outcome by id to Committed.
+    let committed = drive_staged(&client, gc_insert(99)).await.unwrap();
+    assert!(committed.get() >= 1, "resolved to a committed snapshot");
+
+    // Exactly once: the ambiguous commit landed a single slot — no retreat, no
+    // double-apply.
+    assert_eq!(
+        commit_bearing_slots(&inner).await,
+        slots_before + 1,
+        "the ambiguous-landed commit applied exactly once"
+    );
+    assert_eq!(scheduled_ids(&inner).await, vec![1, 99]);
+    // The client raced no slot of its own across the forward: the only landing
+    // was the forwarded one it resolved to, not a direct retreat.
+    assert_eq!(
+        client_store.slot_puts(),
+        client_puts_before,
+        "the client did not retreat to a direct commit"
+    );
+
+    leader.stop().await;
+}
+
+/// The reverse: a forwarded commit whose slot **never landed** (the session
+/// severed before the leader saw it). The client resolves to absent and
+/// retreats to a fresh direct commit that lands it once — no lost write, no
+/// double-apply.
+#[tokio::test]
+async fn an_ambiguous_unlanded_commit_retreats_direct_exactly_once() {
+    let inner = shared_bucket();
+    let leader_store = CountingStore::wrap(&inner);
+    let client_store = CountingStore::wrap(&inner);
+    let (leader, client) =
+        ambiguous_setup(&leader_store, &client_store, DropWhen::BeforeLeaderLands).await;
+
+    let before = commit_bearing_slots(&inner).await;
+
+    // The forward never reached the leader; the client resolves to absent and
+    // retreats to a direct race that lands the work.
+    drive_staged(&client, gc_insert(99)).await.unwrap();
+
+    assert_eq!(
+        commit_bearing_slots(&inner).await,
+        before + 1,
+        "the retreat landed the work exactly once"
+    );
+    assert_eq!(scheduled_ids(&inner).await, vec![1, 99]);
+    assert!(
+        client_store.slot_puts() > 0,
+        "the retreat committed directly on the client's own store"
+    );
 
     leader.stop().await;
 }
