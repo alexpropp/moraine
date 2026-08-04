@@ -242,14 +242,29 @@ the view a view.
 
 **The scan and the write path must overlay identically.** A rowid a
 metadata scan emits is the row's index into whatever list that scan
-materialized, and the staged-write sink resolves the index back by
-re-materializing the same list. Making a kind tx-aware for the scan alone
-is therefore not a partial improvement but a corruption: an
-`UPDATE`/`DELETE ... WHERE ctid`-shaped statement would resolve an index
-into the overlaid list against the committed one, and name a different row
-or none. The sink materializes on the first row it resolves — before that
-statement has staged anything of its own — which is what keeps its list
-equal to the one the scan handed out.
+materialized, and the staged-write sink resolves the index back against a
+list of its own. Making a kind tx-aware for the scan alone is therefore
+not a partial improvement but a corruption: an `UPDATE`/`DELETE ... WHERE
+ctid`-shaped statement would resolve an index into the overlaid list
+against the committed one, and name a different row or none.
+
+Identical *content* is not enough, because two materializations taken at
+two committed heads can differ in content — which is why the two are one
+materialization rather than two that agree. **A table is materialized once
+per DuckDB transaction and shared** (RFC 0009's read-side companion to
+this): the scan takes the list, the sink takes the same list, and the
+index cannot mean two things. The sink pins it *before* opening the staged
+transaction, because opening one is what moves the transaction from
+reading the pinned committed dump to reading through the staged
+transaction's own read point — and the scan that emitted the rowids bound
+in whichever of those held.
+
+That sharing is confined to the reader side. Once a transaction has opened
+a staged transaction, every read of a writable kind goes to the staged
+dump and nothing caches over it: DuckLake's commit loop re-reads exactly
+that surface between attempts, and a retry served the state its first
+attempt saw would re-check its conflict matrix against a premise that
+already lost.
 
 ### Reader safety
 

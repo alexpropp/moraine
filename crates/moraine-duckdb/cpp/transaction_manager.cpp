@@ -41,6 +41,7 @@ MoraineTxHandle *MoraineTransaction::StagedTx() {
 			ThrowMoraineError(err);
 		}
 		staged_tx_ = tx;
+		metadata_rows_.clear();
 	}
 	return staged_tx_;
 }
@@ -49,6 +50,18 @@ MoraineTxHandle *MoraineTransaction::TakeStagedTx() {
 	auto *result = staged_tx_;
 	staged_tx_ = nullptr;
 	return result;
+}
+
+std::shared_ptr<const MetadataRows> MoraineTransaction::GetMetadataRows(const MetadataTableSpec &spec) const {
+	auto it = metadata_rows_.find(&spec);
+	if (it == metadata_rows_.end()) {
+		return nullptr;
+	}
+	return it->second;
+}
+
+void MoraineTransaction::PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows) {
+	metadata_rows_[&spec] = std::move(rows);
 }
 
 duckdb::optional_ptr<duckdb::SchemaCatalogEntry> MoraineTransaction::GetCachedSchema(uint64_t schema_id) const {
