@@ -722,14 +722,21 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
 	// the ABI means "not given", so an explicit zero (flush continuously, no
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
-	// `CACHE_DIR` is a local directory for SlateDB's on-disk block cache; it
-	// must outlive the moraine_attach call, so it lives in this scope.
+	// `CACHE_DIR` is a local directory for SlateDB's on-disk object cache,
+	// which holds fetched object parts; it must outlive the moraine_attach
+	// call, so it lives in this scope. `CACHE_SIZE` bounds that cache in
+	// bytes, per attach rather than per directory; 0 on the ABI means "not
+	// given" and leaves the store's cap. `CACHE_PUTS` additionally fills
+	// that cache from the write path, so a flushed object is local without a
+	// later fetch. None of them touches the in-memory caches.
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
+	uint64_t cache_size_bytes = 0;
+	bool cache_puts = false;
 	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
 	// it is the DATA_PATH the index scoped read and maintenance resolve data
@@ -760,6 +767,10 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
+		} else if (name == "cache_size") {
+			cache_size_bytes = option.second.GetValue<uint64_t>();
+		} else if (name == "cache_puts") {
+			cache_puts = option.second.GetValue<bool>();
 		} else if (name == "checkpoint") {
 			checkpoint = option.second.GetValue<std::string>();
 		}
@@ -775,7 +786,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
+	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);

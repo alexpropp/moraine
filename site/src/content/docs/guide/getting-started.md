@@ -88,10 +88,36 @@ incumbent's committer. Every process past the first should attach
 
 ## Faster repeat queries on S3
 
-Point SlateDB's disk cache at a local directory so warm catalog blocks
-survive restarts and repeat queries skip the GETs:
+Point SlateDB's on-disk object cache at a local directory so fetched object
+parts survive restarts and repeat queries skip the GETs:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (READ_WRITE, META_CACHE_DIR '/var/cache/moraine');
 ```
+
+That cache is capped at 16 GiB per attached store, and the cap is per store
+rather than per directory — four stores sharing a directory can fill four
+times as much. Set it yourself with `META_CACHE_SIZE`, a byte count:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_SIZE 2147483648);
+```
+
+By default that cache fills only as queries read, so an object the writer just
+wrote is fetched back from S3 the first time it is read. `META_CACHE_PUTS true`
+caches it at write time instead, and since store objects are immutable, the
+read-only sessions sharing that directory on the same host get it too:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_PUTS true);
+```
+
+It is off by default because compaction output is cached the same way, and a
+large merge can evict what queries had warmed.
+
+All of this is the disk tier only. SlateDB also keeps an in-memory block cache
+and metadata cache per attached store; moraine leaves both at SlateDB's own
+sizes and neither is settable on the attach.

@@ -959,6 +959,17 @@ extern "C" {
 // already-initialized store, whose stored flag
 // ([`moraine_catalog_encrypted`]) is authoritative.
 //
+// `cache_size_bytes` bounds the on-disk object cache `cache_dir` names.
+// The cap is per attach, so several attaches sharing one directory each
+// spend up to it; `0` leaves the store's own cap in force, and without a
+// `cache_dir` there is no object cache to bound. The store's in-memory
+// caches are separate and take no configuration here.
+//
+// `cache_puts` fills that cache from the write path as well as the read
+// path, so a flushed or compacted object is local without a later fetch.
+// Compaction output is cached too, so a merge can evict what reads had
+// warmed; `false` leaves the cache filled by reads alone.
+//
 // `checkpoint` pins a **read-only** attach to an existing SlateDB
 // checkpoint (see [`moraine_create_checkpoint`]), so the open writes
 // nothing at all — no manifest record of the reader, no refresh, no
@@ -1002,7 +1013,8 @@ extern "C" {
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-// `host_threads` is unconstrained.
+// `cache_size_bytes`, `cache_puts`, and `host_threads` are
+// unconstrained.
 // `probe`, if non-null, must be safe to call with `probe_ctx` from any
 // thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -1013,6 +1025,8 @@ int32_t moraine_attach(const char *path,
                        bool encrypted,
                        uint64_t flush_interval_ms,
                        const char *cache_dir,
+                       uint64_t cache_size_bytes,
+                       bool cache_puts,
                        const char *data_path,
                        const char *checkpoint,
                        uint64_t host_threads,
@@ -1064,13 +1078,17 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
 // point to a valid [`MoraineS3Config`] whose non-null fields are valid
 // NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
-// NUL-terminated C string. `out` must be a valid, writable
-// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
-// writable [`MoraineError`]. All for the duration of this call.
+// NUL-terminated C string. `cache_size_bytes` and `cache_puts` are
+// unconstrained. `out`
+// must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
+// must be a valid, writable [`MoraineError`]. All for the duration of this
+// call.
 int32_t moraine_migrate(const char *path,
                         const struct MoraineS3Config *s3,
                         uint64_t flush_interval_ms,
                         const char *cache_dir,
+                        uint64_t cache_size_bytes,
+                        bool cache_puts,
                         bool checkpoint,
                         struct MoraineMigrationReport *out,
                         struct MoraineError *err);

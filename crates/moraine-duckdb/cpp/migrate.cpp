@@ -94,7 +94,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MigrateInitGlobal(duckdb::C
 
 	MoraineMigrationReport report {};
 	MoraineError err {};
-	auto code = moraine_migrate(bind_data.path.c_str(), is_s3 ? &s3 : nullptr, 0, nullptr, bind_data.checkpoint,
+	auto code = moraine_migrate(bind_data.path.c_str(), is_s3 ? &s3 : nullptr, 0, nullptr, 0, false, bind_data.checkpoint,
 	                            &report, &err);
 	// Drained on both exits: a failed migration's events would otherwise sit
 	// buffered behind a commit that never comes.

@@ -249,12 +249,31 @@ pub struct CatalogOptions {
     /// so a durable commit waits only on the object-store PUT — the lowest
     /// latency, at the cost of a busy flush loop. Defaults to 100ms.
     pub flush_interval: Duration,
-    /// Local directory backing SlateDB's on-disk block cache. When set,
-    /// reads are served from a disk-backed cache that survives process
-    /// restarts, so warm queries skip repeat object-store GETs — worthwhile
-    /// for remote (`s3://`) stores, redundant for local ones. `None` (the
-    /// default) uses only SlateDB's in-memory cache.
+    /// Local directory backing SlateDB's on-disk object cache, which holds
+    /// fetched object parts. When set, reads are served from a disk-backed
+    /// cache that survives process restarts, so warm queries skip repeat
+    /// object-store GETs — worthwhile for remote (`s3://`) stores,
+    /// redundant for local ones. `None` (the default) leaves only the
+    /// in-memory caches: a block cache and a metadata cache, both at
+    /// SlateDB's own sizes and not configurable here.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// How many bytes of disk the on-disk object cache may hold. The cap is
+    /// per open catalog, not per directory, so catalogs sharing a
+    /// [`cache_dir`](Self::cache_dir) each spend up to it — size the volume
+    /// for the number of catalogs a process attaches. `None` (the default)
+    /// leaves SlateDB's own cap of 16 GiB in force, and without a
+    /// `cache_dir` there is no object cache to bound. The in-memory caches
+    /// are a separate mechanism and are unaffected.
+    pub cache_size: Option<u64>,
+    /// Whether objects this catalog writes are cached as they are written,
+    /// rather than only when something reads them back. A flushed or
+    /// compacted store object then costs one local write and no later
+    /// fetch, and — since store objects are immutable and land atomically
+    /// — a reader sharing the [`cache_dir`](Self::cache_dir) reads what
+    /// the writer cached. Compaction output is cached too, so a merge can
+    /// evict what reads had warmed; `false` (the default) leaves the cache
+    /// filled by reads alone. Inert without a `cache_dir`.
+    pub cache_puts: bool,
     /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
     /// recorded as the stored global `data_path` option when a fresh store
     /// bootstraps, so a later open can read it back
@@ -291,6 +310,8 @@ impl Default for CatalogOptions {
             encrypted: false,
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
+            cache_size: None,
+            cache_puts: false,
             data_path: None,
             reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
@@ -379,7 +400,9 @@ impl Catalog {
         let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone());
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_puts(options.cache_puts);
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
             .await?;
         info!(
@@ -455,8 +478,11 @@ impl Catalog {
         let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_puts(options.cache_puts)
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
+
         let reader = commit::open_reader_initialized(store).await?;
         info!(
             path = options.path,
@@ -527,6 +553,8 @@ impl Catalog {
         let db = StoreBuilder::new(&options.path, object_store.clone())
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_puts(options.cache_puts)
             .open_writer()
             .await?;
 

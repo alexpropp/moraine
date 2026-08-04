@@ -263,6 +263,50 @@ fn ducklake_attach_flush_interval_option_is_applied() {
     );
 }
 
+/// The cache options end to end: `ATTACH (META_CACHE_DIR '…',
+/// META_CACHE_SIZE 67108864, META_CACHE_PUTS true)` → DuckLake's `META_`
+/// passthrough → this shim's inner attach → the store's on-disk object
+/// cache, its cap, and its write-path filling. A cap shows only as disk
+/// that stays bounded, so the assertion is that the three are accepted,
+/// commits land through the capped cache, and the cache directory fills.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_attach_cache_options_are_applied() {
+    let dir = TempDir::new("cache-size-store");
+    let data_dir = TempDir::new("cache-size-data");
+    let cache_dir = TempDir::new("cache-size-cache");
+
+    let attach_options = format!(
+        ", META_CACHE_DIR '{}', META_CACHE_SIZE 67108864, META_CACHE_PUTS true",
+        cache_dir.path().display()
+    );
+    run_ducklake_sql_with_options(
+        dir.path(),
+        data_dir.path(),
+        &attach_options,
+        "CREATE TABLE lake.main.t(id BIGINT); \
+         INSERT INTO lake.main.t VALUES (1), (2);",
+    );
+
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            dir.path(),
+            data_dir.path(),
+            &attach_options,
+            "SELECT count(*) FROM lake.main.t;",
+        )),
+        vec![vec!["2".to_string()]]
+    );
+
+    let populated =
+        std::fs::read_dir(cache_dir.path()).is_ok_and(|mut entries| entries.next().is_some());
+    assert!(
+        populated,
+        "expected a bounded object cache under {:?}",
+        cache_dir.path()
+    );
+}
+
 /// `ENCRYPTED` end to end. The flag travels `ATTACH (ENCRYPTED,
 /// META_ENCRYPTED true)` → DuckLake's `META_` passthrough → this
 /// shim's inner attach → the store's creation-time flag, which the
