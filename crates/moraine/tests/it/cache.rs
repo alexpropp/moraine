@@ -404,3 +404,46 @@ async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
 
     writer.close().await.unwrap();
 }
+
+/// A cache size bounds the on-disk object cache without disabling it: the
+/// catalog is served through a capped cache on the writer's side and the
+/// reader's alike, and the cache directory fills.
+#[tokio::test]
+async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let cache = std::env::temp_dir().join(format!(
+        "moraine-bounded-cache-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&cache);
+
+    let mut options = CatalogOptions::default();
+    options.cache_dir = Some(cache.clone());
+    options.cache_size = Some(64 * 1024 * 1024);
+
+    let writer = Catalog::open(Arc::clone(&object_store), options.clone())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            tx.create_table(schema, "t", &[col("a")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let reader = Catalog::open_read_only(object_store, options)
+        .await
+        .unwrap();
+    let view = reader.snapshot().await.unwrap();
+    let schema = view.schema_by_name("main").expect("bootstrap").id;
+    assert!(view.table_by_name(schema, "t").is_some());
+    reader.close().await.unwrap();
+
+    let populated = std::fs::read_dir(&cache).is_ok_and(|mut entries| entries.next().is_some());
+    assert!(populated, "expected an object cache under {cache:?}");
+    let _ = std::fs::remove_dir_all(&cache);
+}

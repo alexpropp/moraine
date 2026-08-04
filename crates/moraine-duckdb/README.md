@@ -106,19 +106,69 @@ Local and `memory://` stores default to read-write and need no flag. A
 read-only attach of an uninitialized store fails with an error that names this
 fix.
 
-**`CACHE_DIR` — on-disk block cache for S3 catalogs.** Each query reads the
+**`CACHE_DIR` — on-disk object cache for S3 catalogs.** Each query reads the
 catalog metadata from the store; on S3 that is network latency every time, and
-the default in-memory cache is lost on each new process. Point SlateDB's disk
-cache at a local directory so warm blocks survive restarts and repeat queries
-skip the GETs — `META_CACHE_DIR` through the DuckLake attach (or `CACHE_DIR`
-directly on a standalone `moraine:` attach):
+the in-memory caches start empty in each new process. Point SlateDB's disk
+cache of fetched object parts at a local directory so warm reads survive
+restarts and repeat queries skip the GETs — `META_CACHE_DIR` through the
+DuckLake attach (or `CACHE_DIR` directly on a standalone `moraine:` attach):
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE, META_CACHE_DIR '/var/cache/moraine');
 ```
 
-Unset, only the in-memory cache applies; redundant for local/`memory://` stores.
+Unset, only the in-memory caches apply; redundant for local/`memory://` stores.
+Those are a separate tier — a block cache and a metadata cache, in memory, per
+attached store — and moraine leaves both at SlateDB's sizes.
+
+**`CACHE_SIZE` — how much disk that object cache may take.** Set the cap
+explicitly — a byte count — and size the volume for the number of stores
+attached, since the cap is per store rather than per directory:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
+   META_CACHE_DIR '/var/cache/moraine', META_CACHE_SIZE 2147483648);
+```
+
+Unset, SlateDB's 16 GiB cap stands; without a `META_CACHE_DIR` there is no
+object cache to bound.
+
+**`CACHE_PUTS` — fill the cache as you write, not just as you read.** By
+default the cache is filled by reads alone, so an object the store just wrote
+is fetched back from S3 the first time it is read. `META_CACHE_PUTS true`
+caches it at write time instead — one local write, no fetch — and because store
+objects are immutable and land atomically, read-only sessions sharing the same
+`META_CACHE_DIR` on that host read what the writer cached:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
+   META_CACHE_DIR '/var/cache/moraine', META_CACHE_PUTS true);
+```
+
+Opt-in, because compaction output is cached the same way and a large merge can
+evict what reads had warmed.
+
+**`CACHE_PRELOAD` — warm the cache during ATTACH, not during the first query.**
+Both of the above still leave a fresh process cold. `META_CACHE_PRELOAD 'all'`
+loads every object the manifest references before the attach returns, `'l0'`
+only the objects no merge has folded down yet, `'none'` (the default) nothing:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
+   META_CACHE_DIR '/var/cache/moraine', META_CACHE_PRELOAD 'all');
+```
+
+The wait is the attach's: the load runs inside the open and skips anything it
+cannot fetch. It is bounded by `META_CACHE_SIZE`, and it **stops** at the first
+object that would exceed the cap rather than skipping that one and continuing —
+so a cap smaller than the store leaves the tail of it unloaded. moraine logs a
+warning at attach when that is the case. `'all'` pays a slower ATTACH for a
+first query that touches S3 not at all, and is worth it when the whole store
+fits the cache — check with `moraine_store_census`.
 
 ## How it is built
 
