@@ -18,8 +18,8 @@ use crate::{
 /// this.
 pub(crate) const TAG_PREFIX_LEN: usize = 1;
 
-/// A fully addressed store key. The seven variants are the seven
-/// subspaces; each is also a SlateDB segment (the store is created with a
+/// A fully addressed store key. Each variant is a subspace, and each
+/// subspace is also a SlateDB segment (the store is created with a
 /// one-byte segment extractor over the leading discriminant).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum Key {
@@ -51,6 +51,18 @@ pub(crate) enum Key {
         table_id: u64,
         /// The snapshot the change landed in.
         begin_snapshot: u64,
+    },
+    /// The `current` keys one commit's batch wrote — the changelog a reader
+    /// replays to advance a held view across that commit. Its own subspace
+    /// rather than a field of the snapshot record: snapshot records are
+    /// scanned in full on a read path DuckLake takes every transaction, and
+    /// the changelog is several times their size. Only a refresh reads
+    /// these, one point read per snapshot in the gap. A sliding window of
+    /// the most recent commits' records is retained; older ones are deleted
+    /// by later commits, so nothing else has to reclaim them.
+    Changelog {
+        /// The snapshot whose batch wrote these keys.
+        snapshot_id: u64,
     },
 }
 
@@ -345,9 +357,6 @@ impl Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subspace {
     /// Store-level singletons.
-    // System keys are read/written by exact key today; no caller prefix-scans
-    // the whole subspace yet.
-    #[allow(dead_code)]
     System,
     /// Snapshot records.
     Snapshot,
@@ -356,19 +365,29 @@ pub(crate) enum Subspace {
     /// Ended entity versions.
     History,
     /// Inlined data.
-    // Data inlining is not implemented yet.
-    #[allow(dead_code)]
     Inline,
     /// Equality-index entries.
-    // Entries are read by exact key or per-index prefix, not by a
-    // whole-subspace scan yet.
-    #[allow(dead_code)]
     Index,
     /// Per-table schema-version records.
     SchemaVersion,
+    /// Per-commit changelogs.
+    Changelog,
 }
 
 impl Subspace {
+    /// Every subspace, in discriminant order. A census walks this, so a
+    /// subspace added to [`Key`] and left out here goes unreported.
+    pub(crate) const ALL: [Self; 8] = [
+        Self::System,
+        Self::Snapshot,
+        Self::Current,
+        Self::History,
+        Self::Inline,
+        Self::Index,
+        Self::SchemaVersion,
+        Self::Changelog,
+    ];
+
     /// A minimal key inside this subspace, for prefix derivation.
     const fn sample(self) -> Key {
         match self {
@@ -388,6 +407,7 @@ impl Subspace {
                 table_id: 0,
                 begin_snapshot: 0,
             },
+            Self::Changelog => Key::Changelog { snapshot_id: 0 },
         }
     }
 }
@@ -722,6 +742,15 @@ mod tests {
         let mut expect = vec![0x03];
         expect.extend(be(42));
         assert_eq!(Key::Snapshot { snapshot_id: 42 }.encode(), expect);
+    }
+
+    /// Appended after every existing subspace, so no key written before it
+    /// existed changes a byte.
+    #[test]
+    fn golden_changelog_key() {
+        let mut expect = vec![0x09];
+        expect.extend(be(42));
+        assert_eq!(Key::Changelog { snapshot_id: 42 }.encode(), expect);
     }
 
     #[test]
@@ -1381,6 +1410,7 @@ mod tests {
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
             any::<u64>().prop_map(|table_id| Key::Inline(InlineKey::FileDeleteTable { table_id })),
             arb_index().prop_map(Key::Index),
+            any::<u64>().prop_map(|snapshot_id| Key::Changelog { snapshot_id }),
         ]
     }
 

@@ -21,6 +21,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Arc,
+    time::Duration,
 };
 
 pub use checkpoints::*;
@@ -601,6 +602,29 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
     error
 }
 
+/// The object-cache cap an ABI byte count names. Zero means "not given",
+/// leaving the store's own cap in force, so a caller that has no opinion
+/// passes nothing.
+fn cache_size_option(cache_size_bytes: u64) -> Option<u64> {
+    (cache_size_bytes != 0).then_some(cache_size_bytes)
+}
+
+/// The preload level an ABI code names: `0` loads nothing, `1` the
+/// newest objects, `2` every object the manifest references. Any other
+/// value is a caller mistake — silently loading nothing would hide a
+/// misspelled option behind an attach that merely felt slow.
+fn cache_preload_option(cache_preload: u8) -> Result<Option<moraine::CachePreload>, AbiError> {
+    match cache_preload {
+        0 => Ok(None),
+        1 => Ok(Some(moraine::CachePreload::L0)),
+        2 => Ok(Some(moraine::CachePreload::All)),
+        other => Err(AbiError::invalid_argument(format!(
+            "cache_preload {other} names no preload level: 0 loads nothing, 1 the newest \
+             objects, 2 every object"
+        ))),
+    }
+}
+
 /// Attaches a moraine catalog: creates the runtime this handle owns for
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.
@@ -616,12 +640,41 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
 /// already-initialized store, whose stored flag
 /// ([`moraine_catalog_encrypted`]) is authoritative.
 ///
+/// `cache_size_bytes` bounds the on-disk object cache `cache_dir` names.
+/// The cap is per attach, so several attaches sharing one directory each
+/// spend up to it; `0` leaves the store's own cap in force, and without a
+/// `cache_dir` there is no object cache to bound. The store's in-memory
+/// caches are separate and take no configuration here.
+///
+/// `cache_preload` loads objects into that cache as the attach opens, so
+/// the first query pays no first touch: `0` loads nothing, `1` the newest
+/// objects, `2` every object the manifest references. The load is bounded
+/// by `cache_size_bytes` and skips what it cannot fetch, but the attach
+/// waits for it. Any other value is [`codes::INVALID_ARGUMENT`].
+///
+/// `cache_puts` fills that cache from the write path as well as the read
+/// path, so a flushed or compacted object is local without a later fetch.
+/// Compaction output is cached too, so a merge can evict what reads had
+/// warmed; `false` leaves the cache filled by reads alone.
+///
 /// `checkpoint` pins a **read-only** attach to an existing SlateDB
 /// checkpoint (see [`moraine_create_checkpoint`]), so the open writes
 /// nothing at all — no manifest record of the reader, no refresh, no
 /// delete on close — and serves a fixed cut that never advances. Null or
 /// empty follows the latest manifest; a non-null value with `read_only`
 /// false is [`codes::INVALID_ARGUMENT`].
+///
+/// `host_threads` is how many execution threads the calling host runs, and
+/// sizes this handle's worker pool: the host's setting is the only number
+/// in the process that says how much parallelism the operator asked for,
+/// so a session pinned to one thread does not get a pool sized to the
+/// machine. It is clamped to a floor of two (a CPU-bound poll must not be
+/// able to stall SlateDB's flush) and a ceiling of eight (the pool waits
+/// on object storage, which yields its worker at every await, so further
+/// workers only park — on cores the host already sized itself to). `0`
+/// means the host does not say and takes the floor. The size is fixed for
+/// the handle's life; a host that changes its own thread count afterwards
+/// keeps the pool it attached with.
 ///
 /// Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
 /// are: the store open is the one long blocking call an attach makes, and
@@ -647,6 +700,8 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
 /// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 /// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+/// `cache_size_bytes`, `cache_preload`, `cache_puts`, and `host_threads`
+/// are unconstrained.
 /// `probe`, if non-null, must be safe to call with `probe_ctx` from any
 /// thread. `out` must be a valid, writable `*mut *mut
 /// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -659,8 +714,12 @@ pub unsafe extern "C" fn moraine_attach(
     encrypted: bool,
     flush_interval_ms: u64,
     cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_preload: u8,
+    cache_puts: bool,
     data_path: *const c_char,
     checkpoint: *const c_char,
+    host_threads: u64,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     out: *mut *mut MoraineCatalogHandle,
@@ -676,7 +735,7 @@ pub unsafe extern "C" fn moraine_attach(
         // SAFETY: `path` validity is this function's own safety contract.
         let path_str = unsafe { borrow_str(path, "path") }?;
         // SAFETY: `cache_dir` validity is this function's own safety contract;
-        // null (or empty) means "no on-disk cache".
+        // null (or empty) means "no on-disk object cache".
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
         // SAFETY: `checkpoint` validity is this function's own safety
         // contract; null (or empty) means "follow the latest manifest".
@@ -704,12 +763,13 @@ pub unsafe extern "C" fn moraine_attach(
         // events (run below on this thread) the same way.
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id).map_err(|e| {
-            AbiError::new(
-                codes::INTERNAL,
-                format!("failed to start tokio runtime: {e}"),
-            )
-        })?;
+        let runtime = new_runtime(log_id, usize::try_from(host_threads).unwrap_or(usize::MAX))
+            .map_err(|e| {
+                AbiError::new(
+                    codes::INTERNAL,
+                    format!("failed to start tokio runtime: {e}"),
+                )
+            })?;
 
         // The DATA_PATH given at this attach (via `META_DATA_PATH`), if any.
         // SAFETY: `data_path` validity is this function's own safety contract;
@@ -739,6 +799,9 @@ pub unsafe extern "C" fn moraine_attach(
             ms => options.flush_interval = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        options.cache_size = cache_size_option(cache_size_bytes);
+        options.cache_preload = cache_preload_option(cache_preload)?;
+        options.cache_puts = cache_puts;
         options.checkpoint = checkpoint.map(str::to_owned);
         // Persist the data root at bootstrap so a later attach reads it back
         // without being told it again.
@@ -908,15 +971,20 @@ pub struct MoraineMigrationReport {
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
 /// point to a valid [`MoraineS3Config`] whose non-null fields are valid
 /// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
-/// NUL-terminated C string. `out` must be a valid, writable
-/// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
-/// writable [`MoraineError`]. All for the duration of this call.
+/// NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+/// `cache_puts` are unconstrained. `out`
+/// must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
+/// must be a valid, writable [`MoraineError`]. All for the duration of this
+/// call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_migrate(
     path: *const c_char,
     s3: *const MoraineS3Config,
     flush_interval_ms: u64,
     cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_preload: u8,
+    cache_puts: bool,
     checkpoint: bool,
     out: *mut MoraineMigrationReport,
     err: *mut MoraineError,
@@ -931,7 +999,7 @@ pub unsafe extern "C" fn moraine_migrate(
         // SAFETY: `path` validity is this function's own safety contract.
         let path_str = unsafe { borrow_str(path, "path") }?;
         // SAFETY: `cache_dir` validity is this function's own safety
-        // contract; null (or empty) means "no on-disk cache".
+        // contract; null (or empty) means "no on-disk object cache".
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
@@ -943,7 +1011,9 @@ pub unsafe extern "C" fn moraine_migrate(
         let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id).map_err(|e| {
+        // A one-shot runtime for one operation, with no host thread
+        // setting to take after: the floor is all it needs.
+        let runtime = new_runtime(log_id, 0).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
                 format!("failed to start tokio runtime: {e}"),
@@ -962,6 +1032,9 @@ pub unsafe extern "C" fn moraine_migrate(
             ms => options.flush_interval = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        options.cache_size = cache_size_option(cache_size_bytes);
+        options.cache_preload = cache_preload_option(cache_preload)?;
+        options.cache_puts = cache_puts;
 
         let mut request = moraine::MigrationRequest::default();
         request.checkpoint = checkpoint;
@@ -1983,6 +2056,360 @@ pub unsafe extern "C" fn moraine_maintain(
     }
 }
 
+/// One subspace's row of a store census, as returned by
+/// [`moraine_store_census`].
+#[repr(C)]
+pub struct MoraineSubspaceCensus {
+    /// The subspace's name, owned — free via [`moraine_store_census_free`].
+    pub subspace: *mut c_char,
+    /// Physical bytes across its SSTs.
+    pub bytes: u64,
+    /// SSTs not yet merged into a sorted run.
+    pub l0_ssts: u32,
+    /// Sorted runs. A merge collapses these to one.
+    pub sorted_runs: u32,
+    /// SSTs across those runs.
+    pub sorted_run_ssts: u32,
+    /// Whether the live fields carry a count; false unless the census was
+    /// asked to scan.
+    pub has_live: bool,
+    /// Live keys a reader would see.
+    pub live_keys: u64,
+    /// Encoded bytes of those keys.
+    pub live_key_bytes: u64,
+    /// Encoded bytes of their values.
+    pub live_value_bytes: u64,
+    /// Deletion-schedule entries among the live keys.
+    pub scheduled_files: u64,
+}
+
+/// Store-wide object totals, as returned by [`moraine_store_census`].
+#[repr(C)]
+pub struct MoraineStoreObjects {
+    /// Whether the store could be listed at all. False leaves every other
+    /// field zero — read-only credentials often grant `GetObject` without
+    /// `ListBucket`.
+    pub listed: bool,
+    /// Every object under the store's prefix.
+    pub total_objects: u64,
+    /// Bytes across all of them.
+    pub total_bytes: u64,
+    /// Write-ahead log objects, replayed by an unpinned read attach.
+    pub wal_objects: u64,
+    /// Bytes across those.
+    pub wal_bytes: u64,
+    /// Manifest versions.
+    pub manifest_objects: u64,
+    /// Bytes across those.
+    pub manifest_bytes: u64,
+    /// Sorted-string tables — the only bytes a merge reclaims.
+    pub sst_objects: u64,
+    /// Bytes across those.
+    pub sst_bytes: u64,
+    /// Everything else the layout carries.
+    pub other_objects: u64,
+    /// Bytes across those.
+    pub other_bytes: u64,
+}
+
+/// Measures the store, one row per subspace, and writes the manifest
+/// version measured to `*out_manifest_id` and the store-wide object totals
+/// to `*out_objects`.
+///
+/// `count_live_entries` adds a scan of every subspace, which costs a full
+/// read of the store; without it the call reads the manifest alone.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; the out-parameters
+/// must be writable, and `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_store_census(
+    handle: *mut MoraineCatalogHandle,
+    count_live_entries: bool,
+    out_items: *mut *mut MoraineSubspaceCensus,
+    out_len: *mut usize,
+    out_manifest_id: *mut u64,
+    out_objects: *mut MoraineStoreObjects,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce =
+        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceCensus>, AbiError> {
+            // `CensusRequest` is `#[non_exhaustive]`, so it is built
+            // through `default()` and field assignment.
+            let mut request = moraine::CensusRequest::default();
+            request.count_live_entries = count_live_entries;
+
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            let census = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.store_census(request),
+                )
+            }?;
+
+            if !out_manifest_id.is_null() {
+                // SAFETY: caller contract — non-null means writable.
+                unsafe { *out_manifest_id = census.manifest_id };
+            }
+            if !out_objects.is_null() {
+                let objects = census.objects.unwrap_or_default();
+                // SAFETY: caller contract — non-null means writable.
+                unsafe {
+                    *out_objects = MoraineStoreObjects {
+                        listed: census.objects.is_some(),
+                        total_objects: objects.total_objects,
+                        total_bytes: objects.total_bytes,
+                        wal_objects: objects.wal_objects,
+                        wal_bytes: objects.wal_bytes,
+                        manifest_objects: objects.manifest_objects,
+                        manifest_bytes: objects.manifest_bytes,
+                        sst_objects: objects.sst_objects,
+                        sst_bytes: objects.sst_bytes,
+                        other_objects: objects.other_objects,
+                        other_bytes: objects.other_bytes,
+                    };
+                }
+            }
+
+            // Owned-first: no raw pointers until every string converts.
+            let owned: Vec<(CString, &moraine::SubspaceCensus)> = census
+                .subspaces
+                .iter()
+                .map(|subspace| Ok((to_c_string(&subspace.subspace.to_string())?, subspace)))
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(name, subspace)| {
+                    let live = subspace.live.unwrap_or_default();
+                    MoraineSubspaceCensus {
+                        subspace: name.into_raw(),
+                        bytes: subspace.bytes,
+                        l0_ssts: subspace.l0_ssts,
+                        sorted_runs: subspace.sorted_runs,
+                        sorted_run_ssts: subspace.sorted_run_ssts,
+                        has_live: subspace.live.is_some(),
+                        live_keys: live.keys,
+                        live_key_bytes: live.key_bytes,
+                        live_value_bytes: live.value_bytes,
+                        scheduled_files: live.scheduled_files,
+                    }
+                })
+                .collect())
+        };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_store_census`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_store_census`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_store_census_free(items: *mut MoraineSubspaceCensus, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |row| free_c_string(row.subspace));
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// One subspace's merge, as returned by [`moraine_compact_store`].
+#[repr(C)]
+pub struct MoraineSubspaceMerge {
+    /// The subspace merged, owned — free via [`moraine_compact_store_free`].
+    pub subspace: *mut c_char,
+    /// `"completed"`, `"failed"`, `"pending"`, or `"skipped"`, owned.
+    pub outcome: *mut c_char,
+    /// The failure message or the skip reason; empty otherwise. Owned.
+    pub detail: *mut c_char,
+    /// Physical bytes before the merge was submitted.
+    pub bytes_before: u64,
+    /// Whether `bytes_after` carries a measurement; false unless the merge
+    /// committed.
+    pub has_bytes_after: bool,
+    /// Physical bytes after it committed.
+    pub bytes_after: u64,
+}
+
+/// Merges each targeted subspace's sorted runs into one.
+///
+/// `subspace` names one subspace, or is null for every one. `wait_ms` of 0
+/// returns as soon as the merges are submitted; otherwise the call waits
+/// that long for each to commit, and a merge that outlives the wait keeps
+/// running and is reported pending.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; the out-parameters
+/// must be writable, and `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_compact_store(
+    handle: *mut MoraineCatalogHandle,
+    subspace: *const c_char,
+    wait_ms: u64,
+    out_items: *mut *mut MoraineSubspaceMerge,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce =
+        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceMerge>, AbiError> {
+            // `CompactStoreRequest` is `#[non_exhaustive]`, so it is built
+            // through `default()` and field assignment.
+            let mut request = moraine::CompactStoreRequest::default();
+            if !subspace.is_null() {
+                // SAFETY: caller contract for the string pointer.
+                let name = unsafe { borrow_str(subspace, "subspace") }?;
+                request.target = moraine::CompactionTarget::Subspace(parse_subspace(name)?);
+            }
+            if wait_ms > 0 {
+                request.wait = Some(Duration::from_millis(wait_ms));
+            }
+
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            let report = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.compact_store(request),
+                )
+            }?;
+
+            // Owned-first: no raw pointers until every string converts.
+            let owned: Vec<(CString, CString, CString, &moraine::SubspaceMerge)> = report
+                .merges
+                .iter()
+                .map(|merge| {
+                    let (outcome, detail) = match &merge.outcome {
+                        moraine::MergeOutcome::Completed => ("completed", String::new()),
+                        moraine::MergeOutcome::Failed(why) => ("failed", why.clone()),
+                        moraine::MergeOutcome::Pending => ("pending", String::new()),
+                        moraine::MergeOutcome::Skipped(why) => ("skipped", (*why).to_string()),
+                        // `MergeOutcome` is `#[non_exhaustive]`: a variant
+                        // this build does not know still gets a row.
+                        _ => ("unknown", String::new()),
+                    };
+                    Ok((
+                        to_c_string(&merge.subspace.to_string())?,
+                        to_c_string(outcome)?,
+                        to_c_string(&detail)?,
+                        merge,
+                    ))
+                })
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(subspace, outcome, detail, merge)| MoraineSubspaceMerge {
+                    subspace: subspace.into_raw(),
+                    outcome: outcome.into_raw(),
+                    detail: detail.into_raw(),
+                    bytes_before: merge.bytes_before,
+                    has_bytes_after: merge.bytes_after.is_some(),
+                    bytes_after: merge.bytes_after.unwrap_or(0),
+                })
+                .collect())
+        };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_compact_store`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_compact_store`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_compact_store_free(items: *mut MoraineSubspaceMerge, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |row| {
+                free_c_string(row.subspace);
+                free_c_string(row.outcome);
+                free_c_string(row.detail);
+            });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Whether `name` is a subspace a merge can target.
+///
+/// Exposed separately from [`moraine_compact_store`] because an attach
+/// validates its options before any catalog is open: a name checked only
+/// when a pass runs would let a typo attach cleanly and then fail every
+/// scheduled pass, unattended, for as long as it stood.
+///
+/// # Safety
+///
+/// `name`, if non-null, must be a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_subspace_is_known(name: *const c_char) -> bool {
+    let attempt = || {
+        if name.is_null() {
+            return false;
+        }
+        // SAFETY: caller contract for `name`.
+        let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return false;
+        };
+        parse_subspace(name).is_ok()
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(false)
+}
+
+/// The subspaces a merge can target, comma-separated, for an error
+/// message. Owned — free via `moraine_error_free`; null if allocation
+/// fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn moraine_subspace_names() -> *mut c_char {
+    let attempt = || {
+        let names: Vec<String> = KNOWN_SUBSPACES.iter().map(ToString::to_string).collect();
+        to_c_string(&names.join(", ")).map_or(ptr::null_mut(), CString::into_raw)
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(ptr::null_mut())
+}
+
+/// The subspace `name` refers to, by the name a census prints.
+fn parse_subspace(name: &str) -> Result<moraine::SubspaceName, AbiError> {
+    KNOWN_SUBSPACES
+        .iter()
+        .find(|known| known.to_string() == name)
+        .cloned()
+        .ok_or_else(|| {
+            let known: Vec<String> = KNOWN_SUBSPACES.iter().map(ToString::to_string).collect();
+            AbiError::invalid_argument(format!(
+                "unknown subspace \"{name}\"; known subspaces are: {}",
+                known.join(", ")
+            ))
+        })
+}
+
+/// The subspaces a merge target may name. An unknown segment addresses no
+/// keys, so it is deliberately absent.
+const KNOWN_SUBSPACES: [moraine::SubspaceName; 8] = [
+    moraine::SubspaceName::System,
+    moraine::SubspaceName::Snapshot,
+    moraine::SubspaceName::Current,
+    moraine::SubspaceName::History,
+    moraine::SubspaceName::Inline,
+    moraine::SubspaceName::Index,
+    moraine::SubspaceName::SchemaVersion,
+    moraine::SubspaceName::Changelog,
+];
+
 /// Lists a table's live equality indexes.
 ///
 /// # Safety
@@ -2543,7 +2970,7 @@ mod tests {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
     };
 
@@ -2551,7 +2978,10 @@ mod tests {
     use object_store::local::LocalFileSystem;
 
     use super::*;
-    use crate::test_support::{TempDir, attach_ok};
+    use crate::{
+        staged::moraine_tx_commit,
+        test_support::{TempDir, attach_ok, begin},
+    };
 
     /// Seeds a catalog directly through the `moraine` API with one
     /// schema, one table with two columns and one data file, and one
@@ -2581,12 +3011,14 @@ mod tests {
                                 column_type: "BIGINT".into(),
                                 nulls_allowed: false,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                             ColumnDef {
                                 name: "amount".into(),
                                 column_type: "DOUBLE".into(),
                                 nulls_allowed: true,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                         ],
                     )?;
@@ -2600,6 +3032,7 @@ mod tests {
                             file_size_bytes: 1024,
                             footer_size: 64,
                             encryption_key: None,
+                            partition_values: vec![],
                             column_stats: vec![],
                         },
                         &[],
@@ -2643,12 +3076,14 @@ mod tests {
                                 column_type: "BIGINT".into(),
                                 nulls_allowed: false,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                             ColumnDef {
                                 name: "b".into(),
                                 column_type: "VARCHAR".into(),
                                 nulls_allowed: false,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                         ],
                     )?;
@@ -2662,6 +3097,7 @@ mod tests {
                             file_size_bytes: 1024,
                             footer_size: 64,
                             encryption_key: None,
+                            partition_values: vec![],
                             column_stats: vec![],
                         },
                         &[],
@@ -3035,8 +3471,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_bad.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut bad_handle,
@@ -3070,8 +3510,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_good.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut good_handle,
@@ -3108,8 +3552,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3153,6 +3601,194 @@ mod tests {
             )
         };
         assert_eq!(code, codes::OK, "maintain with null out-params failed");
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The census ABI names every subspace, writes the manifest version
+    /// through its slot, and carries the live counts only when asked.
+    #[test]
+    fn census_reports_every_subspace_through_the_abi() {
+        let dir = TempDir::new("census-abi");
+        seed(dir.path());
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                0,
+                0,
+                false,
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "attach failed");
+
+        for count_live in [false, true] {
+            let mut items: *mut MoraineSubspaceCensus = ptr::null_mut();
+            let mut len = 0usize;
+            let mut manifest_id = u64::MAX;
+            let mut objects = MoraineStoreObjects {
+                listed: false,
+                total_objects: 0,
+                total_bytes: 0,
+                wal_objects: 0,
+                wal_bytes: 0,
+                manifest_objects: 0,
+                manifest_bytes: 0,
+                sst_objects: 0,
+                sst_bytes: 0,
+                other_objects: 0,
+                other_bytes: 0,
+            };
+            // SAFETY: `handle` is live; every slot is a writable local.
+            let code = unsafe {
+                moraine_store_census(
+                    handle,
+                    count_live,
+                    &raw mut items,
+                    &raw mut len,
+                    &raw mut manifest_id,
+                    &raw mut objects,
+                    None,
+                    ptr::null_mut(),
+                    &raw mut err,
+                )
+            };
+            assert_eq!(code, codes::OK, "census failed");
+            assert!(len >= KNOWN_SUBSPACES.len(), "only {len} subspaces");
+            assert_ne!(manifest_id, u64::MAX, "manifest version not written");
+            // A local store lists fine, and a store that has been written
+            // holds at least a manifest.
+            assert!(objects.listed, "store not listed");
+            assert!(objects.total_objects > 0, "no objects counted");
+            assert!(objects.manifest_objects > 0, "no manifest counted");
+
+            // SAFETY: `items`/`len` are what the call just wrote.
+            let rows = unsafe { std::slice::from_raw_parts(items, len) };
+            for row in rows {
+                // SAFETY: every row owns a valid C string.
+                let name = unsafe { CStr::from_ptr(row.subspace) };
+                assert!(!name.to_bytes().is_empty());
+                assert_eq!(row.has_live, count_live, "{name:?}");
+            }
+            assert!(
+                rows.iter().any(|row| {
+                    // SAFETY: as above.
+                    unsafe { CStr::from_ptr(row.subspace) }.to_bytes() == b"current"
+                }),
+                "no `current` row"
+            );
+
+            // SAFETY: freed exactly once, with the matching length.
+            unsafe { moraine_store_census_free(items, len) };
+        }
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The merge ABI reports one row per subspace, and refuses a subspace
+    /// name it does not know rather than merging the wrong tree.
+    #[test]
+    fn compact_store_reports_rows_and_refuses_unknown_subspaces() {
+        let dir = TempDir::new("compact-abi");
+        seed(dir.path());
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                0,
+                0,
+                false,
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "attach failed");
+
+        // A seeded store has no sorted runs, so every subspace is skipped
+        // and none reports bytes after.
+        let mut items: *mut MoraineSubspaceMerge = ptr::null_mut();
+        let mut len = 0usize;
+        // SAFETY: `handle` is live; every slot is a writable local.
+        let code = unsafe {
+            moraine_compact_store(
+                handle,
+                ptr::null(),
+                1_000,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "compact_store failed");
+        assert_eq!(len, KNOWN_SUBSPACES.len());
+
+        // SAFETY: `items`/`len` are what the call just wrote.
+        let rows = unsafe { std::slice::from_raw_parts(items, len) };
+        for row in rows {
+            // SAFETY: every row owns valid C strings.
+            let outcome = unsafe { CStr::from_ptr(row.outcome) };
+            assert_eq!(outcome.to_bytes(), b"skipped");
+            assert!(!row.has_bytes_after);
+            // SAFETY: as above.
+            let detail = unsafe { CStr::from_ptr(row.detail) };
+            assert!(!detail.to_bytes().is_empty(), "a skip states its reason");
+        }
+        // SAFETY: freed exactly once, with the matching length.
+        unsafe { moraine_compact_store_free(items, len) };
+
+        let unknown = CString::new("gcfile").expect("no interior nul");
+        // SAFETY: `handle` is live; the name is a valid C string.
+        let code = unsafe {
+            moraine_compact_store(
+                handle,
+                unknown.as_ptr(),
+                0,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INVALID_ARGUMENT);
+        if !err.message.is_null() {
+            // SAFETY: the guard wrote an owned message.
+            unsafe { moraine_error_free(err.message) };
+        }
 
         // SAFETY: freed exactly once.
         unsafe { moraine_detach(handle) };
@@ -3235,8 +3871,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_data.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3272,8 +3912,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_safe.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut ok_handle,
@@ -3311,8 +3955,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_first.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut first_handle,
@@ -3342,8 +3990,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_other.as_ptr(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut other_handle,
@@ -3383,8 +4035,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3429,8 +4085,12 @@ mod tests {
                 true,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3694,6 +4354,7 @@ mod tests {
                             column_type: "BIGINT".into(),
                             nulls_allowed: false,
                             default_value: None,
+                            children: Vec::new(),
                         }],
                     )?;
                     Ok(())
@@ -3770,8 +4431,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3808,8 +4473,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -3865,8 +4534,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
+                0,
                 None,
                 ptr::null_mut(),
                 &raw mut handle,
@@ -4031,6 +4704,102 @@ mod tests {
         unsafe { moraine_detach(handle) };
     }
 
+    /// An interrupt that arrives once the operation has already produced
+    /// its result changes nothing: there is nothing left to cancel, so the
+    /// result is reported.
+    ///
+    /// This is the third of cancellation's three cases, and the one with
+    /// no ambiguity in it. The probe here fires only after the future's
+    /// last act, which is exactly the ordering the case describes.
+    #[test]
+    fn an_interrupt_after_the_result_is_known_still_reports_it() {
+        unsafe extern "C" fn probe_flag(probe_ctx: *mut c_void) -> bool {
+            // SAFETY: this test passes a valid `AtomicBool` pointer below.
+            unsafe { &*probe_ctx.cast::<AtomicBool>() }.load(Ordering::SeqCst)
+        }
+
+        let dir = TempDir::new("probe-after-result");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let interrupted = AtomicBool::new(false);
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `interrupted` outlives the call; the probe only reads it
+        // atomically.
+        let result: Result<u32, AbiError> = unsafe {
+            handle_ref.block_on_cancellable(
+                Some(probe_flag),
+                (&raw const interrupted).cast_mut().cast(),
+                async {
+                    // The host's interrupt lands here: after the work is
+                    // done, before the bridge has returned.
+                    interrupted.store(true, Ordering::SeqCst);
+                    Ok::<_, moraine::Error>(9u32)
+                },
+            )
+        };
+        assert_eq!(
+            result.unwrap_or(0),
+            9,
+            "an interrupt past the point of no return must not discard a known result"
+        );
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The staged-row commit honors its probe, and a commit refused before
+    /// it ran leaves the catalog exactly where it was.
+    #[test]
+    fn probe_cancels_a_staged_commit_and_nothing_lands() {
+        let dir = TempDir::new("probe-tx-commit");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+        let before = snapshot_id_of(handle);
+
+        let tx = begin(handle);
+        let mut snapshot_id = 0u64;
+        let mut err = MoraineError::default();
+        // SAFETY: `tx` came from `begin` and is consumed exactly once;
+        // the out-params are local slots; `probe_always` accepts a null
+        // context.
+        let code = unsafe {
+            moraine_tx_commit(
+                tx,
+                &raw mut snapshot_id,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        assert_eq!(
+            snapshot_id_of(handle),
+            before,
+            "an interrupted commit must not advance head"
+        );
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The head this handle reports, for the cases that assert a commit
+    /// left it alone.
+    fn snapshot_id_of(handle: *mut MoraineCatalogHandle) -> u64 {
+        // SAFETY: `handle` is attached for the duration of the caller.
+        let handle_ref = unsafe { &*handle };
+        handle_ref
+            .block_on(handle_ref.catalog.snapshot())
+            .expect("read head")
+            .current_snapshot()
+            .id
+            .get()
+    }
+
     /// The pull channel end to end: a probe reporting an interrupt cancels
     /// the snapshot (out-param unwritten), and the same handle with a
     /// quiet probe succeeds right after — the signal is level-triggered
@@ -4174,8 +4943,12 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
+                0,
                 Some(probe_always),
                 ptr::null_mut(),
                 &raw mut handle,
@@ -4269,5 +5042,123 @@ mod tests {
         // SAFETY: as above.
         let unsupported = unsafe { coerce_lookup_value(&int_value, "DECIMAL(18,3)") };
         assert!(unsupported.is_err());
+    }
+
+    /// Zero bytes on the ABI means "not given", so the store's own cap
+    /// stands; any other value is that many bytes of object cache.
+    #[test]
+    fn a_zero_cache_size_leaves_the_default_cap() {
+        assert_eq!(cache_size_option(0), None);
+        assert_eq!(cache_size_option(64 * 1024 * 1024), Some(64 * 1024 * 1024));
+    }
+
+    /// The preload codes the ABI takes, and the refusal of one it does
+    /// not: a level nobody can act on is a caller mistake, not a default
+    /// to fall back to.
+    #[test]
+    fn cache_preload_codes_map_to_levels_and_reject_the_rest() {
+        assert_eq!(cache_preload_option(0).unwrap(), None);
+        assert_eq!(
+            cache_preload_option(1).unwrap(),
+            Some(moraine::CachePreload::L0)
+        );
+        assert_eq!(
+            cache_preload_option(2).unwrap(),
+            Some(moraine::CachePreload::All)
+        );
+        let refused = cache_preload_option(7).unwrap_err();
+        assert_eq!(refused.code, codes::INVALID_ARGUMENT);
+        assert!(refused.message.contains('7'), "{}", refused.message);
+    }
+
+    /// An attach that caches its writes fills the cache directory from the
+    /// write path: bootstrapping a fresh store leaves what it wrote behind,
+    /// where an attach that does not cache writes leaves nothing.
+    #[test]
+    fn an_attach_caching_writes_fills_the_cache_directory() {
+        let mut cached = Vec::new();
+        for cache_puts in [false, true] {
+            let dir = TempDir::new("put-cache-store");
+            let cache = TempDir::new("put-cache-dir");
+            let c_path = dir.c_path();
+            let c_cache = cache.c_path();
+            let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+            let mut err = MoraineError::default();
+            // SAFETY: both C strings outlive the call; outputs are valid
+            // local slots; null s3/data_path/checkpoint are the documented
+            // "none" cases.
+            let code = unsafe {
+                moraine_attach(
+                    c_path.as_ptr(),
+                    ptr::null(),
+                    false,
+                    false,
+                    0,
+                    c_cache.as_ptr(),
+                    0,
+                    0,
+                    cache_puts,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    None,
+                    ptr::null_mut(),
+                    &raw mut handle,
+                    &raw mut err,
+                )
+            };
+            // SAFETY: `err.message` is null or was just written by the call.
+            let message = unsafe { err.message.as_ref() };
+            assert_eq!(code, codes::OK, "attach failed: {message:?}");
+            // SAFETY: attached above and not yet detached.
+            unsafe { moraine_detach(handle) };
+            cached.push(std::fs::read_dir(cache.path()).map_or(0, Iterator::count));
+        }
+        assert!(
+            cached[1] > cached[0],
+            "caching writes cached {} entries against {} without it",
+            cached[1],
+            cached[0]
+        );
+    }
+
+    /// An attach given a cache directory and a cap opens against them: the
+    /// cap crosses the ABI as a byte count rather than failing the open.
+    #[test]
+    fn an_attach_takes_a_bounded_disk_cache() {
+        let dir = TempDir::new("bounded-cache-store");
+        let cache = TempDir::new("bounded-cache-dir");
+        let c_path = dir.c_path();
+        let c_cache = cache.c_path();
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: both C strings outlive the call; outputs are valid local
+        // slots; null s3/data_path/checkpoint are the documented "none"
+        // cases.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                c_cache.as_ptr(),
+                64 * 1024 * 1024,
+                0,
+                false,
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        // SAFETY: `err.message` is null or was just written by the call.
+        let message = unsafe { err.message.as_ref() };
+        assert_eq!(code, codes::OK, "attach failed: {message:?}");
+        // SAFETY: attached above and not yet detached.
+        unsafe { moraine_detach(handle) };
     }
 }

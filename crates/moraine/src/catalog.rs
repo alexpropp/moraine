@@ -3,6 +3,7 @@
 //! This layer never performs store I/O itself; the commit protocol in
 //! [`crate::transaction`] drives it.
 
+mod census;
 mod handle;
 pub(crate) mod index_policy;
 pub(crate) mod inline;
@@ -12,8 +13,13 @@ pub(crate) mod scoped_read;
 mod snapshot;
 mod types;
 
+pub use census::{
+    CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
+    MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
+};
 pub use handle::{
-    Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest, MigrationRequest,
+    CachePreload, Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest,
+    MigrationRequest,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
@@ -24,6 +30,6 @@ pub use types::{
     IndexState, InlineChunk, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef,
     MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId,
     PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo,
-    SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, TagTarget, ViewId,
-    ViewInfo,
+    SnapshotId, SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo, TableStats,
+    TagEntry, TagTarget, ViewId, ViewInfo,
 };

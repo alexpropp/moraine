@@ -57,8 +57,12 @@ pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
             false,
             0,
             ptr::null(),
+            0,
+            0,
+            false,
             ptr::null(),
             ptr::null(),
+            0,
             None,
             ptr::null_mut(),
             &raw mut handle,
@@ -119,7 +123,7 @@ pub(crate) fn commit(tx: *mut MoraineTxHandle) -> u64 {
     let mut id: u64 = 0;
     let mut err = MoraineError::default();
     // SAFETY: `tx` is live; outputs are valid local slots.
-    let code = unsafe { moraine_tx_commit(tx, &raw mut id, &raw mut err) };
+    let code = unsafe { moraine_tx_commit(tx, &raw mut id, None, ptr::null_mut(), &raw mut err) };
     // SAFETY: `err.message` is null or was just written by `moraine_tx_commit`.
     assert_eq!(code, codes::OK, "commit failed: {:?}", unsafe {
         err.message.as_ref()

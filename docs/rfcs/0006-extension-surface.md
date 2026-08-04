@@ -225,18 +225,86 @@ store the shim rewrites the terse store error to name this fix (add
 paths are not remote-file URIs — a Postgres/MySQL connection string never
 matches the prefix rule, and local DuckDB/SQLite files default read-write.
 
-**`CACHE_DIR` — an on-disk block cache for S3 stores.** Every query rebinds the
+**`CACHE_DIR` — an on-disk object cache for S3 stores.** Every query rebinds the
 catalog by reading its metadata (snapshot → tables → columns → files → stats)
-from the store; on an `s3://`-backed catalog those SlateDB block reads are S3
-round-trips, and the default in-memory cache is lost on each new process. The
-`CACHE_DIR` attach option — `ATTACH 'ducklake:moraine:s3://…' AS lake (DATA_PATH
-'…', READ_WRITE, META_CACHE_DIR '/var/cache/moraine')`, or `CACHE_DIR` directly
-on a standalone `moraine:` attach — points SlateDB's `object_store_cache_options`
-at a local directory, so warm blocks survive restarts and repeat queries skip
-the GETs. It threads through the shim (`moraine_attach`'s `cache_dir`) into
-`CatalogOptions::cache_dir` and `StoreBuilder`, applying to both the writer and
-the reader; unset (the default), only the in-memory cache applies. Redundant for
-local/`memory://` stores.
+from the store; on an `s3://`-backed catalog those reads are S3 round-trips, and
+the in-memory caches start empty in each new process. The `CACHE_DIR` attach
+option — `ATTACH 'ducklake:moraine:s3://…' AS lake (DATA_PATH '…', READ_WRITE,
+META_CACHE_DIR '/var/cache/moraine')`, or `CACHE_DIR` directly on a standalone
+`moraine:` attach — points SlateDB's `object_store_cache_options` at a local
+directory, where whole object parts are kept, so warm reads survive restarts and
+repeat queries skip the GETs. It threads through the shim (`moraine_attach`'s
+`cache_dir`) into `CatalogOptions::cache_dir` and `StoreBuilder`, applying to
+both the writer and the reader; unset (the default), only the in-memory caches
+apply. Redundant for local/`memory://` stores.
+
+This is not the block cache, and the two are worth keeping apart. SlateDB's
+block cache is in memory, holds decoded blocks, and comes with a metadata cache
+beside it; both are per open store and moraine configures neither, so each
+attached store carries SlateDB's own sizes for them. `CACHE_DIR` and
+`CACHE_SIZE` govern only the disk tier.
+
+**`CACHE_SIZE` — how much disk that object cache may take.** It is uncapped
+only in the sense that moraine never chose a cap: SlateDB's own default is
+16 GiB, and it is enforced per open store, not per directory, so several
+stores pointed at one `CACHE_DIR` each spend up to their own cap there. A
+host that attaches four stores and sizes its disk for one is therefore sized
+for a quarter of what it can consume. `CACHE_SIZE` — a byte count,
+`META_CACHE_SIZE 2147483648` through the DuckLake attach or `CACHE_SIZE`
+directly on a standalone `moraine:` attach — sets that cap explicitly,
+threading through the shim (`moraine_attach`'s `cache_size_bytes`, and
+`moraine_migrate`'s) into `CatalogOptions::cache_size` and `StoreBuilder`.
+Zero on the ABI means "not given", so the SlateDB default stands; the option
+is inert without a `CACHE_DIR`, since there is no object cache to bound.
+Multiply by the number of attached stores to size the volume. Part size and
+scan interval stay at SlateDB's defaults, and so do the in-memory caches,
+because nothing has yet shown which way to move them.
+
+**`CACHE_PUTS` — fill that cache from the write path too.** Left alone, the
+object cache is filled only by reads: an object the store just wrote is
+fetched back from object storage the first time something asks for it, even
+though the writer had the bytes in hand. `CACHE_PUTS true` writes each object
+into the local cache as it is PUT, which costs one local write and no fetch.
+Two consequences make it worth more than that arithmetic suggests. Store
+objects are immutable and parts land by atomic rename, so a reader pointed at
+the same `CACHE_DIR` reads what the writer cached — one host running a writer
+and its read-only sessions warms one cache between them. And the widening is
+per part, so a cached write also covers the neighbouring keys in that part,
+not only the ones just written.
+
+It is opt-in because compaction output goes through the same path under an
+admit-everything policy: a merge writing a large object can evict parts that
+reads had warmed, and a store whose merges outpace its queries is better off
+letting reads decide what stays. The option threads through the shim
+(`moraine_attach`'s `cache_puts`) into `CatalogOptions::cache_puts` and
+`StoreBuilder`, and is inert without a `CACHE_DIR`.
+
+**`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
+the above leave a fresh process cold: the cache fills as queries ask for
+objects, so the first query of an attach pays every first touch itself.
+`CACHE_PRELOAD` loads the store into the cache while the attach opens —
+`'l0'` for the objects no merge has folded down yet, `'all'` for every object
+the manifest references, `'none'` (the default) for today's behaviour. It
+crosses the ABI as a level code (`0`, `1`, `2`) on `moraine_attach` and
+`moraine_migrate`, and any other code is refused rather than treated as
+"none", so a misspelled level surfaces as an error instead of an attach that
+merely feels slow.
+
+The cost lands entirely on the attach. The load runs inside the open — the
+handle is returned only once it finishes — fetching each object whole with
+bounded parallelism, and it stops at the first object that would exceed
+`CACHE_SIZE`, so the cap governs the preload as well as the cache. Stopping
+is not skipping: the objects after the one that did not fit go unloaded even
+where they would have, and the store is enumerated newest-first, so what goes
+unloaded is the levelled tail. Nothing in that path says it happened, which
+would leave a half-warmed attach looking exactly like a warm one, so moraine
+compares the manifest's bytes against the cap as it opens and warns with both
+numbers. Fetches that fail are skipped rather than fatal: a preload is an
+optimization, and no attach should die because one object could not be
+warmed. `'all'` therefore
+suits a store small enough to sit on local disk with room to spare, where the
+trade is a slower ATTACH for a first query that touches object storage not at
+all; `'l0'` suits everything else.
 
 ### Interception level: catalog-entry, row-faithful (B1)
 

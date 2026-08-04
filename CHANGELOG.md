@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/morainedb/moraine/compare/v0.4.3...v0.4.4) - 2026-08-04
+
+### Added
+
+- bound, fill, and preload the on-disk object cache ([#82](https://github.com/morainedb/moraine/pull/82))
+- close out the open work across RFCs 0005, 0007, 0011, 0012, 0015, 0017 ([#83](https://github.com/morainedb/moraine/pull/83))
+
+### Other
+
+- cross off the RFC obligations that already have coverage ([#79](https://github.com/morainedb/moraine/pull/79))
+
+## [0.4.3](https://github.com/morainedb/moraine/compare/v0.4.2...v0.4.3) - 2026-08-03
+
+### Added
+
+- measure and reclaim a store's substrate bytes ([#78](https://github.com/morainedb/moraine/pull/78))
+- close out the RFC 0009 reader-refresh work ([#77](https://github.com/morainedb/moraine/pull/77))
+- close out the RFC 0010 async-sync bridge deferrals ([#76](https://github.com/morainedb/moraine/pull/76))
+- close out the RFC 0003 verb-surface deferrals ([#74](https://github.com/morainedb/moraine/pull/74))
+
+## [0.4.2](https://github.com/morainedb/moraine/compare/v0.4.1...v0.4.2) - 2026-08-03
+
+### Fixed
+
+- derive no equality-index entries for a commit that only compacts ([#70](https://github.com/morainedb/moraine/pull/70))
+- leave a row deleted out of the file its commit registers unindexed ([#69](https://github.com/morainedb/moraine/pull/69))
+
+### Other
+
+- fix the two cargo package failures blocking release-plz ([#72](https://github.com/morainedb/moraine/pull/72))
+
 ## [0.4.1](https://github.com/morainedb/moraine/compare/v0.4.0...v0.4.1) - 2026-08-02
 
 ### Added

@@ -79,6 +79,11 @@ id_type!(
     /// global catalog-id counter).
     PartitionId
 );
+id_type!(
+    /// Identifies a sort spec within its table (allocated from the global
+    /// catalog-id counter).
+    SortId
+);
 
 /// A data file to register: the file already exists on object storage
 /// (data before metadata). `row_id_start` is allocated by the commit,
@@ -100,6 +105,13 @@ pub struct DataFile {
     /// Encryption key material, verbatim — an opaque string moraine
     /// stores and returns but never interprets.
     pub encryption_key: Option<String>,
+    /// The partition this file falls in: one value per key of the table's
+    /// live partition spec, in key order, each rendered as text and stored
+    /// verbatim. Empty for a table with no live spec; a partitioned table
+    /// requires one value per key. The spec itself is not named here — a
+    /// file is always written under the one in force, and the commit
+    /// records which that was.
+    pub partition_values: Vec<String>,
     /// Per-column statistics carried with the registration. Every entry
     /// must reference a live column of the table.
     pub column_stats: Vec<FileColumnStats>,
@@ -174,6 +186,39 @@ pub struct PartitionSpec {
     pub columns: Vec<PartitionColumnDef>,
 }
 
+/// One key of a sort spec: a SQL expression and how it orders. Every
+/// field is stored verbatim as DuckLake writes it — the expression and its
+/// `dialect`, the `sort_direction` (`ASC`/`DESC`), the `null_order`
+/// (`NULLS_FIRST`/`NULLS_LAST`) — and moraine parses or evaluates none of
+/// them.
+///
+/// Note the contrast with [`PartitionColumnDef`]: a sort key names its
+/// column inside the expression string, not by field id, so a column
+/// rename does not carry into the spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKeyDef {
+    /// The sort expression, verbatim.
+    pub expression: String,
+    /// The SQL dialect the expression is written in.
+    pub dialect: String,
+    /// The sort direction, verbatim.
+    pub sort_direction: String,
+    /// The null placement, verbatim.
+    pub null_order: String,
+}
+
+/// A table's sort spec: its sort keys in order. A table has at most one
+/// live spec; setting a new one ends the old. Unlike a partition spec, no
+/// data file records the sort spec it was written under — a sort spec is a
+/// write-time instruction, not file provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortSpec {
+    /// The spec's id.
+    pub id: SortId,
+    /// The sort keys, in `sort_key_index` order.
+    pub keys: Vec<SortKeyDef>,
+}
+
 /// A catalog object a tag can be attached to. Schemas, tables, and views
 /// share one id space, so the variant selects which entity the verb
 /// validates against and how the change is classified, not how the tag is
@@ -224,6 +269,17 @@ pub struct DataFileInfo {
     pub row_id_start: Option<u64>,
     /// Encryption key material, verbatim.
     pub encryption_key: Option<String>,
+    /// The partition spec the file was written under, if any. Files
+    /// written under different specs coexist, each naming its own.
+    pub partition_id: Option<PartitionId>,
+    /// The file's value per key of that spec, in key order.
+    pub partition_values: Vec<String>,
+    /// The newest snapshot among the file's rows, when they were inserted
+    /// across more than one — a flush carries rows from every snapshot it
+    /// drains, so its record is backdated to the earliest and bounded
+    /// here by the latest. `None` when every row arrived at the file's
+    /// begin snapshot.
+    pub partial_max: Option<SnapshotId>,
 }
 
 /// A live delete file, as read from a snapshot.
@@ -522,16 +578,30 @@ pub struct RowLocation {
 }
 
 /// A column definition: the input to table creation and column addition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A nested type is a *tree*, not a type string to parse: the parent carries
+/// DuckLake's marker (`"STRUCT"`, `"LIST"`, `"MAP"`) as its
+/// [`column_type`](Self::column_type) and its fields as
+/// [`children`](Self::children). That is exactly the shape DuckLake itself
+/// authors over the staged-row path — a parent row plus one row per field —
+/// so both paths write the same records, and moraine never has to parse a
+/// SQL type string to find out what a column contains.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ColumnDef {
-    /// Column name, unique among the table's live columns.
+    /// Column name, unique among its **siblings**: DuckLake scopes a nested
+    /// field's name to its parent, so two structs may each hold an `x`.
     pub name: String,
-    /// Column type, as a DuckLake type string (e.g. `"BIGINT"`).
+    /// Column type, as a DuckLake type string (e.g. `"BIGINT"`), or a
+    /// nested-type marker when [`children`](Self::children) is non-empty.
     pub column_type: String,
     /// Whether NULL values are allowed.
     pub nulls_allowed: bool,
     /// Default value expression, if any.
     pub default_value: Option<String>,
+    /// The type's fields, in declaration order; empty for a scalar. A
+    /// `LIST`'s single child is conventionally named `element`, as DuckLake
+    /// names it.
+    pub children: Vec<ColumnDef>,
 }
 
 /// A live column: its definition plus identity and position.
@@ -648,6 +718,13 @@ pub struct FlushedDataFile {
     /// The snapshot the file record is backdated to: the earliest
     /// `begin_snapshot` among the rows it carries.
     pub begin_snapshot: SnapshotId,
+    /// The latest `begin_snapshot` among those rows, when the file
+    /// collects rows from more than one snapshot. A reader needs both
+    /// bounds: the record is live from the earliest, and rows newer than
+    /// the snapshot being read must be filtered out per row against the
+    /// file's own snapshot column. `None` when every row shares the
+    /// backdated snapshot.
+    pub partial_max: Option<SnapshotId>,
 }
 
 /// One inlined row, with the Arrow IPC bytes a caller needs to decode it.

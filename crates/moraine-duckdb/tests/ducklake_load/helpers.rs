@@ -94,12 +94,14 @@ pub fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
                             column_type: "BIGINT".into(),
                             nulls_allowed: false,
                             default_value: None,
+                            children: Vec::new(),
                         },
                         ColumnDef {
                             name: "amount".into(),
                             column_type: "DOUBLE".into(),
                             nulls_allowed: true,
                             default_value: None,
+                            children: Vec::new(),
                         },
                     ],
                 )?;
@@ -113,6 +115,7 @@ pub fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
                         file_size_bytes,
                         footer_size,
                         encryption_key: None,
+                        partition_values: vec![],
                         column_stats: vec![],
                     },
                     &[],
@@ -420,6 +423,72 @@ pub fn run_ducklake_sql_with_pause(
     assert_session_ok(output, "paused ducklake session", after)
 }
 
+/// Runs `before` in a held-open session, waits `settle`, runs `during` —
+/// a *second* process against the same store — then runs `after` in the
+/// first session and returns its raw output.
+///
+/// The one shape that answers a question about what a second attach does to
+/// a live writer. Two `-c` sessions cannot: the first has already exited
+/// and dropped its epoch by the time the second opens. `settle` gives
+/// `before` time to execute, since the CLI reads stdin on its own schedule.
+///
+/// Success is not asserted — `after` failing is a legitimate answer, and
+/// the assertion is the caller's.
+pub fn run_ducklake_sql_around(
+    store_dir: &Path,
+    data_path: &Path,
+    before: &str,
+    settle: std::time::Duration,
+    during: impl FnOnce(),
+    after: &str,
+) -> std::process::Output {
+    use std::io::Write;
+
+    let mut child = Command::new(cli_path())
+        .arg("-unsigned")
+        .arg("-csv")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn duckdb CLI");
+
+    let preamble = format!(
+        "SET threads=1;\n\
+         SET extension_directory='{}';\n\
+         INSTALL ducklake;\n\
+         LOAD ducklake;\n\
+         LOAD '{}';\n\
+         ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');\n",
+        extension_directory().display(),
+        ext_path().display(),
+        store_dir.display(),
+        data_path.display(),
+    );
+
+    {
+        // Dropping stdin at the end of this block closes the pipe, so the
+        // CLI sees EOF and exits rather than waiting for more input.
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(preamble.as_bytes())
+            .expect("write the preamble");
+        stdin
+            .write_all(before.as_bytes())
+            .expect("write the first statements");
+        stdin.flush().expect("flush the first statements");
+        std::thread::sleep(settle);
+
+        during();
+
+        stdin
+            .write_all(after.as_bytes())
+            .expect("write the second statements");
+    }
+
+    child.wait_with_output().expect("await duckdb CLI")
+}
+
 /// Asserts the session succeeded and returns its stdout.
 pub fn assert_session_ok(output: std::process::Output, context: &str, sql: &str) -> String {
     assert!(
@@ -605,6 +674,31 @@ pub fn run_ducklake_read_only_sql(store_dir: &Path, data_path: &Path, sql: &str)
         sql,
     );
     assert_session_ok(output, "read-only ducklake attach", sql)
+}
+
+/// As [`run_ducklake_read_only_sql`], but for a statement that must fail
+/// on a reader: returns the CLI's combined output for the caller to assert
+/// on.
+pub fn run_ducklake_read_only_sql_expect_err(
+    store_dir: &Path,
+    data_path: &Path,
+    sql: &str,
+) -> String {
+    let output = run_session(
+        &Attach::Moraine {
+            store_dir,
+            data_path,
+            options: "",
+            read_only: true,
+        },
+        sql,
+    );
+    assert!(
+        !output.status.success(),
+        "`{sql}` unexpectedly succeeded on a read-only attach:\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    combined_output(&output)
 }
 
 /// As [`run_ducklake_sql`], but returns combined stdout+stderr without

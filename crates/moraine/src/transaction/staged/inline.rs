@@ -1,11 +1,12 @@
 //! Inline-data translation: turning staged inline operations into their
 //! `inline/*` store writes.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::{
-    DbTransaction, Error, HashMap, InlineKey, InlineOperation, InlineScanKind, Key, ReadHandle,
-    Result, RowOperation, commit, materialize_inline_rows, proto, store_inline, value,
+    DbTransaction, EntityKey, Error, HashMap, InlineKey, InlineOperation, InlineScanKind, Key,
+    ReadHandle, Result, RowOperation, TableKind, commit, decode::decode_hard_delete,
+    materialize_inline_rows, proto, store_inline, value,
 };
 
 /// Allocates `inline/insert` chunk sequence numbers within one commit: the
@@ -33,13 +34,15 @@ impl ChunkSeqAllocator {
 /// those chunks' rows consumed. Reads `db_tx`'s current (pre-commit)
 /// inline records — the flush op only ever names the table and snapshot,
 /// never the keys to remove.
+///
+/// Returns the row ids drained, which the flushed file now carries.
 pub(crate) async fn translate_inline_flush_delete(
     db_tx: &DbTransaction,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
-) -> Result<()> {
+) -> Result<HashSet<u64>> {
     let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
     let inline_deletes =
         store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
@@ -63,7 +66,9 @@ pub(crate) async fn translate_inline_flush_delete(
     // ones (`ForFlush`) — their `inline/inline_delete` records become orphaned
     // once the owning chunk is gone above, and must go with it.
     let rows = materialize_inline_rows(&scoped, &inline_deletes);
+    let mut drained = HashSet::new();
     for row in InlineScanKind::ForFlush.select(&rows, flush_snapshot, 0) {
+        drained.insert(row.row_id);
         if row.end_snapshot.is_some() {
             writes.push((
                 Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
@@ -76,7 +81,7 @@ pub(crate) async fn translate_inline_flush_delete(
         }
     }
 
-    Ok(())
+    Ok(drained)
 }
 
 /// Removes the named live `inline/file_delete` records, refusing any the
@@ -119,6 +124,68 @@ pub(super) async fn translate_inline_file_delete_removals(
             .encode(),
             None,
         ));
+    }
+    Ok(())
+}
+
+/// The `(table_id, data_file_id)` of every data file this commit
+/// hard-deletes from the catalog.
+///
+/// A hard delete, not an end. A merge subsumes its sources' whole
+/// visibility history into the backdated replacement before pruning their
+/// rows — current and history alike — so nothing can read those files
+/// again. A rewrite instead *ends* its source into history precisely
+/// because a reader below the rewrite must still see the rows it
+/// materialized deletes for, and the deletions making those rows dead have
+/// to remain readable alongside it.
+fn gather_pruned_data_files(ops: &[RowOperation]) -> Result<BTreeSet<(u64, u64)>> {
+    let mut pruned = BTreeSet::new();
+    for op in ops {
+        if let RowOperation::Delete {
+            table: TableKind::DataFile,
+            cells,
+        } = op
+            && let (
+                EntityKey::File {
+                    table_id,
+                    data_file_id,
+                },
+                _,
+            ) = decode_hard_delete(TableKind::DataFile, cells)?
+        {
+            pruned.insert((table_id, data_file_id));
+        }
+    }
+    Ok(pruned)
+}
+
+/// Removes the live `inline/file_delete` records targeting any data file
+/// this commit prunes. Silent on a miss, unlike the DuckLake-driven
+/// removal above: this cascade names files, not records, and a pruned file
+/// carrying no inlined deletion is the ordinary case rather than drift.
+async fn translate_pruned_file_delete_cascade(
+    db_tx: &DbTransaction,
+    pruned: &BTreeSet<(u64, u64)>,
+    writes: &mut Vec<commit::StagedWrite>,
+) -> Result<()> {
+    let tables: BTreeSet<u64> = pruned.iter().map(|(table_id, _)| *table_id).collect();
+    for table_id in tables {
+        for (data_file_id, row_id, _) in
+            store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
+        {
+            if !pruned.contains(&(table_id, data_file_id)) {
+                continue;
+            }
+            writes.push((
+                Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
+                    table_id,
+                    data_file_id,
+                    row_id,
+                }))
+                .encode(),
+                None,
+            ));
+        }
     }
     Ok(())
 }
@@ -328,6 +395,11 @@ pub(super) async fn translate_inline(
 
     for (table_id, removals) in gather_file_delete_removals(ops) {
         translate_inline_file_delete_removals(db_tx, table_id, &removals, &mut writes).await?;
+    }
+
+    let pruned = gather_pruned_data_files(ops)?;
+    if !pruned.is_empty() {
+        translate_pruned_file_delete_cascade(db_tx, &pruned, &mut writes).await?;
     }
 
     for op in ops {

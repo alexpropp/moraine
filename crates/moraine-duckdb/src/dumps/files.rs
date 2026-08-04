@@ -64,6 +64,62 @@ pub struct MoraineDataFileRow {
     pub partial_max: u64,
 }
 
+/// Converts core `ducklake_data_file` records into the C row shape.
+/// Shared by the committed dump and the transaction-aware one, so the
+/// two can never drift in what they report.
+pub(crate) fn data_file_rows(
+    rows: Vec<moraine::ffi_support::DataFileRecord>,
+) -> Result<Vec<MoraineDataFileRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let path = to_c_string(&v.path)?;
+            let file_format = to_c_string(&v.file_format)?;
+            let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
+            Ok((v, path, file_format, encryption_key))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(v, path, file_format, encryption_key)| {
+            let (has_end, end) = opt_u64(v.end_snapshot);
+            let (has_order, order) = opt_u64(v.file_order);
+            let (has_partition, partition) = opt_u64(v.partition_id);
+            let (has_mapping, mapping) = opt_u64(v.mapping_id);
+            let (has_partial_max, partial_max) = opt_u64(v.partial_max);
+            let (has_row_id_start, row_id_start) = opt_u64(v.row_id_start);
+
+            MoraineDataFileRow {
+                data_file_id: v.data_file_id,
+                table_id: v.table_id,
+                begin_snapshot: v.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                has_file_order: has_order,
+                file_order: order,
+                path: path.into_raw(),
+                path_is_relative: v.path_is_relative,
+                file_format: file_format.into_raw(),
+                record_count: v.record_count,
+                file_size_bytes: v.file_size_bytes,
+                footer_size: v.footer_size,
+                has_row_id_start,
+                row_id_start,
+                has_partition_id: has_partition,
+                partition_id: partition,
+                encryption_key: opt_into_raw(encryption_key),
+                has_mapping_id: has_mapping,
+                mapping_id: mapping,
+                has_partial_max,
+                partial_max,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_data_file` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -93,56 +149,7 @@ pub unsafe extern "C" fn moraine_dump_data_files(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_data_files(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|v| {
-                        let path = to_c_string(&v.path)?;
-                        let file_format = to_c_string(&v.file_format)?;
-                        let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
-                        Ok((v, path, file_format, encryption_key))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(v, path, file_format, encryption_key)| {
-                        let (has_end, end) = opt_u64(v.end_snapshot);
-                        let (has_order, order) = opt_u64(v.file_order);
-                        let (has_partition, partition) = opt_u64(v.partition_id);
-                        let (has_mapping, mapping) = opt_u64(v.mapping_id);
-                        let (has_partial_max, partial_max) = opt_u64(v.partial_max);
-                        let (has_row_id_start, row_id_start) = opt_u64(v.row_id_start);
-
-                        MoraineDataFileRow {
-                            data_file_id: v.data_file_id,
-                            table_id: v.table_id,
-                            begin_snapshot: v.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                            has_file_order: has_order,
-                            file_order: order,
-                            path: path.into_raw(),
-                            path_is_relative: v.path_is_relative,
-                            file_format: file_format.into_raw(),
-                            record_count: v.record_count,
-                            file_size_bytes: v.file_size_bytes,
-                            footer_size: v.footer_size,
-                            has_row_id_start,
-                            row_id_start,
-                            has_partition_id: has_partition,
-                            partition_id: partition,
-                            encryption_key: opt_into_raw(encryption_key),
-                            has_mapping_id: has_mapping,
-                            mapping_id: mapping,
-                            has_partial_max,
-                            partial_max,
-                        }
-                    })
-                    .collect())
-            },
+            data_file_rows,
         )
     }
 }
@@ -201,6 +208,49 @@ pub struct MoraineDeleteFileRow {
     pub partial_max: u64,
 }
 
+/// Converts core `ducklake_delete_file` records into the C row shape. Shared by
+/// the committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn delete_file_rows(
+    rows: Vec<moraine::ffi_support::DeleteFileRecord>,
+) -> Result<Vec<MoraineDeleteFileRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let path = to_c_string(&v.path)?;
+            let format = to_c_string(&v.format)?;
+            let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
+            Ok((v, path, format, encryption_key))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+    Ok(owned
+        .into_iter()
+        .map(|(v, path, format, encryption_key)| {
+            let (has_end, end) = opt_u64(v.end_snapshot);
+            let (has_partial_max, partial_max) = opt_u64(v.partial_max);
+            MoraineDeleteFileRow {
+                delete_file_id: v.delete_file_id,
+                table_id: v.table_id,
+                begin_snapshot: v.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                data_file_id: v.data_file_id,
+                path: path.into_raw(),
+                path_is_relative: v.path_is_relative,
+                format: format.into_raw(),
+                delete_count: v.delete_count,
+                file_size_bytes: v.file_size_bytes,
+                footer_size: v.footer_size,
+                encryption_key: opt_into_raw(encryption_key),
+                has_partial_max,
+                partial_max,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_delete_file` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -230,43 +280,7 @@ pub unsafe extern "C" fn moraine_dump_delete_files(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_delete_files(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|v| {
-                        let path = to_c_string(&v.path)?;
-                        let format = to_c_string(&v.format)?;
-                        let encryption_key = opt_c_string(v.encryption_key.as_deref())?;
-                        Ok((v, path, format, encryption_key))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-                Ok(owned
-                    .into_iter()
-                    .map(|(v, path, format, encryption_key)| {
-                        let (has_end, end) = opt_u64(v.end_snapshot);
-                        let (has_partial_max, partial_max) = opt_u64(v.partial_max);
-                        MoraineDeleteFileRow {
-                            delete_file_id: v.delete_file_id,
-                            table_id: v.table_id,
-                            begin_snapshot: v.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                            data_file_id: v.data_file_id,
-                            path: path.into_raw(),
-                            path_is_relative: v.path_is_relative,
-                            format: format.into_raw(),
-                            delete_count: v.delete_count,
-                            file_size_bytes: v.file_size_bytes,
-                            footer_size: v.footer_size,
-                            encryption_key: opt_into_raw(encryption_key),
-                            has_partial_max,
-                            partial_max,
-                        }
-                    })
-                    .collect())
-            },
+            delete_file_rows,
         )
     }
 }
@@ -307,6 +321,33 @@ pub struct MoraineFilePartitionValueRow {
     pub partition_value: *mut c_char,
 }
 
+/// Converts core `ducklake_file_partition_value` records into the C row
+/// shape. Shared by the committed dump and the transaction-aware one, so
+/// the two can never drift in what they report.
+pub(crate) fn file_partition_value_rows(
+    rows: Vec<moraine::ffi_support::FilePartitionValueRow>,
+) -> Result<Vec<MoraineFilePartitionValueRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let partition_value = to_c_string(&row.partition_value)?;
+            Ok((row, partition_value))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, partition_value)| MoraineFilePartitionValueRow {
+            data_file_id: row.data_file_id,
+            table_id: row.table_id,
+            partition_key_index: row.partition_key_index,
+            partition_value: partition_value.into_raw(),
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_file_partition_value` row — one per embedded
 /// partition value of every data-file record, current and history — into
 /// `*out_items`/`*out_len`.
@@ -341,27 +382,7 @@ pub unsafe extern "C" fn moraine_dump_file_partition_values(
                     catalog,
                 ))
             },
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let partition_value = to_c_string(&row.partition_value)?;
-                        Ok((row, partition_value))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, partition_value)| MoraineFilePartitionValueRow {
-                        data_file_id: row.data_file_id,
-                        table_id: row.table_id,
-                        partition_key_index: row.partition_key_index,
-                        partition_value: partition_value.into_raw(),
-                    })
-                    .collect())
-            },
+            file_partition_value_rows,
         )
     }
 }
@@ -399,6 +420,33 @@ pub struct MoraineScheduledDeletionRow {
     pub schedule_start_micros: i64,
 }
 
+/// Converts core `ducklake_files_scheduled_for_deletion` records into the C row
+/// shape. Shared by the committed dump and the transaction-aware one, so the
+/// two can never drift in what they report.
+pub(crate) fn scheduled_deletion_rows(
+    rows: Vec<moraine::ffi_support::GcFileRecord>,
+) -> Result<Vec<MoraineScheduledDeletionRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let path = to_c_string(&row.path)?;
+            Ok((row, path))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, path)| MoraineScheduledDeletionRow {
+            data_file_id: row.data_file_id,
+            path: path.into_raw(),
+            path_is_relative: row.path_is_relative,
+            schedule_start_micros: row.schedule_start_micros,
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_files_scheduled_for_deletion` row into
 /// `*out_items`/`*out_len`.
 ///
@@ -428,27 +476,7 @@ pub unsafe extern "C" fn moraine_dump_scheduled_deletions(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_scheduled_deletions(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let path = to_c_string(&row.path)?;
-                        Ok((row, path))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, path)| MoraineScheduledDeletionRow {
-                        data_file_id: row.data_file_id,
-                        path: path.into_raw(),
-                        path_is_relative: row.path_is_relative,
-                        schedule_start_micros: row.schedule_start_micros,
-                    })
-                    .collect())
-            },
+            scheduled_deletion_rows,
         )
     }
 }

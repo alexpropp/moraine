@@ -4,8 +4,11 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::Bound,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use object_store::{ObjectStore, path::Path};
@@ -17,22 +20,79 @@ use crate::{
         CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo, FileIndexEntry, IndexDef,
         IndexEntry, IndexId, IndexInfo, IndexState, RecentRow, RowHolder, RowLocation, SnapshotId,
         TableId,
+        census::{
+            CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
+            MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
+        },
         inline::{InlineScanKind, materialize_inline_rows},
-        projection::{ProjectionCache, cache_epoch, cached_head_view, install_head_view_at},
+        projection::{
+            ProjectionCache, cache_epoch, cached_head_view, held_head_view, install_head_view_at,
+        },
         scoped_read,
     },
     error::{Error, Result},
     store::{
+        census::{self as store_census, SegmentSize},
+        compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ReadSession},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
         inline as store_inline,
-        key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
+        key::{
+            IndexKey, IndexKind, InlineOperation, Key, Subspace, index_index_prefix,
+            index_kind_prefix, subspace_prefix,
+        },
         open::{self, StoreBuilder},
     },
     transaction::{MigrationReport, Transaction, commit, index_maintenance, migration},
 };
+
+/// One subspace's row, zeroed when the manifest carries no segment for it.
+fn measure(subspace: SubspaceName, segment: Option<&SegmentSize>) -> SubspaceCensus {
+    SubspaceCensus {
+        subspace,
+        bytes: segment.map_or(0, |segment| segment.bytes),
+        l0_ssts: segment.map_or(0, |segment| segment.l0_ssts),
+        sorted_runs: segment.map_or(0, |segment| segment.sorted_runs),
+        sorted_run_ssts: segment.map_or(0, |segment| segment.sorted_run_ssts),
+        live: None,
+    }
+}
+
+/// Counts the live entries of each measured subspace under one read
+/// session.
+async fn count_live_entries(
+    handle: ReadHandle<'_>,
+    subspaces: &mut [SubspaceCensus],
+) -> Result<()> {
+    for measured in subspaces {
+        // An unknown segment addresses no keys this build can decode, so
+        // there is nothing to scan and no count to report.
+        let Some(subspace) = measured.subspace.subspace() else {
+            continue;
+        };
+        let tally = store_census::scan_live(handle, subspace).await?;
+        measured.live = Some(LiveCount {
+            keys: tally.keys,
+            key_bytes: tally.key_bytes,
+            value_bytes: tally.value_bytes,
+            scheduled_files: tally.scheduled_files,
+        });
+    }
+
+    Ok(())
+}
+
+/// The physical bytes `census` recorded for `subspace`, or zero if it
+/// carries no such subspace.
+fn bytes_of(census: &StoreCensus, subspace: &SubspaceName) -> u64 {
+    census
+        .subspaces
+        .iter()
+        .find(|measured| &measured.subspace == subspace)
+        .map_or(0, |measured| measured.bytes)
+}
 
 /// How many entries one staged build step commits. At roughly a kilobyte
 /// of write-path memory apiece, a step peaks near a gigabyte.
@@ -109,6 +169,46 @@ pub struct MaintenanceReport {
     pub index_entries_reclaimed: u64,
 }
 
+/// How a handle has served its reads, for the diagnostics a slow attach
+/// needs.
+///
+/// A materialization is meant to be rare — one per handle, then the cache
+/// serves — so the count is the diagnostic: a handle reporting hundreds is
+/// rebuilding the catalog per read, which no amount of reclaiming the store
+/// would fix.
+#[derive(Debug, Default)]
+struct ReadTally {
+    materializations: AtomicU64,
+    refreshes: AtomicU64,
+    cache_hits: AtomicU64,
+    materialize_micros: AtomicU64,
+}
+
+impl ReadTally {
+    /// Records a full rebuild and reports it, with the running totals that
+    /// make one attach's behaviour legible in a log.
+    fn materialized(&self, elapsed: Duration) {
+        let count = self.materializations.fetch_add(1, Ordering::Relaxed) + 1;
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let total = self.materialize_micros.fetch_add(micros, Ordering::Relaxed) + micros;
+        info!(
+            elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+            materializations = count,
+            total_micros = total,
+            cache_hits = self.cache_hits.load(Ordering::Relaxed),
+            refreshes = self.refreshes.load(Ordering::Relaxed),
+            "materialized the catalog from `current`"
+        );
+    }
+}
+
+/// Where a store lives, for the admin-surface verbs that address it by
+/// path rather than through the open handle.
+struct StoreLocation {
+    path: String,
+    object_store: Arc<dyn ObjectStore>,
+}
+
 /// The open store behind a catalog: the read-write `Db` writer, or a
 /// read-only `DbReader`. A read-only catalog never opens a `Db`, so it never
 /// fences a live writer.
@@ -149,18 +249,56 @@ pub struct CatalogOptions {
     /// so a durable commit waits only on the object-store PUT — the lowest
     /// latency, at the cost of a busy flush loop. Defaults to 100ms.
     pub flush_interval: Duration,
-    /// Local directory backing SlateDB's on-disk block cache. When set,
-    /// reads are served from a disk-backed cache that survives process
-    /// restarts, so warm queries skip repeat object-store GETs — worthwhile
-    /// for remote (`s3://`) stores, redundant for local ones. `None` (the
-    /// default) uses only SlateDB's in-memory cache.
+    /// Local directory backing SlateDB's on-disk object cache, which holds
+    /// fetched object parts. When set, reads are served from a disk-backed
+    /// cache that survives process restarts, so warm queries skip repeat
+    /// object-store GETs — worthwhile for remote (`s3://`) stores,
+    /// redundant for local ones. `None` (the default) leaves only the
+    /// in-memory caches: a block cache and a metadata cache, both at
+    /// SlateDB's own sizes and not configurable here.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// How many bytes of disk the on-disk object cache may hold. The cap is
+    /// per open catalog, not per directory, so catalogs sharing a
+    /// [`cache_dir`](Self::cache_dir) each spend up to it — size the volume
+    /// for the number of catalogs a process attaches. `None` (the default)
+    /// leaves SlateDB's own cap of 16 GiB in force, and without a
+    /// `cache_dir` there is no object cache to bound. The in-memory caches
+    /// are a separate mechanism and are unaffected.
+    pub cache_size: Option<u64>,
+    /// What to load into the on-disk object cache while the catalog opens,
+    /// so the first query pays no first touch. The load is bounded by
+    /// [`cache_size`](Self::cache_size) and best-effort — a fetch that
+    /// fails is skipped, never fatal — but it is part of the open, so an
+    /// open that preloads returns only once it has. `None` (the default)
+    /// loads nothing, leaving the cache to fill as reads ask for objects.
+    /// Inert without a [`cache_dir`](Self::cache_dir).
+    pub cache_preload: Option<CachePreload>,
+    /// Whether objects this catalog writes are cached as they are written,
+    /// rather than only when something reads them back. A flushed or
+    /// compacted store object then costs one local write and no later
+    /// fetch, and — since store objects are immutable and land atomically
+    /// — a reader sharing the [`cache_dir`](Self::cache_dir) reads what
+    /// the writer cached. Compaction output is cached too, so a merge can
+    /// evict what reads had warmed; `false` (the default) leaves the cache
+    /// filled by reads alone. Inert without a `cache_dir`.
+    pub cache_puts: bool,
     /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
     /// recorded as the stored global `data_path` option when a fresh store
     /// bootstraps, so a later open can read it back
     /// ([`CatalogSnapshot::data_path`](crate::CatalogSnapshot::data_path)).
     /// `None` records nothing.
     pub data_path: Option<String>,
+    /// How often a **read-only** catalog polls object storage for state a
+    /// writer has committed since it last looked.
+    ///
+    /// This is a reader's freshness bound: nothing pushes a commit to it,
+    /// so a read-only catalog can be one poll interval behind the writer,
+    /// and its cached view is served for exactly that long. Shorter means
+    /// fresher reads and more (on S3, billed) manifest and WAL listings.
+    /// Defaults to 10 seconds. Ignored by [`Catalog::open`], which reads
+    /// its own writes, and by a catalog pinned to a
+    /// [`checkpoint`](Self::checkpoint), which polls for nothing.
+    pub reader_poll_interval: Duration,
     /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
     /// as reported by [`Catalog::create_checkpoint`].
     ///
@@ -180,9 +318,57 @@ impl Default for CatalogOptions {
             encrypted: false,
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
+            cache_size: None,
+            cache_preload: None,
+            cache_puts: false,
             data_path: None,
+            reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
         }
+    }
+}
+
+/// How much of a store to load into the on-disk object cache as it opens.
+///
+/// The choice is between paying for freshness and paying for everything:
+/// the newest objects are what a writer's own next reads want, while a
+/// whole store is what a query session wants and is only affordable when
+/// the store is small enough to sit on the local disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePreload {
+    /// The newest objects only — those a compaction has not yet merged
+    /// down. Bounded by how far the store has run since its last merge,
+    /// so an open stays quick.
+    L0,
+    /// Every object the store's manifest references, in full. The open
+    /// waits for a copy of the whole store, so this suits a store that
+    /// fits the cache with room to spare.
+    All,
+}
+
+/// Warns when an `All` preload cannot hold the store it is about to load.
+///
+/// The load stops at the first object that would exceed the cap and says
+/// nothing about having stopped, so an attach that silently warms half a
+/// store looks exactly like one that warmed all of it. Diagnostics only:
+/// a manifest that cannot be read here is left to the open itself to
+/// report, and nothing about the open changes either way.
+async fn warn_if_preload_cannot_fit(options: &CatalogOptions, object_store: Arc<dyn ObjectStore>) {
+    if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
+        return;
+    }
+    let Ok(store_bytes) = store_census::manifest_bytes(&options.path, object_store).await else {
+        return;
+    };
+    if let Some(shortfall) = open::preload_shortfall(store_bytes, options.cache_size) {
+        warn!(
+            path = options.path,
+            store_bytes,
+            cache_size = options.cache_size,
+            shortfall,
+            "preload cannot hold this store: the load stops once the cache is full, leaving \
+             the rest to be fetched on demand"
+        );
     }
 }
 
@@ -210,6 +396,12 @@ pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 #[derive(Clone)]
 pub struct Catalog {
     store: Arc<Store>,
+    // Shared across handle clones: how this attach has served its reads.
+    reads: Arc<ReadTally>,
+    // Where the store lives. Retained because the census and the store
+    // merge reach SlateDB's admin surface, which addresses a store by path
+    // rather than through an open handle.
+    location: Arc<StoreLocation>,
     // Shared across handle clones: decoded projections folded forward on
     // commit, served without rescanning when their head matches.
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
@@ -258,9 +450,14 @@ impl Catalog {
                     .to_string(),
             ));
         }
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
+        let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone());
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts);
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
             .await?;
         info!(
@@ -271,6 +468,11 @@ impl Catalog {
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(Self {
             store: Arc::new(Store::Writer(db)),
+            location: Arc::new(StoreLocation {
+                path: options.path,
+                object_store: located,
+            }),
+            reads: Arc::new(ReadTally::default()),
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
         })
@@ -328,9 +530,16 @@ impl Catalog {
         options: CatalogOptions,
     ) -> Result<Self> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
+        let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts)
+            .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
+
         let reader = commit::open_reader_initialized(store).await?;
         info!(
             path = options.path,
@@ -340,6 +549,11 @@ impl Catalog {
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(Self {
             store: Arc::new(Store::Reader(Arc::new(reader))),
+            location: Arc::new(StoreLocation {
+                path: options.path,
+                object_store: located,
+            }),
+            reads: Arc::new(ReadTally::default()),
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
         })
@@ -396,6 +610,9 @@ impl Catalog {
         let db = StoreBuilder::new(&options.path, object_store.clone())
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts)
             .open_writer()
             .await?;
 
@@ -577,6 +794,7 @@ impl Catalog {
     ///                 column_type: "BIGINT".into(),
     ///                 nulls_allowed: false,
     ///                 default_value: None,
+    ///                 children: Vec::new(),
     ///             }],
     ///         )?;
     ///         // The Arrow bytes are the caller's to produce; moraine stores
@@ -607,7 +825,35 @@ impl Catalog {
     /// ```
     pub async fn recent_rows(&self, table: TableId) -> Result<Vec<RecentRow>> {
         let session = self.begin_read().await?;
-        let outcome = self.scan_recent_rows(&session, table).await;
+        let outcome = self.scan_recent_rows(&session, table, None).await;
+        session.finish();
+
+        outcome
+    }
+
+    /// A table's inlined rows as of `snapshot` (time travel): the rows whose
+    /// insert had landed by then and whose tombstone had not.
+    ///
+    /// Only rows still inlined are found. A flush drains the chunks it
+    /// consumes, so past snapshots of flushed rows read from the backdated
+    /// data file [`CatalogSnapshot::data_files_of`] serves, never from here
+    /// — which is what keeps the rows in exactly one place at every
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::recent_rows`], plus [`Error::NotFound`] if `snapshot` is
+    /// beyond the head and [`Error::SnapshotExpired`] if it has fallen below
+    /// the retention horizon.
+    pub async fn recent_rows_at(
+        &self,
+        table: TableId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<RecentRow>> {
+        let session = self.begin_read().await?;
+        let outcome = self
+            .scan_recent_rows(&session, table, Some(snapshot.get()))
+            .await;
         session.finish();
 
         outcome
@@ -627,21 +873,30 @@ impl Catalog {
             .find(|row| row.row_id == row_id))
     }
 
-    /// The live-at-head inline rows of `table`, read through an open
-    /// session.
+    /// The inline rows of `table` live at `at` (head, when `None`), read
+    /// through an open session.
     async fn scan_recent_rows(
         &self,
         session: &ReadSession,
         table: TableId,
+        at: Option<u64>,
     ) -> Result<Vec<RecentRow>> {
         let handle = session.handle();
         commit::refuse_mid_migration(handle).await?;
-        let head = commit::read_head_id(handle).await?;
+        // Head takes no id and so needs no resolution; a requested snapshot
+        // is resolved exactly as `snapshot_at` resolves one.
+        let read_at = match at {
+            Some(_) => commit::resolve_read_snapshot(handle, at).await?.0,
+            None => commit::read_head_id(handle).await?,
+        };
         let chunks = store_inline::scan_inline_chunks(handle, table.get()).await?;
         let tombstones = store_inline::scan_inline_inline_deletes(handle, table.get()).await?;
 
-        let live =
-            InlineScanKind::Table.select(&materialize_inline_rows(&chunks, &tombstones), head, 0);
+        let live = InlineScanKind::Table.select(
+            &materialize_inline_rows(&chunks, &tombstones),
+            read_at,
+            0,
+        );
         // One body per referenced chunk and one schema per referenced
         // version, however many rows point at them.
         let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
@@ -691,13 +946,21 @@ impl Catalog {
 
     /// Time travel always materializes: the cache holds head views only, and
     /// a past snapshot is reconstructed from `history` rather than advanced
-    /// from a newer state. A read-only catalog also materializes — it has no
-    /// local commits, so nothing ever populates a cache for it to serve.
+    /// from a newer state.
+    ///
+    /// A read-only catalog caches too. It folds no batch of its own — it has
+    /// none — so it advances by replaying the changelog of the commits it
+    /// missed, and the head stamp its cached view carries tells it exactly
+    /// which store state it stands at.
     async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
-        if at.is_some() || !self.maintains_projections() {
+        if at.is_some() {
             let session = self.begin_read().await?;
+            let started = Instant::now();
             let view = commit::materialize(session.handle(), at).await;
             session.finish();
+            if view.is_ok() {
+                self.reads.materialized(started.elapsed());
+            }
 
             return view.map(Arc::new);
         }
@@ -715,16 +978,30 @@ impl Catalog {
         Ok(view)
     }
 
-    /// The cached view when it already stands at head, else a fresh one. A
-    /// reader polling a quiet catalog pays one point read and no copy: the
-    /// committer folds each batch forward, so the cache is normally current.
+    /// The cached view when it already stands at head, a view refreshed
+    /// across the gap when it has fallen behind and the gap is replayable,
+    /// else a fresh materialization. A reader polling a quiet catalog pays
+    /// one point read and no copy: the committer folds each batch forward,
+    /// so the cache is normally current.
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
-        let head = commit::read_head_id(handle).await?;
-        if let Some(cached) = cached_head_view(&self.projections, head) {
+        let head = commit::read_head_value(handle).await?;
+        if let Some(cached) = cached_head_view(&self.projections, &head) {
+            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
 
-        Ok(Arc::new(commit::materialize(handle, None).await?))
+        if let Some(behind) = held_head_view(&self.projections)
+            && let Some(refreshed) = commit::refresh(handle, &behind).await?
+        {
+            self.reads.refreshes.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::new(refreshed));
+        }
+
+        let started = Instant::now();
+        let view = commit::materialize(handle, None).await?;
+        self.reads.materialized(started.elapsed());
+
+        Ok(Arc::new(view))
     }
 
     /// Resolves an equality lookup to the rows currently holding `values`.
@@ -1543,6 +1820,210 @@ impl Catalog {
         Ok(report)
     }
 
+    /// What the store weighs, subspace by subspace.
+    ///
+    /// The default request reads the store's manifest and nothing else —
+    /// two object reads, a cost independent of how large the store is — and
+    /// reports physical bytes, SST counts, and sorted-run counts per
+    /// subspace. Those figures include superseded versions and tombstones,
+    /// which is the point: the gap between them and the live count is what
+    /// [`compact_store`](Self::compact_store) reclaims.
+    ///
+    /// Setting [`CensusRequest::count_live_entries`] adds a scan of every
+    /// subspace, which costs a full read of the store.
+    ///
+    /// Available on a read-only catalog: both legs read, neither writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or, for the scanning leg, the store
+    /// cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, CensusRequest, SubspaceName};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+    ///
+    /// let census = catalog.store_census(CensusRequest::default()).await?;
+    /// // Physical figures count what has been written out, so a store whose
+    /// // commits are still in the write-ahead log reports nothing yet.
+    /// assert!(census.total_bytes() >= 0);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn store_census(&self, request: CensusRequest) -> Result<StoreCensus> {
+        let physical = store_census::read_manifest_census(
+            &self.location.path,
+            Arc::clone(&self.location.object_store),
+        )
+        .await?;
+
+        // Every subspace is reported, whether or not the manifest carries a
+        // segment for it: a subspace absent from the manifest is one whose
+        // writes have not been written out, which is a measurement rather
+        // than a reason to omit the row. Two censuses of one store are then
+        // always comparable row by row.
+        let mut subspaces: Vec<SubspaceCensus> = Subspace::ALL
+            .into_iter()
+            .map(|subspace| {
+                let prefix = subspace_prefix(subspace);
+                measure(SubspaceName::from(subspace), physical.segment(&prefix))
+            })
+            .collect();
+        subspaces.extend(
+            physical
+                .segments
+                .iter()
+                .filter(|segment| {
+                    matches!(
+                        SubspaceName::of_prefix(&segment.prefix),
+                        SubspaceName::Unknown(_)
+                    )
+                })
+                .map(|segment| measure(SubspaceName::of_prefix(&segment.prefix), Some(segment))),
+        );
+
+        if request.count_live_entries {
+            // One session for every subspace, so the counts are one
+            // consistent cut rather than a sequence of unrelated ones.
+            let session = self.begin_read().await?;
+            let counted = count_live_entries(session.handle(), &mut subspaces).await;
+            session.finish();
+            counted?;
+        }
+
+        Ok(StoreCensus {
+            manifest_id: physical.manifest_id,
+            subspaces,
+            objects: physical.objects.map(|totals| StoreObjects {
+                total_objects: totals.total_objects,
+                total_bytes: totals.total_bytes,
+                wal_objects: totals.wal_objects,
+                wal_bytes: totals.wal_bytes,
+                manifest_objects: totals.manifest_objects,
+                manifest_bytes: totals.manifest_bytes,
+                sst_objects: totals.sst_objects,
+                sst_bytes: totals.sst_bytes,
+                other_objects: totals.other_objects,
+                other_bytes: totals.other_bytes,
+            }),
+        })
+    }
+
+    /// Merges each targeted subspace's sorted runs into one, reclaiming the
+    /// superseded versions and tombstones they hold.
+    ///
+    /// moraine plans nothing: SlateDB decides which runs merge into which,
+    /// and the plan it makes for a whole tree destines that tree's bottom
+    /// run — which is what permits dropping a tombstone rather than carrying
+    /// it forward. A subspace with no sorted runs is skipped, as is one
+    /// already being merged.
+    ///
+    /// With [`CompactStoreRequest::wait`] set, the call returns once every
+    /// submitted merge has committed or failed. A merge that outlives the
+    /// wait is **not** cancelled: it keeps running, is reported
+    /// [`MergeOutcome::Pending`], and a later census shows the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
+    /// the compactor that executes a submitted merge runs inside the writer,
+    /// so a reader would queue work nothing would run — or a store error if
+    /// the merge cannot be submitted.
+    pub async fn compact_store(&self, request: CompactStoreRequest) -> Result<CompactStoreReport> {
+        self.writer()?;
+
+        let target = match &request.target {
+            CompactionTarget::WholeStore => None,
+            CompactionTarget::Subspace(name) => match name.subspace() {
+                Some(subspace) => Some(subspace_prefix(subspace)),
+                // An unknown subspace addresses no keys, so there is no
+                // tree to name in a request.
+                None => {
+                    return Err(Error::Configuration(format!(
+                        "{name} is not a subspace this build can merge"
+                    )));
+                }
+            },
+        };
+
+        let before = self.store_census(CensusRequest::default()).await?;
+        let submitted = store_compaction::submit_full_merge(
+            &self.location.path,
+            Arc::clone(&self.location.object_store),
+            target.as_deref(),
+        )
+        .await?;
+
+        let mut merges = Vec::new();
+        for merge in &submitted {
+            let subspace = SubspaceName::of_prefix(&merge.segment);
+            let outcome = match request.wait {
+                None => MergeOutcome::Pending,
+                Some(budget) => match store_compaction::await_merge(
+                    &self.location.path,
+                    Arc::clone(&self.location.object_store),
+                    &merge.compaction,
+                    budget,
+                )
+                .await?
+                {
+                    MergeEnd::Completed => MergeOutcome::Completed,
+                    MergeEnd::Failed => {
+                        MergeOutcome::Failed("the merge ended without committing".to_string())
+                    }
+                    MergeEnd::Pending => MergeOutcome::Pending,
+                },
+            };
+
+            merges.push(SubspaceMerge {
+                subspace: subspace.clone(),
+                outcome,
+                bytes_before: bytes_of(&before, &subspace),
+                bytes_after: None,
+            });
+        }
+
+        // Every subspace the request covered but nothing was submitted for
+        // is reported rather than dropped, so two calls stay comparable.
+        for measured in &before.subspaces {
+            let covered = target
+                .as_ref()
+                .is_none_or(|prefix| SubspaceName::of_prefix(prefix) == measured.subspace);
+            if !covered || merges.iter().any(|m| m.subspace == measured.subspace) {
+                continue;
+            }
+            // The only reason a plan omits a tree: L0 SSTs are not
+            // eligible sources, so a tree without sorted runs has nothing
+            // to merge. A tree already being merged is adopted rather than
+            // omitted, so it never reaches here.
+            merges.push(SubspaceMerge {
+                subspace: measured.subspace.clone(),
+                outcome: MergeOutcome::Skipped("no sorted runs to merge"),
+                bytes_before: measured.bytes,
+                bytes_after: None,
+            });
+        }
+
+        if merges
+            .iter()
+            .any(|merge| merge.outcome == MergeOutcome::Completed)
+        {
+            let after = self.store_census(CensusRequest::default()).await?;
+            for merge in &mut merges {
+                if merge.outcome == MergeOutcome::Completed {
+                    merge.bytes_after = Some(bytes_of(&after, &merge.subspace));
+                }
+            }
+        }
+
+        Ok(CompactStoreReport { merges })
+    }
+
     /// The lowest index id at or after `from` holding an entry of `kind`,
     /// or `None` past the last one. One seek per distinct index present —
     /// the scan stops at the first key rather than walking the range.
@@ -1678,6 +2159,7 @@ impl Catalog {
     ///                 column_type: "BIGINT".into(),
     ///                 nulls_allowed: false,
     ///                 default_value: None,
+    ///                 children: Vec::new(),
     ///             }],
     ///         )?;
     ///         Ok(())

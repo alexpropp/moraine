@@ -46,6 +46,15 @@ pub(crate) enum Operation {
         /// The mutated table's id.
         table_id: u64,
     },
+    /// A table's sort spec was set, changed, or cleared. Classifies as an
+    /// alter — it races a concurrent drop or another spec change — but is
+    /// not schema-changing: DuckLake marks the table altered without
+    /// bumping the schema version, a sort spec never invalidating a
+    /// cross-file compaction.
+    AlterTableSorting {
+        /// The re-sorted table's id.
+        table_id: u64,
+    },
     /// A table was dropped.
     DropTable {
         /// The dropped table's id.
@@ -161,7 +170,8 @@ impl Operation {
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
             | Operation::DropMacro { .. } => true,
-            Operation::RegisterDataFile { .. }
+            Operation::AlterTableSorting { .. }
+            | Operation::RegisterDataFile { .. }
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
             | Operation::ExpireDeleteFile { .. }
@@ -188,6 +198,7 @@ impl Operation {
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
             | Operation::AlterSchema { .. }
+            | Operation::AlterTableSorting { .. }
             | Operation::DropTable { .. }
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
@@ -367,7 +378,7 @@ impl ChangeSet {
                         .insert((schema_name.clone(), table_name.clone()));
                     set.created_table_schema_ids.insert(*schema_id);
                 }
-                Operation::AlterTable { table_id } => {
+                Operation::AlterTable { table_id } | Operation::AlterTableSorting { table_id } => {
                     set.altered_tables.insert(*table_id);
                 }
                 Operation::DropTable { table_id } => {
@@ -568,6 +579,33 @@ impl ChangeSet {
         *self == Self::default()
     }
 
+    /// The tables this commit compacts, when compaction is *all* it does.
+    /// DuckLake refuses to mix compaction with any other change in one
+    /// transaction, so such a commit only re-homes rows: every row it
+    /// re-registers keeps the id and the values it already had.
+    ///
+    /// Empty when the set carries anything else, including a kind this
+    /// binary does not model. The caller's fallback is to do the work it
+    /// would otherwise skip, so an unrecognized change must never widen
+    /// this set.
+    pub(crate) fn compaction_only_tables(&self) -> BTreeSet<u64> {
+        // Taken out of a clone rather than read in place: whatever remains
+        // must equal the default, so a change kind added later is counted
+        // by construction instead of by remembering to list it here.
+        let mut rest = self.clone();
+        let compacted: BTreeSet<u64> = std::mem::take(&mut rest.merge_adjacent_tables)
+            .into_iter()
+            .chain(std::mem::take(&mut rest.rewrite_delete_tables))
+            .chain(std::mem::take(&mut rest.compacted_tables))
+            .collect();
+
+        if rest.is_empty() {
+            compacted
+        } else {
+            BTreeSet::new()
+        }
+    }
+
     fn touches_schema_list(&self) -> bool {
         !self.created_schemas.is_empty() || !self.dropped_schemas.is_empty()
     }
@@ -744,6 +782,36 @@ mod tests {
             expect.deletes_untargeted_files = true;
             expect
         });
+    }
+
+    #[test]
+    fn compaction_only_tables_names_a_pure_compaction() {
+        let set = ChangeSet::parse("merge_adjacent:9,rewrite_delete:4");
+        assert_eq!(set.compaction_only_tables(), BTreeSet::from([4, 9]));
+        // The legacy kind classifies with them.
+        let legacy = ChangeSet::parse("compacted_table:9");
+        assert_eq!(legacy.compaction_only_tables(), BTreeSet::from([9]));
+    }
+
+    /// DuckLake never mixes the two, so a set that does is drift — and
+    /// the caller must do the work it would otherwise skip.
+    #[test]
+    fn compaction_only_tables_is_empty_when_anything_else_changed() {
+        for changes in [
+            "merge_adjacent:9,inserted_into_table:9",
+            "merge_adjacent:9,deleted_from_table:4",
+            "merge_adjacent:9,altered_table:9",
+            // A kind this binary does not model.
+            "merge_adjacent:9,inline_flush:9",
+            "",
+        ] {
+            assert!(
+                ChangeSet::parse(changes)
+                    .compaction_only_tables()
+                    .is_empty(),
+                "{changes:?} must not name a compaction-only table"
+            );
+        }
     }
 
     #[test]
@@ -1160,5 +1228,29 @@ mod tests {
         assert!(!Operation::ExpireDataFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::ExpireDeleteFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::UpdateStats { table_id: 0 }.is_schema_changing());
+    }
+
+    /// A sort change is the one table alter that is not schema-changing,
+    /// and it still conflicts with everything an alter conflicts with.
+    #[test]
+    fn a_sort_change_alters_the_table_without_changing_its_schema() {
+        let sorting = Operation::AlterTableSorting { table_id: 1 };
+        assert!(!sorting.is_schema_changing());
+        assert_eq!(sorting.schema_changed_table_id(), None);
+
+        let sorted = ChangeSet::from_operations(&[sorting]);
+        let dropped = ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]);
+        let altered = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
+        assert!(conflicts(&sorted, &dropped));
+        assert!(conflicts(&sorted, &altered));
+        assert!(conflicts(&sorted, &sorted));
+
+        // An append conflicts with it, as with any alter — DuckLake's
+        // matrix, not a rule sorting gets to soften.
+        let appended = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        assert!(conflicts(&sorted, &appended));
+
+        let elsewhere = ChangeSet::from_operations(&[Operation::AlterTableSorting { table_id: 2 }]);
+        assert!(!conflicts(&sorted, &elsewhere));
     }
 }

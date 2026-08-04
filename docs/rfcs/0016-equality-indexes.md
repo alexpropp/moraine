@@ -345,6 +345,14 @@ Making it configurable means threading it through both commit paths and the
 FFI; that is worth doing if a caller ever has a legitimate reason to raise
 it, and is not yet justified.
 
+The remedy the refusal names — split the load — is only available to a
+writer that chooses its own batch boundaries. A DuckLake maintenance call
+does not: `ducklake_merge_adjacent_files` decides for itself how many files
+one snapshot merges. A commit that derived an entry per merged row would
+therefore hit an unsplittable refusal, and an indexed table past a few
+million rows could never be compacted again. It derives none (Compaction
+derives nothing), so the limit binds only writers who can obey it.
+
 ### What data movement costs the index: nothing
 
 The entry payload is a row id, not a location. Flush re-homes rows from
@@ -356,6 +364,62 @@ scale. No maintenance operation rewrites an entry. This is why live-only
 entries plus row-id payloads is the whole design: every alternative payload
 (file id, chunk key) turns flush and compaction into index rewrites
 proportional to moved rows.
+
+Nothing removes a live index's entries when a data file's *row* leaves the
+catalog, either — the maintenance sweep reclaims only the entries of
+indexes that are themselves dropped. What keeps that sound is an invariant
+worth stating, because it is the thing a future data-file lifecycle could
+break: **a file's rows never leave without either a row-grain deletion
+having already taken their entries, or a replacement carrying them under
+their preserved row ids.** A rewrite materializes deletes that each removed
+their entries when their delete file was registered; its survivors keep the
+entries they already had, untouched, because an entry names a row and not
+the file holding it (Compaction derives nothing). A merge subsumes its
+sources. Expiry and cleanup prune rows a replacement already covers. The
+whole sequence is held to the table's own answer by the e2e test
+`moraine_index_entries_survive_the_data_file_lifecycle`.
+
+A leaked entry would not be silent: a row id no live file's range holds
+resolves as `Inline` rather than being filtered out, so it surfaces as a
+lookup that still finds a deleted value — and, under a unique index, as a
+bogus duplicate rejection when that value is claimed again.
+
+### Compaction derives nothing
+
+That an entry *survives* compaction untouched is the payload argument
+above. The commit path must also decline to re-derive it. A registration
+on an indexed table is otherwise read and derived unconditionally — the
+property that keeps coverage total — but under compaction that read costs
+one scoped read per merged file and one staged entry per row, to write
+back the index that is already there. At scale it is not merely wasted
+work: it is more entries than a commit may stage at all (Commit size is
+bounded), which would leave a large indexed table permanently
+uncompactable.
+
+**The signal is the commit's own change set.** DuckLake refuses to mix
+compaction with any other change in one transaction — a transaction either
+makes changes or compacts, enforced upstream where `changes_made` is built
+— so a snapshot naming `merge_adjacent` or `rewrite_delete` and nothing
+else re-homes rows and does nothing else to them: no ids allocated (RFC
+0008), no values changed, no rows killed. Every entry its files would
+derive is already stored under the same key, so those files are not read
+at all.
+
+The rule is read off the staged `ducklake_snapshot_changes` row, so what
+it trusts is the commit's own account of what it did — the same account
+the conflict matrix already decides races on (RFC 0004). The fallback is
+deliberately one-sided: a change set naming compaction *and* anything else
+— an append, a delete, a kind this binary does not model — names no
+compaction-only table, and every registration in it derives as before.
+Only an account claiming compaction and nothing whatever else skips; every
+less certain reading pays for the read.
+
+**What still derives.** UPDATE also writes row-id-preserving files, but its
+rows' values change; its commits carry `inserted_into_table` /
+`deleted_from_table`, never a compaction kind, so they derive. Inline flush
+likewise — `inline_flush` is a kind moraine does not model, so it can never
+read as compaction-only — and its output re-derives entries idempotently,
+bounded by how much data may sit inlined.
 
 ### Lookups
 
@@ -630,7 +694,10 @@ honoured. Data-file paths resolve against that store.
 rewrite files carry rows that already have entries. Multi entries re-derive
 as idempotent puts (the key includes the row id), and the unique check's
 same-row-id no-op arm (Uniqueness enforcement) covers the rest — so DuckLake
-compaction and UPDATE do not abort against their own existing entries.
+UPDATE and inline flush do not abort against their own existing entries.
+Compaction, whose files are *all* such rows, is skipped before the read
+rather than re-derived (Compaction derives nothing); idempotence is what
+makes the remaining overlap harmless, not what makes it affordable.
 
 **Uniqueness on the SQL write path.** Enforcement hinges on one thing: the
 value-keyed put lands in the same atomic commit that adds the row (Uniqueness
@@ -731,12 +798,15 @@ a delete file, or its resolved row id is named by an inline file-delete
 targets alike.
 
 **Maintenance stays derivation, never removal.** Registering a rewrite
-file only re-derives entries that exist (compaction: the idempotent puts
-and the unique same-row-id no-op arm, Uniqueness enforcement) or adds
-entries for changed values (UPDATE: the paired delete file removes the
-old-value entries in the same commit). No register-side path stages an
-entry delete, so a rewrite cannot drop a surviving row's entry — the
-property that makes re-derivation safe to run unconditionally.
+file only re-derives entries that exist (the idempotent puts and the
+unique same-row-id no-op arm, Uniqueness enforcement) or adds entries for
+changed values (UPDATE: the paired delete file removes the old-value
+entries in the same commit). No register-side path stages an entry
+delete, so a rewrite cannot drop a surviving row's entry — the property
+that makes derivation safe to run without knowing what a file holds. It
+is skipped in exactly one case, decided on the commit's change set rather
+than the file's shape: a commit that only compacts (Compaction derives
+nothing).
 
 Indexed columns keep their positional location (Coverage): rewrite and
 flush outputs are written under the table's current schema with the
@@ -866,6 +936,12 @@ tests against real SlateDB on in-memory `object_store`:
   returns the file's rows; the read touches no non-indexed column. Golden
   file fixtures pin the reader against each indexable type. A staged
   `register_delete_file` removes exactly the named positions' entries.
+- **Compaction skips derivation.** A commit whose change set names only
+  `merge_adjacent` or `rewrite_delete` leaves the `index` range untouched
+  without reading the file it registers — pinned by registering a file
+  that is not on the store at all, which a deriving commit could not
+  commit. A change set mixing a compaction kind with any other still
+  reads and derives.
 - **Rewrite idempotence.** A rewrite file carrying a row-id column derives
   entries under the preserved ids; DuckLake compaction over an indexed
   table (unique included) leaves the `index` range byte-identical and never

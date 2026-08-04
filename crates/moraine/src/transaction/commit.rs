@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
@@ -15,7 +15,7 @@ use crate::{
     catalog::{
         CatalogSnapshot, SnapshotId,
         projection::{
-            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch,
+            ProjectionCache, cache_epoch, cached_head_view, fold_committed_batch, held_head_view,
             install_head_view, install_head_view_at, invalidate_head_view,
         },
     },
@@ -153,7 +153,10 @@ pub(crate) fn non_durable() -> WriteOptions {
 async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
     if read::read_migration(tx).await?.is_some() {
         return Err(Error::Migration(
-            "store is mid-migration; refusing to open".to_string(),
+            "store is mid-migration; refusing to open — Catalog::migrate resumes it from the \
+             durable cursor, and takes a store path rather than an open catalog, so it runs \
+             against a store no attach will touch"
+                .to_string(),
         ));
     }
     match read::read_format(tx).await? {
@@ -167,7 +170,9 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
         Some(format) if format.format_version < MIN_FORMAT_VERSION => {
             Err(Error::Migration(format!(
                 "store format {} predates this binary's minimum ({MIN_FORMAT_VERSION}); \
-             it must be migrated up before this binary can open it",
+             migrate it up with Catalog::migrate, which takes a store path rather than an \
+             open catalog and so runs on this same binary against the store it refuses to \
+             open",
                 format.format_version
             )))
         }
@@ -246,7 +251,10 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
     )?;
     stage(
         Key::Sys(SysKey::Head),
-        value::encode_value(&proto::HeadValue { snapshot_id: 0 }),
+        value::encode_value(&proto::HeadValue {
+            snapshot_id: 0,
+            batch_seq: 0,
+        }),
     )
 }
 
@@ -265,7 +273,14 @@ pub(crate) async fn open_initialized(
     encrypted: bool,
     data_path: Option<&str>,
 ) -> Result<Db> {
+    // Timed for the same reason the read-only open is: a writer open reads
+    // the manifest and replays the log before any catalog work begins.
+    let started = Instant::now();
     let db = store.open_writer().await?;
+    info!(
+        writer_open_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "opened the store read-write"
+    );
     let tx = db
         .begin(IsolationLevel::Snapshot)
         .await
@@ -319,8 +334,22 @@ pub(crate) async fn open_initialized(
 /// bootstraps — a read-only attach against an uninitialized store is refused
 /// (there is nothing committed to read).
 pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<DbReader> {
+    // The substrate open is timed on its own: it reads the manifest, takes
+    // a checkpoint, and — unless pinned to one — replays the write-ahead
+    // log, none of which any per-subspace measurement can see.
+    let started = Instant::now();
     let reader = store.open_reader().await?;
-    match validate_format(ReadHandle::Reader(&reader)).await? {
+    let opened = started.elapsed();
+
+    let started = Instant::now();
+    let format = validate_format(ReadHandle::Reader(&reader)).await?;
+    info!(
+        reader_open_ms = opened.as_secs_f64() * 1_000.0,
+        validate_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "opened the store read-only"
+    );
+
+    match format {
         Some(_) => Ok(reader),
         None => Err(Error::Corruption(
             "store is not an initialized moraine catalog; a read-only attach \
@@ -344,22 +373,56 @@ pub(crate) async fn refuse_mid_migration(tx: ReadHandle<'_>) -> Result<()> {
     }
 }
 
-/// The latest committed snapshot id. An initialized store always has one,
-/// so its absence is corruption rather than an empty catalog.
-pub(crate) async fn read_head_id(tx: ReadHandle<'_>) -> Result<u64> {
-    Ok(read::read_head(tx)
+/// The head record. An initialized store always has one, so its absence is
+/// corruption rather than an empty catalog.
+pub(crate) async fn read_head_value(tx: ReadHandle<'_>) -> Result<proto::HeadValue> {
+    read::read_head(tx)
         .await?
-        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))?
-        .snapshot_id)
+        .ok_or_else(|| Error::Corruption("store has no head pointer".to_string()))
 }
 
-/// Materializes a catalog view through an open transaction, so the view
-/// and any staged writes share one read point. `at: None` reads the head
-/// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
-/// entities live at `s`.
-pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
-    refuse_mid_migration(tx).await?;
+/// The latest committed snapshot id.
+pub(crate) async fn read_head_id(tx: ReadHandle<'_>) -> Result<u64> {
+    Ok(read_head_value(tx).await?.snapshot_id)
+}
+
+/// The head write every batch carries: the snapshot id it leaves at head —
+/// unchanged for a maintenance batch — and a batch count one above the one
+/// standing. Writing it unconditionally is what makes `sys/head` both the
+/// single conflict anchor and a stamp that moves whenever committed state
+/// does.
+pub(crate) async fn head_write(db_tx: &DbTransaction, snapshot_id: u64) -> Result<StagedWrite> {
+    let standing = read_head_value(ReadHandle::Tx(db_tx)).await?;
+
+    Ok((
+        Key::Sys(SysKey::Head).encode(),
+        Some(value::encode_value(&proto::HeadValue {
+            snapshot_id,
+            batch_seq: standing.batch_seq.saturating_add(1),
+        })),
+    ))
+}
+
+/// Resolves a requested read point to the snapshot it reads at and that
+/// snapshot's record. `at: None` resolves to head.
+///
+/// Every read that takes a snapshot id resolves it here, so catalog views
+/// and inlined-row reads refuse the same ids for the same reasons.
+pub(crate) async fn resolve_read_snapshot(
+    tx: ReadHandle<'_>,
+    at: Option<u64>,
+) -> Result<(u64, proto::SnapshotValue)> {
     let head = read_head_id(tx).await?;
+    resolve_below(tx, at, head).await
+}
+
+/// As [`resolve_read_snapshot`], for a caller that has already read head
+/// and would otherwise pay for it twice.
+async fn resolve_below(
+    tx: ReadHandle<'_>,
+    at: Option<u64>,
+    head: u64,
+) -> Result<(u64, proto::SnapshotValue)> {
     let target = match at {
         Some(requested) if requested > head => {
             return Err(Error::NotFound(format!(
@@ -379,18 +442,204 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
              re-resolve from head"
         ))
     })?;
-    let current = read::scan_current_entities(tx).await?;
-    let history = match at {
-        Some(_) => read::scan_history_entities(tx).await?,
-        None => Vec::new(),
+
+    Ok((target, snapshot))
+}
+
+/// Materializes a catalog view through an open transaction, so the view
+/// and any staged writes share one read point. `at: None` reads the head
+/// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
+/// entities live at `s`.
+pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
+    read::consistent(tx, || async move {
+        refuse_mid_migration(tx).await?;
+        let head = read_head_value(tx).await?;
+        let (target, snapshot) = resolve_below(tx, at, head.snapshot_id).await?;
+
+        // Timed apart from the decode that follows: a materialization that
+        // is slow is either fetching `current` or building from it, and the
+        // remedies differ entirely.
+        let started = Instant::now();
+        let current = read::scan_current_entities(tx).await?;
+        let scanned = started.elapsed();
+        let history = match at {
+            Some(_) => read::scan_history_entities(tx).await?,
+            None => Vec::new(),
+        };
+        info!(
+            records = current.len(),
+            scan_ms = scanned.as_secs_f64() * 1_000.0,
+            history_records = history.len(),
+            "scanned `current`"
+        );
+
+        let mut view = CatalogSnapshot::build(snapshot, current, history, at.map(|_| target));
+        // A head view stands at the store state the head record names; a
+        // time-travel view stands outside that lineage and carries none.
+        if at.is_none() {
+            view.batch_seq = head.batch_seq;
+        }
+
+        Ok(view)
+    })
+    .await
+}
+
+/// The largest changelog a commit records. The list rides in the snapshot
+/// record, which DuckLake re-reads every transaction, so it is kept small
+/// deliberately: a DuckLake-sized commit writes on the order of ten keys
+/// and adds a few hundred bytes, while a bulk one blows past the cap,
+/// records nothing, and leaves readers to rescan — which is what a
+/// refresher would choose for that much churn anyway.
+const MAX_REFRESH_KEYS: usize = 256;
+
+/// Above this share of the live catalog, replaying a gap's changelog costs
+/// more than one `current` scan and a refresher rescans instead. Full
+/// materialization is roughly linear in live entities; a replay pays one
+/// point read per changed key plus one per snapshot record in the gap, and
+/// a point read is the dearer of the two, so the crossover sits below
+/// parity rather than at it.
+const REFRESH_CHURN_SHARE: usize = 2;
+
+/// The `current` keys a batch wrote: the changelog a reader replays to
+/// advance a held view across this commit, sorted and deduplicated.
+///
+/// The flag is false — and the list empty — for a batch that wrote more
+/// than [`MAX_REFRESH_KEYS`] of them, or that holds a key this binary
+/// cannot decode. Either way a reader crossing the commit rematerializes.
+fn refresh_keys_of(writes: &[StagedWrite]) -> (Vec<Vec<u8>>, bool) {
+    let mut keys = Vec::new();
+    for (encoded, _) in writes {
+        match Key::decode(encoded) {
+            Ok(Key::Current(_)) => keys.push(encoded.clone()),
+            Ok(_) => {}
+            Err(_) => return (Vec::new(), false),
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.len() > MAX_REFRESH_KEYS {
+        return (Vec::new(), false);
+    }
+
+    (keys, true)
+}
+
+/// How many commits' changelogs the store keeps. Each commit writes its
+/// own and deletes the one `CHANGELOG_WINDOW` snapshots back, so the
+/// subspace is bounded by the window and nothing else has to reclaim it —
+/// not expiry, not a maintenance sweep. A reader further behind than this
+/// rematerializes, which a gap that long would cost it anyway.
+const CHANGELOG_WINDOW: u64 = 64;
+
+/// The changelog writes a batch minting `snapshot_id` carries: its own
+/// record of the `current` keys `writes` names, and the deletion of the
+/// record `CHANGELOG_WINDOW` snapshots back. A batch that recorded no
+/// usable changelog writes nothing but the deletion, so the absent record
+/// is what tells a reader to rematerialize.
+pub(crate) fn changelog_writes(snapshot_id: u64, writes: &[StagedWrite]) -> Vec<StagedWrite> {
+    let (keys, complete) = refresh_keys_of(writes);
+    let mut out = Vec::with_capacity(2);
+    if complete {
+        out.push((
+            Key::Changelog { snapshot_id }.encode(),
+            Some(value::encode_value(&proto::ChangelogValue { keys })),
+        ));
+    }
+    if let Some(expired) = snapshot_id.checked_sub(CHANGELOG_WINDOW) {
+        out.push((
+            Key::Changelog {
+                snapshot_id: expired,
+            }
+            .encode(),
+            None,
+        ));
+    }
+
+    out
+}
+
+/// Advances `base` to the store state `head` names by replaying the
+/// changelog of every snapshot in the gap: each commit recorded the
+/// `current` keys it wrote, so the refresh re-reads exactly those and drops
+/// the ones now absent. Cost is proportional to churn across the gap, not
+/// to catalog size.
+///
+/// Returns `None` when the gap cannot — or should not — be replayed, and
+/// the caller rematerializes:
+///
+/// - head has not moved forward, so there is no changelog to walk;
+/// - a batch landed that minted no snapshot (maintenance reclaims state under a
+///   reused snapshot id), leaving part of the gap unrecorded;
+/// - a snapshot record in the gap has been reclaimed — `base` has fallen below
+///   the retention horizon and its changelog is gone;
+/// - a commit in the gap declined to record its changelog;
+/// - the churn is large enough that one `current` scan is cheaper.
+///
+/// The replay reads head itself rather than being handed it, and runs
+/// under the same consistent cut a materialization does, so the view it
+/// returns is stamped with the state its reads actually observed.
+pub(crate) async fn refresh(
+    tx: ReadHandle<'_>,
+    base: &CatalogSnapshot,
+) -> Result<Option<CatalogSnapshot>> {
+    read::consistent(tx, || async move {
+        let head = read_head_value(tx).await?;
+        let churn_limit = base.live_entity_count() / REFRESH_CHURN_SHARE;
+        replay(tx, base, &head, churn_limit).await
+    })
+    .await
+}
+
+/// One pass of [`refresh`], against the state `head` names, declining a gap
+/// whose churn passes `churn_limit`.
+async fn replay(
+    tx: ReadHandle<'_>,
+    base: &CatalogSnapshot,
+    head: &proto::HeadValue,
+    churn_limit: usize,
+) -> Result<Option<CatalogSnapshot>> {
+    let from = base.snapshot.snapshot_id;
+    let Some(minted) = head.snapshot_id.checked_sub(from).filter(|gap| *gap > 0) else {
+        return Ok(None);
+    };
+    // Every batch moves the count by one, so a gap whose count outruns the
+    // snapshots it minted contains a batch that recorded no changelog.
+    if head.batch_seq.saturating_sub(base.batch_seq) != minted {
+        return Ok(None);
+    }
+
+    let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for snapshot_id in (from + 1)..=head.snapshot_id {
+        let Some(changelog) = read::read_changelog(tx, snapshot_id).await? else {
+            return Ok(None);
+        };
+        keys.extend(changelog.keys);
+        if keys.len() > churn_limit {
+            return Ok(None);
+        }
+    }
+
+    // The gap replays, so the view lands at head and takes head's metadata.
+    let Some(latest) = read::read_snapshot(tx, head.snapshot_id).await? else {
+        return Ok(None);
     };
 
-    Ok(CatalogSnapshot::build(
-        snapshot,
-        current,
-        history,
-        at.map(|_| target),
-    ))
+    // Each key's current value is its post-gap state; an absent one was
+    // ended or reclaimed. That is exactly the write set a fold applies, so
+    // the replay reuses the fold rather than restating every kind's rules.
+    let mut writes: Vec<StagedWrite> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = tx.get(&key).await.map_err(Error::from)?;
+        writes.push((key, value.map(|bytes| bytes.to_vec())));
+    }
+
+    let mut view = base.clone();
+    fold::fold_batch(&mut view, &writes)?;
+    view.snapshot = latest;
+    view.batch_seq = head.batch_seq;
+
+    Ok(Some(view))
 }
 
 /// One staged write: `Some` puts, `None` deletes.
@@ -464,9 +713,10 @@ where
     }
 }
 
-/// The view a commit attempt stages against: the cached one when it already
-/// matches head, else a fresh materialization. Staging against this is what
-/// lets a commit skip the full `current` rescan.
+/// The view a commit attempt stages against: the cached one when it
+/// already matches head, one refreshed across the gap when it has fallen
+/// behind, else a fresh materialization. Staging against this is what lets
+/// a commit skip the full `current` rescan.
 ///
 /// Every read runs through `db_tx`, so the premise view and the
 /// conflict-detection window share one start sequence and no commit can land
@@ -484,12 +734,19 @@ pub(crate) async fn head_view_for(
     // a view of a keyspace mid-rewrite is the writer-side form of the
     // partial read the marker exists to forbid.
     refuse_mid_migration(handle).await?;
-    let head = read_head_id(handle).await?;
-    if let Some(view) = cached_head_view(projections, head) {
+    let head = read_head_value(handle).await?;
+    if let Some(view) = cached_head_view(projections, &head) {
         return Ok(view);
     }
 
-    let view = Arc::new(materialize(handle, None).await?);
+    let view = match held_head_view(projections) {
+        Some(behind) => refresh(handle, &behind).await?,
+        None => None,
+    };
+    let view = match view {
+        Some(refreshed) => Arc::new(refreshed),
+        None => Arc::new(materialize(handle, None).await?),
+    };
     install_head_view_at(projections, epoch, Arc::clone(&view));
 
     Ok(view)
@@ -645,14 +902,11 @@ where
         if writes.is_empty() {
             return Ok(Prepared::Nothing { head });
         }
-        // Re-put the unchanged head as a conflict anchor: every
-        // snapshot-minting commit writes it, so a racing drop of this
-        // option's scope forces a re-run that re-validates the scope
-        // against the winner's state instead of committing blind.
-        writes.push((
-            Key::Sys(SysKey::Head).encode(),
-            Some(value::encode_value(&proto::HeadValue { snapshot_id: head })),
-        ));
+        // Re-put the unchanged head as a conflict anchor: every batch
+        // writes it, so a racing drop of this option's scope forces a
+        // re-run that re-validates the scope against the winner's state
+        // instead of committing blind.
+        writes.push(head_write(db_tx, head).await?);
         stage_writes(db_tx, &writes)?;
         return Ok(Prepared::Staged {
             ours: Box::default(),
@@ -693,6 +947,9 @@ where
         writes.push(schema_version_write(*table_id, new_id, schema_version));
     }
     let ours = ChangeSet::from_operations(&operations);
+    // Derived before the snapshot and head writes join the batch: the
+    // changelog names `current` keys, and those two are not.
+    let changelog = changelog_writes(new_id, &writes);
 
     let snapshot = proto::SnapshotValue {
         snapshot_id: new_id,
@@ -709,6 +966,7 @@ where
         // commit at file grain; `changes_made` carries only the table.
         deleted_data_file_ids: ours.deleted_data_file_ids.iter().copied().collect(),
     };
+    writes.extend(changelog);
     writes.push((
         Key::Snapshot {
             snapshot_id: new_id,
@@ -716,12 +974,7 @@ where
         .encode(),
         Some(value::encode_value(&snapshot)),
     ));
-    writes.push((
-        Key::Sys(SysKey::Head).encode(),
-        Some(value::encode_value(&proto::HeadValue {
-            snapshot_id: new_id,
-        })),
-    ));
+    writes.push(head_write(db_tx, new_id).await?);
     stage_writes(db_tx, &writes)?;
 
     Ok(Prepared::Staged {
@@ -774,6 +1027,49 @@ pub(crate) async fn commit_batch(
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => Ok(Landed::LostRace),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// Runs [`commit_batch`] on a task of its own, putting the durable write
+/// out of reach of the caller's cancellation.
+///
+/// Everything before this call is staged in memory and freely droppable;
+/// the write is the point of no return, and dropping a future parked
+/// inside it cannot retract a batch already issued. Spawning moves it off
+/// the cancellable future, so an interrupt races the *wait*, never the
+/// write.
+pub(crate) fn spawn_commit_batch(
+    db_tx: DbTransaction,
+    head_before: u64,
+    head: u64,
+    writes: Vec<StagedWrite>,
+    base: Arc<CatalogSnapshot>,
+    projections: Arc<std::sync::RwLock<ProjectionCache>>,
+) -> tokio::task::JoinHandle<Result<Landed>> {
+    tokio::spawn(async move {
+        commit_batch(db_tx, head_before, head, &writes, &base, &projections).await
+    })
+}
+
+/// Waits for a spawned durable write to report back.
+///
+/// A task that never reports — cancelled with the runtime, or lost to a
+/// panic — leaves the write's fate unknown, which is the one answer a
+/// caller must not read as "nothing landed". It surfaces as
+/// [`Error::Interrupted`] so the caller re-resolves head instead of
+/// re-driving a commit that may already be durable.
+pub(crate) async fn join_commit_batch(
+    handle: tokio::task::JoinHandle<Result<Landed>>,
+) -> Result<Landed> {
+    match handle.await {
+        Ok(landed) => landed,
+        Err(err) => {
+            warn!(error = %err, "the durable write did not report back; its outcome is unknown");
+            Err(Error::Interrupted(format!(
+                "the durable write did not report back ({err}); it may or may not have \
+                 landed — re-resolve head before re-driving"
+            )))
+        }
     }
 }
 

@@ -214,6 +214,13 @@ enum is the executable form of that claim: the test that iterates it matches
 exhaustively, so a new case fails to compile until its guarantee and its
 coverage are both decided.
 
+The enum lives in the library, beside the crash seams, gated on the same
+fault-injection feature. It moved there once `MigrationInterrupted` became
+driven: that case is crashed from *inside* a library call, so the case and
+the seams it stops at have to be able to name each other. Which guarantee
+covers a case, and whether it is driven, stays with the suite — the
+enumeration is the vocabulary both halves index by, not the table itself.
+
 ## Realizing a crash
 
 The harness produces a crash three ways, none of which needs `unsafe`, a
@@ -295,6 +302,14 @@ operation, by dropping a handle, freezing the store, or opening a second
 writer. The one path that needs its own seam hook is RFC 0015's migration
 driver, which carries one: its batch boundaries are internal to a single
 call, so there is no handle to drop between them.
+
+That path needs a second thing the others do not: something to migrate.
+Every format shipped so far is additive, so the driver's registry is empty
+and the public verb is a no-op against every store in the world. The same
+feature that compiles the seams therefore also installs a synthetic unit
+into that registry — the registry the shipped planner reads, not a parallel
+one — so the case is driven through `Catalog::migrate` and covers the
+planner that ships.
 
 ## Test obligations
 

@@ -192,12 +192,14 @@ pub(crate) mod test_support {
                                 column_type: "BIGINT".into(),
                                 nulls_allowed: false,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                             ColumnDef {
                                 name: "amount".into(),
                                 column_type: "DOUBLE".into(),
                                 nulls_allowed: true,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                         ],
                     )?;
@@ -212,6 +214,7 @@ pub(crate) mod test_support {
                             file_size_bytes: 1024,
                             footer_size: 64,
                             encryption_key: Some("a2V5LWRhdGE=".into()),
+                            partition_values: vec![],
                             column_stats: vec![FileColumnStats {
                                 column_id: column,
                                 column_size_bytes: 100,
@@ -297,6 +300,7 @@ pub(crate) mod test_support {
                             column_type: "BIGINT".into(),
                             nulls_allowed: false,
                             default_value: None,
+                            children: Vec::new(),
                         }],
                     )?;
                     Ok(())

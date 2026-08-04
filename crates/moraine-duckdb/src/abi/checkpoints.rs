@@ -32,7 +32,7 @@ pub struct MoraineCheckpoint {
 
 /// The object store and catalog options a path resolves to. The path-taking
 /// entry points here touch the manifest only, so neither the flush cadence
-/// nor the block cache applies.
+/// nor the on-disk object cache applies.
 fn resolve(
     path: &str,
     s3: *const MoraineS3Config,
@@ -148,7 +148,9 @@ pub unsafe extern "C" fn moraine_checkpoints(
 
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id).map_err(|e| {
+        // A one-shot runtime for one operation, with no host thread
+        // setting to take after: the floor is all it needs.
+        let runtime = new_runtime(log_id, 0).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
                 format!("failed to start tokio runtime: {e}"),
@@ -234,7 +236,9 @@ pub unsafe extern "C" fn moraine_delete_checkpoint(
 
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id).map_err(|e| {
+        // A one-shot runtime for one operation, with no host thread
+        // setting to take after: the floor is all it needs.
+        let runtime = new_runtime(log_id, 0).map_err(|e| {
             AbiError::new(
                 codes::INTERNAL,
                 format!("failed to start tokio runtime: {e}"),

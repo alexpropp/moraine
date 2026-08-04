@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use moraine::{
-    Catalog, CatalogOptions, ColumnId, Error, IndexDef, IndexEntry, IndexKeyValue, IndexState,
-    IntWidth, MaintenanceRequest, TableId,
+    Catalog, CatalogOptions, ColumnId, CrashCase, CrashPoint, Error, IndexDef, IndexEntry,
+    IndexKeyValue, IndexState, IntWidth, MaintenanceRequest, MigrationRequest, OptionScope,
+    SchemaId, SyntheticMigration, TableId, inject_crash, install_migration,
 };
 use object_store::{ObjectStore, memory::InMemory};
 
@@ -23,50 +24,12 @@ use crate::{
     fixtures::{col, datafile},
 };
 
-/// Where a crash can interrupt a state-changing operation. Each variant
-/// names what the process was doing when it died; [`guarantee`] says which
-/// guarantee makes that survivable, and its exhaustive match makes adding
-/// a case without deciding one a compile error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrashCase {
-    /// Batch staged, its WAL flush never reached object storage.
-    CommitNotDurable,
-    /// Flush landed; the process died before the caller was told.
-    CommitDurableNotAcknowledged,
-    /// A drop ending many records at once, crashed at every WAL boundary.
-    MultiTombstoneDrop,
-    /// Several catalog commits staged into one batch.
-    GroupCommit,
-    /// A writer died mid-commit and another took the store over.
-    TakeoverMidCommit,
-    /// The displaced writer woke and tried to commit anyway.
-    FencedWriterResumes,
-    /// An initializer died partway through creating the catalog.
-    GenesisInterrupted,
-    /// Two processes created the same empty catalog at once.
-    ConcurrentGenesis,
-    /// A staged index build died between two of its steps.
-    StagedBuildInterrupted,
-    /// A batched entry reclamation died between two of its batches.
-    ReclamationInterrupted,
-    /// A structural format migration died between two of its batches.
-    MigrationInterrupted,
-}
-
-/// Every case.
-const CASES: [CrashCase; 11] = [
-    CrashCase::CommitNotDurable,
-    CrashCase::CommitDurableNotAcknowledged,
-    CrashCase::MultiTombstoneDrop,
-    CrashCase::GroupCommit,
-    CrashCase::TakeoverMidCommit,
-    CrashCase::FencedWriterResumes,
-    CrashCase::GenesisInterrupted,
-    CrashCase::ConcurrentGenesis,
-    CrashCase::StagedBuildInterrupted,
-    CrashCase::ReclamationInterrupted,
-    CrashCase::MigrationInterrupted,
-];
+/// Every case. [`CrashCase`] is the library's, since one case is crashed
+/// from inside a library call and has to name the seams it stops at;
+/// [`guarantee`] and [`blocked_on`] below are this suite's own table, and
+/// their exhaustive matches make adding a case without deciding both a
+/// compile error.
+const CASES: [CrashCase; 11] = CrashCase::ALL;
 
 /// Why a case is survivable. Which one applies follows from the path: a
 /// path is either one batch or several, never both.
@@ -115,14 +78,8 @@ fn blocked_on(case: CrashCase) -> Option<&'static str> {
         | CrashCase::GenesisInterrupted
         | CrashCase::ConcurrentGenesis
         | CrashCase::StagedBuildInterrupted
-        | CrashCase::ReclamationInterrupted => None,
-
-        CrashCase::MigrationInterrupted => Some(
-            "no migration unit ships: every format so far is additive, so the driver's \
-             registry is empty and the migrate verb cannot put a store mid-migration. \
-             Its four seams are covered against a caller-supplied registry in the \
-             driver's own unit tests until one does",
-        ),
+        | CrashCase::ReclamationInterrupted
+        | CrashCase::MigrationInterrupted => None,
     }
 }
 
@@ -131,9 +88,8 @@ fn blocked_on(case: CrashCase) -> Option<&'static str> {
 /// in [`guarantee`] and [`blocked_on`] cover the other half: a new case
 /// fails to compile until both decisions are made.
 ///
-/// Every case is driven but one, and that one is blocked on a feature
-/// rather than on the harness: no migration unit ships, so no store can be
-/// mid-migration to crash.
+/// Every case is driven. The list stays because a case that stops being
+/// driven has to say so here rather than disappear.
 #[test]
 fn every_case_declares_its_guarantee_and_coverage() {
     let driven: Vec<CrashCase> = CASES
@@ -142,18 +98,7 @@ fn every_case_declares_its_guarantee_and_coverage() {
         .collect();
     assert_eq!(
         driven,
-        vec![
-            CrashCase::CommitNotDurable,
-            CrashCase::CommitDurableNotAcknowledged,
-            CrashCase::MultiTombstoneDrop,
-            CrashCase::GroupCommit,
-            CrashCase::TakeoverMidCommit,
-            CrashCase::FencedWriterResumes,
-            CrashCase::GenesisInterrupted,
-            CrashCase::ConcurrentGenesis,
-            CrashCase::StagedBuildInterrupted,
-            CrashCase::ReclamationInterrupted,
-        ],
+        CASES.to_vec(),
         "driven cases changed; update this list as cases land"
     );
     for expected in [Guarantee::Atomicity, Guarantee::Resumability] {
@@ -671,6 +616,197 @@ async fn interrupted_entry_reclamation_converges_on_re_run() {
     assert_eq!(snapshot.data_files_of(table).len(), 1);
     assert!(snapshot.table_by_id(table).is_some());
     reopened.close().await.unwrap();
+}
+
+/// How many schema-scoped option records the migration case plants. The
+/// rewriting unit moves one per batch, so more than one record means the
+/// crash lands with some moved and some not.
+const PLANTED_OPTIONS: u64 = 3;
+
+/// A catalog carrying [`PLANTED_OPTIONS`] schemas, each with a
+/// schema-scoped `planted` option naming its own id, closed so a migrator
+/// can take the writer.
+#[allow(clippy::unwrap_used)]
+async fn catalog_with_planted_options(backing: &Arc<InMemory>) -> Vec<SchemaId> {
+    let catalog = Catalog::open(backing.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let created = std::cell::RefCell::new(Vec::new());
+    catalog
+        .commit(|tx| {
+            for index in 1..=PLANTED_OPTIONS {
+                let schema = tx.create_schema(&format!("s{index}"))?;
+                tx.set_option(OptionScope::Schema(schema), "planted", &schema.to_string())?;
+                created.borrow_mut().push(schema);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+    created.into_inner()
+}
+
+/// `MigrationInterrupted` — a structural format migration runs as a start
+/// batch planting the marker, one batch per bounded piece of the rewrite,
+/// and a finish batch flipping the format and clearing the marker together.
+/// A crash can land at any of those boundaries.
+///
+/// The one case crashed from *inside* a library call: the boundaries are
+/// internal to `Catalog::migrate`, so [`CrashPoint`] is the only way in.
+/// The unit is installed rather than shipped — every format to date is
+/// additive, so the registry is empty and no store in the world needs a
+/// rewrite — but it runs through the shipped planner, and the verb driving
+/// it is the public one.
+///
+/// What must hold, at every seam: while the marker is down no attach may
+/// open the store at all, and a re-run resumes from what is durable and
+/// moves every record exactly once.
+#[tokio::test]
+async fn interrupted_migration_refuses_readers_and_resumes_exactly_once() {
+    for point in CrashCase::MigrationInterrupted.seams() {
+        let backing: Arc<InMemory> = Arc::new(InMemory::new());
+        let schemas = catalog_with_planted_options(&backing).await;
+
+        install_migration(SyntheticMigration::MoveOptionScope);
+        inject_crash(Some(*point));
+        let crashed = Catalog::migrate(
+            backing.clone(),
+            CatalogOptions::default(),
+            MigrationRequest::default(),
+        )
+        .await;
+
+        // Every seam stops the call. `AfterFinish` stops one that had in
+        // fact completed: the finish batch was already durable, so no
+        // marker is left and the store is coherently new — the caller just
+        // never heard so.
+        assert!(crashed.is_err(), "{point:?}");
+        let completed = *point == CrashPoint::AfterFinish;
+
+        if !completed {
+            // No reader sees the half-rewritten middle. The marker is down,
+            // so the attach refuses rather than serving a keyspace in motion.
+            let refused = Catalog::open(backing.clone(), CatalogOptions::default())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("an attach mid-migration must refuse at {point:?}"));
+            assert!(matches!(refused, Error::Migration(_)), "{point:?}");
+        }
+
+        inject_crash(None);
+        let report = Catalog::migrate(
+            backing.clone(),
+            CatalogOptions::default(),
+            MigrationRequest::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("resume after {point:?}: {error:?}"));
+        assert_eq!(report.resumed, !completed, "{point:?}");
+        if completed {
+            // Nothing left to do: the format already names the target.
+            assert_eq!(report.from_format, report.to_format, "{point:?}");
+            assert!(report.units_run.is_empty(), "{point:?}");
+        } else {
+            assert!(report.to_format > report.from_format, "{point:?}");
+            assert_eq!(report.units_run, vec!["move-option-scope"], "{point:?}");
+        }
+
+        // Coherent, and moved exactly once: every planted record now reads
+        // back at the scope the rewrite moved it to, and none is left behind
+        // at the one it came from.
+        let reopened = Catalog::open(backing.clone(), CatalogOptions::default())
+            .await
+            .unwrap_or_else(|error| panic!("attach after {point:?}: {error:?}"));
+        let snapshot = reopened.snapshot().await.unwrap();
+        for schema in &schemas {
+            assert_eq!(
+                snapshot.option(OptionScope::Table(TableId::new(schema.get())), "planted"),
+                Some(schema.to_string()),
+                "{point:?}"
+            );
+            assert_eq!(
+                snapshot.option(OptionScope::Schema(*schema), "planted"),
+                None,
+                "{point:?}"
+            );
+        }
+        assert_eq!(
+            snapshot.schemas().len(),
+            usize::try_from(PLANTED_OPTIONS).unwrap() + 1,
+            "the rewrite touched options, not schemas, at {point:?}"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    // The registry is thread-local; leave the thread as it was found, since
+    // a single-threaded run reuses it for the next case.
+    install_migration(SyntheticMigration::None);
+}
+
+/// The reader-side half of the migration gate: a marker planted by another
+/// process *after* a read-only handle attached. The gate itself is shared —
+/// every read opens its session through one place, which refuses — and the
+/// read-write side is covered by the case above; what this stages is a
+/// reader that was already live and healthy when the keyspace started
+/// moving.
+///
+/// "Another process" here is another writer handle: the marker is durable
+/// object-storage state, so a second handle over the same store is
+/// indistinguishable from a second process to the reader polling it.
+#[tokio::test]
+async fn a_live_reader_refuses_once_another_writer_plants_a_marker() {
+    let backing: Arc<InMemory> = Arc::new(InMemory::new());
+    let schemas = catalog_with_planted_options(&backing).await;
+
+    let mut options = CatalogOptions::default();
+    options.reader_poll_interval = std::time::Duration::from_millis(5);
+    let reader = Catalog::open_read_only(backing.clone(), options)
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.snapshot().await.unwrap().schemas().len(),
+        schemas.len() + 1,
+        "the reader is healthy before the keyspace starts moving"
+    );
+
+    // A second handle starts a migration and dies at its first seam, leaving
+    // the marker down and the store stamped old.
+    install_migration(SyntheticMigration::MoveOptionScope);
+    inject_crash(Some(CrashPoint::AfterStart));
+    Catalog::migrate(
+        backing.clone(),
+        CatalogOptions::default(),
+        MigrationRequest::default(),
+    )
+    .await
+    .expect_err("the seam stops the migration with its marker durable");
+    inject_crash(None);
+    install_migration(SyntheticMigration::None);
+
+    // The live reader polls, meets the marker, and refuses — the typed
+    // error, not a stale view and not a partial one.
+    let refused = poll_until_refused(&reader).await;
+    assert!(matches!(refused, Error::Migration(_)), "{refused:?}");
+    reader.close().await.unwrap();
+}
+
+/// Reads until one refuses, or panics after long enough that the reader was
+/// plainly never going to notice. A read-only catalog polls object storage
+/// on its own cadence, so the marker becomes visible a poll after it lands.
+#[allow(clippy::unwrap_used)]
+async fn poll_until_refused(reader: &Catalog) -> Error {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match reader.snapshot().await {
+            Err(error) => return error,
+            Ok(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never noticed the marker"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// Asserts an operation stopped short of success once the store froze. It

@@ -237,6 +237,27 @@ the table's own counter, never against a global counter — so the verb path
 and the staged-row path (RFC 0006) assign identical ids to the same
 `CREATE TABLE` or `ADD COLUMN`.
 
+The verb path takes the nested type as a **tree**, not a type string to
+parse: `ColumnDef` carries DuckLake's marker (`STRUCT`, `LIST`, `MAP`) and
+its fields as children, and `create_table`/`add_column` walk it depth
+first, taking the next field id and the next position from the same two
+counters a top-level column draws from. Parsing a SQL type string in the
+core was rejected: DuckLake supplies the decomposition over the staged path
+already, and a type grammar in the catalog layer is a surface that would
+have to track DuckDB's, forever, to stay correct.
+
+Three rules follow from the same row-faithfulness and are pinned against a
+real DuckLake catalog:
+
+- **A field's name is scoped to its parent.** Two structs may each hold an
+  `x`; only siblings collide.
+- **Dropping a nested column drops its whole subtree**, to any depth — a
+  field whose parent is gone is not a column anyone can name, and DuckLake
+  ends parent and descendants in one snapshot.
+- **A table's "last column" refusal counts top-level columns only.**
+  Dropping the last field of a struct leaves the struct, which is still
+  selectable.
+
 ### Column and name mapping for external Parquet
 
 Externally-written Parquet may not carry DuckLake field ids, so DuckLake
@@ -313,6 +334,18 @@ SlateDB on in-memory `object_store` and against real DuckLake SQL in e2e:
   sequence of column operations and an arbitrary snapshot `S`, the column
   set / order / types moraine reconstructs at `S` equals what DuckLake
   reports for the catalog at `S`.
+
+  This is two obligations wearing one sentence, and they are met by two
+  tests. The *rules* half is a core property test: an arbitrary sequence
+  over the verb path, replayed by an independent model that restates the id
+  and position rules, compared at every snapshot the sequence produced —
+  fast, and covering far more sequences than a fixed script. The
+  *agreement-with-DuckLake* half is differential and belongs at the e2e
+  tier: a fixed but longer DDL script fed to both moraine and a stock
+  DuckLake catalog, with the live column set compared at **every** historical
+  version rather than at head, since a divergence that cancels out by head is
+  exactly what a head-only probe cannot see. It stays a fixed script: a
+  proptest that spawns a CLI per case would cost minutes per run.
 - **Field ids are never reused.** Across any sequence including drops and
   re-adds, no `column_id` is ever allocated twice; a dropped id never
   reappears in a later `add`. Drop-then-add yields a strictly larger id.

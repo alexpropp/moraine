@@ -33,6 +33,7 @@
 //!                 column_type: "BIGINT".into(),
 //!                 nulls_allowed: false,
 //!                 default_value: None,
+//!                 children: Vec::new(),
 //!             }],
 //!         )?;
 //!         Ok(())
@@ -60,7 +61,8 @@
 //! stores a chunk of rows in the catalog itself — Arrow IPC bytes the caller
 //! encodes, carried by the same single write the commit already performs —
 //! and the rows draw ids from the table's row-id counter exactly as a
-//! registered file's do. [`Catalog::recent_rows`] reads them back,
+//! registered file's do. [`Catalog::recent_rows`] reads them back — or
+//! [`Catalog::recent_rows_at`], for the rows a past snapshot saw —
 //! [`Transaction::inline_delete`] tombstones one, and
 //! [`Transaction::flush_inlined_data`] drains them into a data file the
 //! caller wrote, preserving their ids and backdating the file's record so
@@ -127,13 +129,54 @@
 //! Deciding what is dead rests on catalog ids never being reused, so a
 //! sweep can run alongside a live writer without coordinating with it.
 //!
-//! This is the *only* reclamation moraine owns. Snapshot expiry, file
-//! cleanup, and compaction belong to DuckLake and run through its own
-//! functions; the SlateDB store collects its superseded objects itself,
-//! unprompted. A host embedding this crate calls `maintain` on whatever
-//! cadence it likes — the crate spawns no threads and schedules nothing.
-//! Under the DuckDB extension, all of it is sequenced for you; see that
-//! crate's docs for `moraine_maintenance`.
+//! Beneath the catalog, the store itself accumulates. Every key lives in
+//! a subspace, each subspace is its own tree, and overwriting a key leaves
+//! the old version readable-through until a merge rewrites the SSTs
+//! holding it — which the substrate's own scheduler only does under write
+//! pressure, so a store that goes quiet keeps its dead weight
+//! indefinitely. [`Catalog::store_census`] says where the weight is, from
+//! the store's manifest alone:
+//!
+//! ```
+//! # use std::sync::Arc;
+//! # use moraine::{Catalog, CatalogOptions, CensusRequest, CompactStoreRequest, SubspaceName};
+//! # use object_store::memory::InMemory;
+//! # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+//! let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+//! catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+//!
+//! let census = catalog.store_census(CensusRequest::default()).await?;
+//! // Every subspace is reported, so two censuses compare row by row.
+//! assert!(census.subspaces.iter().any(|s| s.subspace == SubspaceName::Current));
+//!
+//! // ...and the merge collapses a subspace's sorted runs into one.
+//! let report = catalog.compact_store(CompactStoreRequest::default()).await?;
+//! assert!(!report.merges.is_empty());
+//! # Ok::<(), moraine::Error>(()) }).unwrap();
+//! ```
+//!
+//! The census costs a manifest read plus one listing and is available
+//! read-only; its per-subspace figures count SSTs that have been written
+//! out, so a commit still in the write-ahead log is in none of them. The
+//! listing is what catches the rest: [`StoreCensus::unaccounted_bytes`]
+//! reports what the object store holds outside those SSTs, and a large
+//! figure there means a slow attach no merge will fix — an unpinned reader
+//! replays the log before it materializes anything. Ask for
+//! `CensusRequest::count_live_entries` and it also scans, which costs a
+//! full read of the store and is the only way to learn what fraction of a
+//! subspace is live. [`Catalog::compact_store`] then merges: moraine picks
+//! no sources and no destination, and the plan the substrate makes for a
+//! whole tree is what permits dropping a tombstone rather than carrying it
+//! forward. It needs the writer, since the compactor that executes a merge
+//! runs inside it.
+//!
+//! Snapshot expiry, file cleanup, and data-file compaction all belong to
+//! DuckLake and run through its own functions; the SlateDB store collects
+//! its superseded objects itself, unprompted. A host embedding this crate
+//! calls these verbs on whatever cadence it likes — the crate spawns no
+//! threads and schedules nothing. Under the DuckDB extension, all of it is
+//! sequenced for you; see that crate's docs for `moraine_maintenance`,
+//! `moraine_store_census`, and `moraine_compact_store`.
 //!
 //! # Format migration
 //!
@@ -159,8 +202,12 @@
 //! - `fault-injection` — compiles the crash-injection seams the migration
 //!   driver consults between its durable batches, and exposes `CrashPoint` and
 //!   `inject_crash` so a test can arm one and stop a migration at a named
-//!   durable boundary. Off by default; a build without it carries an empty
-//!   function at each seam and no fault surface.
+//!   durable boundary. It also exposes `SyntheticMigration` and
+//!   `install_migration`, which put a unit into the driver's registry — every
+//!   shipped format is additive, so without one there is no migration to crash
+//!   — and `CrashCase`, the enumeration of crash cases the suites drive. Off by
+//!   default; a build without it carries an empty function at each seam, an
+//!   empty installed registry, and no fault surface.
 //!
 //! # Diagnostics
 //!
@@ -193,22 +240,25 @@ mod store;
 mod transaction;
 
 pub use catalog::{
-    Catalog, CatalogOptions, CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo,
-    ColumnOrder, ColumnStats, CommitMember, DataFile, DataFileId, DataFileInfo, DeleteFile,
+    CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest, ColumnAlteration,
+    ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CommitMember, CompactStoreReport,
+    CompactStoreRequest, CompactionTarget, DataFile, DataFileId, DataFileInfo, DeleteFile,
     DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
-    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, MacroId,
-    MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
-    MappingId, MappingInfo, MigrationRequest, NameMappingDef, OptionScope, PartitionColumnDef,
-    PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation, ScheduledDeletion, SchemaId,
-    SchemaInfo, SnapshotId, SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, TagTarget,
-    ViewId, ViewInfo,
+    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, LiveCount,
+    MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport,
+    MaintenanceRequest, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
+    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation,
+    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
+    SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId,
+    TableInfo, TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
-/// Crash-injection seams, for tests that drive a migration to a named
-/// durable boundary and stop it there. Unstable and not part of the semver
-/// contract.
+/// Fault injection: the crash seams a test drives a migration to and stops
+/// it at, the synthetic units that give the migration driver something to
+/// run, and the enumeration of crash cases. Unstable and not part of the
+/// semver contract.
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
-pub use fault::{CrashPoint, inject_crash};
+pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install_migration};
 pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};
 pub use transaction::{MigrationReport, Transaction};

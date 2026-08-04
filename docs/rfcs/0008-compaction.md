@@ -129,6 +129,10 @@ snapshot-minting commit:
 - **`next_row_id` untouched:** compaction stages no `ducklake_table_stats`
   change that advances it; the translation carries whatever DuckLake
   authors, and DuckLake authors no allocation.
+- **Equality-index entries untouched:** entries name rows, not files, and
+  compaction changes neither a row's id nor its values. A commit whose
+  change set is compaction alone stages no index work and does not read
+  the files it registers (RFC 0016).
 
 ### Conflict classification
 

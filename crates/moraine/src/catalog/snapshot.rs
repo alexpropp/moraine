@@ -9,7 +9,8 @@ use crate::{
         IndexId, IndexInfo, IndexState, MacroId, MacroImplementationDef, MacroInfo,
         MacroParameterDef, MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef,
         PartitionId, PartitionSpec, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId,
-        SnapshotInfo, TableId, TableInfo, TableStats, TagEntry, ViewId, ViewInfo,
+        SnapshotInfo, SortId, SortKeyDef, SortSpec, TableId, TableInfo, TableStats, TagEntry,
+        ViewId, ViewInfo,
     },
     error::{Error, Result},
     store::{
@@ -28,14 +29,14 @@ use crate::{
 /// Reads issue no store I/O after the view is built — a `CatalogSnapshot`
 /// is a value, not a cursor. The default value is an empty view at
 /// snapshot 0.
-///
-/// Sort specs carry no read accessor: hosts read them through the ffi
-/// dumps, and the transaction layer diffs the whole per-table map
-/// directly. Partition specs, which the verb surface sets and clears,
-/// have [`partitioning_of`](Self::partitioning_of).
 #[derive(Debug, Clone, Default)]
 pub struct CatalogSnapshot {
     pub(crate) snapshot: SnapshotValue,
+    /// The head record's batch count when this view was built, zero for a
+    /// time-travel view. A maintenance batch changes committed state
+    /// without minting a snapshot, so the snapshot id alone does not say
+    /// which store state a head view stands at; this does.
+    pub(crate) batch_seq: u64,
     pub(crate) schemas: BTreeMap<u64, SchemaValue>,
     pub(crate) tables: BTreeMap<u64, TableValue>,
     pub(crate) views: BTreeMap<u64, ViewValue>,
@@ -171,6 +172,33 @@ impl CatalogSnapshot {
             view.put_record(record);
         }
         view
+    }
+
+    /// How many `current` records this view holds — the size a full
+    /// rematerialization would have to read and decode, and so the scale an
+    /// incremental refresh's churn is weighed against.
+    pub(crate) fn live_entity_count(&self) -> usize {
+        fn nested<K, V>(map: &BTreeMap<u64, BTreeMap<K, V>>) -> usize {
+            map.values().map(BTreeMap::len).sum()
+        }
+
+        self.schemas.len()
+            + self.tables.len()
+            + self.views.len()
+            + self.macros.len()
+            + nested(&self.columns)
+            + nested(&self.data_files)
+            + nested(&self.delete_files)
+            + nested(&self.partitions)
+            + nested(&self.sorts)
+            + nested(&self.mappings)
+            + nested(&self.indexes)
+            + self.table_stats.len()
+            + nested(&self.table_column_stats)
+            + nested(&self.file_column_stats)
+            + self.options.len()
+            + self.tags.len()
+            + self.gc_files.len()
     }
 
     /// Inserts one decoded record into the maps it belongs to, keeping the
@@ -350,6 +378,19 @@ impl CatalogSnapshot {
             .get(&table.get())
             .and_then(|per_table| per_table.values().next())
             .map(partition_spec)
+    }
+
+    /// The table's sort spec live at this view's snapshot, or `None` when
+    /// the table is unsorted. A table has at most one live spec; a store
+    /// carrying more (only reachable through the staged path, which stores
+    /// DuckLake's rows verbatim) yields the lowest-numbered, the one a scan
+    /// in key order meets first.
+    #[must_use]
+    pub fn sorting_of(&self, table: TableId) -> Option<SortSpec> {
+        self.sorts
+            .get(&table.get())
+            .and_then(|per_table| per_table.values().next())
+            .map(sort_spec)
     }
 
     /// A table's live equality indexes, ordered by id.
@@ -802,6 +843,24 @@ fn mapping_info(value: &MappingValue) -> MappingInfo {
     }
 }
 
+fn sort_spec(value: &SortValue) -> SortSpec {
+    let mut expressions: Vec<&crate::store::proto::SortExpression> =
+        value.expressions.iter().collect();
+    expressions.sort_by_key(|expression| expression.sort_key_index);
+    SortSpec {
+        id: SortId::new(value.sort_id),
+        keys: expressions
+            .into_iter()
+            .map(|expression| SortKeyDef {
+                expression: expression.expression.clone(),
+                dialect: expression.dialect.clone(),
+                sort_direction: expression.sort_direction.clone(),
+                null_order: expression.null_order.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn partition_spec(value: &PartitionValue) -> PartitionSpec {
     let mut columns: Vec<&crate::store::proto::PartitionColumn> = value.columns.iter().collect();
     columns.sort_by_key(|column| column.partition_key_index);
@@ -903,7 +962,23 @@ fn data_file_info(value: &DataFileValue) -> DataFileInfo {
         footer_size: value.footer_size,
         row_id_start: value.row_id_start,
         encryption_key: value.encryption_key.clone(),
+        partition_id: value.partition_id.map(PartitionId::new),
+        partition_values: partition_values(value),
+        partial_max: value.partial_max.map(SnapshotId::new),
     }
+}
+
+/// A file's partition values in key order. Stored order is the writer's;
+/// the index is the column, so it decides.
+fn partition_values(value: &DataFileValue) -> Vec<String> {
+    let mut values: Vec<&crate::store::proto::FilePartitionValue> =
+        value.partition_values.iter().collect();
+    values.sort_by_key(|value| value.partition_key_index);
+
+    values
+        .into_iter()
+        .map(|value| value.partition_value.clone())
+        .collect()
 }
 
 fn delete_file_info(value: &DeleteFileValue) -> DeleteFileInfo {

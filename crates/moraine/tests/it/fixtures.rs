@@ -16,6 +16,7 @@ pub fn col(name: &str) -> ColumnDef {
         column_type: "BIGINT".into(),
         nulls_allowed: true,
         default_value: None,
+        children: Vec::new(),
     }
 }
 
@@ -29,6 +30,7 @@ pub fn datafile(rows: u64) -> DataFile {
         file_size_bytes: rows * 10,
         footer_size: 4,
         encryption_key: None,
+        partition_values: vec![],
         column_stats: vec![],
     }
 }

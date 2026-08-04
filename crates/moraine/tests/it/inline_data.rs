@@ -144,6 +144,124 @@ async fn a_tombstoned_row_disappears_from_the_live_rows() {
     assert_eq!(stats.record_count, 3);
 }
 
+/// Time travel over inlined rows: each snapshot sees the rows live at it,
+/// with the tombstoned ones back and the later ones gone.
+#[tokio::test]
+async fn recent_rows_at_reads_the_rows_live_at_a_past_snapshot() {
+    let (catalog, _, table, _) = seeded().await;
+    let inserted = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let tombstoned = catalog
+        .commit(|tx| tx.inline_delete(table, 1, &[]))
+        .await
+        .unwrap();
+    let appended = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let at = async |snapshot| {
+        catalog
+            .recent_rows_at(table, snapshot)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        at(inserted).await,
+        vec![0, 1, 2],
+        "row 1 not yet tombstoned"
+    );
+    assert_eq!(at(tombstoned).await, vec![0, 2]);
+    assert_eq!(at(appended).await, vec![0, 2, 3]);
+    assert_eq!(at(appended).await, row_ids(&catalog, table).await);
+
+    // The bytes travel with the rows: the row read at a past snapshot
+    // carries the chunk it was written into.
+    let past = catalog.recent_rows_at(table, inserted).await.unwrap();
+    assert_eq!(past[1].chunk_body.as_slice(), b"a");
+    assert_eq!(past[1].begin_snapshot, inserted);
+}
+
+/// A snapshot id nobody has minted is refused the same way `snapshot_at`
+/// refuses it — one resolution rule for every read that takes an id.
+#[tokio::test]
+async fn recent_rows_at_refuses_a_snapshot_beyond_the_head() {
+    let (catalog, _, table, _) = seeded().await;
+    let err = catalog
+        .recent_rows_at(table, SnapshotId::new(u64::MAX))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err}");
+}
+
+/// A flush leaves nothing behind for time travel to find: pre-flush
+/// snapshots are served from the backdated Parquet, not from the drained
+/// chunks.
+#[tokio::test]
+async fn recent_rows_at_finds_nothing_once_the_rows_are_flushed() {
+    let (catalog, _, table, _) = seeded().await;
+    let inlined = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.recent_rows_at(table, inlined).await.unwrap().len(),
+        3
+    );
+
+    catalog
+        .commit(move |tx| {
+            tx.flush_inlined_data(
+                table,
+                0,
+                &[FlushedDataFile {
+                    file: DataFile {
+                        record_count: 3,
+                        ..datafile(3)
+                    },
+                    row_id_start: 0,
+                    begin_snapshot: inlined,
+                    partial_max: None,
+                }],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        catalog
+            .recent_rows_at(table, inlined)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        catalog
+            .snapshot_at(inlined)
+            .await
+            .unwrap()
+            .data_files_of(table)
+            .len(),
+        1,
+        "the rows are in the backdated file instead"
+    );
+}
+
 #[tokio::test]
 async fn recent_rows_are_scoped_to_their_table() {
     let (catalog, _, a, b) = seeded().await;
@@ -210,6 +328,7 @@ async fn a_flush_drains_the_chunks_and_registers_the_backdated_file() {
                 file: file.clone(),
                 row_id_start: 0,
                 begin_snapshot: inlined,
+                partial_max: None,
             };
             let ids = tx.flush_inlined_data(table, 0, std::slice::from_ref(&flushed))?;
             assert_eq!(ids.len(), 1);
@@ -271,16 +390,168 @@ async fn a_flush_with_no_files_drains_wholly_tombstoned_chunks() {
     );
 }
 
-/// A drain reads the store as it stood before this commit, so a chunk
-/// inlined in the same commit would survive it while its rows were also
-/// written to the flushed file. Refused rather than double-counted.
+/// One commit both inlines into a table and flushes it. The drain reads
+/// the store as it stood before the commit, so it takes the chunks already
+/// there and leaves the one this commit stages for the next flush.
 #[tokio::test]
-async fn inlining_and_flushing_one_table_in_one_commit_is_refused() {
+async fn one_commit_inlines_into_a_table_and_flushes_it() {
     let (catalog, _, table, _) = seeded().await;
-    let err = catalog
+    let inlined = catalog
         .commit(|tx| {
-            tx.inline_insert(table, &chunk("a", 1), &[])?;
-            tx.flush_inlined_data(table, 0, &[])?;
+            tx.inline_insert(table, &chunk("a", 2), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let file = DataFile {
+        record_count: 2,
+        ..datafile(2)
+    };
+    catalog
+        .commit(move |tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[])?;
+            tx.flush_inlined_data(
+                table,
+                0,
+                &[FlushedDataFile {
+                    file: file.clone(),
+                    row_id_start: 0,
+                    begin_snapshot: inlined,
+                    partial_max: None,
+                }],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let rows = catalog.recent_rows(table).await.unwrap();
+    assert_eq!(
+        row_ids(&catalog, table).await,
+        vec![2],
+        "only the new chunk"
+    );
+    assert_eq!(rows[0].chunk_body.as_slice(), b"b");
+
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(head.data_files_of(table).len(), 1);
+    // Two rows in the file, one still inlined, counted once each.
+    let stats = head.table_stats(table).unwrap();
+    assert_eq!((stats.record_count, stats.next_row_id), (3, 3));
+}
+
+/// The other half of the composition does not hold: a row this commit
+/// tombstones is a row the flush's file already carries as live, and the
+/// tombstone would be dropped with the chunk that is drained out from
+/// under it. Refused, pointing at the delete file that does express it.
+#[tokio::test]
+async fn tombstoning_a_row_the_same_commit_flushes_is_refused() {
+    let (catalog, _, table, _) = seeded().await;
+    let inlined = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("a", 3), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = catalog
+        .commit(move |tx| {
+            tx.inline_delete(table, 1, &[])?;
+            tx.flush_inlined_data(
+                table,
+                0,
+                &[FlushedDataFile {
+                    file: DataFile {
+                        record_count: 3,
+                        ..datafile(3)
+                    },
+                    row_id_start: 0,
+                    begin_snapshot: inlined,
+                    partial_max: None,
+                }],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Constraint(_)), "{err}");
+
+    // Nothing landed: the rows are still inlined and still all live.
+    assert_eq!(row_ids(&catalog, table).await, vec![0, 1, 2]);
+
+    // A tombstone against a version the flush does not drain is untouched
+    // by the rule.
+    catalog
+        .commit(move |tx| {
+            tx.inline_insert(
+                table,
+                &InlineChunk {
+                    schema_version: 1,
+                    arrow_schema: b"schema-v1".to_vec(),
+                    ..chunk("v1", 1)
+                },
+                &[],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    catalog
+        .commit(move |tx| {
+            tx.inline_delete(table, 3, &[])?;
+            tx.flush_inlined_data(
+                table,
+                0,
+                &[FlushedDataFile {
+                    file: DataFile {
+                        record_count: 3,
+                        ..datafile(3)
+                    },
+                    row_id_start: 0,
+                    begin_snapshot: inlined,
+                    partial_max: None,
+                }],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&catalog, table).await, Vec::<u64>::new());
+}
+
+/// The flushed file's ceiling is the ids the table had allocated when the
+/// commit began, so a file cannot claim rows the same commit inlined —
+/// those rows are in the surviving chunk, and counting them in the file
+/// too would put them in two places at once.
+#[tokio::test]
+async fn a_flushed_file_may_not_claim_the_ids_its_own_commit_minted() {
+    let (catalog, _, table, _) = seeded().await;
+    let inlined = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("a", 2), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = catalog
+        .commit(move |tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[])?;
+            tx.flush_inlined_data(
+                table,
+                0,
+                &[FlushedDataFile {
+                    file: DataFile {
+                        record_count: 3,
+                        ..datafile(3)
+                    },
+                    row_id_start: 0,
+                    begin_snapshot: inlined,
+                    partial_max: None,
+                }],
+            )?;
             Ok(())
         })
         .await
@@ -310,6 +581,7 @@ async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
                     file: datafile(2),
                     row_id_start: 0,
                     begin_snapshot: SnapshotId::new(u64::MAX),
+                    partial_max: None,
                 }],
             )?;
             Ok(())
@@ -331,6 +603,7 @@ async fn a_flushed_file_must_be_backdated_and_stay_inside_the_allocated_ids() {
                     file: datafile(2),
                     row_id_start: 1,
                     begin_snapshot: inlined,
+                    partial_max: None,
                 }],
             )?;
             Ok(())
@@ -585,4 +858,101 @@ async fn inlined_rows_survive_a_reopen() {
     assert_eq!(row_ids(&reopened, table).await, vec![0, 1]);
     assert_eq!(rows[0].chunk_body.as_slice(), b"durable");
     assert_eq!(rows[0].arrow_schema.as_slice(), b"schema-v0");
+}
+
+/// A flush that drains rows inlined at several snapshots writes one file
+/// spanning all of them: the record is backdated to the earliest and
+/// bounded by `partial_max`, so a reader knows to filter the file's rows
+/// per row rather than take them all as of the backdated snapshot.
+#[tokio::test]
+async fn a_flushed_file_spanning_snapshots_carries_its_partial_max() {
+    let (catalog, _, table, _) = seeded().await;
+    let first = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("a", 2), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let second = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("b", 1), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .commit(move |tx| {
+            tx.flush_inlined_data(
+                table,
+                0,
+                &[FlushedDataFile {
+                    file: DataFile {
+                        record_count: 3,
+                        ..datafile(3)
+                    },
+                    row_id_start: 0,
+                    begin_snapshot: first,
+                    partial_max: Some(second),
+                }],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let files = catalog.snapshot().await.unwrap().data_files_of(table);
+    assert_eq!(files[0].partial_max, Some(second));
+    // Backdated to the earliest all the same: the file is live at the
+    // snapshot its oldest rows were inlined at.
+    assert_eq!(
+        catalog
+            .snapshot_at(first)
+            .await
+            .unwrap()
+            .data_files_of(table)
+            .len(),
+        1
+    );
+}
+
+/// `partial_max` bounds rows that were already inlined, so it lies at or
+/// above the backdated snapshot and below this commit's.
+#[tokio::test]
+async fn a_partial_max_outside_the_drained_snapshots_is_refused() {
+    let (catalog, _, table, _) = seeded().await;
+    let inlined = catalog
+        .commit(|tx| {
+            tx.inline_insert(table, &chunk("a", 1), &[])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    for partial_max in [
+        SnapshotId::new(inlined.get() - 1),
+        SnapshotId::new(u64::MAX),
+    ] {
+        let err = catalog
+            .commit(move |tx| {
+                tx.flush_inlined_data(
+                    table,
+                    0,
+                    &[FlushedDataFile {
+                        file: DataFile {
+                            record_count: 1,
+                            ..datafile(1)
+                        },
+                        row_id_start: 0,
+                        begin_snapshot: inlined,
+                        partial_max: Some(partial_max),
+                    }],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+    }
 }

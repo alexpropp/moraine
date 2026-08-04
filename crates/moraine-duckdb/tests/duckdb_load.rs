@@ -109,6 +109,7 @@ fn seed(dir: &Path) {
                         column_type: "BIGINT".into(),
                         nulls_allowed: false,
                         default_value: None,
+                        children: Vec::new(),
                     }],
                 )?;
 
@@ -121,12 +122,14 @@ fn seed(dir: &Path) {
                             column_type: "BIGINT".into(),
                             nulls_allowed: false,
                             default_value: None,
+                            children: Vec::new(),
                         },
                         ColumnDef {
                             name: "amount".into(),
                             column_type: "DOUBLE".into(),
                             nulls_allowed: true,
                             default_value: None,
+                            children: Vec::new(),
                         },
                     ],
                 )?;
@@ -140,6 +143,7 @@ fn seed(dir: &Path) {
                         file_size_bytes: 0,
                         footer_size: 0,
                         encryption_key: None,
+                        partition_values: vec![],
                         column_stats: vec![],
                     },
                     &[],
