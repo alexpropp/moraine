@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use object_store::ObjectStore;
 use slatedb::{
-    Db, DbReader,
+    Db, DbReader, DbReaderMode,
     admin::AdminBuilder,
     config::{
         CheckpointOptions, CheckpointScope, DbReaderOptions, ObjectStoreCacheOptions, PreloadLevel,
@@ -203,7 +203,7 @@ impl<'a> StoreBuilder<'a> {
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_options(options);
         if let Some(checkpoint) = self.checkpoint {
-            builder = builder.with_checkpoint_id(checkpoint);
+            builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
         }
         builder.build().await.map_err(Error::from)
     }
@@ -257,7 +257,8 @@ impl<'a> StoreBuilder<'a> {
                 Some(bytes) => Some(usize::try_from(bytes).unwrap_or(usize::MAX)),
                 None => defaults.max_cache_size_bytes,
             },
-            cache_puts: self.cache_puts,
+            cache_on_flush: self.cache_puts,
+            cache_on_compaction: self.cache_puts,
             preload_disk_cache_on_startup: self.cache_preload.map(|preload| match preload {
                 CachePreload::L0 => PreloadLevel::L0Sst,
                 CachePreload::All => PreloadLevel::AllSst,
@@ -543,11 +544,19 @@ mod tests {
     fn cache_puts_is_off_until_requested() {
         let object_store = memory_store();
         let unset = StoreBuilder::new("s", Arc::clone(&object_store));
-        assert!(!unset.cache_options().cache_puts);
+        assert!(!unset.cache_options().cache_on_flush);
+        assert!(!unset.cache_options().cache_on_compaction);
 
         let caching = StoreBuilder::new("s", object_store).cache_puts(true);
-        assert!(caching.cache_options().cache_puts);
-        assert!(caching.settings().object_store_cache_options.cache_puts);
+        assert!(caching.cache_options().cache_on_flush);
+        assert!(caching.cache_options().cache_on_compaction);
+        assert!(caching.settings().object_store_cache_options.cache_on_flush);
+        assert!(
+            caching
+                .settings()
+                .object_store_cache_options
+                .cache_on_compaction
+        );
     }
 
     /// A writer that caches its writes fills the cache directory with what
