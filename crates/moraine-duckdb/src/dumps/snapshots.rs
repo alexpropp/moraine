@@ -138,6 +138,26 @@ pub struct MoraineSchemaVersionRow {
     pub table_id: u64,
 }
 
+/// Converts core `ducklake_schema_versions` records into the C row shape.
+/// Shared by the committed dump and the transaction-aware one, so the two can
+/// never drift in what they report.
+// Infallible — this kind's row carries no strings — but it keeps the
+// fallible signature every converter shares, so `dump_rows` and the
+// transaction-aware dumps take them all the same way.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn schema_version_rows(
+    rows: Vec<moraine::ffi_support::SchemaVersionRow>,
+) -> Result<Vec<MoraineSchemaVersionRow>, AbiError> {
+    Ok(rows
+        .into_iter()
+        .map(|v| MoraineSchemaVersionRow {
+            begin_snapshot: v.begin_snapshot,
+            schema_version: v.schema_version,
+            table_id: v.table_id,
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_schema_versions` row into
 /// `*out_items`/`*out_len`, in snapshot order.
 ///
@@ -167,16 +187,7 @@ pub unsafe extern "C" fn moraine_dump_schema_versions(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_schema_versions(catalog)),
-            |rows| {
-                Ok(rows
-                    .into_iter()
-                    .map(|v| MoraineSchemaVersionRow {
-                        begin_snapshot: v.begin_snapshot,
-                        schema_version: v.schema_version,
-                        table_id: v.table_id,
-                    })
-                    .collect())
-            },
+            schema_version_rows,
         )
     }
 }

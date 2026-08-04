@@ -38,10 +38,6 @@ deliberately not itemized here.
 
 ## 0002 — SlateDB key encoding for catalog state
 
-- **VALIDATE** — Exercise the segmented-store configuration (one-byte segment
-  extractor) through the crash-recovery cases. The segmented path is
-  less-exercised in SlateDB, and the choice is only free to reverse before the
-  first release.
 - **DEFERRED** — If server-side stats pruning is ever added, it needs
   type-aware min/max comparison rather than lexicographic. A wrong compare
   silently drops rows. Part of the single pushdown deferral tracked under 0009.
@@ -66,9 +62,6 @@ deliberately not itemized here.
 
 ## 0005 — Data inlining on SlateDB
 
-- **IMPL** — A column-oriented flush decode path handing the imported
-  `DataChunk` straight to the writer, eliminating the row-by-row
-  `duckdb::Value` materialization and making flush closer to transcode-free.
 - **DEFERRED** — Auto-flush policy: when to trigger an inline flush. This RFC
   specifies only the mechanism; the policy is an operational concern.
 
@@ -85,17 +78,11 @@ deliberately not itemized here.
 
 ## 0007 — Snapshot expiry and garbage collection
 
-- **IMPL** — Read-your-writes for the `dump_*` projections beyond snapshots.
-  Only the snapshot projection overlays the active staged transaction; every
-  other dump opens a fresh read-only transaction, so a cascade SELECT cannot
-  observe its own uncommitted deletes.
 - **DEFERRED** — Expose live reader snapshots at the extension layer so
   operators can size retention windows from observed reader durations.
   Policy-only for now.
 - **DEFERRED** — A moraine-native maintenance and expiry surface, if a
   non-DuckLake consumer appears. v0.1 targets DuckLake parity.
-- **VALIDATE** — Pin interior (non-tail) snapshot expiry via `versions => […]`,
-  confirming nothing in the translation is tail-specific.
 - **VALIDATE** — A verb-path retry whose base predates a concurrent expiry must
   treat a missing intervening snapshot record as conflict-and-refresh, not
   corruption.
@@ -107,10 +94,6 @@ deliberately not itemized here.
 
 - **DEFERRED** — Finer file-set-grain conflict detection, so two compactions of
   disjoint file sets in one table can run concurrently. Table grain today.
-- **VALIDATE** — Pin that a merge never crosses a partition boundary: files
-  spread over two partition values merge to one file per value, never one
-  combined file. The rule is DuckLake's and recorded in the RFC; the pin
-  guards moraine against a future DuckLake that batches differently.
 
 ## 0009 — Reader consistency and snapshot caching
 
@@ -125,21 +108,6 @@ deliberately not itemized here.
 
 ## 0011 — Crash recovery
 
-- **IMPL** — Move `CrashCase` from the integration suite into the library,
-  gated on `#[cfg(any(test, feature = "fault-injection"))]`, once a *driven*
-  case needs an in-code seam hook. It and its coverage table live in
-  `tests/it/crash_recovery.rs` today because no driven case needs one:
-  crashes come from outside the operation. `MigrationInterrupted` is the
-  case that will trip this, since the migration driver's boundaries are
-  internal to one call and its `CrashPoint` seams are the only way in — but
-  it is blocked below, so the move is not yet due.
-- **VALIDATE** — Drive `MigrationInterrupted` at the integration tier.
-  Blocked on the first shipped migration unit: `MIGRATIONS` is empty because
-  every format so far is additive, so `Catalog::migrate` is a no-op against
-  every store and no public path can put one mid-migration. All four seams
-  are covered today in the driver's own unit tests, which drive `Db`
-  directly against a caller-supplied registry — the right assertions at the
-  wrong tier, since RFC 0001 puts crash coverage against the public API.
 - **DEFERRED** — A `cargo-fuzz` target that crashes at arbitrary WAL offsets
   and reopens, asserting the same two guarantees. Every driven case is green,
   so this is now waiting only on the fuzzing tier itself (0001).
@@ -149,17 +117,6 @@ deliberately not itemized here.
 - **DEFERRED** — Define the exact `column_mapping` and `name_mapping` key
   components in 0002's keyspace map once implementation reaches
   external-Parquet interop. The kinds themselves are built.
-- **VALIDATE** — A property test that for an arbitrary sequence of column
-  operations and an arbitrary snapshot `S`, the reconstructed column set,
-  order, and types equal what DuckLake reports. No such proptest exists.
-- **VALIDATE** — After a widening type promotion, reconstruction at a
-  **pre-promotion** snapshot yields the old type. Current coverage asserts
-  promotion at head only.
-- **VALIDATE** — Pin that verb-path `add_column` allocates **nested** field ids
-  as DuckLake does, in pre-order. The flat case is pinned on both paths now —
-  `column_order_numbers_from_one_and_keeps_gaps` for the verb path and
-  `ducklake_column_ids_and_positions_match_stock_ducklake` differentially for
-  the staged one — but nothing covers a nested `STRUCT`'s field ids.
 - **DOC** — Give `ducklake_schema_versions` a named home in 0002's keyspace
   map. It is implemented as a fold into the snapshot record, but the map's
   `snapshot` row never mentions it.
@@ -172,8 +129,6 @@ deliberately not itemized here.
   0009 records why pushdown cannot pay off while the whole catalog is resident,
   so this revives only alongside that decision. If built it must be
   transform-aware and type-aware, never a naive compare.
-- **VALIDATE** — Capture DuckLake's `SET SORTED BY`, sorted-`INSERT`, and
-  `RESET SORTED BY` round trips in the e2e suite to validate the mapping.
 
 ## 0014 — Catalog and data encryption
 
@@ -188,11 +143,6 @@ deliberately not itemized here.
 
 ## 0015 — On-disk format migration
 
-- **DOC** — Name `moraine_migrate` in the below-the-floor refusal, now that
-  an operator has something to run. The typed `Migration` error and the
-  four-way in-range/below-floor/newer/absent split are done, and the arm
-  stays dormant until a rewriting format raises the floor above the base
-  version, so nothing reaches it in the field today.
 - **IMPL** — The first real `v_n → v_{n+1}` unit. The registry ships empty:
   the driver, the unit shape, and the composition are built and tested
   against synthetic units, but every format to date is additive, so no
@@ -201,22 +151,21 @@ deliberately not itemized here.
   its `to_format` is where the keys then live. A test pins the two together
   so that cannot be forgotten, along with the chain shape `chain_from`
   depends on.
-- **VALIDATE** — Drive a real rewrite end to end through SQL once such a unit
-  exists. `moraine_migrate` is only reachable against stores that need
-  nothing today, so the dormant path is covered and the one that moves keys
-  is not yet reachable.
+- **VALIDATE** — Drive a real rewrite end to end through SQL. Blocked on a
+  shipped unit, and on nothing else that is buildable: the core tier drives
+  the whole protocol against a synthetic unit the `fault-injection` feature
+  installs, but the e2e tier loads a *released* extension binary, and
+  building that one with fault injection would ship test scaffolding to
+  every user. So this closes when the first real key-moving format lands,
+  not before — the near-term candidate being 0012's deferred
+  `column_mapping`/`name_mapping` key components, since pinning the key
+  shape of kinds that are already built is a key-moving change.
 - **DEFERRED** — Allowing a trivial, bounded `system`-only migration to
   auto-run on open. The shipping behavior is explicit-verb-only for every
   migration regardless of size; auto-run is a later refinement, not the first
   cut.
 - **DEFERRED** — Rolling a fleet across a structural bump with mixed binary
   versions online.
-- **VALIDATE** — With the marker present, a read-only attach that was already
-  open when the migration started returns the typed error. The gate itself is
-  shared (every read opens its session through one place, which refuses), and
-  the read-write side is covered; what is untested is a reader that meets a
-  marker planted by another process after it attached, which needs a second
-  writer and a manifest poll to stage.
 
 ## 0016 — Equality indexes
 
@@ -257,13 +206,6 @@ deliberately not itemized here.
 
 ## 0017 — Read-write and read-only attach paths
 
-- **VALIDATE** — Whether DuckLake forwards outer `READ_ONLY` into the nested
-  moraine metadata attach. This needs a two-process no-fence probe, not a
-  single-CLI e2e; current coverage exercises the chain but asserts only that
-  rows read back.
-- **DEFERRED** — If DuckLake does not forward it, document `READ_ONLY` on the
-  `moraine:` attach itself as an escape hatch. The option is parsed; the
-  documentation is not written.
 - **DEFERRED** — Fully type the read-only `Catalog` handle so `commit` is
   unavailable at compile time rather than returning `Error::Constraint` at
   runtime (0003).
@@ -303,10 +245,6 @@ deliberately not itemized here.
   production regime extrapolates — what is missing is only the endpoint's
   own latency term, which `object_storage.rs` needs a real bucket to see,
   exactly as the 0004 commit-latency row does.
-- **MEASURE** — Re-time the attach that prompted the read-ahead fix. It was
-  833 s with one materialization costing 276.7 s of it, at ~46 KB/s over
-  S3; the scan now reads 4 MiB ahead with 8 fetches in flight, and what
-  that is worth against real latency is unrecorded.
 - **DECISION** — Whether the read-ahead and fetch-concurrency figures
   (4 MiB, 8) deserve to be attach options. They are moraine's choice today,
   picked to make a scan latency-insensitive rather than measured against a
@@ -322,13 +260,3 @@ deliberately not itemized here.
 - **VALIDATE** — Whether a blocked autocommit caller can still hold something
   the trigger's second connection needs under heavier concurrency. The
   explicit-transaction refusal is currently a guard, not a proof.
-
-## RFC prose to reconcile
-
-Implementation has diverged from these RFCs. Each is either a code gap or an
-RFC edit, and the RFC is binding until edited.
-
-- **0001** marks the real-object-storage test tier as future and not built. It
-  exists, as an integration test plus an xtask target.
-- **0018** says reject UPDATE and DELETE against the mapping tables. UPDATE is
-  rejected; DELETE is deliberately accepted to serve expiry cleanup.

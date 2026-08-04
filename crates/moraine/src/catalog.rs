@@ -19,7 +19,8 @@ pub use census::{
 };
 pub(crate) use handle::SlotStore;
 pub use handle::{
-    Catalog, CatalogOptions, Contention, MaintenanceReport, MaintenanceRequest, MigrationRequest,
+    CachePreload, Catalog, CatalogOptions, Contention, MaintenanceReport, MaintenanceRequest,
+    MigrationRequest,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;

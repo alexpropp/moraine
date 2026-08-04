@@ -107,15 +107,24 @@ protected:
 	}
 
 	// Resolves a rowid the metadata scan emitted (the row's index in the
-	// provider's materialized output — see metadata_tables.cpp) back to
-	// the row itself, re-materializing the provider on first use. Head
-	// stability between the statement's scan and this Sink is a topology
-	// property (see staged_write.hpp's doc comment).
+	// list that scan materialized — see metadata_tables.cpp) back to the row
+	// itself, re-materializing the same list on first use. Head stability
+	// between the statement's scan and this Sink is a topology property (see
+	// staged_write.hpp's doc comment).
+	//
+	// "The same list" is load-bearing: inside a write transaction the scan
+	// serves rows with that transaction's own staged rows over them, so this
+	// must too, or an index would name a different row. It is materialized
+	// once, on the first row this Sink resolves — before this statement has
+	// staged anything of its own, which is what keeps it equal to what the
+	// scan saw.
 	const std::vector<duckdb::Value> &ResolveRow(MetadataDmlState &state, const duckdb::Value &row_id,
 	                                             duckdb::ClientContext &client) const {
 		if (!state.old_rows_loaded) {
 			auto &moraine_catalog = catalog_.Cast<MoraineCatalog>();
-			state.old_rows = spec_.provider(moraine_catalog.Handle(), moraine_shim_is_interrupted, &client);
+			auto tx_rows = MetadataTxAwareRows(client, catalog_, spec_.write_table_kind);
+			state.old_rows = tx_rows ? std::move(*tx_rows)
+			                         : spec_.provider(moraine_catalog.Handle(), moraine_shim_is_interrupted, &client);
 			state.old_rows_loaded = true;
 		}
 		if (row_id.IsNull()) {

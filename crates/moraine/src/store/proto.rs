@@ -17,8 +17,12 @@ mod generated {
 }
 
 // unused_imports: consumers arrive with `catalog`/`transaction`
-// `pub` so `ffi_support` can re-export it as the ABI crate's snapshot row
-// type; reachable only through that `#[doc(hidden)]` seam.
-pub use generated::SnapshotValue;
+// `pub` so `ffi_support` can re-export them as the ABI crate's row types;
+// reachable only through that `#[doc(hidden)]` seam.
 #[allow(unused_imports)]
 pub(crate) use generated::*;
+pub use generated::{
+    ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue, MacroValue,
+    MappingValue, PartitionValue, SchemaValue, SnapshotValue, SortValue, TableColumnStatsValue,
+    TableStatsValue, TableValue, ViewValue,
+};

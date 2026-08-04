@@ -236,17 +236,9 @@ impl Transaction {
                 "table {name} needs at least one column"
             )));
         }
-        let mut seen = HashSet::with_capacity(columns.len());
-        for def in columns {
-            nonempty_name("column", &def.name)?;
-            ensure_inlinable(&def.name, &def.column_type)?;
-            if !seen.insert(&def.name) {
-                return Err(Error::Constraint(format!("duplicate column {}", def.name)));
-            }
-        }
+        validate_column_defs(columns)?;
 
         let table_id = self.alloc_catalog_id();
-        let column_count = columns.len() as u64;
         self.state.put_table(TableValue {
             table_id,
             table_uuid: Uuid::new_v4().to_string(),
@@ -256,18 +248,15 @@ impl Transaction {
             table_name: name.to_owned(),
             path: format!("{name}/"),
             path_is_relative: true,
-            next_column_id: column_count + 1,
+            next_column_id: column_node_count(columns) + 1,
         });
-        // Field ids and positions are both assigned from 1 in declaration
-        // order, as DuckLake assigns them.
-        for (order, def) in columns.iter().enumerate() {
-            self.state.put_column(new_column(
-                table_id,
-                order as u64 + 1,
-                order as u64 + 1,
-                self.new_snapshot_id,
-                def,
-            ));
+        // Field ids and positions are both assigned from 1 in pre-order, as
+        // DuckLake assigns them: a nested field takes the next id after its
+        // parent, before the parent's next sibling.
+        let mut next_id = 1;
+        let mut next_order = 1;
+        for def in columns {
+            self.stage_column_tree(table_id, def, None, &mut next_id, &mut next_order);
         }
         self.state.put_table_stats(TableStatsValue {
             table_id,
@@ -383,38 +372,64 @@ impl Transaction {
     /// Returns [`Error::Unsupported`] if the column's type is one moraine
     /// cannot store.
     pub fn add_column(&mut self, table: TableId, def: &ColumnDef) -> Result<ColumnId> {
-        nonempty_name("column", &def.name)?;
-        ensure_inlinable(&def.name, &def.column_type)?;
+        validate_column_defs(std::slice::from_ref(def))?;
         let value = self.live_table(table)?;
-        self.column_name_free(table, &def.name)?;
+        self.sibling_name_free(table, None, &def.name)?;
         let live_columns = self.state.columns.get(&table.get());
         let live_max_id = live_columns
             .and_then(|cols| cols.keys().max())
             .copied()
             .unwrap_or(0);
-        let column_id = value.next_column_id.max(live_max_id + 1);
+        let mut next_id = value.next_column_id.max(live_max_id + 1);
         // Positions continue past the highest live one, never renumbering, so
         // a dropped column leaves a gap the survivors keep — DuckLake's
         // behaviour. Positions start at 1, so an all-columns-dropped table
         // restarts there rather than at 0.
-        let position = live_columns
+        let mut next_order = live_columns
             .and_then(|cols| cols.values().map(|c| c.column_order).max())
             .map_or(1, |max| max + 1);
-        self.state.put_column(new_column(
-            table.get(),
-            column_id,
-            position,
-            self.new_snapshot_id,
-            def,
-        ));
+        let column_id =
+            self.stage_column_tree(table.get(), def, None, &mut next_id, &mut next_order);
         self.state.put_table(TableValue {
-            next_column_id: column_id + 1,
+            next_column_id: next_id,
             begin_snapshot: self.new_snapshot_id,
             ..value
         });
         self.mark_altered(table.get());
 
         Ok(ColumnId::new(column_id))
+    }
+
+    /// Stages one column and, depth first, every field beneath it, taking
+    /// the next field id and the next position from the same two counters —
+    /// DuckLake's pre-order allocation, where a nested field's id falls
+    /// between its parent's and its parent's next sibling's. Returns the
+    /// root's field id.
+    fn stage_column_tree(
+        &mut self,
+        table_id: u64,
+        def: &ColumnDef,
+        parent_column: Option<u64>,
+        next_id: &mut u64,
+        next_order: &mut u64,
+    ) -> u64 {
+        let column_id = *next_id;
+        let column_order = *next_order;
+        *next_id += 1;
+        *next_order += 1;
+        self.state.put_column(new_column(
+            table_id,
+            column_id,
+            column_order,
+            self.new_snapshot_id,
+            parent_column,
+            def,
+        ));
+        for child in &def.children {
+            self.stage_column_tree(table_id, child, Some(column_id), next_id, next_order);
+        }
+
+        column_id
     }
 
     fn live_column(&self, table: TableId, column: ColumnId) -> Result<ColumnValue> {
@@ -438,12 +453,15 @@ impl Transaction {
             })
     }
 
-    fn column_name_free(&self, table: TableId, name: &str) -> Result<()> {
-        let taken = self
-            .state
-            .columns
-            .get(&table.get())
-            .is_some_and(|cols| cols.values().any(|c| c.column_name == name));
+    /// Refuses a name already taken among `parent`'s fields — the table's
+    /// top-level columns when `parent` is `None`. Sibling scope, not
+    /// table scope: DuckLake nests a field's name inside its parent, so two
+    /// structs may each hold an `x`.
+    fn sibling_name_free(&self, table: TableId, parent: Option<u64>, name: &str) -> Result<()> {
+        let taken = self.state.columns.get(&table.get()).is_some_and(|cols| {
+            cols.values()
+                .any(|c| c.parent_column == parent && c.column_name == name)
+        });
         if taken {
             return Err(Error::AlreadyExists(format!("column {name}")));
         }
@@ -466,11 +484,12 @@ impl Transaction {
         new_name: &str,
     ) -> Result<()> {
         nonempty_name("column", new_name)?;
-        self.column_name_free(table, new_name)?;
+        let current = self.live_column(table, column)?;
+        self.sibling_name_free(table, current.parent_column, new_name)?;
         let value = ColumnValue {
             begin_snapshot: self.new_snapshot_id,
             column_name: new_name.to_string(),
-            ..self.live_column(table, column)?
+            ..current
         };
         self.state.put_column(value);
         self.mark_altered(table.get());
@@ -525,29 +544,65 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns [`Error::NotFound`] if the table or column does not exist.
-    /// Returns [`Error::Constraint`] if this is the last live column of the
-    /// table.
+    /// Returns [`Error::Constraint`] if this is the last live top-level
+    /// column of the table, or if the column or any field beneath it is
+    /// indexed.
+    ///
+    /// Dropping a nested column drops every field beneath it, as DuckLake
+    /// does: a parent and its whole subtree end in the same snapshot, since
+    /// a field with no parent left is not a column anyone can name.
     pub fn drop_column(&mut self, table: TableId, column: ColumnId) -> Result<()> {
-        self.live_column(table, column)?;
-        if self.column_is_indexed(table, column) {
+        let value = self.live_column(table, column)?;
+        let doomed = self.column_subtree(table, column);
+        if let Some(indexed) = doomed
+            .iter()
+            .find(|id| self.column_is_indexed(table, ColumnId::new(**id)))
+        {
             return Err(Error::Constraint(format!(
-                "column {column} of table {table} is indexed; drop the index first"
+                "column {indexed} of table {table} is indexed; drop the index first"
             )));
         }
-        let live = self
-            .state
-            .columns
-            .get(&table.get())
-            .map_or(0, BTreeMap::len);
-        if live <= 1 {
+        // Counted over top-level columns only, and checked only for one:
+        // a table needs a column someone can select, and a nested field is
+        // never that column — dropping the last field of a struct leaves the
+        // struct, which is still selectable.
+        let live_top_level = self.state.columns.get(&table.get()).map_or(0, |cols| {
+            cols.values().filter(|c| c.parent_column.is_none()).count()
+        });
+        if value.parent_column.is_none() && live_top_level <= 1 {
             return Err(Error::Constraint(format!(
                 "column {column} is the last column of table {table}"
             )));
         }
-        self.state.delete_column(table.get(), column.get());
+        for id in doomed {
+            self.state.delete_column(table.get(), id);
+        }
         self.mark_altered(table.get());
 
         Ok(())
+    }
+
+    /// `column` and every field beneath it, parents before their children.
+    /// Depth is unbounded — a struct of structs — so this walks rather than
+    /// looking one level down.
+    fn column_subtree(&self, table: TableId, column: ColumnId) -> Vec<u64> {
+        let Some(columns) = self.state.columns.get(&table.get()) else {
+            return Vec::new();
+        };
+        let mut subtree = vec![column.get()];
+        let mut at = 0;
+        while at < subtree.len() {
+            let parent = subtree[at];
+            at += 1;
+            subtree.extend(
+                columns
+                    .values()
+                    .filter(|c| c.parent_column == Some(parent))
+                    .map(|c| c.column_id),
+            );
+        }
+
+        subtree
     }
 
     /// The table's live partition spec id, if it has one.
@@ -2337,6 +2392,7 @@ fn new_column(
     column_id: u64,
     column_order: u64,
     begin_snapshot: u64,
+    parent_column: Option<u64>,
     def: &ColumnDef,
 ) -> ColumnValue {
     ColumnValue {
@@ -2350,11 +2406,36 @@ fn new_column(
         initial_default: None,
         default_value: def.default_value.clone(),
         nulls_allowed: def.nulls_allowed,
-        parent_column: None,
+        parent_column,
         default_value_type: None,
         default_value_dialect: None,
         tags: vec![],
     }
+}
+
+/// Every node of `defs` in pre-order, validated: names non-empty and unique
+/// among siblings, types storable. Sibling scope is DuckLake's rule — a
+/// nested field's name lives inside its parent, so two structs may each
+/// hold an `x`.
+fn validate_column_defs(defs: &[ColumnDef]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(defs.len());
+    for def in defs {
+        nonempty_name("column", &def.name)?;
+        ensure_inlinable(&def.name, &def.column_type)?;
+        if !seen.insert(&def.name) {
+            return Err(Error::Constraint(format!("duplicate column {}", def.name)));
+        }
+        validate_column_defs(&def.children)?;
+    }
+
+    Ok(())
+}
+
+/// How many column records `defs` becomes: one per node of every tree.
+fn column_node_count(defs: &[ColumnDef]) -> u64 {
+    defs.iter()
+        .map(|def| 1 + column_node_count(&def.children))
+        .sum()
 }
 
 #[cfg(test)]
@@ -2386,13 +2467,199 @@ mod tests {
         Transaction::new(CatalogSnapshot::build(snapshot, vec![], vec![], None), 5)
     }
 
+    /// A nested column: `name` of DuckLake's `struct` marker, holding
+    /// `fields` as its children.
+    fn nested(name: &str, marker: &str, fields: &[ColumnDef]) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            column_type: marker.into(),
+            nulls_allowed: true,
+            default_value: None,
+            children: fields.to_vec(),
+        }
+    }
+
+    /// Every live column as `(id, order, name, parent)`, in id order — the
+    /// shape a `ducklake_column` probe against a real DuckLake catalog
+    /// returns, so the expectations below can be read straight off one.
+    fn column_layout(tx: &Transaction, table: TableId) -> Vec<(u64, u64, String, Option<u64>)> {
+        let mut layout: Vec<(u64, u64, String, Option<u64>)> = tx
+            .columns_of(table)
+            .into_iter()
+            .map(|c| {
+                (
+                    c.id.get(),
+                    c.position,
+                    c.name,
+                    c.parent_column.map(ColumnId::get),
+                )
+            })
+            .collect();
+        layout.sort_by_key(|(id, ..)| *id);
+        layout
+    }
+
     fn col(name: &str) -> ColumnDef {
         ColumnDef {
             name: name.into(),
             column_type: "BIGINT".into(),
             nulls_allowed: true,
             default_value: None,
+            children: Vec::new(),
         }
+    }
+
+    /// Nested field ids are allocated in **pre-order**, from the same two
+    /// counters top-level columns draw from: a field takes the next id after
+    /// its parent, before its parent's next sibling, and `column_order`
+    /// tracks it step for step.
+    ///
+    /// The expectation is stock DuckLake's, read off a real catalog fed
+    /// `CREATE TABLE t(a BIGINT, s STRUCT(x BIGINT, y VARCHAR), l BIGINT[])`:
+    /// ids 1..6 as `a, s, x, y, l, element`, each field naming its parent.
+    #[test]
+    fn nested_columns_allocate_field_ids_in_pre_order() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction
+            .create_table(
+                s,
+                "t",
+                &[
+                    col("a"),
+                    nested("s", "STRUCT", &[col("x"), col("y")]),
+                    nested("l", "LIST", &[col("element")]),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            column_layout(&transaction, t),
+            vec![
+                (1, 1, "a".to_string(), None),
+                (2, 2, "s".to_string(), None),
+                (3, 3, "x".to_string(), Some(2)),
+                (4, 4, "y".to_string(), Some(2)),
+                (5, 5, "l".to_string(), None),
+                (6, 6, "element".to_string(), Some(5)),
+            ]
+        );
+    }
+
+    /// A nested `add_column` continues both counters past the table's high
+    /// water mark rather than filling a dropped column's gap, and nests to
+    /// arbitrary depth. Stock DuckLake, after dropping `a` from the table
+    /// above and adding `m STRUCT(p BIGINT, q STRUCT(r BIGINT))`, allocates
+    /// 7..10 — never reusing 1.
+    #[test]
+    fn a_nested_add_column_continues_past_the_high_water_mark() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction
+            .create_table(
+                s,
+                "t",
+                &[
+                    col("a"),
+                    nested("s", "STRUCT", &[col("x"), col("y")]),
+                    nested("l", "LIST", &[col("element")]),
+                ],
+            )
+            .unwrap();
+
+        transaction.drop_column(t, ColumnId::new(1)).unwrap();
+        let added = transaction
+            .add_column(
+                t,
+                &nested(
+                    "m",
+                    "STRUCT",
+                    &[col("p"), nested("q", "STRUCT", &[col("r")])],
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(added, ColumnId::new(7), "the root's id is the one returned");
+        assert_eq!(
+            column_layout(&transaction, t),
+            vec![
+                (2, 2, "s".to_string(), None),
+                (3, 3, "x".to_string(), Some(2)),
+                (4, 4, "y".to_string(), Some(2)),
+                (5, 5, "l".to_string(), None),
+                (6, 6, "element".to_string(), Some(5)),
+                (7, 7, "m".to_string(), None),
+                (8, 8, "p".to_string(), Some(7)),
+                (9, 9, "q".to_string(), Some(7)),
+                (10, 10, "r".to_string(), Some(9)),
+            ]
+        );
+    }
+
+    /// Dropping a nested column drops every field beneath it, to any depth —
+    /// stock DuckLake ends the parent and its whole subtree in one snapshot,
+    /// because a field whose parent is gone is not a column anyone can name.
+    #[test]
+    fn dropping_a_nested_column_takes_its_whole_subtree() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction
+            .create_table(
+                s,
+                "t",
+                &[
+                    col("a"),
+                    nested(
+                        "m",
+                        "STRUCT",
+                        &[col("p"), nested("q", "STRUCT", &[col("r")])],
+                    ),
+                ],
+            )
+            .unwrap();
+
+        transaction.drop_column(t, ColumnId::new(2)).unwrap();
+
+        assert_eq!(
+            column_layout(&transaction, t),
+            vec![(1, 1, "a".to_string(), None)],
+            "the struct, its field, its nested struct and that struct's field all go"
+        );
+    }
+
+    /// A field's name is scoped to its parent, so two structs may each hold
+    /// an `x` — pinned against stock DuckLake, which allocates both. A
+    /// *top-level* collision is still refused.
+    #[test]
+    fn nested_field_names_are_scoped_to_their_parent() {
+        let mut transaction = empty_transaction();
+        let s = transaction.create_schema("s").unwrap();
+        let t = transaction
+            .create_table(
+                s,
+                "t",
+                &[
+                    nested("s", "STRUCT", &[col("x")]),
+                    nested("s2", "STRUCT", &[col("x")]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(transaction.columns_of(t).len(), 4);
+
+        // Renaming a field to its own sibling's name is still a collision.
+        assert!(matches!(
+            transaction.rename_column(t, ColumnId::new(2), "x"),
+            Err(Error::AlreadyExists(_))
+        ));
+        // But to a name only another parent's field holds, it is not.
+        transaction
+            .rename_column(t, ColumnId::new(4), "x2")
+            .unwrap();
+
+        // Two siblings sharing a name is refused where the tree enters.
+        let duplicate =
+            transaction.add_column(t, &nested("d", "STRUCT", &[col("dup"), col("dup")]));
+        assert!(matches!(duplicate, Err(Error::Constraint(_))));
     }
 
     #[test]
@@ -2410,6 +2677,7 @@ mod tests {
                     column_type: "HUGEINT".into(),
                     nulls_allowed: true,
                     default_value: None,
+                    children: Vec::new(),
                 }],
             )
             .unwrap();

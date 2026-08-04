@@ -578,16 +578,30 @@ pub struct RowLocation {
 }
 
 /// A column definition: the input to table creation and column addition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A nested type is a *tree*, not a type string to parse: the parent carries
+/// DuckLake's marker (`"STRUCT"`, `"LIST"`, `"MAP"`) as its
+/// [`column_type`](Self::column_type) and its fields as
+/// [`children`](Self::children). That is exactly the shape DuckLake itself
+/// authors over the staged-row path — a parent row plus one row per field —
+/// so both paths write the same records, and moraine never has to parse a
+/// SQL type string to find out what a column contains.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ColumnDef {
-    /// Column name, unique among the table's live columns.
+    /// Column name, unique among its **siblings**: DuckLake scopes a nested
+    /// field's name to its parent, so two structs may each hold an `x`.
     pub name: String,
-    /// Column type, as a DuckLake type string (e.g. `"BIGINT"`).
+    /// Column type, as a DuckLake type string (e.g. `"BIGINT"`), or a
+    /// nested-type marker when [`children`](Self::children) is non-empty.
     pub column_type: String,
     /// Whether NULL values are allowed.
     pub nulls_allowed: bool,
     /// Default value expression, if any.
     pub default_value: Option<String>,
+    /// The type's fields, in declaration order; empty for a scalar. A
+    /// `LIST`'s single child is conventionally named `element`, as DuckLake
+    /// names it.
+    pub children: Vec<ColumnDef>,
 }
 
 /// A live column: its definition plus identity and position.

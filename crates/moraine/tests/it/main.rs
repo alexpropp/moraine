@@ -20,6 +20,7 @@ mod macros;
 mod measure;
 mod multi_writer;
 mod partitioning;
+mod schema_evolution;
 mod sorting;
 mod staged_index_build;
 mod tags;

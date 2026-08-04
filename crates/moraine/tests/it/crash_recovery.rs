@@ -12,8 +12,8 @@ mod racing_store;
 use std::sync::Arc;
 
 use moraine::{
-    Catalog, CatalogOptions, ColumnId, Error, IndexDef, IndexEntry, IndexKeyValue, IndexState,
-    IntWidth, MaintenanceRequest, TableId,
+    Catalog, CatalogOptions, ColumnId, CrashCase, Error, IndexDef, IndexEntry, IndexKeyValue,
+    IndexState, IntWidth, MaintenanceRequest, TableId,
 };
 use object_store::memory::InMemory;
 
@@ -22,52 +22,12 @@ use crate::{
     fixtures::{col, datafile},
 };
 
-/// Where a crash can interrupt a state-changing operation. Each variant
-/// names what the process was doing when it died; [`guarantee`] says which
-/// guarantee makes that survivable, and its exhaustive match makes adding
-/// a case without deciding one a compile error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CrashCase {
-    /// Batch staged, its WAL flush never reached object storage.
-    CommitNotDurable,
-    /// Flush landed; the process died before the caller was told.
-    CommitDurableNotAcknowledged,
-    /// A drop ending many records at once, crashed at every WAL boundary.
-    MultiTombstoneDrop,
-    /// Several catalog commits staged into one batch.
-    GroupCommit,
-    /// A writer died mid-commit and another took the store over.
-    TakeoverMidCommit,
-    /// A writer resumes against a log a peer moved past; the multi-writer
-    /// topology rebases its commit onto the fresh head rather than fencing
-    /// it, so it lands whole against the moved head.
-    StaleWriterResumes,
-    /// An initializer died partway through creating the catalog.
-    GenesisInterrupted,
-    /// Two processes created the same empty catalog at once.
-    ConcurrentGenesis,
-    /// A staged index build died between two of its steps.
-    StagedBuildInterrupted,
-    /// A batched entry reclamation died between two of its batches.
-    ReclamationInterrupted,
-    /// A structural format migration died between two of its batches.
-    MigrationInterrupted,
-}
-
-/// Every case.
-const CASES: [CrashCase; 11] = [
-    CrashCase::CommitNotDurable,
-    CrashCase::CommitDurableNotAcknowledged,
-    CrashCase::MultiTombstoneDrop,
-    CrashCase::GroupCommit,
-    CrashCase::TakeoverMidCommit,
-    CrashCase::StaleWriterResumes,
-    CrashCase::GenesisInterrupted,
-    CrashCase::ConcurrentGenesis,
-    CrashCase::StagedBuildInterrupted,
-    CrashCase::ReclamationInterrupted,
-    CrashCase::MigrationInterrupted,
-];
+/// Every case. [`CrashCase`] is the library's, since one case is crashed
+/// from inside a library call and has to name the seams it stops at;
+/// [`guarantee`] and [`blocked_on`] below are this suite's own table, and
+/// their exhaustive matches make adding a case without deciding both a
+/// compile error.
+const CASES: [CrashCase; 11] = CrashCase::ALL;
 
 /// Why a case is survivable. Which one applies follows from the path: a
 /// path is either one batch or several, never both.
@@ -91,7 +51,7 @@ fn guarantee(case: CrashCase) -> Guarantee {
         | CrashCase::MultiTombstoneDrop
         | CrashCase::GroupCommit
         | CrashCase::TakeoverMidCommit
-        | CrashCase::StaleWriterResumes
+        | CrashCase::FencedWriterResumes
         | CrashCase::GenesisInterrupted
         | CrashCase::ConcurrentGenesis => Guarantee::Atomicity,
 
@@ -103,8 +63,8 @@ fn guarantee(case: CrashCase) -> Guarantee {
 
 /// What must be built before a test here can crash the case, or `None`
 /// when a test below already builds the pre-crash state, crashes, reopens,
-/// and asserts what must hold. Every case is driven today; the return type
-/// is what a case that cannot be yet has to fill in.
+/// and asserts what must hold. The return type is what a case that cannot
+/// be driven from this suite has to fill in.
 fn blocked_on(case: CrashCase) -> Option<&'static str> {
     match case {
         CrashCase::CommitNotDurable
@@ -112,17 +72,18 @@ fn blocked_on(case: CrashCase) -> Option<&'static str> {
         | CrashCase::MultiTombstoneDrop
         | CrashCase::GroupCommit
         | CrashCase::TakeoverMidCommit
-        | CrashCase::StaleWriterResumes
+        | CrashCase::FencedWriterResumes
         | CrashCase::GenesisInterrupted
         | CrashCase::ConcurrentGenesis
         | CrashCase::StagedBuildInterrupted
         | CrashCase::ReclamationInterrupted => None,
 
         CrashCase::MigrationInterrupted => Some(
-            "no migration unit ships: every format so far is additive, so the driver's \
-             registry is empty and the migrate verb cannot put a store mid-migration. \
-             Its four seams are covered against a caller-supplied registry in the \
-             driver's own unit tests until one does",
+            "a fresh store bootstraps at the newest format, and this suite reaches the \
+             catalog only through its public API, which offers no way to plant a store at \
+             an older format for the migrate verb to carry forward. The driver's four \
+             seams are covered against a caller-supplied registry in the migration \
+             module's own tests, which restamp the base format directly",
         ),
     }
 }
@@ -132,9 +93,10 @@ fn blocked_on(case: CrashCase) -> Option<&'static str> {
 /// in [`guarantee`] and [`blocked_on`] cover the other half: a new case
 /// fails to compile until both decisions are made.
 ///
-/// Every case is driven but one, and that one is blocked on a feature
-/// rather than on the harness: no migration unit ships, so no store can be
-/// mid-migration to crash.
+/// Every case is driven but one, and that one is blocked on the topology
+/// rather than on the harness: a fresh store bootstraps at the newest
+/// format, so this public-API suite cannot stage one for the migrate verb
+/// to carry forward.
 #[test]
 fn every_case_declares_its_guarantee_and_coverage() {
     let driven: Vec<CrashCase> = CASES
@@ -149,7 +111,7 @@ fn every_case_declares_its_guarantee_and_coverage() {
             CrashCase::MultiTombstoneDrop,
             CrashCase::GroupCommit,
             CrashCase::TakeoverMidCommit,
-            CrashCase::StaleWriterResumes,
+            CrashCase::FencedWriterResumes,
             CrashCase::GenesisInterrupted,
             CrashCase::ConcurrentGenesis,
             CrashCase::StagedBuildInterrupted,
@@ -416,7 +378,7 @@ async fn takeover_reads_the_durable_head_and_continues_from_it() {
     second.close().await.unwrap();
 }
 
-/// `StaleWriterResumes` — a writer resumes against a log a peer moved past.
+/// `FencedWriterResumes` — a writer resumes against a log a peer moved past.
 /// There is no commit-level fence: the multi-writer topology rebases the
 /// stale commit onto the fresh head and lands it whole, so the resumed
 /// writer joins the timeline rather than being turned away. The coherent

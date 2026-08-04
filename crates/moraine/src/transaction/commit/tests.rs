@@ -30,7 +30,7 @@ async fn unknown_format_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Corruption(_)));
+    assert!(matches!(err, Error::Migration(_)));
 }
 
 /// A mid-migration marker refuses the open outright.
@@ -57,7 +57,173 @@ async fn migration_marker_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Corruption(_)));
+    match err {
+        Error::Migration(msg) => assert!(
+            msg.contains("Catalog::migrate"),
+            "mid-migration message names no verb: {msg}"
+        ),
+        other => panic!("expected Migration, got {other:?}"),
+    }
+}
+
+/// A format below this binary's floor refuses toward the migrate path,
+/// distinct from the newer-than-binary message. The floor sits at the base
+/// format while every format is additive, so only a synthetic store reaches
+/// this arm; the test holds it correct for the first format that raises it.
+///
+/// The message must name the verb, and name it as something this binary
+/// runs: `Catalog::migrate` takes a store path and never goes through the
+/// format check, so the store an attach refuses is still migratable by the
+/// binary that refused it. That is the non-obvious half, and the half an
+/// operator gets wrong.
+#[tokio::test]
+async fn older_format_refuses_toward_migrate() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = StoreBuilder::new("", object_store.clone())
+        .open_writer()
+        .await
+        .unwrap();
+    db.put(
+        &Key::Sys(SysKey::Format).encode(),
+        &value::encode_value(&proto::FormatValue {
+            format_version: 0,
+            writer_version: "t".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+
+    let err = open_initialized(StoreBuilder::new("", object_store), false, None)
+        .await
+        .err()
+        .unwrap();
+    match err {
+        Error::Migration(msg) => {
+            assert!(
+                msg.contains("Catalog::migrate"),
+                "older-store message names no verb: {msg}"
+            );
+            assert!(
+                msg.contains("this same binary"),
+                "older-store message does not say who can run it: {msg}"
+            );
+        }
+        other => panic!("expected Migration, got {other:?}"),
+    }
+}
+
+/// A migration marker present under a live head makes every materialization
+/// unavailable, not partial — the reader-side gate, not only the open gate.
+#[tokio::test]
+async fn materialize_gate_refuses_on_marker() {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = StoreBuilder::new("", object_store)
+        .open_writer()
+        .await
+        .unwrap();
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Head).encode(),
+        value::encode_value(&proto::HeadValue {
+            snapshot_id: 0,
+            batch_seq: 0,
+        }),
+    )
+    .unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: vec![],
+        }),
+    )
+    .unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
+
+    let read = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let err = refuse_mid_migration(ReadHandle::Tx(&read))
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+    read.rollback();
+}
+
+/// Renaming one column touches that column and nothing else: churn is
+/// proportional to the change, not to the table's width.
+#[test]
+fn renaming_one_column_stages_no_write_for_any_sibling() {
+    use crate::{
+        catalog::ColumnDef,
+        store::key::{CurrentKey, HistoryKey},
+    };
+
+    let column_def = |name: &str| ColumnDef {
+        name: name.into(),
+        column_type: "BIGINT".into(),
+        nulls_allowed: true,
+        default_value: None,
+        children: Vec::new(),
+    };
+
+    let snap0 = proto::SnapshotValue {
+        snapshot_id: 0,
+        snapshot_time_micros: 0,
+        schema_version: 0,
+        next_catalog_id: 1,
+        next_file_id: 0,
+        changes_made: String::new(),
+        author: None,
+        commit_message: None,
+        commit_extra_info: None,
+        schema_changed_table_ids: Vec::new(),
+        transaction_id: None,
+        deleted_data_file_ids: Vec::new(),
+    };
+    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, vec![], vec![], None), 1);
+    let schema = setup.create_schema("s").unwrap();
+    let table = setup
+        .create_table(
+            schema,
+            "t",
+            &[
+                column_def("a"),
+                column_def("b"),
+                column_def("c"),
+                column_def("d"),
+            ],
+        )
+        .unwrap();
+    let renamed = setup.columns_of(table)[1].id;
+    let base = setup.into_parts().state;
+
+    let mut tx = Transaction::new(base.clone(), 2);
+    tx.rename_column(table, renamed, "b2").unwrap();
+    let state = tx.into_parts().state;
+
+    let touched: Vec<u64> = diff_writes(&base, &state, 2)
+        .iter()
+        .filter_map(|(key_bytes, _)| match Key::decode(key_bytes).unwrap() {
+            Key::Current(CurrentKey::Entity(EntityKey::Column { column_id, .. }))
+            | Key::History(HistoryKey {
+                entity: EntityKey::Column { column_id, .. },
+                ..
+            }) => Some(column_id),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        touched.iter().all(|id| *id == renamed.get()),
+        "a rename of column {} staged writes for siblings: {touched:?}",
+        renamed.get()
+    );
+    assert!(
+        !touched.is_empty(),
+        "the renamed column itself must be written"
+    );
 }
 
 /// A file registered and expired within one commit exists in neither
@@ -96,6 +262,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
                 column_type: "BIGINT".into(),
                 nulls_allowed: true,
                 default_value: None,
+                children: Vec::new(),
             }],
         )
         .unwrap();
@@ -205,6 +372,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
                     column_type: "BIGINT".into(),
                     nulls_allowed: true,
                     default_value: None,
+                    children: Vec::new(),
                 }],
             )?;
             tx.rename_table(table, "t2")?;
@@ -272,6 +440,7 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
                 column_type: "BIGINT".into(),
                 nulls_allowed: true,
                 default_value: None,
+                children: Vec::new(),
             };
             let created = tx.create_table(schema, "t", &[column("a"), column("b")])?;
             table.set(Some(created));

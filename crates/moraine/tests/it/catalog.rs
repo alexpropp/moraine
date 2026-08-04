@@ -190,6 +190,7 @@ async fn type_promotion_is_time_travel_correct() {
         column_type: "INTEGER".into(),
         nulls_allowed: true,
         default_value: None,
+        children: Vec::new(),
     };
     let before = catalog
         .commit(|tx| {
@@ -521,6 +522,7 @@ async fn a_variant_column_is_refused_as_unsupported_on_every_column_verb() {
         column_type: "VARIANT".into(),
         nulls_allowed: true,
         default_value: None,
+        children: Vec::new(),
     };
 
     let on_create = catalog

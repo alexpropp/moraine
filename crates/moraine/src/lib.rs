@@ -41,6 +41,7 @@
 //!                 column_type: "BIGINT".into(),
 //!                 nulls_allowed: false,
 //!                 default_value: None,
+//!                 children: Vec::new(),
 //!             }],
 //!         )?;
 //!         Ok(())
@@ -216,8 +217,12 @@
 //! - `fault-injection` — compiles the crash-injection seams the migration
 //!   driver consults between its durable batches, and exposes `CrashPoint` and
 //!   `inject_crash` so a test can arm one and stop a migration at a named
-//!   durable boundary. Off by default; a build without it carries an empty
-//!   function at each seam and no fault surface.
+//!   durable boundary. It also exposes `SyntheticMigration` and
+//!   `install_migration`, which put a unit into the driver's registry — every
+//!   shipped format is additive, so without one there is no migration to crash
+//!   — and `CrashCase`, the enumeration of crash cases the suites drive. Off by
+//!   default; a build without it carries an empty function at each seam, an
+//!   empty installed registry, and no fault surface.
 //! - `leader` (off by default) — the advisory leader role: a long-lived folder
 //!   opens a network port and becomes a group-commit funnel for forwarded
 //!   sessions, announcing itself through the commit log. Additive: nothing in
@@ -257,25 +262,26 @@ mod store;
 mod transaction;
 
 pub use catalog::{
-    Catalog, CatalogOptions, CatalogSnapshot, CensusRequest, ColumnAlteration, ColumnDef, ColumnId,
-    ColumnInfo, ColumnOrder, ColumnStats, CompactStoreReport, CompactStoreRequest,
-    CompactionTarget, Contention, DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId,
-    DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval, FlushedDataFile, IndexDef,
-    IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, LiveCount, MacroId,
-    MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport, MaintenanceRequest,
-    MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef, OptionScope,
-    PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation,
+    CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest, ColumnAlteration,
+    ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CompactStoreReport,
+    CompactStoreRequest, CompactionTarget, Contention, DataFile, DataFileId, DataFileInfo,
+    DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
+    FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, LiveCount,
+    MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport,
+    MaintenanceRequest, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
+    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation,
     ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
     SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId,
     TableInfo, TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
-/// Crash-injection seams, for tests that drive a migration to a named
-/// durable boundary and stop it there. Unstable and not part of the semver
-/// contract.
+/// Fault injection: the crash seams a test drives a migration to and stops
+/// it at, the synthetic units that give the migration driver something to
+/// run, and the enumeration of crash cases. Unstable and not part of the
+/// semver contract.
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
-pub use fault::{CrashPoint, inject_crash};
+pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install_migration};
 #[cfg(feature = "leader")]
 pub use leader::{Leader, LeaderConfig, LeaderStats};
 pub use moraine_wal::FoldReport;

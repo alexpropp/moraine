@@ -23,6 +23,7 @@ pub fn col(name: &str) -> ColumnDef {
         column_type: "BIGINT".into(),
         nulls_allowed: true,
         default_value: None,
+        children: Vec::new(),
     }
 }
 

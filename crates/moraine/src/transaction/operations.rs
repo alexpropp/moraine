@@ -1255,6 +1255,7 @@ mod tests {
             column_type: "BIGINT".into(),
             nulls_allowed: true,
             default_value: None,
+            children: Vec::new(),
         }
     }
 

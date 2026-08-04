@@ -28,6 +28,39 @@ pub struct MoraineOptionRow {
     pub scope_id: u64,
 }
 
+/// Converts core `ducklake_metadata` records into the C row shape. Shared by
+/// the committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn option_rows(
+    rows: Vec<moraine::ffi_support::OptionRow>,
+) -> Result<Vec<MoraineOptionRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in
+    // the whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let key = to_c_string(&row.key)?;
+            let value = to_c_string(&row.value)?;
+            let scope = opt_c_string(row.scope.as_deref())?;
+            Ok((row, key, value, scope))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, key, value, scope)| {
+            let (has_scope_id, scope_id) = opt_u64(row.scope_id);
+            MoraineOptionRow {
+                key: key.into_raw(),
+                value: value.into_raw(),
+                scope: opt_into_raw(scope),
+                has_scope_id,
+                scope_id,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every stored `ducklake_metadata` row into
 /// `*out_items`/`*out_len`.
 ///
@@ -57,33 +90,7 @@ pub unsafe extern "C" fn moraine_dump_options(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_options(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in
-                // the whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let key = to_c_string(&row.key)?;
-                        let value = to_c_string(&row.value)?;
-                        let scope = opt_c_string(row.scope.as_deref())?;
-                        Ok((row, key, value, scope))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, key, value, scope)| {
-                        let (has_scope_id, scope_id) = opt_u64(row.scope_id);
-                        MoraineOptionRow {
-                            key: key.into_raw(),
-                            value: value.into_raw(),
-                            scope: opt_into_raw(scope),
-                            has_scope_id,
-                            scope_id,
-                        }
-                    })
-                    .collect())
-            },
+            option_rows,
         )
     }
 }

@@ -214,6 +214,19 @@ void ThrowMoraineError(MoraineError &err) {
 	}
 }
 
+void ThrowMigrationRefusal(MoraineError &err, const std::string &path) {
+	std::string message = err.message ? std::string(err.message) : std::string("moraine: unknown error");
+	if (err.message != nullptr) {
+		moraine_error_free(err.message);
+		err.message = nullptr;
+	}
+	// `moraine_migrate` takes a store path precisely because the stores it
+	// repairs are the ones no ATTACH will open, so the refusal and the
+	// remedy are reachable from the same session and the same binary.
+	throw duckdb::IOException("%s. Its SQL surface is moraine_migrate: SELECT * FROM moraine_migrate('%s')", message,
+	                          path);
+}
+
 duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 	std::string upper = ToUpperAscii(ducklake_type);
 
@@ -728,14 +741,23 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
 	// the ABI means "not given", so an explicit zero (flush continuously, no
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
-	// `CACHE_DIR` is a local directory for SlateDB's on-disk block cache; it
-	// must outlive the moraine_attach call, so it lives in this scope.
+	// `CACHE_DIR` is a local directory for SlateDB's on-disk object cache,
+	// which holds fetched object parts; it must outlive the moraine_attach
+	// call, so it lives in this scope. `CACHE_SIZE` bounds that cache in
+	// bytes, per attach rather than per directory; 0 on the ABI means "not
+	// given" and leaves the store's cap. `CACHE_PUTS` additionally fills
+	// that cache from the write path, so a flushed object is local without a
+	// later fetch, and `CACHE_PRELOAD` fills it as the attach opens. None of
+	// them touches the in-memory caches.
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
+	uint64_t cache_size_bytes = 0;
+	bool cache_puts = false;
+	uint8_t cache_preload = 0;
 	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
 	// it is the DATA_PATH the index scoped read and maintenance resolve data
@@ -766,6 +788,24 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
+		} else if (name == "cache_size") {
+			cache_size_bytes = option.second.GetValue<uint64_t>();
+		} else if (name == "cache_puts") {
+			cache_puts = option.second.GetValue<bool>();
+		} else if (name == "cache_preload") {
+			// Spelled as a level rather than a flag: "l0" is bounded by how far
+			// the store has run since its last merge, "all" by the whole store.
+			auto level = duckdb::StringUtil::Lower(option.second.GetValue<std::string>());
+			if (level == "none") {
+				cache_preload = 0;
+			} else if (level == "l0") {
+				cache_preload = 1;
+			} else if (level == "all") {
+				cache_preload = 2;
+			} else {
+				throw duckdb::InvalidInputException(
+				    "moraine: CACHE_PRELOAD must be 'none', 'l0', or 'all'; got \"%s\"", level);
+			}
 		} else if (name == "checkpoint") {
 			checkpoint = option.second.GetValue<std::string>();
 		}
@@ -781,7 +821,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
+	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_preload, cache_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);
@@ -789,6 +829,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.
 	DrainMoraineLogs(context);
+	if (code == MORAINE_MIGRATION) {
+		// The core names its own verb; only this attach holds the path, and
+		// only the shim may name a SQL function. A store refused here is
+		// exactly one `moraine_migrate` repairs.
+		ThrowMigrationRefusal(err, info.path);
+	}
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

@@ -65,6 +65,9 @@ async fn open_folder_writer(store: &SlotStore, wal_enabled: bool) -> Result<Db> 
     StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .wal_enabled(wal_enabled)
         .cache_dir(store.options.cache_dir.clone())
+        .cache_size(store.options.cache_size)
+        .cache_preload(store.options.cache_preload)
+        .cache_puts(store.options.cache_puts)
         .open_writer()
         .await
 }
@@ -265,6 +268,9 @@ fn narrate_fold(report: &FoldReport) {
 pub(crate) async fn unfolded_tail(store: &SlotStore) -> Result<u64> {
     let reader = StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .cache_dir(store.options.cache_dir.clone())
+        .cache_size(store.options.cache_size)
+        .cache_preload(store.options.cache_preload)
+        .cache_puts(store.options.cache_puts)
         .open_reader()
         .await?;
     let fold = fold_cursor(ReadHandle::Reader(&reader)).await;
@@ -396,6 +402,9 @@ fn unix_seconds_now() -> i64 {
 async fn fold_cursor_as_of(store: &SlotStore, checkpoint_id: Uuid) -> Result<u64> {
     let reader = StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .cache_dir(store.options.cache_dir.clone())
+        .cache_size(store.options.cache_size)
+        .cache_preload(store.options.cache_preload)
+        .cache_puts(store.options.cache_puts)
         .open_reader_at(checkpoint_id)
         .await?;
     let cursor = fold_cursor(ReadHandle::Reader(&reader)).await;
@@ -410,6 +419,9 @@ async fn fold_cursor_as_of(store: &SlotStore, checkpoint_id: Uuid) -> Result<u64
 async fn reopen_reader(store: &SlotStore) -> Result<DbReader> {
     StoreBuilder::new(&store.options.path, Arc::clone(&store.object_store))
         .cache_dir(store.options.cache_dir.clone())
+        .cache_size(store.options.cache_size)
+        .cache_preload(store.options.cache_preload)
+        .cache_puts(store.options.cache_puts)
         .open_reader()
         .await
 }

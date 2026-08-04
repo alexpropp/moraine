@@ -6,6 +6,7 @@
 // dump ABI (see metadata_tables.cpp).
 #pragma once
 
+#include <optional>
 #include <vector>
 
 #include "duckdb.hpp"
@@ -81,6 +82,19 @@ struct MetadataTableSpec {
 	// overlay updates stay a statistics-table convention.
 	bool overlay_updatable = false;
 };
+
+// The rows of `write_table_kind` as the calling transaction's open staged
+// transaction sees them — committed rows with its own uncommitted rows over
+// them — or empty when there is no staged transaction, or no tx-aware dump
+// for that kind.
+//
+// The scan and the staged-write Sink must agree on this: a rowid the scan
+// emits is an index into whatever list it materialized, and the Sink
+// resolves that index by re-materializing the same list. One of them
+// serving committed state while the other overlays would let a rowid name a
+// different row, or none.
+std::optional<std::vector<std::vector<duckdb::Value>>>
+MetadataTxAwareRows(duckdb::ClientContext &context, duckdb::Catalog &catalog, int32_t write_table_kind);
 
 // The fixed list of synthesized tables, in the order they're registered.
 // Built once; returns the same static instance every call.

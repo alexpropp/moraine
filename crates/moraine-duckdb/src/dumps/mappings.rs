@@ -22,6 +22,32 @@ pub struct MoraineColumnMappingRow {
     pub map_type: *mut c_char,
 }
 
+/// Converts core `ducklake_column_mapping` records into the C row shape. Shared
+/// by the committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn mapping_rows(
+    rows: Vec<moraine::ffi_support::MappingRecord>,
+) -> Result<Vec<MoraineColumnMappingRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|m| {
+            let map_type = to_c_string(&m.map_type)?;
+            Ok((m, map_type))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(m, map_type)| MoraineColumnMappingRow {
+            mapping_id: m.mapping_id,
+            table_id: m.table_id,
+            map_type: map_type.into_raw(),
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_column_mapping` row into
 /// `*out_items`/`*out_len`. Mappings are unversioned create-only records,
 /// so this is exactly the live rows.
@@ -52,26 +78,7 @@ pub unsafe extern "C" fn moraine_dump_column_mappings(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_mappings(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|m| {
-                        let map_type = to_c_string(&m.map_type)?;
-                        Ok((m, map_type))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(m, map_type)| MoraineColumnMappingRow {
-                        mapping_id: m.mapping_id,
-                        table_id: m.table_id,
-                        map_type: map_type.into_raw(),
-                    })
-                    .collect())
-            },
+            mapping_rows,
         )
     }
 }
@@ -115,6 +122,39 @@ pub struct MoraineNameMappingRow {
     pub is_partition: bool,
 }
 
+/// Converts core `ducklake_name_mapping` records into the C row shape. Shared
+/// by the committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn name_mapping_rows(
+    rows: Vec<moraine::ffi_support::NameMappingRow>,
+) -> Result<Vec<MoraineNameMappingRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let source_name = to_c_string(&row.source_name)?;
+            Ok((row, source_name))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, source_name)| {
+            let (has_parent, parent) = opt_u64(row.parent_column);
+            MoraineNameMappingRow {
+                mapping_id: row.mapping_id,
+                column_id: row.column_id,
+                source_name: source_name.into_raw(),
+                target_field_id: row.target_field_id,
+                has_parent_column: has_parent,
+                parent_column: parent,
+                is_partition: row.is_partition,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_name_mapping` row — flattened from the embedded
 /// rows of every mapping record, ordered by `(mapping_id, column_id)` —
 /// into `*out_items`/`*out_len`.
@@ -145,33 +185,7 @@ pub unsafe extern "C" fn moraine_dump_name_mappings(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_name_mapping_rows(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let source_name = to_c_string(&row.source_name)?;
-                        Ok((row, source_name))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, source_name)| {
-                        let (has_parent, parent) = opt_u64(row.parent_column);
-                        MoraineNameMappingRow {
-                            mapping_id: row.mapping_id,
-                            column_id: row.column_id,
-                            source_name: source_name.into_raw(),
-                            target_field_id: row.target_field_id,
-                            has_parent_column: has_parent,
-                            parent_column: parent,
-                            is_partition: row.is_partition,
-                        }
-                    })
-                    .collect())
-            },
+            name_mapping_rows,
         )
     }
 }

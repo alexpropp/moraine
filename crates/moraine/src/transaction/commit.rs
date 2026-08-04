@@ -85,18 +85,31 @@ pub(crate) fn mint_secret() -> [u8; SECRET_LEN] {
 /// is empty and needs bootstrap.
 async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
     if read::read_migration(tx).await?.is_some() {
-        return Err(Error::Corruption(
-            "store is mid-migration; refusing to open".to_string(),
+        return Err(Error::Migration(
+            "store is mid-migration; refusing to open — Catalog::migrate resumes it from the \
+             durable cursor, and takes a store path rather than an open catalog, so it runs \
+             against a store no attach will touch"
+                .to_string(),
         ));
     }
     match read::read_format(tx).await? {
-        Some(format) if (FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&format.format_version) => {
-            Ok(Some(format))
+        Some(format) if format.format_version > MAX_FORMAT_VERSION => {
+            Err(Error::Migration(format!(
+                "store format {} is newer than this binary understands (max {MAX_FORMAT_VERSION}); \
+             upgrade the binary",
+                format.format_version
+            )))
         }
-        Some(format) => Err(Error::Corruption(format!(
-            "store format {} is outside the supported range {FORMAT_VERSION}..={MAX_FORMAT_VERSION}",
-            format.format_version
-        ))),
+        Some(format) if format.format_version < MIN_FORMAT_VERSION => {
+            Err(Error::Migration(format!(
+                "store format {} predates this binary's minimum ({MIN_FORMAT_VERSION}); \
+                 migrate it up with Catalog::migrate, which takes a store path rather than an \
+                 open catalog and so runs on this same binary against the store it refuses to \
+                 open",
+                format.format_version
+            )))
+        }
+        Some(format) => Ok(Some(format)),
         None => Ok(None),
     }
 }

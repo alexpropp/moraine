@@ -48,6 +48,8 @@ prost-build = { workspace = true }
 protox = { workspace = true }
 
 [dev-dependencies]
+moraine = { path = ".", features = ["fault-injection"] }
+
 async-trait = { workspace = true }
 moraine-wal = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }

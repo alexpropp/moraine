@@ -217,9 +217,9 @@ std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckd
 	return out;
 }
 
-std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context, const uint8_t *schema_ipc,
-                                                              size_t schema_ipc_len, const uint8_t *data, size_t len,
-                                                              const std::vector<duckdb::LogicalType> &user_types) {
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>>
+DecodeInlineChunkPieces(duckdb::ClientContext &context, const uint8_t *schema_ipc, size_t schema_ipc_len,
+                        const uint8_t *data, size_t len, const std::vector<duckdb::LogicalType> &user_types) {
 	ArrowSchema c_schema;
 	ArrowArray c_array;
 	MoraineError err {};
@@ -259,31 +259,24 @@ std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientCont
 	}
 
 	duckdb::vector<duckdb::LogicalType> chunk_types(user_types.begin(), user_types.end());
-	std::vector<std::vector<duckdb::Value>> rows;
-	rows.reserve(total);
+	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pieces;
+	pieces.reserve((total + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE);
 	while (scan_state.chunk_offset < total) {
 		auto size = std::min<duckdb::idx_t>(total - scan_state.chunk_offset, STANDARD_VECTOR_SIZE);
-		duckdb::DataChunk out;
-		out.Initialize(context, chunk_types);
+		auto out = duckdb::make_uniq<duckdb::DataChunk>();
+		out->Initialize(context, chunk_types);
 		// `ArrowToDuckDB` reads `output.size()` as the row count to convert, so
 		// the cardinality must be set before the call, not after.
-		out.SetCardinality(size);
-		duckdb::ArrowTableFunction::ArrowToDuckDB(scan_state, columns, out, /* arrow_scan_is_projected */ false);
-		for (duckdb::idx_t row = 0; row < size; row++) {
-			std::vector<duckdb::Value> cells;
-			cells.reserve(user_types.size());
-			for (duckdb::idx_t col = 0; col < user_types.size(); col++) {
-				cells.push_back(out.GetValue(col, row));
-			}
-			rows.push_back(std::move(cells));
-		}
+		out->SetCardinality(size);
+		duckdb::ArrowTableFunction::ArrowToDuckDB(scan_state, columns, *out, /* arrow_scan_is_projected */ false);
+		pieces.push_back(std::move(out));
 		scan_state.chunk_offset += size;
 	}
 
 	if (c_schema.release) {
 		c_schema.release(&c_schema);
 	}
-	return rows;
+	return pieces;
 }
 
 namespace {
@@ -301,9 +294,42 @@ duckdb::CreateTableInfo BuildInlineDataTableInfo(duckdb::SchemaCatalogEntry &sch
 	return info;
 }
 
+// One row of `ducklake_inlined_data_<t>_<v>`: the three metadata columns
+// verbatim, plus where the row's user values live in the decoded chunks.
+// The user values themselves are never copied out of those chunks — the
+// scan slices them across column-wise.
+struct InlineDataRow {
+	uint64_t row_id;
+	uint64_t begin_snapshot;
+	bool has_end_snapshot;
+	uint64_t end_snapshot;
+	// Index into `InlineDataScan::pieces`.
+	size_t piece;
+	duckdb::idx_t row_in_piece;
+};
+
+// One materialization of `ducklake_inlined_data_<t>_<v>`: its rows in scan
+// order, and the decoded chunks they point into. `pieces` is empty when the
+// caller asked for metadata only.
+struct InlineDataScan {
+	std::vector<InlineDataRow> rows;
+	std::vector<duckdb::unique_ptr<duckdb::DataChunk>> pieces;
+	// How many user columns the table has, so the scan can reject an
+	// out-of-range column id without a decoded piece to measure against.
+	duckdb::idx_t user_columns = 0;
+};
+
+// `row_id`, `begin_snapshot`, `end_snapshot` precede the user columns in
+// `ducklake_inlined_data_<t>_<v>`.
+constexpr duckdb::column_t kInlineUserColumnStart = 3;
+
 // Materializes every live row of `table_id` (the `ForFlush` scan at the
 // maximum snapshot) so DuckDB's query engine applies the WHERE clause; the
 // shim serves raw rows, never interprets the predicate.
+//
+// `with_values` decodes the chunk bodies the rows point into. A caller that
+// needs only `row_id`/`begin_snapshot` — resolving a rowid back to its row
+// for an UPDATE or DELETE — passes `false` and touches no Arrow body at all.
 //
 // `moraine_inline_scan` scans the whole `table_id` across every schema
 // version and a returned row carries no schema-version tag, so decoding
@@ -311,10 +337,9 @@ duckdb::CreateTableInfo BuildInlineDataTableInfo(duckdb::SchemaCatalogEntry &sch
 // single schema version live. A table that underwent a schema change while
 // still holding unflushed inlined data under the old version would misdecode
 // here.
-std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientContext &context,
-                                                              MoraineCatalogHandle *handle, uint64_t table_id,
-                                                              uint64_t schema_version,
-                                                              const std::vector<duckdb::LogicalType> &user_types) {
+InlineDataScan ScanInlineData(duckdb::ClientContext &context, MoraineCatalogHandle *handle, uint64_t table_id,
+                              uint64_t schema_version, const std::vector<duckdb::LogicalType> &user_types,
+                              bool with_values) {
 	// This entry serves one `(table_id, schema_version)`; body-only chunks of
 	// that version decode against its schema-only stream (`inline/schema`).
 	// The scan below spans every version of the table, so chunks of other
@@ -359,11 +384,15 @@ std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientCont
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	std::vector<std::vector<duckdb::Value>> result;
-	result.reserve(scan.rows_len);
-	// Each referenced chunk decodes once, on first use, however many rows
-	// it holds.
-	std::vector<std::optional<std::vector<std::vector<duckdb::Value>>>> decoded_chunks(scan.chunks_len);
+
+	InlineDataScan result;
+	result.user_columns = user_types.size();
+	result.rows.reserve(scan.rows_len);
+	// Each referenced chunk decodes once, on first use, however many rows it
+	// holds. `first_piece[c]` is where chunk `c`'s pieces start in `pieces`;
+	// `npos` means "not decoded yet".
+	std::vector<size_t> first_piece(scan.chunks_len, std::numeric_limits<size_t>::max());
+	std::vector<duckdb::idx_t> chunk_rows(scan.chunks_len, 0);
 	for (size_t i = 0; i < scan.rows_len; i++) {
 		auto &r = scan.rows[i];
 		// The scan spans every schema version of the table; this entry serves
@@ -375,27 +404,174 @@ std::vector<std::vector<duckdb::Value>> ProvideInlineDataRows(duckdb::ClientCont
 		if (r.chunk_index >= scan.chunks_len) {
 			throw duckdb::InternalException("moraine: inline scan chunk index out of range");
 		}
-		auto &slot = decoded_chunks[r.chunk_index];
-		if (!slot.has_value()) {
-			auto &chunk = scan.chunks[r.chunk_index];
-			slot = DecodeInlineChunkRows(context, schema_ipc, schema_ipc_len, chunk.body, chunk.body_len, user_types);
+		size_t piece = 0;
+		duckdb::idx_t row_in_piece = 0;
+		if (with_values) {
+			if (first_piece[r.chunk_index] == std::numeric_limits<size_t>::max()) {
+				auto &chunk = scan.chunks[r.chunk_index];
+				auto decoded = DecodeInlineChunkPieces(context, schema_ipc, schema_ipc_len, chunk.body, chunk.body_len,
+				                                       user_types);
+				first_piece[r.chunk_index] = result.pieces.size();
+				chunk_rows[r.chunk_index] = 0;
+				for (auto &p : decoded) {
+					chunk_rows[r.chunk_index] += p->size();
+					result.pieces.push_back(std::move(p));
+				}
+			}
+			if (r.offset_in_chunk >= chunk_rows[r.chunk_index]) {
+				throw duckdb::InternalException("moraine: inline scan row offset out of range");
+			}
+			piece = first_piece[r.chunk_index] + r.offset_in_chunk / STANDARD_VECTOR_SIZE;
+			row_in_piece = r.offset_in_chunk % STANDARD_VECTOR_SIZE;
 		}
-		auto &decoded = *slot;
-		if (r.offset_in_chunk >= decoded.size()) {
-			throw duckdb::InternalException("moraine: inline scan row offset out of range");
-		}
-		std::vector<duckdb::Value> row;
-		row.reserve(3 + user_types.size());
-		row.push_back(Bigint(r.row_id));
-		row.push_back(Bigint(r.begin_snapshot));
-		row.push_back(OptBigint(r.has_end_snapshot, r.end_snapshot));
-		auto &cells = decoded[r.offset_in_chunk];
-		row.insert(row.end(), cells.begin(), cells.end());
-		result.push_back(std::move(row));
+		result.rows.push_back(
+		    InlineDataRow {r.row_id, r.begin_snapshot, r.has_end_snapshot, r.end_snapshot, piece, row_in_piece});
 	}
 	// `moraine_inline_scan`'s `ForFlush` variant already orders by
 	// `(row_id, begin_snapshot)`.
 	return result;
+}
+
+// The inline data table's own scan state. Distinct from the metadata
+// tables' because this table's payload is decoded `DataChunk`s rather than
+// a `duckdb::Value` matrix, and the scan copies whole runs of it across
+// column-wise.
+struct InlineDataScanBindData : public duckdb::FunctionData {
+	// Shared rather than deep-copied: `Copy` is called per plan, and the
+	// decoded chunks are the expensive part.
+	std::shared_ptr<const InlineDataScan> scan;
+	// Exposed through `get_bind_info` so `LogicalGet::GetTable()` resolves
+	// this entry: the binder's UPDATE/DELETE paths require a resolvable base
+	// table.
+	duckdb::optional_ptr<duckdb::TableCatalogEntry> table_entry;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto result = duckdb::make_uniq<InlineDataScanBindData>();
+		result->scan = scan;
+		result->table_entry = table_entry;
+		return std::move(result);
+	}
+
+	bool Equals(const duckdb::FunctionData &other) const override {
+		auto &that = other.Cast<InlineDataScanBindData>();
+		return scan == that.scan && table_entry.get() == that.table_entry.get();
+	}
+};
+
+struct InlineDataScanGlobalState : public duckdb::GlobalTableFunctionState {
+	duckdb::idx_t offset = 0;
+	// The columns DuckDB asked for, by index into the table's column list,
+	// in output order. Empty for a zero-column probe, which DuckDB emits
+	// only because this function advertises projection pushdown.
+	std::vector<duckdb::column_t> column_ids;
+
+	duckdb::idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> InlineDataScanInitGlobal(duckdb::ClientContext &,
+                                                                              duckdb::TableFunctionInitInput &input) {
+	auto state = duckdb::make_uniq<InlineDataScanGlobalState>();
+	state->column_ids = input.column_ids;
+	return std::move(state);
+}
+
+duckdb::BindInfo InlineDataScanBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data) {
+	auto &data = bind_data->Cast<InlineDataScanBindData>();
+	duckdb::BindInfo info(duckdb::ScanType::TABLE);
+	info.table = data.table_entry;
+	return info;
+}
+
+// The three metadata columns, written straight into the output's flat
+// vectors — no `Value` in the loop.
+void EmitMetadataColumn(const std::vector<InlineDataRow> &rows, duckdb::idx_t offset, duckdb::idx_t count,
+                        duckdb::column_t col_id, duckdb::Vector &target) {
+	auto data = duckdb::FlatVector::GetData<int64_t>(target);
+	auto &validity = duckdb::FlatVector::Validity(target);
+	for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
+		auto &row = rows[offset + out_row];
+		switch (col_id) {
+		case 0:
+			data[out_row] = static_cast<int64_t>(row.row_id);
+			break;
+		case 1:
+			data[out_row] = static_cast<int64_t>(row.begin_snapshot);
+			break;
+		default:
+			if (!row.has_end_snapshot) {
+				validity.SetInvalid(out_row);
+				break;
+			}
+			data[out_row] = static_cast<int64_t>(row.end_snapshot);
+			break;
+		}
+	}
+}
+
+// One user column, copied run by run out of the decoded chunks. A run is a
+// maximal stretch of output rows that is also contiguous in one source
+// piece, which in practice is most of the chunk: the scan orders by
+// `row_id`, and row ids within a chunk follow insertion order.
+void EmitUserColumn(const InlineDataScan &scan, duckdb::idx_t offset, duckdb::idx_t count, duckdb::idx_t user_col,
+                    duckdb::Vector &target) {
+	duckdb::idx_t at = 0;
+	while (at < count) {
+		auto &first = scan.rows[offset + at];
+		duckdb::idx_t run = 1;
+		while (at + run < count) {
+			auto &next = scan.rows[offset + at + run];
+			if (next.piece != first.piece || next.row_in_piece != first.row_in_piece + run) {
+				break;
+			}
+			run++;
+		}
+		duckdb::VectorOperations::Copy(scan.pieces[first.piece]->data[user_col], target, first.row_in_piece + run,
+		                               first.row_in_piece, at);
+		at += run;
+	}
+}
+
+void InlineDataScanImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<InlineDataScanBindData>();
+	auto &state = data.global_state->Cast<InlineDataScanGlobalState>();
+	auto &scan = *bind_data.scan;
+	if (state.offset >= scan.rows.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, scan.rows.size() - state.offset);
+
+	for (duckdb::idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
+		auto col_id = state.column_ids[out_col];
+		auto &target = output.data[out_col];
+		if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+			// The rowid is the row's index in this scan's row list, which the
+			// UPDATE/DELETE sinks resolve back by re-materializing the same
+			// list — metadata only, so nothing is decoded twice.
+			auto rowids = duckdb::FlatVector::GetData<int64_t>(target);
+			for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
+				rowids[out_row] = static_cast<int64_t>(state.offset + out_row);
+			}
+			continue;
+		}
+		if (duckdb::IsVirtualColumn(col_id) || col_id >= kInlineUserColumnStart + scan.user_columns) {
+			// Any other virtual column has no synthesized value; serve an
+			// untyped NULL rather than read out of bounds.
+			target.SetVectorType(duckdb::VectorType::CONSTANT_VECTOR);
+			duckdb::ConstantVector::SetNull(target, true);
+			continue;
+		}
+		if (col_id < kInlineUserColumnStart) {
+			EmitMetadataColumn(scan.rows, state.offset, count, col_id, target);
+			continue;
+		}
+		EmitUserColumn(scan, state.offset, count, col_id - kInlineUserColumnStart, target);
+	}
+
+	state.offset += count;
+	output.SetCardinality(count);
 }
 
 } // namespace
@@ -427,11 +603,22 @@ std::vector<duckdb::LogicalType> MoraineInlineDataTableEntry::UserColumnTypes() 
 duckdb::TableFunction
 MoraineInlineDataTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                              duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
-	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-	scan_bind_data->rows = ProvideInlineDataRows(context, handle_, table_id_, schema_version_, UserColumnTypes());
+	auto scan_bind_data = duckdb::make_uniq<InlineDataScanBindData>();
+	scan_bind_data->scan = std::make_shared<const InlineDataScan>(
+	    ScanInlineData(context, handle_, table_id_, schema_version_, UserColumnTypes(), /* with_values */ true));
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
-	return MetadataScanTableFunction();
+
+	duckdb::TableFunction function("moraine_inline_data_scan", {}, InlineDataScanImpl, nullptr,
+	                               InlineDataScanInitGlobal, nullptr);
+	// Required for the zero-real-column probe shape, and real projection
+	// pushdown falls out of the same mechanism — which matters more here than
+	// for a metadata table: an unasked-for user column is never copied.
+	function.projection_pushdown = true;
+	// Resolves `LogicalGet::GetTable()` so UPDATE/DELETE bind against this
+	// entry.
+	function.get_bind_info = InlineDataScanBindInfo;
+	return function;
 }
 
 duckdb::TableStorageInfo MoraineInlineDataTableEntry::GetStorageInfo(duckdb::ClientContext &) {
@@ -594,7 +781,11 @@ struct InlineDmlState : public duckdb::GlobalSinkState {
 	duckdb::idx_t affected_count = 0;
 	bool emitted = false;
 	bool old_rows_loaded = false;
-	std::vector<std::vector<duckdb::Value>> old_rows;
+	std::vector<InlineDataRow> old_rows;
+	// The delete table's own rows, whose rowids resolve against a different
+	// materialization entirely (`ProvideInlineFileDeleteRows`).
+	bool old_delete_rows_loaded = false;
+	std::vector<std::vector<duckdb::Value>> old_delete_rows;
 	// DELETE only: the maximum `begin_snapshot` among matched rows, standing
 	// in for the flush-snapshot threshold.
 	std::optional<uint64_t> max_begin_snapshot;
@@ -628,16 +819,17 @@ protected:
 		return moraine_tx.StagedTx();
 	}
 
-	// Resolves a rowid the entry's scan emitted (its index into
-	// `ProvideInlineDataRows`'s output) back to the row itself,
-	// re-materializing on first use.
-	const std::vector<duckdb::Value> &ResolveRow(duckdb::ClientContext &context, InlineDmlState &state,
-	                                             MoraineCatalogHandle *handle, uint64_t table_id,
-	                                             uint64_t schema_version,
-	                                             const std::vector<duckdb::LogicalType> &user_types,
-	                                             const duckdb::Value &row_id) const {
+	// Resolves a rowid the entry's scan emitted (its index into that scan's
+	// row list) back to the row itself, re-materializing on first use.
+	// Metadata only: a rowid resolves to `row_id` and `begin_snapshot`, and
+	// neither needs an Arrow body decoded.
+	const InlineDataRow &ResolveRow(duckdb::ClientContext &context, InlineDmlState &state, MoraineCatalogHandle *handle,
+	                                uint64_t table_id, uint64_t schema_version,
+	                                const std::vector<duckdb::LogicalType> &user_types,
+	                                const duckdb::Value &row_id) const {
 		if (!state.old_rows_loaded) {
-			state.old_rows = ProvideInlineDataRows(context, handle, table_id, schema_version, user_types);
+			state.old_rows =
+			    ScanInlineData(context, handle, table_id, schema_version, user_types, /* with_values */ false).rows;
 			state.old_rows_loaded = true;
 		}
 		if (row_id.IsNull()) {
@@ -727,7 +919,7 @@ public:
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
 			auto &old_row = ResolveRow(context.client, state, handle_, table_id_, schema_version_, user_types_,
 			                           chunk.GetValue(row_id_col, row));
-			auto real_row_id = CellAsU64(old_row[0]);
+			auto real_row_id = old_row.row_id;
 			auto end_snapshot = CellAsU64(chunk.GetValue(set_ref_, row));
 			MoraineError err {};
 			auto code = moraine_tx_stage_inline_inline_delete(tx, table_id_, real_row_id, end_snapshot, &err);
@@ -763,7 +955,7 @@ public:
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
 			auto &old_row = ResolveRow(context.client, state, handle_, table_id_, schema_version_, user_types_,
 			                           chunk.GetValue(row_id_chunk_index_, row));
-			auto begin_snapshot = CellAsU64(old_row[1]);
+			auto begin_snapshot = old_row.begin_snapshot;
 			if (!state.max_begin_snapshot.has_value() || begin_snapshot > *state.max_begin_snapshot) {
 				state.max_begin_snapshot = begin_snapshot;
 			}
@@ -839,22 +1031,22 @@ public:
 		auto &state = input.global_state.Cast<InlineDmlState>();
 		auto *tx = StagedTx(context.client);
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
-			if (!state.old_rows_loaded) {
-				state.old_rows = ProvideInlineFileDeleteRows(context.client, handle_, table_id_);
-				state.old_rows_loaded = true;
+			if (!state.old_delete_rows_loaded) {
+				state.old_delete_rows = ProvideInlineFileDeleteRows(context.client, handle_, table_id_);
+				state.old_delete_rows_loaded = true;
 			}
 			auto row_id_value = chunk.GetValue(row_id_chunk_index_, row);
 			if (row_id_value.IsNull()) {
 				throw duckdb::InternalException("moraine: staged write received a NULL rowid");
 			}
 			auto index = static_cast<duckdb::idx_t>(row_id_value.GetValue<int64_t>());
-			if (index >= state.old_rows.size()) {
+			if (index >= state.old_delete_rows.size()) {
 				throw duckdb::InternalException(
 				    "moraine: staged write rowid is out of range — the committed head moved between this "
 				    "statement's scan and its write, which the supported topology excludes");
 			}
 			// Columns 0/1 of the scan are `file_id`/`row_id`.
-			auto &old_row = state.old_rows[index];
+			auto &old_row = state.old_delete_rows[index];
 			MoraineError err {};
 			auto code = moraine_tx_stage_inline_file_delete_remove(tx, table_id_, CellAsU64(old_row[0]),
 			                                                       CellAsU64(old_row[1]), &err);

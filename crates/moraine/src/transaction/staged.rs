@@ -55,6 +55,7 @@ mod decode;
 pub(crate) mod forward;
 mod index_upkeep;
 pub(crate) mod inline;
+mod overlay;
 #[cfg(test)]
 mod tests;
 
@@ -435,6 +436,16 @@ impl StagedBacking {
             Self::Slots { head, .. } => Some(&head.overlay),
         }
     }
+
+    /// The handle and unfolded-tail overlay for a committed-records scan: the
+    /// folded store overlaid with the tail the pinned head carries.
+    fn committed_scan(&self) -> (ReadHandle<'_>, &Overlay) {
+        match self {
+            Self::Slots { head, reader, .. } => {
+                (head.handle(ReadHandle::Reader(reader)), &head.overlay)
+            }
+        }
+    }
 }
 
 /// A staged-row transaction: one commit backing opened by `begin`
@@ -446,6 +457,11 @@ impl StagedBacking {
 pub struct StagedTransaction {
     backing: StagedBacking,
     ops: Vec<RowOperation>,
+    /// The committed records at this transaction's read point, scanned once
+    /// on the first `visible_*` call and shared by every later one. The head
+    /// the backing pins is fixed, so a metadata population issuing one
+    /// `visible_*` call per kind reads them all at one consistent cut.
+    committed: tokio::sync::OnceCell<Arc<Vec<read::EntityRecord>>>,
     /// The `DATA_PATH` object store and its bucket-relative prefix, present
     /// when the attach supplied `META_DATA_PATH`. Index maintenance
     /// scoped-reads registered data files through it; absent it is skipped.
@@ -484,6 +500,7 @@ impl StagedTransaction {
                 slots,
             },
             ops: Vec::new(),
+            committed: tokio::sync::OnceCell::new(),
             data_store,
             data_prefix,
             head_cache,
@@ -555,6 +572,411 @@ impl StagedTransaction {
             .collect())
     }
 
+    /// The committed entity records at this transaction's read point,
+    /// `current` and `history` together — the same pair a `dump_*` scans,
+    /// read through `db_tx` so the committed half and the staged half are
+    /// one consistent cut. Scanned once and shared: a metadata population
+    /// inside a write transaction asks for one kind after another.
+    async fn committed_entities(&self) -> Result<&Arc<Vec<read::EntityRecord>>> {
+        self.committed
+            .get_or_try_init(|| async {
+                let (handle, overlay) = self.backing.committed_scan();
+                let mut records = read::scan_current_entities_overlaid(handle, overlay).await?;
+                records.extend(read::scan_history_entities_overlaid(handle, overlay).await?);
+                Ok(Arc::new(records))
+            })
+            .await
+    }
+
+    /// The committed records of one kind, as the overlay's starting point.
+    async fn committed_rows<T>(
+        &self,
+        extract: impl Fn(&read::EntityRecord) -> Option<T>,
+    ) -> Result<Vec<T>> {
+        Ok(self
+            .committed_entities()
+            .await?
+            .iter()
+            .filter_map(extract)
+            .collect())
+    }
+
+    /// `ducklake_data_file` rows as this transaction sees them: committed
+    /// rows at its read point with its own staged rows over them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_data_files(&self) -> Result<Vec<proto::DataFileValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::File(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_delete_file` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_delete_files(&self) -> Result<Vec<proto::DeleteFileValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::DeleteFile(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_column` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_columns(&self) -> Result<Vec<proto::ColumnValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Column(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_table` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_tables(&self) -> Result<Vec<proto::TableValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Table(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_file_column_stats` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_file_column_stats(&self) -> Result<Vec<proto::FileColumnStatsValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::FileColumnStats(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_unversioned(&self.ops, committed)
+    }
+
+    /// `ducklake_schema` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_schemas(&self) -> Result<Vec<proto::SchemaValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Schema(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_view` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_views(&self) -> Result<Vec<proto::ViewValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::View(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_partition_info` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_partition_info(&self) -> Result<Vec<proto::PartitionValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Partition(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_sort_info` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_sort_info(&self) -> Result<Vec<proto::SortValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Sort(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_macro` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_macros(&self) -> Result<Vec<proto::MacroValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Macro(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_versioned(&self.ops, committed)
+    }
+
+    /// `ducklake_table_stats` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_table_stats(&self) -> Result<Vec<proto::TableStatsValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::TableStats(v) => Some(*v),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_unversioned(&self.ops, committed)
+    }
+
+    /// `ducklake_table_column_stats` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_table_column_stats(&self) -> Result<Vec<proto::TableColumnStatsValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::TableColumnStats(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_unversioned(&self.ops, committed)
+    }
+
+    /// `ducklake_column_mapping` rows as this transaction sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_mappings(&self) -> Result<Vec<proto::MappingValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Mapping(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_unversioned(&self.ops, committed)
+    }
+
+    /// The `ducklake_tag` container records as this transaction sees them.
+    ///
+    /// A tag row is an entry inside its object's container, so the
+    /// transaction's staged tag rows are folded into those containers
+    /// rather than overlaid as records of their own.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_tag_containers(&self) -> Result<Vec<proto::TagValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Tag(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_tag_containers(&self.ops, committed)
+    }
+
+    /// The option-scope records as this transaction sees them, as
+    /// `(scope_kind, scope_id, options)` triples — the shape the
+    /// `ducklake_metadata` projection flattens.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_option_scopes(&self) -> Result<Vec<(u64, u64, proto::OptionScopeValue)>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::Option {
+                    scope_kind,
+                    scope_id,
+                    value,
+                } => Some((*scope_kind, *scope_id, value.clone())),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_option_scopes(&self.ops, committed)
+    }
+
+    /// The rows this transaction staged for one embedded child kind,
+    /// decoded and paired with the parent each names.
+    ///
+    /// An embedded row rides its parent's record, and a staged child always
+    /// names a parent the same batch inserts — translation refuses one that
+    /// does not — so a child projection is its parents' rows plus these.
+    /// Deletes need no counterpart: an embedded row is only ever removed
+    /// alongside the parent that carries it, which the parent's own overlay
+    /// already drops.
+    fn staged_children<T>(
+        &self,
+        kind: TableKind,
+        decode: impl Fn(&[Cell]) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        self.ops
+            .iter()
+            .filter_map(|op| match op {
+                RowOperation::Insert { table, cells } if *table == kind => Some(decode(cells)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `ducklake_partition_column` rows this transaction staged, each
+    /// with its spec's id. See [`staged_children`](Self::staged_children).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_partition_columns(&self) -> Result<Vec<(u64, proto::PartitionColumn)>> {
+        self.staged_children(TableKind::PartitionColumn, decode::decode_partition_column)
+    }
+
+    /// The `ducklake_file_partition_value` rows this transaction staged,
+    /// each with its `(table_id, data_file_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_file_partition_values(
+        &self,
+    ) -> Result<Vec<((u64, u64), proto::FilePartitionValue)>> {
+        self.staged_children(
+            TableKind::FilePartitionValue,
+            decode::decode_file_partition_value,
+        )
+    }
+
+    /// The `ducklake_sort_expression` rows this transaction staged, each
+    /// with its spec's id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_sort_expressions(&self) -> Result<Vec<(u64, proto::SortExpression)>> {
+        self.staged_children(TableKind::SortExpression, decode::decode_sort_expression)
+    }
+
+    /// The `ducklake_column_tag` rows this transaction staged, each with
+    /// its `(table_id, column_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_column_tags(&self) -> Result<Vec<((u64, u64), proto::ColumnTag)>> {
+        self.staged_children(TableKind::ColumnTag, decode::decode_column_tag_row)
+    }
+
+    /// The `ducklake_macro_impl` rows this transaction staged, each with
+    /// its macro's id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_macro_impls(&self) -> Result<Vec<(u64, proto::MacroImplementation)>> {
+        self.staged_children(TableKind::MacroImpl, decode::decode_macro_impl)
+    }
+
+    /// The `ducklake_macro_parameters` rows this transaction staged, each
+    /// with its `(macro_id, impl_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_macro_parameters(&self) -> Result<Vec<((u64, u64), proto::MacroParameter)>> {
+        self.staged_children(TableKind::MacroParameters, decode::decode_macro_parameter)
+    }
+
+    /// The `ducklake_name_mapping` rows this transaction staged, each with
+    /// its mapping's id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a staged row is malformed.
+    pub fn staged_name_mappings(&self) -> Result<Vec<(u64, proto::NameMapping)>> {
+        self.staged_children(TableKind::NameMapping, decode::decode_name_mapping)
+    }
+
+    /// The `schema_version` records as this transaction sees them, as
+    /// `(table_id, begin_snapshot, schema_version)` triples: the committed
+    /// records with the transaction's own inserts and deletes over them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_schema_version_records(&self) -> Result<Vec<(u64, u64, u64)>> {
+        let (handle, overlay) = self.backing.committed_scan();
+        let mut records = read::scan_schema_versions_overlaid(handle, overlay).await?;
+        for op in &self.ops {
+            match op {
+                RowOperation::Insert { table, cells } if *table == TableKind::SchemaVersions => {
+                    records.push(decode::decode_schema_version_row(cells)?);
+                }
+                RowOperation::Delete { table, cells } if *table == TableKind::SchemaVersions => {
+                    let (table_id, begin_snapshot, _) = decode::decode_schema_version_row(cells)?;
+                    records.retain(|(t, b, _)| !(*t == table_id && *b == begin_snapshot));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(records)
+    }
+
+    /// `ducklake_files_scheduled_for_deletion` rows as this transaction
+    /// sees them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scan fails or a staged row is malformed.
+    pub async fn visible_scheduled_deletions(&self) -> Result<Vec<proto::GcFileValue>> {
+        let committed = self
+            .committed_rows(|r| match r {
+                read::EntityRecord::GcFile(v) => Some(v.clone()),
+                _ => None,
+            })
+            .await?;
+        overlay::overlay_unversioned(&self.ops, committed)
+    }
+
     /// Translates every staged row and lands them in one atomic batch.
     ///
     /// A commit with a `ducklake_snapshot` insert mints that snapshot and
@@ -576,6 +998,7 @@ impl StagedTransaction {
         let Self {
             backing,
             ops,
+            committed: _,
             data_store,
             data_prefix,
             head_cache,

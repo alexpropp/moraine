@@ -83,14 +83,17 @@ std::vector<DecodedInlineColumn> DecodeInlineSchema(duckdb::ClientContext &conte
 std::vector<uint8_t> EncodeInlineChunkRows(duckdb::ClientContext &context, duckdb::DataChunk &chunk,
                                            duckdb::idx_t user_col_start);
 
-// Inverse of `EncodeInlineChunkRows`: one entry per row, imported through
-// DuckDB's Arrow reader. `schema_ipc` is the version's schema-only stream
-// (`inline/schema`), against which the body-only chunk decodes. Throws
-// InternalException on malformed bytes or a column count mismatch against
-// `user_types`.
-std::vector<std::vector<duckdb::Value>> DecodeInlineChunkRows(duckdb::ClientContext &context, const uint8_t *schema_ipc,
-                                                              size_t schema_ipc_len, const uint8_t *data, size_t len,
-                                                              const std::vector<duckdb::LogicalType> &user_types);
+// Inverse of `EncodeInlineChunkRows`, imported through DuckDB's Arrow
+// reader and left as the `DataChunk`s that reader produced — one per
+// `STANDARD_VECTOR_SIZE` rows, in order, so the chunk's row `o` is row
+// `o % STANDARD_VECTOR_SIZE` of piece `o / STANDARD_VECTOR_SIZE`. Columnar
+// on both sides: nothing is transcoded through `duckdb::Value`.
+// `schema_ipc` is the version's schema-only stream (`inline/schema`),
+// against which the body-only chunk decodes. Throws InternalException on
+// malformed bytes or a column count mismatch against `user_types`.
+std::vector<duckdb::unique_ptr<duckdb::DataChunk>> DecodeInlineChunkPieces(
+    duckdb::ClientContext &context, const uint8_t *schema_ipc, size_t schema_ipc_len, const uint8_t *data, size_t len,
+    const std::vector<duckdb::LogicalType> &user_types);
 
 // A synthesized `ducklake_inlined_data_<t>_<v>` entry: columns are
 // `(row_id, begin_snapshot, end_snapshot, <user columns>)`.

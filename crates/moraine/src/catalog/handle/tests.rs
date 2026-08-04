@@ -439,6 +439,7 @@ async fn create_index_staged_lands_ready_over_the_slot_log() {
                         column_type: "BIGINT".into(),
                         nulls_allowed: true,
                         default_value: None,
+                        children: Vec::new(),
                     }],
                 )?;
                 created.set(Some(t));

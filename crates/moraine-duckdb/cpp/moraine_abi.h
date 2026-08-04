@@ -959,6 +959,23 @@ extern "C" {
 // already-initialized store, whose stored flag
 // ([`moraine_catalog_encrypted`]) is authoritative.
 //
+// `cache_size_bytes` bounds the on-disk object cache `cache_dir` names.
+// The cap is per attach, so several attaches sharing one directory each
+// spend up to it; `0` leaves the store's own cap in force, and without a
+// `cache_dir` there is no object cache to bound. The store's in-memory
+// caches are separate and take no configuration here.
+//
+// `cache_preload` loads objects into that cache as the attach opens, so
+// the first query pays no first touch: `0` loads nothing, `1` the newest
+// objects, `2` every object the manifest references. The load is bounded
+// by `cache_size_bytes` and skips what it cannot fetch, but the attach
+// waits for it. Any other value is [`codes::INVALID_ARGUMENT`].
+//
+// `cache_puts` fills that cache from the write path as well as the read
+// path, so a flushed or compacted object is local without a later fetch.
+// Compaction output is cached too, so a merge can evict what reads had
+// warmed; `false` leaves the cache filled by reads alone.
+//
 // `checkpoint` pins a **read-only** attach to an existing SlateDB
 // checkpoint (see [`moraine_create_checkpoint`]), so the open writes
 // nothing at all — no manifest record of the reader, no refresh, no
@@ -1002,7 +1019,8 @@ extern "C" {
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-// `host_threads` is unconstrained.
+// `cache_size_bytes`, `cache_preload`, `cache_puts`, and `host_threads`
+// are unconstrained.
 // `probe`, if non-null, must be safe to call with `probe_ctx` from any
 // thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -1013,6 +1031,9 @@ int32_t moraine_attach(const char *path,
                        bool encrypted,
                        uint64_t flush_interval_ms,
                        const char *cache_dir,
+                       uint64_t cache_size_bytes,
+                       uint8_t cache_preload,
+                       bool cache_puts,
                        const char *data_path,
                        const char *checkpoint,
                        uint64_t host_threads,
@@ -1064,13 +1085,18 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
 // point to a valid [`MoraineS3Config`] whose non-null fields are valid
 // NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
-// NUL-terminated C string. `out` must be a valid, writable
-// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
-// writable [`MoraineError`]. All for the duration of this call.
+// NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+// `cache_puts` are unconstrained. `out`
+// must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
+// must be a valid, writable [`MoraineError`]. All for the duration of this
+// call.
 int32_t moraine_migrate(const char *path,
                         const struct MoraineS3Config *s3,
                         uint64_t flush_interval_ms,
                         const char *cache_dir,
+                        uint64_t cache_size_bytes,
+                        uint8_t cache_preload,
+                        bool cache_puts,
                         bool checkpoint,
                         struct MoraineMigrationReport *out,
                         struct MoraineError *err);
@@ -2619,6 +2645,402 @@ int32_t moraine_tx_dump_snapshots(struct MoraineTxHandle *tx,
                                   struct MoraineSnapshotRow **out_items,
                                   size_t *out_len,
                                   struct MoraineError *err);
+
+// Dumps every `ducklake_data_file` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. A cascade that re-reads this table after staging its deletes must
+// observe them, or it re-plans work it has already done.
+// Freed with `moraine_dump_data_files_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_data_files(struct MoraineTxHandle *tx,
+                                   struct MoraineDataFileRow **out_items,
+                                   size_t *out_len,
+                                   struct MoraineError *err);
+
+// Dumps every `ducklake_delete_file` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. A cascade that re-reads this table after staging its deletes must
+// observe them, or it re-plans work it has already done.
+// Freed with `moraine_dump_delete_files_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_delete_files(struct MoraineTxHandle *tx,
+                                     struct MoraineDeleteFileRow **out_items,
+                                     size_t *out_len,
+                                     struct MoraineError *err);
+
+// Dumps every `ducklake_file_column_stats` row **as this transaction sees
+// it**: committed rows at the transaction's read point with its own staged
+// rows over them. A cascade that re-reads this table after staging its deletes
+// must observe them, or it re-plans work it has already done.
+// Freed with `moraine_dump_file_column_stats_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_file_column_stats(struct MoraineTxHandle *tx,
+                                          struct MoraineFileColumnStatsRow **out_items,
+                                          size_t *out_len,
+                                          struct MoraineError *err);
+
+// Dumps every `ducklake_files_scheduled_for_deletion` row **as this
+// transaction sees it**: committed rows at the transaction's read point with
+// its own staged rows over them. A cascade that re-reads this table after
+// staging its deletes must observe them, or it re-plans work it has already
+// done. Freed with `moraine_dump_scheduled_deletions_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_scheduled_deletions(struct MoraineTxHandle *tx,
+                                            struct MoraineScheduledDeletionRow **out_items,
+                                            size_t *out_len,
+                                            struct MoraineError *err);
+
+// Dumps every `ducklake_column` row **as this transaction sees it**: committed
+// rows at the transaction's read point with its own staged rows over them.
+// A cascade that re-reads this table after staging its deletes must
+// observe them, or it re-plans work it has already done.
+// Freed with `moraine_dump_columns_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_columns(struct MoraineTxHandle *tx,
+                                struct MoraineColumnRow **out_items,
+                                size_t *out_len,
+                                struct MoraineError *err);
+
+// Dumps every `ducklake_table` row **as this transaction sees it**: committed
+// rows at the transaction's read point with its own staged rows over them.
+// A cascade that re-reads this table after staging its deletes must
+// observe them, or it re-plans work it has already done.
+// Freed with `moraine_dump_tables_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_tables(struct MoraineTxHandle *tx,
+                               struct MoraineTableRow **out_items,
+                               size_t *out_len,
+                               struct MoraineError *err);
+
+// Dumps every `ducklake_schema` row **as this transaction sees it**: committed
+// rows at the transaction's read point with its own staged rows over them.
+// Freed with `moraine_dump_schemas_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_schemas(struct MoraineTxHandle *tx,
+                                struct MoraineSchemaRow **out_items,
+                                size_t *out_len,
+                                struct MoraineError *err);
+
+// Dumps every `ducklake_view` row **as this transaction sees it**: committed
+// rows at the transaction's read point with its own staged rows over them.
+// Freed with `moraine_dump_views_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_views(struct MoraineTxHandle *tx,
+                              struct MoraineViewRow **out_items,
+                              size_t *out_len,
+                              struct MoraineError *err);
+
+// Dumps every `ducklake_table_stats` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_table_stats_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_table_stats(struct MoraineTxHandle *tx,
+                                    struct MoraineTableStatsRow **out_items,
+                                    size_t *out_len,
+                                    struct MoraineError *err);
+
+// Dumps every `ducklake_table_column_stats` row **as this transaction sees
+// it**: committed rows at the transaction's read point with its own staged
+// rows over them. Freed with `moraine_dump_table_column_stats_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_table_column_stats(struct MoraineTxHandle *tx,
+                                           struct MoraineTableColumnStatsRow **out_items,
+                                           size_t *out_len,
+                                           struct MoraineError *err);
+
+// Dumps every `ducklake_partition_info` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_partition_info_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_partition_info(struct MoraineTxHandle *tx,
+                                       struct MorainePartitionInfoRow **out_items,
+                                       size_t *out_len,
+                                       struct MoraineError *err);
+
+// Dumps every `ducklake_sort_info` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_sort_info_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_sort_info(struct MoraineTxHandle *tx,
+                                  struct MoraineSortInfoRow **out_items,
+                                  size_t *out_len,
+                                  struct MoraineError *err);
+
+// Dumps every `ducklake_macro` row **as this transaction sees it**: committed
+// rows at the transaction's read point with its own staged rows over them.
+// Freed with `moraine_dump_macros_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_macros(struct MoraineTxHandle *tx,
+                               struct MoraineMacroRow **out_items,
+                               size_t *out_len,
+                               struct MoraineError *err);
+
+// Dumps every `ducklake_column_mapping` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_column_mappings_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_column_mappings(struct MoraineTxHandle *tx,
+                                        struct MoraineColumnMappingRow **out_items,
+                                        size_t *out_len,
+                                        struct MoraineError *err);
+
+// Dumps every `ducklake_partition_column` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_partition_columns_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_partition_columns(struct MoraineTxHandle *tx,
+                                          struct MorainePartitionColumnRow **out_items,
+                                          size_t *out_len,
+                                          struct MoraineError *err);
+
+// Dumps every `ducklake_file_partition_value` row **as this transaction sees
+// it**: committed rows at the transaction's read point with its own staged
+// rows over them. Freed with `moraine_dump_file_partition_values_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_file_partition_values(struct MoraineTxHandle *tx,
+                                              struct MoraineFilePartitionValueRow **out_items,
+                                              size_t *out_len,
+                                              struct MoraineError *err);
+
+// Dumps every `ducklake_sort_expression` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_sort_expressions_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_sort_expressions(struct MoraineTxHandle *tx,
+                                         struct MoraineSortExpressionRow **out_items,
+                                         size_t *out_len,
+                                         struct MoraineError *err);
+
+// Dumps every `ducklake_column_tag` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_column_tags_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_column_tags(struct MoraineTxHandle *tx,
+                                    struct MoraineColumnTagRow **out_items,
+                                    size_t *out_len,
+                                    struct MoraineError *err);
+
+// Dumps every `ducklake_macro_impl` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_macro_impls_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_macro_impls(struct MoraineTxHandle *tx,
+                                    struct MoraineMacroImplRow **out_items,
+                                    size_t *out_len,
+                                    struct MoraineError *err);
+
+// Dumps every `ducklake_macro_parameters` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_macro_parameters_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_macro_parameters(struct MoraineTxHandle *tx,
+                                         struct MoraineMacroParameterRow **out_items,
+                                         size_t *out_len,
+                                         struct MoraineError *err);
+
+// Dumps every `ducklake_name_mapping` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_name_mappings_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_name_mappings(struct MoraineTxHandle *tx,
+                                      struct MoraineNameMappingRow **out_items,
+                                      size_t *out_len,
+                                      struct MoraineError *err);
+
+// Dumps every `ducklake_tag` row **as this transaction sees it**: committed
+// rows at the transaction's read point with its own staged rows over them.
+// Freed with `moraine_dump_tags_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_tags(struct MoraineTxHandle *tx,
+                             struct MoraineTagRow **out_items,
+                             size_t *out_len,
+                             struct MoraineError *err);
+
+// Dumps every `ducklake_metadata` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_options_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_options(struct MoraineTxHandle *tx,
+                                struct MoraineOptionRow **out_items,
+                                size_t *out_len,
+                                struct MoraineError *err);
+
+// Dumps every `ducklake_schema_versions` row **as this transaction sees it**:
+// committed rows at the transaction's read point with its own staged rows over
+// them. Freed with `moraine_dump_schema_versions_free`.
+//
+// # Safety
+//
+// `tx` must be a pointer previously returned by [`moraine_tx_begin`] and
+// not yet committed or rolled back; its catalog must still be attached.
+// `out_items`/`out_len` must be valid, writable pointers. `err`, if
+// non-null, must be a valid, writable [`MoraineError`]. All for the
+// duration of this call.
+int32_t moraine_tx_dump_schema_versions(struct MoraineTxHandle *tx,
+                                        struct MoraineSchemaVersionRow **out_items,
+                                        size_t *out_len,
+                                        struct MoraineError *err);
 
 // Translates every staged row and lands them in one atomic batch,
 // consuming `tx`. On success, writes the new snapshot id to
