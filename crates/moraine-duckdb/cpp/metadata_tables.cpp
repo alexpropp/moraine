@@ -1298,21 +1298,24 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> MetadataScanInitGlobal(duck
 void MetadataScanFunctionImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<MetadataScanBindData>();
 	auto &state = data.global_state->Cast<MetadataScanGlobalState>();
-	if (state.offset >= bind_data.rows.size()) {
+	if (bind_data.rows == nullptr) {
+		throw duckdb::InternalException("moraine: metadata scan bound without a materialized row set");
+	}
+	auto &rows = *bind_data.rows;
+	if (state.offset >= rows.size()) {
 		output.SetCardinality(0);
 		return;
 	}
-	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows.size() - state.offset);
+	duckdb::idx_t count = std::min<duckdb::idx_t>(STANDARD_VECTOR_SIZE, rows.size() - state.offset);
 	for (duckdb::idx_t out_row = 0; out_row < count; out_row++) {
-		auto &row = bind_data.rows[state.offset + out_row];
+		auto &row = rows[state.offset + out_row];
 		for (duckdb::idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
 			auto col_id = state.column_ids[out_col];
 			if (col_id == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
 				// The rowid is the row's index in this scan's materialized
-				// row set. The provider's output order is deterministic for a
-				// fixed committed head, so the staged-write Sink
-				// (staged_write.cpp) resolves this index back to the row by
-				// re-materializing the same provider.
+				// row set — the transaction-scoped list `MetadataRowsFor`
+				// hands out, which the staged-write Sink (staged_write.cpp)
+				// resolves the index against by asking for the same one.
 				output.SetValue(out_col, out_row, duckdb::Value::BIGINT(static_cast<int64_t>(state.offset + out_row)));
 				continue;
 			}
@@ -1502,27 +1505,39 @@ std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHand
 
 } // namespace
 
-std::optional<std::vector<std::vector<duckdb::Value>>>
-MetadataTxAwareRows(duckdb::ClientContext &context, duckdb::Catalog &catalog, int32_t write_table_kind) {
-	if (write_table_kind == kNotWritable) {
-		return std::nullopt;
-	}
+std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
+                                                    const MetadataTableSpec &spec) {
 	auto catalog_transaction = catalog.GetCatalogTransaction(context);
-	auto *staged_tx = catalog_transaction.transaction->Cast<MoraineTransaction>().StagedTxIfOpen();
-	if (staged_tx == nullptr) {
-		return std::nullopt;
+	auto &transaction = catalog_transaction.transaction->Cast<MoraineTransaction>();
+	auto *handle = catalog.Cast<MoraineCatalog>().Handle();
+	auto *staged_tx = transaction.StagedTxIfOpen();
+
+	if (staged_tx != nullptr) {
+		// A writing transaction reads through its staged tx, which pins one
+		// read point for its whole life and overlays the rows staged so far.
+		// That is the pinning this function otherwise supplies, and it is
+		// also the surface DuckLake's commit retry re-reads between
+		// attempts, so nothing here may cache over it.
+		if (spec.write_table_kind != kNotWritable) {
+			if (auto staged = TxAwareRows(staged_tx, handle, context, spec.write_table_kind)) {
+				return std::make_shared<const MetadataRows>(std::move(*staged));
+			}
+		}
+		return std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
 	}
-	return TxAwareRows(staged_tx, catalog.Cast<MoraineCatalog>().Handle(), context, write_table_kind);
+
+	if (auto cached = transaction.GetMetadataRows(spec)) {
+		return cached;
+	}
+	auto rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
+	transaction.PutMetadataRows(spec, rows);
+	return rows;
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                                  duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-
-	auto tx_rows = MetadataTxAwareRows(context, ParentCatalog(), spec_.write_table_kind);
-	scan_bind_data->rows =
-	    tx_rows ? std::move(*tx_rows) : spec_.provider(handle_, moraine_shim_is_interrupted, &context);
-
+	scan_bind_data->rows = MetadataRowsFor(context, ParentCatalog(), spec_);
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();

@@ -664,7 +664,8 @@ duckdb::TableFunction
 MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-	scan_bind_data->rows = ProvideInlineFileDeleteRows(context, handle_, table_id_);
+	scan_bind_data->rows =
+	    std::make_shared<const MetadataRows>(ProvideInlineFileDeleteRows(context, handle_, table_id_));
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();

@@ -69,8 +69,11 @@ MoraineCell CellFromValue(const duckdb::Value &value, const duckdb::LogicalType 
 struct MetadataDmlState : public duckdb::GlobalSinkState {
 	duckdb::idx_t affected_count = 0;
 	bool emitted = false;
-	bool old_rows_loaded = false;
-	std::vector<std::vector<duckdb::Value>> old_rows;
+	// The transaction's materialized table, shared with the scan that
+	// emitted the rowids resolved against it. Held for this operator's
+	// whole run, so opening the staged tx — which drops the transaction's
+	// own reference — leaves it standing. Null until pinned.
+	std::shared_ptr<const MetadataRows> old_rows;
 };
 
 // Base for the three staged-write operators: owns the spec/catalog
@@ -106,37 +109,36 @@ protected:
 		return moraine_tx.StagedTx();
 	}
 
-	// Resolves a rowid the metadata scan emitted (the row's index in the
-	// list that scan materialized — see metadata_tables.cpp) back to the row
-	// itself, re-materializing the same list on first use. Head stability
-	// between the statement's scan and this Sink is a topology property (see
-	// staged_write.hpp's doc comment).
+	// Takes the list the scan emitted its rowids into, so this Sink resolves
+	// them against the rows the scan actually handed out rather than a
+	// second materialization: `MetadataRowsFor` gives one list per
+	// (transaction, table) while the transaction has no staged tx, and one
+	// pinned to the staged tx's read point once it has.
 	//
-	// "The same list" is load-bearing: inside a write transaction the scan
-	// serves rows with that transaction's own staged rows over them, so this
-	// must too, or an index would name a different row. It is materialized
-	// once, on the first row this Sink resolves — before this statement has
-	// staged anything of its own, which is what keeps it equal to what the
-	// scan saw.
+	// Called before `StagedTx`, because opening the staged tx is what moves
+	// the transaction between those two regimes, and the scan that produced
+	// these rowids bound in whichever one held before this statement ran.
+	void PinScannedRows(MetadataDmlState &state, duckdb::ClientContext &client) const {
+		if (state.old_rows == nullptr) {
+			state.old_rows = MetadataRowsFor(client, catalog_, spec_);
+		}
+	}
+
+	// Resolves a rowid the metadata scan emitted (the row's index in the
+	// list `PinScannedRows` took) back to the row itself.
 	const std::vector<duckdb::Value> &ResolveRow(MetadataDmlState &state, const duckdb::Value &row_id,
 	                                             duckdb::ClientContext &client) const {
-		if (!state.old_rows_loaded) {
-			auto &moraine_catalog = catalog_.Cast<MoraineCatalog>();
-			auto tx_rows = MetadataTxAwareRows(client, catalog_, spec_.write_table_kind);
-			state.old_rows = tx_rows ? std::move(*tx_rows)
-			                         : spec_.provider(moraine_catalog.Handle(), moraine_shim_is_interrupted, &client);
-			state.old_rows_loaded = true;
-		}
+		PinScannedRows(state, client);
 		if (row_id.IsNull()) {
 			throw duckdb::InternalException("moraine: staged write received a NULL rowid");
 		}
 		auto index = static_cast<duckdb::idx_t>(row_id.GetValue<int64_t>());
-		if (index >= state.old_rows.size()) {
+		if (index >= state.old_rows->size()) {
 			throw duckdb::InternalException(
-			    "moraine: staged write rowid is out of range — the committed head moved between this "
-			    "statement's scan and its write, which the supported topology excludes");
+			    "moraine: staged write rowid is out of range — the row set this Sink resolved against is not "
+			    "the one the scan emitted rowids into");
 		}
-		return state.old_rows[index];
+		return (*state.old_rows)[index];
 	}
 
 public:
@@ -236,6 +238,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
+		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		// Pinned layout: the row-id column is the last column of the sink
@@ -307,6 +310,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
+		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
@@ -372,6 +376,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
+		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {

@@ -1,0 +1,129 @@
+# name: test/sql/metadata_read_pinning.test
+# group: [moraine]
+#
+# One DuckLake transaction's view of the metadata catalog, while another
+# connection commits under it.
+#
+# DuckLake resolves a transaction's snapshot by reading `ducklake_snapshot`
+# twice in one statement — the row whose id is the maximum, and the maximum
+# itself. Each scan of a synthesized `ducklake_*` table is one dump, and two
+# dumps observe two committed heads, so a commit or an expiry landing between
+# them leaves the maximum naming a row the other scan never saw. DuckLake
+# reports the tear as "No snapshot found" and cannot re-resolve, because it
+# was handed an empty result rather than a typed error.
+#
+# So each table is materialized once per DuckDB transaction and every reader
+# of it in that transaction is served the same rows. That is what this pins:
+# a commit landing under an open reader does not change what the reader's
+# transaction sees, and the reader's next transaction sees it.
+#
+# Two connections over one instance are the only way to overlap a commit with
+# an open reader, which is what this runner gives and the CLI cannot.
+#
+# Skipped unless the packaged extension and cached extension directory are
+# named in the environment; `cargo xtask e2e` supplies both.
+
+require-env MORAINE_DUCKDB_EXT
+
+require-env MORAINE_EXTENSION_DIR
+
+# As in commit_concurrency.test: pin one thread so the connections, not the
+# scheduler, are the concurrency.
+statement ok
+SET threads=1;
+
+statement ok
+SET extension_directory='${MORAINE_EXTENSION_DIR}';
+
+statement ok
+INSTALL parquet;
+
+statement ok
+LOAD parquet;
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+LOAD '${MORAINE_DUCKDB_EXT}';
+
+statement ok
+ATTACH 'ducklake:moraine:__TEST_DIR__/pin-store' AS lake (DATA_PATH '__TEST_DIR__/pin-data/');
+
+statement ok
+CREATE TABLE lake.main.t(a BIGINT);
+
+statement ok con1
+BEGIN;
+
+# con1's first read materializes `ducklake_snapshot` for its transaction.
+# Held in a connection-local variable so every comparison below is against
+# what con1 itself saw, and none needs an absolute snapshot id.
+statement ok con1
+SET VARIABLE baseline = (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot);
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (1);
+
+# The commit landed under con1, and con1 still reads the rows it took. A
+# second dump here would have returned con2's snapshot as well.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = getvariable('baseline');
+----
+true
+
+# The shape DuckLake's own resolution uses, inside the same transaction: one
+# statement, two scans of the table. Both are the same row set, so the
+# maximum resolves to a row rather than to nothing.
+query I con1
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot
+WHERE snapshot_id = (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot);
+----
+1
+
+statement ok con1
+COMMIT;
+
+# The pin is the transaction's, not the connection's: con1's next
+# transaction sees the commit.
+query I con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) > getvariable('baseline');
+----
+true
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+1
+
+# A writing transaction is not pinned this way: it reads through its staged
+# transaction, so it must still see its own uncommitted rows across
+# statements. One INSERT, then a read of the table it wrote, both inside one
+# transaction — DuckLake's commit path depends on exactly this.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO lake.main.t VALUES (2);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+statement ok con1
+COMMIT;
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+# Every snapshot the exchange minted is intact and consecutive.
+query I
+SELECT count(*) = max(snapshot_id) + 1 FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+true

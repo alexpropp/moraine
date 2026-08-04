@@ -11,6 +11,7 @@
 // MoraineTransactionManager::Create's signature.
 #include "duckdb/storage/storage_extension.hpp"
 
+#include "metadata_tables.hpp"
 #include "moraine_abi.h"
 
 namespace moraine_duckdb {
@@ -63,12 +64,23 @@ public:
 	// rollback becomes a no-op. Returns null if no write ever opened one.
 	MoraineTxHandle *TakeStagedTx();
 
+	// The one materialization of a synthesized `ducklake_*` table this
+	// transaction serves every reader of it from, or null before its first
+	// scan. Only populated while no staged tx is open — once one is, the
+	// staged tx's own read point pins the transaction's reads instead, and
+	// `StagedTx` drops what these hold. `MetadataRowsFor`
+	// (metadata_tables.hpp) is the only caller of this pair and states what
+	// rests on the sharing.
+	std::shared_ptr<const MetadataRows> GetMetadataRows(const MetadataTableSpec &spec) const;
+	void PutMetadataRows(const MetadataTableSpec &spec, std::shared_ptr<const MetadataRows> rows);
+
 private:
 	MoraineSnapshotHandle *snapshot_;
 	MoraineCatalogHandle *catalog_handle_;
 	bool schemas_loaded_ = false;
 	std::unordered_map<uint64_t, duckdb::unique_ptr<duckdb::SchemaCatalogEntry>> schema_cache_;
 	MoraineTxHandle *staged_tx_ = nullptr;
+	std::unordered_map<const MetadataTableSpec *, std::shared_ptr<const MetadataRows>> metadata_rows_;
 };
 
 class MoraineTransactionManager : public duckdb::TransactionManager {
@@ -88,8 +100,6 @@ public:
 private:
 	MoraineCatalog &catalog_;
 	std::mutex lock_;
-	// Owns every started transaction until it is committed or rolled back,
-	// at which point it's erased (and its snapshot freed) here.
 	std::vector<duckdb::unique_ptr<duckdb::Transaction>> active_transactions_;
 };
 

@@ -1573,3 +1573,98 @@ fn ducklake_merge_adjacent_files_survives_expiry() {
         vec![vec!["30".to_string(), "435".to_string()]]
     );
 }
+
+/// Reads racing the scheduler's own expiry pass.
+///
+/// DuckLake resolves a transaction's snapshot by reading
+/// `ducklake_snapshot` twice in one statement — the row whose id is the
+/// maximum, and the maximum itself. Each scan is one dump and two dumps
+/// observe two committed heads, so an expiry landing between them leaves
+/// the maximum naming a row the other scan never saw. DuckLake reports
+/// that as "No snapshot found" and cannot re-resolve: it was handed an
+/// empty result, not a typed error. Materializing the table once per
+/// DuckDB transaction is what makes both halves one row set.
+///
+/// `test/sql/metadata_read_pinning.test` pins the mechanism
+/// deterministically, over two connections. This is the live shape it was
+/// found in: an expiry pass ticking every 50 ms under a session that keeps
+/// reading and committing, with `older_than => now()` so every pass has
+/// the whole tail to reclaim. Any statement in the session that fails —
+/// including on "No snapshot found" — fails the test.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn reads_survive_an_expiry_pass_running_under_them() {
+    const ROUNDS: usize = 120;
+    let store = TempDir::new("maint-race-store");
+    let data = TempDir::new("maint-race-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+
+    // A tail of snapshots for the first pass to find, minted in a session
+    // with no scheduler so nothing reclaims them before the race starts.
+    run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(20) t(i);\
+         INSERT INTO lake.main.t SELECT i FROM range(20) t(i);\
+         INSERT INTO lake.main.t SELECT i FROM range(20) t(i);",
+    );
+
+    // `older_than` as an interval renders as a rolling window, so every
+    // tick expires everything below head rather than freezing on an
+    // attach-time instant. The session's own commits keep refilling the
+    // tail the passes reclaim, so the two overlap for the whole run.
+    let scheduled = format!(
+        "{meta}, META_MAINTENANCE_INTERVAL INTERVAL '50 milliseconds', \
+         META_MAINTENANCE_EXPIRE_SNAPSHOTS_OLDER_THAN INTERVAL '0 seconds'"
+    );
+
+    // Each round resolves a fresh snapshot (autocommit gives every
+    // statement its own transaction), reads the metadata catalog the way
+    // DuckLake's own resolution does, and commits one more snapshot for
+    // the next pass to expire.
+    let mut race = "INSERT INTO lake.main.t VALUES (1);\n\
+                    SELECT count(*) FROM lake.main.t;\n\
+                    SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot \
+                      WHERE snapshot_id = (SELECT max(snapshot_id) \
+                                             FROM __ducklake_metadata_lake.ducklake_snapshot);\n"
+        .repeat(ROUNDS);
+    race.push_str(
+        "SELECT 'PASS' AS marker, status FROM moraine_maintenance_status('lake') \
+           WHERE step = 'expire_snapshots';\n",
+    );
+
+    let output = run_ducklake_sql_with_pause(
+        store.path(),
+        data.path(),
+        &scheduled,
+        // Nothing but the attach; the pause lets the first ticks land so
+        // the race is already running when the reads start.
+        "SELECT 1;\n",
+        std::time::Duration::from_millis(200),
+        &race,
+    );
+
+    // The reads are only evidence if expiry was actually running under
+    // them: a pass that never ran the step would make this vacuous.
+    let ran = csv_rows(&output)
+        .into_iter()
+        .filter(|row| row.first().is_some_and(|marker| marker == "PASS"))
+        .filter(|row| row[1] == "ran")
+        .count();
+    assert!(
+        ran > 0,
+        "no expiry pass ran under the reads, so they raced nothing: {output}"
+    );
+
+    // And the lake is whole: every round's row landed, and every surviving
+    // snapshot still resolves.
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        "SELECT count(*) FROM lake.main.t;",
+    ));
+    assert_eq!(rows, vec![vec![(60 + ROUNDS).to_string()]]);
+}

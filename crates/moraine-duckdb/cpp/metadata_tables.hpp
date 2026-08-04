@@ -6,6 +6,7 @@
 // dump ABI (see metadata_tables.cpp).
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -16,6 +17,10 @@
 #include "moraine_abi.h"
 
 namespace moraine_duckdb {
+
+// Every row of one synthesized `ducklake_*` table, each row's cells in
+// column-declaration order.
+using MetadataRows = std::vector<std::vector<duckdb::Value>>;
 
 // One column of a synthesized `ducklake_*` table: `ducklake_type` is a
 // DuckLake column-type string (fed through the existing `MapColumnType`,
@@ -31,8 +36,8 @@ struct MetadataColumnSpec {
 // dump ABI for store-backed tables, forwarding the probe pair so a blocked
 // read cancels; `ducklake_metadata`'s provider ignores `handle` and the
 // probe pair and returns fixed rows instead (see metadata_tables.cpp).
-using MetadataRowProvider = std::vector<std::vector<duckdb::Value>> (*)(MoraineCatalogHandle *handle,
-                                                                        MoraineInterruptProbe probe, void *probe_ctx);
+using MetadataRowProvider = MetadataRows (*)(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                             void *probe_ctx);
 
 // `moraine_tx_stage`'s "not writable" `table_kind` sentinel (moraine_abi.h),
 // mirrored here so this spec and the staged-write Sink (staged_write.cpp)
@@ -83,18 +88,35 @@ struct MetadataTableSpec {
 	bool overlay_updatable = false;
 };
 
-// The rows of `write_table_kind` as the calling transaction's open staged
-// transaction sees them — committed rows with its own uncommitted rows over
-// them — or empty when there is no staged transaction, or no tx-aware dump
-// for that kind.
+// The rows of `spec` as the calling DuckDB transaction sees them. Every
+// reader of one table in one transaction gets one list, which is what makes
+// a rowid mean something: the scan emits an index into it and the
+// staged-write Sink (staged_write.cpp) resolves that index against the same
+// list, rather than against a second materialization that a commit landing
+// in between could have reordered.
 //
-// The scan and the staged-write Sink must agree on this: a rowid the scan
-// emits is an index into whatever list it materialized, and the Sink
-// resolves that index by re-materializing the same list. One of them
-// serving committed state while the other overlays would let a rowid name a
-// different row, or none.
-std::optional<std::vector<std::vector<duckdb::Value>>>
-MetadataTxAwareRows(duckdb::ClientContext &context, duckdb::Catalog &catalog, int32_t write_table_kind);
+// Which list depends on whether the transaction has opened a staged tx:
+//
+//   - **Before it has** — a reader — each table is dumped once and held for
+//     the transaction. This is what a plain read needs: DuckLake resolves
+//     its snapshot by reading `ducklake_snapshot` twice in one statement
+//     (`WHERE snapshot_id = (SELECT MAX(snapshot_id) ...)`), and two dumps
+//     observe two heads (dumps.rs), so a commit or an expiry landing
+//     between them yields a maximum the other half has never heard of —
+//     which DuckLake reports as "No snapshot found".
+//   - **After it has** — a writer — every read goes to the staged tx, whose
+//     own read point pins it and whose dumps overlay the rows staged so
+//     far. Nothing is cached over that: it is the surface DuckLake's commit
+//     retry re-reads between attempts, and a retry served the state its
+//     first attempt saw would re-check its conflict matrix against a
+//     premise that already lost.
+//
+// Two limits remain. Tables are pinned independently, each at the head its
+// first scan observed, so a statement joining two of them can still
+// straddle a commit; and a writer's `kNotWritable` tables have no staged
+// dump, so they re-read per scan (they are the always-empty stand-ins).
+std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &context, duckdb::Catalog &catalog,
+                                                    const MetadataTableSpec &spec);
 
 // The fixed list of synthesized tables, in the order they're registered.
 // Built once; returns the same static instance every call.
@@ -142,7 +164,10 @@ void PopulateMetadataTables(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry
 // by the synthesized `ducklake_*` tables (this file) and the dynamic
 // inline-table entries (inline_tables.cpp), which scan the same way.
 struct MetadataScanBindData : public duckdb::FunctionData {
-	std::vector<std::vector<duckdb::Value>> rows;
+	// Shared, never copied: a rowid is an index into this exact list, and
+	// the staged-write Sink resolves it against the same one (see
+	// `MetadataRowsFor`).
+	std::shared_ptr<const MetadataRows> rows;
 	// The synthesized entry this scan reads, exposed through the table
 	// function's `get_bind_info` so `LogicalGet::GetTable()` resolves it:
 	// the binder's UPDATE/DELETE paths require a resolvable base table.

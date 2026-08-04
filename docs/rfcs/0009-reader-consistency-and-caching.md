@@ -308,6 +308,47 @@ The reader never silently dereferences a reclaimed file: either its `S` is
 still retained (files present) or materialization/refresh fails loudly with
 `SnapshotExpired`.
 
+### A DuckLake transaction reads one materialization per metadata table
+
+Everything above concerns a reader holding a `CatalogSnapshot`. DuckLake
+holds none: it reads the synthesized `ducklake_*` tables (RFC 0006) as
+SQL, and each scan of one is a separate dump served at whatever `sys/head`
+is when it runs. The `SnapshotExpired` contract is therefore unreachable
+from that path — a table hands back a row set, not a typed error, so a
+snapshot that vanished mid-statement reaches DuckLake as a missing *row*
+and it has nothing to re-resolve from.
+
+That matters because DuckLake reads one table twice in one statement.
+`GetSnapshot` is `SELECT ... WHERE snapshot_id = (SELECT MAX(snapshot_id)
+...)` over `ducklake_snapshot` — two table references, two binds, two
+dumps. Served at two heads, an expiry (or an ordinary commit) landing
+between them leaves the maximum naming a row the other scan never saw, and
+DuckLake reports the tear as "No snapshot found".
+
+So the shim pins the read the same way the core pins a materialization,
+one level up: **a synthesized table is dumped once per DuckDB transaction
+and every reader of it in that transaction is served the same rows.** The
+`MoraineTransaction` that already owns one `moraine_snapshot` for its
+catalog entries owns these too, and releases them with itself.
+
+Two boundaries are deliberate:
+
+- **The pin is per table, not per transaction.** Each table is materialized
+  at the head its first scan observed, so a statement joining two of them
+  can still straddle a commit. Closing that needs one read point across
+  dumps — an ABI-level read session — which would hold a SlateDB
+  transaction open for a whole user transaction and contradicts this RFC's
+  one-materialization-long retention. Left open deliberately, not by
+  oversight.
+- **A writing transaction is not pinned this way.** Once it opens a staged
+  transaction, every read of a writable kind goes through that
+  transaction's dumps: those already read at one fixed point *and* overlay
+  the rows staged so far, which is both the pinning and the read-your-
+  writes a writer needs. Nothing caches over them, because that is the
+  surface DuckLake's commit loop re-reads between attempts (RFC 0007) and
+  a retry served its first attempt's state would re-check its conflict
+  matrix against a premise that already lost.
+
 ### Caching is per-handle, in-memory, logical
 
 The materialized in-memory catalog *is* the cache. A `Catalog` handle (RFC
@@ -468,6 +509,15 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   sequence (creates, file registrations, stats updates, renames, expiry), each
   maintained projection equals a fresh scan of the same subspaces at the same
   head.
+- **A metadata table is one materialization per DuckDB transaction.** Over
+  two connections on one instance: a commit landing under an open reader does
+  not change what that reader's transaction sees of `ducklake_snapshot`, the
+  two-scan resolution shape still resolves to a row inside it, and the
+  reader's next transaction sees the commit. A *writing* transaction is
+  exempt — it reads its own uncommitted rows across statements.
+- **Reads survive an expiry pass under them.** With the scheduler expiring
+  everything below head on a sub-second tick, a session that keeps reading
+  and committing never sees "No snapshot found".
 
 ## Alternatives considered
 
