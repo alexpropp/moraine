@@ -1172,14 +1172,19 @@ fn scheduler_runs_a_pass_unattended() {
          SELECT * FROM moraine_index_drop('lake','main','t','by_a');",
     );
 
-    let scheduled = format!("{meta}, META_MAINTENANCE_INTERVAL INTERVAL '200 milliseconds'");
+    let scheduled = format!("{meta}, META_MAINTENANCE_INTERVAL INTERVAL '500 milliseconds'");
+    // The window must outlast a slow attach — under the full suite's load,
+    // installing and loading the extensions can eat over a second before the
+    // timer's first tick — yet stay under the 16 passes the status retains,
+    // or the claiming pass is evicted. A 500ms interval over 5s tops out near
+    // ten passes, leaving room on both sides.
     let output = run_ducklake_sql_with_pause(
         store.path(),
         data.path(),
         &scheduled,
         // Nothing but the attach; the timer is the only actor.
         "SELECT 1;\n",
-        std::time::Duration::from_millis(1_500),
+        std::time::Duration::from_secs(5),
         "SELECT 'PASS' AS marker, trigger, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
     );
@@ -1257,12 +1262,13 @@ fn scheduler_ticks_skip_a_pass_already_running() {
     orphaned_range(&store, &data, ENTRIES);
 
     // The pass takes 1 500 commits — about a second, several ticks — so
-    // ticks land while it is still running. The window holds 14 ticks,
-    // fewer than the report retains passes, so the pass that claims the
-    // range cannot be pushed out of the report by the empty ones after
-    // it however fast the machine is.
+    // ticks land while it is still running. The window holds at most twelve
+    // ticks, fewer than the report retains passes, so the pass that claims
+    // the range cannot be pushed out of the report by the empty ones after
+    // it however fast the machine is; and it outlasts a slow attach under
+    // the full suite's load, where the first tick can be over a second late.
     let options = format!(
-        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '300 milliseconds', \
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '700 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
@@ -1271,7 +1277,7 @@ fn scheduler_ticks_skip_a_pass_already_running() {
         data.path(),
         &options,
         "SELECT 1;\n",
-        std::time::Duration::from_millis(4_200),
+        std::time::Duration::from_secs(9),
         "SELECT 'PASS' AS marker, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
     );

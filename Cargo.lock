@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "moraine"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-duckdb"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "arrow",
  "cbindgen",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-remote"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "proptest",
  "prost",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-wal"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "async-trait",
  "fastrand",
