@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/morainedb/moraine/compare/v0.4.3...v0.5.0) - 2026-08-04
+
+### Added
+
+- bound, fill, and preload the on-disk object cache ([#82](https://github.com/morainedb/moraine/pull/82))
+- close out the open work across RFCs 0005, 0007, 0011, 0012, 0015, 0017 ([#83](https://github.com/morainedb/moraine/pull/83))
+
+### Other
+
+- cross off the RFC obligations that already have coverage ([#79](https://github.com/morainedb/moraine/pull/79))
+
 ## [0.4.3](https://github.com/morainedb/moraine/compare/v0.4.2...v0.4.3) - 2026-08-03
 
 ### Added
