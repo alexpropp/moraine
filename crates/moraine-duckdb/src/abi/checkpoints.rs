@@ -32,7 +32,7 @@ pub struct MoraineCheckpoint {
 
 /// The object store and catalog options a path resolves to. The path-taking
 /// entry points here touch the manifest only, so neither the flush cadence
-/// nor the block cache applies.
+/// nor the on-disk object cache applies.
 fn resolve(
     path: &str,
     s3: *const MoraineS3Config,

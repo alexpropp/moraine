@@ -122,6 +122,22 @@ pub(crate) async fn read_manifest_census(
     Ok(census)
 }
 
+/// Bytes the manifest accounts for, without the store listing a full
+/// census pays for. One manifest read, so it costs the same on a large
+/// store as on a small one.
+pub(crate) async fn manifest_bytes(path: &str, object_store: Arc<dyn ObjectStore>) -> Result<u64> {
+    let view = AdminBuilder::new(path, object_store)
+        .build()
+        .read_compactor_state_view()
+        .await
+        .map_err(Error::from)?;
+
+    Ok(census_of_manifest(view.manifest())
+        .segments
+        .iter()
+        .fold(0, |total, segment| total.saturating_add(segment.bytes)))
+}
+
 /// Totals every object under the store's prefix, by kind.
 ///
 /// One listing, paginated by the object store — the only part of a census

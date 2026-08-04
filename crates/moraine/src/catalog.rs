@@ -18,7 +18,8 @@ pub use census::{
     MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
 };
 pub use handle::{
-    Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest, MigrationRequest,
+    CachePreload, Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest,
+    MigrationRequest,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;

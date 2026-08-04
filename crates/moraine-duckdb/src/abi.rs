@@ -602,6 +602,29 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
     error
 }
 
+/// The object-cache cap an ABI byte count names. Zero means "not given",
+/// leaving the store's own cap in force, so a caller that has no opinion
+/// passes nothing.
+fn cache_size_option(cache_size_bytes: u64) -> Option<u64> {
+    (cache_size_bytes != 0).then_some(cache_size_bytes)
+}
+
+/// The preload level an ABI code names: `0` loads nothing, `1` the
+/// newest objects, `2` every object the manifest references. Any other
+/// value is a caller mistake — silently loading nothing would hide a
+/// misspelled option behind an attach that merely felt slow.
+fn cache_preload_option(cache_preload: u8) -> Result<Option<moraine::CachePreload>, AbiError> {
+    match cache_preload {
+        0 => Ok(None),
+        1 => Ok(Some(moraine::CachePreload::L0)),
+        2 => Ok(Some(moraine::CachePreload::All)),
+        other => Err(AbiError::invalid_argument(format!(
+            "cache_preload {other} names no preload level: 0 loads nothing, 1 the newest \
+             objects, 2 every object"
+        ))),
+    }
+}
+
 /// Attaches a moraine catalog: creates the runtime this handle owns for
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.
@@ -616,6 +639,23 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
 /// only: it is recorded when a fresh store bootstraps and ignored on an
 /// already-initialized store, whose stored flag
 /// ([`moraine_catalog_encrypted`]) is authoritative.
+///
+/// `cache_size_bytes` bounds the on-disk object cache `cache_dir` names.
+/// The cap is per attach, so several attaches sharing one directory each
+/// spend up to it; `0` leaves the store's own cap in force, and without a
+/// `cache_dir` there is no object cache to bound. The store's in-memory
+/// caches are separate and take no configuration here.
+///
+/// `cache_preload` loads objects into that cache as the attach opens, so
+/// the first query pays no first touch: `0` loads nothing, `1` the newest
+/// objects, `2` every object the manifest references. The load is bounded
+/// by `cache_size_bytes` and skips what it cannot fetch, but the attach
+/// waits for it. Any other value is [`codes::INVALID_ARGUMENT`].
+///
+/// `cache_puts` fills that cache from the write path as well as the read
+/// path, so a flushed or compacted object is local without a later fetch.
+/// Compaction output is cached too, so a merge can evict what reads had
+/// warmed; `false` leaves the cache filled by reads alone.
 ///
 /// `checkpoint` pins a **read-only** attach to an existing SlateDB
 /// checkpoint (see [`moraine_create_checkpoint`]), so the open writes
@@ -660,7 +700,8 @@ fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError 
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
 /// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 /// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-/// `host_threads` is unconstrained.
+/// `cache_size_bytes`, `cache_preload`, `cache_puts`, and `host_threads`
+/// are unconstrained.
 /// `probe`, if non-null, must be safe to call with `probe_ctx` from any
 /// thread. `out` must be a valid, writable `*mut *mut
 /// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -673,6 +714,9 @@ pub unsafe extern "C" fn moraine_attach(
     encrypted: bool,
     flush_interval_ms: u64,
     cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_preload: u8,
+    cache_puts: bool,
     data_path: *const c_char,
     checkpoint: *const c_char,
     host_threads: u64,
@@ -691,7 +735,7 @@ pub unsafe extern "C" fn moraine_attach(
         // SAFETY: `path` validity is this function's own safety contract.
         let path_str = unsafe { borrow_str(path, "path") }?;
         // SAFETY: `cache_dir` validity is this function's own safety contract;
-        // null (or empty) means "no on-disk cache".
+        // null (or empty) means "no on-disk object cache".
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
         // SAFETY: `checkpoint` validity is this function's own safety
         // contract; null (or empty) means "follow the latest manifest".
@@ -755,6 +799,9 @@ pub unsafe extern "C" fn moraine_attach(
             ms => options.flush_interval = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        options.cache_size = cache_size_option(cache_size_bytes);
+        options.cache_preload = cache_preload_option(cache_preload)?;
+        options.cache_puts = cache_puts;
         options.checkpoint = checkpoint.map(str::to_owned);
         // Persist the data root at bootstrap so a later attach reads it back
         // without being told it again.
@@ -924,15 +971,20 @@ pub struct MoraineMigrationReport {
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
 /// point to a valid [`MoraineS3Config`] whose non-null fields are valid
 /// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
-/// NUL-terminated C string. `out` must be a valid, writable
-/// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
-/// writable [`MoraineError`]. All for the duration of this call.
+/// NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+/// `cache_puts` are unconstrained. `out`
+/// must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
+/// must be a valid, writable [`MoraineError`]. All for the duration of this
+/// call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_migrate(
     path: *const c_char,
     s3: *const MoraineS3Config,
     flush_interval_ms: u64,
     cache_dir: *const c_char,
+    cache_size_bytes: u64,
+    cache_preload: u8,
+    cache_puts: bool,
     checkpoint: bool,
     out: *mut MoraineMigrationReport,
     err: *mut MoraineError,
@@ -947,7 +999,7 @@ pub unsafe extern "C" fn moraine_migrate(
         // SAFETY: `path` validity is this function's own safety contract.
         let path_str = unsafe { borrow_str(path, "path") }?;
         // SAFETY: `cache_dir` validity is this function's own safety
-        // contract; null (or empty) means "no on-disk cache".
+        // contract; null (or empty) means "no on-disk object cache".
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
@@ -980,6 +1032,9 @@ pub unsafe extern "C" fn moraine_migrate(
             ms => options.flush_interval = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        options.cache_size = cache_size_option(cache_size_bytes);
+        options.cache_preload = cache_preload_option(cache_preload)?;
+        options.cache_puts = cache_puts;
 
         let mut request = moraine::MigrationRequest::default();
         request.checkpoint = checkpoint;
@@ -3416,6 +3471,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_bad.as_ptr(),
                 ptr::null(),
                 0,
@@ -3452,6 +3510,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_good.as_ptr(),
                 ptr::null(),
                 0,
@@ -3491,6 +3552,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -3561,6 +3625,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -3655,6 +3722,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -3801,6 +3871,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_data.as_ptr(),
                 ptr::null(),
                 0,
@@ -3839,6 +3912,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_safe.as_ptr(),
                 ptr::null(),
                 0,
@@ -3879,6 +3955,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_first.as_ptr(),
                 ptr::null(),
                 0,
@@ -3911,6 +3990,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 c_other.as_ptr(),
                 ptr::null(),
                 0,
@@ -3953,6 +4035,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -4000,6 +4085,9 @@ mod tests {
                 true,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -4343,6 +4431,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -4382,6 +4473,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -4440,6 +4534,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -4846,6 +4943,9 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
+                0,
+                false,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -4942,5 +5042,123 @@ mod tests {
         // SAFETY: as above.
         let unsupported = unsafe { coerce_lookup_value(&int_value, "DECIMAL(18,3)") };
         assert!(unsupported.is_err());
+    }
+
+    /// Zero bytes on the ABI means "not given", so the store's own cap
+    /// stands; any other value is that many bytes of object cache.
+    #[test]
+    fn a_zero_cache_size_leaves_the_default_cap() {
+        assert_eq!(cache_size_option(0), None);
+        assert_eq!(cache_size_option(64 * 1024 * 1024), Some(64 * 1024 * 1024));
+    }
+
+    /// The preload codes the ABI takes, and the refusal of one it does
+    /// not: a level nobody can act on is a caller mistake, not a default
+    /// to fall back to.
+    #[test]
+    fn cache_preload_codes_map_to_levels_and_reject_the_rest() {
+        assert_eq!(cache_preload_option(0).unwrap(), None);
+        assert_eq!(
+            cache_preload_option(1).unwrap(),
+            Some(moraine::CachePreload::L0)
+        );
+        assert_eq!(
+            cache_preload_option(2).unwrap(),
+            Some(moraine::CachePreload::All)
+        );
+        let refused = cache_preload_option(7).unwrap_err();
+        assert_eq!(refused.code, codes::INVALID_ARGUMENT);
+        assert!(refused.message.contains('7'), "{}", refused.message);
+    }
+
+    /// An attach that caches its writes fills the cache directory from the
+    /// write path: bootstrapping a fresh store leaves what it wrote behind,
+    /// where an attach that does not cache writes leaves nothing.
+    #[test]
+    fn an_attach_caching_writes_fills_the_cache_directory() {
+        let mut cached = Vec::new();
+        for cache_puts in [false, true] {
+            let dir = TempDir::new("put-cache-store");
+            let cache = TempDir::new("put-cache-dir");
+            let c_path = dir.c_path();
+            let c_cache = cache.c_path();
+            let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+            let mut err = MoraineError::default();
+            // SAFETY: both C strings outlive the call; outputs are valid
+            // local slots; null s3/data_path/checkpoint are the documented
+            // "none" cases.
+            let code = unsafe {
+                moraine_attach(
+                    c_path.as_ptr(),
+                    ptr::null(),
+                    false,
+                    false,
+                    0,
+                    c_cache.as_ptr(),
+                    0,
+                    0,
+                    cache_puts,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    None,
+                    ptr::null_mut(),
+                    &raw mut handle,
+                    &raw mut err,
+                )
+            };
+            // SAFETY: `err.message` is null or was just written by the call.
+            let message = unsafe { err.message.as_ref() };
+            assert_eq!(code, codes::OK, "attach failed: {message:?}");
+            // SAFETY: attached above and not yet detached.
+            unsafe { moraine_detach(handle) };
+            cached.push(std::fs::read_dir(cache.path()).map_or(0, Iterator::count));
+        }
+        assert!(
+            cached[1] > cached[0],
+            "caching writes cached {} entries against {} without it",
+            cached[1],
+            cached[0]
+        );
+    }
+
+    /// An attach given a cache directory and a cap opens against them: the
+    /// cap crosses the ABI as a byte count rather than failing the open.
+    #[test]
+    fn an_attach_takes_a_bounded_disk_cache() {
+        let dir = TempDir::new("bounded-cache-store");
+        let cache = TempDir::new("bounded-cache-dir");
+        let c_path = dir.c_path();
+        let c_cache = cache.c_path();
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: both C strings outlive the call; outputs are valid local
+        // slots; null s3/data_path/checkpoint are the documented "none"
+        // cases.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                c_cache.as_ptr(),
+                64 * 1024 * 1024,
+                0,
+                false,
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        // SAFETY: `err.message` is null or was just written by the call.
+        let message = unsafe { err.message.as_ref() };
+        assert_eq!(code, codes::OK, "attach failed: {message:?}");
+        // SAFETY: attached above and not yet detached.
+        unsafe { moraine_detach(handle) };
     }
 }

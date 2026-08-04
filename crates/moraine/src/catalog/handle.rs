@@ -249,12 +249,39 @@ pub struct CatalogOptions {
     /// so a durable commit waits only on the object-store PUT — the lowest
     /// latency, at the cost of a busy flush loop. Defaults to 100ms.
     pub flush_interval: Duration,
-    /// Local directory backing SlateDB's on-disk block cache. When set,
-    /// reads are served from a disk-backed cache that survives process
-    /// restarts, so warm queries skip repeat object-store GETs — worthwhile
-    /// for remote (`s3://`) stores, redundant for local ones. `None` (the
-    /// default) uses only SlateDB's in-memory cache.
+    /// Local directory backing SlateDB's on-disk object cache, which holds
+    /// fetched object parts. When set, reads are served from a disk-backed
+    /// cache that survives process restarts, so warm queries skip repeat
+    /// object-store GETs — worthwhile for remote (`s3://`) stores,
+    /// redundant for local ones. `None` (the default) leaves only the
+    /// in-memory caches: a block cache and a metadata cache, both at
+    /// SlateDB's own sizes and not configurable here.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// How many bytes of disk the on-disk object cache may hold. The cap is
+    /// per open catalog, not per directory, so catalogs sharing a
+    /// [`cache_dir`](Self::cache_dir) each spend up to it — size the volume
+    /// for the number of catalogs a process attaches. `None` (the default)
+    /// leaves SlateDB's own cap of 16 GiB in force, and without a
+    /// `cache_dir` there is no object cache to bound. The in-memory caches
+    /// are a separate mechanism and are unaffected.
+    pub cache_size: Option<u64>,
+    /// What to load into the on-disk object cache while the catalog opens,
+    /// so the first query pays no first touch. The load is bounded by
+    /// [`cache_size`](Self::cache_size) and best-effort — a fetch that
+    /// fails is skipped, never fatal — but it is part of the open, so an
+    /// open that preloads returns only once it has. `None` (the default)
+    /// loads nothing, leaving the cache to fill as reads ask for objects.
+    /// Inert without a [`cache_dir`](Self::cache_dir).
+    pub cache_preload: Option<CachePreload>,
+    /// Whether objects this catalog writes are cached as they are written,
+    /// rather than only when something reads them back. A flushed or
+    /// compacted store object then costs one local write and no later
+    /// fetch, and — since store objects are immutable and land atomically
+    /// — a reader sharing the [`cache_dir`](Self::cache_dir) reads what
+    /// the writer cached. Compaction output is cached too, so a merge can
+    /// evict what reads had warmed; `false` (the default) leaves the cache
+    /// filled by reads alone. Inert without a `cache_dir`.
+    pub cache_puts: bool,
     /// The lake's data root (DuckLake's `DATA_PATH`). Creation-time only:
     /// recorded as the stored global `data_path` option when a fresh store
     /// bootstraps, so a later open can read it back
@@ -291,10 +318,57 @@ impl Default for CatalogOptions {
             encrypted: false,
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
+            cache_size: None,
+            cache_preload: None,
+            cache_puts: false,
             data_path: None,
             reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
         }
+    }
+}
+
+/// How much of a store to load into the on-disk object cache as it opens.
+///
+/// The choice is between paying for freshness and paying for everything:
+/// the newest objects are what a writer's own next reads want, while a
+/// whole store is what a query session wants and is only affordable when
+/// the store is small enough to sit on the local disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePreload {
+    /// The newest objects only — those a compaction has not yet merged
+    /// down. Bounded by how far the store has run since its last merge,
+    /// so an open stays quick.
+    L0,
+    /// Every object the store's manifest references, in full. The open
+    /// waits for a copy of the whole store, so this suits a store that
+    /// fits the cache with room to spare.
+    All,
+}
+
+/// Warns when an `All` preload cannot hold the store it is about to load.
+///
+/// The load stops at the first object that would exceed the cap and says
+/// nothing about having stopped, so an attach that silently warms half a
+/// store looks exactly like one that warmed all of it. Diagnostics only:
+/// a manifest that cannot be read here is left to the open itself to
+/// report, and nothing about the open changes either way.
+async fn warn_if_preload_cannot_fit(options: &CatalogOptions, object_store: Arc<dyn ObjectStore>) {
+    if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
+        return;
+    }
+    let Ok(store_bytes) = store_census::manifest_bytes(&options.path, object_store).await else {
+        return;
+    };
+    if let Some(shortfall) = open::preload_shortfall(store_bytes, options.cache_size) {
+        warn!(
+            path = options.path,
+            store_bytes,
+            cache_size = options.cache_size,
+            shortfall,
+            "preload cannot hold this store: the load stops once the cache is full, leaving \
+             the rest to be fetched on demand"
+        );
     }
 }
 
@@ -376,10 +450,14 @@ impl Catalog {
                     .to_string(),
             ));
         }
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone());
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts);
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
             .await?;
         info!(
@@ -452,11 +530,16 @@ impl Catalog {
         options: CatalogOptions,
     ) -> Result<Self> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts)
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
+
         let reader = commit::open_reader_initialized(store).await?;
         info!(
             path = options.path,
@@ -527,6 +610,9 @@ impl Catalog {
         let db = StoreBuilder::new(&options.path, object_store.clone())
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts)
             .open_writer()
             .await?;
 
