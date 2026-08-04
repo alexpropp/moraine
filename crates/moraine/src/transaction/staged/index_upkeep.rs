@@ -197,23 +197,60 @@ pub(super) async fn stage_index_maintenance(
         )
         .await?;
     }
-    for ((table_id, data_file_id), killed) in &file_deletes {
-        stage_file_delete_entries(
-            base,
-            *table_id,
-            *data_file_id,
-            killed,
-            data_store,
-            data_prefix,
-            &mut entries,
-        )
-        .await?;
-    }
+    stage_file_delete_removals(
+        base,
+        ops,
+        &file_deletes,
+        data_store,
+        data_prefix,
+        &mut entries,
+    )
+    .await?;
 
     if entries.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
     plan_index_entries(probe, &entries).await
+}
+
+/// Stages the index removals for this commit's file deletes. Each target is
+/// resolved against a base carrying the commit's own data-file registrations —
+/// a flush registers a file and deletes rows from it in one commit, so the
+/// head alone does not yet hold the file.
+async fn stage_file_delete_removals(
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+    file_deletes: &HashMap<(u64, u64), KilledRows>,
+    data_store: Option<&Arc<dyn ObjectStore>>,
+    data_prefix: &str,
+    entries: &mut Vec<StagedIndexEntry>,
+) -> Result<()> {
+    if file_deletes.is_empty() {
+        return Ok(());
+    }
+    let mut augmented = base.clone();
+    for op in ops {
+        if let RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells,
+        } = op
+        {
+            augmented.put_data_file(decode_data_file(cells)?);
+        }
+    }
+    for ((table_id, data_file_id), killed) in file_deletes {
+        stage_file_delete_entries(
+            &augmented,
+            *table_id,
+            *data_file_id,
+            killed,
+            data_store,
+            data_prefix,
+            entries,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// The inline schemas this commit registers, for a chunk whose

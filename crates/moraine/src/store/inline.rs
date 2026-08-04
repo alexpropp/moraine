@@ -96,10 +96,18 @@ pub(crate) async fn scan_inline_file_deletes(
 /// marked as existing.
 pub(crate) async fn read_inline_file_delete_table(
     handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
 ) -> Result<bool> {
-    let marker: Option<InlineFileDeleteTableValue> =
-        read_singleton(handle, Key::Inline(InlineKey::FileDeleteTable { table_id })).await?;
+    let key = Key::Inline(InlineKey::FileDeleteTable { table_id });
+    if let Some(overlay) = overlay {
+        match overlay.get(&key.encode()) {
+            Some(Some(_)) => return Ok(true),
+            Some(None) => return Ok(false),
+            None => {}
+        }
+    }
+    let marker: Option<InlineFileDeleteTableValue> = read_singleton(handle, key).await?;
     Ok(marker.is_some())
 }
 

@@ -128,6 +128,12 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
+    // The drop clears the marker too, so `ducklake_inlined_delete_<table_id>`
+    // stops existing with the table; deleting an absent key is a store no-op.
+    writes.push((
+        Key::Inline(InlineKey::FileDeleteTable { table_id }).encode(),
+        None,
+    ));
     Ok(())
 }
 
@@ -234,6 +240,30 @@ pub(super) fn inline_file_delete_remove_write(
     )
 }
 
+/// Sets the `inline/file_delete_table` marker: what makes
+/// `ducklake_inlined_delete_<table_id>` exist for the life of the catalog.
+/// Set on the first file deletion of a table and cleared only by a drop, so an
+/// emptied table (a flush materialized its deletions into a real delete file)
+/// still reports as existing.
+pub(super) fn inline_file_delete_table_write(table_id: u64) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::FileDeleteTable { table_id }).encode(),
+        Some(value::encode_value(&proto::InlineFileDeleteTableValue {})),
+    )
+}
+
+/// Stages the marker the first time a table's file deletions are seen in a
+/// batch; later ones for the same table find it already staged.
+fn mark_file_delete_table(
+    table_id: u64,
+    seen: &mut HashSet<u64>,
+    writes: &mut Vec<commit::StagedWrite>,
+) {
+    if seen.insert(table_id) {
+        writes.push(inline_file_delete_table_write(table_id));
+    }
+}
+
 /// The tombstone write that deregisters one `inline/schema` record.
 pub(super) fn inline_schema_drop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
     (
@@ -253,6 +283,9 @@ pub(super) async fn translate_inline(
 ) -> Result<Vec<commit::StagedWrite>> {
     let mut writes = Vec::new();
     let mut chunk_seqs = ChunkSeqAllocator::default();
+    // The marker rides the first file deletion or removal of each table in this
+    // batch; the rest find it already staged.
+    let mut file_delete_tables: HashSet<u64> = HashSet::new();
 
     for op in ops {
         match op {
@@ -298,12 +331,15 @@ pub(super) async fn translate_inline(
                 data_file_id,
                 row_id,
                 begin_snapshot,
-            } => writes.push(inline_file_delete_write(
-                *table_id,
-                *data_file_id,
-                *row_id,
-                *begin_snapshot,
-            )),
+            } => {
+                mark_file_delete_table(*table_id, &mut file_delete_tables, &mut writes);
+                writes.push(inline_file_delete_write(
+                    *table_id,
+                    *data_file_id,
+                    *row_id,
+                    *begin_snapshot,
+                ));
+            }
             RowOperation::InlineFlushDelete {
                 table_id,
                 schema_version,
@@ -330,11 +366,14 @@ pub(super) async fn translate_inline(
                 table_id,
                 data_file_id,
                 row_id,
-            } => writes.push(inline_file_delete_remove_write(
-                *table_id,
-                *data_file_id,
-                *row_id,
-            )),
+            } => {
+                mark_file_delete_table(*table_id, &mut file_delete_tables, &mut writes);
+                writes.push(inline_file_delete_remove_write(
+                    *table_id,
+                    *data_file_id,
+                    *row_id,
+                ));
+            }
             RowOperation::Insert { .. }
             | RowOperation::Delete { .. }
             | RowOperation::UpdateSetEnd { .. }

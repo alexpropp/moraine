@@ -170,7 +170,8 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
 #[doc(hidden)]
 pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -> Result<bool> {
     let read = catalog.begin_dump().await?;
-    let marked = store_inline::read_inline_file_delete_table(read.handle(), table_id).await;
+    let marked =
+        store_inline::read_inline_file_delete_table(read.handle(), read.overlay(), table_id).await;
     let exists = match marked {
         Ok(true) => Ok(true),
         Ok(false) => {
