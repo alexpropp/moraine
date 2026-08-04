@@ -10,10 +10,29 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# The advisory leader role: a self-appointed group-commit funnel that opens a
+# network port and serves forwarded sessions. Additive — nothing in the
+# direct/folder commit path depends on it, and with the feature off the whole
+# leader module is absent.
+leader = [
+    "dep:moraine-remote",
+    "dep:constant_time_eq",
+    "tokio/net",
+    "tokio/io-util",
+    "tokio/rt",
+]
+# Exposes crash-injection seams for the format-migration driver.
+# Off by default; production builds carry no seam code.
+fault-injection = []
+
 [dependencies]
 arrow = { workspace = true, features = ["ipc"] }
 bytes = { workspace = true }
+constant_time_eq = { workspace = true, optional = true }
 futures = { workspace = true }
+moraine-remote = { workspace = true, optional = true }
+moraine-wal = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
 prost = { workspace = true }
@@ -24,10 +43,6 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
-[features]
-# Exposes crash-injection seams for the format-migration driver.
-fault-injection = []
-
 [build-dependencies]
 prost-build = { workspace = true }
 protox = { workspace = true }
@@ -36,10 +51,13 @@ protox = { workspace = true }
 moraine = { path = ".", features = ["fault-injection"] }
 
 async-trait = { workspace = true }
+moraine-wal = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

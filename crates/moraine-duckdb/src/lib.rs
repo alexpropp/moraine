@@ -111,9 +111,20 @@
 //!
 //! A read-write attach can carry a maintenance schedule. When
 //! `META_MAINTENANCE_INTERVAL` is given, the shim runs a thread that
-//! performs a pass on that cadence: DuckLake's own maintenance functions
-//! in a fixed order, then moraine's orphaned-index-entry sweep. Without an
-//! interval no thread starts, and a read-only attach never schedules.
+//! performs a pass on that cadence: a fold of the commit log into the
+//! store, DuckLake's own maintenance functions in a fixed order, moraine's
+//! orphaned-index-entry sweep, then a truncation of the folded slots.
+//! Without an interval no thread starts, and a read-only attach never
+//! schedules.
+//!
+//! A session running maintenance is the store's **designated folder**: its
+//! passes are what drain the commit log into the store and reclaim its
+//! slots. A fleet in which every session is ephemeral still gets fold
+//! sprints — whenever any session's pass runs — and commits never wait on
+//! folding either way, since folding is invisible to readers and holds the
+//! writer only for the pass. A pass fenced by a competing folder mid-fold
+//! records the fold `skipped` and carries on: a duelling folder is wasted
+//! work, not a failure.
 //!
 //! ```sql
 //! ATTACH 'ducklake:moraine:/lake/catalog' AS lake (
@@ -137,13 +148,20 @@
 //! Step options derive from DuckLake's own names:
 //! `META_MAINTENANCE_<function minus its `ducklake_` prefix>` enables a
 //! step with DuckLake's defaults, and appending `_<parameter>` passes one
-//! through unaltered. The steps run in this order: `expire_snapshots`,
-//! `flush_inlined_data`, `merge_adjacent_files`, `rewrite_data_files`,
-//! `cleanup_old_files`, `delete_orphaned_files`, then the sweep. A failed
-//! step abandons the rest of the DuckLake sequence — those steps depend on
-//! each other — but never the sweep, which depends on none of them.
-//! `META_MAINTENANCE_SWEEP_INDEXES false` disables the sweep and
-//! `META_MAINTENANCE_BATCH_SIZE` bounds its deletes per commit.
+//! through unaltered. The steps run in this order: the fold, then
+//! `expire_snapshots`, `flush_inlined_data`, `merge_adjacent_files`,
+//! `rewrite_data_files`, `cleanup_old_files`, `delete_orphaned_files`, the
+//! sweep, and the truncation. The fold leads because the sweep reads the
+//! folded store: a dropped index's definition rides an unfolded slot until
+//! folded, so the sweep can reclaim its range only once the fold has
+//! landed the drop. Truncation trails because its horizon is the durable
+//! fold cursor the fold just advanced. A failed DuckLake step abandons the
+//! rest of the DuckLake sequence — those steps depend on each other — but
+//! never the sweep, which depends on none of them.
+//! `META_MAINTENANCE_SWEEP_INDEXES false` disables the sweep,
+//! `META_MAINTENANCE_FOLD_SLOTS false` the fold,
+//! `META_MAINTENANCE_TRUNCATE_SLOTS false` the truncation, and
+//! `META_MAINTENANCE_BATCH_SIZE` bounds the sweep's deletes per commit.
 //!
 //! Two table functions serve the same pass. `moraine_maintenance('lake')`
 //! runs one immediately and returns `(step, status, detail)`;

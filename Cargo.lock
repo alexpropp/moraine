@@ -516,6 +516,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1848,8 +1854,11 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "constant_time_eq",
  "futures",
  "moraine",
+ "moraine-remote",
+ "moraine-wal",
  "object_store",
  "parquet",
  "proptest",
@@ -1862,6 +1871,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1876,6 +1886,34 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "moraine-remote"
+version = "0.4.4"
+dependencies = [
+ "proptest",
+ "prost",
+ "prost-build",
+ "protox",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "moraine-wal"
+version = "0.4.4"
+dependencies = [
+ "async-trait",
+ "fastrand",
+ "futures",
+ "object_store",
+ "proptest",
+ "prost",
+ "prost-build",
+ "protox",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

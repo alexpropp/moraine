@@ -7,9 +7,9 @@ use crate::{
         handle::ReadHandle,
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
-            ChangelogValue, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
-            FormatValue, GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue,
-            MigrationValue, OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue,
+            ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
+            GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
+            OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue, SecretValue,
             SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
             ViewValue,
         },
@@ -120,6 +120,55 @@ pub(crate) async fn scan_decode<T>(
     Ok(records)
 }
 
+/// As [`scan_decode`], but with the unfolded tail overlaid over the store:
+/// a tail write shadows the stored value, a tail delete hides it. The merge
+/// is last-writer-wins by key, so a slot-backed dump sees a winner no folder
+/// has applied yet.
+pub(crate) async fn scan_decode_overlaid<T>(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+    prefix: Vec<u8>,
+    mut extract: impl FnMut(Key, &[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+        std::collections::BTreeMap::new();
+    let mut iter = handle.scan_prefix(prefix.clone(), ..).await?;
+    while let Some(entry) = iter.next().await? {
+        merged.insert(entry.key.to_vec(), entry.value.to_vec());
+    }
+    for (key, value) in overlay.prefixed(&prefix) {
+        match value {
+            Some(bytes) => {
+                merged.insert(key.to_vec(), bytes.to_vec());
+            }
+            None => {
+                merged.remove(key);
+            }
+        }
+    }
+
+    merged
+        .iter()
+        .map(|(key, value)| extract(Key::decode(key)?, value))
+        .collect()
+}
+
+/// [`scan_decode`], overlaying the unfolded tail when one is given: `Some`
+/// merges the tail (three-state, last-writer-wins), `None` scans the store
+/// alone. The one dispatch point for scans that must reflect a slot-backed
+/// attach's tail on a `Slots` backing and behave unchanged everywhere else.
+pub(crate) async fn scan_decode_maybe<T>(
+    handle: ReadHandle<'_>,
+    overlay: Option<&moraine_wal::Overlay>,
+    prefix: Vec<u8>,
+    extract: impl FnMut(Key, &[u8]) -> Result<T>,
+) -> Result<Vec<T>> {
+    match overlay {
+        Some(overlay) => scan_decode_overlaid(handle, overlay, prefix, extract).await,
+        None => scan_decode(handle, prefix, extract).await,
+    }
+}
+
 /// The layout-format stamp, if the store has been initialized.
 pub(crate) async fn read_format(handle: ReadHandle<'_>) -> Result<Option<FormatValue>> {
     read_singleton(handle, Key::Sys(SysKey::Format)).await
@@ -135,57 +184,19 @@ pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue
     read_singleton(handle, Key::Sys(SysKey::Head)).await
 }
 
-/// How many times a read-only pass is re-run before its instability is
-/// reported. A reader's state advances only when its manifest poller runs,
-/// not on every commit, so a pass that straddles one refresh is very
-/// unlikely to straddle the next.
-const STABLE_READ_ATTEMPTS: usize = 8;
-
-/// Runs `read` so that everything it observes belongs to one store state.
-///
-/// A transaction handle reads at its own start sequence, so it already
-/// does and `read` runs once. A read-only reader follows the manifest:
-/// its state advances between calls, and a pass of several reads can
-/// straddle a commit and return a mix of before and after. Every batch
-/// writes the head record and moves its batch count — a maintenance batch
-/// that reuses the snapshot id included — so reading that record before
-/// and after the pass detects any state the pass could have straddled.
-/// A pass that saw it move is discarded and re-run, never returned.
-///
-/// # Errors
-///
-/// Returns [`Error::RetryBudgetExhausted`] if the store moved under every
-/// attempt, or whatever `read` itself returns.
-pub(crate) async fn consistent<T, F, Fut>(handle: ReadHandle<'_>, read: F) -> Result<T>
-where
-    F: Fn() -> Fut,
-    Fut: Future<Output = Result<T>>,
-{
-    if handle.is_isolated() {
-        return read().await;
-    }
-
-    for _ in 0..STABLE_READ_ATTEMPTS {
-        let before = read_head(handle).await?;
-        let value = read().await?;
-        if read_head(handle).await? == before {
-            return Ok(value);
-        }
-    }
-
-    Err(Error::RetryBudgetExhausted(format!(
-        "a read-only pass could not observe a single store state in \
-         {STABLE_READ_ATTEMPTS} attempts; the catalog is committing faster than it reads"
-    )))
+/// Reads the fold cursor; `None` on a store that has never been
+/// multi-writer.
+pub(crate) async fn read_fold(handle: ReadHandle<'_>) -> Result<Option<moraine_wal::FoldValue>> {
+    read_singleton(handle, Key::Sys(SysKey::Fold)).await
 }
 
-/// One commit's changelog, absent once it falls out of the retained
-/// window (or if the commit recorded none).
-pub(crate) async fn read_changelog(
-    handle: ReadHandle<'_>,
-    snapshot_id: u64,
-) -> Result<Option<ChangelogValue>> {
-    read_singleton(handle, Key::Changelog { snapshot_id }).await
+/// Reads the forwarding token; `None` on a store predating it (a leader mints
+/// it lazily on first bind).
+// Read by the leader role and its bootstrap-mint test; the leaderless build
+// still writes it, but reads it back only in the test.
+#[cfg_attr(not(feature = "leader"), allow(dead_code))]
+pub(crate) async fn read_secret(handle: ReadHandle<'_>) -> Result<Option<SecretValue>> {
+    read_singleton(handle, Key::Sys(SysKey::Secret)).await
 }
 
 /// One snapshot record.
@@ -196,18 +207,81 @@ pub(crate) async fn read_snapshot(
     read_singleton(handle, Key::Snapshot { snapshot_id }).await
 }
 
+/// [`read_snapshot`] with the unfolded tail overlaid: a tail write shadows the
+/// stored record. A tail *delete*, though, is an expiry the folder has not
+/// applied — the store still holds the record — so time travel resolves it from
+/// there until a fold prunes it, the one place the unfolded view outlives the
+/// folded one rather than matching it.
+pub(crate) async fn read_snapshot_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+    snapshot_id: u64,
+) -> Result<Option<SnapshotValue>> {
+    match overlay.get(&Key::Snapshot { snapshot_id }.encode()) {
+        Some(Some(bytes)) => Ok(Some(value::decode_value(bytes)?)),
+        Some(None) | None => read_snapshot(handle, snapshot_id).await,
+    }
+}
+
+/// The snapshot id a transaction committed at, scanning the snapshot subspace
+/// ascending from `floor + 1` for the record carrying `transaction_id`; `None`
+/// when no record above `floor` carries it. Forward-only: transaction ids are
+/// unique, so the first match settles it.
+pub(crate) async fn snapshot_of_transaction(
+    handle: ReadHandle<'_>,
+    floor: u64,
+    transaction_id: &[u8],
+) -> Result<Option<u64>> {
+    let prefix = subspace_prefix(Subspace::Snapshot);
+    let start = Key::Snapshot {
+        snapshot_id: floor.saturating_add(1),
+    }
+    .encode();
+    let suffix = start[prefix.len()..].to_vec();
+
+    let mut iter = handle.scan_prefix(prefix, suffix..).await?;
+    while let Some(entry) = iter.next().await? {
+        let snapshot: SnapshotValue = value::decode_value(&entry.value)?;
+        if snapshot.transaction_id.as_deref() == Some(transaction_id) {
+            return Ok(Some(snapshot.snapshot_id));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Decodes one entry of a `ducklake_snapshot` scan.
+fn extract_snapshot(key: Key, bytes: &[u8]) -> Result<SnapshotValue> {
+    match key {
+        Key::Snapshot { .. } => value::decode_value(bytes),
+        other => Err(Error::Corruption(format!(
+            "non-snapshot key in snapshot scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every committed snapshot record (`ducklake_snapshot` +
 /// `ducklake_snapshot_changes`, merged), in key order.
 pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<SnapshotValue>> {
     scan_decode(
         handle,
         subspace_prefix(Subspace::Snapshot),
-        |key, bytes| match key {
-            Key::Snapshot { .. } => value::decode_value(bytes),
-            other => Err(Error::Corruption(format!(
-                "non-snapshot key in snapshot scan: {other:?}"
-            ))),
-        },
+        extract_snapshot,
+    )
+    .await
+}
+
+/// [`scan_snapshots`] with the unfolded tail overlaid, for a slot-backed
+/// attach whose folder has not applied every committed snapshot yet.
+pub(crate) async fn scan_snapshots_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<SnapshotValue>> {
+    scan_decode_overlaid(
+        handle,
+        overlay,
+        subspace_prefix(Subspace::Snapshot),
+        extract_snapshot,
     )
     .await
 }
@@ -244,6 +318,19 @@ pub(crate) fn decode_entity(entity: EntityKey, bytes: &[u8]) -> Result<EntityRec
     }
 }
 
+/// Decodes one entry of a `current`-subspace scan.
+fn extract_current(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
+    match key {
+        Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
+        Key::Current(CurrentKey::GcFile { .. }) => {
+            Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
+        }
+        other => Err(Error::Corruption(format!(
+            "non-current key in current scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every `ducklake_schema_versions` record as `(table_id,
 /// begin_snapshot, schema_version)`, in key order. Retained across
 /// snapshot expiry, so this is the projection's durable source — the
@@ -252,36 +339,56 @@ pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(
     scan_decode(
         handle,
         subspace_prefix(Subspace::SchemaVersion),
-        |key, bytes| match key {
-            Key::SchemaVersion {
-                table_id,
-                begin_snapshot,
-            } => {
-                let value: SchemaVersionValue = value::decode_value(bytes)?;
-                Ok((table_id, begin_snapshot, value.schema_version))
-            }
-            other => Err(Error::Corruption(format!(
-                "non-schema-version key in schema-version scan: {other:?}"
-            ))),
-        },
+        extract_schema_version,
     )
     .await
 }
 
+/// [`scan_schema_versions`] with the unfolded tail overlaid, for a slot-backed
+/// attach whose folder has not applied every committed schema-version row yet.
+pub(crate) async fn scan_schema_versions_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<(u64, u64, u64)>> {
+    scan_decode_overlaid(
+        handle,
+        overlay,
+        subspace_prefix(Subspace::SchemaVersion),
+        extract_schema_version,
+    )
+    .await
+}
+
+fn extract_schema_version(key: Key, bytes: &[u8]) -> Result<(u64, u64, u64)> {
+    match key {
+        Key::SchemaVersion {
+            table_id,
+            begin_snapshot,
+        } => {
+            let value: SchemaVersionValue = value::decode_value(bytes)?;
+            Ok((table_id, begin_snapshot, value.schema_version))
+        }
+        other => Err(Error::Corruption(format!(
+            "non-schema-version key in schema-version scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every live entity record.
 pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    scan_decode(
+    scan_decode(handle, subspace_prefix(Subspace::Current), extract_current).await
+}
+
+/// [`scan_current_entities`] with the unfolded tail overlaid.
+pub(crate) async fn scan_current_entities_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<EntityRecord>> {
+    scan_decode_overlaid(
         handle,
+        overlay,
         subspace_prefix(Subspace::Current),
-        |key, bytes| match key {
-            Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
-            Key::Current(CurrentKey::GcFile { .. }) => {
-                Ok(EntityRecord::GcFile(value::decode_value(bytes)?))
-            }
-            other => Err(Error::Corruption(format!(
-                "non-current key in current scan: {other:?}"
-            ))),
-        },
+        extract_current,
     )
     .await
 }
@@ -292,20 +399,36 @@ pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<
 /// before any consumer, snapshot build or raw dump, could replay it over
 /// the live record.
 pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
-    scan_decode(
+    scan_decode(handle, subspace_prefix(Subspace::History), extract_history).await
+}
+
+/// [`scan_history_entities`] with the unfolded tail overlaid.
+pub(crate) async fn scan_history_entities_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<EntityRecord>> {
+    scan_decode_overlaid(
         handle,
+        overlay,
         subspace_prefix(Subspace::History),
-        |key, bytes| match key {
-            Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(
-                format!("unversioned key in history scan: {:?}", history.entity),
-            )),
-            Key::History(history) => decode_entity(history.entity, bytes),
-            other => Err(Error::Corruption(format!(
-                "non-history key in history scan: {other:?}"
-            ))),
-        },
+        extract_history,
     )
     .await
+}
+
+/// Decodes one entry of a `history`-subspace scan, refusing an unversioned
+/// kind mirrored there.
+fn extract_history(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
+    match key {
+        Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(format!(
+            "unversioned key in history scan: {:?}",
+            history.entity
+        ))),
+        Key::History(history) => decode_entity(history.entity, bytes),
+        other => Err(Error::Corruption(format!(
+            "non-history key in history scan: {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +577,36 @@ mod tests {
         }));
         let history = scan_history_entities(ReadHandle::Tx(&tx)).await.unwrap();
         assert_eq!(history, vec![EntityRecord::Schema(ended)]);
+        tx.rollback();
+        db.close().await.unwrap();
+    }
+
+    /// The fold cursor reads back like any other singleton, and a store
+    /// that has never been multi-writer has none.
+    #[tokio::test]
+    async fn fold_cursor_reads_back_and_is_absent_by_default() {
+        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert_eq!(read_fold(ReadHandle::Tx(&tx)).await.unwrap(), None);
+        tx.rollback();
+
+        let fold = moraine_wal::FoldValue { folded_sequence: 9 };
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        tx.put(Key::Sys(SysKey::Fold).encode(), value::encode_value(&fold))
+            .unwrap();
+        tx.commit_with_options(&WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        assert_eq!(read_fold(ReadHandle::Tx(&tx)).await.unwrap(), Some(fold));
         tx.rollback();
         db.close().await.unwrap();
     }

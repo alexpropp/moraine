@@ -14,9 +14,13 @@ anyhow = "1"
 arrow = { version = "59.1.0", default-features = false }
 async-trait = "0.1"
 bytes = "1"
+constant_time_eq = "0.4"
+fastrand = "2"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "snap", "zstd"] }
 moraine = { path = "crates/moraine", version = "0.4.4" }
+moraine-remote = { path = "crates/moraine-remote", version = "0.4.4" }
+moraine-wal = { path = "crates/moraine-wal", version = "0.4.4" }
 # object_store must stay on the same minor as slatedb's
 object_store = "0.14"
 prost = "0.14"
@@ -24,7 +28,7 @@ prost-build = "0.14"
 protox = "0.9"
 proptest = "1"
 proptest-derive = "0.8"
-slatedb = "0.14.1"
+slatedb = { version = "0.14.1", features = ["wal_disable"] }
 storekey = "0.11"
 thiserror = "2"
 tokio = "1"

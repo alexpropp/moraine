@@ -17,8 +17,9 @@ pub use census::{
     CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
     MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
 };
+pub(crate) use handle::SlotStore;
 pub use handle::{
-    CachePreload, Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest,
+    CachePreload, Catalog, CatalogOptions, Contention, MaintenanceReport, MaintenanceRequest,
     MigrationRequest,
 };
 pub use snapshot::CatalogSnapshot;

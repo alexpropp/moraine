@@ -124,7 +124,7 @@ async fn measure_commit_latency_against_the_endpoint() {
 
     for (row, flush_ms) in intervals.iter().enumerate() {
         let mut options = options_at(&format!("latency-{flush_ms}-{row}"));
-        options.flush_interval = Duration::from_millis(*flush_ms);
+        options.commit_batch_window = Duration::from_millis(*flush_ms);
         let catalog = Catalog::open(store.clone(), options).await.unwrap();
 
         let mut samples = Vec::with_capacity(COMMITS);

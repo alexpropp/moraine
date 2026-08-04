@@ -174,33 +174,6 @@ impl CatalogSnapshot {
         view
     }
 
-    /// How many `current` records this view holds — the size a full
-    /// rematerialization would have to read and decode, and so the scale an
-    /// incremental refresh's churn is weighed against.
-    pub(crate) fn live_entity_count(&self) -> usize {
-        fn nested<K, V>(map: &BTreeMap<u64, BTreeMap<K, V>>) -> usize {
-            map.values().map(BTreeMap::len).sum()
-        }
-
-        self.schemas.len()
-            + self.tables.len()
-            + self.views.len()
-            + self.macros.len()
-            + nested(&self.columns)
-            + nested(&self.data_files)
-            + nested(&self.delete_files)
-            + nested(&self.partitions)
-            + nested(&self.sorts)
-            + nested(&self.mappings)
-            + nested(&self.indexes)
-            + self.table_stats.len()
-            + nested(&self.table_column_stats)
-            + nested(&self.file_column_stats)
-            + self.options.len()
-            + self.tags.len()
-            + self.gc_files.len()
-    }
-
     /// Inserts one decoded record into the maps it belongs to, keeping the
     /// name indexes coherent. Shared by [`build`](Self::build) and the
     /// commit-time fold that folds a batch forward without rescanning.
@@ -1030,6 +1003,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
             deleted_data_file_ids: Vec::new(),
         }
     }

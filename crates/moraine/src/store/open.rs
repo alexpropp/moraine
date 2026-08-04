@@ -28,10 +28,9 @@ use crate::{
 /// The default WAL flush cadence when none is configured.
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How often a read-only handle polls for new state when none is
-/// configured — SlateDB's own default, kept so an unconfigured reader
-/// costs exactly what it always has.
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// The default reader manifest-poll cadence when none is configured. A reader
+/// following the log lags the head by up to this interval.
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Creates a checkpoint of everything `db` has committed, expiring after
 /// `lifetime` (never, if `None`), and reports its id. The scope is every
@@ -73,13 +72,14 @@ pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Op
 /// Opens a moraine store on `object_store` — a read-write [`Db`] via
 /// [`open_writer`](Self::open_writer) or a read-only [`DbReader`] via
 /// [`open_reader`](Self::open_reader) — carrying the shared open
-/// configuration: the WAL flush cadence (writer only) and the on-disk object
-/// cache.
+/// configuration: the WAL flush cadence (writer only), the reader
+/// manifest-poll cadence (reader only), and the on-disk object cache.
 pub(crate) struct StoreBuilder<'a> {
     path: &'a str,
     object_store: Arc<dyn ObjectStore>,
     flush_interval: Duration,
-    poll_interval: Duration,
+    refresh_interval: Duration,
+    wal_enabled: bool,
     cache_dir: Option<PathBuf>,
     cache_size: Option<u64>,
     cache_preload: Option<CachePreload>,
@@ -89,13 +89,14 @@ pub(crate) struct StoreBuilder<'a> {
 
 impl<'a> StoreBuilder<'a> {
     /// A builder for the store at `path` on `object_store`, with the default
-    /// flush cadence and no on-disk object cache.
+    /// flush and refresh cadences and no on-disk object cache.
     pub(crate) fn new(path: &'a str, object_store: Arc<dyn ObjectStore>) -> Self {
         Self {
             path,
             object_store,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
-            poll_interval: DEFAULT_POLL_INTERVAL,
+            refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            wal_enabled: true,
             cache_dir: None,
             cache_size: None,
             cache_preload: None,
@@ -104,21 +105,35 @@ impl<'a> StoreBuilder<'a> {
         }
     }
 
-    /// Sets how often a read-only handle polls for new state. Reader only —
-    /// a writer reads its own writes.
-    pub(crate) fn poll_interval(mut self, poll_interval: Duration) -> Self {
-        self.poll_interval = poll_interval;
-        self
-    }
-
     /// Sets the WAL flush cadence. Durable commits wait for the next flush,
     /// so this bounds per-commit latency; smaller values mean more frequent
     /// (on S3, costlier) object-store PUTs. Zero flushes continuously (no
     /// timer), so a durable commit waits only on the object-store PUT — the
     /// lowest latency, at the cost of a busy flush loop. Writer only — a
     /// reader never flushes.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn flush_interval(mut self, flush_interval: Duration) -> Self {
         self.flush_interval = flush_interval;
+        self
+    }
+
+    /// Sets the reader manifest-poll cadence. A reader following the slot log
+    /// refreshes its view of the folded store on this interval, so it lags the
+    /// head by up to this long; a shorter interval trades more manifest reads
+    /// for less fold lag. Reader only — a writer follows its own cadence.
+    pub(crate) fn refresh_interval(mut self, refresh_interval: Duration) -> Self {
+        self.refresh_interval = refresh_interval;
+        self
+    }
+
+    /// Enables or disables SlateDB's write-ahead log for this writer. Disabling
+    /// it writes straight into the memtable, so durability arrives only at an
+    /// L0 flush — a caller that disables the WAL must force [`Db::flush`]
+    /// before close, since no WAL and a size-triggered flush that rarely
+    /// fires leave nothing else to make writes durable. Writer only; a
+    /// reader never writes.
+    pub(crate) fn wal_enabled(mut self, wal_enabled: bool) -> Self {
+        self.wal_enabled = wal_enabled;
         self
     }
 
@@ -194,11 +209,7 @@ impl<'a> StoreBuilder<'a> {
     /// lifetime. Pinned to a [`checkpoint`](Self::checkpoint) it writes
     /// nothing at all, and reads the fixed cut that checkpoint names.
     pub(crate) async fn open_reader(&self) -> Result<DbReader> {
-        let options = DbReaderOptions {
-            object_store_cache_options: self.cache_options(),
-            manifest_poll_interval: self.poll_interval,
-            ..Default::default()
-        };
+        let options = self.reader_options();
         let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_options(options);
@@ -219,6 +230,37 @@ impl<'a> StoreBuilder<'a> {
             .map_err(Error::from)
     }
 
+    /// Opens the store read-only pinned to `checkpoint_id`: the reader reads
+    /// the manifest that checkpoint references and neither creates nor
+    /// refreshes a checkpoint of its own. Reading a slot log's truncation
+    /// horizon uses this to see the fold cursor exactly as a lagging peer's
+    /// checkpoint does.
+    pub(crate) async fn open_reader_at(self, checkpoint_id: Uuid) -> Result<DbReader> {
+        let options = self.reader_options();
+        DbReader::builder(self.path, self.object_store)
+            .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_options(options)
+            .with_checkpoint_id(checkpoint_id)
+            .build()
+            .await
+            .map_err(Error::from)
+    }
+
+    fn reader_options(&self) -> DbReaderOptions {
+        // The checkpoint lifetime must exceed twice the poll interval; keep
+        // SlateDB's default headroom, widening it only for a long interval.
+        let checkpoint_lifetime = self
+            .refresh_interval
+            .saturating_mul(3)
+            .max(Duration::from_secs(10 * 60));
+        DbReaderOptions {
+            manifest_poll_interval: self.refresh_interval,
+            checkpoint_lifetime,
+            object_store_cache_options: self.cache_options(),
+            ..Default::default()
+        }
+    }
+
     /// Every checkpoint the store's manifest currently carries, oldest
     /// first — reader-established ones included.
     pub(crate) async fn list_checkpoints(&self) -> Result<Vec<Uuid>> {
@@ -237,6 +279,7 @@ impl<'a> StoreBuilder<'a> {
     fn settings(&self) -> Settings {
         Settings {
             flush_interval: Some(self.flush_interval),
+            wal_enabled: self.wal_enabled,
             object_store_cache_options: self.cache_options(),
             ..Default::default()
         }

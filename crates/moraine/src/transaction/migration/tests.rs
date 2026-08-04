@@ -39,6 +39,16 @@ async fn seeded_store() -> Arc<InMemory> {
 
     let db = open_migrator(&object_store).await;
     let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    // Bootstrap stamps the newest format; restamp the base so the synthetic
+    // units below have an old store to carry forward.
+    tx.put(
+        Key::Sys(SysKey::Format).encode(),
+        value::encode_value(&proto::FormatValue {
+            format_version: FORMAT_VERSION,
+            writer_version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
+    .unwrap();
     for scope_id in 1..=SEEDED_RECORDS {
         tx.put(
             Key::current(EntityKey::Option {
@@ -154,7 +164,7 @@ async fn a_crash_mid_rewrite_leaves_the_store_old_and_unreadable() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(error, Error::Migration(_)), "{error:?}");
+    assert!(matches!(error, Error::Corruption(_)), "{error:?}");
 }
 
 /// Every seam: crash there, reopen, resume, and land on a coherent store
@@ -289,7 +299,6 @@ async fn a_migrated_store_still_time_travels() {
     names.sort();
     assert_eq!(names, vec!["main".to_string(), "sales".to_string()]);
 }
-
 /// A marker the format stamp contradicts cannot be produced by any step of
 /// the protocol, so meeting one is corruption, not a resume.
 #[test]
@@ -347,8 +356,8 @@ async fn the_migrate_verb_is_a_noop_against_a_current_store() {
     .await
     .unwrap();
 
-    assert_eq!(report.from_format, FORMAT_VERSION);
-    assert_eq!(report.to_format, FORMAT_VERSION);
+    assert_eq!(report.from_format, MAX_FORMAT_VERSION);
+    assert_eq!(report.to_format, MAX_FORMAT_VERSION);
     assert!(report.units_run.is_empty());
     assert!(!report.resumed);
 }

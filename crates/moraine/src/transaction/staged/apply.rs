@@ -1155,6 +1155,7 @@ pub(super) fn build_snapshot_value(ops: &[RowOperation]) -> Result<proto::Snapsh
         commit_message,
         commit_extra_info,
         schema_changed_table_ids,
+        transaction_id: None,
         // DuckLake authored this snapshot and names only the tables it
         // deleted from, so the file set stays empty and a later commit
         // classifies against it at table grain.

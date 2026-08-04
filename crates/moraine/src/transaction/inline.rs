@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use slatedb::DbTransaction;
+use moraine_wal::Overlay;
 
 use crate::{
     error::{Error, Result},
@@ -64,12 +64,13 @@ pub(crate) enum InlineStage {
 /// chunks already written decode against the recorded one, so accepting it
 /// would silently misread them.
 async fn schema_write_if_new(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     schema_version: u64,
     arrow_schema: &[u8],
 ) -> Result<Option<StagedWrite>> {
-    match store_inline::read_inline_schema(ReadHandle::Tx(db_tx), table_id, schema_version).await? {
+    match store_inline::read_inline_schema(handle, overlay, table_id, schema_version).await? {
         Some(recorded) if recorded.arrow_schema == arrow_schema => Ok(None),
         Some(_) => Err(Error::Constraint(format!(
             "table {table_id} already records a different schema for version {schema_version}; \
@@ -125,7 +126,8 @@ fn refuse_tombstones_of_drained_rows(
 /// stood before this commit — which is why a transaction may not both inline
 /// into a table and flush it.
 pub(crate) async fn stage_inline_writes(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     ops: &[InlineStage],
 ) -> Result<Vec<StagedWrite>> {
     let mut writes = Vec::new();
@@ -141,8 +143,14 @@ pub(crate) async fn stage_inline_writes(
             } => {
                 if settled.insert((*table_id, *schema_version)) {
                     writes.extend(
-                        schema_write_if_new(db_tx, *table_id, *schema_version, arrow_schema)
-                            .await?,
+                        schema_write_if_new(
+                            handle,
+                            overlay,
+                            *table_id,
+                            *schema_version,
+                            arrow_schema,
+                        )
+                        .await?,
                     );
                 }
             }
@@ -178,7 +186,8 @@ pub(crate) async fn stage_inline_writes(
                 flush_snapshot,
             } => {
                 let drained = translate_inline_flush_delete(
-                    db_tx,
+                    handle,
+                    overlay,
                     *table_id,
                     *schema_version,
                     *flush_snapshot,

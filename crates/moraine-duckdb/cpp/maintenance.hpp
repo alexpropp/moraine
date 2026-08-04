@@ -54,6 +54,19 @@ struct MaintenanceConfig {
 	// Zero takes the core's own batch default.
 	uint64_t batch_size = 0;
 	bool sweep_indexes = true;
+	bool fold_slots = true;
+	bool truncate_slots = true;
+	// The leader role: the designated folder binds a listener, announces
+	// through the log, and serves forwarded sessions. Off unless
+	// MAINTENANCE_LEADER is set; a read-only attach never leads.
+	bool leader = false;
+	// The address the listener binds. Required when `leader` is set.
+	std::string leader_address;
+	// The address announced in the log; defaults to the bind address when
+	// unset (they differ behind NAT or in containers).
+	std::string leader_advertise;
+	// The most concurrent forwarded sessions the leader serves.
+	uint64_t leader_max_sessions = 64;
 	// Off by default: the merge rewrites whatever the store holds and
 	// pays for every byte in object-store traffic. It destroys nothing a
 	// query can observe, so the default is about cost, not safety.
@@ -115,6 +128,12 @@ private:
 	MaintenanceStep RunDuckLakeStep(duckdb::Connection &connection, const std::string &lake,
 	                                const DuckLakeStep &step);
 	MaintenanceStep RunSweep();
+	// Folds unfolded slots into the store so the sweep sees folded drops.
+	// A `Fenced` result is a duelling folder — recorded and skipped, never
+	// fatal.
+	MaintenanceStep RunFold();
+	// Removes durably folded slots, oldest first.
+	MaintenanceStep RunTruncate();
 	MaintenanceStep RunStoreMerge();
 	// The DuckLake catalog sitting above this metadata catalog, found by
 	// matching attached databases on path. DuckLake's own maintenance

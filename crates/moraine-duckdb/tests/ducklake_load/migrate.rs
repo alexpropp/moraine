@@ -54,8 +54,8 @@ fn migrate_reaches_a_store_without_attaching_it() {
     assert_eq!(
         rows,
         vec![vec![
-            "1".to_string(),
-            "1".to_string(),
+            "4".to_string(),
+            "4".to_string(),
             "false".to_string(),
             String::new(),
         ]],

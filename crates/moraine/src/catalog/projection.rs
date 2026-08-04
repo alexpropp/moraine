@@ -6,50 +6,17 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use crate::{
-    catalog::CatalogSnapshot,
-    store::{
-        key::{CurrentKey, EntityKey, Key, SysKey},
-        proto::{HeadValue, SnapshotValue, TableColumnStatsValue, TableStatsValue},
-        read::EntityRecord,
-        value,
-    },
-    transaction::commit::StagedWrite,
+use crate::store::{
+    proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
+    read::EntityRecord,
 };
 
 /// One maintained projection: decoded rows stamped with the head snapshot
 /// id they are valid at. `head: None` means not installed — serves refuse
 /// and folds skip until a fresh scan installs it.
 struct Maintained<K: Ord, V> {
-    // The whole head stamp, not the snapshot id alone. A writer folds every
-    // batch forward so an id would serve it correctly, but a reader folds
-    // nothing and can only compare what the store told it — and a
-    // maintenance batch reuses the id while changing what a scan finds.
-    head: Option<HeadValue>,
+    head: Option<u64>,
     rows: BTreeMap<K, V>,
-}
-
-/// The head record a batch leaves behind. Every catalog batch writes one.
-///
-/// Searched from the end: a group commit stages each member's own head
-/// write onto the one batch, each read through the transaction and so
-/// numbered above the last, and the store keeps the final write of a key.
-/// Taking the first would stamp the projections with a state the store
-/// never settled at — a reader matching it would be served rows from a
-/// partial batch.
-fn head_stamp(writes: &[StagedWrite]) -> Option<HeadValue> {
-    let head_key = Key::Sys(SysKey::Head).encode();
-    writes.iter().rev().find_map(|(key, bytes)| {
-        (key == &head_key)
-            .then_some(bytes.as_ref())
-            .flatten()
-            .and_then(|bytes| value::decode_value::<HeadValue>(bytes).ok())
-    })
-}
-
-/// Whether two head records name the same store state.
-fn same_head(a: &HeadValue, b: &HeadValue) -> bool {
-    a.snapshot_id == b.snapshot_id && a.batch_seq == b.batch_seq
 }
 
 impl<K: Ord, V> Maintained<K, V> {
@@ -60,157 +27,30 @@ impl<K: Ord, V> Maintained<K, V> {
         }
     }
 
-    fn install(&mut self, head: HeadValue, rows: BTreeMap<K, V>) {
+    fn install(&mut self, head: u64, rows: BTreeMap<K, V>) {
         self.head = Some(head);
         self.rows = rows;
     }
 
-    fn clear(&mut self) {
-        self.head = None;
-        self.rows.clear();
-    }
-
-    fn advance(&mut self, new_head: HeadValue) {
-        if self.head.is_some() {
-            self.head = Some(new_head);
-        }
-    }
-
-    fn serve(&self, expected: &HeadValue) -> Option<Vec<V>>
+    fn serve(&self, expected_head: u64) -> Option<Vec<V>>
     where
         V: Clone,
     {
-        self.head
-            .as_ref()
-            .is_some_and(|head| same_head(head, expected))
-            .then(|| self.rows.values().cloned().collect())
-    }
-
-    /// Applies one folded write; on an undecodable put, clears — the
-    /// projection degrades to a rescan rather than serving wrong rows.
-    fn fold(&mut self, key: K, bytes: Option<&[u8]>)
-    where
-        V: prost::Message + Default,
-    {
-        if self.head.is_none() {
-            return;
-        }
-        match bytes {
-            None => {
-                self.rows.remove(&key);
-            }
-            Some(bytes) => match value::decode_value(bytes) {
-                Ok(decoded) => {
-                    self.rows.insert(key, decoded);
-                }
-                Err(_) => self.clear(),
-            },
-        }
+        (self.head == Some(expected_head)).then(|| self.rows.values().cloned().collect())
     }
 }
 
-/// Folds a just-committed batch into the shared cache. A poisoned lock is
-/// recovered rather than propagated: panics cannot originate inside the
-/// fold (non-panicking map operations end to end), so the state under a
-/// poisoned lock is never half-applied.
-pub(crate) fn fold_committed_batch(
-    cache: &std::sync::RwLock<ProjectionCache>,
-    writes: &[StagedWrite],
-    new_head: u64,
-) {
-    cache
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .apply_batch(writes, new_head);
-}
-
-/// The cached head view iff it stands at exactly the state `expected`
-/// names.
-pub(crate) fn cached_head_view(
-    cache: &std::sync::RwLock<ProjectionCache>,
-    expected: &HeadValue,
-) -> Option<Arc<CatalogSnapshot>> {
-    cache
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .head_view(expected)
-}
-
-/// The cached head view whatever state it stands at — the base an
-/// incremental refresh advances when it has fallen behind.
-pub(crate) fn held_head_view(
-    cache: &std::sync::RwLock<ProjectionCache>,
-) -> Option<Arc<CatalogSnapshot>> {
-    cache
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .head_view
-        .clone()
-}
-
-pub(crate) fn install_head_view(
-    cache: &std::sync::RwLock<ProjectionCache>,
-    view: Arc<CatalogSnapshot>,
-) {
-    cache
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_head_view(view);
-}
-
-/// The install epoch to capture before reading the store.
-pub(crate) fn cache_epoch(cache: &std::sync::RwLock<ProjectionCache>) -> u64 {
-    cache
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .epoch()
-}
-
-/// Installs `view` only if no invalidation has intervened since `epoch` was
-/// captured. A reader pins its handle and then reads, so without this an
-/// install could land after a head-preserving commit's invalidation and
-/// resurrect the very content that invalidation discarded.
-pub(crate) fn install_head_view_at(
-    cache: &std::sync::RwLock<ProjectionCache>,
-    epoch: u64,
-    view: Arc<CatalogSnapshot>,
-) {
-    cache
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .set_head_view_at(epoch, view);
-}
-
-pub(crate) fn invalidate_head_view(cache: &std::sync::RwLock<ProjectionCache>) {
-    cache
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear_head_view();
-}
-
-/// The projections DuckLake re-reads per transaction, maintained on a
-/// read-write catalog so serving them does not rescan the store.
+/// The projections DuckLake re-reads per transaction, served from one scan
+/// per head so a run of per-kind dumps does not rescan the store.
 pub(crate) struct ProjectionCache {
     snapshots: Maintained<u64, SnapshotValue>,
     table_stats: Maintained<u64, TableStatsValue>,
     table_column_stats: Maintained<(u64, u64), TableColumnStatsValue>,
     /// The full current+history entity scan at one head: populating
     /// DuckLake's metadata tables issues ~two dozen per-kind dumps, and
-    /// this serves them all from one scan pair. Not folded forward —
-    /// entity writes are too varied — so any committed batch drops it
+    /// this serves them all from one scan pair. Any committed batch drops it
     /// and the next dump re-installs it at the new head.
-    // Keyed on the whole head stamp, not the snapshot id alone: a
-    // maintenance batch reuses the id while changing what a scan would
-    // find, so an id-keyed entry would serve the state it reclaimed.
-    entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
-    /// The materialized head view, folded forward on every commit and
-    /// served to the commit path so it stages against known state without
-    /// rescanning. Carries its own head (`snapshot.snapshot_id`); a fold
-    /// that cannot be applied faithfully clears it, degrading to a scan.
-    head_view: Option<Arc<CatalogSnapshot>>,
-    /// Bumped by every invalidation, so an installer that captured it
-    /// before reading can tell whether its view is still admissible.
-    epoch: u64,
+    entities: Option<(u64, Arc<Vec<EntityRecord>>)>,
 }
 
 impl ProjectionCache {
@@ -220,71 +60,33 @@ impl ProjectionCache {
             table_stats: Maintained::empty(),
             table_column_stats: Maintained::empty(),
             entities: None,
-            head_view: None,
-            epoch: 0,
         }
     }
 
-    /// The head view iff it stands at exactly the state `expected` names.
-    /// Both halves of the stamp are checked: a maintenance batch reuses the
-    /// snapshot id, so the id alone would let a view of the state it
-    /// reclaimed keep serving.
-    pub(crate) fn head_view(&self, expected: &HeadValue) -> Option<Arc<CatalogSnapshot>> {
-        self.head_view
-            .as_ref()
-            .filter(|view| {
-                view.snapshot.snapshot_id == expected.snapshot_id
-                    && view.batch_seq == expected.batch_seq
-            })
-            .cloned()
-    }
-
-    pub(crate) fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    pub(crate) fn set_head_view(&mut self, view: Arc<CatalogSnapshot>) {
-        self.head_view = Some(view);
-    }
-
-    /// Installs only if no invalidation has intervened since `epoch`.
-    pub(crate) fn set_head_view_at(&mut self, epoch: u64, view: Arc<CatalogSnapshot>) {
-        if self.epoch == epoch {
-            self.head_view = Some(view);
-        }
-    }
-
-    pub(crate) fn clear_head_view(&mut self) {
-        self.head_view = None;
-        self.epoch = self.epoch.wrapping_add(1);
-    }
-
-    pub(crate) fn install_entities(&mut self, head: HeadValue, records: Vec<EntityRecord>) {
+    pub(crate) fn install_entities(&mut self, head: u64, records: Vec<EntityRecord>) {
         self.entities = Some((head, Arc::new(records)));
     }
 
-    /// Serves the entity scan if it stands at exactly `expected` — both
-    /// halves of the stamp, so a maintenance batch that reused the
-    /// snapshot id invalidates it like any other.
-    pub(crate) fn entities_at(&self, expected: &HeadValue) -> Option<Arc<Vec<EntityRecord>>> {
+    /// Serves the entity scan if it is exactly at `expected_head`.
+    pub(crate) fn entities_at(&self, expected_head: u64) -> Option<Arc<Vec<EntityRecord>>> {
         self.entities
             .as_ref()
-            .and_then(|(head, records)| same_head(head, expected).then(|| Arc::clone(records)))
+            .and_then(|(head, records)| (*head == expected_head).then(|| Arc::clone(records)))
     }
 
-    pub(crate) fn install_snapshots(&mut self, head: HeadValue, rows: Vec<SnapshotValue>) {
+    pub(crate) fn install_snapshots(&mut self, head: u64, rows: Vec<SnapshotValue>) {
         self.snapshots
             .install(head, rows.into_iter().map(|r| (r.snapshot_id, r)).collect());
     }
 
-    pub(crate) fn install_table_stats(&mut self, head: HeadValue, rows: Vec<TableStatsValue>) {
+    pub(crate) fn install_table_stats(&mut self, head: u64, rows: Vec<TableStatsValue>) {
         self.table_stats
             .install(head, rows.into_iter().map(|r| (r.table_id, r)).collect());
     }
 
     pub(crate) fn install_table_column_stats(
         &mut self,
-        head: HeadValue,
+        head: u64,
         rows: Vec<TableColumnStatsValue>,
     ) {
         self.table_column_stats.install(
@@ -296,207 +98,26 @@ impl ProjectionCache {
     }
 
     /// Serves the snapshot projection if it is exactly at `expected_head`.
-    pub(crate) fn snapshots_at(&self, expected: &HeadValue) -> Option<Vec<SnapshotValue>> {
-        self.snapshots.serve(expected)
+    pub(crate) fn snapshots_at(&self, expected_head: u64) -> Option<Vec<SnapshotValue>> {
+        self.snapshots.serve(expected_head)
     }
 
-    pub(crate) fn table_stats_at(&self, expected: &HeadValue) -> Option<Vec<TableStatsValue>> {
-        self.table_stats.serve(expected)
+    pub(crate) fn table_stats_at(&self, expected_head: u64) -> Option<Vec<TableStatsValue>> {
+        self.table_stats.serve(expected_head)
     }
 
     pub(crate) fn table_column_stats_at(
         &self,
-        expected: &HeadValue,
+        expected_head: u64,
     ) -> Option<Vec<TableColumnStatsValue>> {
-        self.table_column_stats.serve(expected)
-    }
-
-    /// Folds one committed batch, stamping every installed projection with
-    /// the head record the batch itself wrote. Every batch writes
-    /// `sys/head` — a maintenance one reuses the snapshot id and still
-    /// moves the batch count — so the stamp is read out of `writes` rather
-    /// than passed alongside them, which keeps it impossible for the two to
-    /// disagree. An undecodable key, or a batch with no head write, clears
-    /// everything: the batch cannot be attributed, so no projection may
-    /// claim the state it left.
-    pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
-        self.entities = None;
-        for (encoded_key, write) in writes {
-            let bytes = write.as_deref();
-            match Key::decode(encoded_key) {
-                Ok(Key::Snapshot { snapshot_id }) => self.snapshots.fold(snapshot_id, bytes),
-                Ok(Key::Current(CurrentKey::Entity(EntityKey::TableStats { table_id }))) => {
-                    self.table_stats.fold(table_id, bytes);
-                }
-                Ok(Key::Current(CurrentKey::Entity(EntityKey::TableColumnStats {
-                    table_id,
-                    column_id,
-                }))) => self.table_column_stats.fold((table_id, column_id), bytes),
-                Ok(_) => {}
-                Err(_) => {
-                    self.snapshots.clear();
-                    self.table_stats.clear();
-                    self.table_column_stats.clear();
-                    return;
-                }
-            }
-        }
-        // A batch with no head write, or one naming a state the caller does
-        // not agree with, cannot be attributed — so nothing may keep
-        // claiming a state. Cleared rather than asserted: this runs under
-        // the projection write lock inside a spawned commit, where a panic
-        // strands the joiner instead of failing the commit.
-        let Some(stamp) = head_stamp(writes).filter(|stamp| stamp.snapshot_id == new_head) else {
-            self.snapshots.clear();
-            self.table_stats.clear();
-            self.table_column_stats.clear();
-            return;
-        };
-        self.snapshots.advance(stamp);
-        self.table_stats.advance(stamp);
-        self.table_column_stats.advance(stamp);
+        self.table_column_stats.serve(expected_head)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use object_store::memory::InMemory;
-
     use super::*;
-    use crate::{
-        Catalog, CatalogOptions, ColumnDef,
-        ffi_support::{dump_snapshots, dump_table_column_stats, dump_table_stats},
-        store::{
-            key::{EntityKey, Key},
-            proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue},
-            value::encode_value,
-        },
-    };
-
-    /// A view holding nothing but its head stamp.
-    fn view_at(snapshot_id: u64) -> Arc<CatalogSnapshot> {
-        Arc::new(CatalogSnapshot {
-            snapshot: SnapshotValue {
-                snapshot_id,
-                ..SnapshotValue::default()
-            },
-            ..CatalogSnapshot::default()
-        })
-    }
-
-    /// The head record naming the state `view_at` builds a view of.
-    fn head_at(snapshot_id: u64) -> HeadValue {
-        HeadValue {
-            snapshot_id,
-            batch_seq: 0,
-        }
-    }
-
-    /// A reader pins its handle and then reads, so an invalidation can land
-    /// mid-read. Installing afterwards must not resurrect the view that
-    /// invalidation existed to discard.
-    #[test]
-    fn an_interleaved_invalidation_voids_an_install() {
-        let cache = std::sync::RwLock::new(ProjectionCache::empty());
-
-        let epoch = cache_epoch(&cache);
-        invalidate_head_view(&cache);
-        install_head_view_at(&cache, epoch, view_at(7));
-
-        assert!(cached_head_view(&cache, &head_at(7)).is_none());
-    }
-
-    /// Without an intervening invalidation the same install must land, or
-    /// no read path could ever warm the cache.
-    #[test]
-    fn an_uncontended_install_lands() {
-        let cache = std::sync::RwLock::new(ProjectionCache::empty());
-
-        let epoch = cache_epoch(&cache);
-        install_head_view_at(&cache, epoch, view_at(7));
-
-        assert!(cached_head_view(&cache, &head_at(7)).is_some());
-    }
-
-    /// The store's head record, which is what the projections key on.
-    async fn current_head(catalog: &Catalog) -> HeadValue {
-        let session = catalog.begin_read().await.unwrap();
-        let head = crate::store::read::read_head(session.handle())
-            .await
-            .unwrap()
-            .expect("an initialized store has a head");
-        session.finish();
-        head
-    }
-
-    /// Snapshot rows read directly from the store, bypassing the cache.
-    async fn scanned_snapshots(catalog: &Catalog) -> Vec<SnapshotValue> {
-        let session = catalog.begin_read().await.unwrap();
-        let rows = crate::store::read::scan_snapshots(session.handle())
-            .await
-            .unwrap();
-        session.finish();
-        rows
-    }
-
-    /// After every commit, the served projections equal fresh scans at the
-    /// same head — served through the cache (installed by the first dump,
-    /// folded forward by each commit), proven equal to the store's truth.
-    #[tokio::test]
-    async fn dumps_after_commits_match_fresh_scans() {
-        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
-            .await
-            .unwrap();
-
-        for round in 0..8u64 {
-            // Prime/serve before the commit so the fold path (not the
-            // install path) is what keeps the cache current.
-            let _ = dump_snapshots(&catalog).await.unwrap();
-
-            catalog
-                .commit(|tx| {
-                    let main = tx.schemas()[0].id;
-                    let table = tx.create_table(
-                        main,
-                        &format!("t{round}"),
-                        &[ColumnDef {
-                            name: "id".into(),
-                            column_type: "BIGINT".into(),
-                            nulls_allowed: false,
-                            default_value: None,
-                            children: Vec::new(),
-                        }],
-                    )?;
-                    if round % 2 == 0 {
-                        tx.rename_table(table, &format!("t{round}_renamed"))?;
-                    }
-                    Ok(())
-                })
-                .await
-                .unwrap();
-
-            let served = dump_snapshots(&catalog).await.unwrap();
-            assert_eq!(served, scanned_snapshots(&catalog).await, "round {round}");
-
-            let head = current_head(&catalog).await;
-            let cache_current = {
-                let guard = catalog
-                    .projections()
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.snapshots_at(&head).is_some()
-            };
-            assert!(
-                cache_current,
-                "cache must be current at head {head:?} after serving"
-            );
-
-            let _ = dump_table_stats(&catalog).await.unwrap();
-            let _ = dump_table_column_stats(&catalog).await.unwrap();
-        }
-    }
+    use crate::store::proto::{SnapshotValue, TableColumnStatsValue, TableStatsValue};
 
     fn snapshot_value(id: u64) -> SnapshotValue {
         SnapshotValue {
@@ -510,6 +131,7 @@ mod tests {
             commit_message: None,
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
+            transaction_id: None,
             deleted_data_file_ids: Vec::new(),
         }
     }
@@ -535,174 +157,18 @@ mod tests {
         }
     }
 
-    /// A head stamp, as the projections key on.
-    fn stamp(snapshot_id: u64, batch_seq: u64) -> HeadValue {
-        HeadValue {
-            snapshot_id,
-            batch_seq,
-        }
-    }
-
-    /// The `sys/head` write every batch carries. `apply_batch` reads the
-    /// stamp out of it rather than being told separately.
-    fn head_write(snapshot_id: u64, batch_seq: u64) -> StagedWrite {
-        (
-            Key::Sys(SysKey::Head).encode(),
-            Some(encode_value(&stamp(snapshot_id, batch_seq))),
-        )
-    }
-
     fn installed_at_three() -> ProjectionCache {
         let mut cache = ProjectionCache::empty();
-        cache.install_snapshots(stamp(3, 3), (0..=3).map(snapshot_value).collect());
-        cache.install_table_stats(stamp(3, 3), vec![stats_value(7, 10)]);
-        cache.install_table_column_stats(stamp(3, 3), vec![column_stats_value(7, 1)]);
+        cache.install_snapshots(3, (0..=3).map(snapshot_value).collect());
+        cache.install_table_stats(3, vec![stats_value(7, 10)]);
+        cache.install_table_column_stats(3, vec![column_stats_value(7, 1)]);
         cache
-    }
-
-    #[test]
-    fn fold_inserts_snapshot_and_updates_stats() {
-        let mut cache = installed_at_three();
-
-        let writes = vec![
-            (
-                Key::Snapshot { snapshot_id: 4 }.encode(),
-                Some(encode_value(&snapshot_value(4))),
-            ),
-            (
-                Key::current(EntityKey::TableStats { table_id: 7 }).encode(),
-                Some(encode_value(&stats_value(7, 11))),
-            ),
-            head_write(4, 4),
-        ];
-        cache.apply_batch(&writes, 4);
-
-        let at = stamp(4, 4);
-        let snapshots = cache.snapshots_at(&at).unwrap();
-        assert_eq!(snapshots.len(), 5);
-        assert_eq!(snapshots.last().unwrap().snapshot_id, 4);
-
-        let stats = cache.table_stats_at(&at).unwrap();
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].record_count, 11);
-
-        assert_eq!(cache.table_column_stats_at(&at).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn fold_deletes_remove_rows() {
-        let mut cache = installed_at_three();
-
-        let writes = vec![
-            (Key::Snapshot { snapshot_id: 2 }.encode(), None),
-            (
-                Key::current(EntityKey::TableColumnStats {
-                    table_id: 7,
-                    column_id: 1,
-                })
-                .encode(),
-                None,
-            ),
-            // Head-preserving, as a maintenance batch is: the snapshot id
-            // stands and the batch count moves.
-            head_write(3, 4),
-        ];
-        cache.apply_batch(&writes, 3);
-
-        let at = stamp(3, 4);
-        let snapshots = cache.snapshots_at(&at).unwrap();
-        assert_eq!(snapshots.len(), 3);
-        assert!(snapshots.iter().all(|s| s.snapshot_id != 2));
-        assert!(cache.table_column_stats_at(&at).unwrap().is_empty());
-        // And the state it replaced is no longer served, though its
-        // snapshot id is unchanged — the reason the key is the whole stamp.
-        assert!(cache.snapshots_at(&stamp(3, 3)).is_none());
     }
 
     #[test]
     fn serve_refuses_a_mismatched_head() {
         let cache = installed_at_three();
-        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
-        assert!(cache.table_stats_at(&stamp(2, 2)).is_none());
-        // Same snapshot id, different batch: a maintenance commit's shape.
-        assert!(cache.snapshots_at(&stamp(3, 4)).is_none());
-    }
-
-    #[test]
-    fn fold_on_an_empty_cache_is_a_noop() {
-        let mut cache = ProjectionCache::empty();
-        cache.apply_batch(
-            &[
-                (
-                    Key::Snapshot { snapshot_id: 1 }.encode(),
-                    Some(encode_value(&snapshot_value(1))),
-                ),
-                head_write(1, 1),
-            ],
-            1,
-        );
-        assert!(cache.snapshots_at(&stamp(1, 1)).is_none());
-    }
-
-    #[test]
-    fn an_undecodable_value_clears_only_the_touched_projection() {
-        let mut cache = installed_at_three();
-        cache.apply_batch(
-            &[
-                (
-                    Key::Snapshot { snapshot_id: 4 }.encode(),
-                    Some(vec![0xff, 0xff, 0xff, 0xff]),
-                ),
-                head_write(4, 4),
-            ],
-            4,
-        );
-        // Snapshots degrade to a rescan; the untouched stats fold forward.
-        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
-        assert!(cache.table_stats_at(&stamp(4, 4)).is_some());
-    }
-
-    #[test]
-    fn an_undecodable_key_clears_everything() {
-        let mut cache = installed_at_three();
-        cache.apply_batch(&[(vec![0xff, 0xee], Some(vec![])), head_write(4, 4)], 4);
-        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
-        assert!(cache.table_stats_at(&stamp(4, 4)).is_none());
-        assert!(cache.table_column_stats_at(&stamp(4, 4)).is_none());
-    }
-
-    #[test]
-    fn irrelevant_keys_still_advance_the_head() {
-        let mut cache = installed_at_three();
-        cache.apply_batch(
-            &[
-                (
-                    Key::current(EntityKey::Schema { schema_id: 9 }).encode(),
-                    Some(vec![1, 2, 3]),
-                ),
-                head_write(4, 4),
-            ],
-            4,
-        );
-        assert_eq!(cache.snapshots_at(&stamp(4, 4)).unwrap().len(), 4);
-        assert!(cache.snapshots_at(&stamp(3, 3)).is_none());
-    }
-
-    /// A batch with no head write cannot be attributed to a state, so
-    /// nothing may keep claiming one. Every catalog batch writes the head,
-    /// so this is a corruption guard rather than a live path.
-    #[test]
-    fn a_batch_without_a_head_write_clears_everything() {
-        let mut cache = installed_at_three();
-        cache.apply_batch(
-            &[(
-                Key::Snapshot { snapshot_id: 4 }.encode(),
-                Some(encode_value(&snapshot_value(4))),
-            )],
-            4,
-        );
-        assert!(cache.snapshots_at(&stamp(4, 4)).is_none());
-        assert!(cache.snapshots_at(&stamp(3, 3)).is_none());
-        assert!(cache.table_stats_at(&stamp(3, 3)).is_none());
+        assert!(cache.snapshots_at(4).is_none());
+        assert!(cache.table_stats_at(2).is_none());
     }
 }

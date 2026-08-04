@@ -7,13 +7,14 @@
 //! mechanically, and the loser re-runs and sees the winner's entry.
 
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     ops::Bound,
 };
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
-use slatedb::DbTransaction;
+use moraine_wal::Overlay;
 use tracing::warn;
 
 use crate::{
@@ -26,7 +27,35 @@ use crate::{
             index_value_above, index_value_body, index_value_suffix,
         },
     },
+    transaction::commit::StagedWrite,
 };
+
+/// Read-side dispatch for uniqueness probes: the folded store view overlaid
+/// with the writes of slots no folder has applied yet.
+#[derive(Clone, Copy)]
+pub(crate) enum ProbeHandle<'a> {
+    /// A store view overlaid with an unfolded tail: a tail write shadows the
+    /// stored value, a tail delete hides it.
+    Overlaid {
+        /// The folded store view.
+        store: ReadHandle<'a>,
+        /// The writes of slots no folder has applied yet.
+        overlay: &'a moraine_wal::Overlay,
+    },
+}
+
+impl ProbeHandle<'_> {
+    /// Point read of one key, an overlaid tail's write for it taking
+    /// precedence over the store's.
+    pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        match self {
+            Self::Overlaid { store, overlay } => match overlay.get(key) {
+                Some(write) => Ok(write.map(Bytes::copy_from_slice)),
+                None => store.get(key).await.map_err(Error::from),
+            },
+        }
+    }
+}
 
 /// One index-entry mutation accumulated during a commit closure, resolved
 /// against the store when the batch is staged.
@@ -126,16 +155,17 @@ fn collision(probe_index_id: u64, building: bool, poisoned: &mut Vec<u64>) -> Op
     }
 }
 
-/// Probes one group of unique puts concurrently and stages the survivors,
-/// draining `pending`. Present with a different row id rejects the batch;
-/// present with the same row id is a re-derived entry and stages nothing.
+/// Probes one group of unique puts concurrently and plans the survivors'
+/// puts into `writes`, draining `pending`. Present with a different row id
+/// rejects the batch; present with the same row id is a re-derived entry and
+/// plans nothing.
 async fn resolve_probes(
-    db_tx: &DbTransaction,
+    probe: &ProbeHandle<'_>,
     deleted_unique: &HashSet<Vec<u8>>,
     pending: &mut Vec<PendingProbe>,
     poisoned: &mut Vec<u64>,
+    writes: &mut Vec<StagedWrite>,
 ) -> Result<()> {
-    let reader = ReadHandle::Tx(db_tx);
     let held: Vec<Option<Bytes>> = stream::iter(0..pending.len())
         .map(|position| {
             let key_bytes = pending[position].key.clone();
@@ -146,14 +176,13 @@ async fn resolve_probes(
                 if deleted {
                     Ok(None)
                 } else {
-                    reader.get(key_bytes).await
+                    probe.get(&key_bytes).await
                 }
             }
         })
         .buffered(UNIQUENESS_PROBE_CONCURRENCY)
         .try_collect()
-        .await
-        .map_err(Error::from)?;
+        .await?;
 
     // Resolved in batch order, so which entry a rejection names does not
     // depend on which probe happened to finish first.
@@ -168,17 +197,19 @@ async fn resolve_probes(
             }
             continue;
         }
-        db_tx.put(probe.key, probe.row_id.to_be_bytes())?;
+        writes.push((probe.key, Some(probe.row_id.to_be_bytes().to_vec())));
     }
     Ok(())
 }
 
-/// Resolves accumulated entries onto `db_tx`, enforcing uniqueness at
-/// commit. Deletes are staged first so a delete-then-reinsert of one unique
-/// value within a commit sees the value as absent. For each unique put:
-/// present with a **different** row id → [`Error::Constraint`]; present with
-/// the **same** row id → no-op (a re-derived entry); absent → staged.
-/// Duplicates within the commit are caught in memory.
+/// Resolves accumulated entries into planned writes, enforcing uniqueness at
+/// commit against `probe`. Returns the ids of poisoned building indexes and
+/// the writes to stage — deletes first, then puts, so staging them in order
+/// makes a delete-then-reinsert of one unique value within a commit see the
+/// value as absent. For each unique put: present with a **different** row id →
+/// [`Error::Constraint`]; present with the **same** row id → no-op (a
+/// re-derived entry); absent → planned. Duplicates within the commit are
+/// caught in memory.
 ///
 /// A collision against an index that is still **building** poisons it
 /// instead: the id is returned, the claim is dropped so the live holder's
@@ -186,20 +217,13 @@ async fn resolve_probes(
 /// build flips ready, so failing the finder would decide by timing which
 /// party a duplicate falls on.
 ///
-/// Entries stage onto the transaction directly rather than through the
-/// caller's write list. The list is retained until the commit lands so the
-/// maintained projections can fold it, and no projection reflects an index
-/// entry — keeping one would hold a second copy of the batch's largest part
-/// in memory for nothing. A bulk load stages one entry per indexed row, so
-/// that copy is what decides whether the commit fits in RAM.
-///
-/// Unique puts stage after non-unique ones rather than in entry order. Every
-/// staged key is distinct — an entry's kind is part of its key — so only the
+/// Unique puts plan after non-unique ones rather than in entry order. Every
+/// key is distinct — an entry's kind is part of its key — so only the
 /// deletes-before-puts ordering above carries meaning.
-pub(crate) async fn stage_index_entries(
-    db_tx: &DbTransaction,
+pub(crate) async fn plan_index_entries(
+    probe: ProbeHandle<'_>,
     entries: &[StagedIndexEntry],
-) -> Result<Vec<u64>> {
+) -> Result<(Vec<u64>, Vec<StagedWrite>)> {
     if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
         // Logged as well as returned: the refusal is the guardrail firing,
         // and an operator reading logs after a failed bulk load should see
@@ -212,20 +236,20 @@ pub(crate) async fn stage_index_entries(
         return Err(oversized_commit(entries.len()));
     }
 
+    let mut writes: Vec<StagedWrite> = Vec::new();
     let mut deleted_unique: HashSet<Vec<u8>> = HashSet::new();
     for entry in entries.iter().filter(|entry| entry.delete) {
         let key_bytes = entry_key(entry).encode();
         if entry.unique {
             deleted_unique.insert(key_bytes.clone());
         }
-        db_tx.delete(key_bytes)?;
+        writes.push((key_bytes, None));
     }
 
-    // Non-unique puts stage straight away; unique puts collapse to one probe
+    // Non-unique puts plan straight away; unique puts collapse to one probe
     // per distinct key. Two entries claiming one value for different rows
     // collide here, in memory, before any read. Presence is then resolved a
-    // bounded group of concurrent point reads at a time, so peak memory is
-    // one group of keys rather than the whole batch's.
+    // group of point reads at a time.
     let mut pending: Vec<PendingProbe> = Vec::new();
     let mut claimed: HashMap<Vec<u8>, u64> = HashMap::new();
     let mut poisoned: Vec<u64> = Vec::new();
@@ -233,7 +257,7 @@ pub(crate) async fn stage_index_entries(
         let key_bytes = entry_key(entry).encode();
         if !entry.unique {
             // The row id lives in the key; the value is empty.
-            db_tx.put(key_bytes, [])?;
+            writes.push((key_bytes, Some(Vec::new())));
             continue;
         }
         match claimed.get(&key_bytes) {
@@ -253,14 +277,28 @@ pub(crate) async fn stage_index_entries(
             building: entry.building,
         });
         if pending.len() >= UNIQUENESS_PROBE_GROUP {
-            resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
+            resolve_probes(
+                &probe,
+                &deleted_unique,
+                &mut pending,
+                &mut poisoned,
+                &mut writes,
+            )
+            .await?;
         }
     }
-    resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
+    resolve_probes(
+        &probe,
+        &deleted_unique,
+        &mut pending,
+        &mut poisoned,
+        &mut writes,
+    )
+    .await?;
 
     poisoned.sort_unstable();
     poisoned.dedup();
-    Ok(poisoned)
+    Ok((poisoned, writes))
 }
 
 /// Records `poisoned` on the working state's definitions, so the commit's
@@ -365,11 +403,139 @@ pub(crate) async fn reclaim_entries_from(
     Ok((deleted, last))
 }
 
+/// A byte range under one entry prefix, as the suffix bounds a scan takes.
+type Subrange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
+/// The row id one entry names, from its key and value.
+type RowIdOf = fn(&[u8], &[u8]) -> Result<u64>;
+
+/// A non-unique entry carries its row id in the key.
+fn multi_row_id(key: &[u8], _value: &[u8]) -> Result<u64> {
+    match Key::decode(key)? {
+        Key::Index(IndexKey::Multi { row_id, .. }) => Ok(row_id),
+        other => Err(Error::Corruption(format!(
+            "non-multi key in index scan: {other:?}"
+        ))),
+    }
+}
+
+/// A unique entry's value is the holding row id.
+fn unique_row_id(_key: &[u8], value: &[u8]) -> Result<u64> {
+    decode_row_id(value)
+}
+
+/// Whether `key` falls inside `subrange`, whose bounds are suffixes of
+/// `prefix`. Every key considered starts with `prefix`, and such keys compare
+/// as their suffixes do, so the bounds are compared whole.
+fn in_subrange(key: &[u8], prefix: &[u8], (lower, upper): &Subrange) -> bool {
+    let full = |suffix: &[u8]| [prefix, suffix].concat();
+    let above_lower = match lower {
+        Bound::Included(suffix) => key >= full(suffix).as_slice(),
+        Bound::Excluded(suffix) => key > full(suffix).as_slice(),
+        Bound::Unbounded => true,
+    };
+    let below_upper = match upper {
+        Bound::Included(suffix) => key <= full(suffix).as_slice(),
+        Bound::Excluded(suffix) => key < full(suffix).as_slice(),
+        Bound::Unbounded => true,
+    };
+
+    above_lower && below_upper
+}
+
+/// The row ids of the entries under `prefix` within `subrange`, with an
+/// unfolded tail's writes merged over the store's: a tail put shadows the
+/// stored entry, a tail delete hides it. Both sides ascend by key, so one pass
+/// over each answers the probe, and only the tail's slice of the range is held
+/// in memory.
+async fn merged_row_ids(
+    reader: ReadHandle<'_>,
+    tail: Option<&Overlay>,
+    prefix: Vec<u8>,
+    subrange: Subrange,
+    row_id_of: RowIdOf,
+) -> Result<Vec<u64>> {
+    let writes: Vec<(Vec<u8>, Option<Vec<u8>>)> = tail.map_or_else(Vec::new, |tail| {
+        tail.prefixed(&prefix)
+            .filter(|(key, _)| in_subrange(key, &prefix, &subrange))
+            .map(|(key, value)| (key.to_vec(), value.map(<[u8]>::to_vec)))
+            .collect()
+    });
+
+    let mut iter = reader
+        .scan_prefix(prefix, subrange)
+        .await
+        .map_err(Error::from)?;
+    let mut stored = iter.next().await.map_err(Error::from)?;
+    let mut writes = writes.into_iter();
+    let mut written = writes.next();
+
+    let mut row_ids = Vec::new();
+    loop {
+        match (stored.take(), written.take()) {
+            (None, None) => break,
+            (Some(entry), None) => {
+                row_ids.push(row_id_of(&entry.key, &entry.value)?);
+                stored = iter.next().await.map_err(Error::from)?;
+            }
+            (None, Some((key, value))) => {
+                if let Some(bytes) = value {
+                    row_ids.push(row_id_of(&key, &bytes)?);
+                }
+                written = writes.next();
+            }
+            (Some(entry), Some((key, value))) => match key.as_slice().cmp(entry.key.as_ref()) {
+                Ordering::Less => {
+                    if let Some(bytes) = value {
+                        row_ids.push(row_id_of(&key, &bytes)?);
+                    }
+                    stored = Some(entry);
+                    written = writes.next();
+                }
+                // The tail wrote the stored entry's own key, so it replaces it.
+                Ordering::Equal => {
+                    if let Some(bytes) = value {
+                        row_ids.push(row_id_of(&key, &bytes)?);
+                    }
+                    stored = iter.next().await.map_err(Error::from)?;
+                    written = writes.next();
+                }
+                Ordering::Greater => {
+                    row_ids.push(row_id_of(&entry.key, &entry.value)?);
+                    stored = iter.next().await.map_err(Error::from)?;
+                    written = Some((key, value));
+                }
+            },
+        }
+    }
+
+    Ok(row_ids)
+}
+
+/// One entry, an unfolded tail's write for it taking precedence over the
+/// store's.
+async fn read_entry(
+    reader: ReadHandle<'_>,
+    tail: Option<&Overlay>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if let Some(write) = tail.and_then(|tail| tail.get(key)) {
+        return Ok(write.map(<[u8]>::to_vec));
+    }
+
+    Ok(reader
+        .get(key)
+        .await
+        .map_err(Error::from)?
+        .map(|bytes| bytes.to_vec()))
+}
+
 /// The row ids holding one indexed value: a point-get for a unique index,
-/// an ascending prefix scan for a non-unique one. The non-unique row id
-/// lives in the entry key, so each scanned key is decoded to recover it.
+/// an ascending prefix scan for a non-unique one. `tail` carries the writes of
+/// slots no folder has applied yet, when the store is slot-backed.
 pub(crate) async fn lookup_row_ids(
     reader: ReadHandle<'_>,
+    tail: Option<&Overlay>,
     index_id: u64,
     unique: bool,
     key: &CanonicalKey,
@@ -380,26 +546,20 @@ pub(crate) async fn lookup_row_ids(
             key: key.clone(),
         })
         .encode();
-        return match reader.get(entry_key).await.map_err(Error::from)? {
+        return match read_entry(reader, tail, &entry_key).await? {
             Some(bytes) => Ok(vec![decode_row_id(&bytes)?]),
             None => Ok(Vec::new()),
         };
     }
 
-    let prefix = index_multi_value_prefix(index_id, key);
-    let mut iter = reader.scan_prefix(prefix, ..).await.map_err(Error::from)?;
-    let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-multi key in index scan: {other:?}"
-                )));
-            }
-        }
-    }
-    Ok(row_ids)
+    merged_row_ids(
+        reader,
+        tail,
+        index_multi_value_prefix(index_id, key),
+        (Bound::Unbounded, Bound::Unbounded),
+        multi_row_id,
+    )
+    .await
 }
 
 /// The row ids whose indexed value falls between `lower` and `upper`, in the
@@ -407,9 +567,10 @@ pub(crate) async fn lookup_row_ids(
 /// so the query is a bounded sub-scan of the index's contiguous range; the
 /// bounds are the canonical values, already encoded in the columns' declared
 /// directions. A unique entry carries its row id in the value, a non-unique
-/// one in the key.
+/// one in the key. `tail` is treated as in [`lookup_row_ids`].
 pub(crate) async fn range_row_ids(
     reader: ReadHandle<'_>,
+    tail: Option<&Overlay>,
     index_id: u64,
     unique: bool,
     leading_nulls: NullOrder,
@@ -452,26 +613,9 @@ pub(crate) async fn range_row_ids(
         Bound::Unbounded => past_non_null,
     };
 
-    let mut iter = reader
-        .scan_prefix(prefix, (start, end))
-        .await
-        .map_err(Error::from)?;
-    let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        if unique {
-            row_ids.push(decode_row_id(entry.value.as_ref())?);
-        } else {
-            match Key::decode(&entry.key)? {
-                Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
-                other => {
-                    return Err(Error::Corruption(format!(
-                        "non-multi key in index range scan: {other:?}"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(row_ids)
+    let row_id_of = if unique { unique_row_id } else { multi_row_id };
+
+    merged_row_ids(reader, tail, prefix, (start, end), row_id_of).await
 }
 
 /// The row ids of live rows whose leading indexed columns match `prefix` — a
@@ -479,8 +623,10 @@ pub(crate) async fn range_row_ids(
 /// A row with any NULL indexed column is stored multi-shaped, so `IS NULL`
 /// queries scan the `multi` subrange; the value framing's terminator is
 /// dropped from the scan prefix so it matches every key that extends the run.
+/// `tail` is treated as in [`lookup_row_ids`].
 pub(crate) async fn null_prefix_row_ids(
     reader: ReadHandle<'_>,
+    tail: Option<&Overlay>,
     index_id: u64,
     prefix: &CanonicalKey,
 ) -> Result<Vec<u64>> {
@@ -488,27 +634,145 @@ pub(crate) async fn null_prefix_row_ids(
     // `index_multi_value_prefix` frames the value and appends a terminator for an
     // exact-value scan; dropping it turns the bytes into a true leading prefix.
     scan_prefix.pop();
-    let mut iter = reader
-        .scan_prefix(scan_prefix, ..)
-        .await
-        .map_err(Error::from)?;
-    let mut row_ids = Vec::new();
-    while let Some(entry) = iter.next().await.map_err(Error::from)? {
-        match Key::decode(&entry.key)? {
-            Key::Index(IndexKey::Multi { row_id, .. }) => row_ids.push(row_id),
-            other => {
-                return Err(Error::Corruption(format!(
-                    "non-multi key in null-prefix scan: {other:?}"
-                )));
-            }
-        }
-    }
-    Ok(row_ids)
+
+    merged_row_ids(
+        reader,
+        tail,
+        scan_prefix,
+        (Bound::Unbounded, Bound::Unbounded),
+        multi_row_id,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use moraine_wal::{Commit, Envelope, SlotPayload, SlotWrite};
+    use object_store::memory::InMemory;
+    use slatedb::{IsolationLevel, config::WriteOptions};
+
     use super::*;
+    use crate::store::{
+        index_encoding::{Direction, IndexKeyValue, IntWidth, encode_ordered_values},
+        open::StoreBuilder,
+    };
+
+    /// A one-column ascending key over `value`.
+    fn value_key(value: u128) -> CanonicalKey {
+        encode_ordered_values(
+            &[Some(IndexKeyValue::UInt {
+                value,
+                width: IntWidth::I64,
+            })],
+            &[Direction::Ascending],
+            &[NullOrder::Last],
+        )
+        .unwrap()
+    }
+
+    /// The encoded key of one non-unique entry.
+    fn multi_key(index_id: u64, value: u128, row_id: u64) -> Vec<u8> {
+        Key::Index(IndexKey::Multi {
+            index_id,
+            key: value_key(value),
+            row_id,
+        })
+        .encode()
+    }
+
+    /// An overlay holding one envelope's writes, as tail replay builds it.
+    fn tail_writing(writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Overlay {
+        let mut overlay = Overlay::default();
+        overlay.absorb(&Envelope {
+            leader: None,
+            commits: vec![Commit {
+                transaction_id: [1; 16],
+                payload: SlotPayload {
+                    validated_head: 0,
+                    changes_made: String::new(),
+                    writes: writes
+                        .into_iter()
+                        .map(|(key, value)| SlotWrite { key, value })
+                        .collect(),
+                },
+            }],
+        });
+        overlay
+    }
+
+    /// A probe on a slot-backed store reads the unfolded tail over the store:
+    /// the tail's entries join the stored ones, and the entries it deletes
+    /// disappear. Without this a query would miss every commit no folder has
+    /// applied.
+    #[tokio::test]
+    async fn a_probe_reads_the_tail_over_the_stored_entries() {
+        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+            .open_writer()
+            .await
+            .unwrap();
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        for (value, row_id) in [(10_u128, 1_u64), (20, 2), (30, 3)] {
+            tx.put(multi_key(7, value, row_id), []).unwrap();
+        }
+        tx.commit_with_options(&WriteOptions {
+            await_durable: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // The tail adds value 20 for row 4 and 40 for row 5, and deletes the
+        // stored entry for 30.
+        let tail = tail_writing(vec![
+            (multi_key(7, 20, 4), Some(Vec::new())),
+            (multi_key(7, 40, 5), Some(Vec::new())),
+            (multi_key(7, 30, 3), None),
+        ]);
+
+        let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+        let handle = ReadHandle::Tx(&tx);
+
+        // A point lookup sees the tail's added row alongside the stored one.
+        assert_eq!(
+            lookup_row_ids(handle, Some(&tail), 7, false, &value_key(20))
+                .await
+                .unwrap(),
+            vec![2, 4]
+        );
+        // A deleted entry is gone, though the store still holds it.
+        assert!(
+            lookup_row_ids(handle, Some(&tail), 7, false, &value_key(30))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A whole-index range merges both sides in value order.
+        assert_eq!(
+            range_row_ids(
+                handle,
+                Some(&tail),
+                7,
+                false,
+                NullOrder::Last,
+                Bound::Unbounded,
+                Bound::Unbounded,
+            )
+            .await
+            .unwrap(),
+            vec![1, 2, 4, 5]
+        );
+        // Without a tail the same probes see only the store.
+        assert_eq!(
+            lookup_row_ids(handle, None, 7, false, &value_key(30))
+                .await
+                .unwrap(),
+            vec![3]
+        );
+        tx.rollback();
+        db.close().await.unwrap();
+    }
 
     /// The oversized-commit refusal must be terminal: DuckLake re-runs a
     /// commit whose error text carries any of four substrings, and

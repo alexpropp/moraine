@@ -1,12 +1,13 @@
 //! Inline-data translation: turning staged inline operations into their
 //! `inline/*` store writes.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::HashSet;
+
+use moraine_wal::Overlay;
 
 use super::{
-    DbTransaction, EntityKey, Error, HashMap, InlineKey, InlineOperation, InlineScanKind, Key,
-    ReadHandle, Result, RowOperation, TableKind, commit, decode::decode_hard_delete,
-    materialize_inline_rows, proto, store_inline, value,
+    HashMap, InlineKey, InlineOperation, InlineScanKind, Key, ReadHandle, Result, RowOperation,
+    commit, materialize_inline_rows, proto, store_inline, value,
 };
 
 /// Allocates `inline/insert` chunk sequence numbers within one commit: the
@@ -34,18 +35,17 @@ impl ChunkSeqAllocator {
 /// those chunks' rows consumed. Reads `db_tx`'s current (pre-commit)
 /// inline records — the flush op only ever names the table and snapshot,
 /// never the keys to remove.
-///
-/// Returns the row ids drained, which the flushed file now carries.
 pub(crate) async fn translate_inline_flush_delete(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<HashSet<u64>> {
-    let chunks = store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await?;
+    let chunks = store_inline::scan_inline_chunks(handle, overlay, table_id).await?;
     let inline_deletes =
-        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?;
+        store_inline::scan_inline_inline_deletes(handle, overlay, table_id).await?;
 
     let scoped: Vec<(InlineOperation, proto::InlineChunkValue)> = chunks
         .into_iter()
@@ -84,125 +84,18 @@ pub(crate) async fn translate_inline_flush_delete(
     Ok(drained)
 }
 
-/// Removes the named live `inline/file_delete` records, refusing any the
-/// table does not carry.
-///
-/// The check is why this takes the whole batch rather than one record at
-/// a time: it costs one prefix scan for the commit instead of one per
-/// row. And it is worth its cost — a raw key delete of an absent key is a
-/// silent no-op, so without it a removal naming a record that is not
-/// there would pass, and the only symptom would be a row that DuckLake
-/// believes it stopped deleting still reading as deleted. Every other
-/// delete path in this translator fails loudly on a miss for the same
-/// reason.
-pub(super) async fn translate_inline_file_delete_removals(
-    db_tx: &DbTransaction,
-    table_id: u64,
-    removals: &[(u64, u64)],
-    writes: &mut Vec<commit::StagedWrite>,
-) -> Result<()> {
-    let live: HashSet<(u64, u64)> =
-        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id)
-            .await?
-            .into_iter()
-            .map(|(data_file_id, row_id, _)| (data_file_id, row_id))
-            .collect();
-
-    writes.push(inline_file_delete_table_write(table_id));
-    for &(data_file_id, row_id) in removals {
-        if !live.contains(&(data_file_id, row_id)) {
-            return Err(Error::Corruption(format!(
-                "no live inlined file-delete ({table_id}, {data_file_id}, {row_id}) to remove"
-            )));
-        }
-        writes.push((
-            Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
-                table_id,
-                data_file_id,
-                row_id,
-            }))
-            .encode(),
-            None,
-        ));
-    }
-    Ok(())
-}
-
-/// The `(table_id, data_file_id)` of every data file this commit
-/// hard-deletes from the catalog.
-///
-/// A hard delete, not an end. A merge subsumes its sources' whole
-/// visibility history into the backdated replacement before pruning their
-/// rows — current and history alike — so nothing can read those files
-/// again. A rewrite instead *ends* its source into history precisely
-/// because a reader below the rewrite must still see the rows it
-/// materialized deletes for, and the deletions making those rows dead have
-/// to remain readable alongside it.
-fn gather_pruned_data_files(ops: &[RowOperation]) -> Result<BTreeSet<(u64, u64)>> {
-    let mut pruned = BTreeSet::new();
-    for op in ops {
-        if let RowOperation::Delete {
-            table: TableKind::DataFile,
-            cells,
-        } = op
-            && let (
-                EntityKey::File {
-                    table_id,
-                    data_file_id,
-                },
-                _,
-            ) = decode_hard_delete(TableKind::DataFile, cells)?
-        {
-            pruned.insert((table_id, data_file_id));
-        }
-    }
-    Ok(pruned)
-}
-
-/// Removes the live `inline/file_delete` records targeting any data file
-/// this commit prunes. Silent on a miss, unlike the DuckLake-driven
-/// removal above: this cascade names files, not records, and a pruned file
-/// carrying no inlined deletion is the ordinary case rather than drift.
-async fn translate_pruned_file_delete_cascade(
-    db_tx: &DbTransaction,
-    pruned: &BTreeSet<(u64, u64)>,
-    writes: &mut Vec<commit::StagedWrite>,
-) -> Result<()> {
-    let tables: BTreeSet<u64> = pruned.iter().map(|(table_id, _)| *table_id).collect();
-    for table_id in tables {
-        for (data_file_id, row_id, _) in
-            store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
-        {
-            if !pruned.contains(&(table_id, data_file_id)) {
-                continue;
-            }
-            writes.push((
-                Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
-                    table_id,
-                    data_file_id,
-                    row_id,
-                }))
-                .encode(),
-                None,
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Removes every `inline/*` record for `table_id`: schema, chunks, and
 /// tombstones, read from `db_tx`'s current (pre-commit) state.
 pub(super) async fn translate_inline_drop(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     table_id: u64,
     writes: &mut Vec<commit::StagedWrite>,
 ) -> Result<()> {
-    for (op, _) in store_inline::scan_inline_chunks(ReadHandle::Tx(db_tx), table_id).await? {
+    for (op, _) in store_inline::scan_inline_chunks(handle, overlay, table_id).await? {
         writes.push((Key::Inline(InlineKey::Live(op)).encode(), None));
     }
-    for (row_id, _) in
-        store_inline::scan_inline_inline_deletes(ReadHandle::Tx(db_tx), table_id).await?
-    {
+    for (row_id, _) in store_inline::scan_inline_inline_deletes(handle, overlay, table_id).await? {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
                 table_id,
@@ -213,7 +106,7 @@ pub(super) async fn translate_inline_drop(
         ));
     }
     for (data_file_id, row_id, _) in
-        store_inline::scan_inline_file_deletes(ReadHandle::Tx(db_tx), table_id).await?
+        store_inline::scan_inline_file_deletes(handle, overlay, table_id).await?
     {
         writes.push((
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
@@ -225,9 +118,7 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
-    for (schema_version, _) in
-        store_inline::scan_inline_schemas(ReadHandle::Tx(db_tx), table_id).await?
-    {
+    for (schema_version, _) in store_inline::scan_inline_schemas(handle, overlay, table_id).await? {
         writes.push((
             Key::Inline(InlineKey::Schema {
                 table_id,
@@ -237,8 +128,8 @@ pub(super) async fn translate_inline_drop(
             None,
         ));
     }
-    // Unconditional: the drop removes everything, and deleting an absent
-    // key is a no-op at the store.
+    // The drop clears the marker too, so `ducklake_inlined_delete_<table_id>`
+    // stops existing with the table; deleting an absent key is a store no-op.
     writes.push((
         Key::Inline(InlineKey::FileDeleteTable { table_id }).encode(),
         None,
@@ -313,36 +204,6 @@ pub(crate) fn inline_inline_delete_write(
     )
 }
 
-/// The existence marker for a table's
-/// `ducklake_inlined_delete_<table_id>`, written idempotently by every
-/// path that proves the table exists — staging a deletion into it, or
-/// removing one from it.
-///
-/// Written unconditionally rather than only when absent: it is one small
-/// key, and a conditional would cost a read to save a write that is
-/// already cheaper than the read. Writing it on the *removal* path too is
-/// what heals a store written before the marker existed, whose deletions
-/// would otherwise take the table's existence with them when a flush
-/// cleared them.
-/// Deregisters one `(table_id, schema_version)`'s Arrow schema.
-pub(super) fn inline_schema_drop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
-    (
-        Key::Inline(InlineKey::Schema {
-            table_id,
-            schema_version,
-        })
-        .encode(),
-        None,
-    )
-}
-
-pub(super) fn inline_file_delete_table_write(table_id: u64) -> commit::StagedWrite {
-    (
-        Key::Inline(InlineKey::FileDeleteTable { table_id }).encode(),
-        Some(value::encode_value(&proto::InlineFileDeleteTableValue {})),
-    )
-}
-
 pub(super) fn inline_file_delete_write(
     table_id: u64,
     data_file_id: u64,
@@ -362,45 +223,69 @@ pub(super) fn inline_file_delete_write(
     )
 }
 
-/// The batch's `InlineFileDeleteRemove` ops grouped by table, so the
-/// liveness check behind them costs one prefix scan per table rather than
-/// one per row.
-fn gather_file_delete_removals(ops: &[RowOperation]) -> BTreeMap<u64, Vec<(u64, u64)>> {
-    let mut removals: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
-    for op in ops {
-        if let RowOperation::InlineFileDeleteRemove {
+/// The tombstone write that removes a live `inline/file_delete` record.
+pub(super) fn inline_file_delete_remove_write(
+    table_id: u64,
+    data_file_id: u64,
+    row_id: u64,
+) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
             table_id,
             data_file_id,
             row_id,
-        } = op
-        {
-            removals
-                .entry(*table_id)
-                .or_default()
-                .push((*data_file_id, *row_id));
-        }
+        }))
+        .encode(),
+        None,
+    )
+}
+
+/// Sets the `inline/file_delete_table` marker: what makes
+/// `ducklake_inlined_delete_<table_id>` exist for the life of the catalog.
+/// Set on the first file deletion of a table and cleared only by a drop, so an
+/// emptied table (a flush materialized its deletions into a real delete file)
+/// still reports as existing.
+pub(super) fn inline_file_delete_table_write(table_id: u64) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::FileDeleteTable { table_id }).encode(),
+        Some(value::encode_value(&proto::InlineFileDeleteTableValue {})),
+    )
+}
+
+/// Stages the marker the first time a table's file deletions are seen in a
+/// batch; later ones for the same table find it already staged.
+fn mark_file_delete_table(
+    table_id: u64,
+    seen: &mut HashSet<u64>,
+    writes: &mut Vec<commit::StagedWrite>,
+) {
+    if seen.insert(table_id) {
+        writes.push(inline_file_delete_table_write(table_id));
     }
-    removals
+}
+
+/// The tombstone write that deregisters one `inline/schema` record.
+pub(super) fn inline_schema_drop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Schema {
+            table_id,
+            schema_version,
+        })
+        .encode(),
+        None,
+    )
 }
 
 pub(super) async fn translate_inline(
-    db_tx: &DbTransaction,
+    handle: ReadHandle<'_>,
+    overlay: Option<&Overlay>,
     ops: &[RowOperation],
 ) -> Result<Vec<commit::StagedWrite>> {
     let mut writes = Vec::new();
     let mut chunk_seqs = ChunkSeqAllocator::default();
-    // One existence marker per table per commit, however many deletions
-    // this batch stages into it.
+    // The marker rides the first file deletion or removal of each table in this
+    // batch; the rest find it already staged.
     let mut file_delete_tables: HashSet<u64> = HashSet::new();
-
-    for (table_id, removals) in gather_file_delete_removals(ops) {
-        translate_inline_file_delete_removals(db_tx, table_id, &removals, &mut writes).await?;
-    }
-
-    let pruned = gather_pruned_data_files(ops)?;
-    if !pruned.is_empty() {
-        translate_pruned_file_delete_cascade(db_tx, &pruned, &mut writes).await?;
-    }
 
     for op in ops {
         match op {
@@ -447,14 +332,13 @@ pub(super) async fn translate_inline(
                 row_id,
                 begin_snapshot,
             } => {
-                // The marker rides the first deletion of each table in
-                // this batch; the rest of them find it already staged.
-                if file_delete_tables.insert(*table_id) {
-                    writes.push(inline_file_delete_table_write(*table_id));
-                }
-                let write =
-                    inline_file_delete_write(*table_id, *data_file_id, *row_id, *begin_snapshot);
-                writes.push(write);
+                mark_file_delete_table(*table_id, &mut file_delete_tables, &mut writes);
+                writes.push(inline_file_delete_write(
+                    *table_id,
+                    *data_file_id,
+                    *row_id,
+                    *begin_snapshot,
+                ));
             }
             RowOperation::InlineFlushDelete {
                 table_id,
@@ -462,7 +346,8 @@ pub(super) async fn translate_inline(
                 flush_snapshot,
             } => {
                 translate_inline_flush_delete(
-                    db_tx,
+                    handle,
+                    overlay,
                     *table_id,
                     *schema_version,
                     *flush_snapshot,
@@ -471,16 +356,25 @@ pub(super) async fn translate_inline(
                 .await?;
             }
             RowOperation::InlineDrop { table_id } => {
-                translate_inline_drop(db_tx, *table_id, &mut writes).await?;
+                translate_inline_drop(handle, overlay, *table_id, &mut writes).await?;
             }
             RowOperation::InlineSchemaDrop {
                 table_id,
                 schema_version,
             } => writes.push(inline_schema_drop_write(*table_id, *schema_version)),
-            // Removals are handled above, in one pass per table; the
-            // entity ops belong to `translate`, not here.
-            RowOperation::InlineFileDeleteRemove { .. }
-            | RowOperation::Insert { .. }
+            RowOperation::InlineFileDeleteRemove {
+                table_id,
+                data_file_id,
+                row_id,
+            } => {
+                mark_file_delete_table(*table_id, &mut file_delete_tables, &mut writes);
+                writes.push(inline_file_delete_remove_write(
+                    *table_id,
+                    *data_file_id,
+                    *row_id,
+                ));
+            }
+            RowOperation::Insert { .. }
             | RowOperation::Delete { .. }
             | RowOperation::UpdateSetEnd { .. }
             | RowOperation::UpdateSetBegin { .. } => {}
