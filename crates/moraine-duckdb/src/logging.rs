@@ -247,13 +247,12 @@ where
         // returning means no call is in flight.
         if let Some(handle) = record.handle
             && let Ok(sinks) = sinks().lock()
+            && let Some(registered) = sinks.iter().find(|registered| registered.handle == handle)
         {
-            if let Some(registered) = sinks.iter().find(|registered| registered.handle == handle) {
-                // SAFETY: the registration contract keeps `sink` callable
-                // with `ctx` from any thread while the entry is present.
-                unsafe { write_record(registered.sink, registered.ctx, &record) };
-                return;
-            }
+            // SAFETY: the registration contract keeps `sink` callable
+            // with `ctx` from any thread while the entry is present.
+            unsafe { write_record(registered.sink, registered.ctx, &record) };
+            return;
         }
 
         let Ok(mut buffer) = buffer().lock() else {

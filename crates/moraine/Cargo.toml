@@ -27,6 +27,8 @@ uuid = { workspace = true }
 [features]
 # Exposes crash-injection seams for the format-migration driver.
 fault-injection = []
+# Exposes the codec entry points the `fuzz/` targets drive.
+fuzzing = []
 
 [build-dependencies]
 prost-build = { workspace = true }

@@ -24,27 +24,6 @@ Resolving an item means updating the owning RFC and deleting the entry.
 RFC 0022 (the commit log and the leader role) is wholly unimplemented and is
 deliberately not itemized here.
 
-## 0001 — Repository structure and conventions
-
-- **DEFERRED** — A `fuzz/` directory with `cargo-fuzz` targets for the `store`
-  codecs and the commit-protocol read path (decode arbitrary bytes without
-  panicking), on a nightly cadence, once the codecs stabilize.
-- **DEFERRED** — A dedicated MSRV-check CI job. `rust-version` is declared in
-  workspace metadata with nothing checking it.
-- **DEFERRED** — The first crates.io release, which activates the dormant
-  `release-plz` workflow and its `cargo-semver-checks` gate.
-- **DEFERRED** — Decouple the shared workspace version so `moraine` and
-  `moraine-duckdb` release independently. Post-1.0.
-
-## 0002 — SlateDB key encoding for catalog state
-
-- **DEFERRED** — If server-side stats pruning is ever added, it needs
-  type-aware min/max comparison rather than lexicographic. A wrong compare
-  silently drops rows. Part of the single pushdown deferral tracked under 0009.
-- **DEFERRED** — Map future DuckLake spec catalog tables into the keyspace
-  using the established conventions (own kind, embedded child, or merged 1:1
-  side table) by updating the RFC rather than diverging.
-
 ## 0004 — Commit and transaction protocol
 
 - **DEFERRED** — Let the staged-row path join a batch. Both front doors now
@@ -81,14 +60,6 @@ deliberately not itemized here.
 - **DEFERRED** — Expose live reader snapshots at the extension layer so
   operators can size retention windows from observed reader durations.
   Policy-only for now.
-- **DEFERRED** — A moraine-native maintenance and expiry surface, if a
-  non-DuckLake consumer appears. v0.1 targets DuckLake parity.
-- **VALIDATE** — A verb-path retry whose base predates a concurrent expiry must
-  treat a missing intervening snapshot record as conflict-and-refresh, not
-  corruption.
-- **DOC** — The operator safety contract: the retention window must exceed
-  maximum read and attach duration, and the cleanup grace period must exceed
-  maximum reader and scan duration.
 
 ## 0008 — Compaction and delete-file consolidation
 
@@ -105,21 +76,6 @@ deliberately not itemized here.
   Whichever is taken first pulls the other with it. A replay's base-view
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
-
-## 0011 — Crash recovery
-
-- **DEFERRED** — A `cargo-fuzz` target that crashes at arbitrary WAL offsets
-  and reopens, asserting the same two guarantees. Every driven case is green,
-  so this is now waiting only on the fuzzing tier itself (0001).
-
-## 0012 — Schema evolution and versioning
-
-- **DEFERRED** — Define the exact `column_mapping` and `name_mapping` key
-  components in 0002's keyspace map once implementation reaches
-  external-Parquet interop. The kinds themselves are built.
-- **DOC** — Give `ducklake_schema_versions` a named home in 0002's keyspace
-  map. It is implemented as a fold into the snapshot record, but the map's
-  `snapshot` row never mentions it.
 
 ## 0013 — Partitioning, sorting, and pruning
 
@@ -138,8 +94,6 @@ deliberately not itemized here.
 - **DEFERRED** — If store objects ever need encryption independent of the
   bucket, implement it at SlateDB's `BlockTransformer` seam. Manifests and SST
   footers stay plaintext today.
-- **DOC** — Operator documentation for bucket KMS key policy, grants, and
-  rotation posture. It exists only inside this RFC.
 
 ## 0015 — On-disk format migration
 
@@ -157,9 +111,9 @@ deliberately not itemized here.
   installs, but the e2e tier loads a *released* extension binary, and
   building that one with fault injection would ship test scaffolding to
   every user. So this closes when the first real key-moving format lands,
-  not before — the near-term candidate being 0012's deferred
-  `column_mapping`/`name_mapping` key components, since pinning the key
-  shape of kinds that are already built is a key-moving change.
+  not before. No candidate is in sight: the mapping kinds that were the
+  near-term one are now pinned in 0002's map as built, which moved no key,
+  and every format to date remains additive.
 - **DEFERRED** — Allowing a trivial, bounded `system`-only migration to
   auto-run on open. The shipping behavior is explicit-verb-only for every
   migration regardless of size; auto-run is a later refinement, not the first
@@ -204,19 +158,6 @@ deliberately not itemized here.
   the reserved `ducklake_index_id` field, if DuckLake grows index metadata,
   with maintenance arriving as writer-supplied entries.
 
-## 0017 — Read-write and read-only attach paths
-
-- **DEFERRED** — Fully type the read-only `Catalog` handle so `commit` is
-  unavailable at compile time rather than returning `Error::Constraint` at
-  runtime (0003).
-
-## 0018 — Column and name mapping for external Parquet
-
-- **DEFERRED** — Physical deletion of mapping rows during snapshot expiry:
-  delete `ducklake_column_mapping` by `table_id`, then sweep orphan
-  `ducklake_name_mapping` rows. Served tables stay insert-only until then.
-  0007 work.
-
 ## 0021 — Maintenance orchestration
 
 - **DECISION** — The outcome when a process is torn down without detaching at
@@ -249,14 +190,3 @@ deliberately not itemized here.
   (4 MiB, 8) deserve to be attach options. They are moraine's choice today,
   picked to make a scan latency-insensitive rather than measured against a
   ladder, and the right values plainly differ between a local store and S3.
-- **DECISION** — Whether `Catalog` is safe to drive from a multi-threaded
-  tokio runtime under repeated open/close. A measurement that opened the
-  catalog 161 times in a loop deadlocked with every thread parked at zero
-  CPU under `#[tokio::test(flavor = "multi_thread")]` and ran in 8 s on a
-  current-thread runtime; four other multi-threaded measurements are
-  unaffected, so this is not a blanket incompatibility and the cause is
-  unknown. moraine is a library, and embedders will use multi-threaded
-  runtimes.
-- **VALIDATE** — Whether a blocked autocommit caller can still hold something
-  the trigger's second connection needs under heavier concurrency. The
-  explicit-transaction refusal is currently a guard, not a proof.

@@ -55,10 +55,10 @@ pub(crate) async fn translate_inline_flush_delete(
         .collect();
 
     for (op, _) in &scoped {
-        if let InlineOperation::Insert { begin_snapshot, .. } = op {
-            if *begin_snapshot <= flush_snapshot {
-                writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
-            }
+        if let InlineOperation::Insert { begin_snapshot, .. } = op
+            && *begin_snapshot <= flush_snapshot
+        {
+            writes.push((Key::Inline(InlineKey::Live(*op)).encode(), None));
         }
     }
 

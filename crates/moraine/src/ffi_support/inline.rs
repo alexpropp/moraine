@@ -8,7 +8,7 @@
 pub use crate::catalog::inline::InlineScanKind;
 use crate::{
     catalog::{
-        Catalog,
+        ReadOnlyCatalog,
         inline::{InlineRow, materialize_inline_rows},
     },
     error::{Error, Result},
@@ -57,7 +57,7 @@ pub struct InlineScanRecord {
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn scan_inline(
-    catalog: &Catalog,
+    catalog: &ReadOnlyCatalog,
     table_id: u64,
     kind: InlineScanKind,
     snapshot: u64,
@@ -118,7 +118,10 @@ pub async fn scan_inline(
 /// Returns an error if the underlying store scan fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+pub async fn inline_schemas(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<Vec<(u64, Vec<u8>)>> {
     let session = catalog.begin_read().await?;
     let schemas = store_inline::scan_inline_schemas(session.handle(), table_id).await;
     session.finish();
@@ -137,7 +140,7 @@ pub async fn inline_schemas(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64
 /// Returns an error if the underlying store scan fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64)>> {
+pub async fn inline_registered_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<(u64, u64)>> {
     let session = catalog.begin_read().await?;
     let schemas = store_inline::scan_all_inline_schemas(session.handle()).await;
     session.finish();
@@ -165,7 +168,10 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
 /// Returns an error if the underlying store read fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -> Result<bool> {
+pub async fn inline_file_delete_table_exists(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<bool> {
     let session = catalog.begin_read().await?;
     let marked = store_inline::read_inline_file_delete_table(session.handle(), table_id).await;
     let exists = match marked {
@@ -188,7 +194,10 @@ pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -
 /// Returns an error if the underlying store scan fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
-pub async fn inline_file_deletes(catalog: &Catalog, table_id: u64) -> Result<Vec<(u64, u64, u64)>> {
+pub async fn inline_file_deletes(
+    catalog: &ReadOnlyCatalog,
+    table_id: u64,
+) -> Result<Vec<(u64, u64, u64)>> {
     let session = catalog.begin_read().await?;
     let file_deletes = store_inline::scan_inline_file_deletes(session.handle(), table_id).await;
     session.finish();
@@ -232,8 +241,8 @@ mod tests {
         ]
     }
 
-    async fn open() -> Catalog {
-        Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+    async fn open() -> crate::catalog::Catalog {
+        crate::catalog::Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
             .await
             .unwrap()
     }

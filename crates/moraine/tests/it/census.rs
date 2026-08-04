@@ -128,11 +128,8 @@ async fn a_read_only_catalog_measures_but_does_not_merge() {
     counting.count_live_entries = true;
     reader.store_census(counting).await.unwrap();
 
-    let refused = reader
-        .compact_store(CompactStoreRequest::default())
-        .await
-        .unwrap_err();
-    assert!(matches!(refused, Error::Constraint(_)), "{refused:?}");
+    // The merge is a mutator, so it is not on `ReadOnlyCatalog` at all —
+    // the census is the whole read-only maintenance surface.
 }
 
 /// A subspace this build cannot name addresses no keys, so it cannot be a

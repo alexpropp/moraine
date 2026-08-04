@@ -331,6 +331,66 @@ fn ducklake_name_mapping_registration_carries_schema_version_forward() {
     );
 }
 
+/// Expiry is the only thing that deletes mapping rows, and this drives it
+/// end to end: register foreign Parquet so a real
+/// `ducklake_column_mapping` record and its `ducklake_name_mapping` rows
+/// exist, drop the table that owns them, then expire. The dead-table
+/// cleanup reclaims the record, and the name-mapping rows — embedded in it
+/// here rather than a table of their own — go with it.
+///
+/// Differential throughout: every probe asserts moraine agrees with stock
+/// DuckLake row for row, so an over- or under-reclaim on either side fails.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn expiry_reclaims_the_mappings_of_a_dropped_table() {
+    let twin = Twin::new("mapping-expiry");
+    let foreign = TempDir::new("mapping-expiry-foreign");
+
+    twin.apply("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    twin.apply("INSERT INTO lake.main.t SELECT i, 'v' FROM range(100) t(i);");
+
+    // A plain DuckDB `COPY` writes no DuckLake field ids, so registering it
+    // forces the name-mapping path.
+    let file = foreign.path().join("foreign.parquet");
+    run_ducklake_sql(
+        twin.store.path(),
+        twin.data.path(),
+        &format!(
+            "COPY (SELECT i::BIGINT AS a, 'f' AS b FROM range(20) t(i)) TO '{}' (FORMAT PARQUET);",
+            file.display()
+        ),
+    );
+    twin.apply(&format!(
+        "CALL ducklake_add_data_files('lake', 't', '{}');",
+        file.display()
+    ));
+    assert_ne!(
+        one(&twin.probe(
+            "SELECT count(*)::BIGINT FROM __ducklake_metadata_lake.ducklake_column_mapping;"
+        )),
+        "0",
+        "the registration is expected to write the file's mapping"
+    );
+
+    twin.apply("DROP TABLE lake.main.t;");
+    twin.apply("CALL ducklake_expire_snapshots('lake', older_than => now());");
+    twin.apply("CALL ducklake_cleanup_old_files('lake', older_than => now());");
+
+    assert_eq!(
+        one(&twin.probe(
+            "SELECT count(*)::BIGINT FROM __ducklake_metadata_lake.ducklake_column_mapping;"
+        )),
+        "0",
+        "the dropped table's mapping record must be reclaimed"
+    );
+    assert_eq!(
+        one(&twin
+            .probe("SELECT count(*)::BIGINT FROM __ducklake_metadata_lake.ducklake_name_mapping;")),
+        "0",
+        "its name-mapping rows must go with it"
+    );
+}
+
 /// The retry contract moraine composes with, pinned against the tracked
 /// DuckLake version rather than assumed from its prose.
 ///

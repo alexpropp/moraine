@@ -39,10 +39,14 @@ Non-goals:
   If a
   case here cannot be made to pass, the bug is in the referenced RFC's
   implementation, not in this one.
-- **Fuzzing / randomized fault injection.** RFC 0001 reserves `cargo-fuzz`
-  for `store` codecs and the read path as future work. This list is
-  enumerated and deterministic; a randomized harness that crashes at
-  arbitrary WAL offsets is a complementary future layer, not built here.
+- **Fuzzing / randomized fault injection.** The list below is enumerated and
+  deterministic, and stays the floor. The complementary layer is built and
+  lives in the fuzzing tier (RFC 0001) as the `crash_recovery` target: it
+  picks the write offset to freeze the store at, so a commit dies at
+  boundaries no named case enumerates, and asserts the atomicity guarantee
+  on reopen. It runs at single-digit executions per second — each one
+  builds and reopens a real store — so it is breadth over a long horizon,
+  not a gate.
 - **Real-object-storage crash behavior** (MinIO/localstack, torn multipart
   uploads). RFC 0001 lists real-object-storage tests as a later tier; these
   cases run on in-memory `object_store`, where the crash seam is the store
@@ -373,8 +377,8 @@ half — reclaiming entries in resumable batches — is
 - **Randomized/fuzz crash injection only.** Rejected as the *primary*
   mechanism: a fuzzer that crashes at random offsets gives breadth but no
   stable per-scenario identity, so a regression cannot be named, pinned, or
-  guaranteed to re-run. The named list is the floor; fuzzing is a future
-  ceiling.
+  guaranteed to re-run. The named list is the floor and the fuzz target the
+  ceiling; both exist, and the ordering between them is the point.
 - **One crash test per RFC, owned by that RFC.** Rejected: the invariants
   are cross-cutting (atomicity recurs in commit, drop, takeover, and
   genesis; resumability in backfill, reclamation, and the migration

@@ -3,7 +3,7 @@
 
 use std::{ffi::c_void, future::Future, sync::Arc, time::Duration};
 
-use moraine::{Catalog, CatalogSnapshot};
+use moraine::{Catalog, CatalogSnapshot, ReadOnlyCatalog};
 use object_store::ObjectStore;
 use tokio::runtime::{Builder, Runtime};
 
@@ -34,7 +34,7 @@ const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// `moraine` core ever blocks on itself.
 pub struct MoraineCatalogHandle {
     pub(crate) runtime: Runtime,
-    pub(crate) catalog: Catalog,
+    pub(crate) catalog: AttachedCatalog,
     /// Routes this handle's `tracing` events to its registered log sink:
     /// the runtime's worker threads carry it for life, and the `block_on`
     /// wrappers below tag the calling thread with it per call.
@@ -48,8 +48,38 @@ pub struct MoraineCatalogHandle {
     pub(crate) data_prefix: String,
 }
 
+/// Which mode the attach opened in. The core types the two apart, so a
+/// mutator is unavailable on the read-only one at compile time; this is
+/// where that meets a C ABI with one handle type and no types of its own,
+/// and a write on a read-only attach becomes a runtime refusal again —
+/// [`AttachedCatalog::writer`] is the single place that happens.
+pub(crate) enum AttachedCatalog {
+    Writer(Catalog),
+    Reader(ReadOnlyCatalog),
+}
+
+impl AttachedCatalog {
+    /// The read surface, which both modes serve.
+    pub(crate) fn reads(&self) -> &ReadOnlyCatalog {
+        match self {
+            Self::Writer(catalog) => catalog,
+            Self::Reader(catalog) => catalog,
+        }
+    }
+
+    /// The mutator surface, or the refusal a read-only attach gets.
+    pub(crate) fn writer(&self) -> Result<&Catalog, moraine::Error> {
+        match self {
+            Self::Writer(catalog) => Ok(catalog),
+            Self::Reader(_) => Err(moraine::Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
+    }
+}
+
 impl MoraineCatalogHandle {
-    pub(crate) fn new(runtime: Runtime, catalog: Catalog, log_id: HandleId) -> Self {
+    pub(crate) fn new(runtime: Runtime, catalog: AttachedCatalog, log_id: HandleId) -> Self {
         Self {
             runtime,
             catalog,

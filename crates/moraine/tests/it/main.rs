@@ -19,6 +19,7 @@ mod interrupt;
 mod macros;
 mod measure;
 mod partitioning;
+mod runtime;
 mod schema_evolution;
 mod sorting;
 mod staged_index_build;

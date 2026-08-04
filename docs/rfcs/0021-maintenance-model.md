@@ -417,6 +417,20 @@ second connection writes the catalog, so running inside a user's `BEGIN`
 invites a self-deadlock. Refused unless
 `context.transaction.IsAutoCommit()` (`transaction_context.hpp:49`).
 
+That refusal is a guard on the caller's own transaction, and it says nothing
+about what else may be open elsewhere. The autocommit case is now driven
+rather than assumed: a trigger runs to completion while another connection
+holds an uncommitted write transaction against the same lake, and while the
+calling connection's own implicit transaction is the most recent writer,
+with the pass configured to do real work — DuckLake steps issuing SQL on its
+connection, and a per-entry sweep committing throughout. What the concurrent
+writer meets is a **conflict, not a wait**: the pass expires snapshots and so
+alters the table under it, and DuckLake reports that in the retryable
+language its own writers already handle. Contending for catalog state is
+expected; deadlocking over it is what the refusal exists to prevent, and one
+connection cannot express the question — hence a sqllogictest rather than a
+CLI case.
+
 ### Orphaned index-entry reclamation
 
 **The invariant that makes this safe.** `index_id` is allocated from the
@@ -695,6 +709,37 @@ guard sees only the path moraine is told about: `META_DATA_PATH`, or a
 value already recorded for the lake. DuckLake keeps its own unprefixed
 `DATA_PATH` for the data layer and does not forward it to this metadata
 attach, so an attach naming only that leaves nothing to compare.
+
+### The close hazard on a multi-threaded runtime
+
+A store handle that is written to and then closed can wedge on close, and
+repeating that cycle in one process eventually hits it. The subject is
+SlateDB's `Db::close`, not anything moraine owns: the same loop against
+SlateDB alone — build, one `put`, close, no moraine in the chain —
+reproduces it, and `Catalog::close` is a one-line delegation to that call.
+
+Three conditions have to hold together, and dropping any one of them
+clears 300 cycles: a write between the open and the close, repeated
+cycles, and a multi-threaded runtime. The cycle at which it wedges varies
+run to run, so it is a race rather than a threshold. At the wedge every
+worker is parked at zero CPU with the close future suspended and nothing
+runnable anywhere — a lost wakeup in the shutdown path, not a lock cycle
+or a spin — and the stall sometimes swallows the runtime's timer with it,
+so a `timeout` around the close is not a reliable escape.
+
+This is not a hazard only an embedder can meet. The attach path builds a
+multi-threaded runtime deliberately (a one-worker pool would let a
+CPU-bound poll stall SlateDB's flush), so a session that repeatedly
+attaches, writes, and detaches is running the same cycle. The exposure is
+bounded by how the shipped paths use it: one attach opens once and closes
+once, and neither the scheduler nor the on-demand trigger opens or closes
+a handle — they run passes against the handle the attach already holds.
+
+Nothing here is worked around in moraine, because a wedge inside the
+store's shutdown has no seam above it to unwedge: a caller that gives up
+waiting still leaves the handle live. It is pinned by a reproducer that
+asserts the hang's *presence* against SlateDB alone, so that test failing
+is the signal the pin can be removed.
 
 ### Test obligations
 

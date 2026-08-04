@@ -61,8 +61,8 @@
 //! stores a chunk of rows in the catalog itself — Arrow IPC bytes the caller
 //! encodes, carried by the same single write the commit already performs —
 //! and the rows draw ids from the table's row-id counter exactly as a
-//! registered file's do. [`Catalog::recent_rows`] reads them back — or
-//! [`Catalog::recent_rows_at`], for the rows a past snapshot saw —
+//! registered file's do. [`ReadOnlyCatalog::recent_rows`] reads them back — or
+//! [`ReadOnlyCatalog::recent_rows_at`], for the rows a past snapshot saw —
 //! [`Transaction::inline_delete`] tombstones one, and
 //! [`Transaction::flush_inlined_data`] drains them into a data file the
 //! caller wrote, preserving their ids and backdating the file's record so
@@ -71,8 +71,12 @@
 //! # Readers
 //!
 //! [`Catalog::open_read_only`] opens the same store without becoming its
-//! writer, so it never fences one. It comes in two forms, and the
-//! difference is what the reader's credentials must be allowed to do.
+//! writer, so it never fences one. What it hands back is a
+//! [`ReadOnlyCatalog`], which carries the reads and no mutator at all — so
+//! committing through a read-only handle is a compile error rather than a
+//! runtime one, and a [`Catalog`] serves the same reads by dereferencing to
+//! it. Read-only comes in two forms, and the difference is what the
+//! reader's credentials must be allowed to do.
 //!
 //! The default follows the latest state: it sees every commit as it lands,
 //! and pays for that by writing a checkpoint into the manifest on open and
@@ -134,8 +138,8 @@
 //! the old version readable-through until a merge rewrites the SSTs
 //! holding it — which the substrate's own scheduler only does under write
 //! pressure, so a store that goes quiet keeps its dead weight
-//! indefinitely. [`Catalog::store_census`] says where the weight is, from
-//! the store's manifest alone:
+//! indefinitely. [`ReadOnlyCatalog::store_census`] says where the weight is,
+//! from the store's manifest alone:
 //!
 //! ```
 //! # use std::sync::Arc;
@@ -208,6 +212,9 @@
 //!   — and `CrashCase`, the enumeration of crash cases the suites drive. Off by
 //!   default; a build without it carries an empty function at each seam, an
 //!   empty installed registry, and no fault surface.
+//! - `fuzzing` — exposes the codec and read-path decode entry points the
+//!   `fuzz/` targets drive. They live in their own crate and so cannot reach
+//!   the crate-private codecs; nothing else needs this. Off by default.
 //!
 //! # Diagnostics
 //!
@@ -247,10 +254,10 @@ pub use catalog::{
     FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, LiveCount,
     MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport,
     MaintenanceRequest, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,
-    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, RecentRow, RowHolder, RowLocation,
-    ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo, SortId, SortKeyDef,
-    SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName, TableId,
-    TableInfo, TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
+    OptionScope, PartitionColumnDef, PartitionId, PartitionSpec, ReadOnlyCatalog, RecentRow,
+    RowHolder, RowLocation, ScheduledDeletion, SchemaId, SchemaInfo, SnapshotId, SnapshotInfo,
+    SortId, SortKeyDef, SortSpec, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge,
+    SubspaceName, TableId, TableInfo, TableStats, TagEntry, TagTarget, ViewId, ViewInfo,
 };
 pub use error::{Error, Result};
 /// Fault injection: the crash seams a test drives a migration to and stops
@@ -260,5 +267,10 @@ pub use error::{Error, Result};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use fault::{CrashCase, CrashPoint, SyntheticMigration, inject_crash, install_migration};
+/// Decode entry points for the out-of-crate fuzz targets. Unstable and not
+/// part of the semver contract.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz;
 pub use store::index_encoding::{Direction, IndexKeyValue, IntWidth, NullOrder};
 pub use transaction::{MigrationReport, Transaction};

@@ -149,7 +149,7 @@ pub unsafe extern "C" fn moraine_inline_scan(
                 probe,
                 probe_ctx,
                 moraine::ffi_support::inline::scan_inline(
-                    &handle_ref.catalog,
+                    handle_ref.catalog.reads(),
                     table_id,
                     kind,
                     snapshot,
@@ -269,7 +269,7 @@ pub unsafe extern "C" fn moraine_inline_schemas(
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
-                moraine::ffi_support::inline::inline_schemas(&handle_ref.catalog, table_id),
+                moraine::ffi_support::inline::inline_schemas(handle_ref.catalog.reads(), table_id),
             )
         }?;
         Ok(schemas
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn moraine_inline_registered_tables(
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
-                moraine::ffi_support::inline::inline_registered_tables(&handle_ref.catalog),
+                moraine::ffi_support::inline::inline_registered_tables(handle_ref.catalog.reads()),
             )
         }?;
         Ok(tables
@@ -438,7 +438,7 @@ pub unsafe extern "C" fn moraine_inline_file_delete_table_exists(
                 probe,
                 probe_ctx,
                 moraine::ffi_support::inline::inline_file_delete_table_exists(
-                    &handle_ref.catalog,
+                    handle_ref.catalog.reads(),
                     table_id,
                 ),
             )
@@ -500,7 +500,10 @@ pub unsafe extern "C" fn moraine_inline_file_deletes(
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
-                moraine::ffi_support::inline::inline_file_deletes(&handle_ref.catalog, table_id),
+                moraine::ffi_support::inline::inline_file_deletes(
+                    handle_ref.catalog.reads(),
+                    table_id,
+                ),
             )
         }?;
         Ok(file_deletes

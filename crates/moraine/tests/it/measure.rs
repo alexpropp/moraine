@@ -59,7 +59,7 @@ impl Stats {
 /// A read-only handle: it opens no writer, so it neither fences nor runs a
 /// compactor that would move the state a measurement is holding still.
 #[allow(clippy::unwrap_used)]
-async fn open_reader(store: Arc<InMemory>) -> Catalog {
+async fn open_reader(store: Arc<InMemory>) -> moraine::ReadOnlyCatalog {
     Catalog::open_read_only(store, CatalogOptions::default())
         .await
         .unwrap()

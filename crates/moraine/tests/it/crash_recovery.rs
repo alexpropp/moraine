@@ -795,7 +795,7 @@ async fn a_live_reader_refuses_once_another_writer_plants_a_marker() {
 /// plainly never going to notice. A read-only catalog polls object storage
 /// on its own cadence, so the marker becomes visible a poll after it lands.
 #[allow(clippy::unwrap_used)]
-async fn poll_until_refused(reader: &Catalog) -> Error {
+async fn poll_until_refused(reader: &moraine::ReadOnlyCatalog) -> Error {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match reader.snapshot().await {

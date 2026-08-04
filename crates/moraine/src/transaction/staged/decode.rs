@@ -587,14 +587,31 @@ pub(super) fn decode_delete_key(table: TableKind, cells: &[Cell]) -> Result<Stat
     Ok(key)
 }
 
-/// Decodes a versioned kind's hard-delete row: the entity's key columns
-/// (decoder order) followed by the row's `end_snapshot` — `NULL` names
-/// the live `current` record, a value names that `history` record.
+/// Decodes a hard-delete row: the entity's key columns (decoder order)
+/// followed by the row's `end_snapshot` — `NULL` names the live `current`
+/// record, a value names that `history` record.
+///
+/// `ducklake_column_mapping` is the one unversioned kind that comes
+/// through here. It has no `end_snapshot` column to carry, so it returns
+/// `None` and consumes only its key columns; every other kind is
+/// versioned.
 pub(super) fn decode_hard_delete(
     table: TableKind,
     cells: &[Cell],
 ) -> Result<(EntityKey, Option<u64>)> {
     let mut c = Cursor::new(table, cells);
+    if table == TableKind::ColumnMapping {
+        let mapping_id = c.u64()?;
+        let table_id = c.u64()?;
+        c.finish()?;
+        return Ok((
+            EntityKey::Mapping {
+                table_id,
+                mapping_id,
+            },
+            None,
+        ));
+    }
     let key = match table {
         TableKind::Schema => EntityKey::Schema {
             schema_id: c.u64()?,

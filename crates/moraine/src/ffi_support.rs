@@ -25,7 +25,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    catalog::{Catalog, projection::ProjectionCache},
+    catalog::{ReadOnlyCatalog, projection::ProjectionCache},
     error::Result,
     store::{
         proto::{
@@ -49,7 +49,7 @@ async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Opt
 
 /// Locks the shared projection state for reading, recovering a poisoned
 /// lock (folds never panic mid-flight, so the state is whole).
-fn projections_read(catalog: &Catalog) -> std::sync::RwLockReadGuard<'_, ProjectionCache> {
+fn projections_read(catalog: &ReadOnlyCatalog) -> std::sync::RwLockReadGuard<'_, ProjectionCache> {
     catalog
         .projections()
         .read()
@@ -57,7 +57,9 @@ fn projections_read(catalog: &Catalog) -> std::sync::RwLockReadGuard<'_, Project
 }
 
 /// As [`projections_read`], for writing (installs).
-fn projections_write(catalog: &Catalog) -> std::sync::RwLockWriteGuard<'_, ProjectionCache> {
+fn projections_write(
+    catalog: &ReadOnlyCatalog,
+) -> std::sync::RwLockWriteGuard<'_, ProjectionCache> {
     catalog
         .projections()
         .write()
@@ -90,7 +92,7 @@ pub use crate::store::proto::{
 /// pair installs it otherwise. Populating DuckLake's metadata tables
 /// issues ~two dozen `dump_*` calls, and this collapses their store cost
 /// to one scan pair per head.
-async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
+async fn all_entities(catalog: &ReadOnlyCatalog) -> Result<Arc<Vec<EntityRecord>>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
 
@@ -131,7 +133,7 @@ async fn all_entities(catalog: &Catalog) -> Result<Arc<Vec<EntityRecord>>> {
 /// set per call, and one population of DuckLake's metadata tables issues
 /// two dozen of them.
 async fn dump_entities<T>(
-    catalog: &Catalog,
+    catalog: &ReadOnlyCatalog,
     extract: impl Fn(&EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
     let records = all_entities(catalog).await?;
@@ -146,7 +148,7 @@ async fn dump_entities<T>(
 /// read-only catalog (no projections) scans `current` only, where the
 /// history scan would be pure waste.
 async fn dump_current_entities<T>(
-    catalog: &Catalog,
+    catalog: &ReadOnlyCatalog,
     extract: impl Fn(&EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
     if catalog.maintains_projections() {
@@ -161,7 +163,7 @@ async fn dump_current_entities<T>(
 
 /// Every `ducklake_schema` row, current and history.
 #[doc(hidden)]
-pub async fn dump_schemas(catalog: &Catalog) -> Result<Vec<SchemaValue>> {
+pub async fn dump_schemas(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::Schema(v) => Some(v.clone()),
         _ => None,
@@ -171,7 +173,7 @@ pub async fn dump_schemas(catalog: &Catalog) -> Result<Vec<SchemaValue>> {
 
 /// Every `ducklake_table` row, current and history.
 #[doc(hidden)]
-pub async fn dump_tables(catalog: &Catalog) -> Result<Vec<TableValue>> {
+pub async fn dump_tables(catalog: &ReadOnlyCatalog) -> Result<Vec<TableValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::Table(v) => Some(v.clone()),
         _ => None,
@@ -181,7 +183,7 @@ pub async fn dump_tables(catalog: &Catalog) -> Result<Vec<TableValue>> {
 
 /// Every `ducklake_view` row, current and history.
 #[doc(hidden)]
-pub async fn dump_views(catalog: &Catalog) -> Result<Vec<ViewValue>> {
+pub async fn dump_views(catalog: &ReadOnlyCatalog) -> Result<Vec<ViewValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::View(v) => Some(v.clone()),
         _ => None,
@@ -192,7 +194,7 @@ pub async fn dump_views(catalog: &Catalog) -> Result<Vec<ViewValue>> {
 /// Every `ducklake_macro` row, current and history, implementations and
 /// their parameters embedded in `impl_id`/`column_id` order.
 #[doc(hidden)]
-pub async fn dump_macros(catalog: &Catalog) -> Result<Vec<MacroValue>> {
+pub async fn dump_macros(catalog: &ReadOnlyCatalog) -> Result<Vec<MacroValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::Macro(m) => Some(m.clone()),
         _ => None,
@@ -205,7 +207,7 @@ pub async fn dump_macros(catalog: &Catalog) -> Result<Vec<MacroValue>> {
 /// (create-only, never mirrored), so this is always exactly the live
 /// rows.
 #[doc(hidden)]
-pub async fn dump_mappings(catalog: &Catalog) -> Result<Vec<MappingValue>> {
+pub async fn dump_mappings(catalog: &ReadOnlyCatalog) -> Result<Vec<MappingValue>> {
     dump_current_entities(catalog, |r| match r {
         EntityRecord::Mapping(m) => Some(m.clone()),
         _ => None,
@@ -215,7 +217,7 @@ pub async fn dump_mappings(catalog: &Catalog) -> Result<Vec<MappingValue>> {
 
 /// Every `ducklake_column` row, current and history.
 #[doc(hidden)]
-pub async fn dump_columns(catalog: &Catalog) -> Result<Vec<ColumnValue>> {
+pub async fn dump_columns(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::Column(v) => Some(v.clone()),
         _ => None,
@@ -225,7 +227,7 @@ pub async fn dump_columns(catalog: &Catalog) -> Result<Vec<ColumnValue>> {
 
 /// Every `ducklake_data_file` row, current and history.
 #[doc(hidden)]
-pub async fn dump_data_files(catalog: &Catalog) -> Result<Vec<DataFileValue>> {
+pub async fn dump_data_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DataFileValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::File(v) => Some(v.clone()),
         _ => None,
@@ -235,7 +237,7 @@ pub async fn dump_data_files(catalog: &Catalog) -> Result<Vec<DataFileValue>> {
 
 /// Every `ducklake_delete_file` row, current and history.
 #[doc(hidden)]
-pub async fn dump_delete_files(catalog: &Catalog) -> Result<Vec<DeleteFileValue>> {
+pub async fn dump_delete_files(catalog: &ReadOnlyCatalog) -> Result<Vec<DeleteFileValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::DeleteFile(v) => Some(v.clone()),
         _ => None,
@@ -246,7 +248,7 @@ pub async fn dump_delete_files(catalog: &Catalog) -> Result<Vec<DeleteFileValue>
 /// Every `ducklake_partition_info` row (with its embedded partition
 /// columns), current and history.
 #[doc(hidden)]
-pub async fn dump_partition_info(catalog: &Catalog) -> Result<Vec<PartitionValue>> {
+pub async fn dump_partition_info(catalog: &ReadOnlyCatalog) -> Result<Vec<PartitionValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::Partition(v) => Some(v.clone()),
         _ => None,
@@ -257,7 +259,7 @@ pub async fn dump_partition_info(catalog: &Catalog) -> Result<Vec<PartitionValue
 /// Every `ducklake_sort_info` row (with its embedded sort expressions),
 /// current and history.
 #[doc(hidden)]
-pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
+pub async fn dump_sort_info(catalog: &ReadOnlyCatalog) -> Result<Vec<SortValue>> {
     dump_entities(catalog, |r| match r {
         EntityRecord::Sort(v) => Some(v.clone()),
         _ => None,
@@ -269,7 +271,7 @@ pub async fn dump_sort_info(catalog: &Catalog) -> Result<Vec<SortValue>> {
 /// projection cache: rows come from the projection when its head matches,
 /// and a scan on a miss installs them for the next call.
 async fn dump_projected_current<T: Clone>(
-    catalog: &Catalog,
+    catalog: &ReadOnlyCatalog,
     read: impl Fn(&ProjectionCache, &HeadValue) -> Option<Vec<T>>,
     install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(EntityRecord) -> Option<T>,
@@ -305,7 +307,7 @@ async fn dump_projected_current<T: Clone>(
 /// Served from the maintained projection when its head matches; a fresh
 /// scan installs it otherwise.
 #[doc(hidden)]
-pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>> {
+pub async fn dump_table_stats(catalog: &ReadOnlyCatalog) -> Result<Vec<TableStatsValue>> {
     dump_projected_current(
         catalog,
         ProjectionCache::table_stats_at,
@@ -322,7 +324,9 @@ pub async fn dump_table_stats(catalog: &Catalog) -> Result<Vec<TableStatsValue>>
 /// [`dump_table_stats`], and served from the maintained projection the
 /// same way.
 #[doc(hidden)]
-pub async fn dump_table_column_stats(catalog: &Catalog) -> Result<Vec<TableColumnStatsValue>> {
+pub async fn dump_table_column_stats(
+    catalog: &ReadOnlyCatalog,
+) -> Result<Vec<TableColumnStatsValue>> {
     dump_projected_current(
         catalog,
         ProjectionCache::table_column_stats_at,
@@ -338,7 +342,9 @@ pub async fn dump_table_column_stats(catalog: &Catalog) -> Result<Vec<TableColum
 /// Every `ducklake_file_column_stats` row. Unversioned, as
 /// [`dump_table_stats`].
 #[doc(hidden)]
-pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnStatsValue>> {
+pub async fn dump_file_column_stats(
+    catalog: &ReadOnlyCatalog,
+) -> Result<Vec<FileColumnStatsValue>> {
     dump_current_entities(catalog, |r| match r {
         EntityRecord::FileColumnStats(v) => Some(v.clone()),
         _ => None,
@@ -352,7 +358,7 @@ pub async fn dump_file_column_stats(catalog: &Catalog) -> Result<Vec<FileColumnS
 /// from the maintained projection when its head matches; a fresh scan
 /// installs it otherwise.
 #[doc(hidden)]
-pub async fn dump_snapshots(catalog: &Catalog) -> Result<Vec<SnapshotValue>> {
+pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
     let session = catalog.begin_read().await?;
     let head = session_head(&session).await?;
     if let Some(head) = head {
@@ -403,7 +409,7 @@ pub struct SchemaVersionRow {
 /// also what stock DuckLake resolves for a file that old once the
 /// columns of its era have themselves expired.
 #[doc(hidden)]
-pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersionRow>> {
+pub async fn dump_schema_versions(catalog: &ReadOnlyCatalog) -> Result<Vec<SchemaVersionRow>> {
     let session = catalog.begin_read().await?;
     let records = scan_schema_versions(session.handle()).await;
     session.finish();
@@ -502,7 +508,7 @@ fn schema_version_floors(
 /// with no temporal lifecycle: always exactly the rows awaiting physical
 /// deletion.
 #[doc(hidden)]
-pub async fn dump_scheduled_deletions(catalog: &Catalog) -> Result<Vec<GcFileValue>> {
+pub async fn dump_scheduled_deletions(catalog: &ReadOnlyCatalog) -> Result<Vec<GcFileValue>> {
     dump_current_entities(catalog, |r| match r {
         EntityRecord::GcFile(v) => Some(v.clone()),
         _ => None,
@@ -530,7 +536,7 @@ pub struct TagRow {
 /// included — each row carries its lifecycle verbatim and DuckLake
 /// filters in SQL.
 #[doc(hidden)]
-pub async fn dump_tags(catalog: &Catalog) -> Result<Vec<TagRow>> {
+pub async fn dump_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<TagRow>> {
     Ok(tag_rows_from(
         dump_current_entities(catalog, |r| match r {
             EntityRecord::Tag(v) => Some(v.clone()),
@@ -580,7 +586,7 @@ pub struct OptionRow {
 /// they live outside the snapshot protocol, last write wins — so this is
 /// simply what is set now.
 #[doc(hidden)]
-pub async fn dump_options(catalog: &Catalog) -> Result<Vec<OptionRow>> {
+pub async fn dump_options(catalog: &ReadOnlyCatalog) -> Result<Vec<OptionRow>> {
     Ok(option_rows_from(
         dump_current_entities(catalog, |r| match r {
             EntityRecord::Option {
@@ -686,7 +692,7 @@ pub fn column_tag_rows_from(columns: &[ColumnValue]) -> Vec<ColumnTagRow> {
 /// so rows are emitted from that record only — emitting from every
 /// version would duplicate them.
 #[doc(hidden)]
-pub async fn dump_column_tags(catalog: &Catalog) -> Result<Vec<ColumnTagRow>> {
+pub async fn dump_column_tags(catalog: &ReadOnlyCatalog) -> Result<Vec<ColumnTagRow>> {
     Ok(column_tag_rows_from(&dump_columns(catalog).await?))
 }
 
@@ -732,7 +738,7 @@ pub fn macro_impl_rows_from(parents: Vec<MacroValue>) -> Vec<MacroImplRow> {
 
 /// Every `ducklake_macro_impl` row, current and history.
 #[doc(hidden)]
-pub async fn dump_macro_impl_rows(catalog: &Catalog) -> Result<Vec<MacroImplRow>> {
+pub async fn dump_macro_impl_rows(catalog: &ReadOnlyCatalog) -> Result<Vec<MacroImplRow>> {
     Ok(macro_impl_rows_from(dump_macros(catalog).await?))
 }
 
@@ -785,7 +791,9 @@ pub fn macro_parameter_rows_from(parents: Vec<MacroValue>) -> Vec<MacroParameter
 
 /// Every `ducklake_macro_parameters` row, current and history.
 #[doc(hidden)]
-pub async fn dump_macro_parameter_rows(catalog: &Catalog) -> Result<Vec<MacroParameterRow>> {
+pub async fn dump_macro_parameter_rows(
+    catalog: &ReadOnlyCatalog,
+) -> Result<Vec<MacroParameterRow>> {
     Ok(macro_parameter_rows_from(dump_macros(catalog).await?))
 }
 
@@ -834,7 +842,7 @@ pub fn name_mapping_rows_from(parents: Vec<MappingValue>) -> Vec<NameMappingRow>
 
 /// Every `ducklake_name_mapping` row (mappings are unversioned).
 #[doc(hidden)]
-pub async fn dump_name_mapping_rows(catalog: &Catalog) -> Result<Vec<NameMappingRow>> {
+pub async fn dump_name_mapping_rows(catalog: &ReadOnlyCatalog) -> Result<Vec<NameMappingRow>> {
     Ok(name_mapping_rows_from(dump_mappings(catalog).await?))
 }
 
@@ -879,7 +887,9 @@ pub fn partition_column_rows_from(parents: Vec<PartitionValue>) -> Vec<Partition
 
 /// Every `ducklake_partition_column` row, current and history.
 #[doc(hidden)]
-pub async fn dump_partition_column_rows(catalog: &Catalog) -> Result<Vec<PartitionColumnRow>> {
+pub async fn dump_partition_column_rows(
+    catalog: &ReadOnlyCatalog,
+) -> Result<Vec<PartitionColumnRow>> {
     Ok(partition_column_rows_from(
         dump_partition_info(catalog).await?,
     ))
@@ -925,7 +935,7 @@ pub fn file_partition_value_rows_from(parents: Vec<DataFileValue>) -> Vec<FilePa
 /// Every `ducklake_file_partition_value` row, current and history.
 #[doc(hidden)]
 pub async fn dump_file_partition_value_rows(
-    catalog: &Catalog,
+    catalog: &ReadOnlyCatalog,
 ) -> Result<Vec<FilePartitionValueRow>> {
     Ok(file_partition_value_rows_from(
         dump_data_files(catalog).await?,
@@ -979,7 +989,9 @@ pub fn sort_expression_rows_from(parents: Vec<SortValue>) -> Vec<SortExpressionR
 
 /// Every `ducklake_sort_expression` row, current and history.
 #[doc(hidden)]
-pub async fn dump_sort_expression_rows(catalog: &Catalog) -> Result<Vec<SortExpressionRow>> {
+pub async fn dump_sort_expression_rows(
+    catalog: &ReadOnlyCatalog,
+) -> Result<Vec<SortExpressionRow>> {
     Ok(sort_expression_rows_from(dump_sort_info(catalog).await?))
 }
 
