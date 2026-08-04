@@ -184,10 +184,10 @@ this crate; there is no `build.rs`.
 
 Two git submodules pin the build:
 
-- `duckdb/` — DuckDB source at tag **v1.5.4**: the shim compiles against its
+- `duckdb/` — DuckDB source at tag **v1.5.5**: the shim compiles against its
   full `src/include/` tree and links its static library.
 - `extension-ci-tools/` — the toolchain (Make + CMake helpers) at the
-  matching **v1.5.4**.
+  matching **v1.5.5**.
 
 The moraine Rust static library is bridged into CMake with
 [corrosion](https://github.com/corrosion-rs/corrosion) (see the repo-root
@@ -212,8 +212,8 @@ submodules, both workflow files, and the table below.
 
 | What | Pinned at |
 |---|---|
-| DuckDB | **v1.5.4** (git hash `08e34c447b`, codename Variegata) |
-| Toolchain | `duckdb/extension-ci-tools` tag **v1.5.4** |
+| DuckDB | **v1.5.5** (git hash `d8cdaa33fd`, codename Variegata) |
+| Toolchain | `duckdb/extension-ci-tools` branch **v1.5.5** |
 | C++ standard | C++17 |
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
 | DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
@@ -268,7 +268,7 @@ duckdb -unsigned -c "LOAD './build/release/extension/moraine/moraine.duckdb_exte
 ```
 
 Release assets are named `moraine.<duckdb-version>.<platform>.duckdb_extension`
-(`moraine.v1.5.4.linux_amd64.duckdb_extension`). Pick the one matching your
+(`moraine.v1.5.5.linux_amd64.duckdb_extension`). Pick the one matching your
 DuckDB *exactly*: a mismatch is rejected even when unsigned, because a
 C++-ABI extension is bound to the version string in its footer. The
 loadable's base filename (`moraine`) is load-bearing too — DuckDB derives
@@ -276,15 +276,15 @@ the entry symbol (`moraine_duckdb_cpp_init`, defined in
 `cpp/moraine_extension.cpp`) from the filename before the first `.` — so
 rename an asset to `moraine.duckdb_extension` before loading it.
 
-## Obtaining a DuckDB v1.5.4 CLI for testing
+## Obtaining a DuckDB v1.5.5 CLI for testing
 
 Downloaded directly from the GitHub release, no build required:
 
 ```
-https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-osx-arm64.zip   # this machine
-https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-osx-universal.zip
-https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip
-https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-arm64.zip
+https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-osx-arm64.zip   # this machine
+https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-osx-universal.zip
+https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-amd64.zip
+https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-arm64.zip
 # (+ windows-amd64/arm64, and -musl variants for linux)
 ```
 
@@ -294,7 +294,7 @@ against comes from the `duckdb` submodule, not this download.
 
 ## Obtaining the DuckLake extension
 
-`INSTALL ducklake` against the pinned `v1.5.4` CLI deterministically
+`INSTALL ducklake` against the pinned `v1.5.5` CLI deterministically
 resolves and installs DuckLake — no version pin of our own is needed beyond
 the DuckDB version:
 
@@ -306,15 +306,15 @@ $ target/duckdb-cli/cli/duckdb \
 ┌────────────────┬────────────────────┬──────────────┬────────────────┐
 │ extension_name │ extension_version  │ install_mode │ installed_from │
 ├────────────────┼────────────────────┼──────────────┼────────────────┤
-│ ducklake       │ d318a545           │ REPOSITORY   │ core           │
+│ ducklake       │ d8a1881e           │ REPOSITORY   │ core           │
 └────────────────┴────────────────────┴──────────────┴────────────────┘
 ```
 
 `extension_version` is DuckLake's own short git commit hash, resolved from
-DuckDB v1.5.4's own build-time pin
+DuckDB v1.5.5's own build-time pin
 (`.github/config/extensions/ducklake.cmake` in the `duckdb/duckdb` source
 tree names `GIT_URL https://github.com/duckdb/ducklake` at
-`GIT_TAG d318a545571d7d46eb751fa2aa5f6f4389285d3c`) — `INSTALL ducklake`
+`GIT_TAG d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4`) — `INSTALL ducklake`
 against this exact CLI build always resolves to this exact commit,
 deterministically, from DuckDB's `core` extension repository
 (`installed_from: core`, not the community repository).
@@ -331,7 +331,7 @@ $ duckdb -c "SET extension_directory='target/duckdb-extensions';" \
 ┌──────────────────────────────────────────────────────────────────┐
 │                            install_path                          │
 ├──────────────────────────────────────────────────────────────────┤
-│ target/duckdb-extensions/v1.5.4/osx_arm64/ducklake.duckdb_extension │
+│ target/duckdb-extensions/v1.5.5/osx_arm64/ducklake.duckdb_extension │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -345,7 +345,7 @@ DuckLake drives moraine as its own metadata catalog by nesting an
 `ATTACH 'moraine:<path>' ...` inside `ATTACH 'ducklake:moraine:<path>' AS
 lake (DATA_PATH ...)`. The facts that attach chain depends on are pinned
 against the DuckLake source at commit
-`d318a545571d7d46eb751fa2aa5f6f4389285d3c`.
+`d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4`.
 
 ### The `moraine:` prefix
 
