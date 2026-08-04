@@ -965,6 +965,12 @@ extern "C" {
 // `cache_dir` there is no object cache to bound. The store's in-memory
 // caches are separate and take no configuration here.
 //
+// `cache_preload` loads objects into that cache as the attach opens, so
+// the first query pays no first touch: `0` loads nothing, `1` the newest
+// objects, `2` every object the manifest references. The load is bounded
+// by `cache_size_bytes` and skips what it cannot fetch, but the attach
+// waits for it. Any other value is [`codes::INVALID_ARGUMENT`].
+//
 // `cache_puts` fills that cache from the write path as well as the read
 // path, so a flushed or compacted object is local without a later fetch.
 // Compaction output is cached too, so a merge can evict what reads had
@@ -1013,8 +1019,8 @@ extern "C" {
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-// `cache_size_bytes`, `cache_puts`, and `host_threads` are
-// unconstrained.
+// `cache_size_bytes`, `cache_preload`, `cache_puts`, and `host_threads`
+// are unconstrained.
 // `probe`, if non-null, must be safe to call with `probe_ctx` from any
 // thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -1026,6 +1032,7 @@ int32_t moraine_attach(const char *path,
                        uint64_t flush_interval_ms,
                        const char *cache_dir,
                        uint64_t cache_size_bytes,
+                       uint8_t cache_preload,
                        bool cache_puts,
                        const char *data_path,
                        const char *checkpoint,
@@ -1078,8 +1085,8 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
 // point to a valid [`MoraineS3Config`] whose non-null fields are valid
 // NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
-// NUL-terminated C string. `cache_size_bytes` and `cache_puts` are
-// unconstrained. `out`
+// NUL-terminated C string. `cache_size_bytes`, `cache_preload`, and
+// `cache_puts` are unconstrained. `out`
 // must be a valid, writable [`MoraineMigrationReport`]. `err`, if non-null,
 // must be a valid, writable [`MoraineError`]. All for the duration of this
 // call.
@@ -1088,6 +1095,7 @@ int32_t moraine_migrate(const char *path,
                         uint64_t flush_interval_ms,
                         const char *cache_dir,
                         uint64_t cache_size_bytes,
+                        uint8_t cache_preload,
                         bool cache_puts,
                         bool checkpoint,
                         struct MoraineMigrationReport *out,

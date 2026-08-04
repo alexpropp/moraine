@@ -58,6 +58,7 @@ pub(crate) fn attach_ok(dir: &Path) -> *mut MoraineCatalogHandle {
             0,
             ptr::null(),
             0,
+            0,
             false,
             ptr::null(),
             ptr::null(),

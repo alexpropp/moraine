@@ -279,6 +279,27 @@ letting reads decide what stays. The option threads through the shim
 (`moraine_attach`'s `cache_puts`) into `CatalogOptions::cache_puts` and
 `StoreBuilder`, and is inert without a `CACHE_DIR`.
 
+**`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
+the above leave a fresh process cold: the cache fills as queries ask for
+objects, so the first query of an attach pays every first touch itself.
+`CACHE_PRELOAD` loads the store into the cache while the attach opens —
+`'l0'` for the objects no merge has folded down yet, `'all'` for every object
+the manifest references, `'none'` (the default) for today's behaviour. It
+crosses the ABI as a level code (`0`, `1`, `2`) on `moraine_attach` and
+`moraine_migrate`, and any other code is refused rather than treated as
+"none", so a misspelled level surfaces as an error instead of an attach that
+merely feels slow.
+
+The cost lands entirely on the attach. The load runs inside the open — the
+handle is returned only once it finishes — fetching each object whole with
+bounded parallelism, and it stops at the first object that would exceed
+`CACHE_SIZE`, so the cap governs the preload as well as the cache. Fetches
+that fail are skipped rather than fatal: a preload is an optimization, and no
+attach should die because one object could not be warmed. `'all'` therefore
+suits a store small enough to sit on local disk with room to spare, where the
+trade is a slower ATTACH for a first query that touches object storage not at
+all; `'l0'` suits everything else.
+
 ### Interception level: catalog-entry, row-faithful (B1)
 
 moraine intercepts at DuckDB's **Catalog / table-scan / DML layer** — the

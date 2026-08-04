@@ -265,6 +265,14 @@ pub struct CatalogOptions {
     /// `cache_dir` there is no object cache to bound. The in-memory caches
     /// are a separate mechanism and are unaffected.
     pub cache_size: Option<u64>,
+    /// What to load into the on-disk object cache while the catalog opens,
+    /// so the first query pays no first touch. The load is bounded by
+    /// [`cache_size`](Self::cache_size) and best-effort — a fetch that
+    /// fails is skipped, never fatal — but it is part of the open, so an
+    /// open that preloads returns only once it has. `None` (the default)
+    /// loads nothing, leaving the cache to fill as reads ask for objects.
+    /// Inert without a [`cache_dir`](Self::cache_dir).
+    pub cache_preload: Option<CachePreload>,
     /// Whether objects this catalog writes are cached as they are written,
     /// rather than only when something reads them back. A flushed or
     /// compacted store object then costs one local write and no later
@@ -311,12 +319,31 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
             cache_size: None,
+            cache_preload: None,
             cache_puts: false,
             data_path: None,
             reader_poll_interval: Duration::from_secs(10),
             checkpoint: None,
         }
     }
+}
+
+/// How much of a store to load into the on-disk object cache as it opens.
+///
+/// The choice is between paying for freshness and paying for everything:
+/// the newest objects are what a writer's own next reads want, while a
+/// whole store is what a query session wants and is only affordable when
+/// the store is small enough to sit on the local disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePreload {
+    /// The newest objects only — those a compaction has not yet merged
+    /// down. Bounded by how far the store has run since its last merge,
+    /// so an open stays quick.
+    L0,
+    /// Every object the store's manifest references, in full. The open
+    /// waits for a copy of the whole store, so this suits a store that
+    /// fits the cache with room to spare.
+    All,
 }
 
 /// Parses a configured checkpoint id, naming the option in the error.
@@ -402,6 +429,7 @@ impl Catalog {
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts);
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
             .await?;
@@ -479,6 +507,7 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
@@ -554,6 +583,7 @@ impl Catalog {
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .open_writer()
             .await?;

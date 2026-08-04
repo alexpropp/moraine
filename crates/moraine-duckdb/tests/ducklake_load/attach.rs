@@ -264,11 +264,12 @@ fn ducklake_attach_flush_interval_option_is_applied() {
 }
 
 /// The cache options end to end: `ATTACH (META_CACHE_DIR '…',
-/// META_CACHE_SIZE 67108864, META_CACHE_PUTS true)` → DuckLake's `META_`
-/// passthrough → this shim's inner attach → the store's on-disk object
-/// cache, its cap, and its write-path filling. A cap shows only as disk
-/// that stays bounded, so the assertion is that the three are accepted,
-/// commits land through the capped cache, and the cache directory fills.
+/// META_CACHE_SIZE 67108864, META_CACHE_PUTS true, META_CACHE_PRELOAD
+/// 'all')` → DuckLake's `META_` passthrough → this shim's inner attach →
+/// the store's on-disk object cache, its cap, its write-path filling, and
+/// its open-time load. A cap shows only as disk that stays bounded, so the
+/// assertion is that the four are accepted, commits land through the capped
+/// cache, and the cache directory fills.
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn ducklake_attach_cache_options_are_applied() {
@@ -277,7 +278,8 @@ fn ducklake_attach_cache_options_are_applied() {
     let cache_dir = TempDir::new("cache-size-cache");
 
     let attach_options = format!(
-        ", META_CACHE_DIR '{}', META_CACHE_SIZE 67108864, META_CACHE_PUTS true",
+        ", META_CACHE_DIR '{}', META_CACHE_SIZE 67108864, META_CACHE_PUTS true, \
+         META_CACHE_PRELOAD 'all'",
         cache_dir.path().display()
     );
     run_ducklake_sql_with_options(

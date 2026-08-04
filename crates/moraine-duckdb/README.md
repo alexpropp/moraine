@@ -151,6 +151,22 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 Opt-in, because compaction output is cached the same way and a large merge can
 evict what reads had warmed.
 
+**`CACHE_PRELOAD` — warm the cache during ATTACH, not during the first query.**
+Both of the above still leave a fresh process cold. `META_CACHE_PRELOAD 'all'`
+loads every object the manifest references before the attach returns, `'l0'`
+only the objects no merge has folded down yet, `'none'` (the default) nothing:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (DATA_PATH 's3://bucket/prefix-data/', READ_WRITE,
+   META_CACHE_DIR '/var/cache/moraine', META_CACHE_PRELOAD 'all');
+```
+
+The wait is the attach's: the load runs inside the open, bounded by
+`META_CACHE_SIZE`, skipping anything it cannot fetch. `'all'` pays a slower
+ATTACH for a first query that touches S3 not at all, and is worth it when the
+whole store fits the cache — check with `moraine_store_census`.
+
 ## How it is built
 
 moraine-duckdb builds through DuckDB's own extension toolchain

@@ -13,12 +13,14 @@ use slatedb::{
     Db, DbReader,
     admin::AdminBuilder,
     config::{
-        CheckpointOptions, CheckpointScope, DbReaderOptions, ObjectStoreCacheOptions, Settings,
+        CheckpointOptions, CheckpointScope, DbReaderOptions, ObjectStoreCacheOptions, PreloadLevel,
+        Settings,
     },
 };
 use uuid::Uuid;
 
 use crate::{
+    catalog::CachePreload,
     error::{Error, Result},
     store::segment::TagSegmentExtractor,
 };
@@ -61,6 +63,7 @@ pub(crate) struct StoreBuilder<'a> {
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
     cache_size: Option<u64>,
+    cache_preload: Option<CachePreload>,
     cache_puts: bool,
     checkpoint: Option<Uuid>,
 }
@@ -76,6 +79,7 @@ impl<'a> StoreBuilder<'a> {
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
             cache_size: None,
+            cache_preload: None,
             cache_puts: false,
             checkpoint: None,
         }
@@ -118,6 +122,16 @@ impl<'a> StoreBuilder<'a> {
     /// are untouched by this.
     pub(crate) fn cache_size(mut self, cache_size: Option<u64>) -> Self {
         self.cache_size = cache_size;
+        self
+    }
+
+    /// Sets what to load into the on-disk object cache while the store
+    /// opens. The load is bounded by [`cache_size`](Self::cache_size) and
+    /// skips what it cannot fetch, but it runs as part of the open, so an
+    /// open that preloads returns only once it has. `None` (the default)
+    /// loads nothing. Inert without a [`cache_dir`](Self::cache_dir).
+    pub(crate) fn cache_preload(mut self, cache_preload: Option<CachePreload>) -> Self {
+        self.cache_preload = cache_preload;
         self
     }
 
@@ -225,6 +239,10 @@ impl<'a> StoreBuilder<'a> {
                 None => defaults.max_cache_size_bytes,
             },
             cache_puts: self.cache_puts,
+            preload_disk_cache_on_startup: self.cache_preload.map(|preload| match preload {
+                CachePreload::L0 => PreloadLevel::L0Sst,
+                CachePreload::All => PreloadLevel::AllSst,
+            }),
             ..defaults
         }
     }
@@ -409,6 +427,75 @@ mod tests {
             capped.cache_options().max_cache_size_bytes,
             Some(usize::MAX)
         );
+    }
+
+    /// Preloading is off unless asked for, and each level reaches the
+    /// writer and the reader alike when it is.
+    #[test]
+    fn cache_preload_is_off_until_requested() {
+        let object_store = memory_store();
+        let unset = StoreBuilder::new("s", Arc::clone(&object_store));
+        assert_eq!(unset.cache_options().preload_disk_cache_on_startup, None);
+
+        let l0 =
+            StoreBuilder::new("s", Arc::clone(&object_store)).cache_preload(Some(CachePreload::L0));
+        assert_eq!(
+            l0.cache_options().preload_disk_cache_on_startup,
+            Some(PreloadLevel::L0Sst)
+        );
+
+        let all = StoreBuilder::new("s", object_store).cache_preload(Some(CachePreload::All));
+        assert_eq!(
+            all.settings()
+                .object_store_cache_options
+                .preload_disk_cache_on_startup,
+            Some(PreloadLevel::AllSst)
+        );
+    }
+
+    /// A reader asked to preload fills its cache directory as it opens —
+    /// before anything has read a key through it.
+    #[tokio::test]
+    async fn cache_preload_fills_the_cache_as_the_store_opens() {
+        let object_store = memory_store();
+        let root = std::env::temp_dir().join(format!("moraine-preload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let db = StoreBuilder::new("s", Arc::clone(&object_store))
+            .flush_interval(Duration::from_millis(1))
+            .open_writer()
+            .await
+            .unwrap();
+        for index in 0..64u64 {
+            let key = Key::Snapshot { snapshot_id: index }.encode();
+            db.put(&key, &vec![b'v'; 16 * 1024]).await.unwrap();
+        }
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+
+        // Two cold readers over the same store, differing only in whether
+        // they preload. Neither is read from, so only the preloading one
+        // has any reason to have fetched anything.
+        let mut cached = Vec::new();
+        for (tag, preload) in [("off", None), ("on", Some(CachePreload::All))] {
+            let cache = root.join(tag);
+            let reader = StoreBuilder::new("s", Arc::clone(&object_store))
+                .cache_dir(Some(cache.clone()))
+                .cache_preload(preload)
+                .open_reader()
+                .await
+                .unwrap();
+            reader.close().await.unwrap();
+            cached.push(cached_bytes(&cache));
+        }
+
+        assert!(
+            cached[1] > cached[0],
+            "preloading cached {} bytes against {} without it: the open is not filling the cache",
+            cached[1],
+            cached[0]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Caching writes is off unless asked for, and reaches the writer and

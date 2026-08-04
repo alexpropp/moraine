@@ -118,6 +118,19 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 It is off by default because compaction output is cached the same way, and a
 large merge can evict what queries had warmed.
 
+A fresh process still starts cold, though, and the first query pays every
+first touch. `META_CACHE_PRELOAD` moves that cost into the ATTACH — `'all'`
+loads every object the store references before the attach returns, `'l0'` only
+the newest, `'none'` (the default) nothing:
+
+```sql
+ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
+  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_PRELOAD 'all');
+```
+
+`'all'` is worth it when the whole store fits the cache — `moraine_store_census`
+tells you how big it is.
+
 All of this is the disk tier only. SlateDB also keeps an in-memory block cache
 and metadata cache per attached store; moraine leaves both at SlateDB's own
 sizes and neither is settable on the attach.
