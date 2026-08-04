@@ -1,0 +1,33 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+# Every workspace gets the repo's git hooks. They shell out to cargo, and
+# hooks run in non-interactive shells that never source a profile, so the
+# toolchain has to be installed and on the default PATH before they fire.
+[scripts]
+setup = '''
+set -e
+
+# Cloud workspaces start bare; a developer machine already has a toolchain,
+# so this whole block is skipped there. The pinned channel installs itself
+# on first use from rust-toolchain.toml, but the gate's `cargo +nightly fmt`
+# needs a nightly rustfmt alongside it, and linking needs a C compiler.
+if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+  "$HOME/.cargo/bin/rustup" toolchain install nightly --profile minimal --component rustfmt
+  command -v cc >/dev/null 2>&1 || sudo dnf install -y gcc
+fi
+
+# `~/.cargo/bin` is reached through a shell profile, which a hook never
+# reads. Symlink into a directory the default PATH already covers.
+if ! command -v cargo >/dev/null 2>&1 && [ -d "$HOME/.cargo/bin" ]; then
+  for tool in "$HOME"/.cargo/bin/*; do
+    sudo ln -sf "$tool" "/usr/local/bin/$(basename "$tool")"
+  done
+fi
+
+# Materialize the pinned toolchain now rather than during someone's first
+# commit, when it would look like the hook hanging.
+cargo --version >/dev/null
+
+git config core.hooksPath .githooks
+'''

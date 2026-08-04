@@ -325,11 +325,37 @@ pub unsafe extern "C" fn moraine_tx_dump_snapshots(
 /// either way; it must not be passed to [`moraine_tx_rollback`]
 /// afterward.
 ///
+/// Cancellable: races the commit against `probe` (polled immediately, then
+/// ~100 ms; a null `probe` disables polling). Where the cancellation lands
+/// decides what it means, and one of the three outcomes is ambiguous:
+///
+/// - **Before the durable write is issued** — translation, index maintenance,
+///   and staging are in-memory only, so cancelling discards them.
+///   [`codes::INTERRUPTED`], catalog unchanged, head where it was.
+/// - **While the durable write is in flight** — the write is spawned past the
+///   point of no return and is never dropped mid-batch, so it runs to
+///   completion in the background while this call returns
+///   [`codes::INTERRUPTED`] promptly. **The commit may still land.** The
+///   outcome is therefore ambiguous in exactly the way an unacknowledged
+///   durable write is: the batch is atomic, so head ends at either the old id
+///   or the new one and never in between, but this return does not say which. A
+///   caller that needs to know re-resolves head and reads it — it must not
+///   treat [`codes::INTERRUPTED`] as "nothing landed", and must not re-drive
+///   the rows blind.
+/// - **After the write completed** — there is nothing left to cancel, so the
+///   committed snapshot id is reported normally.
+///
+/// The interrupt is honored rather than ridden out because the wait it
+/// escapes is unbounded: a durable write against an unreachable endpoint
+/// is retried beneath moraine indefinitely, and a session with no way out
+/// of it is the worse failure.
+///
 /// # Safety
 ///
 /// `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 /// and not yet committed or rolled back. `out_snapshot_id` must be a
-/// valid, writable `*mut u64`. `err`, if non-null, must be a valid,
+/// valid, writable `*mut u64`. `probe`, if non-null, must be safe to call
+/// with `probe_ctx` from any thread. `err`, if non-null, must be a valid,
 /// writable [`MoraineError`]. All for the duration of this call. The
 /// catalog handle `tx` was opened on ([`moraine_tx_begin`]'s contract)
 /// must still be attached.
@@ -337,6 +363,8 @@ pub unsafe extern "C" fn moraine_tx_dump_snapshots(
 pub unsafe extern "C" fn moraine_tx_commit(
     tx: *mut MoraineTxHandle,
     out_snapshot_id: *mut u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     err: *mut MoraineError,
 ) -> i32 {
     let attempt = || -> Result<u64, AbiError> {
@@ -354,10 +382,9 @@ pub unsafe extern "C" fn moraine_tx_commit(
         }
         // SAFETY: `catalog` outlives `tx` per `moraine_tx_begin`'s contract.
         let catalog_ref = unsafe { &*catalog };
-        let id = catalog_ref
-            .runtime
-            .block_on(tx.commit())
-            .map_err(AbiError::from)?;
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let id = unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit()) }?;
 
         Ok(id.get())
     };
@@ -548,6 +575,50 @@ pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete(
             data_file_id,
             row_id,
             begin_snapshot,
+        });
+
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// Stages the removal of one live `inline/file_delete` record — the
+/// row-grain counterpart of [`moraine_tx_stage_inline_file_delete`],
+/// which a `DELETE` against `ducklake_inlined_delete_<table_id>`
+/// translates to.
+///
+/// DuckLake issues that `DELETE` at the end of
+/// `ducklake_flush_inlined_data`, once it has materialized the table's
+/// inlined deletions into a real delete file: leaving the inlined form
+/// behind would count those rows deleted twice. Naming a record the table
+/// does not carry is [`codes::CORRUPTION`], not a no-op.
+///
+/// # Safety
+///
+/// Same contract as [`moraine_tx_stage_inline_inline_delete`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_tx_stage_inline_file_delete_remove(
+    tx: *mut MoraineTxHandle,
+    table_id: u64,
+    data_file_id: u64,
+    row_id: u64,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        if tx.is_null() {
+            return Err(AbiError::invalid_argument("`tx` is null"));
+        }
+        // SAFETY: caller contract for `tx`.
+        let tx_ref = unsafe { &mut *tx };
+        tx_ref.tx.stage(RowOperation::InlineFileDeleteRemove {
+            table_id,
+            data_file_id,
+            row_id,
         });
 
         Ok(())
@@ -788,7 +859,15 @@ mod tests {
         let mut snapshot_id: u64 = 0;
         let mut err = MoraineError::default();
         // SAFETY: `tx` is live; outputs are valid local slots.
-        let code = unsafe { moraine_tx_commit(tx, &raw mut snapshot_id, &raw mut err) };
+        let code = unsafe {
+            moraine_tx_commit(
+                tx,
+                &raw mut snapshot_id,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         // SAFETY: `err.message` is null or was just written by `moraine_tx_commit`.
         assert_eq!(code, codes::OK, "commit failed: {:?}", unsafe {
             err.message.as_ref()
@@ -879,7 +958,8 @@ mod tests {
         let mut id: u64 = 0;
         let mut err = MoraineError::default();
         // SAFETY: `setup` is live; outputs are valid local slots.
-        let code = unsafe { moraine_tx_commit(setup, &raw mut id, &raw mut err) };
+        let code =
+            unsafe { moraine_tx_commit(setup, &raw mut id, None, ptr::null_mut(), &raw mut err) };
         assert_eq!(code, codes::OK);
 
         // Snapshot 2: end `t`'s live version (rename shape: end + new
@@ -894,7 +974,8 @@ mod tests {
         let mut id2: u64 = 0;
         let mut err2 = MoraineError::default();
         // SAFETY: `tx` is live; outputs are valid local slots.
-        let code = unsafe { moraine_tx_commit(tx, &raw mut id2, &raw mut err2) };
+        let code =
+            unsafe { moraine_tx_commit(tx, &raw mut id2, None, ptr::null_mut(), &raw mut err2) };
         // SAFETY: `err2.message` is null or was just written.
         assert_eq!(code, codes::OK, "commit failed: {:?}", unsafe {
             err2.message.as_ref()
@@ -1016,13 +1097,17 @@ mod tests {
         let mut id_a: u64 = 0;
         let mut err_a = MoraineError::default();
         // SAFETY: `tx_a` is live; outputs are valid local slots.
-        let code_a = unsafe { moraine_tx_commit(tx_a, &raw mut id_a, &raw mut err_a) };
+        let code_a = unsafe {
+            moraine_tx_commit(tx_a, &raw mut id_a, None, ptr::null_mut(), &raw mut err_a)
+        };
         assert_eq!(code_a, codes::OK);
 
         let mut id_b: u64 = 0;
         let mut err_b = MoraineError::default();
         // SAFETY: `tx_b` is live; outputs are valid local slots.
-        let code_b = unsafe { moraine_tx_commit(tx_b, &raw mut id_b, &raw mut err_b) };
+        let code_b = unsafe {
+            moraine_tx_commit(tx_b, &raw mut id_b, None, ptr::null_mut(), &raw mut err_b)
+        };
         assert_eq!(code_b, codes::COMMIT_CONFLICT);
         assert_eq!(err_b.code, codes::COMMIT_CONFLICT);
         assert!(!err_b.message.is_null());
@@ -1131,7 +1216,15 @@ mod tests {
         let mut snapshot_id: u64 = 0;
         let mut err = MoraineError::default();
         // SAFETY: `tx` is live; outputs are valid local slots.
-        let code = unsafe { moraine_tx_commit(tx, &raw mut snapshot_id, &raw mut err) };
+        let code = unsafe {
+            moraine_tx_commit(
+                tx,
+                &raw mut snapshot_id,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::CORRUPTION);
 
         // SAFETY: `err.message`/`handle` came from the calls above and are
@@ -1260,7 +1353,15 @@ mod tests {
         let mut snapshot_id: u64 = 0;
         let mut err = MoraineError::default();
         // SAFETY: `tx` is live; outputs are valid local slots.
-        let code = unsafe { moraine_tx_commit(tx, &raw mut snapshot_id, &raw mut err) };
+        let code = unsafe {
+            moraine_tx_commit(
+                tx,
+                &raw mut snapshot_id,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
         assert_eq!(code, codes::OK);
 
         // Stage (but do not commit) an expiry of snapshot 0.

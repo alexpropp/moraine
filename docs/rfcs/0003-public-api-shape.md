@@ -56,7 +56,9 @@ core concerns.
 
 SlateDB is async (tokio). The core surface is therefore `async`; the core
 spawns no runtime and no threads of its own — the caller drives it, and the
-DuckDB bridge owns the sync↔async translation.
+DuckDB bridge owns the sync↔async translation. It does spawn *tasks* onto the
+runtime already driving it, which is how a commit's durable write survives its
+caller being cancelled (RFC 0010); that needs no runtime of its own.
 
 RFC 0002 establishes the read model this API exposes: a client builds an
 in-memory catalog by scanning the `current` subspace at attach; the live catalog
@@ -104,6 +106,19 @@ It also carries the store's path within the bucket, defaulting to the bucket
 root — the default deployment stays "a bucket and credentials", and a prefix
 is opt-in for hosts sharing a bucket.
 
+`Catalog::open_read_only` is the reader's door onto the same store, and takes
+the same options. One of them selects *which* kind of reader:
+`CatalogOptions::checkpoint` pins the open to an existing checkpoint id
+instead of following the latest state, which is the difference between a
+reader that writes the manifest and one that writes nothing at all (RFC
+0004, Topology). Checkpoints are minted through `Catalog::create_checkpoint`
+on a writer and released through `Catalog::delete_checkpoint`, which — like
+`Catalog::migrate` — is free-standing because it touches only the manifest
+and so runs against a live catalog without fencing it. The id crosses the
+API as a `String`, matching how every other identifier of SlateDB's that
+moraine hands out is spelled, so no `slatedb::` or `uuid::` name appears
+publicly.
+
 ### Reads
 
 ```rust
@@ -111,9 +126,18 @@ let snaphot = catalog.snapshot().await?;                 // current catalog
 let past = catalog.snapshot_at(snapshot_id).await?;   // time travel
 ```
 
-Both return `CatalogSnapshot`. `snapshot()` scans `current`; `snapshot_at(S)`
-additionally scans the relevant `history` ranges and filters by begin/end per RFC
-0002. Accessors (all in-memory, name→id resolved internally):
+Both return `Arc<CatalogSnapshot>`. `snapshot()` serves the handle's cached
+view when it already stands at head (RFC 0009) and scans `current` when it
+does not; `snapshot_at(S)` always scans, additionally reading the relevant
+`history` ranges and filtering by begin/end per RFC 0002.
+
+The `Arc` is what makes a warm read genuinely cheap. The view is immutable
+and often large, so handing back a shared pointer lets the handle and every
+caller name the same materialization; returning it by value would copy the
+whole catalog on each read and give back most of what the cache saves.
+Callers who want an owned copy can still clone through the `Arc`.
+
+Accessors (all in-memory, name→id resolved internally):
 
 | Accessor | Returns |
 |---|---|
@@ -124,15 +148,30 @@ additionally scans the relevant `history` ranges and filters by begin/end per RF
 | `views_in(schema)` / `view_by_name` / `view_by_id` | views |
 | `columns_of(table)` | ordered columns (tags embedded) |
 | `partitioning_of(table)` | partition spec, if any |
+| `sorting_of(table)` | sort spec, if any |
 | `data_files_of(table)` | live data files (incl. inlined chunks, RFC 0005) |
 | `delete_files_of(table)` | live delete files (incl. inlined deletes) |
 | `table_stats(table)` / `column_stats(table, column)` | statistics |
 | `option(scope, key)` | resolved option value |
 | `current_snapshot()` | snapshot id + metadata of this view |
-| `recent_rows(table)` / `recent_row(table, row_id)` | recently inlined rows served natively from the store's `inline` subspace |
 
 Reads issue no store I/O after the snapshot is built — a `CatalogSnapshot` is a
 value, not a cursor.
+
+Inlined rows (RFC 0005) are the one read the snapshot does **not** serve.
+`recent_rows(table)`, `recent_rows_at(table, snapshot)` and
+`recent_row(table, row_id)` are `Catalog` methods, each one contiguous range
+scan of the `inline` subspace — at head, or, for `recent_rows_at`, at the
+snapshot named. That id resolves through the rule `snapshot_at` uses, so an
+unminted id and an expired one are refused the same way whichever read is
+asking. They are row
+data, not catalog metadata: an inlined chunk carries the table's actual values
+as an Arrow IPC body, so materializing them into every `CatalogSnapshot` would
+put unbounded row bytes behind an accessor the whole catalog shares and break
+the "the live catalog is small by design" premise the materialized view rests
+on. Rows of one chunk share one body and rows of one schema version share one
+schema, so each set of bytes is read and returned once however many rows
+reference it.
 
 ### Writes: closure-with-retry
 
@@ -169,6 +208,25 @@ snapshot, and anything slow — writing Parquet, say — happens *before*
 is implicit — a successful `commit` produces one new snapshot; there is no
 explicit `begin_snapshot` verb.
 
+`commit_group` is the same surface for several closures at once:
+
+```rust
+let ids: Vec<SnapshotId> = catalog.commit_group(&[
+    &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
+    &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
+]).await?;
+```
+
+Members are `CommitMember`: a trait object, so one call can pass closures
+that do different things, and `Sync`, so a grouped commit is as spawnable
+as a lone one. Every contract above holds per member, purity included — a
+lost race re-runs the whole group. One snapshot id comes back per member,
+in member order.
+
+This is the explicit half of RFC 0004's group commit. The implicit half
+needs no API, since concurrent `commit` callers are batched without asking;
+either way the batching is invisible in what is returned here.
+
 This closure/verb surface is the **embedding API** — one of RFC 0004's two
 commit front doors. The DuckDB extension (RFC 0006) does not call it: that
 path commits DuckLake-authored row mutations through RFC 0004's staged-row
@@ -188,7 +246,7 @@ is a verb-path property.
 | `Corruption` | value decode failure or unknown `sys/format` version (RFC 0002) | no |
 | `Unsupported` | a DuckLake feature moraine does not yet implement (e.g. VARIANT inlining, RFC 0005) | no |
 | `SnapshotExpired` | a held/requested snapshot fell below the RFC 0007 retention horizon (RFC 0009) — re-resolve from head | no |
-| `Interrupted` | operation cancelled by a host interrupt before its point of no return (RFC 0010) | no |
+| `Interrupted` | operation cancelled by a host interrupt before its point of no return, or a durable write past that point whose outcome went unreported (RFC 0010) — re-resolve head | no |
 | `Migration` | store requires, is undergoing, or is newer than a structural format the binary supports (RFC 0015) | no |
 
 The conflict split follows from closure-with-retry: transient races
@@ -206,10 +264,11 @@ The public surface is hand-written domain types, decoupled from the
 
 - **Newtype ids** (wrapping the DuckLake-allocated `u64`s of RFC 0002):
   `SchemaId`, `TableId`, `ViewId`, `MacroId`, `MappingId`, `ColumnId`,
-  `DataFileId`, `DeleteFileId`, `SnapshotId`.
+  `DataFileId`, `DeleteFileId`, `PartitionId`, `SortId`, `SnapshotId`.
 - **Value structs:** `TableInfo`, `ViewInfo`, `MacroInfo`, `MappingInfo`,
-  `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `ColumnStats`,
-  `TableStats`, `OptionScope`.
+  `ColumnDef`, `DataFile`, `DeleteFile`, `PartitionSpec`, `PartitionColumnDef`,
+  `SortSpec`, `SortKeyDef`, `ColumnStats`, `TableStats`, `OptionScope`,
+  `TagTarget`, `InlineChunk`, `FlushedDataFile`, `RecentRow`.
 
 Keeping these separate from the wire types is what lets RFC 0002's protobuf
 field evolution stay an internal change instead of a public breaking one.
@@ -229,13 +288,15 @@ semantics and the entities RFC 0002 maps:
 | **Macros** (RFC 0019) | `create_macro`, `drop_macro` (no alter verb — DuckLake models macro replacement as drop + create under a fresh `macro_id`; macro names collide with live macros in the schema only, not with tables/views) |
 | **Columns** | `add_column`, `rename_column`, `alter_column` (type / default / nullability), `drop_column` |
 | **Partitioning** | `set_partitioning`, `clear_partitioning` |
+| **Sorting** (RFC 0013) | `set_sorting`, `clear_sorting` |
 | **Data files** | `register_data_file` (carries its file column stats), `expire_data_file` |
 | **Delete files** | `register_delete_file`, `expire_delete_file` |
 | **Statistics** | `update_table_stats`, `update_column_stats` |
-| **Tags** | `set_tag`, `remove_tag` |
+| **Tags** | `set_tag`, `remove_tag` (on a schema, table, or view; column tags travel on the column record and have no verb) |
 | **Options** | `set_option`, `unset_option` (global / schema / table scopes) |
 | **Inlined data** (RFC 0005) | `inline_insert`, `inline_delete`, `flush_inlined_data` |
-| **Maintenance** (RFC 0021) | `maintain` — reclaims the entry ranges of indexes no longer live; not a `Transaction` mutator but a `Catalog` verb, since it mints no snapshot |
+| **Maintenance** (RFC 0021) | `maintain` — reclaims the entry ranges of indexes no longer live; `store_census` — what each subspace weighs, from the manifest, plus an opt-in live count; `compact_store` — merges a subspace's sorted runs into one, reclaiming superseded versions and tombstones. None is a `Transaction` mutator: all three are `Catalog` verbs, since none mints a snapshot. `store_census` is the one maintenance verb a read-only catalog serves — it reads, and the compactor that executes a merge runs inside the writer |
+| **Format migration** (RFC 0015) | `migrate` — rewrites the store to the newest structural format the binary understands. Not a `Transaction` mutator and not even a `Catalog` method: an associated function taking the object store, because the stores it exists to act on are the ones an ordinary attach refuses |
 
 Notes:
 
@@ -248,11 +309,80 @@ Notes:
 - `alter_column` is one verb taking an optional change per attribute, rather
   than three verbs, because DuckLake models a column alteration as a single
   new column version regardless of which attributes changed.
-- Column/name mappings (RFC 0018) have **no verb**: DuckLake creates them
-  only as a side effect of `ducklake_add_data_files`, and the embedding API
-  has no consumer registering foreign Parquet today. `register_data_file`
-  leaves `mapping_id` unset on the verb path; the staged path carries it
-  verbatim. A verb is added if an embedding use case appears (additive).
+- Sorting and partitioning are twins in shape and differ in two ways the
+  verbs must carry. A sort change marks the table altered without bumping
+  the schema version — a sort spec constrains writes and never invalidates
+  a cross-file compaction, so DuckLake does not bump, and neither does the
+  verb path. And a sort key names its column inside a verbatim SQL
+  expression rather than by field id, so `set_sorting` has no column to
+  resolve and validates none: what a rename or a drop does to a sorted
+  column is DuckLake's binder's business, and moraine records what
+  committed (RFC 0013). `clear_sorting` is a genuine clear, unlike
+  `clear_partitioning`, whose DuckLake counterpart lands a live spec with
+  no columns.
+- Every verb that puts a column type into the catalog — `create_table`,
+  `add_column`, `alter_column` — enforces the RFC 0005 type policy and raises
+  `Unsupported` for a type moraine cannot store. The rule is the core's, and
+  the staged path enforces the same one at the same boundary, so a `VARIANT`
+  column is refused where it enters the catalog rather than at the first
+  insert that would need it. The shim keeps its own refusal at the Arrow
+  conversion, and it is not redundant: DuckLake builds the inlined data table
+  while flushing the `CREATE TABLE`, *before* the `ducklake_column` rows the
+  core validates reach a commit, so removing it leaves the user with DuckDB's
+  bare "Unsupported Arrow type VARIANT". Measured by deleting it and running
+  the e2e suite. This is also why `register_data_file` carries no variant
+  statistics: `ducklake_file_variant_stats` describes the shredded paths of
+  a `VARIANT` column, and no such column can reach the catalog to have any.
+  The field stays in the stored record for row-faithfulness, and arrives on
+  the verb surface with `VARIANT` support or not at all.
+- `flush_inlined_data` registers the files it drains into, rather than leaving
+  them to `register_data_file`. A flushed file is not an ordinary
+  registration: its rows keep the ids they were inlined under and its record
+  is backdated to the earliest snapshot among them, neither of which
+  `register_data_file` can express. Keeping that inside the flush verb is why
+  the core needs no general row-id-preserving registration: compaction is the
+  only other operation of that shape, and it is DuckLake's own — it reaches
+  the store through the staged-row path, never through this surface. A verb
+  is added if an embedding consumer ever writes a rewritten file itself
+  (additive).
+- A registered file carries the partition it falls in — one value per key
+  of the table's live spec, in key order, verbatim text. The spec is
+  resolved rather than named by the caller: a file is written under the one
+  in force, and a registration racing a repartition already conflicts as
+  append-versus-alter, so passing an id could only ever name the spec the
+  commit is about to be arbitrated against. A partitioned table requires
+  its values and an unpartitioned one refuses any, on the same reasoning as
+  the index-entry rule — a file silently landing in no partition is a file
+  no pruning scan can place.
+- A flushed file additionally carries `partial_max`, the newest snapshot
+  among its rows, whenever a drain sweeps up rows inlined at several. Both
+  bounds are needed and neither is derivable from the other: the record is
+  live from the earliest so pre-flush time travel finds it, and a reader at
+  a snapshot inside the span filters the file's rows per row against its
+  own snapshot column rather than taking all of them. It is validated to
+  sit at or above the backdated snapshot and below this commit's, the same
+  window the backdating check enforces from the other side.
+- One commit may both inline into a table and flush it. The drain reads the
+  store as it stood before the commit, so the chunk the commit stages is not
+  among the chunks it drains — those rows stay inlined for the next flush.
+  What the drain reads is also what bounds the file: a flushed file's rows
+  must lie below the row ids the table had allocated when the commit began,
+  since the caller wrote its Parquet before calling `commit` and so cannot
+  have put a row this commit mints into it. The pairing that does *not*
+  compose is tombstoning a row the same commit flushes: the file carries that
+  row as live and the drain removes the chunk the tombstone hangs off, so the
+  delete would vanish. It is refused, and a delete file against the id
+  `flush_inlined_data` returns expresses it instead.
+- Column/name mappings (RFC 0018) have **no verb**, and this is settled
+  rather than deferred. A mapping exists only to resolve the columns of
+  *foreign* Parquet — a file written without DuckLake's field ids — and
+  moraine does not expect to serve one. DuckLake creates mappings as a side
+  effect of `ducklake_add_data_files`, which a user can still issue through
+  the extension; the staged path carries those rows verbatim and always
+  will. What is settled is the verb surface: no `create_mapping`, and
+  `register_data_file` leaves `mapping_id` unset, because a file this
+  surface registers is one the host wrote against the table's own
+  columns.
 - Snapshot expiry / `history` GC has no verb (deferred, per non-goals).
   RFC 0021's `maintain` is not one: it reclaims moraine's own orphaned
   index entries and nothing else — it computes no retention policy, and
@@ -260,10 +390,13 @@ Notes:
   objects unprompted. RFC 0021 *does* orchestrate DuckLake's expiry and
   cleanup functions, but from the DuckDB shim, which can issue SQL — never
   from this surface, which cannot.
-- This table covers the entities the core models today. As the DuckLake v1.0
-  spec's remaining tables and the extension contract (RFC 0005 open question)
-  are reached in e2e, operations are added here — this RFC is updated, not
-  diverged from.
+- This table covers the entities the core models today. The extension
+  contract that once gated the full set is settled: RFC 0005 maps every
+  DuckLake statement the shim issues onto a store record, and none of them
+  needs a verb this table lacks — the extension rides the staged-row path,
+  not this surface. What is left is the DuckLake v1.0 spec's remaining
+  tables; as e2e reaches them, operations are added here — this RFC is
+  updated, not diverged from.
 
 ### Testing obligations
 
@@ -318,5 +451,6 @@ Per RFC 0001:
 - **Structural-shape-only scope** (define the types and models, leave the
   operation set to fill in later): considered and rejected in favor of the
   full enumeration above, grounding the operation set in DuckLake v1.0
-  semantics rather than the still-unresolved extension contract, so the
-  surface is legible now and updated (not redesigned) as e2e reveals detail.
+  semantics rather than in the extension contract, which was unresolved when
+  this was written. The bet paid: the contract settled (RFC 0005) without
+  moving a verb, and the surface was legible throughout.

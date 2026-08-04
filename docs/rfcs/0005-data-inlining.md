@@ -33,8 +33,9 @@ Non-goals:
 
 - Auto-flush policy (when to flush is an operational/maintenance concern;
   this RFC defines only the mechanism).
-- Inlining `VARIANT` columns (DuckLake excludes them for third-party
-  catalogs; moraine matches until the e2e suite proves more is possible).
+- Inlining `VARIANT` columns. Arrow cannot represent the type, so a
+  `VARIANT` column is refused rather than inlined; carrying it would mean a
+  second, non-Arrow value format.
 
 ## Background
 
@@ -78,19 +79,44 @@ inherit that limitation.
 | `inline/insert` | `table_id, schema_version, begin_snapshot, chunk_seq` | Arrow IPC record-batch **body** (the batch message + buffers, no schema) over the user columns + `row_id_start`, `row_count`. Decoded against the version's `inline/schema` stream, so the schema is not re-serialized per chunk |
 | `inline/inline_delete` | `table_id, row_id` | `end_snapshot` (tombstone for an inlined insert row) |
 | `inline/file_delete` | `table_id, data_file_id, row_id` | `begin_snapshot` (inlined delete against a Parquet file) |
+| `inline/file_delete_table` | `table_id` | Empty — the key is the fact. Marks that `ducklake_inlined_delete_<table_id>` exists |
 
-All three are append-only on the commit path.
+The first four are append-only on the commit path. The fifth is a marker,
+and exists because existence cannot be derived from the fourth: a flush
+materializes a table's inlined deletions into a real delete file and
+clears them, and an emptied SQL table still exists. DuckLake caches that
+table's existence for the life of the catalog and never re-probes, so a
+content-derived existence disappears under it mid-session and every later
+bind fails. Written idempotently by both paths that prove the table
+exists — staging a deletion into it, and removing one from it, the latter
+so a store written before the marker heals on its first flush — and
+removed by the `DROP TABLE` cascade.
 
 ### Write path
 
 An insert below the row limit becomes one `inline/insert` **chunk record**:
 the commit's rows for that table, Arrow-IPC-encoded, with row ids
 allocated from the table's row-id counter exactly as a Parquet write would
-allocate them. Chunk-per-commit (not row-per-key) because the read unit is
-"all live inlined rows of table T", and because one key per commit rides
-the `WriteBatch` with negligible overhead. `chunk_seq` disambiguates
+allocate them — the per-table row-id high-water mark in `tstat`, as
+DuckLake allocates it. Chunk-per-commit (not row-per-key) because the read
+unit is "all live inlined rows of table T", and because one key per commit
+rides the `WriteBatch` with negligible overhead. `chunk_seq` disambiguates
 multiple chunks in one commit (how rows are batched within a commit is an
 implementation detail).
+
+Type eligibility here is **moraine's**, not DuckLake's, and it is set by the
+value format below: an inline chunk is Arrow IPC, so a column is inlinable
+exactly when DuckDB's Arrow encoding can carry it. That is a different and
+narrower rule than DuckLake's own — stock DuckLake stores inline data as SQL
+values and inlines types moraine cannot.
+
+`GEOMETRY` is inlinable when `spatial` is loaded, because spatial registers
+the Arrow extension type; values survive both the inline keyspace and the
+flush. `VARIANT` has no Arrow representation at all, so moraine refuses the
+column at `CREATE TABLE` with an error naming moraine, the type, and Arrow
+as the cause — a refusal, not a silent Parquet fallback, because the table
+would otherwise appear to work until its first insert. Scalars, `BLOB`,
+`UUID`, `DECIMAL` and nested `LIST`/`STRUCT`/`MAP` all inline.
 
 Arrow IPC is the value format because inlined data is *row data*, not
 metadata: it carries the table's actual types — including nested
@@ -225,8 +251,11 @@ The operation → keyspace mapping (source-verified against DuckLake
 | `INSERT INTO ducklake_inlined_data_<t>_<v> VALUES (row_id, {snap}, NULL, <cols>), …` (one multi-row `VALUES` per commit) | one `inline/insert` chunk at `(t, v, begin_snapshot={snap}, chunk_seq)`: the user-column cells as one Arrow IPC record-batch body (no schema message; decoded against the version's `inline/schema`), plus `row_id_start` (first row's `row_id`) and `row_count`. The `row_id`/`begin_snapshot`/`end_snapshot` columns are moraine-derived on read (`row_id = row_id_start + offset`, `begin_snapshot` from the key, `end_snapshot` from `inline/inline_delete`), never stored in the body |
 | `UPDATE ducklake_inlined_data_<t>_<v> SET end_snapshot={snap} WHERE row_id=r …` | `inline/inline_delete` at `(t, r)` holding `end_snapshot={snap}` |
 | `SELECT <cols> FROM ducklake_inlined_data_<t>_<v> WHERE {snap} >= begin_snapshot AND ({snap} < end_snapshot OR end_snapshot IS NULL) ORDER BY row_id` (and the `SCAN_INSERTIONS`/`SCAN_DELETIONS`/`SCAN_FOR_FLUSH` filter variants) | range-scan `inline/insert` for `t` at `v`, decode Arrow, reconstruct the three virtual columns, apply the snapshot predicate, subtract `inline/inline_delete` tombstones, project and order by `row_id` |
-| `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}` |
+| `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id, {snap}), …` | `inline/file_delete` at `(t, file_id, row_id)` holding `begin_snapshot={snap}`, plus the `inline/file_delete_table` marker for `t` |
+| `DELETE FROM ducklake_inlined_delete_<t>` (the flush's clean-up, once those deletions are written out as a real delete file) | remove the `inline/file_delete` record behind each matched row, keeping the `inline/file_delete_table` marker. Translated per row rather than as a table-wide clear: DuckLake's flush happens to delete every row, but what it issues is an ordinary SQL `DELETE`, so a filtered one removes exactly what it matched. Naming a record the table does not carry is a typed error, not a silent no-op |
 | `DELETE FROM ducklake_inlined_data_<t>_<v> WHERE begin_snapshot <= {flush_snap}` then `DROP TABLE …` + `DELETE FROM ducklake_inlined_data_tables …` (flush / superseded-table cleanup) | remove the flushed `inline/insert` chunks and consumed `inline/inline_delete`; drop the `inline/schema` and deregister. The flushed data lives on as the backdated `ducklake_data_file` DuckLake registers through the ordinary file path |
+| hard `DELETE FROM ducklake_data_file` naming `(t, file_id)` (a merge pruning its sources, cleanup draining the schedule) | remove every `inline/file_delete` record targeting that file, keeping the marker. Silent on a miss, unlike the removal above: this cascade names a file rather than records, and a pruned file carrying no inlined deletion is the ordinary case |
+| `UPDATE ducklake_data_file SET end_snapshot` (a rewrite ending its source) | nothing — see below |
 | `DROP TABLE lake.<schema>.<t>` cascade | drop every `inline/*` record for `t` |
 
 This is served through the same staged-row commit path (RFC 0004): the
@@ -236,6 +265,16 @@ of `inline/*` records — same one-batch atomicity, same no-internal-retry,
 same `conflict` wire contract. Values DuckLake authors (`row_id`,
 `begin_snapshot`, `end_snapshot`, user cells) are stored verbatim per the
 keyspace; nothing is re-derived on write.
+
+A nested column reaches the catalog as DuckLake represents it: a top-level
+marker row (`list`/`struct`/`map`) plus child `ducklake_column` rows linked
+by `parent_column`. moraine stores those rows verbatim, passes the marker
+through its `ducklake_column` projection, and reconstructs the nested
+`LogicalType` from the child hierarchy for its own catalog entries
+(`catalog.cpp`'s `BuildColumnType`); the Arrow IPC inline path carries the
+values themselves natively. `LIST`, `STRUCT`, and `MAP` are verified live
+through inline and flush by the e2e test
+`ducklake_inline_nested_types_round_trip_through_flush`.
 
 Three reconciliations with the surrounding RFCs, recorded here because they
 governed the implementation:
@@ -273,28 +312,63 @@ governed the implementation:
   the imported `DataChunk` to the flush writer directly, but the row
   materialization is not on the tiny-commit hot path inlining optimizes.
 
-## Open questions
+### Flush registers a data file and a delete file against it in one commit
 
-- **Nested-column tables** (`LIST`/`STRUCT`/`MAP`) create, inline, and
-  round-trip end to end. DuckLake stores a nested column as a top-level
-  marker row (`list`/`struct`/`map`) plus child `ducklake_column` rows
-  linked by `parent_column`; moraine stores those verbatim, passes the
-  marker through its `ducklake_column` projection, and reconstructs the
-  nested `LogicalType` from the child hierarchy for its own catalog entries
-  (`catalog.cpp`'s `BuildColumnType`). The Arrow IPC inline path carries the
-  values natively. `LIST`, `STRUCT`, and `MAP` are all verified live through
-  inline and flush (e2e `ducklake_inline_nested_types_round_trip_through_flush`).
-- **VARIANT/GEOMETRY inlining.** DuckLake's `CanInlineColumns` excludes
-  only `GEOMETRY`; VARIANT is inlinable there. An unsupported column type
-  makes the whole table fall back to the non-inlined (Parquet) path, which
-  is always correct. The exact inlinable-type set is pinned in the e2e
-  suite (scalar `BIGINT`/`VARCHAR`/`DOUBLE`/`BOOLEAN` with `NULL`s, plus
-  nested `LIST`/`STRUCT`/`MAP`, today).
-- **Row-id counter placement — settled by RFC 0004.** The per-table row-id
-  high-water mark lives in `tstat`, matching DuckLake, which also aligns
-  row-id allocation with conflict granularity (and, via RFC 0004's
-  append-append refinement, lets concurrent inlined inserts to one table
-  both land on the verb path).
+A flush does not filter tombstoned rows out of the Parquet it writes. It
+materializes **every** inlined row of the table — live and tombstoned
+alike — into one data file, then writes a delete file naming the
+tombstoned rows' *positions in that file*
+(`ducklake_flush_inlined_data.cpp`'s `AttachDeleteFilesToWrittenFiles`).
+One commit therefore carries a `ducklake_data_file` insert and a
+`ducklake_delete_file` insert whose `data_file_id` is that same
+brand-new file.
+
+Equality-index upkeep therefore resolves such a delete **at the add**: the
+rows it kills are left out of the file's entries as the file is read, so
+they are never indexed at all. The commit's deletes are collected before
+any add is derived, since nothing fixes the two rows' order in the batch.
+
+Staging a removal beside the add instead would be wrong, not merely
+wasteful. An index entry's key carries no file, so an add and a removal of
+one `(key, row_id)` in a single batch is *exactly* the shape an `UPDATE`
+produces — DuckLake rewrites the updated row into a new file under its
+preserved row id, ending the old file's copy — and there the entry must
+survive. The two are indistinguishable at the batch layer and can only be
+told apart by whether the removal targets the very file the add came from.
+`stage_file_delete_entries` accordingly handles only targets the committed
+head already holds; a target the commit itself registers is skipped there
+because the add already accounted for it.
+
+Only an indexed table reaches any of this: upkeep returns early when the
+table carries no live index.
+
+### An inlined deletion dies with its target's row, not with its target
+
+`ducklake_inlined_delete_<t>` has no `end_snapshot` column: a deletion
+exists or it does not, and there is no way to express one that applied over
+a window. Removal is therefore the only way one goes away, and every
+removal has to be paired with something that preserves what it meant — the
+flush pairs its clear with a backdated delete file.
+
+That forces the cascade to key on how a data file leaves, which RFC 0021
+already distinguishes for its own reasons:
+
+- **Pruned** (a merge's sources, cleanup's schedule) — the row is
+  hard-deleted, current *and* history, because the backdated replacement
+  subsumed its whole visibility history. Nothing can read that file at any
+  snapshot again, so an inlined deletion against it is unreachable. It is
+  removed with the file's row. Left behind, it would still be served, and
+  the next flush would materialize it into a delete file naming a data file
+  that no longer exists — which the commit refuses.
+- **Ended** (a rewrite's source) — the row moves to `history` precisely
+  because a reader below the rewrite must still see the rows it
+  materialized deletes for. The deletions that make those rows dead have to
+  stay readable alongside it, so ending a file removes nothing. They go
+  later, when expiry and cleanup prune the ended row.
+
+Both are covered by
+`hard_deleting_a_data_file_drops_the_inlined_deletions_against_it` and
+`ending_a_data_file_keeps_the_inlined_deletions_against_it`.
 
 ## Alternatives considered
 

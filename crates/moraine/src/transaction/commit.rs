@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use slatedb::{Db, DbReader, DbTransaction, IsolationLevel, config::WriteOptions};
@@ -21,6 +21,7 @@ use crate::{
     },
     transaction::{
         index_maintenance::{self, ProbeHandle},
+        inline,
         operations::{ChangeSet, Operation},
         verbs::{Transaction, TransactionParts},
     },
@@ -44,8 +45,13 @@ pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
 /// topology.
 pub(crate) const FORMAT_MULTI_WRITER: u64 = 4;
 /// The highest format this binary understands. It opens any store in
-/// `FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
+/// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
 pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_MULTI_WRITER;
+/// The lowest structural format this binary reads directly. Every format so
+/// far is additive — each adds a subspace without moving an existing key — so
+/// the floor sits at the base format and no store in the world is below it. It
+/// rises only when a format rewrites the keyspace.
+pub(crate) const MIN_FORMAT_VERSION: u64 = FORMAT_VERSION;
 
 /// Current time in microseconds since the Unix epoch. Clamped, never
 /// panicking: a clock before the epoch stamps 0.
@@ -145,6 +151,7 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             transaction_id: None,
+            deleted_data_file_ids: Vec::new(),
         }),
     )?;
     stage(
@@ -178,7 +185,10 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
     )?;
     stage(
         Key::Sys(SysKey::Head),
-        value::encode_value(&proto::HeadValue { snapshot_id: 0 }),
+        value::encode_value(&proto::HeadValue {
+            snapshot_id: 0,
+            batch_seq: 0,
+        }),
     )
 }
 
@@ -372,8 +382,113 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
     ))
 }
 
+/// [`materialize`] over the folded store with the unfolded tail overlaid, for a
+/// time-travel target no folder has applied. The whole tail is overlaid, not a
+/// prefix truncated at the target, so a later commit's backdated record — a
+/// flush's data file effective at or below `at` — is present and the snapshot
+/// filter admits it. `head` is the tail's own head, the ceiling `at` may name.
+pub(crate) async fn materialize_overlaid(
+    tx: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+    head: u64,
+    at: u64,
+) -> Result<CatalogSnapshot> {
+    if at > head {
+        return Err(Error::NotFound(format!("snapshot {at} (head is {head})")));
+    }
+    let snapshot = read::read_snapshot_overlaid(tx, overlay, at)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("snapshot {at} (expired or never minted)")))?;
+    let current = read::scan_current_entities_overlaid(tx, overlay).await?;
+    let history = read::scan_history_entities_overlaid(tx, overlay).await?;
+
+    Ok(CatalogSnapshot::build(snapshot, current, history, Some(at)))
+}
+
 /// One staged write: `Some` puts, `None` deletes.
 pub(crate) type StagedWrite = (Vec<u8>, Option<Vec<u8>>);
+
+/// How long a durable commit may wait before the wait itself is reported,
+/// and how often it is reported thereafter.
+const STALL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Commits `tx` and waits for the batch to reach object storage, naming
+/// `operation` in the log if the wait runs long.
+///
+/// The wait is unbounded on purpose. A failed object-store write is retried
+/// beneath us indefinitely, so a permanent refusal — expired credentials, a
+/// revoked bucket policy — stalls here rather than failing. Giving up on a
+/// deadline would not undo the staged batch: the flush continues, so the
+/// deadline would report failure for a commit that still lands, and a
+/// caller re-driving it would apply it twice. A stall that says so in the
+/// log is the half of that trade worth having.
+pub(crate) async fn commit_durable(
+    tx: DbTransaction,
+    operation: &'static str,
+) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
+    let options = durable();
+    let mut commit = Box::pin(tx.commit_with_options(&options));
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Ok(outcome) = tokio::time::timeout(STALL_INTERVAL, &mut commit).await {
+            return outcome;
+        }
+        waited = waited.saturating_add(STALL_INTERVAL);
+        warn!(
+            operation,
+            waited_seconds = waited.as_secs(),
+            "still waiting for object storage to accept a durable write; writes are retried \
+             indefinitely, so check credentials and bucket policy"
+        );
+    }
+}
+
+/// A commit that returns without waiting for the write to reach object
+/// storage. The write is still atomic and visible to this handle at once;
+/// only the durability wait — a flush-cadence tick — is skipped. Use it
+/// where a lost write is self-correcting, never where a caller treats the
+/// return as a durable fact.
+pub(crate) fn non_durable() -> WriteOptions {
+    WriteOptions {
+        await_durable: false,
+        ..Default::default()
+    }
+}
+
+/// Refuses a store whose keyspace is mid-move. A structural migration
+/// rewrites keys in place, so any scan of it may be missing records that
+/// have not arrived yet; failing is the only way to avoid returning a
+/// silently partial catalog.
+pub(crate) async fn refuse_mid_migration(tx: ReadHandle<'_>) -> Result<()> {
+    match read::read_migration(tx).await? {
+        Some(marker) => Err(Error::Migration(format!(
+            "store is migrating from format {} to {}; reads are unavailable until it completes",
+            marker.from_format, marker.to_format
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The `ducklake_schema_versions` record a schema-changing commit owes for
+/// one table. Outlives the snapshot record that names the same table: expiry
+/// deletes snapshots, and a data file older than every surviving snapshot
+/// still has to resolve its schema version.
+pub(crate) fn schema_version_write(
+    table_id: u64,
+    begin_snapshot: u64,
+    schema_version: u64,
+) -> StagedWrite {
+    (
+        Key::SchemaVersion {
+            table_id,
+            begin_snapshot,
+        }
+        .encode(),
+        Some(value::encode_value(&proto::SchemaVersionValue {
+            schema_version,
+        })),
+    )
+}
 
 mod diff;
 pub(crate) mod fold;
@@ -478,12 +593,16 @@ where
     let TransactionParts {
         operations,
         index_entries,
+        inline_ops,
         mut state,
         next_catalog_id,
         next_file_id,
     } = tx.into_parts();
 
-    if operations.is_empty() {
+    let ProbeHandle::Overlaid { store, overlay } = probe;
+    let inline_writes = inline::stage_inline_writes(store, Some(overlay), &inline_ops).await?;
+
+    if operations.is_empty() && inline_writes.is_empty() {
         let mut writes = Vec::new();
         diff_options(&mut writes, base, &state);
         if writes.is_empty() {
@@ -495,7 +614,10 @@ where
         // against the winner's state instead of committing blind.
         writes.push((
             Key::Sys(SysKey::Head).encode(),
-            Some(value::encode_value(&proto::HeadValue { snapshot_id: head })),
+            Some(value::encode_value(&proto::HeadValue {
+                snapshot_id: head,
+                batch_seq: 0,
+            })),
         ));
         return Ok(Prepared::Staged(Assembled {
             ours: Box::default(),
@@ -512,6 +634,7 @@ where
     index_maintenance::apply_poison(&mut state, &poisoned);
 
     writes.extend(diff_writes(base, &state, new_id));
+    writes.extend(inline_writes);
     writes.extend(format_stamp(format_current, &state));
     tracing::debug!(
         snapshot = new_id,
@@ -530,10 +653,19 @@ where
         .collect();
     let ours = ChangeSet::from_operations(&operations);
 
+    let schema_version = base.snapshot.schema_version + u64::from(schema_changed);
+
+    // The schema-version rows this commit staged, as records of their own:
+    // `snapshot` carries them too, but only until expiry deletes it, and the
+    // files they describe outlive that.
+    for table_id in &schema_changed_table_ids {
+        writes.push(schema_version_write(*table_id, new_id, schema_version));
+    }
+
     let snapshot = proto::SnapshotValue {
         snapshot_id: new_id,
         snapshot_time_micros: now_micros(),
-        schema_version: base.snapshot.schema_version + u64::from(schema_changed),
+        schema_version,
         next_catalog_id,
         next_file_id,
         changes_made: ours.to_changes_made(),
@@ -542,6 +674,7 @@ where
         commit_extra_info: None,
         schema_changed_table_ids,
         transaction_id: transaction_id.map(|id| id.to_vec()),
+        deleted_data_file_ids: Vec::new(),
     };
     writes.push((
         Key::Snapshot {
@@ -554,6 +687,7 @@ where
         Key::Sys(SysKey::Head).encode(),
         Some(value::encode_value(&proto::HeadValue {
             snapshot_id: new_id,
+            batch_seq: 0,
         })),
     ));
 

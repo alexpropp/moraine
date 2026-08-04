@@ -225,6 +225,11 @@ fn map_error(kind: ErrorKind, message: String) -> Error {
         ErrorKind::Configuration => Error::Configuration(message),
         ErrorKind::Fenced => Error::Fenced(message),
         ErrorKind::SlotLog => Error::SlotLog(message),
+        ErrorKind::Unsupported => Error::Unsupported(message),
+        ErrorKind::SnapshotExpired => Error::SnapshotExpired(message),
+        ErrorKind::Interrupted => Error::Interrupted(message),
+        ErrorKind::Migration => Error::Migration(message),
+        ErrorKind::OpenRaced => Error::OpenRaced(message),
         ErrorKind::Store => Error::Corruption(format!("forwarded store error: {message}")),
     }
 }
@@ -301,6 +306,15 @@ fn wire_operation(operation: &RowOperation) -> WireRowOperation {
             data_file_id: *data_file_id,
             row_id: *row_id,
             begin_snapshot: *begin_snapshot,
+        },
+        RowOperation::InlineFileDeleteRemove {
+            table_id,
+            data_file_id,
+            row_id,
+        } => WireRowOperation::InlineFileDeleteRemove {
+            table_id: *table_id,
+            data_file_id: *data_file_id,
+            row_id: *row_id,
         },
         RowOperation::InlineFlushDelete {
             table_id,

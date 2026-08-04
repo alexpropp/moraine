@@ -14,13 +14,17 @@
 //! [`Catalog`]: moraine::Catalog
 //! [`CatalogSnapshot`]: moraine::CatalogSnapshot
 
+mod checkpoints;
+
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     sync::Arc,
+    time::Duration,
 };
 
+pub use checkpoints::*;
 use moraine::{CatalogOptions, Leader, LeaderConfig};
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use tracing::warn;
@@ -28,7 +32,8 @@ use tracing::warn;
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
     runtime::{
-        LeaderHost, MoraineCatalogHandle, MoraineInterruptProbe, MoraineSnapshotHandle, new_runtime,
+        CANCELLED_ATTACH_SHUTDOWN, LeaderHost, MoraineCatalogHandle, MoraineInterruptProbe,
+        MoraineSnapshotHandle, block_on_cancellable_in, new_runtime,
     },
 };
 
@@ -229,7 +234,7 @@ pub struct MoraineS3Config {
 
 /// S3 credentials borrowed from a [`MoraineS3Config`]. Every field is
 /// optional; an absent field defers to the AWS_* environment.
-struct S3Creds<'a> {
+pub(crate) struct S3Creds<'a> {
     key_id: Option<&'a str>,
     secret: Option<&'a str>,
     region: Option<&'a str>,
@@ -237,6 +242,36 @@ struct S3Creds<'a> {
     endpoint: Option<&'a str>,
     url_style: Option<&'a str>,
     use_ssl: Option<bool>,
+}
+
+/// Borrows the credentials out of a nullable [`MoraineS3Config`]. Null
+/// means "no secret — the environment supplies credentials".
+///
+/// # Safety
+///
+/// `s3`, if non-null, must point to a valid [`MoraineS3Config`] whose
+/// non-null string fields are NUL-terminated C strings, all valid for
+/// reads for the duration of the borrow.
+pub(crate) unsafe fn borrow_s3_creds<'a>(s3: *const MoraineS3Config) -> Option<S3Creds<'a>> {
+    // SAFETY: caller contract above.
+    let config = unsafe { s3.as_ref() }?;
+    // SAFETY: each string field is null or a NUL-terminated C string valid
+    // for the borrow, per the same contract.
+    Some(unsafe {
+        S3Creds {
+            key_id: opt_str(config.key_id),
+            secret: opt_str(config.secret),
+            region: opt_str(config.region),
+            session_token: opt_str(config.session_token),
+            endpoint: opt_str(config.endpoint),
+            url_style: opt_str(config.url_style),
+            use_ssl: match config.use_ssl {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+        }
+    })
 }
 
 /// Borrows a nullable C string as `Some(&str)`, mapping null, empty, and
@@ -266,7 +301,7 @@ unsafe fn opt_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 ///
 /// `ptr`, if non-null, must point to a NUL-terminated C string valid for
 /// reads for the duration of this call.
-unsafe fn opt_borrow_str<'a>(
+pub(crate) unsafe fn opt_borrow_str<'a>(
     ptr: *const c_char,
     arg_name: &str,
 ) -> Result<Option<&'a str>, AbiError> {
@@ -279,7 +314,7 @@ unsafe fn opt_borrow_str<'a>(
 }
 
 /// The object store an attach path resolves to.
-enum StoreKind {
+pub(crate) enum StoreKind {
     /// A directory on the local filesystem, created if absent.
     LocalFile,
     /// A fresh, empty in-memory store.
@@ -291,7 +326,7 @@ enum StoreKind {
 impl StoreKind {
     /// Classifies an attach path by scheme, returning the store kind and the
     /// bucket-relative key prefix (empty for local and in-memory stores).
-    fn from_path(path: &str) -> Result<(Self, String), AbiError> {
+    pub(crate) fn from_path(path: &str) -> Result<(Self, String), AbiError> {
         if let Some(rest) = path.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
             if bucket.is_empty() {
@@ -322,7 +357,11 @@ impl StoreKind {
         Ok((Self::LocalFile, String::new()))
     }
 
-    fn open(&self, path: &str, s3: Option<&S3Creds>) -> Result<Arc<dyn ObjectStore>, AbiError> {
+    pub(crate) fn open(
+        &self,
+        path: &str,
+        s3: Option<&S3Creds>,
+    ) -> Result<Arc<dyn ObjectStore>, AbiError> {
         match self {
             Self::LocalFile => {
                 std::fs::create_dir_all(path).map_err(|e| {
@@ -549,6 +588,20 @@ fn resolve_data_store(
     }
 }
 
+/// Winds down the runtime of an attach that will not produce a handle,
+/// and returns the error that ended it.
+///
+/// A cancelled open leaves a half-built store behind whose background
+/// tasks may be mid-request. Dropping the runtime would block until every
+/// one of them finished — turning a cancellation into the hang it was
+/// meant to escape — so it is shut down with a deadline instead, after
+/// which the stragglers are abandoned. Nothing was committed through this
+/// runtime, so abandoning them loses no durable state.
+fn cancel_attach(runtime: tokio::runtime::Runtime, error: AbiError) -> AbiError {
+    runtime.shutdown_timeout(CANCELLED_ATTACH_SHUTDOWN);
+    error
+}
+
 /// Attaches a moraine catalog: creates the runtime this handle owns for
 /// its lifetime, opens (creating and initializing if empty) the catalog,
 /// and writes the resulting handle to `*out`.
@@ -564,6 +617,39 @@ fn resolve_data_store(
 /// already-initialized store, whose stored flag
 /// ([`moraine_catalog_encrypted`]) is authoritative.
 ///
+/// `checkpoint` pins a **read-only** attach to an existing SlateDB
+/// checkpoint (see [`moraine_create_checkpoint`]), so the open writes
+/// nothing at all — no manifest record of the reader, no refresh, no
+/// delete on close — and serves a fixed cut that never advances. Null or
+/// empty follows the latest manifest; a non-null value with `read_only`
+/// false is [`codes::INVALID_ARGUMENT`].
+///
+/// `host_threads` is how many execution threads the calling host runs, and
+/// sizes this handle's worker pool: the host's setting is the only number
+/// in the process that says how much parallelism the operator asked for,
+/// so a session pinned to one thread does not get a pool sized to the
+/// machine. It is clamped to a floor of two (a CPU-bound poll must not be
+/// able to stall SlateDB's flush) and a ceiling of eight (the pool waits
+/// on object storage, which yields its worker at every await, so further
+/// workers only park — on cores the host already sized itself to). `0`
+/// means the host does not say and takes the floor. The size is fixed for
+/// the handle's life; a host that changes its own thread count afterwards
+/// keeps the pool it attached with.
+///
+/// Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
+/// are: the store open is the one long blocking call an attach makes, and
+/// against an unreachable endpoint it is the one worth escaping. A
+/// cancelled attach returns [`codes::INTERRUPTED`], writes no handle, and
+/// leaves nothing attached. It may still have fenced a writer that was
+/// attached before it — an attach takes the writer epoch before it can
+/// know whether it will finish — so the previously attached process must
+/// re-attach either way, exactly as after any failed attach.
+///
+/// [`moraine_detach`] takes no probe and never will: it is teardown, and
+/// an interrupt part-way through would either leak the handle or leave
+/// the store half-closed. Cancellation exists to escape a wait, and
+/// detach's wait is the flush that makes committed data durable.
+///
 /// Returns [`codes::OK`] on success. On failure, `*out` is left
 /// unwritten and, if `err` is non-null, `*err` carries the code and a
 /// message.
@@ -572,9 +658,13 @@ fn resolve_data_store(
 ///
 /// `path` must be a valid NUL-terminated C string. `s3`, if non-null,
 /// must point to a valid [`MoraineS3Config`] whose non-null fields are
-/// valid NUL-terminated C strings. `out` must be a valid, writable
-/// `*mut *mut MoraineCatalogHandle`. `err`, if non-null, must be a valid,
-/// writable [`MoraineError`]. All for the duration of this call.
+/// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
+/// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+/// `host_threads` is unconstrained.
+/// `probe`, if non-null, must be safe to call with `probe_ctx` from any
+/// thread. `out` must be a valid, writable `*mut *mut
+/// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
+/// [`MoraineError`]. All for the duration of this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_attach(
     path: *const c_char,
@@ -584,6 +674,10 @@ pub unsafe extern "C" fn moraine_attach(
     flush_interval_ms: u64,
     cache_dir: *const c_char,
     data_path: *const c_char,
+    checkpoint: *const c_char,
+    host_threads: u64,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
     out: *mut *mut MoraineCatalogHandle,
     err: *mut MoraineError,
 ) -> i32 {
@@ -599,31 +693,23 @@ pub unsafe extern "C" fn moraine_attach(
         // SAFETY: `cache_dir` validity is this function's own safety contract;
         // null (or empty) means "no on-disk cache".
         let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
+        // SAFETY: `checkpoint` validity is this function's own safety
+        // contract; null (or empty) means "follow the latest manifest".
+        let checkpoint = unsafe { opt_borrow_str(checkpoint, "checkpoint") }?;
+        // Refused here rather than left to the core: the core's message
+        // would name the option, and the caller needs to be told which
+        // half of the attach to change.
+        if checkpoint.is_some() && !read_only {
+            return Err(AbiError::invalid_argument(
+                "moraine_attach: a checkpoint pins a fixed past cut, so it applies to a \
+                 read-only attach only — add READ_ONLY, or drop the checkpoint",
+            ));
+        }
 
         let (store_kind, prefix) = StoreKind::from_path(path_str)?;
 
-        // SAFETY: `s3` validity is this function's own safety contract; null
-        // means "no secret — the environment supplies credentials".
-        let s3_config = unsafe { s3.as_ref() };
-        let s3_creds = s3_config.map(|c| {
-            // SAFETY: each string field of `*c` is null or a NUL-terminated C
-            // string valid for this call (the shim keeps them alive across it).
-            unsafe {
-                S3Creds {
-                    key_id: opt_str(c.key_id),
-                    secret: opt_str(c.secret),
-                    region: opt_str(c.region),
-                    session_token: opt_str(c.session_token),
-                    endpoint: opt_str(c.endpoint),
-                    url_style: opt_str(c.url_style),
-                    use_ssl: match c.use_ssl {
-                        0 => Some(false),
-                        1 => Some(true),
-                        _ => None,
-                    },
-                }
-            }
-        });
+        // SAFETY: `s3` validity is this function's own safety contract.
+        let s3_creds = unsafe { borrow_s3_creds(s3) };
 
         // Open the store first: it is synchronous and fallible, and a bad
         // path must not cost a runtime spun up just to be torn down.
@@ -633,12 +719,13 @@ pub unsafe extern "C" fn moraine_attach(
         // events (run below on this thread) the same way.
         let log_id = crate::logging::allocate_handle_id();
         let _log_guard = crate::logging::enter_handle(log_id);
-        let runtime = new_runtime(log_id).map_err(|e| {
-            AbiError::new(
-                codes::INTERNAL,
-                format!("failed to start tokio runtime: {e}"),
-            )
-        })?;
+        let runtime = new_runtime(log_id, usize::try_from(host_threads).unwrap_or(usize::MAX))
+            .map_err(|e| {
+                AbiError::new(
+                    codes::INTERNAL,
+                    format!("failed to start tokio runtime: {e}"),
+                )
+            })?;
 
         // The DATA_PATH given at this attach (via `META_DATA_PATH`), if any.
         // SAFETY: `data_path` validity is this function's own safety contract;
@@ -671,20 +758,42 @@ pub unsafe extern "C" fn moraine_attach(
             ms => options.commit_batch_window = std::time::Duration::from_millis(ms),
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+        options.checkpoint = checkpoint.map(str::to_owned);
         // Persist the data root at bootstrap so a later attach reads it back
         // without being told it again.
         options.data_path.clone_from(&data_path_arg);
-        let catalog = if read_only {
-            // A read-only attach never bootstraps; on a fresh store the open
-            // fails, so surface the reason (DuckDB defaults remote attaches to
-            // read-only) and the fix (add READ_WRITE).
-            runtime
-                .block_on(moraine::Catalog::open_read_only(object_store, options))
-                .map_err(|e| AbiError::from(e).with_read_only_attach_hint())?
-        } else {
-            runtime
-                .block_on(moraine::Catalog::open(object_store, options))
-                .map_err(AbiError::from)?
+        // Cancellable: opening a store is the one long blocking call an
+        // attach makes, and against an unreachable S3 endpoint it is the
+        // one a user is most likely to want out of. A cancelled open
+        // abandons a half-built store, so the runtime is wound down with a
+        // deadline rather than dropped — see `cancel_attach`.
+        //
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        let opened = unsafe {
+            if read_only {
+                block_on_cancellable_in(
+                    &runtime,
+                    probe,
+                    probe_ctx,
+                    moraine::Catalog::open_read_only(object_store, options),
+                )
+                // A read-only attach never bootstraps; on a fresh store the
+                // open fails, so surface the reason (DuckDB defaults remote
+                // attaches to read-only) and the fix (add READ_WRITE).
+                .map_err(AbiError::with_read_only_attach_hint)
+            } else {
+                block_on_cancellable_in(
+                    &runtime,
+                    probe,
+                    probe_ctx,
+                    moraine::Catalog::open(object_store, options),
+                )
+            }
+        };
+        let catalog = match opened {
+            Ok(catalog) => catalog,
+            Err(error) => return Err(cancel_attach(runtime, error)),
         };
 
         // Resolve the DATA_PATH object store index maintenance and backfill
@@ -770,6 +879,133 @@ pub unsafe extern "C" fn moraine_data_path(
         };
         // SAFETY: `out` is non-null and writable per the caller contract.
         unsafe { *out = path_ptr };
+        Ok(())
+    };
+
+    // SAFETY: `err` validity is this function's own safety contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(()) => codes::OK,
+        Err(code) => code,
+    }
+}
+
+/// What one [`moraine_migrate`] call did.
+#[repr(C)]
+pub struct MoraineMigrationReport {
+    /// The structural format the store carried when the call began.
+    pub from_format: u64,
+    /// The format it carries now. Equal to `from_format` when there was
+    /// nothing to run.
+    pub to_format: u64,
+    /// Whether the call resumed a migration a previous run left partly
+    /// applied, rather than starting from a settled store.
+    pub resumed: bool,
+    /// Comma-separated names of the units that ran, in order, or null when
+    /// none did. Free with [`moraine_string_free`].
+    pub units_run: *mut c_char,
+}
+
+/// Applies every structural format migration this binary carries that the
+/// store at `path` still needs.
+///
+/// Deliberately not part of [`moraine_attach`]: a rewrite takes the single
+/// writer for its duration, so it is the operator's explicit choice. It
+/// also opens the store itself, because the stores it exists to repair —
+/// those carrying a migration marker — are exactly the ones an attach
+/// refuses.
+///
+/// `checkpoint` takes a whole-store checkpoint before the first rewrite and
+/// releases it once the run is durable, leaving a manual recovery point if
+/// the migration fails partway.
+///
+/// Returns [`codes::OK`] on success, having written `*out`. On failure
+/// `*out` is left unwritten and, if `err` is non-null, `*err` carries the
+/// code and a message.
+///
+/// # Safety
+///
+/// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
+/// point to a valid [`MoraineS3Config`] whose non-null fields are valid
+/// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
+/// NUL-terminated C string. `out` must be a valid, writable
+/// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
+/// writable [`MoraineError`]. All for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_migrate(
+    path: *const c_char,
+    s3: *const MoraineS3Config,
+    flush_interval_ms: u64,
+    cache_dir: *const c_char,
+    checkpoint: bool,
+    out: *mut MoraineMigrationReport,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<(), AbiError> {
+        // Before anything that could emit an event, so a migrate failure is
+        // itself drainable.
+        crate::logging::install();
+        if out.is_null() {
+            return Err(AbiError::invalid_argument("`out` is null"));
+        }
+        // SAFETY: `path` validity is this function's own safety contract.
+        let path_str = unsafe { borrow_str(path, "path") }?;
+        // SAFETY: `cache_dir` validity is this function's own safety
+        // contract; null (or empty) means "no on-disk cache".
+        let cache_dir = unsafe { opt_borrow_str(cache_dir, "cache_dir") }?;
+        let (store_kind, prefix) = StoreKind::from_path(path_str)?;
+
+        // SAFETY: `s3` validity is this function's own safety contract.
+        let s3_creds = unsafe { borrow_s3_creds(s3) };
+
+        // Opened before the runtime for the same reason an attach does it: a
+        // bad path must not cost a runtime spun up just to be torn down.
+        let object_store = store_kind.open(path_str, s3_creds.as_ref())?;
+        let log_id = crate::logging::allocate_handle_id();
+        let _log_guard = crate::logging::enter_handle(log_id);
+        // A one-shot runtime for one operation, with no host thread
+        // setting to take after: the floor is all it needs.
+        let runtime = new_runtime(log_id, 0).map_err(|e| {
+            AbiError::new(
+                codes::INTERNAL,
+                format!("failed to start tokio runtime: {e}"),
+            )
+        })?;
+
+        // `CatalogOptions` is `#[non_exhaustive]`, so it is built through
+        // `default()` and field assignment rather than a struct literal.
+        let mut options = moraine::CatalogOptions::default();
+        options.path = prefix;
+        // 0 means "not given": the default cadence stands. `u64::MAX` is the
+        // shim's sentinel for an explicit zero interval. `flush_interval_ms`
+        // is a deprecated alias for the commit batch window.
+        match flush_interval_ms {
+            0 => {}
+            u64::MAX => options.commit_batch_window = std::time::Duration::ZERO,
+            ms => options.commit_batch_window = std::time::Duration::from_millis(ms),
+        }
+        options.cache_dir = cache_dir.map(std::path::PathBuf::from);
+
+        let mut request = moraine::MigrationRequest::default();
+        request.checkpoint = checkpoint;
+
+        let report = runtime
+            .block_on(moraine::Catalog::migrate(object_store, options, request))
+            .map_err(AbiError::from)?;
+
+        let units_run = if report.units_run.is_empty() {
+            ptr::null_mut()
+        } else {
+            to_c_string(&report.units_run.join(","))?.into_raw()
+        };
+        // SAFETY: `out` is non-null and writable per the caller contract.
+        unsafe {
+            *out = MoraineMigrationReport {
+                from_format: report.from_format,
+                to_format: report.to_format,
+                resumed: report.resumed,
+                units_run,
+            };
+        }
         Ok(())
     };
 
@@ -1985,6 +2221,172 @@ pub unsafe extern "C" fn moraine_leader_stop(handle: *mut MoraineCatalogHandle) 
     let _ = catch_unwind(AssertUnwindSafe(attempt));
 }
 
+/// One subspace's row of a store census, as returned by
+/// [`moraine_store_census`].
+#[repr(C)]
+pub struct MoraineSubspaceCensus {
+    /// The subspace's name, owned — free via [`moraine_store_census_free`].
+    pub subspace: *mut c_char,
+    /// Physical bytes across its SSTs.
+    pub bytes: u64,
+    /// SSTs not yet merged into a sorted run.
+    pub l0_ssts: u32,
+    /// Sorted runs. A merge collapses these to one.
+    pub sorted_runs: u32,
+    /// SSTs across those runs.
+    pub sorted_run_ssts: u32,
+    /// Whether the live fields carry a count; false unless the census was
+    /// asked to scan.
+    pub has_live: bool,
+    /// Live keys a reader would see.
+    pub live_keys: u64,
+    /// Encoded bytes of those keys.
+    pub live_key_bytes: u64,
+    /// Encoded bytes of their values.
+    pub live_value_bytes: u64,
+    /// Deletion-schedule entries among the live keys.
+    pub scheduled_files: u64,
+}
+
+/// Store-wide object totals, as returned by [`moraine_store_census`].
+#[repr(C)]
+pub struct MoraineStoreObjects {
+    /// Whether the store could be listed at all. False leaves every other
+    /// field zero — read-only credentials often grant `GetObject` without
+    /// `ListBucket`.
+    pub listed: bool,
+    /// Every object under the store's prefix.
+    pub total_objects: u64,
+    /// Bytes across all of them.
+    pub total_bytes: u64,
+    /// Write-ahead log objects, replayed by an unpinned read attach.
+    pub wal_objects: u64,
+    /// Bytes across those.
+    pub wal_bytes: u64,
+    /// Manifest versions.
+    pub manifest_objects: u64,
+    /// Bytes across those.
+    pub manifest_bytes: u64,
+    /// Sorted-string tables — the only bytes a merge reclaims.
+    pub sst_objects: u64,
+    /// Bytes across those.
+    pub sst_bytes: u64,
+    /// Everything else the layout carries.
+    pub other_objects: u64,
+    /// Bytes across those.
+    pub other_bytes: u64,
+}
+
+/// Measures the store, one row per subspace, and writes the manifest
+/// version measured to `*out_manifest_id` and the store-wide object totals
+/// to `*out_objects`.
+///
+/// `count_live_entries` adds a scan of every subspace, which costs a full
+/// read of the store; without it the call reads the manifest alone.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; the out-parameters
+/// must be writable, and `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_store_census(
+    handle: *mut MoraineCatalogHandle,
+    count_live_entries: bool,
+    out_items: *mut *mut MoraineSubspaceCensus,
+    out_len: *mut usize,
+    out_manifest_id: *mut u64,
+    out_objects: *mut MoraineStoreObjects,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce =
+        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceCensus>, AbiError> {
+            // `CensusRequest` is `#[non_exhaustive]`, so it is built
+            // through `default()` and field assignment.
+            let mut request = moraine::CensusRequest::default();
+            request.count_live_entries = count_live_entries;
+
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            let census = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.store_census(request),
+                )
+            }?;
+
+            if !out_manifest_id.is_null() {
+                // SAFETY: caller contract — non-null means writable.
+                unsafe { *out_manifest_id = census.manifest_id };
+            }
+            if !out_objects.is_null() {
+                let objects = census.objects.unwrap_or_default();
+                // SAFETY: caller contract — non-null means writable.
+                unsafe {
+                    *out_objects = MoraineStoreObjects {
+                        listed: census.objects.is_some(),
+                        total_objects: objects.total_objects,
+                        total_bytes: objects.total_bytes,
+                        wal_objects: objects.wal_objects,
+                        wal_bytes: objects.wal_bytes,
+                        manifest_objects: objects.manifest_objects,
+                        manifest_bytes: objects.manifest_bytes,
+                        sst_objects: objects.sst_objects,
+                        sst_bytes: objects.sst_bytes,
+                        other_objects: objects.other_objects,
+                        other_bytes: objects.other_bytes,
+                    };
+                }
+            }
+
+            // Owned-first: no raw pointers until every string converts.
+            let owned: Vec<(CString, &moraine::SubspaceCensus)> = census
+                .subspaces
+                .iter()
+                .map(|subspace| Ok((to_c_string(&subspace.subspace.to_string())?, subspace)))
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(name, subspace)| {
+                    let live = subspace.live.unwrap_or_default();
+                    MoraineSubspaceCensus {
+                        subspace: name.into_raw(),
+                        bytes: subspace.bytes,
+                        l0_ssts: subspace.l0_ssts,
+                        sorted_runs: subspace.sorted_runs,
+                        sorted_run_ssts: subspace.sorted_run_ssts,
+                        has_live: subspace.live.is_some(),
+                        live_keys: live.keys,
+                        live_key_bytes: live.key_bytes,
+                        live_value_bytes: live.value_bytes,
+                        scheduled_files: live.scheduled_files,
+                    }
+                })
+                .collect())
+        };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_store_census`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_store_census`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_store_census_free(items: *mut MoraineSubspaceCensus, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |row| free_c_string(row.subspace));
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
 /// Reports the leader role: whether this catalog holds it right now, the
 /// forwarded sessions open, and the commits landed through the funnel since it
 /// bound. A handle not leading reports `false`/`0`/`0`.
@@ -2042,6 +2444,194 @@ pub unsafe extern "C" fn moraine_leader_status(
         Err(code) => code,
     }
 }
+
+/// One subspace's merge, as returned by [`moraine_compact_store`].
+#[repr(C)]
+pub struct MoraineSubspaceMerge {
+    /// The subspace merged, owned — free via [`moraine_compact_store_free`].
+    pub subspace: *mut c_char,
+    /// `"completed"`, `"failed"`, `"pending"`, or `"skipped"`, owned.
+    pub outcome: *mut c_char,
+    /// The failure message or the skip reason; empty otherwise. Owned.
+    pub detail: *mut c_char,
+    /// Physical bytes before the merge was submitted.
+    pub bytes_before: u64,
+    /// Whether `bytes_after` carries a measurement; false unless the merge
+    /// committed.
+    pub has_bytes_after: bool,
+    /// Physical bytes after it committed.
+    pub bytes_after: u64,
+}
+
+/// Merges each targeted subspace's sorted runs into one.
+///
+/// `subspace` names one subspace, or is null for every one. `wait_ms` of 0
+/// returns as soon as the merges are submitted; otherwise the call waits
+/// that long for each to commit, and a merge that outlives the wait keeps
+/// running and is reported pending.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; the out-parameters
+/// must be writable, and `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_compact_store(
+    handle: *mut MoraineCatalogHandle,
+    subspace: *const c_char,
+    wait_ms: u64,
+    out_items: *mut *mut MoraineSubspaceMerge,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce =
+        |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineSubspaceMerge>, AbiError> {
+            // `CompactStoreRequest` is `#[non_exhaustive]`, so it is built
+            // through `default()` and field assignment.
+            let mut request = moraine::CompactStoreRequest::default();
+            if !subspace.is_null() {
+                // SAFETY: caller contract for the string pointer.
+                let name = unsafe { borrow_str(subspace, "subspace") }?;
+                request.target = moraine::CompactionTarget::Subspace(parse_subspace(name)?);
+            }
+            if wait_ms > 0 {
+                request.wait = Some(Duration::from_millis(wait_ms));
+            }
+
+            // SAFETY: caller contract for `probe`/`probe_ctx`.
+            let report = unsafe {
+                handle_ref.block_on_cancellable(
+                    probe,
+                    probe_ctx,
+                    handle_ref.catalog.compact_store(request),
+                )
+            }?;
+
+            // Owned-first: no raw pointers until every string converts.
+            let owned: Vec<(CString, CString, CString, &moraine::SubspaceMerge)> = report
+                .merges
+                .iter()
+                .map(|merge| {
+                    let (outcome, detail) = match &merge.outcome {
+                        moraine::MergeOutcome::Completed => ("completed", String::new()),
+                        moraine::MergeOutcome::Failed(why) => ("failed", why.clone()),
+                        moraine::MergeOutcome::Pending => ("pending", String::new()),
+                        moraine::MergeOutcome::Skipped(why) => ("skipped", (*why).to_string()),
+                        // `MergeOutcome` is `#[non_exhaustive]`: a variant
+                        // this build does not know still gets a row.
+                        _ => ("unknown", String::new()),
+                    };
+                    Ok((
+                        to_c_string(&merge.subspace.to_string())?,
+                        to_c_string(outcome)?,
+                        to_c_string(&detail)?,
+                        merge,
+                    ))
+                })
+                .collect::<Result<_, AbiError>>()?;
+            Ok(owned
+                .into_iter()
+                .map(|(subspace, outcome, detail, merge)| MoraineSubspaceMerge {
+                    subspace: subspace.into_raw(),
+                    outcome: outcome.into_raw(),
+                    detail: detail.into_raw(),
+                    bytes_before: merge.bytes_before,
+                    has_bytes_after: merge.bytes_after.is_some(),
+                    bytes_after: merge.bytes_after.unwrap_or(0),
+                })
+                .collect())
+        };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_compact_store`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a
+/// matching [`moraine_compact_store`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_compact_store_free(items: *mut MoraineSubspaceMerge, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above.
+        unsafe {
+            free_array(items, len, |row| {
+                free_c_string(row.subspace);
+                free_c_string(row.outcome);
+                free_c_string(row.detail);
+            });
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Whether `name` is a subspace a merge can target.
+///
+/// Exposed separately from [`moraine_compact_store`] because an attach
+/// validates its options before any catalog is open: a name checked only
+/// when a pass runs would let a typo attach cleanly and then fail every
+/// scheduled pass, unattended, for as long as it stood.
+///
+/// # Safety
+///
+/// `name`, if non-null, must be a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_subspace_is_known(name: *const c_char) -> bool {
+    let attempt = || {
+        if name.is_null() {
+            return false;
+        }
+        // SAFETY: caller contract for `name`.
+        let Ok(name) = (unsafe { CStr::from_ptr(name) }).to_str() else {
+            return false;
+        };
+        parse_subspace(name).is_ok()
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(false)
+}
+
+/// The subspaces a merge can target, comma-separated, for an error
+/// message. Owned — free via `moraine_error_free`; null if allocation
+/// fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn moraine_subspace_names() -> *mut c_char {
+    let attempt = || {
+        let names: Vec<String> = KNOWN_SUBSPACES.iter().map(ToString::to_string).collect();
+        to_c_string(&names.join(", ")).map_or(ptr::null_mut(), CString::into_raw)
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(ptr::null_mut())
+}
+
+/// The subspace `name` refers to, by the name a census prints.
+fn parse_subspace(name: &str) -> Result<moraine::SubspaceName, AbiError> {
+    KNOWN_SUBSPACES
+        .iter()
+        .find(|known| known.to_string() == name)
+        .cloned()
+        .ok_or_else(|| {
+            let known: Vec<String> = KNOWN_SUBSPACES.iter().map(ToString::to_string).collect();
+            AbiError::invalid_argument(format!(
+                "unknown subspace \"{name}\"; known subspaces are: {}",
+                known.join(", ")
+            ))
+        })
+}
+
+/// The subspaces a merge target may name. An unknown segment addresses no
+/// keys, so it is deliberately absent.
+const KNOWN_SUBSPACES: [moraine::SubspaceName; 8] = [
+    moraine::SubspaceName::System,
+    moraine::SubspaceName::Snapshot,
+    moraine::SubspaceName::Current,
+    moraine::SubspaceName::History,
+    moraine::SubspaceName::Inline,
+    moraine::SubspaceName::Index,
+    moraine::SubspaceName::SchemaVersion,
+    moraine::SubspaceName::Changelog,
+];
 
 /// Lists a table's live equality indexes.
 ///
@@ -2603,7 +3193,7 @@ mod tests {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
     };
 
@@ -2611,7 +3201,10 @@ mod tests {
     use object_store::local::LocalFileSystem;
 
     use super::*;
-    use crate::test_support::{TempDir, attach_ok};
+    use crate::{
+        staged::moraine_tx_commit,
+        test_support::{TempDir, attach_ok, begin},
+    };
 
     /// Seeds a catalog directly through the `moraine` API with one
     /// schema, one table with two columns and one data file, and one
@@ -2660,6 +3253,7 @@ mod tests {
                             file_size_bytes: 1024,
                             footer_size: 64,
                             encryption_key: None,
+                            partition_values: vec![],
                             column_stats: vec![],
                         },
                         &[],
@@ -2722,6 +3316,7 @@ mod tests {
                             file_size_bytes: 1024,
                             footer_size: 64,
                             encryption_key: None,
+                            partition_values: vec![],
                             column_stats: vec![],
                         },
                         &[],
@@ -3096,6 +3691,10 @@ mod tests {
                 0,
                 ptr::null(),
                 c_bad.as_ptr(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut bad_handle,
                 &raw mut bad_err,
             )
@@ -3128,6 +3727,10 @@ mod tests {
                 0,
                 ptr::null(),
                 c_good.as_ptr(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut good_handle,
                 &raw mut good_err,
             )
@@ -3163,6 +3766,10 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3204,6 +3811,188 @@ mod tests {
             )
         };
         assert_eq!(code, codes::OK, "maintain with null out-params failed");
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The census ABI names every subspace, writes the manifest version
+    /// through its slot, and carries the live counts only when asked.
+    #[test]
+    fn census_reports_every_subspace_through_the_abi() {
+        let dir = TempDir::new("census-abi");
+        seed(dir.path());
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "attach failed");
+
+        for count_live in [false, true] {
+            let mut items: *mut MoraineSubspaceCensus = ptr::null_mut();
+            let mut len = 0usize;
+            let mut manifest_id = u64::MAX;
+            let mut objects = MoraineStoreObjects {
+                listed: false,
+                total_objects: 0,
+                total_bytes: 0,
+                wal_objects: 0,
+                wal_bytes: 0,
+                manifest_objects: 0,
+                manifest_bytes: 0,
+                sst_objects: 0,
+                sst_bytes: 0,
+                other_objects: 0,
+                other_bytes: 0,
+            };
+            // SAFETY: `handle` is live; every slot is a writable local.
+            let code = unsafe {
+                moraine_store_census(
+                    handle,
+                    count_live,
+                    &raw mut items,
+                    &raw mut len,
+                    &raw mut manifest_id,
+                    &raw mut objects,
+                    None,
+                    ptr::null_mut(),
+                    &raw mut err,
+                )
+            };
+            assert_eq!(code, codes::OK, "census failed");
+            assert!(len >= KNOWN_SUBSPACES.len(), "only {len} subspaces");
+            assert_ne!(manifest_id, u64::MAX, "manifest version not written");
+            // A local store lists fine, and a store that has been written
+            // holds at least a manifest.
+            assert!(objects.listed, "store not listed");
+            assert!(objects.total_objects > 0, "no objects counted");
+            assert!(objects.manifest_objects > 0, "no manifest counted");
+
+            // SAFETY: `items`/`len` are what the call just wrote.
+            let rows = unsafe { std::slice::from_raw_parts(items, len) };
+            for row in rows {
+                // SAFETY: every row owns a valid C string.
+                let name = unsafe { CStr::from_ptr(row.subspace) };
+                assert!(!name.to_bytes().is_empty());
+                assert_eq!(row.has_live, count_live, "{name:?}");
+            }
+            assert!(
+                rows.iter().any(|row| {
+                    // SAFETY: as above.
+                    unsafe { CStr::from_ptr(row.subspace) }.to_bytes() == b"current"
+                }),
+                "no `current` row"
+            );
+
+            // SAFETY: freed exactly once, with the matching length.
+            unsafe { moraine_store_census_free(items, len) };
+        }
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The merge ABI reports one row per subspace, and refuses a subspace
+    /// name it does not know rather than merging the wrong tree.
+    #[test]
+    fn compact_store_reports_rows_and_refuses_unknown_subspaces() {
+        let dir = TempDir::new("compact-abi");
+        seed(dir.path());
+        let c_path = dir.c_path();
+
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: all pointers are valid C strings / local slots.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "attach failed");
+
+        // A seeded store has no sorted runs, so every subspace is skipped
+        // and none reports bytes after.
+        let mut items: *mut MoraineSubspaceMerge = ptr::null_mut();
+        let mut len = 0usize;
+        // SAFETY: `handle` is live; every slot is a writable local.
+        let code = unsafe {
+            moraine_compact_store(
+                handle,
+                ptr::null(),
+                1_000,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "compact_store failed");
+        assert_eq!(len, KNOWN_SUBSPACES.len());
+
+        // SAFETY: `items`/`len` are what the call just wrote.
+        let rows = unsafe { std::slice::from_raw_parts(items, len) };
+        for row in rows {
+            // SAFETY: every row owns valid C strings.
+            let outcome = unsafe { CStr::from_ptr(row.outcome) };
+            assert_eq!(outcome.to_bytes(), b"skipped");
+            assert!(!row.has_bytes_after);
+            // SAFETY: as above.
+            let detail = unsafe { CStr::from_ptr(row.detail) };
+            assert!(!detail.to_bytes().is_empty(), "a skip states its reason");
+        }
+        // SAFETY: freed exactly once, with the matching length.
+        unsafe { moraine_compact_store_free(items, len) };
+
+        let unknown = CString::new("gcfile").expect("no interior nul");
+        // SAFETY: `handle` is live; the name is a valid C string.
+        let code = unsafe {
+            moraine_compact_store(
+                handle,
+                unknown.as_ptr(),
+                0,
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INVALID_ARGUMENT);
+        if !err.message.is_null() {
+            // SAFETY: the guard wrote an owned message.
+            unsafe { moraine_error_free(err.message) };
+        }
 
         // SAFETY: freed exactly once.
         unsafe { moraine_detach(handle) };
@@ -3287,6 +4076,10 @@ mod tests {
                 0,
                 ptr::null(),
                 c_data.as_ptr(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3321,6 +4114,10 @@ mod tests {
                 0,
                 ptr::null(),
                 c_safe.as_ptr(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut ok_handle,
                 &raw mut ok_err,
             )
@@ -3357,6 +4154,10 @@ mod tests {
                 0,
                 ptr::null(),
                 c_first.as_ptr(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut first_handle,
                 &raw mut first_err,
             )
@@ -3385,6 +4186,10 @@ mod tests {
                 0,
                 ptr::null(),
                 c_other.as_ptr(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut other_handle,
                 &raw mut other_err,
             )
@@ -3423,6 +4228,10 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3466,6 +4275,10 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3804,6 +4617,10 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3839,6 +4656,10 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -3893,6 +4714,10 @@ mod tests {
                 0,
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
+                0,
+                None,
+                ptr::null_mut(),
                 &raw mut handle,
                 &raw mut err,
             )
@@ -4055,6 +4880,102 @@ mod tests {
         unsafe { moraine_detach(handle) };
     }
 
+    /// An interrupt that arrives once the operation has already produced
+    /// its result changes nothing: there is nothing left to cancel, so the
+    /// result is reported.
+    ///
+    /// This is the third of cancellation's three cases, and the one with
+    /// no ambiguity in it. The probe here fires only after the future's
+    /// last act, which is exactly the ordering the case describes.
+    #[test]
+    fn an_interrupt_after_the_result_is_known_still_reports_it() {
+        unsafe extern "C" fn probe_flag(probe_ctx: *mut c_void) -> bool {
+            // SAFETY: this test passes a valid `AtomicBool` pointer below.
+            unsafe { &*probe_ctx.cast::<AtomicBool>() }.load(Ordering::SeqCst)
+        }
+
+        let dir = TempDir::new("probe-after-result");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let interrupted = AtomicBool::new(false);
+        // SAFETY: `handle` came from `attach_ok` and is still attached.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `interrupted` outlives the call; the probe only reads it
+        // atomically.
+        let result: Result<u32, AbiError> = unsafe {
+            handle_ref.block_on_cancellable(
+                Some(probe_flag),
+                (&raw const interrupted).cast_mut().cast(),
+                async {
+                    // The host's interrupt lands here: after the work is
+                    // done, before the bridge has returned.
+                    interrupted.store(true, Ordering::SeqCst);
+                    Ok::<_, moraine::Error>(9u32)
+                },
+            )
+        };
+        assert_eq!(
+            result.unwrap_or(0),
+            9,
+            "an interrupt past the point of no return must not discard a known result"
+        );
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The staged-row commit honors its probe, and a commit refused before
+    /// it ran leaves the catalog exactly where it was.
+    #[test]
+    fn probe_cancels_a_staged_commit_and_nothing_lands() {
+        let dir = TempDir::new("probe-tx-commit");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+        let before = snapshot_id_of(handle);
+
+        let tx = begin(handle);
+        let mut snapshot_id = 0u64;
+        let mut err = MoraineError::default();
+        // SAFETY: `tx` came from `begin` and is consumed exactly once;
+        // the out-params are local slots; `probe_always` accepts a null
+        // context.
+        let code = unsafe {
+            moraine_tx_commit(
+                tx,
+                &raw mut snapshot_id,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        assert_eq!(
+            snapshot_id_of(handle),
+            before,
+            "an interrupted commit must not advance head"
+        );
+
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// The head this handle reports, for the cases that assert a commit
+    /// left it alone.
+    fn snapshot_id_of(handle: *mut MoraineCatalogHandle) -> u64 {
+        // SAFETY: `handle` is attached for the duration of the caller.
+        let handle_ref = unsafe { &*handle };
+        handle_ref
+            .block_on(handle_ref.catalog.snapshot())
+            .expect("read head")
+            .current_snapshot()
+            .id
+            .get()
+    }
+
     /// The pull channel end to end: a probe reporting an interrupt cancels
     /// the snapshot (out-param unwritten), and the same handle with a
     /// quiet probe succeeds right after — the signal is level-triggered
@@ -4104,6 +5025,120 @@ mod tests {
             moraine_snapshot_free(snap2);
             moraine_detach(handle);
         }
+    }
+
+    /// Cancellation is per call, not per handle: two reads in flight on
+    /// one handle carry their own probes, and interrupting one leaves the
+    /// other to finish.
+    ///
+    /// This is the shape a real session takes — DuckDB's probe is a load
+    /// of `ClientContext::interrupted`, one context per connection, and
+    /// several connections share one attached catalog. A design routing
+    /// cancellation through a single per-handle signal would let one
+    /// connection's Ctrl-C abort another's query, or be consumed by it.
+    #[test]
+    fn concurrent_reads_on_one_handle_cancel_independently() {
+        let dir = TempDir::new("probe-concurrent");
+        seed(dir.path());
+        let handle = attach_ok(dir.path());
+        let handle_address = handle as usize;
+
+        // The interrupted read never resolves on its own, so only its own
+        // probe can end it; the survivor waits for that to happen before
+        // resolving, so the two genuinely overlap.
+        let cancelled_first = Arc::new(std::sync::Barrier::new(2));
+        let waiter = Arc::clone(&cancelled_first);
+
+        let interrupted = std::thread::spawn(move || {
+            let handle = handle_address as *mut MoraineCatalogHandle;
+            // SAFETY: the handle outlives both threads — it is detached
+            // only after they are joined.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe_always` accepts a null context.
+            let result: Result<(), AbiError> = unsafe {
+                handle_ref.block_on_cancellable(
+                    Some(probe_always),
+                    ptr::null_mut(),
+                    std::future::pending::<Result<(), moraine::Error>>(),
+                )
+            };
+            cancelled_first.wait();
+            result
+        });
+
+        let survivor = std::thread::spawn(move || {
+            let handle = handle_address as *mut MoraineCatalogHandle;
+            // SAFETY: as above.
+            let handle_ref = unsafe { &*handle };
+            // SAFETY: `probe_never` accepts a null context.
+            unsafe {
+                handle_ref.block_on_cancellable(Some(probe_never), ptr::null_mut(), async move {
+                    waiter.wait();
+                    Ok::<_, moraine::Error>(7u32)
+                })
+            }
+        });
+
+        assert_eq!(
+            interrupted
+                .join()
+                .expect("interrupted read")
+                .unwrap_err()
+                .code,
+            codes::INTERRUPTED
+        );
+        assert_eq!(
+            survivor.join().expect("surviving read").unwrap(),
+            7,
+            "one read's interrupt must not cancel or be consumed by another's"
+        );
+
+        // SAFETY: both threads are joined; freed exactly once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// An attach whose probe is already firing is cancelled before the
+    /// store is opened: no handle, the interrupted code, and — the part
+    /// that matters — the call returns rather than winding down a runtime
+    /// with a half-built store still on it.
+    #[test]
+    fn attach_is_cancelled_by_a_firing_probe() {
+        let dir = TempDir::new("probe-attach");
+        seed(dir.path());
+
+        let c_path = dir.c_path();
+        let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `c_path` is a valid C string, the out-params are local
+        // slots, and `probe_always` accepts a null context.
+        let code = unsafe {
+            moraine_attach(
+                c_path.as_ptr(),
+                ptr::null(),
+                false,
+                false,
+                0,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                Some(probe_always),
+                ptr::null_mut(),
+                &raw mut handle,
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::INTERRUPTED);
+        assert_eq!(err.code, codes::INTERRUPTED);
+        assert!(handle.is_null(), "a cancelled attach writes no handle");
+        // SAFETY: populated by the failed call above, freed exactly once.
+        unsafe { moraine_error_free(err.message) };
+
+        // The store is untouched by the cancellation: a plain attach still
+        // works, so nothing was left half-initialized.
+        let handle = attach_ok(dir.path());
+        // SAFETY: freed exactly once.
+        unsafe { moraine_detach(handle) };
     }
 
     /// A lookup value coerces to the same canonical `IndexKeyValue` the

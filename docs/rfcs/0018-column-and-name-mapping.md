@@ -34,8 +34,14 @@ writes them.
 Non-goals:
 
 - **A verb-path API.** DuckLake has no mapping DDL — mappings are a side
-  effect of `ducklake_add_data_files` — and the embedding API has no
-  consumer registering foreign Parquet today.
+  effect of `ducklake_add_data_files` — and moraine does not expect to
+  serve foreign Parquet, so the embedding surface will not grow a
+  `create_mapping` verb or a way to point a registered file at a mapping.
+  This is a settled position, not a deferral: a file the verb surface
+  registers is one the host wrote against the table's own columns, which
+  needs no mapping to resolve. The staged path serves the one writer that
+  does create them, for a user who issues `ducklake_add_data_files` through
+  the extension, and that is what the rest of this RFC specifies.
 - **Using mappings.** moraine never reads Parquet; resolving a file's
   columns through its mapping is DuckLake's scanner's job. moraine stores
   and serves.

@@ -140,6 +140,7 @@ fn seed(dir: &Path) {
                         file_size_bytes: 0,
                         footer_size: 0,
                         encryption_key: None,
+                        partition_values: vec![],
                         column_stats: vec![],
                     },
                     &[],

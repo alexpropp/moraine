@@ -19,7 +19,7 @@
 //! stamps on its own — so a mismatch is drift caught loudly.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -54,11 +54,14 @@ mod decode;
 #[cfg(feature = "leader")]
 pub(crate) mod forward;
 mod index_upkeep;
-mod inline;
+pub(crate) mod inline;
 #[cfg(test)]
 mod tests;
 
-use apply::{ChildRows, apply_op, build_snapshot_value, collect_child_rows, is_inline_op};
+use apply::{
+    ChildRows, apply_op, build_snapshot_value, collect_child_rows, collect_hard_deletes,
+    is_inline_op,
+};
 use decode::Cursor;
 use index_upkeep::stage_index_maintenance;
 use inline::translate_inline;
@@ -99,9 +102,11 @@ pub enum TableKind {
     /// `(begin_snapshot, schema_version, table_id)` row per
     /// created-or-schema-altered table per commit. The first two values
     /// are always the committing snapshot's own id and `schema_version`,
-    /// so the table-id set is the only new information — folded into the
-    /// snapshot record's `schema_changed_table_ids`, with both redundant values
-    /// validated against the `ducklake_snapshot` row in the same batch.
+    /// validated against the `ducklake_snapshot` row in the same batch
+    /// rather than trusted. Each row lands as a `schema_version` record of
+    /// its own — the snapshot record names the same tables, but expiry
+    /// deletes it and a data file older than every surviving snapshot
+    /// still has to resolve the version it was written under.
     SchemaVersions,
     /// `ducklake_partition_info`.
     PartitionInfo,
@@ -130,13 +135,19 @@ pub enum TableKind {
     ColumnMapping,
     /// `ducklake_name_mapping` — folded into its mapping's record.
     NameMapping,
+    /// `ducklake_metadata`: catalog options, keyed by `(key, scope,
+    /// scope_id)`. Outside the snapshot protocol — DuckLake writes it
+    /// within its metadata connection, minting no snapshot and bumping no
+    /// schema version — so its rows overwrite the scope's option record in
+    /// place, last write wins.
+    Metadata,
 }
 
 impl TableKind {
     /// Every kind, in wire-discriminant order — the decode table for the
     /// ABI's `table_kind` values. A new variant added anywhere but the
     /// end fails the order test pinning `ALL[i] as i32 == i`.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Snapshot,
         Self::SnapshotChanges,
         Self::Schema,
@@ -162,6 +173,7 @@ impl TableKind {
         Self::MacroParameters,
         Self::ColumnMapping,
         Self::NameMapping,
+        Self::Metadata,
     ];
 }
 
@@ -292,6 +304,23 @@ pub enum RowOperation {
         row_id: u64,
         /// The commit snapshot the delete takes effect at.
         begin_snapshot: u64,
+    },
+    /// Removes one live `inline/file_delete` record — the row-grain
+    /// counterpart of [`Self::InlineFileDelete`], issued when a flush has
+    /// materialized that inlined deletion into a real delete file and the
+    /// inlined form must go, or the row would be counted deleted twice.
+    ///
+    /// Row-grain rather than table-wide on purpose: DuckLake's flush
+    /// happens to clear the whole table, but the operation it issues is an
+    /// ordinary SQL `DELETE`, and translating it per row means a filtered
+    /// one removes exactly what it matched instead of everything.
+    InlineFileDeleteRemove {
+        /// Owning table.
+        table_id: u64,
+        /// The data file the removed deletion targeted.
+        data_file_id: u64,
+        /// The row the removed deletion killed.
+        row_id: u64,
     },
     /// Removes every `inline/insert` chunk begun at or before
     /// `flush_snapshot` for `(table_id, schema_version)`, plus the
@@ -507,7 +536,7 @@ impl StagedTransaction {
             }
         };
 
-        let mut deleted = std::collections::BTreeSet::new();
+        let mut deleted = BTreeSet::new();
         for op in &self.ops {
             if let RowOperation::Delete {
                 table: TableKind::Snapshot,
@@ -682,6 +711,7 @@ pub(crate) async fn assemble(
             Key::Sys(SysKey::Head).encode(),
             Some(value::encode_value(&proto::HeadValue {
                 snapshot_id: new_id,
+                batch_seq: 0,
             })),
         ));
         (new_id, writes, changes_made)
@@ -816,6 +846,19 @@ fn translate(
     let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
 
+    // DuckLake mints the id from the head it read, so an id at or below the
+    // head this commit lands on means another commit landed in between.
+    // Landing it would overwrite a snapshot record and move the head
+    // backwards, and every write below stamps `new_id` as the version it
+    // begins at — so refuse it, as the lost race it is. Reporting anything
+    // else would be a wire-contract bug rather than a wording one: DuckLake
+    // re-drives on the text of the error, and a loser it does not recognize
+    // is a transaction it abandons instead of re-running against the head
+    // that won.
+    if new_id <= base.snapshot.snapshot_id {
+        return Err(staged_lost_race(new_id, ops.len()));
+    }
+
     // Ends and deletes apply before inserts, independent of DuckLake's
     // emit order: a rename ends the old version and inserts a new one
     // under the same id, and the insert must win their shared `current` key —
@@ -827,6 +870,8 @@ fn translate(
     let mut state = base.clone();
     let mut children = collect_child_rows(ops)?;
     let mut direct = Vec::new();
+    let hard_deleted = collect_hard_deletes(ops)?;
+
     for op in ops {
         if !is_inline_op(op)
             && !matches!(
@@ -834,56 +879,47 @@ fn translate(
                 RowOperation::Insert { .. } | RowOperation::UpdateSetBegin { .. }
             )
         {
-            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
-        }
-    }
-    for op in ops {
-        if matches!(op, RowOperation::Insert { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
-        }
-    }
-    for op in ops {
-        if matches!(op, RowOperation::UpdateSetBegin { .. }) {
-            apply_op(base, &mut state, op, new_id, &mut children, &mut direct)?;
+            apply_op(
+                base,
+                &mut state,
+                op,
+                new_id,
+                &mut children,
+                &mut direct,
+                &hard_deleted,
+            )?;
         }
     }
 
-    if !children.partition_columns.is_empty() {
-        return Err(corrupt_row(
-            TableKind::PartitionColumn,
-            "partition_column rows without a matching partition_info insert in this commit",
-        ));
+    for op in ops {
+        if matches!(op, RowOperation::Insert { .. }) {
+            apply_op(
+                base,
+                &mut state,
+                op,
+                new_id,
+                &mut children,
+                &mut direct,
+                &hard_deleted,
+            )?;
+        }
     }
-    if !children.sort_expressions.is_empty() {
-        return Err(corrupt_row(
-            TableKind::SortExpression,
-            "sort_expression rows without a matching sort_info insert in this commit",
-        ));
+
+    for op in ops {
+        if matches!(op, RowOperation::UpdateSetBegin { .. }) {
+            apply_op(
+                base,
+                &mut state,
+                op,
+                new_id,
+                &mut children,
+                &mut direct,
+                &hard_deleted,
+            )?;
+        }
     }
-    if !children.file_partition_values.is_empty() {
-        return Err(corrupt_row(
-            TableKind::FilePartitionValue,
-            "file_partition_value rows without a matching data_file insert in this commit",
-        ));
-    }
-    if !children.macro_implementations.is_empty() {
-        return Err(corrupt_row(
-            TableKind::MacroImpl,
-            "macro_impl rows without a matching macro insert in this commit",
-        ));
-    }
-    if !children.macro_parameters.is_empty() {
-        return Err(corrupt_row(
-            TableKind::MacroParameters,
-            "macro_parameters rows without a matching macro_impl in this commit",
-        ));
-    }
-    if !children.name_mappings.is_empty() {
-        return Err(corrupt_row(
-            TableKind::NameMapping,
-            "name_mapping rows without a matching column_mapping insert in this commit",
-        ));
-    }
+
+    refuse_orphaned_children(&children)?;
 
     // DuckLake authors column ids itself, so its inserts advance no
     // counter; float each table's field-id counter above every live id so
@@ -903,7 +939,63 @@ fn translate(
 
     let mut writes = commit::diff_writes(base, &state, new_id);
     writes.extend(direct);
+    // The `ducklake_schema_versions` rows this commit staged, as records of
+    // their own: `snapshot` carries them too, but only until expiry deletes
+    // it, and the files they describe outlive that.
+    for table_id in &snapshot.schema_changed_table_ids {
+        writes.push(commit::schema_version_write(
+            *table_id,
+            new_id,
+            snapshot.schema_version,
+        ));
+    }
+
     Ok((new_id, writes, snapshot))
+}
+
+/// Refuses child rows left over after every parent was applied. An
+/// embedded child whose parent is not in the same commit has nowhere to
+/// live, and dropping it silently would lose a partition column or a macro
+/// parameter DuckLake believes it wrote.
+fn refuse_orphaned_children(children: &ChildRows) -> Result<()> {
+    let orphans = [
+        (
+            children.partition_columns.is_empty(),
+            TableKind::PartitionColumn,
+            "partition_column rows without a matching partition_info insert in this commit",
+        ),
+        (
+            children.sort_expressions.is_empty(),
+            TableKind::SortExpression,
+            "sort_expression rows without a matching sort_info insert in this commit",
+        ),
+        (
+            children.file_partition_values.is_empty(),
+            TableKind::FilePartitionValue,
+            "file_partition_value rows without a matching data_file insert in this commit",
+        ),
+        (
+            children.macro_implementations.is_empty(),
+            TableKind::MacroImpl,
+            "macro_impl rows without a matching macro insert in this commit",
+        ),
+        (
+            children.macro_parameters.is_empty(),
+            TableKind::MacroParameters,
+            "macro_parameters rows without a matching macro_impl in this commit",
+        ),
+        (
+            children.name_mappings.is_empty(),
+            TableKind::NameMapping,
+            "name_mapping rows without a matching column_mapping insert in this commit",
+        ),
+    ];
+    for (applied, table, detail) in orphans {
+        if !applied {
+            return Err(corrupt_row(table, detail));
+        }
+    }
+    Ok(())
 }
 
 /// Translates a head-preserving maintenance commit: snapshot expiry and
@@ -923,23 +1015,38 @@ fn translate_maintenance(
     let mut state = base.clone();
     let mut children = ChildRows::default();
     let mut direct = Vec::new();
+    let hard_deleted = collect_hard_deletes(ops)?;
     for op in ops {
         let allowed = matches!(
             op,
             RowOperation::Delete { .. }
                 | RowOperation::Insert {
-                    table: TableKind::FilesScheduledForDeletion,
+                    table: TableKind::FilesScheduledForDeletion
+                        // An option write mints no snapshot by design —
+                        // DuckLake writes `ducklake_metadata` within its
+                        // metadata connection, outside the protocol — so it
+                        // arrives here exactly as reclamation does.
+                        | TableKind::Metadata,
                     ..
                 }
         ) || is_inline_op(op);
         if !allowed {
             return Err(Error::Constraint(
                 "a staged commit without a ducklake_snapshot insert may only reclaim state \
-                 (maintenance deletes and deletion-schedule inserts)"
+                 or set options (maintenance deletes, deletion-schedule inserts, and \
+                 ducklake_metadata writes)"
                     .to_string(),
             ));
         }
-        apply_op(base, &mut state, op, head, &mut children, &mut direct)?;
+        apply_op(
+            base,
+            &mut state,
+            op,
+            head,
+            &mut children,
+            &mut direct,
+            &hard_deleted,
+        )?;
     }
 
     let mut writes = commit::diff_writes(base, &state, head);

@@ -60,6 +60,8 @@ below the leading byte is moraine convention, opaque to SlateDB.
 | `current` | Live catalog entities (no `end_snapshot`) | Insert + delete |
 | `history` | Ended entity versions | Append-only |
 | `inline` | Inlined data — reserved for RFC 0005 | Per RFC 0005 |
+| `index` | Equality-index entries (RFC 0016) | Live-only; insert + delete |
+| `schema_version` | `ducklake_schema_versions` rows | Insert + delete, and never expired with the snapshot that wrote one |
 
 (Subspace declaration order — and therefore each subspace's discriminant
 byte — is fixed by the `Key` type and pinned by golden vectors; see Keys.)
@@ -149,9 +151,11 @@ Other subspaces:
 | `sys/head` | — | Latest committed `snapshot_id`, as folded (RFC 0022: the true head is this plus replay of any commit-log slots past `sys/fold`) |
 | `sys/migration` | — | Structural-migration marker (RFC 0015): `{from_format, to_format, cursor}`, present only mid-migration. **Reserved from format v1**: every materialization checks it and refuses a mid-migration store (RFC 0009) — the check must predate the first migration ever run. |
 | `sys/fold` | — | Highest commit-log sequence folded into this store (RFC 0022). Absent reads as 0. Advanced only by the folder, in the same atomic batch as the slot's records — RFC 0002's one-commit-one-batch invariant extended to a fold. |
-| `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together) |
+| `snapshot` | `snapshot_id` | `ducklake_snapshot` + `ducklake_snapshot_changes` merged into one record (1:1, always written together), plus one moraine-internal field the DuckLake grammar has no room for: the data files this commit's delete files target, so a later commit classifies a delete against it at file grain. Absent on a DuckLake-authored row, which reads back as "deletes from the whole table" |
+| `changelog` | `snapshot_id` | The encoded `current` keys one commit's batch wrote — the changelog a reader replays to advance a held view across that commit (RFC 0009). Its own subspace rather than a field of the snapshot record because snapshot records are scanned in full on a read path DuckLake takes every transaction, and the changelog measures several times their size (`BENCHMARK.md`); only a refresh reads these, one point read per snapshot in its gap. Bounded by a sliding window: each commit deletes the record N snapshots back, so nothing else — not expiry, not a maintenance sweep — has to reclaim them |
 | `current/gcfile` | `data_file_id` | `ducklake_files_scheduled_for_deletion` — keyed by the scheduled file's id, the row's identity in DuckLake's own schema (inserts carry it, cleanup deletes by it); unique because a file's catalog rows are removed in the same transaction that schedules it, so no moraine-allocated id or counter exists (RFC 0007) |
-| `inline/*` | `table_id, schema_version, …` | Reserved — RFC 0005 |
+| `inline/*` | `table_id, schema_version, …` | Inlined data — RFC 0005 owns the five kinds (`schema`, `insert`, `inline_delete`, `file_delete`, and the `file_delete_table` existence marker) |
+| `schema_version` | `table_id, begin_snapshot` | The catalog `schema_version` that snapshot minted — the third column of a `ducklake_schema_versions` row. Its own subspace rather than a field of the snapshot record, because expiry (RFC 0007) deletes snapshot records and these rows must outlive them: a data file resolves the schema version it was written under by joining its `begin_snapshot` against them, long after that snapshot is gone. Removed only by the dead-table cleanup, exactly as DuckLake's own catalogs remove them |
 
 **The commit log is not a subspace.** RFC 0022's log lives at the bucket
 prefix `commits/<seq>` — plain objects addressed directly by the object
@@ -175,6 +179,16 @@ conventions — this RFC is updated, not diverged from.
 Per-table collections (`column`, `file`, `fstat`, …) are keyed
 `table_id`-first so "everything about table T" — the unit DuckLake reads
 and invalidates — is one contiguous range per subspace.
+
+Within `fstat` the remaining components are file-major: `data_file_id`
+before `column_id`, so a file's columns sit together. Column-major would win
+only for a read that wants one column across many files, and no such read
+exists — DuckDB pushes no row filter into the served projections (RFC 0009)
+and nothing inside moraine reads statistics selectively, so the only
+operation on `fstat` is a full scan, costing the same either way. The
+ordering reopens only with server-side pruning, on the terms RFC 0009 sets;
+reversing it once the collection is large needs a migration, so that is the
+moment to weigh it.
 
 ### Value codec
 
@@ -232,18 +246,6 @@ Per RFC 0001:
   rejection — corrupt magic, truncated header, unknown encoding version —
   fails as `Corruption`, never a partial decode.
 
-## Open questions
-
-- **`fstat` key ordering.** File-major (`table_id, data_file_id,
-  column_id`) makes "all stats for one file" contiguous — the write unit
-  and the per-file predicate shape. DuckLake's own stats query filters by
-  `(table_id, column_id)` across files, which file-major serves via a
-  table-range scan filtered in memory; column-major would invert the
-  trade. The wrong choice costs a factor of the column count on wide
-  tables, so the ordering is settled against captured DuckLake stats
-  queries in e2e before the table grows migration-sized. File-major stands
-  until then.
-
 ## Alternatives considered
 
 - **Single subspace, begin/end in values:** every current read filters
@@ -273,7 +275,7 @@ Per RFC 0001:
   crash/recovery path, but the extractor is fixed per store at creation,
   making format-v1 genesis the only free adoption moment — deferring would
   price the `inline`-isolation payoff at an RFC 0015 rebuild per store.
-  The risk is testable instead: the RFC 0011 matrix runs against segmented
+  The risk is testable instead: RFC 0011's crash cases run against segmented
   stores, and the decision can still flip for free before first release.
   Prefix bloom filters (the other half of SlateDB's prefix machinery) stay
   unused — a catalog this small doesn't earn them; they can be enabled per

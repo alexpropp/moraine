@@ -36,6 +36,7 @@ pub fn datafile(rows: u64) -> DataFile {
         file_size_bytes: rows * 10,
         footer_size: 4,
         encryption_key: None,
+        partition_values: vec![],
         column_stats: vec![],
     }
 }

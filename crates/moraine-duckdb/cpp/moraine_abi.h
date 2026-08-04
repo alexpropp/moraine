@@ -33,6 +33,10 @@ enum {
 	MORAINE_INTERRUPTED = 9,
 	MORAINE_RETRY_EXHAUSTED = 10,
 	MORAINE_FENCED = 11,
+	MORAINE_MIGRATION = 12,
+	MORAINE_SNAPSHOT_EXPIRED = 13,
+	MORAINE_UNSUPPORTED = 14,
+	MORAINE_OPEN_RACED = 15,
 };
 
 
@@ -81,6 +85,12 @@ typedef struct MoraineS3Config {
   int32_t use_ssl;
 } MoraineS3Config;
 
+// A C-side cancellation probe polled while a cancellable call's core
+// future is pending; returning `true` cancels the call. `None` disables
+// the pull channel for that call. Mirrors `MoraineInterruptProbe` in
+// `cpp/moraine_abi.h`.
+typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
+
 // The `(code, message)` pair carried across the FFI boundary.
 //
 // Caller-allocated and passed by pointer to every fallible `moraine_*`
@@ -96,11 +106,20 @@ typedef struct MoraineError {
   char *message;
 } MoraineError;
 
-// A C-side cancellation probe polled while a cancellable call's core
-// future is pending; returning `true` cancels the call. `None` disables
-// the pull channel for that call. Mirrors `MoraineInterruptProbe` in
-// `cpp/moraine_abi.h`.
-typedef bool (*MoraineInterruptProbe)(void *probe_ctx);
+// What one [`moraine_migrate`] call did.
+typedef struct MoraineMigrationReport {
+  // The structural format the store carried when the call began.
+  uint64_t from_format;
+  // The format it carries now. Equal to `from_format` when there was
+  // nothing to run.
+  uint64_t to_format;
+  // Whether the call resumed a migration a previous run left partly
+  // applied, rather than starting from a settled store.
+  bool resumed;
+  // Comma-separated names of the units that ran, in order, or null when
+  // none did. Free with [`moraine_string_free`].
+  char *units_run;
+} MoraineMigrationReport;
 
 // One schema, as returned by [`moraine_snapshot_schemas`].
 typedef struct MoraineSchemaDesc {
@@ -181,6 +200,77 @@ typedef struct MoraineDataFileDesc {
   uint64_t footer_size;
 } MoraineDataFileDesc;
 
+// One subspace's row of a store census, as returned by
+// [`moraine_store_census`].
+typedef struct MoraineSubspaceCensus {
+  // The subspace's name, owned — free via [`moraine_store_census_free`].
+  char *subspace;
+  // Physical bytes across its SSTs.
+  uint64_t bytes;
+  // SSTs not yet merged into a sorted run.
+  uint32_t l0_ssts;
+  // Sorted runs. A merge collapses these to one.
+  uint32_t sorted_runs;
+  // SSTs across those runs.
+  uint32_t sorted_run_ssts;
+  // Whether the live fields carry a count; false unless the census was
+  // asked to scan.
+  bool has_live;
+  // Live keys a reader would see.
+  uint64_t live_keys;
+  // Encoded bytes of those keys.
+  uint64_t live_key_bytes;
+  // Encoded bytes of their values.
+  uint64_t live_value_bytes;
+  // Deletion-schedule entries among the live keys.
+  uint64_t scheduled_files;
+} MoraineSubspaceCensus;
+
+// Store-wide object totals, as returned by [`moraine_store_census`].
+typedef struct MoraineStoreObjects {
+  // Whether the store could be listed at all. False leaves every other
+  // field zero — read-only credentials often grant `GetObject` without
+  // `ListBucket`.
+  bool listed;
+  // Every object under the store's prefix.
+  uint64_t total_objects;
+  // Bytes across all of them.
+  uint64_t total_bytes;
+  // Write-ahead log objects, replayed by an unpinned read attach.
+  uint64_t wal_objects;
+  // Bytes across those.
+  uint64_t wal_bytes;
+  // Manifest versions.
+  uint64_t manifest_objects;
+  // Bytes across those.
+  uint64_t manifest_bytes;
+  // Sorted-string tables — the only bytes a merge reclaims.
+  uint64_t sst_objects;
+  // Bytes across those.
+  uint64_t sst_bytes;
+  // Everything else the layout carries.
+  uint64_t other_objects;
+  // Bytes across those.
+  uint64_t other_bytes;
+} MoraineStoreObjects;
+
+// One subspace's merge, as returned by [`moraine_compact_store`].
+typedef struct MoraineSubspaceMerge {
+  // The subspace merged, owned — free via [`moraine_compact_store_free`].
+  char *subspace;
+  // `"completed"`, `"failed"`, `"pending"`, or `"skipped"`, owned.
+  char *outcome;
+  // The failure message or the skip reason; empty otherwise. Owned.
+  char *detail;
+  // Physical bytes before the merge was submitted.
+  uint64_t bytes_before;
+  // Whether `bytes_after` carries a measurement; false unless the merge
+  // committed.
+  bool has_bytes_after;
+  // Physical bytes after it committed.
+  uint64_t bytes_after;
+} MoraineSubspaceMerge;
+
 // One index, as returned by [`moraine_indexes`].
 typedef struct MoraineIndexDesc {
   // The index's id.
@@ -225,6 +315,13 @@ typedef struct MoraineRowLocation {
   // Whether the row is inlined (or not resolvable to a dense-range file).
   bool is_inline;
 } MoraineRowLocation;
+
+// One checkpoint the store's manifest carries.
+typedef struct MoraineCheckpoint {
+  // The checkpoint's id, in the form `moraine_attach`'s `checkpoint`
+  // takes. Owned by the array.
+  char *id;
+} MoraineCheckpoint;
 
 // A byte buffer owned by Rust and freed via [`moraine_arrow_bytes_free`].
 typedef struct MoraineArrowBytes {
@@ -533,6 +630,20 @@ typedef struct MoraineNameMappingRow {
   // `is_partition`.
   bool is_partition;
 } MoraineNameMappingRow;
+
+// One `ducklake_metadata` row, as returned by [`moraine_dump_options`].
+typedef struct MoraineOptionRow {
+  // `key`, owned.
+  char *key;
+  // `value`, owned.
+  char *value;
+  // `scope`, owned, null for a global option.
+  char *scope;
+  // Whether `scope_id` is present.
+  bool has_scope_id;
+  // `scope_id`, valid iff `has_scope_id`.
+  uint64_t scope_id;
+} MoraineOptionRow;
 
 // One `ducklake_partition_info` row, as returned by
 // [`moraine_dump_partition_info`]. Partition columns
@@ -848,6 +959,39 @@ extern "C" {
 // already-initialized store, whose stored flag
 // ([`moraine_catalog_encrypted`]) is authoritative.
 //
+// `checkpoint` pins a **read-only** attach to an existing SlateDB
+// checkpoint (see [`moraine_create_checkpoint`]), so the open writes
+// nothing at all — no manifest record of the reader, no refresh, no
+// delete on close — and serves a fixed cut that never advances. Null or
+// empty follows the latest manifest; a non-null value with `read_only`
+// false is [`codes::INVALID_ARGUMENT`].
+//
+// `host_threads` is how many execution threads the calling host runs, and
+// sizes this handle's worker pool: the host's setting is the only number
+// in the process that says how much parallelism the operator asked for,
+// so a session pinned to one thread does not get a pool sized to the
+// machine. It is clamped to a floor of two (a CPU-bound poll must not be
+// able to stall SlateDB's flush) and a ceiling of eight (the pool waits
+// on object storage, which yields its worker at every await, so further
+// workers only park — on cores the host already sized itself to). `0`
+// means the host does not say and takes the floor. The size is fixed for
+// the handle's life; a host that changes its own thread count afterwards
+// keeps the pool it attached with.
+//
+// Cancellable via `probe`/`probe_ctx`, exactly as the read entry points
+// are: the store open is the one long blocking call an attach makes, and
+// against an unreachable endpoint it is the one worth escaping. A
+// cancelled attach returns [`codes::INTERRUPTED`], writes no handle, and
+// leaves nothing attached. It may still have fenced a writer that was
+// attached before it — an attach takes the writer epoch before it can
+// know whether it will finish — so the previously attached process must
+// re-attach either way, exactly as after any failed attach.
+//
+// [`moraine_detach`] takes no probe and never will: it is teardown, and
+// an interrupt part-way through would either leak the handle or leave
+// the store half-closed. Cancellation exists to escape a wait, and
+// detach's wait is the flush that makes committed data durable.
+//
 // Returns [`codes::OK`] on success. On failure, `*out` is left
 // unwritten and, if `err` is non-null, `*err` carries the code and a
 // message.
@@ -856,9 +1000,13 @@ extern "C" {
 //
 // `path` must be a valid NUL-terminated C string. `s3`, if non-null,
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
-// valid NUL-terminated C strings. `out` must be a valid, writable
-// `*mut *mut MoraineCatalogHandle`. `err`, if non-null, must be a valid,
-// writable [`MoraineError`]. All for the duration of this call.
+// valid NUL-terminated C strings. `cache_dir`, `data_path`, and
+// `checkpoint`, if non-null, must be valid NUL-terminated C strings.
+// `host_threads` is unconstrained.
+// `probe`, if non-null, must be safe to call with `probe_ctx` from any
+// thread. `out` must be a valid, writable `*mut *mut
+// MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
+// [`MoraineError`]. All for the duration of this call.
 int32_t moraine_attach(const char *path,
                        const struct MoraineS3Config *s3,
                        bool read_only,
@@ -866,6 +1014,10 @@ int32_t moraine_attach(const char *path,
                        uint64_t flush_interval_ms,
                        const char *cache_dir,
                        const char *data_path,
+                       const char *checkpoint,
+                       uint64_t host_threads,
+                       MoraineInterruptProbe probe,
+                       void *probe_ctx,
                        struct MoraineCatalogHandle **out,
                        struct MoraineError *err);
 
@@ -889,6 +1041,39 @@ int32_t moraine_data_path(struct MoraineCatalogHandle *handle,
                           void *probe_ctx,
                           char **out,
                           struct MoraineError *err);
+
+// Applies every structural format migration this binary carries that the
+// store at `path` still needs.
+//
+// Deliberately not part of [`moraine_attach`]: a rewrite takes the single
+// writer for its duration, so it is the operator's explicit choice. It
+// also opens the store itself, because the stores it exists to repair —
+// those carrying a migration marker — are exactly the ones an attach
+// refuses.
+//
+// `checkpoint` takes a whole-store checkpoint before the first rewrite and
+// releases it once the run is durable, leaving a manual recovery point if
+// the migration fails partway.
+//
+// Returns [`codes::OK`] on success, having written `*out`. On failure
+// `*out` is left unwritten and, if `err` is non-null, `*err` carries the
+// code and a message.
+//
+// # Safety
+//
+// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
+// point to a valid [`MoraineS3Config`] whose non-null fields are valid
+// NUL-terminated C strings. `cache_dir`, if non-null, must be a valid
+// NUL-terminated C string. `out` must be a valid, writable
+// [`MoraineMigrationReport`]. `err`, if non-null, must be a valid,
+// writable [`MoraineError`]. All for the duration of this call.
+int32_t moraine_migrate(const char *path,
+                        const struct MoraineS3Config *s3,
+                        uint64_t flush_interval_ms,
+                        const char *cache_dir,
+                        bool checkpoint,
+                        struct MoraineMigrationReport *out,
+                        struct MoraineError *err);
 
 // Frees a string previously written through [`moraine_data_path`]'s `out`.
 // A null pointer is ignored.
@@ -1198,6 +1383,35 @@ int32_t moraine_leader_start(struct MoraineCatalogHandle *handle,
 // `handle`, if non-null, must be a live [`moraine_attach`] pointer.
 void moraine_leader_stop(struct MoraineCatalogHandle *handle);
 
+// Measures the store, one row per subspace, and writes the manifest
+// version measured to `*out_manifest_id` and the store-wide object totals
+// to `*out_objects`.
+//
+// `count_live_entries` adds a scan of every subspace, which costs a full
+// read of the store; without it the call reads the manifest alone.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; the out-parameters
+// must be writable, and `err`, if non-null, must be writable.
+int32_t moraine_store_census(struct MoraineCatalogHandle *handle,
+                             bool count_live_entries,
+                             struct MoraineSubspaceCensus **out_items,
+                             size_t *out_len,
+                             uint64_t *out_manifest_id,
+                             struct MoraineStoreObjects *out_objects,
+                             MoraineInterruptProbe probe,
+                             void *probe_ctx,
+                             struct MoraineError *err);
+
+// Frees the array a [`moraine_store_census`] call returned.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a
+// matching [`moraine_store_census`] call, not yet freed.
+void moraine_store_census_free(struct MoraineSubspaceCensus *items, size_t len);
+
 // Reports the leader role: whether this catalog holds it right now, the
 // forwarded sessions open, and the commits landed through the funnel since it
 // bound. A handle not leading reports `false`/`0`/`0`.
@@ -1211,6 +1425,51 @@ int32_t moraine_leader_status(struct MoraineCatalogHandle *handle,
                               uint64_t *out_sessions,
                               uint64_t *out_forwarded,
                               struct MoraineError *err);
+
+// Merges each targeted subspace's sorted runs into one.
+//
+// `subspace` names one subspace, or is null for every one. `wait_ms` of 0
+// returns as soon as the merges are submitted; otherwise the call waits
+// that long for each to commit, and a merge that outlives the wait keeps
+// running and is reported pending.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; the out-parameters
+// must be writable, and `err`, if non-null, must be writable.
+int32_t moraine_compact_store(struct MoraineCatalogHandle *handle,
+                              const char *subspace,
+                              uint64_t wait_ms,
+                              struct MoraineSubspaceMerge **out_items,
+                              size_t *out_len,
+                              MoraineInterruptProbe probe,
+                              void *probe_ctx,
+                              struct MoraineError *err);
+
+// Frees the array a [`moraine_compact_store`] call returned.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a
+// matching [`moraine_compact_store`] call, not yet freed.
+void moraine_compact_store_free(struct MoraineSubspaceMerge *items, size_t len);
+
+// Whether `name` is a subspace a merge can target.
+//
+// Exposed separately from [`moraine_compact_store`] because an attach
+// validates its options before any catalog is open: a name checked only
+// when a pass runs would let a typo attach cleanly and then fail every
+// scheduled pass, unattended, for as long as it stood.
+//
+// # Safety
+//
+// `name`, if non-null, must be a valid C string.
+bool moraine_subspace_is_known(const char *name);
+
+// The subspaces a merge can target, comma-separated, for an error
+// message. Owned — free via `moraine_error_free`; null if allocation
+// fails.
+char *moraine_subspace_names(void);
 
 // Lists a table's live equality indexes.
 //
@@ -1334,6 +1593,84 @@ int32_t moraine_index_nulls(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a matching
 // [`moraine_index_nulls`] call, not yet freed.
 void moraine_index_nulls_free(struct MoraineRowLocation *items, size_t len);
+
+// Mints a checkpoint over `handle`'s current durable state and writes its
+// id to `*out_id` (free with `moraine_string_free`).
+//
+// Takes the attached handle rather than a path: the core mints through
+// the writer, and opening a second one to do it would fence the first.
+// The handle must therefore be a read-write attach.
+//
+// `lifetime_ms` bounds how long the checkpoint holds its objects against
+// garbage collection; `0` means no expiry, which pins them until
+// [`moraine_delete_checkpoint`] releases it.
+//
+// Returns [`codes::OK`] on success. On failure `*out_id` is left
+// unwritten and, if `err` is non-null, `*err` carries the code and a
+// message.
+//
+// # Safety
+//
+// `handle` must be a live handle from
+// [`moraine_attach`](super::moraine_attach). `out_id` must be a valid,
+// writable `*mut *mut c_char`. `err`, if non-null, must be a valid, writable
+// [`MoraineError`]. All for the duration of this call.
+int32_t moraine_create_checkpoint(struct MoraineCatalogHandle *handle,
+                                  uint64_t lifetime_ms,
+                                  char **out_id,
+                                  struct MoraineError *err);
+
+// Lists every checkpoint the store at `path` carries — a
+// reader-established one included — into `*out_items` / `*out_len`.
+// Free with [`moraine_checkpoints_free`].
+//
+// Returns [`codes::OK`] on success. On failure the out-parameters are
+// left unwritten and, if `err` is non-null, `*err` carries the code and a
+// message.
+//
+// # Safety
+//
+// `path` must be a valid NUL-terminated C string. `s3`, if non-null, must
+// point to a valid [`MoraineS3Config`] whose non-null fields are valid
+// NUL-terminated C strings. `out_items` must be a valid, writable
+// `*mut *mut MoraineCheckpoint` and `out_len` a valid, writable
+// `*mut usize`. `err`, if non-null, must be a valid, writable
+// [`MoraineError`]. All for the duration of this call.
+int32_t moraine_checkpoints(const char *path,
+                            const struct MoraineS3Config *s3,
+                            struct MoraineCheckpoint **out_items,
+                            size_t *out_len,
+                            struct MoraineError *err);
+
+// Frees an array written by [`moraine_checkpoints`]. A null pointer is
+// ignored.
+//
+// # Safety
+//
+// `items`/`len` must be a pair written by [`moraine_checkpoints`] and not
+// yet freed, or `items` null.
+void moraine_checkpoints_free(struct MoraineCheckpoint *items, size_t len);
+
+// Releases the checkpoint named by `id`, unpinning whatever it held
+// against garbage collection.
+//
+// Takes a path rather than a handle: it CASes the manifest without
+// opening the writer, so it runs against a live catalog without fencing
+// it.
+//
+// Returns [`codes::OK`] on success. On failure, if `err` is non-null,
+// `*err` carries the code and a message.
+//
+// # Safety
+//
+// `path` and `id` must be valid NUL-terminated C strings. `s3`, if
+// non-null, must point to a valid [`MoraineS3Config`] whose non-null
+// fields are valid NUL-terminated C strings. `err`, if non-null, must be
+// a valid, writable [`MoraineError`]. All for the duration of this call.
+int32_t moraine_delete_checkpoint(const char *path,
+                                  const struct MoraineS3Config *s3,
+                                  const char *id,
+                                  struct MoraineError *err);
 
 // Frees a buffer returned by an encode call.
 //
@@ -1736,6 +2073,31 @@ int32_t moraine_dump_name_mappings(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pair a matching
 // [`moraine_dump_name_mappings`] call wrote, not yet freed.
 void moraine_dump_name_mappings_free(struct MoraineNameMappingRow *items, size_t len);
+
+// Dumps every stored `ducklake_metadata` row into
+// `*out_items`/`*out_len`.
+//
+// # Safety
+//
+// The shared dump-entry contract (`dump_rows`): a live `handle` from
+// [`moraine_attach`](crate::abi::moraine_attach), valid writable
+// `out_items`/`out_len`, a `probe` callable with `probe_ctx` from any
+// thread, and a null-or-writable `err`, all for the duration of the
+// call.
+int32_t moraine_dump_options(struct MoraineCatalogHandle *handle,
+                             struct MoraineOptionRow **out_items,
+                             size_t *out_len,
+                             MoraineInterruptProbe probe,
+                             void *probe_ctx,
+                             struct MoraineError *err);
+
+// Frees the array returned by [`moraine_dump_options`].
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pair a matching
+// [`moraine_dump_options`] call wrote, not yet freed.
+void moraine_dump_options_free(struct MoraineOptionRow *items, size_t len);
 
 // Dumps every `ducklake_partition_info` row — current and history — into
 // `*out_items`/`*out_len`.
@@ -2268,16 +2630,44 @@ int32_t moraine_tx_dump_snapshots(struct MoraineTxHandle *tx,
 // either way; it must not be passed to [`moraine_tx_rollback`]
 // afterward.
 //
+// Cancellable: races the commit against `probe` (polled immediately, then
+// ~100 ms; a null `probe` disables polling). Where the cancellation lands
+// decides what it means, and one of the three outcomes is ambiguous:
+//
+// - **Before the durable write is issued** — translation, index maintenance,
+//   and staging are in-memory only, so cancelling discards them.
+//   [`codes::INTERRUPTED`], catalog unchanged, head where it was.
+// - **While the durable write is in flight** — the write is spawned past the
+//   point of no return and is never dropped mid-batch, so it runs to
+//   completion in the background while this call returns
+//   [`codes::INTERRUPTED`] promptly. **The commit may still land.** The
+//   outcome is therefore ambiguous in exactly the way an unacknowledged
+//   durable write is: the batch is atomic, so head ends at either the old id
+//   or the new one and never in between, but this return does not say which. A
+//   caller that needs to know re-resolves head and reads it — it must not
+//   treat [`codes::INTERRUPTED`] as "nothing landed", and must not re-drive
+//   the rows blind.
+// - **After the write completed** — there is nothing left to cancel, so the
+//   committed snapshot id is reported normally.
+//
+// The interrupt is honored rather than ridden out because the wait it
+// escapes is unbounded: a durable write against an unreachable endpoint
+// is retried beneath moraine indefinitely, and a session with no way out
+// of it is the worse failure.
+//
 // # Safety
 //
 // `tx` must be a pointer previously returned by [`moraine_tx_begin`]
 // and not yet committed or rolled back. `out_snapshot_id` must be a
-// valid, writable `*mut u64`. `err`, if non-null, must be a valid,
+// valid, writable `*mut u64`. `probe`, if non-null, must be safe to call
+// with `probe_ctx` from any thread. `err`, if non-null, must be a valid,
 // writable [`MoraineError`]. All for the duration of this call. The
 // catalog handle `tx` was opened on ([`moraine_tx_begin`]'s contract)
 // must still be attached.
 int32_t moraine_tx_commit(struct MoraineTxHandle *tx,
                           uint64_t *out_snapshot_id,
+                          MoraineInterruptProbe probe,
+                          void *probe_ctx,
                           struct MoraineError *err);
 
 // Discards every staged row without writing anything, consuming `tx`.
@@ -2348,6 +2738,26 @@ int32_t moraine_tx_stage_inline_file_delete(struct MoraineTxHandle *tx,
                                             uint64_t row_id,
                                             uint64_t begin_snapshot,
                                             struct MoraineError *err);
+
+// Stages the removal of one live `inline/file_delete` record — the
+// row-grain counterpart of [`moraine_tx_stage_inline_file_delete`],
+// which a `DELETE` against `ducklake_inlined_delete_<table_id>`
+// translates to.
+//
+// DuckLake issues that `DELETE` at the end of
+// `ducklake_flush_inlined_data`, once it has materialized the table's
+// inlined deletions into a real delete file: leaving the inlined form
+// behind would count those rows deleted twice. Naming a record the table
+// does not carry is [`codes::CORRUPTION`], not a no-op.
+//
+// # Safety
+//
+// Same contract as [`moraine_tx_stage_inline_inline_delete`].
+int32_t moraine_tx_stage_inline_file_delete_remove(struct MoraineTxHandle *tx,
+                                                   uint64_t table_id,
+                                                   uint64_t data_file_id,
+                                                   uint64_t row_id,
+                                                   struct MoraineError *err);
 
 // Stages a flush-delete: removes every `inline/insert` chunk begun at or
 // before `flush_snapshot` for `(table_id, schema_version)`, plus the

@@ -32,6 +32,7 @@ use crate::{
 
 /// Read-side dispatch for uniqueness probes: the folded store view overlaid
 /// with the writes of slots no folder has applied yet.
+#[derive(Clone, Copy)]
 pub(crate) enum ProbeHandle<'a> {
     /// A store view overlaid with an unfolded tail: a tail write shadows the
     /// stored value, a tail delete hides it.

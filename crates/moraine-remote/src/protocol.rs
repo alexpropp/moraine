@@ -14,10 +14,11 @@ use crate::{
     frame,
     proto::{
         CellValue, CommitValue, CommittedValue, ErrorKindValue, ErrorValue, HelloValue,
-        InlineDropValue, InlineFileDeleteValue, InlineFlushDeleteValue, InlineInlineDeleteValue,
-        InlineInsertValue, InlineSchemaDropValue, InlineSchemaValue, RequestMessage,
-        ResponseMessage, RowCellsValue, RowOperationValue, SnapshotRowsValue, Unit, cell_value,
-        request_message, response_message, row_operation_value,
+        InlineDropValue, InlineFileDeleteRemoveValue, InlineFileDeleteValue,
+        InlineFlushDeleteValue, InlineInlineDeleteValue, InlineInsertValue, InlineSchemaDropValue,
+        InlineSchemaValue, RequestMessage, ResponseMessage, RowCellsValue, RowOperationValue,
+        SnapshotRowsValue, Unit, cell_value, request_message, response_message,
+        row_operation_value,
     },
 };
 
@@ -113,6 +114,18 @@ pub enum ErrorKind {
     SlotLog,
     /// The underlying store failed.
     Store,
+    /// A DuckLake feature moraine does not implement.
+    Unsupported,
+    /// A held or requested snapshot fell below the retention horizon.
+    SnapshotExpired,
+    /// A host interrupt cancelled the operation, or a durable write past its
+    /// point of no return never reported its outcome.
+    Interrupted,
+    /// The store requires, is undergoing, or was written by an unsupported
+    /// structural format.
+    Migration,
+    /// Another process created this store while this open was creating it.
+    OpenRaced,
 }
 
 impl ErrorKind {
@@ -133,6 +146,11 @@ impl ErrorKind {
             Self::Fenced => format!("writer fenced: {message}"),
             Self::SlotLog => format!("commit-slot log unavailable: {message}"),
             Self::Store => "store error".to_string(),
+            Self::Unsupported => format!("unsupported: {message}"),
+            Self::SnapshotExpired => format!("snapshot expired: {message}"),
+            Self::Interrupted => format!("interrupted: {message}"),
+            Self::Migration => format!("migration required: {message}"),
+            Self::OpenRaced => format!("open raced: {message}"),
         }
     }
 
@@ -149,6 +167,11 @@ impl ErrorKind {
             Self::Fenced => ErrorKindValue::Fenced,
             Self::SlotLog => ErrorKindValue::SlotLog,
             Self::Store => ErrorKindValue::Store,
+            Self::Unsupported => ErrorKindValue::Unsupported,
+            Self::SnapshotExpired => ErrorKindValue::SnapshotExpired,
+            Self::Interrupted => ErrorKindValue::Interrupted,
+            Self::Migration => ErrorKindValue::Migration,
+            Self::OpenRaced => ErrorKindValue::OpenRaced,
         }
     }
 
@@ -165,6 +188,11 @@ impl ErrorKind {
             ErrorKindValue::Fenced => Ok(Self::Fenced),
             ErrorKindValue::SlotLog => Ok(Self::SlotLog),
             ErrorKindValue::Store => Ok(Self::Store),
+            ErrorKindValue::Unsupported => Ok(Self::Unsupported),
+            ErrorKindValue::SnapshotExpired => Ok(Self::SnapshotExpired),
+            ErrorKindValue::Interrupted => Ok(Self::Interrupted),
+            ErrorKindValue::Migration => Ok(Self::Migration),
+            ErrorKindValue::OpenRaced => Ok(Self::OpenRaced),
             ErrorKindValue::Unspecified => Err(Error::Protocol(
                 "error carries no kind discriminant".to_string(),
             )),
@@ -264,6 +292,15 @@ pub enum WireRowOperation {
         row_id: u64,
         /// The commit snapshot the delete takes effect at.
         begin_snapshot: u64,
+    },
+    /// Removes one live `inline/file_delete` record.
+    InlineFileDeleteRemove {
+        /// Owning table.
+        table_id: u64,
+        /// The data file the removed deletion targeted.
+        data_file_id: u64,
+        /// The row the removed deletion killed.
+        row_id: u64,
     },
     /// `inline/*` flush: removes chunks begun at or before `flush_snapshot`.
     InlineFlushDelete {
@@ -515,6 +552,15 @@ impl WireRowOperation {
                 row_id: *row_id,
                 begin_snapshot: *begin_snapshot,
             }),
+            Self::InlineFileDeleteRemove {
+                table_id,
+                data_file_id,
+                row_id,
+            } => Wire::InlineFileDeleteRemove(InlineFileDeleteRemoveValue {
+                table_id: *table_id,
+                data_file_id: *data_file_id,
+                row_id: *row_id,
+            }),
             Self::InlineFlushDelete {
                 table_id,
                 schema_version,
@@ -585,6 +631,11 @@ impl WireRowOperation {
                 data_file_id: inline.data_file_id,
                 row_id: inline.row_id,
                 begin_snapshot: inline.begin_snapshot,
+            },
+            Wire::InlineFileDeleteRemove(inline) => Self::InlineFileDeleteRemove {
+                table_id: inline.table_id,
+                data_file_id: inline.data_file_id,
+                row_id: inline.row_id,
             },
             Wire::InlineFlushDelete(inline) => Self::InlineFlushDelete {
                 table_id: inline.table_id,
@@ -726,6 +777,13 @@ mod tests {
                 }
             ),
             (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(table_id, data_file_id, row_id)| WireRowOperation::InlineFileDeleteRemove {
+                    table_id,
+                    data_file_id,
+                    row_id,
+                }
+            ),
+            (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
                 |(table_id, schema_version, flush_snapshot)| WireRowOperation::InlineFlushDelete {
                     table_id,
                     schema_version,
@@ -773,6 +831,11 @@ mod tests {
             Just(ErrorKind::Fenced),
             Just(ErrorKind::SlotLog),
             Just(ErrorKind::Store),
+            Just(ErrorKind::Unsupported),
+            Just(ErrorKind::SnapshotExpired),
+            Just(ErrorKind::Interrupted),
+            Just(ErrorKind::Migration),
+            Just(ErrorKind::OpenRaced),
         ]
     }
 
@@ -861,5 +924,13 @@ mod tests {
             "commit-slot log unavailable: x"
         );
         assert_eq!(ErrorKind::Store.render("ignored"), "store error");
+        assert_eq!(ErrorKind::Unsupported.render("x"), "unsupported: x");
+        assert_eq!(
+            ErrorKind::SnapshotExpired.render("x"),
+            "snapshot expired: x"
+        );
+        assert_eq!(ErrorKind::Interrupted.render("x"), "interrupted: x");
+        assert_eq!(ErrorKind::Migration.render("x"), "migration required: x");
+        assert_eq!(ErrorKind::OpenRaced.render("x"), "open raced: x");
     }
 }

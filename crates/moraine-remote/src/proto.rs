@@ -12,8 +12,8 @@ mod generated {
 
 pub(crate) use generated::{
     CellValue, CommitValue, CommittedValue, ErrorKindValue, ErrorValue, HelloValue,
-    InlineDropValue, InlineFileDeleteValue, InlineFlushDeleteValue, InlineInlineDeleteValue,
-    InlineInsertValue, InlineSchemaDropValue, InlineSchemaValue, RequestMessage, ResponseMessage,
-    RowCellsValue, RowOperationValue, SnapshotRowsValue, Unit, cell_value, request_message,
-    response_message, row_operation_value,
+    InlineDropValue, InlineFileDeleteRemoveValue, InlineFileDeleteValue, InlineFlushDeleteValue,
+    InlineInlineDeleteValue, InlineInsertValue, InlineSchemaDropValue, InlineSchemaValue,
+    RequestMessage, ResponseMessage, RowCellsValue, RowOperationValue, SnapshotRowsValue, Unit,
+    cell_value, request_message, response_message, row_operation_value,
 };

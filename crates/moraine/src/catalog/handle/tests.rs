@@ -78,6 +78,7 @@ async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
             commit_extra_info: None,
             schema_changed_table_ids: Vec::new(),
             transaction_id: None,
+            deleted_data_file_ids: Vec::new(),
         }),
     )
     .unwrap();
@@ -96,7 +97,10 @@ async fn legacy_store_with_schema(object_store: Arc<dyn ObjectStore>) {
     .unwrap();
     tx.put(
         Key::Sys(SysKey::Head).encode(),
-        value::encode_value(&proto::HeadValue { snapshot_id: 1 }),
+        value::encode_value(&proto::HeadValue {
+            snapshot_id: 1,
+            batch_seq: 0,
+        }),
     )
     .unwrap();
     tx.commit_with_options(&commit::durable()).await.unwrap();
@@ -268,7 +272,10 @@ async fn migration_fences_a_live_legacy_writer_with_a_typed_error() {
         let tx = incumbent.begin(IsolationLevel::Snapshot).await?;
         tx.put(
             Key::Sys(SysKey::Head).encode(),
-            value::encode_value(&proto::HeadValue { snapshot_id: 99 }),
+            value::encode_value(&proto::HeadValue {
+                snapshot_id: 99,
+                batch_seq: 0,
+            }),
         )?;
         tx.commit_with_options(&commit::durable()).await?;
         Ok(())

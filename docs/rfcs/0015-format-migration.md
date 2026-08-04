@@ -27,7 +27,7 @@ any of this machinery.
   ([RFC 0004](0004-commit-protocol.md)), one-batch atomicity per step
   ([RFC 0002](0002-slatedb-key-encoding.md)), data-before-metadata ordering
   ([RFC 0007](0007-snapshot-expiry-and-gc.md)), and crash-resumability
-  ([RFC 0011](0011-crash-injection-test-matrix.md)).
+  ([RFC 0011](0011-crash-recovery.md)).
 - Refuse, loudly and typed, to open a store whose `sys/format` is *newer* than
   the running binary understands (RFC 0002's meet-a-newer-format rule) — never
   silently downgrade or misread.
@@ -48,13 +48,12 @@ Non-goals:
   this RFC does not touch the value codec.
 - **Online migration across mixed binary versions.** A structural rewrite
   changes key structure, so an old binary cannot read the new layout. Rolling a
-  fleet across a structural bump is called out as an Open question, not
-  solved here.
+  fleet across a structural bump is unresolved, not solved here.
 - **Automatic rollback / downgrade.** Migrations are one-way; recovery is
   manual and rests on old objects surviving until new ones are durable
-  (below). Rollback strategy is an Open question.
+  (below). Rollback strategy is unresolved.
 - **Inventing new atomicity or fencing primitives.** This RFC composes the
-  existing ones exactly as [RFC 0011](0011-crash-injection-test-matrix.md)
+  existing ones exactly as [RFC 0011](0011-crash-recovery.md)
   composes them for genesis.
 
 ## Background
@@ -67,9 +66,10 @@ reader cannot absorb lazily. RFC 0002 states the governing rule: *a
 reader/writer that meets a newer format than it understands errors rather
 than misreading.* This RFC is the other half of that rule — what happens when
 the store is **older** than the binary, and the operator chooses to upgrade it
-in place.
+in place. Not every older store needs upgrading, though — see "Additive
+versus rewriting, within axis 2".
 
-The genesis protocol ([RFC 0011](0011-crash-injection-test-matrix.md), D-rows)
+The genesis protocol ([RFC 0011](0011-crash-recovery.md), the genesis cases)
 already establishes the template this RFC follows: a multi-step state change
 that cannot always be one `WriteBatch`, made safe by a durable marker, a
 resume-from-cursor loop, and a final atomic flip. Genesis births a store;
@@ -86,14 +86,36 @@ table before anything else.
 |---|---|---|
 | What changes | Protobuf fields; per-value encoding version | Subspace tags; key structure |
 | Signal | Framing-header encoding byte (RFC 0002) | `sys/format` structural version |
-| Compatibility | Forward/backward (skip unknown, default missing) | Breaking — key layout differs |
-| Handled by | **Readers, lazily, on decode** | **A one-time rewrite of the store** |
-| Migration? | **None** | **This RFC** |
+| Compatibility | Forward/backward (skip unknown, default missing) | Breaking for a binary that cannot name the new tags |
+| Handled by | **Readers, lazily, on decode** | **A lazy stamp, or a one-time rewrite of the store** |
+| Migration? | **None** | **This RFC — for the rewriting kind only (next section)** |
 
 If a proposed change can be expressed as a new protobuf field a reader
 defaults or ignores, it is axis 1 and does **not** bump `sys/format`. Only a
 change to *where a key lives* or *how it sorts* is axis 2. The bar for axis 2
 is deliberately high, because axis 2 is the expensive one.
+
+### Additive versus rewriting, within axis 2
+
+Axis 2 splits again, and only one half needs this RFC's machinery.
+
+An **additive** structural change introduces a new subspace or a new kind and
+**moves no existing key**. The `index` subspace ([RFC 0016](0016-equality-indexes.md))
+is the worked example: a store that grows one is stamped a higher
+`sys/format` so binaries that cannot name the new tag refuse it, but nothing
+already written is rewritten, and a binary that *does* know the tag reads the
+older store unchanged. The stamp is therefore **lazy** — written the first
+time the feature is used, not on open — and there is **no migration**.
+
+A **rewriting** structural change alters where existing keys live or how they
+sort. Old keys must be read, re-encoded, and deleted. This is the only kind
+that needs the start/step/finish protocol below, and the only kind that makes
+an older store unreadable rather than merely older.
+
+The practical consequence is that a binary reads a **range** of formats, not
+one: every format from the oldest it can still make sense of (its floor) up
+to the newest it can name. Additive bumps widen that range; a rewriting bump
+raises the floor, because below it the keys are somewhere else.
 
 ### On-open version check
 
@@ -102,14 +124,21 @@ structural version to the binary's:
 
 | Store vs. binary | Action |
 |---|---|
-| **Equal** | Proceed normally. |
-| **Store older** | Store is *eligible* for migration. Do **not** migrate implicitly (see "Trigger policy"); open read-only against the old layout is permitted, but a write path that requires the new layout surfaces the typed `Migration` error (RFC 0003) naming the source and target versions. |
-| **Store newer** | **Refuse to open.** Return the typed `Migration` error (RFC 0003, per RFC 0002's meet-a-newer-format rule). Never guess, never downgrade, never write. |
+| **Within the binary's range** (floor ≤ store ≤ newest it names) | Proceed normally. A store *below* the binary's newest is not migration-eligible: the intervening bumps were additive, so its keys are exactly where this binary looks for them. It is stamped forward lazily if and when it uses the newer feature, never rewritten on open. |
+| **Below the floor** | **Refuse to open.** Return the typed `Migration` error (RFC 0003) naming the store's version and the floor. A rewriting migration put this store's keys somewhere this binary does not look; it must be migrated up first. |
+| **Newer than the binary names** | **Refuse to open.** Return the typed `Migration` error (RFC 0003, per RFC 0002's meet-a-newer-format rule). Never guess, never downgrade, never write. |
+| **Absent** | The store is uninitialized. A read-write attach bootstraps it; a read-only attach refuses, having nothing committed to read. |
 
 The newer-than-binary refusal is not optional or best-effort: a binary that
 cannot name every subspace tag it might encounter cannot safely read, so it
 stops. This is the same discipline the framing header applies to an unknown
 value encoding, lifted to the structural level.
+
+Until the first rewriting migration exists, the floor sits at the base format
+and the below-the-floor arm is **dormant** — no store in the world is below
+it. It is specified and implemented now anyway, for the same reason the
+reader gate is: the arm has to be in the fielded binaries *before* the format
+that makes it fire.
 
 ### Single-writer migration
 
@@ -119,11 +148,11 @@ performing it is the folder role — migration is folder-role work, like
 fold and genesis, because all three write the store directly). This is not
 new machinery: SlateDB's `writer_epoch` CAS-on-open means a second process
 attempting to migrate the same store is fenced — it loses the epoch and
-writes nothing (RFC 0011, C-rows). So **exactly one migrator runs**, by the
-same guarantee that makes an accidental second catalog writer safe.
-Readers, meanwhile, must never observe a half-migrated store; the resume
-protocol below is structured so the only externally visible flip of
-`sys/format` is atomic and last.
+writes nothing (RFC 0011, the takeover cases). So **exactly one migrator
+runs**, by the same guarantee that makes an accidental second catalog
+writer safe. Readers, meanwhile, must never observe a half-migrated store;
+the resume protocol below is structured so the only externally visible flip
+of `sys/format` is atomic and last.
 
 ### Crash-safe resumable migration
 
@@ -172,8 +201,8 @@ distinguished by reading `sys/format` and `sys/migration`:
 
 The one combination that must be impossible — **new format with the marker
 still present** — is made impossible by putting the flip and the clear in the
-same batch. This is exactly RFC 0011 D2's "one `WriteBatch` for the terminal
-transition" applied to the migration's end instead of genesis's.
+same batch. This is exactly `GenesisInterrupted`'s "one `WriteBatch` for the
+terminal transition" applied to the migration's end instead of genesis's.
 
 ### Reader coherence during migration
 
@@ -213,10 +242,12 @@ merely migrator bookkeeping:
   half-migrated intermediate to anyone.
 
 Consequently **structural migration is _not_ online across mixed binary
-versions.** A rolling deployment that spans a structural bump either drains
-readers across the flip or tolerates a brief unavailability window. Making
-structural migration truly online across mixed binaries is an Open question,
-not a delivered feature — and saying so is the point of this section.
+versions**, and that is the permanent answer, not an open gap. A rolling
+deployment that spans a structural bump either drains readers across the flip
+or tolerates a brief unavailability window. Serving one structural bump across
+two binary versions at once is not offered: the key layout differs, so an old
+binary cannot read the new store, and no scheme reconciles that without keeping
+a second layout live alongside the first.
 
 ### One-way, composable migrations
 
@@ -226,16 +257,21 @@ v1→v2 then v2→v3, run in sequence, each with its own start/step/finish and i
 own cursor. There is no bespoke v1→v3 path to write or test; correctness of
 the composition follows from correctness of each link.
 
-There is **no automatic rollback.** The mitigations, all already load-bearing
-elsewhere in the design, are:
+There is **no automatic rollback**, by decision. Recovery from a failed
+migration is manual, resting on two mitigations already load-bearing elsewhere
+in the design:
 
 - Old objects are not deleted until the new ones that supersede them are
   durable (the step-loop ordering), so a failed migration can be reasoned
   about against surviving old state.
-- SlateDB's object history and/or an **optional pre-migration snapshot**
-  (Open question) give a manual recovery point.
+- An **optional pre-migration checkpoint** gives a manual recovery point,
+  alongside SlateDB's object history. It is a whole-store
+  `Db::create_checkpoint()` behind an operator flag on the `migrate` verb, off
+  by default; when taken, it is released after the finish batch is durable.
 
-Rollback as a first-class, automatic operation is an Open question below.
+Paired inverse migrations are deliberately not written or tested: the
+sanctioned recovery path is the pre-migration checkpoint, not a reverse
+rewrite.
 
 ### Trigger policy
 
@@ -256,6 +292,12 @@ reasoning:
   which is exactly the mixed-version hazard the previous section names.
 - Migration cost (time, object-store traffic, writer occupancy) is an
   operational decision with a maintenance-window shape; the operator owns it.
+
+The verb takes the object store rather than an open catalog, because the
+store it must act on is precisely the one an ordinary attach refuses: below
+the floor, or carrying a marker. It opens the writer itself — taking the
+same epoch `open` takes, so it fences a running catalog and is fenced by
+one — runs the plan the durable state implies, and closes.
 
 **Bounded `system`-only migrations auto-run on read-write attach.** A
 migration qualifies when it is a single atomic `WriteBatch` touching only
@@ -279,15 +321,22 @@ count.
 
 ### Test obligations
 
-These extend [RFC 0011](0011-crash-injection-test-matrix.md)'s matrix; they
+These extend [RFC 0011](0011-crash-recovery.md)'s cases; they
 run against real SlateDB on in-memory `object_store`, no store mocks
-(RFC 0001), and are naturally expressed as new `CrashPoint`-style rows.
+(RFC 0001), and are naturally expressed as new `CrashCase`-style cases.
 
-- **Crash at every migration seam.** Inject a crash at the start batch, at
-  each step's new-key-write, at each step's old-key-delete, at the cursor
-  advance, and at the finish flip. Each reopen resumes to a **coherent
-  store** — new format if the finish landed, else resumed from the cursor —
-  and never exposes new-format-with-marker.
+- **Crash at every migration seam.** Inject a crash after the start batch,
+  after each step batch, before the finish flip, and after it. Each reopen
+  resumes to a **coherent store** — new format if the finish landed, else
+  resumed from the cursor — and never exposes new-format-with-marker.
+
+  Those four are the *whole* set, because a seam is only meaningful where a
+  durable state exists to crash into. A step's new-key write, its old-key
+  delete, and its cursor advance all land in **one batch**, so there is no
+  durable intermediate between them to inject at: the interleavings are
+  unrepresentable rather than merely untested. The same holds for the finish
+  flip and the marker clear. Injecting "inside" a batch would test SlateDB's
+  atomicity, not this protocol's.
 - **Refuse-to-open on a future format.** A store whose `sys/format` exceeds
   the binary errors typed, writes nothing.
 - **Reader gate mid-migration.** With the `sys/migration` marker present, a
@@ -305,7 +354,7 @@ run against real SlateDB on in-memory `object_store`, no store mocks
 ## Open questions
 
 - **Rollback strategy.** Migrations are one-way. Is a pre-migration snapshot
-  (below) the sanctioned recovery, or should paired `v_{n+1} → v_n` inverse
+  the sanctioned recovery, or should paired `v_{n+1} → v_n` inverse
   migrations be written and tested? The latter doubles the test surface and
   is not always expressible (a lossy structural change has no inverse).
 - **Online / mixed-binary migration for rolling deploys.** Can a structural
@@ -313,21 +362,6 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   reader that understands both layouts for a window — or is a drain/brief
   unavailability the permanent answer? This RFC assumes the latter and flags
   the former as unsolved.
-- **Auto-vs-explicit trigger boundary — resolved.** Trigger policy states
-  the rule: a migration auto-runs on read-write attach exactly when it is
-  one atomic `WriteBatch` over `system` records only, no keyspace walk, no
-  cursor — RFC 0022's format 4 migration is the first instance. Anything
-  that walks the keyspace stays behind the explicit verb, regardless of how
-  small it looks in practice; the boundary is about the *hazard shape* (a
-  half-migrated intermediate a rolling reader could observe), not row
-  count.
-- **Encrypted stores ([RFC 0014](0014-encryption.md)) pose no constraint.**
-  Catalog-at-rest encryption is delegated to object-store SSE, so a migrator
-  always sees plaintext values through the store client. RFC 0014 rejected
-  value-payload envelope encryption partly *because* it would make values
-  opaque to field-touching structural migrations; any future
-  bucket-independent encryption goes below the value format (SlateDB block
-  layer), where migrations remain unaffected.
 - **Whole-store pre-migration snapshot.** Should the `migrate` verb snapshot
   the entire store before starting, for guaranteed manual rollback? SlateDB
   (pinned 0.14.x) provides the mechanism nearly for free:
@@ -345,7 +379,7 @@ run against real SlateDB on in-memory `object_store`, no store mocks
   upgraded node to attach begins rewriting the keyspace under every
   still-running old-binary reader, surprising a rolling fleet and coupling an
   operational decision to an incidental attach. Explicit opt-in makes the
-  cost and timing owned. (Bounded `system`-only migrations are the settled
+  cost and timing owned. (Bounded `system`-only migrations are the
   exception — see Trigger policy.)
 - **Lazy / online per-key migration on read.** Translate old keys to the new
   layout on the fly, forever, the way axis 1 translates old *values*.

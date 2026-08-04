@@ -309,11 +309,10 @@ message OptionScopeValue {
 }
 
 // ducklake_snapshot + ducklake_snapshot_changes, merged (1:1).
-// schema_changed_table_ids also folds in this snapshot's
-// ducklake_schema_versions rows: each row DuckLake writes there is
-// (snapshot_id, schema_version, table_id) with the first two always the
-// committing snapshot's own values, so the table-id set is the only new
-// information and lives here rather than under a key kind of its own.
+// schema_changed_table_ids names the tables whose shape this snapshot
+// changed. The matching ducklake_schema_versions rows are written to the
+// schema_version subspace as well: they outlive the snapshot record,
+// which expiry deletes.
 message SnapshotValue {
   uint64 snapshot_id = 1;
   int64 snapshot_time_micros = 2;
@@ -328,7 +327,30 @@ message SnapshotValue {
   optional string commit_message = 9;
   optional string commit_extra_info = 10;
   repeated uint64 schema_changed_table_ids = 11;
-  optional bytes transaction_id = 12;
+  // The data files this commit's delete files target. moraine-internal,
+  // like schema_changed_table_ids: DuckLake's changes_made grammar names
+  // the table and not the file, and delete-versus-delete is the one pair
+  // it checks at file grain. Empty on a DuckLake-authored snapshot, which
+  // is read back as "deletes from the whole table".
+  repeated uint64 deleted_data_file_ids = 12;
+  optional bytes transaction_id = 13;
+}
+
+// changelog/<snapshot_id>: the `current` keys one commit's batch wrote,
+// encoded and sorted. A reader holding a view at an older snapshot
+// advances it by re-reading exactly these keys instead of rescanning
+// `current`, so the changelog a refresh needs is the one the commit
+// already produced. Only a refresh reads these — one point read per
+// snapshot in its gap — so they cost the serve path nothing.
+message ChangelogValue {
+  repeated bytes keys = 1;
+}
+
+// schema_version/<table_id>/<begin_snapshot>: the catalog schema version
+// the snapshot minted. The key carries the other two columns of the
+// ducklake_schema_versions row.
+message SchemaVersionValue {
+  uint64 schema_version = 1;
 }
 
 // ducklake_files_scheduled_for_deletion.
@@ -346,9 +368,14 @@ message FormatValue {
   string writer_version = 2;
 }
 
-// sys/head: latest committed snapshot id.
+// sys/head: latest committed snapshot id, and the count of batches that
+// have landed. Every batch writes this record and increments the count,
+// including a maintenance batch that reuses the snapshot id, so the pair
+// changes whenever any committed state does — which is what lets a
+// read-only reader tell a consistent cut from a torn one.
 message HeadValue {
   uint64 snapshot_id = 1;
+  uint64 batch_seq = 2;
 }
 
 // sys/secret: the forwarding token a leader authenticates sessions against.
@@ -395,3 +422,11 @@ message InlineInlineDeleteValue {
 message InlineFileDeleteValue {
   uint64 begin_snapshot = 1;
 }
+
+// inline/file_delete_table: the existence marker for a table's
+// ducklake_inlined_delete_<table_id>. Empty — the key is the fact. It
+// exists because DuckLake caches "this table exists" for the life of the
+// catalog, so existence cannot be derived from whether any inlined
+// deletion is currently recorded: a flush empties them, and an emptied
+// SQL table still exists.
+message InlineFileDeleteTableValue {}

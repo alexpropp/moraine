@@ -13,7 +13,8 @@ use crate::{
             inline_schema_prefix, inline_schema_table_prefix,
         },
         proto::{
-            InlineChunkValue, InlineFileDeleteValue, InlineInlineDeleteValue, InlineSchemaValue,
+            InlineChunkValue, InlineFileDeleteTableValue, InlineFileDeleteValue,
+            InlineInlineDeleteValue, InlineSchemaValue,
         },
         read::{read_singleton, scan_decode_maybe},
         value,
@@ -89,6 +90,17 @@ pub(crate) async fn scan_inline_file_deletes(
         },
     )
     .await
+}
+
+/// Whether `table_id`'s `ducklake_inlined_delete_<table_id>` has been
+/// marked as existing.
+pub(crate) async fn read_inline_file_delete_table(
+    handle: ReadHandle<'_>,
+    table_id: u64,
+) -> Result<bool> {
+    let marker: Option<InlineFileDeleteTableValue> =
+        read_singleton(handle, Key::Inline(InlineKey::FileDeleteTable { table_id })).await?;
+    Ok(marker.is_some())
 }
 
 /// One table's Arrow IPC schema at `schema_version`, if recorded. `overlay`

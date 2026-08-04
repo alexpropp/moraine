@@ -9,8 +9,9 @@ use crate::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, FormatValue,
             GcFileValue, HeadValue, IndexValue, MacroValue, MappingValue, MigrationValue,
-            OptionScopeValue, PartitionValue, SchemaValue, SecretValue, SnapshotValue, SortValue,
-            TableColumnStatsValue, TableStatsValue, TableValue, TagValue, ViewValue,
+            OptionScopeValue, PartitionValue, SchemaValue, SchemaVersionValue, SecretValue,
+            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
+            ViewValue,
         },
         value,
     },
@@ -178,7 +179,7 @@ pub(crate) async fn read_migration(handle: ReadHandle<'_>) -> Result<Option<Migr
     read_singleton(handle, Key::Sys(SysKey::Migration)).await
 }
 
-/// The head pointer: the latest committed snapshot id.
+/// The head pointer: the latest committed snapshot id and batch count.
 pub(crate) async fn read_head(handle: ReadHandle<'_>) -> Result<Option<HeadValue>> {
     read_singleton(handle, Key::Sys(SysKey::Head)).await
 }
@@ -204,6 +205,22 @@ pub(crate) async fn read_snapshot(
     snapshot_id: u64,
 ) -> Result<Option<SnapshotValue>> {
     read_singleton(handle, Key::Snapshot { snapshot_id }).await
+}
+
+/// [`read_snapshot`] with the unfolded tail overlaid: a tail write shadows the
+/// stored record. A tail *delete*, though, is an expiry the folder has not
+/// applied — the store still holds the record — so time travel resolves it from
+/// there until a fold prunes it, the one place the unfolded view outlives the
+/// folded one rather than matching it.
+pub(crate) async fn read_snapshot_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+    snapshot_id: u64,
+) -> Result<Option<SnapshotValue>> {
+    match overlay.get(&Key::Snapshot { snapshot_id }.encode()) {
+        Some(Some(bytes)) => Ok(Some(value::decode_value(bytes)?)),
+        Some(None) | None => read_snapshot(handle, snapshot_id).await,
+    }
 }
 
 /// The snapshot id a transaction committed at, scanning the snapshot subspace
@@ -314,6 +331,49 @@ fn extract_current(key: Key, bytes: &[u8]) -> Result<EntityRecord> {
     }
 }
 
+/// Every `ducklake_schema_versions` record as `(table_id,
+/// begin_snapshot, schema_version)`, in key order. Retained across
+/// snapshot expiry, so this is the projection's durable source — the
+/// snapshot records only carry the same rows for as long as they live.
+pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(u64, u64, u64)>> {
+    scan_decode(
+        handle,
+        subspace_prefix(Subspace::SchemaVersion),
+        extract_schema_version,
+    )
+    .await
+}
+
+/// [`scan_schema_versions`] with the unfolded tail overlaid, for a slot-backed
+/// attach whose folder has not applied every committed schema-version row yet.
+pub(crate) async fn scan_schema_versions_overlaid(
+    handle: ReadHandle<'_>,
+    overlay: &moraine_wal::Overlay,
+) -> Result<Vec<(u64, u64, u64)>> {
+    scan_decode_overlaid(
+        handle,
+        overlay,
+        subspace_prefix(Subspace::SchemaVersion),
+        extract_schema_version,
+    )
+    .await
+}
+
+fn extract_schema_version(key: Key, bytes: &[u8]) -> Result<(u64, u64, u64)> {
+    match key {
+        Key::SchemaVersion {
+            table_id,
+            begin_snapshot,
+        } => {
+            let value: SchemaVersionValue = value::decode_value(bytes)?;
+            Ok((table_id, begin_snapshot, value.schema_version))
+        }
+        other => Err(Error::Corruption(format!(
+            "non-schema-version key in schema-version scan: {other:?}"
+        ))),
+    }
+}
+
 /// Every live entity record.
 pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<EntityRecord>> {
     scan_decode(handle, subspace_prefix(Subspace::Current), extract_current).await
@@ -389,7 +449,10 @@ mod tests {
             .await
             .unwrap();
 
-        let head = HeadValue { snapshot_id: 3 };
+        let head = HeadValue {
+            snapshot_id: 3,
+            batch_seq: 1,
+        };
         let schema = SchemaValue {
             schema_id: 1,
             schema_uuid: "u".into(),

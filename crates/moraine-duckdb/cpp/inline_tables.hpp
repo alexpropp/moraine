@@ -127,6 +127,12 @@ private:
 
 // A synthesized `ducklake_inlined_delete_<t>` entry: fixed columns
 // `(file_id, row_id, begin_snapshot)`.
+//
+// It exists from the table's first inlined deletion until the table is
+// dropped — emptying it does not remove it. DuckLake caches the table's
+// existence for the life of the catalog and never re-probes, so an
+// existence that tracked whether any deletion is currently recorded would
+// vanish under it the moment a flush cleared them.
 class MoraineInlineDeleteTableEntry : public duckdb::TableCatalogEntry {
 public:
 	MoraineInlineDeleteTableEntry(duckdb::Catalog &catalog, duckdb::SchemaCatalogEntry &schema,
@@ -205,6 +211,12 @@ duckdb::PhysicalOperator &PlanInlineDataDelete(duckdb::PhysicalPlanGenerator &pl
 // `INSERT INTO ducklake_inlined_delete_<t> VALUES (file_id, row_id,
 // {snap}), ...` — one `stage_inline_fdel` call per row.
 duckdb::PhysicalOperator &PlanInlineDeleteInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
+                                                 MoraineInlineDeleteTableEntry &table_entry);
+
+// `DELETE FROM ducklake_inlined_delete_<t>` — the flush's clean-up step,
+// once those inlined deletions have been written out as a real delete
+// file. One `stage_inline_file_delete_remove` call per matched row.
+duckdb::PhysicalOperator &PlanInlineDeleteDelete(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalDelete &op,
                                                  MoraineInlineDeleteTableEntry &table_entry);
 
 } // namespace moraine_duckdb

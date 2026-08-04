@@ -1,15 +1,6 @@
 # RFC 0016: Equality and range indexes
 
 - **Date:** 2026-07-10
-- **Revised:** 2026-07-19 — staged (multi-commit) builds designed in;
-  previously deferred to Open questions.
-- **Revised:** 2026-07-21 — rewrite-file row-id resolution designed in
-  (Rewrite files); previously an implementation follow-up behind a typed
-  refusal.
-- **Revised:** 2026-07-22 — the index becomes **ordered**: order-preserving
-  encoding, per-column direction and NULL placement, and comparison
-  accessors (Range and comparison queries). `=` is now the degenerate closed
-  `[v, v]` range over the same storage.
 
 ## Summary
 
@@ -232,7 +223,7 @@ questions).
 **Oversized values are refused.** Indexed values beyond a fixed cap fail
 with `Constraint` at insert/registration — huge keys degrade the whole
 segment, and equality over megabyte values is not this feature's job.
-Hash-overflow is rejected for v1 (Open questions records the threshold).
+Hash-overflow is rejected for v1.
 
 ### Coverage — who writes entries, and when
 
@@ -307,26 +298,19 @@ fits in memory at all. Three properties are load-bearing:
 - **One probe per distinct key, not per entry.** Repeats within a batch
   collapse in memory; two entries claiming one value for different rows
   collide there, before any read.
-- **Bounded concurrency, in bounded groups — up to a threshold batch
-  size.** Probes are independent point reads, so serializing them makes a
-  batch cost one store round-trip of latency *per entry*. They run with a
-  bounded fan-out, resolved a group at a time — peak memory is one group of
-  keys, not the batch's. Results are applied in batch order, so which entry
-  a rejection names does not depend on which probe finished first.
-- **Past the threshold, one sorted pass per index.** A bulk load probes
-  nearly every key it stages, and a random point read per key against an
-  index that grows with the load makes loading quadratic in rows — measured
-  as the difference between minutes and hours at ten million rows. Above a
-  threshold of unique puts, the batch's keys are sorted (the index id leads
-  the encoded key, so each index's keys form a contiguous run) and each run
-  is resolved by one scan bounded to the run's key span, advanced in step
-  with the sorted keys and seeking over gaps: sequential reads proportional
-  to the overlapping range instead of a random read per key. Outcomes match
-  the point-read mode exactly, and the earliest staged entry still decides
-  which index a rejection names. Peak memory grows by the batch's probe
-  keys — a small share of the commit bound's kilobyte-per-entry budget.
-  Below the threshold — the small-commit shape, probing a large committed
-  index — point reads win, so both modes stay.
+- **Bounded concurrency, in bounded groups, at every batch size.** Probes
+  are independent point reads, so serializing them makes a batch cost one
+  store round-trip of latency *per entry*. They run with a bounded fan-out,
+  resolved a group at a time — peak memory is one group of keys, not the
+  batch's, whatever the batch size. Results are applied in batch order, so
+  which entry a rejection names does not depend on which probe finished
+  first. A bulk load probes nearly every key it stages, but each probe is a
+  bloom-filtered point read whose cost does not grow with the index, and the
+  bounded fan-out overlaps the object store's per-read latency — so the batch
+  stays linear in rows without a second resolution mode. A sorted range scan
+  would be worse for the common case: a bulk load's indexed values are not
+  store-ordered, so one scan sweeps the whole index serially where the
+  concurrent point reads touch only the blocks they need, in parallel.
 - **Entries stage onto the transaction directly.** They never enter the
   write list the committer retains for the maintained projections. No
   projection reflects an index entry, so retaining them would hold a second
@@ -361,6 +345,14 @@ Making it configurable means threading it through both commit paths and the
 FFI; that is worth doing if a caller ever has a legitimate reason to raise
 it, and is not yet justified.
 
+The remedy the refusal names — split the load — is only available to a
+writer that chooses its own batch boundaries. A DuckLake maintenance call
+does not: `ducklake_merge_adjacent_files` decides for itself how many files
+one snapshot merges. A commit that derived an entry per merged row would
+therefore hit an unsplittable refusal, and an indexed table past a few
+million rows could never be compacted again. It derives none (Compaction
+derives nothing), so the limit binds only writers who can obey it.
+
 ### What data movement costs the index: nothing
 
 The entry payload is a row id, not a location. Flush re-homes rows from
@@ -372,6 +364,62 @@ scale. No maintenance operation rewrites an entry. This is why live-only
 entries plus row-id payloads is the whole design: every alternative payload
 (file id, chunk key) turns flush and compaction into index rewrites
 proportional to moved rows.
+
+Nothing removes a live index's entries when a data file's *row* leaves the
+catalog, either — the maintenance sweep reclaims only the entries of
+indexes that are themselves dropped. What keeps that sound is an invariant
+worth stating, because it is the thing a future data-file lifecycle could
+break: **a file's rows never leave without either a row-grain deletion
+having already taken their entries, or a replacement carrying them under
+their preserved row ids.** A rewrite materializes deletes that each removed
+their entries when their delete file was registered; its survivors keep the
+entries they already had, untouched, because an entry names a row and not
+the file holding it (Compaction derives nothing). A merge subsumes its
+sources. Expiry and cleanup prune rows a replacement already covers. The
+whole sequence is held to the table's own answer by the e2e test
+`moraine_index_entries_survive_the_data_file_lifecycle`.
+
+A leaked entry would not be silent: a row id no live file's range holds
+resolves as `Inline` rather than being filtered out, so it surfaces as a
+lookup that still finds a deleted value — and, under a unique index, as a
+bogus duplicate rejection when that value is claimed again.
+
+### Compaction derives nothing
+
+That an entry *survives* compaction untouched is the payload argument
+above. The commit path must also decline to re-derive it. A registration
+on an indexed table is otherwise read and derived unconditionally — the
+property that keeps coverage total — but under compaction that read costs
+one scoped read per merged file and one staged entry per row, to write
+back the index that is already there. At scale it is not merely wasted
+work: it is more entries than a commit may stage at all (Commit size is
+bounded), which would leave a large indexed table permanently
+uncompactable.
+
+**The signal is the commit's own change set.** DuckLake refuses to mix
+compaction with any other change in one transaction — a transaction either
+makes changes or compacts, enforced upstream where `changes_made` is built
+— so a snapshot naming `merge_adjacent` or `rewrite_delete` and nothing
+else re-homes rows and does nothing else to them: no ids allocated (RFC
+0008), no values changed, no rows killed. Every entry its files would
+derive is already stored under the same key, so those files are not read
+at all.
+
+The rule is read off the staged `ducklake_snapshot_changes` row, so what
+it trusts is the commit's own account of what it did — the same account
+the conflict matrix already decides races on (RFC 0004). The fallback is
+deliberately one-sided: a change set naming compaction *and* anything else
+— an append, a delete, a kind this binary does not model — names no
+compaction-only table, and every registration in it derives as before.
+Only an account claiming compaction and nothing whatever else skips; every
+less certain reading pays for the read.
+
+**What still derives.** UPDATE also writes row-id-preserving files, but its
+rows' values change; its commits carry `inserted_into_table` /
+`deleted_from_table`, never a compaction kind, so they derive. Inline flush
+likewise — `inline_flush` is a kind moraine does not model, so it can never
+read as compaction-only — and its output re-derives entries idempotently,
+bounded by how much data may sit inlined.
 
 ### Lookups
 
@@ -490,8 +538,8 @@ Two builders racing the same build both write the definition key and
 collide write-write — the cursor serializes them mechanically. Steps carry
 the definition write, so they classify `altered_table:<table_id>` like the
 create: conservative — a step racing any same-table write surfaces a
-conflict rather than interleaving (the benign `inserted_into_table`
-refinement is recorded in Open questions).
+conflict rather than interleaving (a benign `inserted_into_table`
+refinement is unsettled).
 
 **The delete race.** A row live at one derivation pass can die before its
 step lands, and a stale entry for a dead row is corruption — for a unique
@@ -646,7 +694,10 @@ honoured. Data-file paths resolve against that store.
 rewrite files carry rows that already have entries. Multi entries re-derive
 as idempotent puts (the key includes the row id), and the unique check's
 same-row-id no-op arm (Uniqueness enforcement) covers the rest — so DuckLake
-compaction and UPDATE do not abort against their own existing entries.
+UPDATE and inline flush do not abort against their own existing entries.
+Compaction, whose files are *all* such rows, is skipped before the read
+rather than re-derived (Compaction derives nothing); idempotence is what
+makes the remaining overlap harmless, not what makes it affordable.
 
 **Uniqueness on the SQL write path.** Enforcement hinges on one thing: the
 value-keyed put lands in the same atomic commit that adds the row (Uniqueness
@@ -660,8 +711,7 @@ written to a file collide as they must. Two further guarantees are
 load-bearing:
 
 - **A unique index's scoped read is synchronous at commit.** Deferring it
-  (the non-unique option in Open questions) would let a duplicate commit
-  unchecked.
+  would let a duplicate commit unchecked.
 - **A failed read aborts the commit.** If the registered file cannot be read,
   the commit fails with a store error; the check is never skipped.
 
@@ -748,12 +798,15 @@ a delete file, or its resolved row id is named by an inline file-delete
 targets alike.
 
 **Maintenance stays derivation, never removal.** Registering a rewrite
-file only re-derives entries that exist (compaction: the idempotent puts
-and the unique same-row-id no-op arm, Uniqueness enforcement) or adds
-entries for changed values (UPDATE: the paired delete file removes the
-old-value entries in the same commit). No register-side path stages an
-entry delete, so a rewrite cannot drop a surviving row's entry — the
-property that makes re-derivation safe to run unconditionally.
+file only re-derives entries that exist (the idempotent puts and the
+unique same-row-id no-op arm, Uniqueness enforcement) or adds entries for
+changed values (UPDATE: the paired delete file removes the old-value
+entries in the same commit). No register-side path stages an entry
+delete, so a rewrite cannot drop a surviving row's entry — the property
+that makes derivation safe to run without knowing what a file holds. It
+is skipped in exactly one case, decided on the commit's change set rather
+than the file's shape: a commit that only compacts (Compaction derives
+nothing).
 
 Indexed columns keep their positional location (Coverage): rewrite and
 flush outputs are written under the table's current schema with the
@@ -789,7 +842,7 @@ and `index` kind — no migration, no rewrite; dropping the last index does not
 downgrade the stamp. Staged builds bump once more, to format 3 (Staged
 builds), under the same lazy posture. The `index` discriminant leaves the
 segment extractor ("first byte") untouched, so existing segments and the
-RFC 0011 crash matrix are unaffected.
+RFC 0011 crash cases are unaffected.
 
 ### Reclamation
 
@@ -883,6 +936,12 @@ tests against real SlateDB on in-memory `object_store`:
   returns the file's rows; the read touches no non-indexed column. Golden
   file fixtures pin the reader against each indexable type. A staged
   `register_delete_file` removes exactly the named positions' entries.
+- **Compaction skips derivation.** A commit whose change set names only
+  `merge_adjacent` or `rewrite_delete` leaves the `index` range untouched
+  without reading the file it registers — pinned by registering a file
+  that is not on the store at all, which a deriving commit could not
+  commit. A change set mixing a compaction kind with any other still
+  reads and derives.
 - **Rewrite idempotence.** A rewrite file carrying a row-id column derives
   entries under the preserved ids; DuckLake compaction over an indexed
   table (unique included) leaves the `index` range byte-identical and never
@@ -923,42 +982,6 @@ tests against real SlateDB on in-memory `object_store`:
   entries; `moraine_create_index` on a table already holding rewrite
   files backfills them.
 
-## Open questions
-
-- **Oversized-value cap.** The refusal threshold for indexed value size
-  (strawman: 1 KiB per composite key). Hash-overflow schemes are the
-  recorded escape if a real workload needs large indexed values.
-- **Benign build steps.** Steps classify `altered_table`, so a build
-  serializes against same-table writers (each side re-drives on conflict).
-  The `inserted_into_table` refinement — steps benign with concurrent
-  appends — needs the delete race re-examined before the classification
-  loosens, since surfaced conflicts are what force the stale-batch
-  re-derivation today.
-- **Transparent pushdown.** Whether to carry the DuckLake binder patch
-  (Extension path, Future directions) that accepts `CREATE INDEX`/`PRIMARY
-  KEY` and routes equality pushdown to the index. Nothing in the layout
-  precludes it; nothing here promises it.
-- **Deferred maintenance under SQL writes.** The same-commit scoped read adds
-  latency proportional to the registered file's indexed columns. A deferred
-  (post-commit) mode could shed it for non-unique indexes at the cost of an
-  under-coverage window. Unique indexes cannot defer: enforcement *is* the
-  commit.
-- **Ordered NULL *emission*.** NULL rows are now stored (multi-shaped,
-  collision-exempt) and reachable by `IS NULL`, but the placement's *ordering*
-  effect — emitting NULL rows at the declared `FIRST`/`LAST` end of an
-  ordered scan — is only meaningful for `ORDER BY`, which is not yet routed to
-  the index (see pushdown, below). Until then `NULLS FIRST`/`LAST` governs the
-  stored flag byte and nothing a reader observes about order.
-- **Reverse-direction scans.** The store scans forward only, so one index
-  serves one declared order. Whether to grow a store-level reverse iterator
-  (letting one index serve both directions, and a composite its exact-opposite
-  order) versus the current "declare the direction, or build a second index"
-  is open.
-- **Transparent range/`ORDER BY` pushdown.** The ordered encoding removes the
-  encoding blocker; routing comparison and `ORDER BY` pushdown into DuckLake's
-  optimizer still waits on a DuckLake binder change (Extension path, Future
-  directions).
-
 ## Alternatives considered
 
 - **Temporally versioned entries (`begin`/`end`, current/history-style).**
@@ -983,8 +1006,8 @@ tests against real SlateDB on in-memory `object_store`:
   index to a `stale` flag). A stale unique index enforces nothing and says so
   only to callers who ask — silent degradation of the exact guarantee the
   feature exists to give. Rejected for the scoped read, which keeps DuckLake
-  flows working *and* the index honest; stale-mode survives only as the
-  deferred-non-unique open question, where correctness is not at stake.
+  flows working *and* the index honest; stale-mode survives only as an
+  unsettled option for non-unique indexes, where correctness is not at stake.
 - **Refusing the extension write path outright** (this RFC's first stance).
   Reading a registered file's indexed columns is a bounded, merge-free
   projection — not the scan path the non-goal guards — so blanket refusal
@@ -1029,7 +1052,7 @@ commits over upstream (reader snapshots, a multi-get batching point-gets) —
 no index primitives: no range-delete, no merge operator. The whole index
 family, uniqueness included, rides the same `get` / `WriteBatch` /
 prefix-scan surface this RFC assumes. A production index engine living
-without range-delete answers Reclamation's open question: the batched sweep
+without range-delete settles the Reclamation question: the batched sweep
 is a legitimate permanent design, not a workaround awaiting a SlateDB
 feature.
 

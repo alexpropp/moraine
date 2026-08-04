@@ -150,22 +150,38 @@ pub async fn inline_registered_tables(catalog: &Catalog) -> Result<Vec<(u64, u64
         .collect())
 }
 
-/// Whether `table_id` has at least one recorded `inline/file_delete` record.
-/// DuckLake probes the inlined-delete table's existence via a catalog bind
-/// that must error until the first `inline/file_delete` is staged, so this
-/// reports the table missing (not merely unreferenced) until then.
+/// Whether `table_id`'s `ducklake_inlined_delete_<table_id>` exists.
+/// DuckLake probes it via a catalog bind that must error until the first
+/// `inline/file_delete` is staged, so this reports the table missing (not
+/// merely unreferenced) until then.
+///
+/// Existing once it has existed is the other half, and the reason this
+/// consults a marker rather than only the records: a flush materializes
+/// the table's deletions into a real delete file and clears them, and an
+/// emptied SQL table still exists — which is what DuckLake, having cached
+/// the table's existence for the life of the catalog, goes on assuming.
+/// The record fallback covers stores written before the marker did, whose
+/// first write of either kind heals them.
 ///
 /// # Errors
 ///
-/// Returns an error if the underlying store scan fails or decodes
+/// Returns an error if the underlying store read fails or decodes
 /// corrupt bytes.
 #[doc(hidden)]
 pub async fn inline_file_delete_table_exists(catalog: &Catalog, table_id: u64) -> Result<bool> {
     let read = catalog.begin_dump().await?;
-    let file_deletes =
-        store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id).await;
+    let marked = store_inline::read_inline_file_delete_table(read.handle(), table_id).await;
+    let exists = match marked {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            store_inline::scan_inline_file_deletes(read.handle(), read.overlay(), table_id)
+                .await
+                .map(|records| !records.is_empty())
+        }
+        Err(error) => Err(error),
+    };
     read.finish().await;
-    Ok(!file_deletes?.is_empty())
+    exists
 }
 
 /// Every `inline/file_delete` record for `table_id` as

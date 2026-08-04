@@ -67,6 +67,16 @@ struct MaintenanceConfig {
 	std::string leader_advertise;
 	// The most concurrent forwarded sessions the leader serves.
 	uint64_t leader_max_sessions = 64;
+	// Off by default: the merge rewrites whatever the store holds and
+	// pays for every byte in object-store traffic. It destroys nothing a
+	// query can observe, so the default is about cost, not safety.
+	bool compact_store = false;
+	// Empty merges every subspace holding sorted runs.
+	std::string compact_store_subspace;
+	// How long a pass waits for each submitted merge to commit. Zero
+	// returns as soon as they are submitted; a merge that outlives the
+	// wait keeps running and is reported pending.
+	uint64_t compact_store_timeout_ms = 0;
 	std::vector<DuckLakeStep> ducklake_steps;
 };
 
@@ -124,6 +134,7 @@ private:
 	MaintenanceStep RunFold();
 	// Removes durably folded slots, oldest first.
 	MaintenanceStep RunTruncate();
+	MaintenanceStep RunStoreMerge();
 	// The DuckLake catalog sitting above this metadata catalog, found by
 	// matching attached databases on path. DuckLake's own maintenance
 	// functions take that name, not this catalog's.

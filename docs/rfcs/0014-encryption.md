@@ -141,16 +141,6 @@ application-level encryption of its own store.
   objects ever need encryption independent of the bucket, that hook is the
   seam: below moraine's value format, invisible to codecs and migration.
 
-## Open questions
-
-- **KMS configuration guidance.** Key policy, grants, and rotation posture
-  for the bucket key are operator documentation, not moraine design, and are
-  unwritten.
-- **Untrusted-bucket deployments.** If demand appears for store objects the
-  bucket operator cannot read, pursue it at the SlateDB layer
-  (`BlockTransformer` or a future native scheme), not in moraine's value
-  format. Nothing is designed.
-
 ## Alternatives considered
 
 - **moraine-level envelope encryption of value payloads.** moraine would

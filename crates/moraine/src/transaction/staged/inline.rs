@@ -1,6 +1,8 @@
 //! Inline-data translation: turning staged inline operations into their
 //! `inline/*` store writes.
 
+use std::collections::HashSet;
+
 use moraine_wal::Overlay;
 
 use super::{
@@ -33,14 +35,14 @@ impl ChunkSeqAllocator {
 /// those chunks' rows consumed. Reads `db_tx`'s current (pre-commit)
 /// inline records — the flush op only ever names the table and snapshot,
 /// never the keys to remove.
-pub(super) async fn translate_inline_flush_delete(
+pub(crate) async fn translate_inline_flush_delete(
     handle: ReadHandle<'_>,
     overlay: Option<&Overlay>,
     table_id: u64,
     schema_version: u64,
     flush_snapshot: u64,
     writes: &mut Vec<commit::StagedWrite>,
-) -> Result<()> {
+) -> Result<HashSet<u64>> {
     let chunks = store_inline::scan_inline_chunks(handle, overlay, table_id).await?;
     let inline_deletes =
         store_inline::scan_inline_inline_deletes(handle, overlay, table_id).await?;
@@ -64,7 +66,9 @@ pub(super) async fn translate_inline_flush_delete(
     // ones (`ForFlush`) — their `inline/inline_delete` records become orphaned
     // once the owning chunk is gone above, and must go with it.
     let rows = materialize_inline_rows(&scoped, &inline_deletes);
+    let mut drained = HashSet::new();
     for row in InlineScanKind::ForFlush.select(&rows, flush_snapshot, 0) {
+        drained.insert(row.row_id);
         if row.end_snapshot.is_some() {
             writes.push((
                 Key::Inline(InlineKey::Live(InlineOperation::InlineDelete {
@@ -77,7 +81,7 @@ pub(super) async fn translate_inline_flush_delete(
         }
     }
 
-    Ok(())
+    Ok(drained)
 }
 
 /// Removes every `inline/*` record for `table_id`: schema, chunks, and
@@ -133,7 +137,7 @@ pub(super) async fn translate_inline_drop(
 /// (for `InlineFlushDelete`/`InlineDrop`, which name a table rather than
 /// the keys to remove) at its pre-commit state, before any of this
 /// commit's own writes are staged onto it.
-pub(super) fn inline_schema_write(
+pub(crate) fn inline_schema_write(
     table_id: u64,
     schema_version: u64,
     arrow_schema: &[u8],
@@ -151,7 +155,7 @@ pub(super) fn inline_schema_write(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn inline_insert_write(
+pub(crate) fn inline_insert_write(
     table_id: u64,
     schema_version: u64,
     begin_snapshot: u64,
@@ -177,7 +181,7 @@ pub(super) fn inline_insert_write(
     )
 }
 
-pub(super) fn inline_inline_delete_write(
+pub(crate) fn inline_inline_delete_write(
     table_id: u64,
     row_id: u64,
     end_snapshot: u64,
@@ -210,6 +214,35 @@ pub(super) fn inline_file_delete_write(
         Some(value::encode_value(&proto::InlineFileDeleteValue {
             begin_snapshot,
         })),
+    )
+}
+
+/// The tombstone write that removes a live `inline/file_delete` record.
+pub(super) fn inline_file_delete_remove_write(
+    table_id: u64,
+    data_file_id: u64,
+    row_id: u64,
+) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
+            table_id,
+            data_file_id,
+            row_id,
+        }))
+        .encode(),
+        None,
+    )
+}
+
+/// The tombstone write that deregisters one `inline/schema` record.
+pub(super) fn inline_schema_drop_write(table_id: u64, schema_version: u64) -> commit::StagedWrite {
+    (
+        Key::Inline(InlineKey::Schema {
+            table_id,
+            schema_version,
+        })
+        .encode(),
+        None,
     )
 }
 
@@ -292,16 +325,16 @@ pub(super) async fn translate_inline(
             RowOperation::InlineSchemaDrop {
                 table_id,
                 schema_version,
-            } => {
-                writes.push((
-                    Key::Inline(InlineKey::Schema {
-                        table_id: *table_id,
-                        schema_version: *schema_version,
-                    })
-                    .encode(),
-                    None,
-                ));
-            }
+            } => writes.push(inline_schema_drop_write(*table_id, *schema_version)),
+            RowOperation::InlineFileDeleteRemove {
+                table_id,
+                data_file_id,
+                row_id,
+            } => writes.push(inline_file_delete_remove_write(
+                *table_id,
+                *data_file_id,
+                *row_id,
+            )),
             RowOperation::Insert { .. }
             | RowOperation::Delete { .. }
             | RowOperation::UpdateSetEnd { .. }

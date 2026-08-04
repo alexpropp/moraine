@@ -22,6 +22,7 @@ use std::ffi::{CString, c_char};
 /// | [`COMMIT_CONFLICT`](codes::COMMIT_CONFLICT) | concurrent commit conflict; message contains the substring `conflict` | `TransactionException` |
 /// | [`RETRY_EXHAUSTED`](codes::RETRY_EXHAUSTED) | the commit's internal retry budget ran out; message carries none of DuckLake's retry substrings | `TransactionException` |
 /// | [`FENCED`](codes::FENCED) | another process took over as the writer; the handle can no longer commit | `IOException` |
+/// | [`OPEN_RACED`](codes::OPEN_RACED) | another process created the store while this attach was creating it; nothing was written, and attaching again adopts it | `IOException` |
 /// | [`CORRUPTION`](codes::CORRUPTION) | stored bytes failed to decode, or a catalog string cannot round-trip through a C string | `IOException` |
 /// | [`STORE`](codes::STORE) | the underlying object store / SlateDB failed | `IOException` |
 /// | [`INVALID_ARGUMENT`](codes::INVALID_ARGUMENT) | a null pointer, non-UTF-8 string, or unsupported ABI input | `InvalidInputException` |
@@ -63,6 +64,25 @@ pub mod codes {
     /// writer; this handle can no longer commit. Terminal for the handle,
     /// and the message likewise avoids DuckLake's retry substrings.
     pub const FENCED: i32 = 11;
+    /// [`moraine::Error::Migration`] — the store needs, is undergoing, or
+    /// is newer than a structural format this binary supports. The C++
+    /// shim raises it as an `IOException`: fatal at attach, never retried.
+    pub const MIGRATION: i32 = 12;
+    /// [`moraine::Error::SnapshotExpired`] — a time-travel target fell
+    /// below the retention horizon. Raised as a `CatalogException`, like a
+    /// missing entity: the caller re-resolves rather than retries.
+    pub const SNAPSHOT_EXPIRED: i32 = 13;
+    /// [`moraine::Error::Unsupported`] — a DuckLake feature moraine does
+    /// not implement. Raised as a `NotImplementedException`; terminal.
+    pub const UNSUPPORTED: i32 = 14;
+    /// [`moraine::Error::OpenRaced`] — another process created this store
+    /// while the attach was creating it. Nothing was written, and attaching
+    /// again adopts the store that won, so this is the one code here whose
+    /// remedy is to repeat the attach. Raised as an `IOException` like the
+    /// other attach-time failures, and deliberately **not** a
+    /// `TransactionException`: re-driving a commit is the wrong response to
+    /// a race that happened before any transaction existed.
+    pub const OPEN_RACED: i32 = 15;
 }
 
 /// Fixed message for a caught panic; never derived from the panic
@@ -156,7 +176,16 @@ impl From<moraine::Error> for AbiError {
             moraine::Error::RetryBudgetExhausted(_) => codes::RETRY_EXHAUSTED,
             moraine::Error::Fenced(_) => codes::FENCED,
             moraine::Error::Corruption(_) => codes::CORRUPTION,
-            // Covers `Store` and any future `#[non_exhaustive]` variant.
+            // The four below carry none of the shim's retry substrings, so
+            // none is re-driven; their codes map to non-`TransactionException`
+            // DuckDB errors in the C++ shim (catalog.cpp) for the same reason.
+            moraine::Error::Unsupported(_) => codes::UNSUPPORTED,
+            moraine::Error::SnapshotExpired(_) => codes::SNAPSHOT_EXPIRED,
+            moraine::Error::Interrupted(_) => codes::INTERRUPTED,
+            moraine::Error::Migration(_) => codes::MIGRATION,
+            moraine::Error::OpenRaced(_) => codes::OPEN_RACED,
+            // Covers `Store`, `IndexBuilding`, `Configuration`, and any
+            // future `#[non_exhaustive]` variant.
             _ => codes::STORE,
         };
         Self::new(code, error_chain(&err))
@@ -232,5 +261,146 @@ mod tests {
         let err =
             AbiError::new(codes::INVALID_ARGUMENT, "bad argument").with_read_only_attach_hint();
         assert!(!err.message.contains("READ_WRITE"), "{}", err.message);
+    }
+
+    /// The C++ shim switches on `MORAINE_*`, and those are hand-written in
+    /// `cbindgen.toml` rather than generated from the consts here — cbindgen
+    /// would emit them as unprefixed `#define OK 0` macros. Two hand-kept
+    /// copies of a wire contract drift, and silently: a code added here but
+    /// not there still compiles, and the shim falls through to
+    /// `InternalException` for it at runtime.
+    ///
+    /// So this reads the generated header back and pins the pair. The count
+    /// check is what catches an addition, since a code missing from the
+    /// table below would otherwise go unnoticed by the value checks.
+    #[test]
+    fn every_code_matches_the_c_enum_the_shim_switches_on() {
+        let header = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cpp/moraine_abi.h"),
+        )
+        .expect("read the generated ABI header");
+
+        let declared: std::collections::HashMap<&str, i32> = header
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("MORAINE_"))
+            .filter_map(|entry| {
+                let (name, value) = entry.split_once(" = ")?;
+                let value = value.trim_end_matches(',').parse().ok()?;
+                Some((name, value))
+            })
+            .collect();
+
+        let expected = [
+            ("OK", codes::OK),
+            ("NOT_FOUND", codes::NOT_FOUND),
+            ("ALREADY_EXISTS", codes::ALREADY_EXISTS),
+            ("CONSTRAINT", codes::CONSTRAINT),
+            ("COMMIT_CONFLICT", codes::COMMIT_CONFLICT),
+            ("CORRUPTION", codes::CORRUPTION),
+            ("STORE", codes::STORE),
+            ("INVALID_ARGUMENT", codes::INVALID_ARGUMENT),
+            ("INTERNAL", codes::INTERNAL),
+            ("INTERRUPTED", codes::INTERRUPTED),
+            ("RETRY_EXHAUSTED", codes::RETRY_EXHAUSTED),
+            ("FENCED", codes::FENCED),
+            ("MIGRATION", codes::MIGRATION),
+            ("SNAPSHOT_EXPIRED", codes::SNAPSHOT_EXPIRED),
+            ("UNSUPPORTED", codes::UNSUPPORTED),
+            ("OPEN_RACED", codes::OPEN_RACED),
+        ];
+
+        assert_eq!(
+            declared.len(),
+            expected.len(),
+            "the header declares {} codes and this test knows {}; a code was added on one \
+             side only",
+            declared.len(),
+            expected.len()
+        );
+        for (name, value) in expected {
+            assert_eq!(
+                declared.get(name),
+                Some(&value),
+                "MORAINE_{name} in the header does not match `codes::{name}`"
+            );
+        }
+    }
+
+    /// Every variant the core can raise carries its own code. The catch-all
+    /// exists for the store-shaped rest, so a variant landing there by
+    /// omission is invisible until a caller sees the wrong DuckDB exception.
+    #[test]
+    fn distinctly_handled_errors_do_not_fall_into_the_store_catch_all() {
+        let sample = || "x".to_string();
+        for (error, expected) in [
+            (moraine::Error::NotFound(sample()), codes::NOT_FOUND),
+            (
+                moraine::Error::AlreadyExists(sample()),
+                codes::ALREADY_EXISTS,
+            ),
+            (moraine::Error::Constraint(sample()), codes::CONSTRAINT),
+            (
+                moraine::Error::CommitConflict(sample()),
+                codes::COMMIT_CONFLICT,
+            ),
+            (
+                moraine::Error::RetryBudgetExhausted(sample()),
+                codes::RETRY_EXHAUSTED,
+            ),
+            (moraine::Error::Fenced(sample()), codes::FENCED),
+            (moraine::Error::OpenRaced(sample()), codes::OPEN_RACED),
+            (moraine::Error::Corruption(sample()), codes::CORRUPTION),
+            (moraine::Error::Unsupported(sample()), codes::UNSUPPORTED),
+            (
+                moraine::Error::SnapshotExpired(sample()),
+                codes::SNAPSHOT_EXPIRED,
+            ),
+            (moraine::Error::Interrupted(sample()), codes::INTERRUPTED),
+            (moraine::Error::Migration(sample()), codes::MIGRATION),
+        ] {
+            let rendered = format!("{error:?}");
+            assert_eq!(AbiError::from(error).code, expected, "{rendered}");
+        }
+    }
+
+    /// The first of the two conflict-propagation wire obligations: the
+    /// message a lost commit carries must still contain `conflict` once it
+    /// has crossed this boundary. DuckLake's `RetryOnError` decides
+    /// retryability by substring on the lowercased text, so a conversion
+    /// that summarized or replaced the message would turn every benign
+    /// race into an aborted transaction — silently, and only under
+    /// concurrency.
+    ///
+    /// The counterpart is pinned alongside it: no other error the shim
+    /// raises from a commit may carry any of the four substrings, or an
+    /// unretryable failure is re-driven until DuckLake's own budget runs
+    /// out.
+    #[test]
+    fn the_commit_conflict_message_keeps_its_retry_substring() {
+        let conflict = AbiError::from(moraine::Error::CommitConflict(
+            "a concurrent commit changed state this one read".to_string(),
+        ));
+        assert_eq!(conflict.code, codes::COMMIT_CONFLICT);
+        assert!(
+            conflict.message.to_lowercase().contains("conflict"),
+            "the lost-commit message must stay retryable: {}",
+            conflict.message
+        );
+
+        for error in [
+            moraine::Error::RetryBudgetExhausted("budget".to_string()),
+            moraine::Error::Fenced("fenced".to_string()),
+            moraine::Error::Constraint("constrained".to_string()),
+            moraine::Error::Unsupported("unsupported".to_string()),
+        ] {
+            let rendered = format!("{error:?}");
+            let message = AbiError::from(error).message.to_lowercase();
+            for substring in ["conflict", "concurrent", "unique", "primary key"] {
+                assert!(
+                    !message.contains(substring),
+                    "{rendered} must not carry retry substring {substring:?}: {message}"
+                );
+            }
+        }
     }
 }

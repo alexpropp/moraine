@@ -217,6 +217,11 @@ fn error_response(err: &Error) -> Response {
         Error::Configuration(message) => (ErrorKind::Configuration, message.clone()),
         Error::Fenced(message) => (ErrorKind::Fenced, message.clone()),
         Error::SlotLog(message) => (ErrorKind::SlotLog, message.clone()),
+        Error::Unsupported(message) => (ErrorKind::Unsupported, message.clone()),
+        Error::SnapshotExpired(message) => (ErrorKind::SnapshotExpired, message.clone()),
+        Error::Interrupted(message) => (ErrorKind::Interrupted, message.clone()),
+        Error::Migration(message) => (ErrorKind::Migration, message.clone()),
+        Error::OpenRaced(message) => (ErrorKind::OpenRaced, message.clone()),
         Error::Store(source) => (ErrorKind::Store, source.to_string()),
     };
     Response::Error { kind, message }
@@ -291,6 +296,15 @@ fn wire_operation(operation: WireRowOperation) -> Result<RowOperation> {
             data_file_id,
             row_id,
             begin_snapshot,
+        },
+        WireRowOperation::InlineFileDeleteRemove {
+            table_id,
+            data_file_id,
+            row_id,
+        } => RowOperation::InlineFileDeleteRemove {
+            table_id,
+            data_file_id,
+            row_id,
         },
         WireRowOperation::InlineFlushDelete {
             table_id,

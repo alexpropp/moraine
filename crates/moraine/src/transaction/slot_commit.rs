@@ -315,10 +315,15 @@ pub(crate) async fn cached_slot_head(store: &SlotStore) -> Result<SlotHead> {
     {
         let cache = store.head_cache.lock();
         if let Some(cached) = cache.as_ref()
-            && cached.refreshed_at.elapsed() < store.options.refresh_interval
+            && (store.pinned || cached.refreshed_at.elapsed() < store.options.refresh_interval)
         {
             return Ok(cached.to_head());
         }
+    }
+    // A pinned attach reads a fixed cut: it materializes the folded store once
+    // and never revalidates against the tail committed after the checkpoint.
+    if store.pinned {
+        return materialize_into_cache(store).await;
     }
     revalidate_head(store).await
 }
@@ -427,22 +432,13 @@ pub(crate) async fn materialize_slot_view_at(
         return commit::materialize(handle, Some(snapshot)).await;
     }
 
-    let head = slot_head(store, Some(snapshot), false).await?;
+    // The whole tail is replayed, not a prefix truncated at the target: a
+    // later commit's backdated record — a flush's data file effective at or
+    // below the target — is in the overlay the target's view filters over.
+    let head = slot_head(store, None, false).await?;
     let reached = head.view.snapshot.snapshot_id;
-    if reached == snapshot {
-        release_reader(head.reader.as_ref()).await;
-        return Ok(head.view);
-    }
-
-    let outcome = if reached > snapshot {
-        // The reader followed the manifest past the target while the tail was
-        // read, so the store now holds the target as history.
-        commit::materialize(head.handle(handle), Some(snapshot)).await
-    } else {
-        Err(Error::NotFound(format!(
-            "snapshot {snapshot} (head is {reached})"
-        )))
-    };
+    let outcome =
+        commit::materialize_overlaid(head.handle(handle), &head.overlay, reached, snapshot).await;
     release_reader(head.reader.as_ref()).await;
 
     outcome
@@ -548,6 +544,21 @@ async fn tail_minted_snapshot(
 /// handle's — the entry-scan paths need it, so a folder-role write the handle's
 /// reader has not yet polled is still seen.
 async fn slot_head(store: &SlotStore, until: Option<u64>, fresh: bool) -> Result<SlotHead> {
+    // A pinned attach reads the folded store the checkpoint captured and never
+    // the tail committed after it, so its head is the folded view with no
+    // overlay.
+    if store.pinned {
+        let handle = ReadHandle::Reader(&store.reader);
+        let view = commit::materialize(handle, None).await?;
+        let next_sequence = fold_cursor(handle).await?.saturating_add(1);
+        return Ok(SlotHead {
+            view,
+            overlay: Overlay::default(),
+            next_sequence,
+            reader: None,
+        });
+    }
+
     if !fresh && let Replayed::Head(head) = replay(&store.reader, &store.slots, until).await? {
         return Ok(*head);
     }
@@ -822,6 +833,7 @@ mod tests {
             object_store,
             options,
             read_only: false,
+            pinned: false,
             coalescer,
             head_cache: HeadCache::default(),
             contention: Arc::new(ContentionCounters::default()),
@@ -862,7 +874,10 @@ mod tests {
             },
             SlotWrite {
                 key: Key::Sys(SysKey::Head).encode(),
-                value: Some(value::encode_value(&proto::HeadValue { snapshot_id })),
+                value: Some(value::encode_value(&proto::HeadValue {
+                    snapshot_id,
+                    batch_seq: 0,
+                })),
             },
         ]
     }
@@ -1390,7 +1405,10 @@ mod tests {
         .unwrap();
         tx.put(
             Key::Sys(SysKey::Head).encode(),
-            value::encode_value(&proto::HeadValue { snapshot_id }),
+            value::encode_value(&proto::HeadValue {
+                snapshot_id,
+                batch_seq: 0,
+            }),
         )
         .unwrap();
         tx.put(

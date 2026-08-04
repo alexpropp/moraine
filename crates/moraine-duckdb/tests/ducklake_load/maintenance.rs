@@ -173,6 +173,91 @@ fn ducklake_delete_orphaned_files_ignores_catalogued_paths() {
     );
 }
 
+/// Merge never crosses a partition boundary: files spread over two
+/// partition values compact to one file per value, never one combined
+/// file, so a merged file still carries exactly one partition value and
+/// the governing spec stays satisfied. The eligibility rule is
+/// DuckLake's, applied before moraine sees the batch — this pins that
+/// moraine's served projections do not mislead it into merging across.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_merge_does_not_cross_partition_boundaries() {
+    let store = TempDir::new("merge-part-store");
+    let data = TempDir::new("merge-part-data");
+    let (store, data) = (store.path(), data.path());
+
+    run_ducklake_sql(
+        store,
+        data,
+        "CREATE TABLE lake.main.p (region VARCHAR, v INTEGER);",
+    );
+    run_ducklake_sql(
+        store,
+        data,
+        "ALTER TABLE lake.main.p SET PARTITIONED BY (region);",
+    );
+
+    // Four separate statements, so four files: two per partition value.
+    // Each exceeds the inlining limit so they land as real Parquet.
+    for region in ["EU", "US"] {
+        for batch in 0..2 {
+            run_ducklake_sql(
+                store,
+                data,
+                &format!(
+                    "INSERT INTO lake.main.p \
+                     SELECT '{region}', i FROM range({start}, {end}) t(i);",
+                    start = batch * 100,
+                    end = batch * 100 + 100,
+                ),
+            );
+        }
+    }
+
+    let live_files = "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;";
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["4".to_string()]],
+        "expected one file per insert before merging"
+    );
+
+    run_ducklake_sql(store, data, "CALL ducklake_merge_adjacent_files('lake');");
+
+    // Two partition values in, two files out — not one.
+    assert_eq!(
+        csv_rows(&run_standalone_sql(store, live_files)),
+        vec![vec!["2".to_string()]],
+        "merge must compact within each partition and not across them"
+    );
+
+    // And each surviving file carries exactly one partition value.
+    let values_per_file = run_standalone_sql(
+        store,
+        "SELECT count(DISTINCT pv.partition_value) \
+         FROM m.ducklake_data_file f \
+         JOIN m.ducklake_file_partition_value pv ON pv.data_file_id = f.data_file_id \
+         WHERE f.end_snapshot IS NULL GROUP BY f.data_file_id ORDER BY 1;",
+    );
+    assert_eq!(
+        csv_rows(&values_per_file),
+        vec![vec!["1".to_string()], vec!["1".to_string()]],
+        "a merged file spanning two partition values would break pruning"
+    );
+
+    // The rows themselves survive the merge intact.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data,
+            "SELECT region, count(*) FROM lake.main.p GROUP BY region ORDER BY region;",
+        )),
+        vec![
+            vec!["EU".to_string(), "200".to_string()],
+            vec!["US".to_string(), "200".to_string()]
+        ]
+    );
+}
+
 /// Merge compaction, differential against a stock DuckLake catalog
 /// fed the identical statements: three small files merge into one,
 /// rows and row ids are identical to the reference before and after,
@@ -397,6 +482,7 @@ fn maintenance_without_configuration_runs_only_the_sweep() {
         );
     }
     assert_eq!(by_step.get("sweep_indexes"), Some(&"ran"), "{rows:?}");
+    assert_eq!(by_step.get("compact_store"), Some(&"skipped"), "{rows:?}");
 
     // Nothing the pass did is observable in the data.
     assert_eq!(
@@ -507,6 +593,7 @@ fn maintenance_runs_configured_ducklake_steps_in_order() {
             "cleanup_old_files",
             "delete_orphaned_files",
             "sweep_indexes",
+            "compact_store",
             "truncate_slots",
         ],
         "steps must report in sequence order"
@@ -557,6 +644,226 @@ fn maintenance_refuses_inside_an_explicit_transaction() {
     assert!(
         error.contains("explicit transaction"),
         "expected a transaction refusal, got: {error}"
+    );
+}
+
+/// The census reports one row per subspace, from a read-write and a
+/// read-only attach alike, and carries live counts only when asked for
+/// them — the scanning leg costs a full read of the store.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn store_census_reports_every_subspace() {
+    let store = TempDir::new("census-store");
+    let data = TempDir::new("census-data");
+
+    let rows = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(20) t(i);\
+         SELECT subspace, live_keys FROM moraine_store_census('lake') ORDER BY subspace;",
+    ));
+    let names: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+    for subspace in ["current", "history", "index", "snapshot"] {
+        assert!(names.contains(&subspace), "no `{subspace}` row: {rows:?}");
+    }
+    // Without the scanning leg the live columns are NULL, not zero: a
+    // subspace with no live keys and one nobody counted differ.
+    assert!(
+        rows.iter().all(|row| row[1] == "NULL"),
+        "unrequested live counts: {rows:?}"
+    );
+
+    let counted = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT live_keys, scheduled_files FROM moraine_store_census('lake', live := true) \
+         WHERE subspace = 'current';",
+    ));
+    let live: u64 = counted[0][0].parse().expect("a live count");
+    assert!(live > 0, "{counted:?}");
+    // Nothing has been expired, so the deletion schedule is empty.
+    assert_eq!(counted[0][1], "0", "{counted:?}");
+
+    // An operator investigating a production store attaches read-only,
+    // and the census is the part of this surface that serves them.
+    let read_only = csv_rows(&run_ducklake_read_only_sql(
+        store.path(),
+        data.path(),
+        "SELECT count(*) FROM moraine_store_census('lake');",
+    ));
+    assert_eq!(
+        read_only[0][0].parse::<usize>().expect("a count"),
+        names.len()
+    );
+}
+
+/// A configured pass runs the store merge and reports it; an
+/// unconfigured one skips it. The merge reclaims substrate bytes and
+/// moves nothing a query can observe.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn maintenance_merges_the_store_when_configured() {
+    let store = TempDir::new("maint-merge-store");
+    let data = TempDir::new("maint-merge-data");
+    let configured =
+        ", META_MAINTENANCE_COMPACT_STORE true, META_MAINTENANCE_COMPACT_STORE_TIMEOUT 60";
+
+    let rows = csv_rows(&run_ducklake_sql_with_options(
+        store.path(),
+        data.path(),
+        configured,
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(50) t(i);\
+         SELECT step, status, detail FROM moraine_maintenance('lake') WHERE step = 'compact_store';",
+    ));
+    assert_eq!(rows[0][1], "ran", "{rows:?}");
+    // Every subspace is accounted for, whether it had runs to merge or
+    // not, so two passes stay comparable. The detail is one clause per
+    // subspace, which CSV splits across fields.
+    let detail = rows[0][2..].join(",");
+    for subspace in ["current", "history", "index", "snapshot"] {
+        assert!(
+            detail.contains(subspace),
+            "no `{subspace}` clause: {rows:?}"
+        );
+    }
+
+    // The merge mints no snapshot and moves no rows.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql_with_options(
+            store.path(),
+            data.path(),
+            configured,
+            "SELECT count(*), sum(a) FROM lake.main.t;"
+        )),
+        vec![vec!["50".to_string(), "1225".to_string()]]
+    );
+}
+
+/// The store merge has a trigger of its own, so merging once needs no
+/// re-attach: it reports a row per subspace, refuses a name it does not
+/// know, and moves nothing a query can observe.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn compact_store_merges_on_demand() {
+    let store = TempDir::new("compact-now-store");
+    let data = TempDir::new("compact-now-data");
+
+    // No MAINTENANCE_* option anywhere: the point of the trigger is that a
+    // one-off merge needs no attach-time configuration.
+    let rows = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(50) t(i);\
+         SELECT subspace, outcome FROM moraine_compact_store('lake') ORDER BY subspace;",
+    ));
+    let names: Vec<&str> = rows.iter().map(|row| row[0].as_str()).collect();
+    for subspace in ["current", "history", "index", "snapshot"] {
+        assert!(names.contains(&subspace), "no `{subspace}` row: {rows:?}");
+    }
+    // A store this small has no sorted runs, so every tree is skipped —
+    // reported rather than omitted, so two calls stay comparable.
+    assert!(
+        rows.iter().all(|row| row[1] == "skipped"),
+        "unexpected outcome: {rows:?}"
+    );
+
+    // Narrowing to one subspace reports only that one.
+    let one = csv_rows(&run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT subspace FROM moraine_compact_store('lake', subspace := 'current');",
+    ));
+    assert_eq!(one, vec![vec!["current".to_string()]]);
+
+    let unknown = run_ducklake_sql_expect_err(
+        store.path(),
+        data.path(),
+        "SELECT * FROM moraine_compact_store('lake', subspace := 'gcfile');",
+    );
+    assert!(
+        unknown.contains("no subspace named") && unknown.contains("current"),
+        "got: {unknown}"
+    );
+
+    // The merge mints no snapshot and moves no rows.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            "SELECT count(*), sum(a) FROM lake.main.t;"
+        )),
+        vec![vec!["50".to_string(), "1225".to_string()]]
+    );
+}
+
+/// The merge runs inside the writer, so a read-only attach refuses it
+/// while still serving the census.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn compact_store_refuses_a_read_only_attach() {
+    let store = TempDir::new("compact-ro-store");
+    let data = TempDir::new("compact-ro-data");
+
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT); INSERT INTO lake.main.t VALUES (1);",
+    );
+
+    // The census serves a reader; the merge does not.
+    let census = csv_rows(&run_ducklake_read_only_sql(
+        store.path(),
+        data.path(),
+        "SELECT count(*) FROM moraine_store_census('lake');",
+    ));
+    assert!(census[0][0].parse::<usize>().expect("a count") > 0);
+
+    let refused = run_ducklake_read_only_sql_expect_err(
+        store.path(),
+        data.path(),
+        "SELECT * FROM moraine_compact_store('lake');",
+    );
+    assert!(
+        refused.contains("read-only") && refused.contains("writer"),
+        "got: {refused}"
+    );
+}
+
+/// A merge step disabled while one of its own parameters is supplied is
+/// two contradictory instructions, and fails at bind rather than
+/// resolving silently.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn maintenance_rejects_a_contradictory_merge_configuration() {
+    let store = TempDir::new("maint-merge-badopt-store");
+    let data = TempDir::new("maint-merge-badopt-data");
+
+    let contradictory = run_ducklake_sql_expect_err_with_options(
+        store.path(),
+        data.path(),
+        ", META_MAINTENANCE_COMPACT_STORE false, META_MAINTENANCE_COMPACT_STORE_SUBSPACE 'current'",
+        "SELECT 1;",
+    );
+    assert!(
+        contradictory.contains("but one of its parameters was supplied"),
+        "got: {contradictory}"
+    );
+
+    // A subspace name is checked at attach rather than when a pass runs:
+    // a typo caught only at pass time would attach cleanly and then fail
+    // every scheduled pass, unattended, for as long as it stood.
+    let unknown_subspace = run_ducklake_sql_expect_err_with_options(
+        store.path(),
+        data.path(),
+        ", META_MAINTENANCE_COMPACT_STORE_SUBSPACE 'gcfile'",
+        "SELECT 1;",
+    );
+    assert!(
+        unknown_subspace.contains("names no subspace") && unknown_subspace.contains("current"),
+        "got: {unknown_subspace}"
     );
 }
 
@@ -821,10 +1128,11 @@ fn scheduler_runs_a_pass_unattended() {
 /// Orphans `entries` index entries in a session of its own, so a later
 /// session's scheduler has something slow to reclaim.
 ///
-/// A pass over them with `MAINTENANCE_BATCH_SIZE 1` takes one durable
-/// commit per entry — each waiting out the WAL flush cadence — so the
-/// pass reliably outruns a sub-second interval. That is the only way to
-/// provoke tick contention without a test-only knob.
+/// A pass over them with `MAINTENANCE_BATCH_SIZE 1` takes one commit per
+/// entry, so its wall-clock is the entry count times per-commit compute
+/// (sub-millisecond, since reclaim batches do not await durability).
+/// Enough entries and the pass outruns a sub-second interval, which is
+/// the only way to provoke tick contention without a test-only knob.
 fn orphaned_range(store: &TempDir, data: &TempDir, entries: u64) {
     let meta = format!(", META_DATA_PATH '{}'", data.path().display());
     run_ducklake_sql_with_options(
@@ -860,15 +1168,18 @@ fn marked_passes(output: &str) -> Vec<Vec<String>> {
 #[test]
 #[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
 fn scheduler_ticks_skip_a_pass_already_running() {
-    const ENTRIES: u64 = 20;
+    const ENTRIES: u64 = 1_500;
     let store = TempDir::new("maint-single-store");
     let data = TempDir::new("maint-single-data");
     orphaned_range(&store, &data, ENTRIES);
 
-    // The pass takes ~20 durable commits; ticks fire every 100ms, so
-    // many of them land while it is still running.
+    // The pass takes 1 500 commits — about a second, several ticks — so
+    // ticks land while it is still running. The window holds 14 ticks,
+    // fewer than the report retains passes, so the pass that claims the
+    // range cannot be pushed out of the report by the empty ones after
+    // it however fast the machine is.
     let options = format!(
-        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '300 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
@@ -877,7 +1188,7 @@ fn scheduler_ticks_skip_a_pass_already_running() {
         data.path(),
         &options,
         "SELECT 1;\n",
-        std::time::Duration::from_millis(3_500),
+        std::time::Duration::from_millis(4_200),
         "SELECT 'PASS' AS marker, detail FROM moraine_maintenance_status('lake') \
            WHERE step = 'sweep_indexes' ORDER BY started_at;\n",
     );
@@ -917,15 +1228,15 @@ fn scheduler_ticks_skip_a_pass_already_running() {
 fn detach_during_a_running_pass_completes() {
     let store = TempDir::new("maint-detach-store");
     let data = TempDir::new("maint-detach-data");
-    orphaned_range(&store, &data, 20);
+    orphaned_range(&store, &data, 1_500);
 
     let options = format!(
         ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
          META_MAINTENANCE_BATCH_SIZE 1",
         data.path().display()
     );
-    // The first tick fires at ~100ms and the pass then runs for well over
-    // a second, so detaching at 500ms lands squarely inside it.
+    // The first tick fires at ~100ms and the pass then runs for about a
+    // second, so detaching at 500ms lands squarely inside it.
     let output = run_ducklake_sql_with_pause(
         store.path(),
         data.path(),
@@ -1101,5 +1412,80 @@ fn maintenance_renders_an_interval_older_than_as_a_rolling_window() {
             "SELECT count(*) FROM lake.main.t;"
         )),
         vec![vec!["4".to_string()]]
+    );
+}
+
+/// Compaction after expiry, differential against a stock DuckLake
+/// catalog: `ducklake_schema_versions` keeps the rows the expired
+/// snapshots wrote, so `ducklake_merge_adjacent_files` still resolves
+/// each data file's schema version and merges. Deriving those rows from
+/// surviving snapshots instead leaves the compaction planner's join
+/// with a NULL and aborts it at bind.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_merge_adjacent_files_survives_expiry() {
+    let store = TempDir::new("merge-expire-store");
+    let data = TempDir::new("merge-expire-data");
+    let reference_meta = TempDir::new("merge-expire-ref-meta");
+    let reference_data = TempDir::new("merge-expire-ref-data");
+
+    let apply = |sql: &str| {
+        run_ducklake_sql(store.path(), data.path(), sql);
+        run_reference_ducklake_sql(reference_meta.path(), reference_data.path(), sql);
+    };
+    let probe = |sql: &str| -> Vec<Vec<String>> {
+        let moraine_rows = csv_rows(&run_ducklake_sql(store.path(), data.path(), sql));
+        let reference_rows = csv_rows(&run_reference_ducklake_sql(
+            reference_meta.path(),
+            reference_data.path(),
+            sql,
+        ));
+        assert_eq!(
+            moraine_rows, reference_rows,
+            "moraine diverges from stock DuckLake for `{sql}`"
+        );
+        moraine_rows
+    };
+
+    // Three small Parquet files, each from its own snapshot: merge input
+    // once flushed. `ALTER TABLE` gives the table a second schema
+    // version, so the rows being retained are more than one.
+    apply("CREATE TABLE lake.main.t(a BIGINT);");
+    for range in ["range(10)", "range(10, 20)", "range(20, 30)"] {
+        apply(&format!(
+            "INSERT INTO lake.main.t SELECT i FROM {range} t(i);\
+             CALL ducklake_flush_inlined_data('lake');"
+        ));
+    }
+    apply("ALTER TABLE lake.main.t ADD COLUMN b VARCHAR;");
+    let recorded = probe(
+        "SELECT begin_snapshot, schema_version, table_id \
+         FROM __ducklake_metadata_lake.ducklake_schema_versions ORDER BY 1, 3;",
+    );
+    assert_eq!(recorded.len(), 2, "create and alter each record a row");
+
+    // Expiry takes every snapshot below the head — including the ones
+    // those rows were written in, and every one the three data files
+    // were written in.
+    apply("CALL ducklake_expire_snapshots('lake', older_than => now());");
+    assert_eq!(
+        probe("SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot;"),
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        probe(
+            "SELECT begin_snapshot, schema_version, table_id \
+             FROM __ducklake_metadata_lake.ducklake_schema_versions ORDER BY 1, 3;"
+        ),
+        recorded
+    );
+
+    assert_eq!(
+        probe("SELECT files_processed, files_created FROM ducklake_merge_adjacent_files('lake');"),
+        vec![vec!["3".to_string(), "1".to_string()]]
+    );
+    assert_eq!(
+        probe("SELECT count(*), sum(a) FROM lake.main.t;"),
+        vec![vec!["30".to_string(), "435".to_string()]]
     );
 }

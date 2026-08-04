@@ -3,10 +3,13 @@
 
 use std::sync::Arc;
 
-use moraine::{Catalog, CatalogOptions, ColumnId, Error, OptionScope, SchemaId, SnapshotId};
+use moraine::{
+    Catalog, CatalogOptions, ColumnAlteration, ColumnDef, ColumnId, Error, OptionScope, SchemaId,
+    SnapshotId,
+};
 use object_store::memory::InMemory;
 
-use crate::fixtures::{col, open_memory};
+use crate::fixtures::{col, open_memory, seeded};
 
 #[tokio::test]
 async fn encrypted_flag_is_fixed_at_bootstrap() {
@@ -170,6 +173,64 @@ async fn ddl_commits_are_visible_and_time_travelable() {
     let zero = catalog.snapshot_at(SnapshotId::new(0)).await.unwrap();
     assert_eq!(zero.schemas().len(), 1);
     assert_eq!(zero.schemas()[0].name, "main");
+
+    catalog.close().await.unwrap();
+}
+
+/// A widening type promotion is a version transition like any other, so a
+/// snapshot taken before it still reports the narrower type. Asserting the
+/// promotion at head alone would pass even if the old version were
+/// overwritten in place rather than ended into `history`.
+#[tokio::test]
+async fn type_promotion_is_time_travel_correct() {
+    let catalog = open_memory().await;
+
+    let narrow = moraine::ColumnDef {
+        name: "amount".into(),
+        column_type: "INTEGER".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+    let before = catalog
+        .commit(|tx| {
+            let schema = tx.create_schema("s")?;
+            tx.create_table(schema, "t", std::slice::from_ref(&narrow))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    catalog
+        .commit(|tx| {
+            let schema = tx.schema_by_name("s").expect("committed above");
+            let table = tx.table_by_name(schema.id, "t").expect("committed above");
+            let column = tx.columns_of(table.id)[0].id;
+            tx.alter_column(
+                table.id,
+                column,
+                moraine::ColumnAlteration {
+                    column_type: Some("BIGINT".into()),
+                    nulls_allowed: None,
+                    default_value: None,
+                },
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let column_type_at = |view: &moraine::CatalogSnapshot| {
+        let schema = view.schema_by_name("s").expect("schema");
+        let table = view.table_by_name(schema.id, "t").expect("table");
+        view.columns_of(table.id)[0].column_type.clone()
+    };
+
+    assert_eq!(column_type_at(&catalog.snapshot().await.unwrap()), "BIGINT");
+    assert_eq!(
+        column_type_at(&catalog.snapshot_at(before).await.unwrap()),
+        "INTEGER",
+        "the pre-promotion snapshot must still report the narrower type"
+    );
 
     catalog.close().await.unwrap();
 }
@@ -445,4 +506,63 @@ async fn two_read_write_attaches_coexist_without_fencing() {
         assert!(view.schema_by_name("first_again").is_some());
     }
     second.close().await.unwrap();
+}
+
+/// A type moraine cannot store is refused where the column enters the
+/// catalog — at creation, at addition, and at an alteration that would
+/// change into it — rather than at the first insert that would need it.
+/// Typed `Unsupported`, so a bridge maps it to "not implemented" without
+/// reading the message.
+#[tokio::test]
+async fn a_variant_column_is_refused_as_unsupported_on_every_column_verb() {
+    let (catalog, schema, table, _) = seeded().await;
+    let variant = ColumnDef {
+        name: "v".into(),
+        column_type: "VARIANT".into(),
+        nulls_allowed: true,
+        default_value: None,
+    };
+
+    let on_create = catalog
+        .commit({
+            let variant = variant.clone();
+            move |tx| {
+                tx.create_table(schema, "with_variant", std::slice::from_ref(&variant))?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(on_create, Error::Unsupported(_)), "{on_create}");
+
+    let on_add = catalog
+        .commit(move |tx| {
+            tx.add_column(table, &variant)?;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(on_add, Error::Unsupported(_)), "{on_add}");
+
+    let column = catalog.snapshot().await.unwrap().columns_of(table)[0].id;
+    let on_alter = catalog
+        .commit(move |tx| {
+            tx.alter_column(
+                table,
+                column,
+                ColumnAlteration {
+                    column_type: Some("VARIANT".into()),
+                    ..ColumnAlteration::default()
+                },
+            )
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(on_alter, Error::Unsupported(_)), "{on_alter}");
+
+    // Nothing landed: the table still has only the column it was seeded
+    // with, and the refused table was never created.
+    let head = catalog.snapshot().await.unwrap();
+    assert_eq!(head.columns_of(table).len(), 1);
+    assert!(head.table_by_name(schema, "with_variant").is_none());
 }

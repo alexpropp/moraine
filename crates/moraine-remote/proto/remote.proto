@@ -85,6 +85,11 @@ enum ErrorKindValue {
   ERROR_KIND_VALUE_FENCED = 9;
   ERROR_KIND_VALUE_SLOT_LOG = 10;
   ERROR_KIND_VALUE_STORE = 11;
+  ERROR_KIND_VALUE_UNSUPPORTED = 12;
+  ERROR_KIND_VALUE_SNAPSHOT_EXPIRED = 13;
+  ERROR_KIND_VALUE_INTERRUPTED = 14;
+  ERROR_KIND_VALUE_MIGRATION = 15;
+  ERROR_KIND_VALUE_OPEN_RACED = 16;
 }
 
 // One staged row mutation, mirroring moraine's RowOperation.
@@ -101,6 +106,7 @@ message RowOperationValue {
     InlineFlushDeleteValue inline_flush_delete = 9;
     InlineDropValue inline_drop = 10;
     InlineSchemaDropValue inline_schema_drop = 11;
+    InlineFileDeleteRemoveValue inline_file_delete_remove = 12;
   }
 }
 
@@ -137,6 +143,12 @@ message InlineFileDeleteValue {
   uint64 data_file_id = 2;
   uint64 row_id = 3;
   uint64 begin_snapshot = 4;
+}
+
+message InlineFileDeleteRemoveValue {
+  uint64 table_id = 1;
+  uint64 data_file_id = 2;
+  uint64 row_id = 3;
 }
 
 message InlineFlushDeleteValue {

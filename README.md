@@ -1,6 +1,6 @@
 # moraine
 
-[![CI](https://github.com/alexpropp/moraine/actions/workflows/ci.yml/badge.svg)](https://github.com/alexpropp/moraine/actions/workflows/ci.yml)
+[![CI](https://github.com/morainedb/moraine/actions/workflows/ci.yml/badge.svg)](https://github.com/morainedb/moraine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![crates.io](https://img.shields.io/crates/v/moraine.svg)](https://crates.io/crates/moraine)
 [![docs.rs](https://docs.rs/moraine/badge.svg)](https://docs.rs/moraine)
@@ -8,7 +8,8 @@
 Moraine brings a [SlateDB](https://slatedb.io) backend to
 [DuckLake](https://ducklake.select): a DuckLake catalog implemented on a
 transactional KV store over object storage, instead of the usual relational
-catalog database.
+catalog database. Guides and design docs live on the project site:
+<https://morainedb.github.io/>.
 
 > **Status: pre-1.0, actively developed.** The catalog core and DuckDB
 > extension work end-to-end: DuckLake SQL — `CREATE`/`INSERT`/`UPDATE`/
@@ -64,6 +65,43 @@ for seconds, this is noise; small inserts use DuckLake **data inlining** to
 skip the per-commit Parquet-file tax. Workloads needing sub-PUT commit
 latency want a hot server with local state — moraine stays serverless and
 won't compete there.
+
+## One writer, many readers
+
+**Exactly one process may attach a moraine lake read-write; every other
+process must attach `READ_ONLY`.** Readers are uncoordinated and unbounded
+in number, and never disturb the writer. But SlateDB's writer fencing means
+the *newest* writer wins: a second process attaching read-write silently
+fences the first, so two of them take turns killing each other's committer
+rather than one failing cleanly.
+
+```sql
+-- The one writer.
+ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
+       (DATA_PATH 's3://bucket/lake-data/', READ_WRITE);
+-- Everyone else.
+ATTACH 'ducklake:moraine:s3://bucket/lake' AS lake
+       (DATA_PATH 's3://bucket/lake-data/', READ_ONLY);
+```
+
+Safety is never at risk — a fenced writer writes nothing and corrupts
+nothing — but availability is, so this is a real limitation next to the
+multi-client SQL catalogs DuckLake otherwise uses: a fleet of independent
+DuckDB processes writing one lake is not a topology moraine supports today.
+A deployment that needs commit concurrency funnels its commits through one
+long-lived writer process. Concurrent commits inside that process share a
+flush rather than each waiting for one of their own, so the funnel is not
+the throughput ceiling it looks like.
+
+`READ_ONLY` is read-only at the *catalog* level, not the IAM level: a
+reader that follows the latest state writes a checkpoint into the manifest
+and refreshes it while it lives, so its credentials still need write
+access. A deployment whose readers hold strictly read-only credentials
+pins them to a checkpoint taken ahead of time (`CHECKPOINT`), which writes
+nothing at all — in exchange for reading the fixed cut that checkpoint
+named rather than following head. See
+[`crates/moraine-duckdb/README.md`](crates/moraine-duckdb/README.md) for
+the attach surface.
 
 ## Architecture
 

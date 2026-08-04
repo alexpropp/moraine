@@ -22,6 +22,14 @@ pub(crate) enum Operation {
         /// The dropped schema's id.
         schema_id: u64,
     },
+    /// An existing schema's tags changed. Mints a snapshot and bumps the
+    /// schema version, but feeds no change-set entry: DuckLake's
+    /// `changes_made` grammar has no schema-alter kind, and a concurrent
+    /// drop of the schema is caught by the closure re-run instead.
+    AlterSchema {
+        /// The mutated schema's id.
+        schema_id: u64,
+    },
     /// A table was created.
     CreateTable {
         /// The schema the table was created in.
@@ -38,6 +46,15 @@ pub(crate) enum Operation {
         /// The mutated table's id.
         table_id: u64,
     },
+    /// A table's sort spec was set, changed, or cleared. Classifies as an
+    /// alter — it races a concurrent drop or another spec change — but is
+    /// not schema-changing: DuckLake marks the table altered without
+    /// bumping the schema version, a sort spec never invalidating a
+    /// cross-file compaction.
+    AlterTableSorting {
+        /// The re-sorted table's id.
+        table_id: u64,
+    },
     /// A table was dropped.
     DropTable {
         /// The dropped table's id.
@@ -52,6 +69,10 @@ pub(crate) enum Operation {
     RegisterDeleteFile {
         /// The table delete markers were appended to.
         table_id: u64,
+        /// The data file whose rows they remove. Carried so two concurrent
+        /// deletes of one table conflict only when they touch the same
+        /// file, which is the grain DuckLake checks deletes at.
+        data_file_id: u64,
     },
     /// Data file(s) became eligible for garbage collection via merge.
     ExpireDataFile {
@@ -111,6 +132,26 @@ pub(crate) enum Operation {
         /// `"scalar"` or `"table"` — selects the change-set entry kind.
         macro_type: String,
     },
+    /// Rows were inlined into a table. Classifies as an append, exactly as
+    /// a data-file registration does — DuckLake's inlined inserts carry
+    /// `inserted_into_table` too.
+    InlineInsert {
+        /// The table rows were inlined into.
+        table_id: u64,
+    },
+    /// Inlined rows were tombstoned. Classifies as a delete, like a delete
+    /// file.
+    InlineDelete {
+        /// The table rows were tombstoned in.
+        table_id: u64,
+    },
+    /// Inlined rows were drained to a data file. Classifies as compaction:
+    /// it rewrites rows that already exist rather than adding any, so it
+    /// races a concurrent delete or drop but not a concurrent append.
+    FlushInlinedData {
+        /// The table whose inlined rows were drained.
+        table_id: u64,
+    },
 }
 
 impl Operation {
@@ -120,6 +161,7 @@ impl Operation {
         match self {
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
+            | Operation::AlterSchema { .. }
             | Operation::CreateTable { .. }
             | Operation::AlterTable { .. }
             | Operation::DropTable { .. }
@@ -128,11 +170,15 @@ impl Operation {
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
             | Operation::DropMacro { .. } => true,
-            Operation::RegisterDataFile { .. }
+            Operation::AlterTableSorting { .. }
+            | Operation::RegisterDataFile { .. }
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
             | Operation::ExpireDeleteFile { .. }
-            | Operation::UpdateStats { .. } => false,
+            | Operation::UpdateStats { .. }
+            | Operation::InlineInsert { .. }
+            | Operation::InlineDelete { .. }
+            | Operation::FlushInlinedData { .. } => false,
         }
     }
 
@@ -151,6 +197,8 @@ impl Operation {
             // `ducklake_schema_versions` row for macro DDL.
             Operation::CreateSchema { .. }
             | Operation::DropSchema { .. }
+            | Operation::AlterSchema { .. }
+            | Operation::AlterTableSorting { .. }
             | Operation::DropTable { .. }
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
@@ -159,7 +207,10 @@ impl Operation {
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
             | Operation::ExpireDeleteFile { .. }
-            | Operation::UpdateStats { .. } => None,
+            | Operation::UpdateStats { .. }
+            | Operation::InlineInsert { .. }
+            | Operation::InlineDelete { .. }
+            | Operation::FlushInlinedData { .. } => None,
         }
     }
 }
@@ -285,6 +336,15 @@ pub(crate) struct ChangeSet {
     pub(crate) inserted_tables: BTreeSet<u64>,
     /// Tables delete markers were appended to.
     pub(crate) deleted_from_tables: BTreeSet<u64>,
+    /// The data files those delete markers target. Ids are global, so a
+    /// shared id *is* a shared file and no table key is needed to compare
+    /// two commits.
+    pub(crate) deleted_data_file_ids: BTreeSet<u64>,
+    /// Set when this commit deletes without naming the file it deletes
+    /// from: an inlined delete names a row, and a change set parsed from
+    /// DuckLake's grammar carries table ids only. Either way the file set
+    /// above is incomplete, so delete-delete falls back to table grain.
+    pub(crate) deletes_untargeted_files: bool,
     /// Tables whose data files were merged away.
     pub(crate) merge_adjacent_tables: BTreeSet<u64>,
     /// Tables whose delete files were rewritten away.
@@ -318,28 +378,43 @@ impl ChangeSet {
                         .insert((schema_name.clone(), table_name.clone()));
                     set.created_table_schema_ids.insert(*schema_id);
                 }
-                Operation::AlterTable { table_id } => {
+                Operation::AlterTable { table_id } | Operation::AlterTableSorting { table_id } => {
                     set.altered_tables.insert(*table_id);
                 }
                 Operation::DropTable { table_id } => {
                     set.dropped_tables.insert(*table_id);
                 }
-                Operation::RegisterDataFile { table_id } => {
+                // An inlined insert is an append and an inlined tombstone
+                // a delete: they classify exactly as their file-backed
+                // counterparts, because to a concurrent writer they are the
+                // same change to the same table.
+                Operation::RegisterDataFile { table_id } | Operation::InlineInsert { table_id } => {
                     set.inserted_tables.insert(*table_id);
                 }
-                Operation::RegisterDeleteFile { table_id } => {
+                Operation::RegisterDeleteFile {
+                    table_id,
+                    data_file_id,
+                } => {
                     set.deleted_from_tables.insert(*table_id);
+                    set.deleted_data_file_ids.insert(*data_file_id);
                 }
-                Operation::ExpireDataFile { table_id } => {
+                // An inlined delete names a row, not a file, so it has no
+                // file grain to be refined at.
+                Operation::InlineDelete { table_id } => {
+                    set.deleted_from_tables.insert(*table_id);
+                    set.deletes_untargeted_files = true;
+                }
+                Operation::ExpireDataFile { table_id }
+                | Operation::FlushInlinedData { table_id } => {
                     set.merge_adjacent_tables.insert(*table_id);
                 }
                 Operation::ExpireDeleteFile { table_id } => {
                     set.rewrite_delete_tables.insert(*table_id);
                 }
-                Operation::UpdateStats { .. } => {
-                    // UpdateStats does not populate any set; it exists so a
-                    // stats-only commit is non-empty and mints a snapshot.
-                }
+                // Neither populates a set: each exists so its commit is
+                // non-empty and mints a snapshot. A schema alteration has no
+                // kind in the wire grammar at all.
+                Operation::UpdateStats { .. } | Operation::AlterSchema { .. } => {}
                 Operation::CreateView {
                     schema_id,
                     schema_name,
@@ -477,7 +552,14 @@ impl ChangeSet {
                 "dropped_scalar_macro" => id(&mut set.dropped_scalar_macros),
                 "dropped_table_macro" => id(&mut set.dropped_table_macros),
                 "inserted_into_table" => id(&mut set.inserted_tables),
-                "deleted_from_table" => id(&mut set.deleted_from_tables),
+                // The grammar names the table, never the files, so a
+                // parsed delete is untargeted by construction. A caller
+                // that has the file ids elsewhere — the committer, from
+                // the snapshot record — supplies them after parsing.
+                "deleted_from_table" => {
+                    set.deletes_untargeted_files = true;
+                    id(&mut set.deleted_from_tables)
+                }
                 "merge_adjacent" => id(&mut set.merge_adjacent_tables),
                 "rewrite_delete" => id(&mut set.rewrite_delete_tables),
                 "compacted_table" => id(&mut set.compacted_tables),
@@ -542,10 +624,13 @@ struct TableKinds {
 }
 
 /// DuckLake's per-table conflict matrix, symmetric closure.
+///
+/// Delete-versus-delete is deliberately absent: it is the one pair DuckLake
+/// checks below table grain, and [`delete_delete_conflicts`] decides it.
 fn kinds_conflict(a: TableKinds, b: TableKinds) -> bool {
     let one_way = |x: TableKinds, y: TableKinds| {
         (x.inserted && (y.altered || y.deleted || y.dropped))
-            || (x.deleted && (y.altered || y.deleted || y.compacted || y.dropped || y.inserted))
+            || (x.deleted && (y.altered || y.compacted || y.dropped || y.inserted))
             || (x.altered && (y.altered || y.dropped))
             || (x.compacted && (y.deleted || y.dropped || y.compacted))
     };
@@ -553,12 +638,34 @@ fn kinds_conflict(a: TableKinds, b: TableKinds) -> bool {
     one_way(a, b) || one_way(b, a)
 }
 
+/// Whether two concurrent deletes of one table conflict.
+///
+/// DuckLake checks this pair at `data_file_id` grain rather than table
+/// grain — two transactions deleting from the same table clash only if they
+/// deleted from the same **file** — and moraine matches it: one live delete
+/// file per data file, so two commits targeting disjoint files write
+/// disjoint records and neither invalidates the other's premise.
+///
+/// A side that deleted without naming a file falls back to table grain,
+/// which is where every DuckLake-authored commit lands: its grammar carries
+/// the table and not the file, so it is treated as deleting from all of
+/// them. Stricter is always safe here; looser would let two rewrites of one
+/// file both land.
+fn delete_delete_conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
+    ours.deletes_untargeted_files
+        || theirs.deletes_untargeted_files
+        || !ours
+            .deleted_data_file_ids
+            .is_disjoint(&theirs.deleted_data_file_ids)
+}
+
 /// Whether two concurrent commits are a true conflict. Symmetric.
 ///
 /// Benign unless: either side has unknown changes; both touch the schema
-/// list (coarse by design); a common table has incompatible kinds; or one
-/// created a table inside a schema the other dropped. Name uniqueness is
-/// re-validated by the closure re-run, not by set comparison.
+/// list (coarse by design); a common table has incompatible kinds, or has
+/// deletes on both sides that meet on a file; or one created a table inside
+/// a schema the other dropped. Name uniqueness is re-validated by the
+/// closure re-run, not by set comparison.
 pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
     if ours.has_unknown || theirs.has_unknown {
         return true;
@@ -572,6 +679,12 @@ pub(crate) fn conflicts(ours: &ChangeSet, theirs: &ChangeSet) -> bool {
     for (&table_id, &our_table_kinds) in &our_kinds {
         if let Some(&their_table_kinds) = their_kinds.get(&table_id) {
             if kinds_conflict(our_table_kinds, their_table_kinds) {
+                return true;
+            }
+            if our_table_kinds.deleted
+                && their_table_kinds.deleted
+                && delete_delete_conflicts(ours, theirs)
+            {
                 return true;
             }
         }
@@ -622,7 +735,10 @@ mod tests {
         let ops = [
             create_schema(1, "s1"),
             Operation::RegisterDataFile { table_id: 7 },
-            Operation::RegisterDeleteFile { table_id: 8 },
+            Operation::RegisterDeleteFile {
+                table_id: 8,
+                data_file_id: 80,
+            },
             Operation::ExpireDataFile { table_id: 9 },
             Operation::ExpireDeleteFile { table_id: 9 },
             Operation::AlterTable { table_id: 3 },
@@ -633,9 +749,15 @@ mod tests {
             set.to_changes_made(),
             r#"created_schema:"s1",inserted_into_table:7,deleted_from_table:8,altered_table:3,merge_adjacent:9,rewrite_delete:9"#
         );
+        // The round trip is through DuckLake's grammar, which carries
+        // neither the schema a table was created in nor the file a delete
+        // targeted — so both come back absent, and the delete comes back
+        // untargeted.
         assert_eq!(ChangeSet::parse(&set.to_changes_made()), {
             let mut expect = set.clone();
             expect.created_table_schema_ids.clear();
+            expect.deleted_data_file_ids.clear();
+            expect.deletes_untargeted_files = true;
             expect
         });
     }
@@ -661,11 +783,63 @@ mod tests {
         assert!(!conflicts(&a, &c));
     }
 
+    /// Delete-versus-delete is the one pair DuckLake checks below table
+    /// grain, and moraine matches it: two commits deleting from the same
+    /// table are benign when they targeted different data files, and a
+    /// conflict when they targeted the same one.
+    #[test]
+    fn delete_delete_is_checked_at_file_grain() {
+        let delete = |table_id, data_file_id| {
+            ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+                table_id,
+                data_file_id,
+            }])
+        };
+
+        assert!(!conflicts(&delete(1, 10), &delete(1, 11)));
+        assert!(conflicts(&delete(1, 10), &delete(1, 10)));
+
+        // A commit deleting from several files conflicts on any shared one.
+        let several = ChangeSet::from_operations(&[
+            Operation::RegisterDeleteFile {
+                table_id: 1,
+                data_file_id: 10,
+            },
+            Operation::RegisterDeleteFile {
+                table_id: 1,
+                data_file_id: 11,
+            },
+        ]);
+        assert!(conflicts(&several, &delete(1, 11)));
+        assert!(!conflicts(&several, &delete(1, 12)));
+
+        // An inlined delete names a row, not a file, so it has no grain to
+        // be refined at and falls back to the whole table.
+        let inlined = ChangeSet::from_operations(&[Operation::InlineDelete { table_id: 1 }]);
+        assert!(conflicts(&inlined, &delete(1, 10)));
+        assert!(conflicts(&inlined, &inlined));
+
+        // A DuckLake-authored delete arrives through the grammar, which
+        // names the table only — so it conflicts with any delete of it,
+        // however the file sets actually stand.
+        let theirs = ChangeSet::parse("deleted_from_table:1");
+        assert!(!theirs.has_unknown);
+        assert!(conflicts(&delete(1, 10), &theirs));
+        // Still only that table, though.
+        assert!(!conflicts(&delete(2, 10), &theirs));
+    }
+
     #[test]
     fn the_conflict_matrix() {
         let insert = |t| ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: t }]);
-        let delete =
-            |t| ChangeSet::from_operations(&[Operation::RegisterDeleteFile { table_id: t }]);
+        // One file per table here, so same-table deletes meet on it and the
+        // matrix's table-grain expectations hold as written.
+        let delete = |t| {
+            ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+                table_id: t,
+                data_file_id: t * 100,
+            }])
+        };
         let alter = |t| ChangeSet::from_operations(&[Operation::AlterTable { table_id: t }]);
         let drop = |t| ChangeSet::from_operations(&[Operation::DropTable { table_id: t }]);
         let compact =
@@ -696,10 +870,40 @@ mod tests {
     fn parsed_compaction_kinds_classify_as_compaction() {
         let theirs = ChangeSet::parse("compacted_table:1");
         assert!(!theirs.has_unknown);
-        let ours = ChangeSet::from_operations(&[Operation::RegisterDeleteFile { table_id: 1 }]);
+        let ours = ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+            table_id: 1,
+            data_file_id: 100,
+        }]);
         assert!(conflicts(&ours, &theirs));
         let benign = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
         assert!(!conflicts(&benign, &theirs));
+    }
+
+    /// A DuckLake-authored append — an ordinary insert, or the inline
+    /// flush that turns staged rows into a file — reaches the classifier
+    /// only as a parsed `inserted_into_table` entry. It must classify like
+    /// one of ours: benign against our appends and against a compaction of
+    /// the same table, a conflict against a delete, alter, or drop of it.
+    #[test]
+    fn a_parsed_insert_classifies_like_an_append() {
+        let theirs = ChangeSet::parse("inserted_into_table:1");
+        assert!(!theirs.has_unknown);
+
+        let append = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        let compaction = ChangeSet::from_operations(&[Operation::ExpireDataFile { table_id: 1 }]);
+        assert!(!conflicts(&append, &theirs));
+        assert!(!conflicts(&compaction, &theirs));
+
+        for ours in [
+            ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+                table_id: 1,
+                data_file_id: 100,
+            }]),
+            ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]),
+            ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]),
+        ] {
+            assert!(conflicts(&ours, &theirs));
+        }
     }
 
     #[test]
@@ -962,7 +1166,13 @@ mod tests {
     #[test]
     fn data_plane_ops_are_not_schema_changing() {
         assert!(!Operation::RegisterDataFile { table_id: 0 }.is_schema_changing());
-        assert!(!Operation::RegisterDeleteFile { table_id: 0 }.is_schema_changing());
+        assert!(
+            !Operation::RegisterDeleteFile {
+                table_id: 0,
+                data_file_id: 0
+            }
+            .is_schema_changing()
+        );
         assert!(!Operation::ExpireDataFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::ExpireDeleteFile { table_id: 0 }.is_schema_changing());
         assert!(!Operation::UpdateStats { table_id: 0 }.is_schema_changing());
@@ -1131,7 +1341,7 @@ mod tests {
     async fn change_set_of(catalog: &Catalog, action: &Action, ids: &Ids) -> ChangeSet {
         let base = catalog.snapshot().await.unwrap();
         let next = base.snapshot.snapshot_id + 1;
-        let mut tx = Transaction::new(base, next);
+        let mut tx = Transaction::new((*base).clone(), next);
         let _ = action.apply(&mut tx, ids, "probe");
         ChangeSet::from_operations(&tx.into_parts().operations)
     }
@@ -1200,5 +1410,29 @@ mod tests {
                 runtime.block_on(benign_pair_commutes(&x, &y))?;
             }
         );
+    }
+
+    /// A sort change is the one table alter that is not schema-changing,
+    /// and it still conflicts with everything an alter conflicts with.
+    #[test]
+    fn a_sort_change_alters_the_table_without_changing_its_schema() {
+        let sorting = Operation::AlterTableSorting { table_id: 1 };
+        assert!(!sorting.is_schema_changing());
+        assert_eq!(sorting.schema_changed_table_id(), None);
+
+        let sorted = ChangeSet::from_operations(&[sorting]);
+        let dropped = ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]);
+        let altered = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
+        assert!(conflicts(&sorted, &dropped));
+        assert!(conflicts(&sorted, &altered));
+        assert!(conflicts(&sorted, &sorted));
+
+        // An append conflicts with it, as with any alter — DuckLake's
+        // matrix, not a rule sorting gets to soften.
+        let appended = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        assert!(conflicts(&sorted, &appended));
+
+        let elsewhere = ChangeSet::from_operations(&[Operation::AlterTableSorting { table_id: 2 }]);
+        assert!(!conflicts(&sorted, &elsewhere));
     }
 }

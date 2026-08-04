@@ -4,12 +4,23 @@
 
 mod fixtures;
 
+mod cache;
 mod catalog;
+mod census;
+mod checkpoint;
 mod coalescer_bench;
 mod commit_concurrency;
+mod counting_store;
+mod crash_recovery;
 mod data_files;
 mod index_backfill;
+mod inline_data;
+mod interrupt;
 mod macros;
+mod measure;
 mod multi_writer;
+mod partitioning;
+mod sorting;
 mod staged_index_build;
+mod tags;
 mod views_options;

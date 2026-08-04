@@ -18,9 +18,9 @@ use crate::{
 /// this.
 pub(crate) const TAG_PREFIX_LEN: usize = 1;
 
-/// A fully addressed store key. The six variants are the six subspaces;
-/// each is also a SlateDB segment (the store is created with a one-byte
-/// segment extractor over the leading discriminant).
+/// A fully addressed store key. Each variant is a subspace, and each
+/// subspace is also a SlateDB segment (the store is created with a
+/// one-byte segment extractor over the leading discriminant).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum Key {
     /// Store-level singletons: format version, head pointer, migration
@@ -41,6 +41,29 @@ pub(crate) enum Key {
     /// Equality-index entries. Live-only; keyed by index and canonical
     /// value.
     Index(IndexKey),
+    /// `ducklake_schema_versions`: one record per snapshot at which a
+    /// table's shape changed, holding the catalog schema version that
+    /// snapshot minted. Retained across snapshot expiry — a data file
+    /// resolves its schema version through these long after the snapshot
+    /// that wrote it is gone — and removed only with the table.
+    SchemaVersion {
+        /// The created-or-altered table (or view).
+        table_id: u64,
+        /// The snapshot the change landed in.
+        begin_snapshot: u64,
+    },
+    /// The `current` keys one commit's batch wrote — the changelog a reader
+    /// replays to advance a held view across that commit. Its own subspace
+    /// rather than a field of the snapshot record: snapshot records are
+    /// scanned in full on a read path DuckLake takes every transaction, and
+    /// the changelog is several times their size. Only a refresh reads
+    /// these, one point read per snapshot in the gap. A sliding window of
+    /// the most recent commits' records is retained; older ones are deleted
+    /// by later commits, so nothing else has to reclaim them.
+    Changelog {
+        /// The snapshot whose batch wrote these keys.
+        snapshot_id: u64,
+    },
 }
 
 /// An equality-index entry key. The unique kind keys on the value alone —
@@ -240,9 +263,9 @@ impl EntityKey {
 }
 
 /// An inlined-data key: the per-schema-version Arrow schema, a live
-/// record, or the archived (post-flush) form of a live record. `Live` and
-/// `Arch` share [`InlineOp`], so an archive key has exactly the components
-/// of its live form.
+/// record, the archived (post-flush) form of a live record, or a
+/// delete-table existence marker. `Live` and `Arch` share [`InlineOp`], so
+/// an archive key has exactly the components of its live form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 pub(crate) enum InlineKey {
     /// Arrow IPC schema message, once per `(table, schema_version)`. Has
@@ -257,6 +280,19 @@ pub(crate) enum InlineKey {
     Live(InlineOperation),
     /// The archived form of an inlined-data record.
     Arch(InlineOperation),
+    /// Marks that a table's `ducklake_inlined_delete_<table_id>` exists,
+    /// once per table. Appended last so the variants above keep their
+    /// discriminants.
+    ///
+    /// Existence has to be recorded rather than derived from whether any
+    /// `FileDelete` record is currently live: a flush materializes those
+    /// into a real delete file and clears them, and an emptied SQL table
+    /// still exists — which is what DuckLake, having cached the table's
+    /// existence for the life of the catalog, goes on assuming.
+    FileDeleteTable {
+        /// Owning table.
+        table_id: u64,
+    },
 }
 
 /// An inlined-data record that exists in both live and archived form.
@@ -327,9 +363,6 @@ impl Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Subspace {
     /// Store-level singletons.
-    // System keys are read/written by exact key today; no caller prefix-scans
-    // the whole subspace yet.
-    #[allow(dead_code)]
     System,
     /// Snapshot records.
     Snapshot,
@@ -338,17 +371,29 @@ pub(crate) enum Subspace {
     /// Ended entity versions.
     History,
     /// Inlined data.
-    // Data inlining is not implemented yet.
-    #[allow(dead_code)]
     Inline,
     /// Equality-index entries.
-    // Entries are read by exact key or per-index prefix, not by a
-    // whole-subspace scan yet.
-    #[allow(dead_code)]
     Index,
+    /// Per-table schema-version records.
+    SchemaVersion,
+    /// Per-commit changelogs.
+    Changelog,
 }
 
 impl Subspace {
+    /// Every subspace, in discriminant order. A census walks this, so a
+    /// subspace added to [`Key`] and left out here goes unreported.
+    pub(crate) const ALL: [Self; 8] = [
+        Self::System,
+        Self::Snapshot,
+        Self::Current,
+        Self::History,
+        Self::Inline,
+        Self::Index,
+        Self::SchemaVersion,
+        Self::Changelog,
+    ];
+
     /// A minimal key inside this subspace, for prefix derivation.
     const fn sample(self) -> Key {
         match self {
@@ -364,6 +409,11 @@ impl Subspace {
                 index_id: 0,
                 key: CanonicalKey::empty(),
             }),
+            Self::SchemaVersion => Key::SchemaVersion {
+                table_id: 0,
+                begin_snapshot: 0,
+            },
+            Self::Changelog => Key::Changelog { snapshot_id: 0 },
         }
     }
 }
@@ -703,6 +753,15 @@ mod tests {
         assert_eq!(Key::Snapshot { snapshot_id: 42 }.encode(), expect);
     }
 
+    /// Appended after every existing subspace, so no key written before it
+    /// existed changes a byte.
+    #[test]
+    fn golden_changelog_key() {
+        let mut expect = vec![0x09];
+        expect.extend(be(42));
+        assert_eq!(Key::Changelog { snapshot_id: 42 }.encode(), expect);
+    }
+
     #[test]
     fn golden_current_file_key() {
         let mut expect = vec![0x04, 0x02, 0x07];
@@ -804,6 +863,14 @@ mod tests {
             begin_snapshot: 11,
             chunk_seq: 0,
         }));
+        assert_eq!(key.encode(), expect);
+    }
+
+    #[test]
+    fn golden_inline_file_delete_table_key() {
+        let mut expect = vec![0x06, 0x05];
+        expect.extend(be(7));
+        let key = Key::Inline(InlineKey::FileDeleteTable { table_id: 7 });
         assert_eq!(key.encode(), expect);
     }
 
@@ -1101,6 +1168,7 @@ mod tests {
                 data_file_id: 2,
                 row_id: 3,
             })),
+            Key::Inline(InlineKey::FileDeleteTable { table_id: 1 }),
         ];
         for key in keys {
             let decoded = Key::decode(&key.encode()).unwrap();
@@ -1352,7 +1420,9 @@ mod tests {
             }),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Live(op))),
             arb_inline_op().prop_map(|op| Key::Inline(InlineKey::Arch(op))),
+            any::<u64>().prop_map(|table_id| Key::Inline(InlineKey::FileDeleteTable { table_id })),
             arb_index().prop_map(Key::Index),
+            any::<u64>().prop_map(|snapshot_id| Key::Changelog { snapshot_id }),
         ]
     }
 

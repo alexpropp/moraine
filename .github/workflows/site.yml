@@ -1,0 +1,46 @@
+name: Site
+
+on:
+  push:
+    branches: [main]
+    paths: ['site/**', 'docs/rfcs/**']
+  pull_request:
+    paths: ['site/**', 'docs/rfcs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+        working-directory: site
+      - run: npm test
+        working-directory: site
+      - run: npm run build
+        working-directory: site
+
+      # The org root site (morainedb.github.io) can only be served from the
+      # repository of that name, so the built site is pushed there; Pages in
+      # that repository deploys the gh-pages branch.
+      - name: Publish to morainedb.github.io
+        if: github.event_name != 'pull_request'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.SITE_DEPLOY_KEY }}
+          external_repository: morainedb/morainedb.github.io
+          publish_branch: gh-pages
+          publish_dir: site/dist
+          force_orphan: true

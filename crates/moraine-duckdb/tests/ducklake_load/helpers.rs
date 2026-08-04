@@ -113,6 +113,7 @@ pub fn seed(dir: &Path, file_size_bytes: u64, footer_size: u64) {
                         file_size_bytes,
                         footer_size,
                         encryption_key: None,
+                        partition_values: vec![],
                         column_stats: vec![],
                     },
                     &[],
@@ -279,6 +280,61 @@ pub fn run_session(attach: &Attach, sql: &str) -> std::process::Output {
         .arg(sql)
         .output()
         .expect("failed to spawn duckdb CLI")
+}
+
+/// Runs `sql` in an open session, waits `settle`, then kills the process
+/// outright — no commit, no detach, no close.
+///
+/// This is the one crash a moraine-side test cannot stage: the interesting
+/// instant is between DuckLake writing a Parquet file and committing the
+/// metadata that references it, and only a session running both halves
+/// reaches it. `sql` is expected to leave a transaction open; `settle`
+/// gives the write time to land before the kill.
+pub fn kill_ducklake_session_after(
+    store_dir: &Path,
+    data_path: &Path,
+    sql: &str,
+    settle: std::time::Duration,
+) {
+    use std::io::Write;
+
+    let mut child = Command::new(cli_path())
+        .arg("-unsigned")
+        .arg("-csv")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn duckdb CLI");
+
+    let preamble = format!(
+        "SET threads=1;\n\
+         SET extension_directory='{}';\n\
+         INSTALL ducklake;\n\
+         LOAD ducklake;\n\
+         LOAD '{}';\n\
+         ATTACH 'ducklake:moraine:{}' AS lake (DATA_PATH '{}');\n",
+        extension_directory().display(),
+        ext_path().display(),
+        store_dir.display(),
+        data_path.display(),
+    );
+
+    // Held, not dropped: closing stdin would give the CLI an EOF and let
+    // it exit cleanly, which is the opposite of the crash under test.
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin
+        .write_all(preamble.as_bytes())
+        .expect("write the preamble");
+    stdin
+        .write_all(sql.as_bytes())
+        .expect("write the statements");
+    stdin.flush().expect("flush the statements");
+
+    std::thread::sleep(settle);
+
+    child.kill().expect("kill duckdb CLI");
+    child.wait().expect("reap duckdb CLI");
 }
 
 /// Runs `before`, waits `pause`, then runs `after` — all in **one**
@@ -550,6 +606,31 @@ pub fn run_ducklake_read_only_sql(store_dir: &Path, data_path: &Path, sql: &str)
         sql,
     );
     assert_session_ok(output, "read-only ducklake attach", sql)
+}
+
+/// As [`run_ducklake_read_only_sql`], but for a statement that must fail
+/// on a reader: returns the CLI's combined output for the caller to assert
+/// on.
+pub fn run_ducklake_read_only_sql_expect_err(
+    store_dir: &Path,
+    data_path: &Path,
+    sql: &str,
+) -> String {
+    let output = run_session(
+        &Attach::Moraine {
+            store_dir,
+            data_path,
+            options: "",
+            read_only: true,
+        },
+        sql,
+    );
+    assert!(
+        !output.status.success(),
+        "`{sql}` unexpectedly succeeded on a read-only attach:\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    combined_output(&output)
 }
 
 /// As [`run_ducklake_sql`], but returns combined stdout+stderr without

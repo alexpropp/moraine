@@ -1004,13 +1004,13 @@ async fn folding_is_invisible_across_a_dropped_schema() {
     );
 }
 
-/// A pruned snapshot is time-travelable until a folder applies the prune to the
-/// store; folding reconciles the divergence. An expiry deletes snapshot 1's
-/// record in a head-preserving commit: the unfolded tail still reconstructs the
-/// state as of snapshot 1, but once folded the store no longer holds that
-/// record and time travel to it resolves to `NotFound`.
+/// An expired snapshot resolves to `NotFound`, folded or not. A head-preserving
+/// expiry deletes snapshot 1's record; the unfolded view resolves a snapshot
+/// record exactly as the store holds it, so the prune takes effect the moment
+/// it commits — the same answer a folded store gives, never a window where the
+/// two disagree.
 #[tokio::test]
-async fn folding_reconciles_an_expired_snapshot_to_not_found() {
+async fn an_expired_snapshot_resolves_to_not_found() {
     use moraine::ffi_support::staged::{Cell, RowOperation, TableKind, staged_begin};
 
     let store = Arc::new(InMemory::new());
@@ -1048,24 +1048,26 @@ async fn folding_reconciles_an_expired_snapshot_to_not_found() {
         "expiry must not advance the head"
     );
 
-    // Pruned but unfolded: the tail replay still reconstructs snapshot 1.
-    open_multi_writer(&store)
-        .await
-        .snapshot_at(SnapshotId::new(1))
-        .await
-        .expect("a pruned-but-unfolded snapshot stays time-travelable");
-
-    catalog.fold_sprint(u64::MAX).await.unwrap();
-    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
-
-    // Folding reconciles: the store no longer holds snapshot 1, so time travel
-    // to it resolves to NotFound — the folded/single-writer semantics.
+    // Pruned: the record is gone from the store the unfolded view resolves
+    // against, so time travel to snapshot 1 is NotFound the moment the expiry
+    // commits — no unfolded window where it lingers.
     let err = open_multi_writer(&store)
         .await
         .snapshot_at(SnapshotId::new(1))
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    assert!(matches!(err, Error::NotFound(_)), "before fold: {err:?}");
+
+    catalog.fold_sprint(u64::MAX).await.unwrap();
+    assert_eq!(catalog.unfolded_tail().await.unwrap(), 0);
+
+    // Folding changes nothing: still NotFound.
+    let err = open_multi_writer(&store)
+        .await
+        .snapshot_at(SnapshotId::new(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "after fold: {err:?}");
 
     // The surviving snapshot and its schemas are unaffected.
     let head = open_multi_writer(&store).await.snapshot().await.unwrap();

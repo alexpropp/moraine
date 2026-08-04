@@ -174,3 +174,130 @@ fn ducklake_inline_nested_types_round_trip_through_flush() {
     ));
     assert_eq!(remaining_inline_rows, vec![vec!["0".to_string()]]);
 }
+
+/// Flushing a table that carries **inlined file-deletions** — deletes
+/// against rows living in a real Parquet file, rather than against
+/// inlined rows.
+///
+/// This is the shape `ducklake_inline_data_round_trip_through_flush`
+/// above does not reach: there, every row is inlined, so a DELETE writes
+/// an `inline/inline_delete` tombstone. Once an insert overflows the
+/// inlining limit and lands as a Parquet file, a DELETE against it
+/// records an `inline/file_delete` instead, and the flush must
+/// materialize those into a real delete file and then clear them —
+/// DuckLake issues an unqualified `DELETE FROM
+/// ducklake_inlined_delete_<table_id>` to do it.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_flush_clears_inlined_file_deletions() {
+    let dir = TempDir::new("idel-flush-store");
+    let data_dir = TempDir::new("idel-flush-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(store, data_path, "CREATE TABLE lake.main.t (i BIGINT);");
+    // 100 rows overflows the inlining limit, so this lands as a Parquet
+    // data file rather than an inlined chunk.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "INSERT INTO lake.main.t SELECT range FROM range(100);",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["1"]],
+        "the overflowing insert must land as a real data file"
+    );
+
+    // A delete against a Parquet-resident row is inlined, not written as
+    // a delete file — that is what the flush below has to resolve.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "DELETE FROM lake.main.t WHERE i IN (5, 7);",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_delete_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["0"]],
+        "the delete is inlined, so no delete file exists yet"
+    );
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+
+    // The flush wrote a real delete file and cleared the inlined
+    // deletions it materialized.
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_delete_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["1"]],
+        "the flush must register a delete file for the inlined deletions"
+    );
+
+    // The rows stay deleted, and are now deleted exactly once — a
+    // surviving inlined deletion alongside the delete file would be the
+    // silent double-count this clearing exists to prevent.
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT count(*), sum(i) FROM lake.main.t;",
+        )),
+        vec![vec!["98", "4938"]],
+        "5 and 7 stay deleted after the flush"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT i FROM lake.main.t WHERE i IN (5, 7);",
+        )),
+        Vec::<Vec<String>>::new()
+    );
+
+    // A second flush is a no-op rather than a re-run: nothing inlined is
+    // left to materialize.
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake');",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_delete_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["1"]],
+        "a second flush must not write another delete file"
+    );
+
+    // The emptied table must still exist. DuckLake caches "this inlined
+    // deletion table exists" for the life of the catalog and never
+    // re-probes, so anything it runs after the flush *in the same
+    // session* queries a table it believes is there. One session, flush
+    // then maintenance then read — the sequence that catches an existence
+    // derived from whether any deletion is currently recorded.
+    let after = csv_rows(&run_ducklake_sql(
+        store,
+        data_path,
+        "CALL ducklake_flush_inlined_data('lake'); \
+         CALL ducklake_merge_adjacent_files('lake'); \
+         SELECT count(*) FROM lake.main.t;",
+    ));
+    assert_eq!(
+        after.last().expect("a count row"),
+        &vec!["98".to_string()],
+        "the emptied inlined-deletion table must still exist for the rest of the session"
+    );
+}

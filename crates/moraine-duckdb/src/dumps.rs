@@ -20,6 +20,7 @@ mod catalog;
 mod files;
 mod macros;
 mod mappings;
+mod options;
 mod partitions;
 mod snapshots;
 mod statistics;
@@ -35,6 +36,7 @@ pub use catalog::*;
 pub use files::*;
 pub use macros::*;
 pub use mappings::*;
+pub use options::*;
 pub use partitions::*;
 pub use snapshots::*;
 pub use statistics::*;
@@ -210,6 +212,7 @@ pub(crate) mod test_support {
                             file_size_bytes: 1024,
                             footer_size: 64,
                             encryption_key: Some("a2V5LWRhdGE=".into()),
+                            partition_values: vec![],
                             column_stats: vec![FileColumnStats {
                                 column_id: column,
                                 column_size_bytes: 100,

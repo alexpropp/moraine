@@ -21,6 +21,9 @@ this file is the operational summary.
 - `crates/moraine-duckdb` — DuckDB extension: a thin C++ shim registering a
   `StorageExtension` over a C ABI to the Rust core (RFC 0006). Thin by policy:
   if logic accumulates here, move it to the core.
+- `test/sql` — sqllogictest files run by DuckDB's own runner, for what the
+  CLI cannot express: several connections over one instance (concurrent
+  DuckLake transactions). Driven by `cargo xtask e2e`.
 - `xtask` — automation (`cargo xtask e2e`). Rust, not shell scripts.
 
 ## Rules
@@ -81,10 +84,12 @@ this file is the operational summary.
 cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warnings \
   && cargo test --workspace --locked \
   && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps \
-  && cargo deny check && cargo xtask e2e
+  && cargo deny check && cargo xtask check-pins && cargo xtask e2e
 ```
 
 The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`,
 and a commit-msg hook there rejects non-conventional commit subjects (the
 changelog is generated from them; CI validates PR titles the same way).
-One-time setup per clone: `git config core.hooksPath .githooks`.
+Conductor workspaces enable those hooks from `.conductor/settings.toml`,
+which also installs the toolchain a cloud workspace starts without. A plain
+clone needs it once: `git config core.hooksPath .githooks`.

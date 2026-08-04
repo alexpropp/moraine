@@ -143,22 +143,33 @@ reader's lifetime. So a reader does not fence and does not write data,
 but it *does* need write access to the manifest object and generates
 manifest traffic, and its checkpoint pins SSTs against SlateDB's own GC
 for the checkpoint lifetime — the same checkpoint RFC 0022's truncation
-bound relies on to find live readers. Deployments that want truly
-zero-write readers configure `DbReader` against an existing checkpoint id
-instead; the default "follow latest" mode trades a small manifest write for
-consistent WAL-inclusive reads.
+bound relies on to find live readers. The default "follow latest" mode
+trades that small manifest write for consistent WAL-inclusive reads.
+
+Deployments whose reader credentials cannot write at all open against an
+existing checkpoint instead. A checkpoint id given at open selects a
+`DbReader` that resolves a fixed cut: it neither creates a checkpoint, nor
+replays WALs, nor polls the manifest, so the open and everything after it
+write nothing whatsoever — verified by opening one against a store that
+refuses every write and reading through it. The cost is the other half of
+the trade: a pinned reader never sees a commit made after its checkpoint,
+however long it stays open. Checkpoints are minted by the writer (which
+alone can write the manifest) and released explicitly or by their
+lifetime, since one that is neither pins the objects it references against
+SlateDB's garbage collection for as long as it exists.
 
 Be precise about what fencing does, because its direction is the opposite
 of a lock: SlateDB's `writer_epoch` means **the newest writer wins**. A
 second process opening the folder read-write bumps the epoch and **fences
 the incumbent** — the first folder's next durable write fails, not the
 second's. Safety is absolute (a fenced writer writes nothing, never
-corrupts — RFC 0011 C2), but availability is not: two processes attaching
-read-write to fold do not degrade to "second one fails," they take turns
-killing each other's writer. RFC 0022's appointment rule (observe the
-unfolded tail, delay, re-check, then open) is what keeps this from
-thrashing in the steady state; nothing about commit liveness depends on
-it — a commit lands at its slot whether or not a folder is running at all.
+corrupts — RFC 0011's `FencedWriterResumes`), but availability is not: two
+processes attaching read-write to fold do not degrade to "second one
+fails," they take turns killing each other's writer. RFC 0022's appointment
+rule (observe the unfolded tail, delay, re-check, then open) is what keeps
+this from thrashing in the steady state; nothing about commit liveness
+depends on it — a commit lands at its slot whether or not a folder is
+running at all.
 
 ### Bootstrap — the commit that creates the store
 
@@ -290,6 +301,23 @@ string):
   budget spans a few hundred milliseconds. A commit that lands on its
   first attempt never waits, so the backoff costs the uncontended path
   nothing.
+
+  **The budget is deliberately not DuckLake's**, whose own loop waits
+  100 ms × 1.5ᵏ over 10 attempts. Two reasons, both consequences of what
+  moraine's races actually are. First, a benign race here clears in one
+  WAL flush — the shape group commit made visible, where concurrent
+  commits inside the process meet in a batch rather than racing at all,
+  leaving only a staged-path commit colliding with a verb-path batch. A
+  budget of ten attempts capped at 50 ms spans several flush intervals at
+  the 100 ms default, which is several times more than the collision it
+  waits out. Second, the two budgets **compose**: DuckLake re-drives a
+  retryable moraine error up to ten times, so moraine's own waits are
+  multiplied by ten before an application sees anything. At DuckLake's
+  cadence that product is tens of seconds of invisible waiting; at
+  moraine's it is a few seconds worst case, and typically one retry that
+  waits 2 ms. Ten attempts is kept: losing ten consecutive races requires
+  a pathology the topology does not otherwise admit, and past that
+  `RetryBudgetExhausted` is the honest answer.
 - **Overlapping table set → true conflict** (subject to the append-append
   refinement below). A concurrent commit mutated a table this commit also
   mutated. The premise may be invalid (the table was dropped, a column
@@ -298,17 +326,20 @@ string):
 - **Budget spent → terminal.** A commit that loses `MAX_COMMIT_ATTEMPTS`
   benign races in a row aborts with `RetryBudgetExhausted`, not
   `CommitConflict`. The distinction is a wire contract, not cosmetics:
-  DuckLake's own commit loop re-runs a failed commit whenever the error
-  text contains `conflict`, `concurrent`, `unique`, or `primary key`, and
-  `CommitConflict`'s `Display` carries `conflict` in its prefix. A
-  transient conflict *should* stay retryable and keeps that wording; an
-  exhausted budget must not, or the two bounded loops compose into
-  `ducklake_max_retry_count` × `MAX_COMMIT_ATTEMPTS` re-runs of a commit
-  that already failed to settle ten times. `RetryBudgetExhausted`'s text
-  is therefore free of all four substrings, exactly as the equality-index
-  uniqueness rejection already is. Every exhaustion is logged at `warn`
-  with the head it started from and the commits it lost to — without it
-  the failure is a slow commit with no stated reason.
+  DuckLake decides retryability in `DuckLakeTransaction::RetryOnError`, a
+  **substring match on the error message** — it re-runs a failed commit
+  iff the lowercased text contains `primary key`, `unique`, `conflict`, or
+  `concurrent` — and `CommitConflict`'s `Display` carries `conflict` in
+  its prefix. The text moraine surfaces for a lost commit is part of the
+  interface, not wording. A transient conflict *should* stay retryable and
+  keeps that wording; an exhausted budget must not, or the two bounded
+  loops compose into `ducklake_max_retry_count` × `MAX_COMMIT_ATTEMPTS`
+  re-runs of a commit that already failed to settle ten times.
+  `RetryBudgetExhausted`'s text is therefore free of all four substrings,
+  exactly as the equality-index uniqueness rejection already is. Every
+  exhaustion is logged at `warn` with the head it started from and the
+  commits it lost to — without it the failure is a slow commit with no
+  stated reason.
 
 **Counter advancement is never, by itself, a conflict.** Every commit reads
 and bumps `next_catalog_id`/`next_file_id`; that shared read is precisely
@@ -330,23 +361,39 @@ This mirrors DuckLake's own conflict matrix, verified in its source
 (`DuckLakeTransactionState::CheckForConflicts`,
 `src/storage/ducklake_transaction_state.cpp`): an insert conflicts with a
 concurrent **drop**, **alter**, or **delete** on the same table — and with
-nothing else. Two inserts never conflict, and an insert is also compatible
-with a concurrent inline **flush** or **compaction** of the same table
-(their file sets are disjoint: the insert's new files are not the
+nothing else. Its `tables_inserted_into` and `tables_inserted_inlined` sets
+are checked against the dropped, altered, and deleted-from tables only,
+never against another transaction's inserts, and an insert is likewise
+compatible with a concurrent inline **flush** or **compaction** of the same
+table (their file sets are disjoint: the insert's new files are not the
 maintenance operation's inputs). moraine's verb path adopts the same
 classification: an append is benign against other appends, flushes, and
 compactions of its table; drop/alter/delete on that table are true
-conflicts, in both directions. DuckLake is finer-grained in exactly one
-place — two transactions *deleting* from the same table conflict only if
-they touched the same **data files** (its `CheckForConflicts` fetches the
-files deleted after the transaction's snapshot and conflict-checks at
-`data_file_id` grain). moraine keeps delete-delete at table grain on the
-verb path: stricter is safe there, because the verb path is moraine's own
-embedding API — while on the extension path DuckLake applies its own
-matrix itself (see Staged-row commits), so fidelity to DuckLake is
-structural, not something moraine's classifier must reproduce. File-grain
-delete-delete is a possible later refinement if an embedding workload
-wants it.
+conflicts, in both directions.
+
+The refinement is required for verb-path fidelity, not an optimization:
+plain table-grain overlap would call a same-table append pair a true
+conflict and make moraine strictly stricter than the catalog it serves.
+
+DuckLake is finer-grained in exactly one place — two transactions
+*deleting* from the same table conflict only if they touched the same
+**data files** (its `CheckForConflicts` fetches the files deleted after
+the transaction's snapshot and conflict-checks at `data_file_id` grain) —
+and moraine matches it. A `register_delete_file` records the data file it
+targets, and two commits deleting from one table classify benign when
+those targets are disjoint. The premise holds because moraine allows one
+live delete file per data file: disjoint targets write disjoint records,
+so neither commit invalidates the other's.
+
+Two cases fall back to table grain, both because the file set is not
+knowable rather than as a policy choice. An **inlined** delete names a
+row, not a file. And a **DuckLake-authored** change set arrives through
+the `changes_made` grammar, which carries `deleted_from_table:<id>` and
+no file — so a commit whose file ids moraine did not author is treated as
+deleting from all of them. Since data-file ids are global, a shared id is
+a shared file and the comparison needs no table key; the file ids ride the
+snapshot record as moraine-internal state, exactly as
+`schema_changed_table_ids` does, and are invisible to DuckLake.
 
 **Name collisions are invisible to id-set comparison.** Two concurrent
 commits each creating a table named `orders` in the same schema allocate
@@ -400,7 +447,7 @@ true conflict belongs to whoever authored the operation:
 
 - **DuckLake**, whose commit loop retries retryable conflict signals
   internally and re-checks its own conflict matrix (source-verified; see
-  Staged-row commits and Open questions), or
+  Staged-row commits), or
 - **the application**, re-running its statement when DuckLake classifies
   the conflict as true and throws — as a PostgreSQL `SERIALIZABLE`
   transaction retries on a `40001` serialization failure.
@@ -454,12 +501,14 @@ data (RFC 0003 verb names):
 - **Schema-changing** (`schema_version` bumps): create/drop schema;
   create/rename/drop table and move-to-schema; create/alter/rename/drop
   view; add/remove/rename column, column type change, default and
-  null-constraint changes; set partition key; create/drop macros.
-- **Altered but not schema-versioned**: set sort key; table and column
-  comments. DuckLake marks the table altered — conflict detection sees the
-  alter — but does not bump `schema_version` (a sort or comment change
-  never invalidates cross-file compaction, so the
-  `ducklake_schema_versions` grouping is unaffected).
+  null-constraint changes; set partition key; create/drop macros;
+  comments and tags on tables and columns. The last of these bump despite
+  changing no column: DuckLake models them as `AlterEntry` variants, and
+  the rewritten entry enters `new_tables`.
+- **Altered but not schema-versioned**: set sort key. DuckLake marks the
+  table altered — conflict detection sees the alter — but does not bump
+  `schema_version` (a sort change never invalidates cross-file
+  compaction, so the `ducklake_schema_versions` grouping is unaffected).
 - **Data-only** (`schema_version` carried forward): `register_data_file` /
   `expire_data_file`, `register_delete_file` / `expire_delete_file`,
   statistics updates, column/name-mapping registration, and the RFC 0005
@@ -469,20 +518,31 @@ data (RFC 0003 verb names):
   `ducklake_metadata` within the transaction's metadata connection — it
   mints no snapshot, bumps no `schema_version`, and is not recorded in
   `snapshot_changes` (so it is invisible to conflict detection; options
-  are last-write-wins).
+  are last-write-wins). Both paths implement exactly that. On the
+  staged-row path a `ducklake_metadata` row translates to a write of the
+  scope's option record, and because such a commit carries no
+  `ducklake_snapshot` insert it takes the head-preserving path — the same
+  one snapshot expiry and file cleanup take. So `CALL
+  <lake>.set_option(…)` lands the option and moves nothing else: no
+  snapshot, no `schema_version`, no `snapshot_changes` entry, and so
+  nothing for conflict detection to *classify*. It does still write
+  `sys/head` at the standing snapshot id with the batch count advanced, as
+  every head-preserving batch does — that is the anchor a concurrent
+  commit conflicts on, and the stamp that tells a reader the state moved
+  under an unchanged snapshot id.
 
 This classification is source-verified against DuckLake
 (`DuckLakeTransactionState::SchemaChangesMade`, which tests exactly the
 new/dropped table, schema, view, and macro sets; per-table alters route
 through `GetTransactionTableChanges`, which decides per change type
-whether the alter also bumps `schema_version` — `SET_SORT_KEY` and the
-comment changes land in `altered_tables` only).
+whether the alter also bumps `schema_version` — `SET_SORT_KEY` lands in
+`altered_tables` only).
 
 The flag is an explicit property of the mutation set, not something
 inferred from the batch's key set after the fact — an inference would
 misclassify (e.g. a stats-only touch of a table's state) and silently
 re-introduce one of the two failure modes. The exact schema-mutating set is
-pinned against DuckLake's own behaviour in the e2e suite (Open questions).
+pinned against DuckLake's own behaviour in the e2e suite.
 
 The flag machinery above belongs to the **verb path only**. On the
 staged-row path (next section) DuckLake computes `schema_version` itself
@@ -528,8 +588,12 @@ verb path:
   `ducklake_max_retry_count = 10`, jittered exponential backoff from
   `ducklake_retry_wait_ms = 100` × `ducklake_retry_backoff = 1.5`),
   re-checking its own conflict matrix against `ducklake_snapshot_changes`
-  before each re-attempt and re-staging with freshly derived ids. Benign
-  races are absorbed by *DuckLake's* loop; true conflicts throw its
+  before each re-attempt and re-staging with freshly derived ids. Those
+  re-checks are catalog reads moraine must serve *between* attempts —
+  DuckLake queries the snapshot list and `ducklake_snapshot_changes` for
+  everything committed after its transaction snapshot, so the read surface
+  stays live while a commit of its own is in flight. Benign races are
+  absorbed by *DuckLake's* loop; true conflicts throw its
   `TransactionException` to the application. The "disjoint concurrent
   commits both succeed without caller involvement" goal is thus a
   **verb-path** property; on the extension path the equivalent behavior
@@ -576,6 +640,86 @@ in-memory `object_store` (`concurrent_commits_coalesce_into_few_slots`);
 the leader role that chains commits forwarded across processes is RFC
 0022's to build.
 
+**Implemented** two ways over one core — a lone commit is a group of one,
+so there is one commit path, not two. `Catalog::commit_group` batches what
+one caller hands it; concurrent callers of the ordinary `Catalog::commit`
+are batched without asking. A commit that finds the store free opens a
+batch, one that finds a batch forming joins it, one that finds a batch in
+flight waits for the next, and a batch seals as soon as no caller is on its
+way into it — so the flush already in the air is the batching window and an
+uncontended commit waits for nobody. A batch also seals at a bounded member
+count, since under saturation the arrival count never falls to zero.
+
+Steps 1–3 run once per member, against a premise folded forward from the
+member before it (the same fold that refreshes the cached head view), so
+member *i* allocates its ids and detects its name collisions against
+everything members *1..i* did. That is what makes intra-batch conflicts
+unreachable rather than unlikely. Step 4 then runs once.
+
+A batch batches commits; it does not merge them. Each member mints its own
+snapshot, which time travel resolves separately. What batching changes is
+durability granularity, not catalog shape.
+
+Measured, the coalescing is exact: a batch carries as many commits as there
+are concurrent committers, so throughput is `concurrency / flush_interval`
+with no overhead visible at any level, up to the member ceiling — where 128
+concurrent commits land as two full batches at the same rate 64 do
+(`BENCHMARK.md`, "Commit throughput vs. concurrency"). The ceiling, not the
+flush cadence, is what binds first under saturation, and it is the lever if
+a workload ever needs past it.
+
+The batch is the unit of failure. A member that fails discards the batch,
+and its other members re-run; a lost race re-runs every member, conflicting
+if any member's change set does; a crash leaves every member committed or
+none (RFC 0011, `GroupCommit`). A sealed batch commits on a task of its own
+rather than on whichever caller sealed it, because a host interrupt drops
+that caller's future (RFC 0010) and the other members are owed an answer.
+
+Both front doors land through one function, so the durable write, the
+head-race classification, and the projection bookkeeping exist once. What
+the staged-row path does not do is *join* a batch: it commits its own
+transaction, because DuckLake authors its snapshot id against the head it
+read, and no fold onto a preceding member can re-derive that id. The id is
+therefore checked rather than trusted — a staged commit whose id does not
+advance the head it lands on is refused, where before it relied on the
+head-pointer race to catch the same disagreement. That refusal is a lost
+race and must be reported as one: it carries `CommitConflict`'s text, the
+substring DuckLake re-drives on. Reporting it as corruption instead would
+be a wire-contract bug, not a wording one — DuckLake would abandon a
+transaction it could have re-run against the head that won.
+
+So batching is a verb-path property, and SQL through DuckLake reaches it
+only where a statement runs a verb (index DDL, maintenance). DuckLake's own
+DML and DDL do not batch, and would gain nothing if they did: its metadata
+connection is serialized, so successive SQL transactions never overlap and
+there is nothing to batch them with. A `BEGIN … COMMIT` still lands as one
+snapshot, but that is statements merged, not commits batched.
+
+### Sequence numbers are the store's, not moraine's
+
+A commit writes with SlateDB's generated sequence number; moraine never pins
+one. The knob exists — a non-zero `WriteOptions::seqnum` overrides the
+generated value, and a write below the store's current maximum is refused —
+so it reads at first like an exactly-once primitive: pin the same number on
+a re-drive and the duplicate is rejected.
+
+It is not one here, for two reasons. The sequence space is **global to the
+store**, not per catalog commit: index build steps, entry reclamation,
+inlined writes, and migration batches all advance it while minting no
+snapshot, so no function of a snapshot id stays in step with it, and any
+mapping moraine chose would be stale the moment a non-committing write
+landed. And the number moraine would need to pin does not exist at re-drive
+time anyway. A re-drive re-runs the caller's closure against the *advanced*
+head, so it is a different logical commit computed from a different premise
+— there is nothing stable across the crash to pin *to*.
+
+Exactly-once across a process death needs a **caller-supplied idempotency
+token**, recorded in the commit and checked before staging. That is an API
+change this RFC does not make, and pinning `seqnum` would not substitute for
+it. So a re-driven commit is an ordinary commit: guarded operations surface
+their guard, and a data-only re-drive lands a second time (RFC 0011,
+`CommitDurableNotAcknowledged`).
+
 ### Reader visibility after commit
 
 Step 4 makes a commit **durable** the instant the slot PUT is acked
@@ -609,6 +753,10 @@ SlateDB on in-memory `object_store` — no mocks of the store:
 - Concurrent pure appends to the same table both succeed (append-append
   refinement); the loser's rows carry row ids re-allocated above the
   winner's advanced `next_row_id`, with no collision or gap.
+- Concurrent deletes from the same table are benign when their target data
+  files are disjoint and a conflict when they meet on one; an inlined
+  delete, and a delete parsed from DuckLake's grammar, fall back to table
+  grain.
 - Concurrent same-name creates (two commits each creating table `orders`
   in one schema): exactly one succeeds; the other's retry re-runs the
   closure and returns `AlreadyExists` — never two live tables with one
@@ -619,7 +767,8 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   extension path returns `CommitConflict` with the store unchanged by the
   loser.
 - Crash-shaped sequences: partial batch never observable (atomicity);
-  commit, reopen, verify head and snapshot resolve consistently.
+  commit, reopen, verify head and snapshot resolve consistently. Crash
+  recovery is owned by RFC 0011 rather than restated here.
 - Counter monotonicity: `next_catalog_id`/`next_file_id`/per-table
   `next_row_id` never regress or collide across concurrent commits.
 - Bounded retry terminates: a forced write storm returns `CommitConflict`
@@ -638,70 +787,45 @@ SlateDB on in-memory `object_store` — no mocks of the store:
   validation above, run against real SlateDB on in-memory `object_store`);
   ordinary commit visibility — before folding — is a tail replay,
   specified and tested under RFC 0022.
+- Checkpoint readers: a reader pinned to a checkpoint serves the state at
+  it and never a later commit; it opens, reads, and closes against a store
+  that refuses every write, attempting none, where a latest-following
+  reader on the same store writes; a writer refuses a checkpoint, a
+  read-only catalog refuses to mint one, and a malformed, unknown, or
+  deleted id is refused rather than silently followed.
+- DuckLake-facing pins, differential against a stock DuckLake catalog fed
+  the identical statements: row ids allocate as `next_row_id +=
+  record_count` per table, stay dense, survive an UPDATE of other rows,
+  and never contend across tables; `schema_version` bumps for column DDL
+  and for comments and tags, and is carried forward by inserts (file and
+  inlined) and by name-mapping registration; and DuckLake's retry budget
+  (`ducklake_max_retry_count` 10, `ducklake_retry_wait_ms` 100,
+  `ducklake_retry_backoff` 1.5) is what the composed budget above assumes.
+  A genuine concurrent DuckLake race needs more than one connection on one
+  DuckDB instance, which the CLI cannot give: `test/sql` drives DuckDB's
+  own sqllogictest runner for that, and pins the loop end to end — two
+  overlapping DuckLake transactions where a compatible loser re-drives and
+  lands (with row ids dense across the race), and an incompatible one
+  throws. What a retry reads mid-flight is pinned alongside it: the
+  `ducklake_snapshot_changes` rows above a snapshot id, and the exact
+  `changes_made` entries moraine authors on the verb path.
+- Options through the staged-row path: `set_option` records the option,
+  global or table-scoped, and mints no snapshot; a second write of one key
+  wins over the first; a delete removes it and the scope resolves to its
+  parent's value again.
+- Group commit: a group costs fewer object-store writes than the same
+  members committed separately; every member mints its own consecutive
+  snapshot and time travel resolves each one to that member's state; a
+  member stages against what the members before it left; a failing member
+  aborts the group; a group that loses a disjoint race re-runs and lands
+  every member.
+- Coalescing: a burst of concurrent `commit` calls costs fewer
+  object-store writes than the same calls made one at a time, while each
+  still mints its own snapshot; and a commit whose future is dropped part
+  way — the shape a host interrupt takes, swept across the commit's life —
+  never strands the commits sharing its batch.
 
-E2E testing validates the protocol against real DuckLake SQL — especially
-the open questions below.
-
-## Open questions
-
-- **Does DuckLake retry conflicts internally, or propagate to the user? —
-  resolved (source-verified, DuckLake main 2026-07).** Both, split exactly
-  as this RFC's benign/true distinction: DuckLake's client-side
-  `RunCommitLoop` retries a failed metadata commit internally (bounded,
-  defaults above), but before each retry runs
-  `DuckLakeTransactionState::CheckForConflicts` over the intervening
-  `ducklake_snapshot_changes` — a true conflict per its matrix throws
-  `TransactionException` to the application; only benign races are
-  re-driven. Two load-bearing details for moraine: (a) retryability is
-  decided by `DuckLakeTransaction::RetryOnError`, a **substring match on
-  the error message** — it retries iff the lowercased message contains
-  `"primary key"`, `"unique"`, `"conflict"`, or `"concurrent"` — so the
-  error text moraine surfaces for a lost commit is a wire contract, not
-  cosmetics (RFC 0006); (b) between attempts DuckLake queries the catalog
-  for snapshots and `ducklake_snapshot_changes` after its transaction
-  snapshot, which moraine must serve mid-retry. What remains for e2e is
-  regression-pinning this behavior against the DuckLake version the e2e
-  suite tracks, not discovering it.
-- **Row-id increment mechanics.** Spec says `next_row_id += record_count`;
-  e2e confirms moraine's allocation matches DuckLake's expectation exactly,
-  including under UPDATE/compaction row-id preservation.
-- **DuckLake's concurrent same-table-append semantics — resolved
-  (source-verified, DuckLake main 2026-07).** Concurrent inserts into one
-  table do not conflict: in `CheckForConflicts`, `tables_inserted_into`
-  and `tables_inserted_inlined` are checked against drops, alters, and
-  deletes only — never against other transactions' inserts — and inserts
-  are likewise compatible with concurrent flushes and compactions. The
-  append-append refinement is therefore required for verb-path fidelity,
-  not optional; the strict table-grain fallback would have been strictly
-  stricter than DuckLake. E2e regression-pins the matrix against the
-  tracked DuckLake version.
-- **Benign-race retry bound.** The fixed attempt count is a tuning
-  parameter; DuckLake's own loop defaults (10 retries, 100 ms base wait,
-  1.5× backoff with jitter) are the natural starting point for the verb
-  path — confirm once e2e shows realistic contention shapes.
-- **Exact schema-mutating operation set — resolved (source-verified,
-  DuckLake main 2026-07).** The boundary cases land as follows:
-  comments/tags on tables and columns **bump** (they are `AlterEntry`
-  variants and enter `new_tables`); column/name-mapping registration does
-  **not** bump (it rides data-file registration, outside
-  `SchemaChangesMade`); option changes neither bump nor mint a snapshot at
-  all (`set_option` writes `ducklake_metadata` directly). The full
-  classification is in Schema-version tracking. E2e regression-pins it
-  against the tracked DuckLake version.
-- **Fresh-reader visibility call — resolved (source-verified, SlateDB
-  0.14.x).** No extra flush call is needed for the folder's own SlateDB
-  write: a batch committed with `await_durable: true` blocks on a
-  durability watcher that fires only after the WAL object is PUT to
-  object storage (`WalBufferManager::do_flush_one_wal` → `notify_durable`),
-  and both fresh-open paths — `Db::open` and `DbReader::open` in latest
-  mode — replay WALs from object storage past the manifest state. So once
-  a fold batch returns, a freshly opened handle resolves the folded
-  snapshot by construction — the mechanism for folded state and for
-  genesis/migration, the operations that write SlateDB directly. Ordinary
-  commit visibility does not run through it at all: that is tail replay off
-  the slot log (see Reader visibility after commit). The store-harness
-  validation test pins the fold-visibility claim specifically, not general
-  commit visibility.
+E2E testing validates the protocol against real DuckLake SQL.
 
 ## Alternatives considered
 
@@ -725,17 +849,16 @@ the open questions below.
   disjoint-table writers would falsely conflict. The slot's conditional
   put (RFC 0022) already serializes the physical write; there is no reason
   to also serialize logically-disjoint commits.
-- **Entity-level conflict detection (per-file/column).** Rejected for the
-  verb path, with the precise shape of DuckLake's model in view: DuckLake's
-  matrix is operation-grained over tables everywhere except one case —
-  delete-vs-delete on the same table is checked at `data_file_id` grain.
-  Reproducing that one file-grain check buys concurrency only for
-  concurrent deleters of one table (rare in the workloads moraine targets)
-  at real machinery cost, and matters not at all on the extension path,
-  where DuckLake applies its own matrix. Table grain plus the
-  append-append refinement matches DuckLake everywhere else; the
-  file-grain delete-delete check is the noted candidate if an embedding
-  workload ever needs it.
+- **Entity-level conflict detection (per-file/column) everywhere.**
+  Rejected, but with one exception now built. DuckLake's matrix is
+  operation-grained over tables everywhere except delete-vs-delete on one
+  table, which it checks at `data_file_id` grain — and moraine reproduces
+  exactly that one check (above), because a delete already names its
+  target file and carrying the id costs a set comparison. Generalizing the
+  idea to columns or to per-file inserts is what stays rejected: it buys
+  no concurrency the append-append refinement does not already give, and
+  it would put entity-shaped knowledge in a classifier whose whole virtue
+  is not needing any.
 - **Global `next_row_id` in the snapshot record.** Rejected: contradicts
   DuckLake (`next_row_id` is per-table in `ducklake_table_stats`) and would
   make every insert into any table contend on one counter, turning benign

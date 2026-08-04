@@ -11,7 +11,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use object_store::ObjectStore;
 use slatedb::{
     Db, DbReader,
-    config::{DbReaderOptions, ObjectStoreCacheOptions, Settings},
+    admin::AdminBuilder,
+    config::{
+        CheckpointOptions, CheckpointScope, DbReaderOptions, ObjectStoreCacheOptions, Settings,
+    },
 };
 use uuid::Uuid;
 
@@ -27,6 +30,24 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// following the log lags the head by up to this interval.
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Creates a checkpoint of everything `db` has committed, expiring after
+/// `lifetime` (never, if `None`), and reports its id. The scope is every
+/// write the handle has taken, not only the already-durable ones, so a
+/// commit that has returned is inside the checkpoint it precedes.
+pub(crate) async fn create_checkpoint(db: &Db, lifetime: Option<Duration>) -> Result<Uuid> {
+    let created = db
+        .create_checkpoint(
+            CheckpointScope::All,
+            &CheckpointOptions {
+                lifetime,
+                ..CheckpointOptions::default()
+            },
+        )
+        .await
+        .map_err(Error::from)?;
+    Ok(created.id)
+}
+
 /// Opens a moraine store on `object_store` — a read-write [`Db`] via
 /// [`open_writer`](Self::open_writer) or a read-only [`DbReader`] via
 /// [`open_reader`](Self::open_reader) — carrying the shared open
@@ -39,6 +60,7 @@ pub(crate) struct StoreBuilder<'a> {
     refresh_interval: Duration,
     wal_enabled: bool,
     cache_dir: Option<PathBuf>,
+    checkpoint: Option<Uuid>,
 }
 
 impl<'a> StoreBuilder<'a> {
@@ -52,6 +74,7 @@ impl<'a> StoreBuilder<'a> {
             refresh_interval: DEFAULT_REFRESH_INTERVAL,
             wal_enabled: true,
             cache_dir: None,
+            checkpoint: None,
         }
     }
 
@@ -96,10 +119,19 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
+    /// Pins the reader to an existing checkpoint instead of the latest
+    /// manifest. Reader only, and the only truly zero-write open: a
+    /// latest-mode reader creates and refreshes a checkpoint of its own,
+    /// which is a manifest write.
+    pub(crate) fn checkpoint(mut self, checkpoint: Option<Uuid>) -> Self {
+        self.checkpoint = checkpoint;
+        self
+    }
+
     /// Opens (or creates) the store as a read-write [`Db`].
-    pub(crate) async fn open_writer(self) -> Result<Db> {
+    pub(crate) async fn open_writer(&self) -> Result<Db> {
         let settings = self.settings();
-        Db::builder(self.path, self.object_store)
+        Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .build()
@@ -107,15 +139,32 @@ impl<'a> StoreBuilder<'a> {
             .map_err(Error::from)
     }
 
-    /// Opens the store read-only as a [`DbReader`] following the latest
-    /// manifest. A `DbReader` never opens the writer `Db`, so it never fences
-    /// a live writer. The flush cadence, if set, is ignored.
-    pub(crate) async fn open_reader(self) -> Result<DbReader> {
+    /// Opens the store read-only as a [`DbReader`]. A `DbReader` never opens
+    /// the writer `Db`, so it never fences a live writer. The flush cadence,
+    /// if set, is ignored.
+    ///
+    /// Without a checkpoint the reader follows the latest manifest, which
+    /// costs a manifest write on open and a refresh for the reader's
+    /// lifetime. Pinned to a [`checkpoint`](Self::checkpoint) it writes
+    /// nothing at all, and reads the fixed cut that checkpoint names.
+    pub(crate) async fn open_reader(&self) -> Result<DbReader> {
         let options = self.reader_options();
-        DbReader::builder(self.path, self.object_store)
+        let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
-            .with_options(options)
+            .with_options(options);
+        if let Some(checkpoint) = self.checkpoint {
+            builder = builder.with_checkpoint_id(checkpoint);
+        }
+        builder.build().await.map_err(Error::from)
+    }
+
+    /// Deletes the checkpoint `checkpoint`, unpinning whatever it held
+    /// against SlateDB's garbage collection. Readers still open against it
+    /// keep serving from the objects they have already resolved.
+    pub(crate) async fn delete_checkpoint(&self, checkpoint: Uuid) -> Result<()> {
+        AdminBuilder::new(self.path, Arc::clone(&self.object_store))
             .build()
+            .delete_checkpoint(checkpoint)
             .await
             .map_err(Error::from)
     }
@@ -149,6 +198,17 @@ impl<'a> StoreBuilder<'a> {
             object_store_cache_options: self.cache_options(),
             ..Default::default()
         }
+    }
+
+    /// Every checkpoint the store's manifest currently carries, oldest
+    /// first — reader-established ones included.
+    pub(crate) async fn list_checkpoints(&self) -> Result<Vec<Uuid>> {
+        let checkpoints = AdminBuilder::new(self.path, Arc::clone(&self.object_store))
+            .build()
+            .list_checkpoints(None)
+            .await
+            .map_err(Error::from)?;
+        Ok(checkpoints.into_iter().map(|c| c.id).collect())
     }
 
     /// SlateDB settings for a writer. A zero flush interval flushes

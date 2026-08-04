@@ -4,6 +4,7 @@
 #include "metadata_tables.hpp"
 #include "owned_array.hpp"
 #include "scan.hpp"
+#include "s3_secret.hpp"
 #include "staged_write.hpp"
 #include "transaction_manager.hpp"
 
@@ -186,17 +187,26 @@ void ThrowMoraineError(MoraineError &err) {
 	case MORAINE_NOT_FOUND:
 	case MORAINE_ALREADY_EXISTS:
 	case MORAINE_CONSTRAINT:
+	case MORAINE_SNAPSHOT_EXPIRED:
 		throw duckdb::CatalogException(message);
 	case MORAINE_COMMIT_CONFLICT:
 	case MORAINE_RETRY_EXHAUSTED:
 		throw duckdb::TransactionException(message);
 	case MORAINE_INVALID_ARGUMENT:
 		throw duckdb::InvalidInputException(message);
+	case MORAINE_UNSUPPORTED:
+		throw duckdb::NotImplementedException(message);
 	case MORAINE_INTERRUPTED:
 		throw duckdb::InterruptException();
 	case MORAINE_CORRUPTION:
 	case MORAINE_STORE:
 	case MORAINE_FENCED:
+	case MORAINE_MIGRATION:
+	// An attach that lost the store-creation race. Grouped here rather than
+	// with the transaction codes on purpose: the remedy is to attach again,
+	// and re-driving a commit would answer a race that predates any
+	// transaction.
+	case MORAINE_OPEN_RACED:
 		throw duckdb::IOException(message);
 	case MORAINE_INTERNAL:
 	default:
@@ -543,11 +553,11 @@ duckdb::optional_ptr<duckdb::CatalogEntry> MoraineSchemaEntry::CreateTable(duckd
 	}
 
 	if (auto delete_table_id = ParseInlinedDeleteTableName(table_name)) {
-		// Fixed shape, no store-side schema to stage — existence follows from
-		// the first `inline/fdel` staged against it (see inline_tables.hpp),
-		// so CREATE only builds and caches the entry for the rest of this
-		// transaction. The find below is a defensive re-check; DuckLake
-		// de-duplicates its own CREATE-per-batch.
+		// Fixed shape, no store-side schema to stage — the store records the
+		// table's existence when the first `inline/fdel` is staged against it
+		// (see inline_tables.hpp), so CREATE only builds and caches the entry
+		// for the rest of this transaction. The find below is a defensive
+		// re-check; DuckLake de-duplicates its own CREATE-per-batch.
 		auto found = tables_.find(table_name);
 		if (found != tables_.end()) {
 			if (info.Base().on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT) {
@@ -720,9 +730,13 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
 	// `CACHE_DIR` is a local directory for SlateDB's on-disk block cache; it
 	// must outlive the moraine_attach call, so it lives in this scope.
+	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
+	// time, so the open writes nothing at all; the ABI refuses it on a
+	// read-write attach.
 	bool encrypted = false;
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
+	std::string checkpoint;
 	// DuckLake's `META_DATA_PATH` passthrough arrives here as `data_path`;
 	// it is the DATA_PATH the index scoped read and maintenance resolve data
 	// files against. (DuckLake keeps its own unprefixed `DATA_PATH` for the
@@ -752,44 +766,25 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			flush_interval_ms = requested == 0 ? UINT64_MAX : requested;
 		} else if (name == "cache_dir") {
 			cache_dir = option.second.GetValue<std::string>();
+		} else if (name == "checkpoint") {
+			checkpoint = option.second.GetValue<std::string>();
 		}
 	}
-	// For an s3:// store, resolve credentials from the matching DuckDB secret
-	// (the same secret DuckLake/httpfs use for DATA_PATH); fields the secret
-	// omits fall back to the AWS_* environment in the core. The backing strings
-	// must outlive the moraine_attach call, so they live in this scope.
+	// The backing strings must outlive the moraine_attach call, so they live
+	// in this scope rather than inside the resolver.
 	MoraineS3Config s3 {};
-	s3.use_ssl = -1;
-	std::string key_id, secret, region, session_token, endpoint, url_style;
-	bool is_s3 = duckdb::StringUtil::StartsWith(info.path, "s3://");
-	if (is_s3) {
-		auto &secret_manager = duckdb::SecretManager::Get(context);
-		auto transaction = duckdb::CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto match = secret_manager.LookupSecret(transaction, info.path, "s3");
-		if (match.HasMatch()) {
-			auto &kv = dynamic_cast<const duckdb::KeyValueSecret &>(match.GetSecret());
-			auto take = [&](const char *key, std::string &into, const char *&field) {
-				duckdb::Value value;
-				if (kv.TryGetValue(key, value) && !value.IsNull()) {
-					into = value.ToString();
-					field = into.c_str();
-				}
-			};
-			take("key_id", key_id, s3.key_id);
-			take("secret", secret, s3.secret);
-			take("region", region, s3.region);
-			take("session_token", session_token, s3.session_token);
-			take("endpoint", endpoint, s3.endpoint);
-			take("url_style", url_style, s3.url_style);
-			duckdb::Value ssl;
-			if (kv.TryGetValue("use_ssl", ssl) && !ssl.IsNull()) {
-				s3.use_ssl = ssl.GetValue<bool>() ? 1 : 0;
-			}
-		}
-	}
+	S3SecretStrings s3_strings;
+	bool is_s3 = ResolveS3Config(context, info.path, s3, s3_strings);
+	// DuckDB's own execution-thread count sizes the catalog's worker pool,
+	// so a session pinned with `SET threads=1` does not get one sized to
+	// the machine on top of DuckDB's. The ABI clamps it; read once here,
+	// since the pool is fixed for the attach's life.
+	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
 	                           cache_dir.empty() ? nullptr : cache_dir.c_str(),
-	                           data_path.empty() ? nullptr : data_path.c_str(), &handle, &err);
+	                           data_path.empty() ? nullptr : data_path.c_str(),
+	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
+	                           moraine_shim_is_interrupted, &context, &handle, &err);
 	// Drained on both exits: the open's own events (and a failed open's)
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.
@@ -912,6 +907,11 @@ duckdb::PhysicalOperator &MoraineCatalog::PlanDelete(duckdb::ClientContext &, du
 	// decided in PlanMetadataDelete/PlanInlineDataDelete.
 	if (auto *inline_data_table = dynamic_cast<MoraineInlineDataTableEntry *>(&op.table)) {
 		auto &delete_op = PlanInlineDataDelete(planner, op, *inline_data_table);
+		delete_op.children.push_back(plan);
+		return delete_op;
+	}
+	if (auto *inline_delete_table = dynamic_cast<MoraineInlineDeleteTableEntry *>(&op.table)) {
+		auto &delete_op = PlanInlineDeleteDelete(planner, op, *inline_delete_table);
 		delete_op.children.push_back(plan);
 		return delete_op;
 	}

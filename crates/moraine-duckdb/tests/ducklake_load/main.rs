@@ -25,11 +25,16 @@ mod helpers;
 
 mod attach;
 mod change_feed;
+mod checkpoints;
+mod commit_protocol;
+mod crash;
 mod ddl;
 mod index;
 mod inline;
 mod maintenance;
+mod migrate;
 mod multi_writer;
 mod partitioning;
 mod time_travel;
 mod types;
+mod wire_contract;

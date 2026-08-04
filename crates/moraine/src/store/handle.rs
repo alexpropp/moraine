@@ -9,7 +9,31 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use slatedb::{ByteRangeBounds, DbIterator, DbReader, DbTransaction};
+use slatedb::{ByteRangeBounds, DbIterator, DbReader, DbTransaction, config::ScanOptions};
+
+/// Read-ahead for a scan, in bytes, rounded up to a block by SlateDB.
+///
+/// The default is one byte — one block — fetched with no concurrency, so a
+/// scan of a whole subspace costs one object-store round trip per block.
+/// That is invisible on local storage and ruinous on remote: a 12.8 MB
+/// subspace measured 276 s against S3, ~46 KB/s, which is the round-trip
+/// latency of ~3 200 sequential 4 KB fetches and nothing else.
+const SCAN_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many block fetches a scan may have in flight. Read-ahead alone
+/// still serializes on latency; the concurrency is what converts a scan
+/// from a round-trip count into a throughput number.
+const SCAN_FETCH_TASKS: usize = 8;
+
+/// Scan options for reading a whole subspace, as every materialization
+/// does.
+fn bulk_scan_options() -> ScanOptions {
+    ScanOptions {
+        read_ahead_bytes: SCAN_READ_AHEAD_BYTES,
+        max_fetch_tasks: SCAN_FETCH_TASKS,
+        ..ScanOptions::default()
+    }
+}
 
 /// A read over a read-write transaction or a read-only reader. Cheap to
 /// copy — it holds a borrow, not a session.
@@ -34,6 +58,10 @@ impl ReadHandle<'_> {
     }
 
     /// Scan keys sharing `prefix`, restricted to `subrange`.
+    ///
+    /// Reads ahead and fetches concurrently: every caller here walks a
+    /// range rather than probing it, so paying a round trip per block is
+    /// never what is wanted.
     pub(crate) async fn scan_prefix<P, T>(
         &self,
         prefix: P,
@@ -43,9 +71,17 @@ impl ReadHandle<'_> {
         P: AsRef<[u8]> + Send,
         T: ByteRangeBounds + Send,
     {
+        let options = bulk_scan_options();
         match self {
-            Self::Tx(tx) => tx.scan_prefix(prefix, subrange).await,
-            Self::Reader(reader) => reader.scan_prefix(prefix, subrange).await,
+            Self::Tx(tx) => {
+                tx.scan_prefix_with_options(prefix, subrange, &options)
+                    .await
+            }
+            Self::Reader(reader) => {
+                reader
+                    .scan_prefix_with_options(prefix, subrange, &options)
+                    .await
+            }
         }
     }
 }

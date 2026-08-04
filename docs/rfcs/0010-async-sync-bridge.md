@@ -31,7 +31,9 @@ a typed error, never undefined behavior.
   not an accident, and no more complex than the workload justifies.
 - **The core stays runtime-free.** No `tokio::runtime` or thread spawning in
   `moraine` (RFC 0003). The runtime lives entirely in the `moraine-duckdb`
-  C-ABI layer; a pure-Rust host brings its own and awaits directly.
+  C-ABI layer; a pure-Rust host brings its own and awaits directly. The core
+  does spawn *tasks* onto whichever runtime is driving it — that is how the
+  commit write is shielded, below — but it never creates one.
 - **Background work makes progress.** SlateDB's background tasks (WAL flush,
   compaction) and concurrent DuckDB scan threads all progress while one or more
   DuckDB threads are blocked on a catalog call.
@@ -44,7 +46,7 @@ a typed error, never undefined behavior.
   on catalog state, and a committed commit is never "half-cancelled" — the
   write itself is shielded from cancellation, at the documented cost that an
   interrupt racing the write yields an ambiguous (`Interrupted`-but-landed)
-  outcome equivalent to RFC 0011's A2 crash row.
+  outcome equivalent to RFC 0011's `CommitDurableNotAcknowledged`.
 - **Panics never cross the C ABI.** Every FFI boundary catches unwinding and
   converts it to a typed error mapped to a DuckDB error code (RFC 0006), never
   UB. Consistent with the CLAUDE.md no-panic-in-library policy and the
@@ -96,7 +98,7 @@ worker threads drive the IO and SlateDB's background tasks.
   model exactly (call, wait, return); the calling thread is external to the
   runtime, so `block_on` cannot deadlock a worker (see next subsection); the C
   ABI stays synchronous (RFC 0006); cancellation is a `select!` of the future
-  against an interrupt token (see cancellation, below).
+  against an interrupt probe (see cancellation, below).
 - *Against:* one OS thread is parked per concurrent in-flight call — parked
   *threads*, not cores, bounded by DuckDB's thread count. This is why the
   runtime must be multi-threaded: background IO must progress while those
@@ -114,7 +116,9 @@ callback on completion that resumes DuckDB.
   into, so it would park the DuckDB thread anyway (defeating its only advantage)
   or demand deep DuckDB changes moraine does not control. It also adds a
   callback protocol crossing the C ABI — more surface, more unwind-across-FFI
-  risk — against RFC 0006's "thin, synchronous C functions."
+  risk — against RFC 0006's "thin, synchronous C functions." Should DuckDB
+  ever grow an async catalog or operator contract, this is the option to
+  re-open — but nothing here is built in anticipation of one.
 
 **C. Channel to a background runtime (dispatcher/actor).** The runtime runs on
 dedicated background thread(s); the FFI thread serializes each request onto a
@@ -170,7 +174,31 @@ moraine catalog** (per `slatedb::Db` / `Catalog` instance, RFC 0003), at
   moraine catalogs get independent runtimes; this keeps `DETACH` teardown local
   and avoids a process-global whose worker count must serve an unknown number
   of catalogs. (Revisit if many-catalog processes make a shared runtime worth
-  the coupling — see Open questions.)
+  the coupling.)
+
+**Worker count: DuckDB's own thread setting, clamped to `2..=8`.** The attach
+entry point takes the host's execution-thread count and sizes the pool from
+it. Three constraints fix the rule:
+
+- **Track the host.** DuckDB's `threads` setting is the only number in the
+  process that states how much parallelism the operator asked for, and it
+  bounds how many DuckDB threads can be inside a catalog call at once. A
+  session pinned with `SET threads=1` must not get a pool sized to the
+  machine, on top of DuckDB's own.
+- **Floor of two.** A CPU-bound poll holds its worker to completion, and
+  SlateDB's flush and compaction have to progress while it does — the same
+  reason the runtime is multi-threaded at all, so it is a floor and not a
+  tuning knob.
+- **Ceiling of eight.** The pool waits on object storage, which yields its
+  worker at every await: four workers absorb thirty-two concurrent
+  materializations at a flat batch time, and eight concurrent decodes leave a
+  short call at ~0.4 ms (`BENCHMARK.md` → Core measurements, both halves).
+  Past a handful, further workers only park — and they park in addition to
+  DuckDB's own threads, on cores DuckDB already sized itself to.
+
+The size is fixed at attach. A session that changes `threads` afterwards keeps
+the pool it attached with; rebuilding a runtime that owns live background
+tasks costs more than the mismatch does.
 
 ### `block_on` discipline
 
@@ -205,18 +233,39 @@ travel materialization, a commit stalled on a slow object-store PUT) must
 respond. The bridge implements cancellation as:
 
 1. The FFI entry point `block_on`s a `select!` of the operation against a
-   **cancellation token** fed by DuckDB's interrupt signal (delivered per the
-   RFC 0006 C-ABI — a flag the shim sets, polled by the token).
+   **cancellation probe** supplied by the caller.
 2. On interrupt, the cancellable portion of the operation is **dropped**
    (async cancellation *is* drop), unwinding its `await` stack and releasing
    resources, and the entry point returns a typed **`Interrupted`** (RFC
    0003 taxonomy → DuckDB error code, RFC 0006).
 
+**How the interrupt arrives: a pollable flag, not a callback or a handle.**
+DuckDB offers no way to push a cancellation into an extension — there is no
+callback to register and no cancellation handle to hold. What it does offer
+is `ClientContext::IsInterrupted()`, one atomic load of the same flag its own
+executor polls, safe to call from any thread. So the bridge pulls: every
+cancellable entry point takes a probe function pointer and an opaque context,
+the shim passes its `moraine_shim_is_interrupted` and the `ClientContext`, and
+the bridge polls it — once before the future is first polled, then every
+~100 ms while it is pending. The pre-poll check is load-bearing: a timer's
+first tick is pending even when already elapsed, so a future that completes on
+its first poll would otherwise beat an interrupt that was already standing.
+
+Two consequences follow from the probe being per **call** rather than per
+handle. Cancellation is scoped to the query that asked for it — several
+connections share one attached catalog, and one connection's Ctrl-C must not
+abort or be consumed by another's query. And the signal is level-triggered:
+nothing consumes it, so a probe that reports an interrupt cancels every call
+that observes it, and a later call with a quiet probe succeeds normally.
+
+`DETACH` takes no probe and never will: it is teardown, and its wait is the
+flush that makes committed data durable.
+
 **The commit write is shielded — `select!` alone is not the design.** A bare
 `select!` over the whole commit future would drop it at *whatever* `await`
 it is parked on when the interrupt fires — including inside the durable
 batch write itself, where the write has already been issued and dropping
-the future cannot retract it. No design can both race a token against the
+the future cannot retract it. No design can both race a probe against the
 whole future *and* promise that past the point of no return the operation
 runs to completion; those are contradictory mechanisms. The bridge is
 therefore split at the point of no return:
@@ -224,11 +273,23 @@ therefore split at the point of no return:
 - **Phases before the batch write** (load-head, id allocation, batch
   assembly, conflict retry) run inside the `select!` and are freely
   cancellable: dropping them discards only staged in-memory state.
-- **The batch write itself is spawned onto the runtime**
-  (`Handle::spawn`) rather than awaited inline in the cancellable future,
-  so no interrupt — and no drop of the FFI-side future — can abort a write
-  mid-flight. The FFI thread then waits on the spawned task's join handle,
-  still racing the token.
+- **The batch write itself is spawned onto the runtime** rather than
+  awaited inline in the cancellable future, so no interrupt — and no drop
+  of the FFI-side future — can abort a write mid-flight. The caller then
+  waits for the spawned task, still racing the probe.
+
+Both commit paths take that split. The verb path's group commit (RFC 0004)
+already had it structurally: a batch is spawned the moment it seals, and its
+members wait on a channel rather than on the write, because a member that
+sealed the batch must not be able to take every other member's commit down
+with it when its own caller is interrupted. The staged-row path has no batch
+to share, so it spawns its own write and waits on the join handle.
+
+A spawned write that never reports back — its runtime shut down, or the task
+lost to a panic — leaves the outcome unknown, which is the one answer a
+caller must not read as "nothing landed". The core raises `Interrupted` for
+it, so the caller re-resolves head rather than re-driving a commit that may
+already be durable.
 
 **Cancel-safety, relative to RFC 0004**, then has three cases instead of a
 clean two:
@@ -243,7 +304,7 @@ clean two:
   fails, but is never torn. The caller-visible outcome is therefore
   **ambiguous**: `Interrupted` was returned, yet the commit may have
   landed. This is not a new hazard — it is byte-for-byte the semantics of
-  RFC 0011's A2 row (`CommitBatchLandedNoAck`): a caller that must know
+  RFC 0011's `CommitDurableNotAcknowledged`: a caller that must know
   re-resolves head and re-drives, observing either the landed commit or
   clean pre-commit state. The ambiguity is documented on the FFI commit
   entry point rather than papered over.
@@ -292,7 +353,7 @@ paths are exercised by the `cargo xtask e2e` DuckDB harness (RFC 0006):
   spawned batch write is in flight returns `Interrupted` promptly; the
   write still completes (or fails) in the background, never torn — a
   subsequent read observes head at exactly `N` or exactly `N+1`, and a
-  re-drive behaves per RFC 0011 A2.
+  re-drive behaves per RFC 0011's `CommitDurableNotAcknowledged`.
 - **Commit past the point of no return.** An interrupt delivered after the
   durable write completed still reports the committed snapshot; state is
   consistent.
@@ -303,33 +364,6 @@ paths are exercised by the `cargo xtask e2e` DuckDB harness (RFC 0006):
   runtime remains usable for the next call.
 - **Teardown.** `DETACH` drops the runtime and flushes SlateDB with no
   outstanding-task leak.
-
-## Open questions
-
-- **Interrupt delivery mechanism.** Exactly how DuckDB hands an interrupt to a
-  C-ABI extension (a pollable flag on the client context, a callback, a
-  cancellation handle) — pinned against DuckDB's extension API in RFC 0006
-  work; determines whether the cancellation token is polled or signal-driven.
-- **Worker-thread count.** The runtime's worker count default — likely derived
-  from DuckDB's own thread setting so the two do not oversubscribe cores;
-  settled with a perf pass.
-- **Per-instance vs. shared runtime.** For a process attaching many moraine
-  catalogs, one shared runtime saves threads at the cost of coupling teardown.
-  Deferred; per-instance is the safe default and is revisited only if
-  many-catalog processes prove common.
-- **Blocking-call latency under load.** Whether a separate IO-dedicated runtime
-  (or `spawn_blocking` discipline) is needed if SlateDB IO latency starves the
-  shared worker pool under heavy parallel scans — measured before adding
-  complexity.
-- **A future async DuckDB contract.** If DuckDB gains an async catalog/operator
-  contract, the completion-callback mechanism (B) becomes viable — but only if
-  bridge overhead ever rises above the object-store-latency floor, which for
-  catalog workloads it does not. Track DuckDB's extension API; do not pre-build
-  for it.
-- **A commit-funnel dispatcher.** Option C's one real use — serializing a
-  many-connection process through a single committer — is an RFC 0004 topology
-  decision layered *above* the bridge, not a change to mechanism A. Revisit
-  there if a many-committer process appears.
 
 ## Alternatives considered
 

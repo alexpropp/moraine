@@ -24,10 +24,14 @@ set(EXTENSION_SOURCES
     ${CPP_DIR}/moraine_extension.cpp
     ${CPP_DIR}/storage_extension.cpp
     ${CPP_DIR}/catalog.cpp
+    ${CPP_DIR}/checkpoints.cpp
+    ${CPP_DIR}/census.cpp
     ${CPP_DIR}/index_functions.cpp
     ${CPP_DIR}/inline_tables.cpp
     ${CPP_DIR}/maintenance.cpp
     ${CPP_DIR}/metadata_tables.cpp
+    ${CPP_DIR}/migrate.cpp
+    ${CPP_DIR}/s3_secret.cpp
     ${CPP_DIR}/scan.cpp
     ${CPP_DIR}/staged_write.cpp
     ${CPP_DIR}/transaction_manager.cpp

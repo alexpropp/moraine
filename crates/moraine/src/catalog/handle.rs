@@ -7,8 +7,11 @@ mod tests;
 use std::{
     collections::{HashMap, HashSet},
     ops::Bound,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use futures::StreamExt;
@@ -20,21 +23,81 @@ use tracing::{info, warn};
 use crate::{
     catalog::{
         CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo, FileIndexEntry, IndexDef,
-        IndexEntry, IndexId, IndexInfo, IndexState, RowHolder, RowLocation, SnapshotId, TableId,
-        projection::ProjectionCache, scoped_read,
+        IndexEntry, IndexId, IndexInfo, IndexState, RecentRow, RowHolder, RowLocation, SnapshotId,
+        TableId,
+        census::{
+            CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
+            MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
+        },
+        inline::{InlineScanKind, materialize_inline_rows},
+        projection::ProjectionCache,
+        scoped_read,
     },
     error::{Error, Result},
     store::{
+        census::{self as store_census, SegmentSize},
+        compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ReadSession},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
         inline as store_inline,
-        key::{IndexKey, IndexKind, InlineOperation, Key, index_index_prefix, index_kind_prefix},
-        open::StoreBuilder,
+        key::{
+            IndexKey, IndexKind, InlineOperation, Key, Subspace, index_index_prefix,
+            index_kind_prefix, subspace_prefix,
+        },
+        open::{self, StoreBuilder},
     },
-    transaction::{Transaction, commit, folder, index_maintenance, slot_commit},
+    transaction::{
+        MigrationReport, Transaction, commit, folder, index_maintenance, migration, slot_commit,
+    },
 };
+
+/// One subspace's row, zeroed when the manifest carries no segment for it.
+fn measure(subspace: SubspaceName, segment: Option<&SegmentSize>) -> SubspaceCensus {
+    SubspaceCensus {
+        subspace,
+        bytes: segment.map_or(0, |segment| segment.bytes),
+        l0_ssts: segment.map_or(0, |segment| segment.l0_ssts),
+        sorted_runs: segment.map_or(0, |segment| segment.sorted_runs),
+        sorted_run_ssts: segment.map_or(0, |segment| segment.sorted_run_ssts),
+        live: None,
+    }
+}
+
+/// Counts the live entries of each measured subspace under one read
+/// session.
+async fn count_live_entries(
+    handle: ReadHandle<'_>,
+    subspaces: &mut [SubspaceCensus],
+) -> Result<()> {
+    for measured in subspaces {
+        // An unknown segment addresses no keys this build can decode, so
+        // there is nothing to scan and no count to report.
+        let Some(subspace) = measured.subspace.subspace() else {
+            continue;
+        };
+        let tally = store_census::scan_live(handle, subspace).await?;
+        measured.live = Some(LiveCount {
+            keys: tally.keys,
+            key_bytes: tally.key_bytes,
+            value_bytes: tally.value_bytes,
+            scheduled_files: tally.scheduled_files,
+        });
+    }
+
+    Ok(())
+}
+
+/// The physical bytes `census` recorded for `subspace`, or zero if it
+/// carries no such subspace.
+fn bytes_of(census: &StoreCensus, subspace: &SubspaceName) -> u64 {
+    census
+        .subspaces
+        .iter()
+        .find(|measured| &measured.subspace == subspace)
+        .map_or(0, |measured| measured.bytes)
+}
 
 /// How many entries one staged build step commits. At roughly a kilobyte
 /// of write-path memory apiece, a step peaks near a gigabyte.
@@ -62,30 +125,60 @@ enum FormatClass {
     TooNew(u64),
 }
 
-/// Whether `path` provably holds no objects. A listing that fails answers
-/// `false`: this licenses creating a store, so anything short of proof that
-/// there is nothing to destroy must deny.
-async fn prefix_is_known_empty(object_store: &Arc<dyn ObjectStore>, path: &str) -> bool {
+/// What `path` holds when an open could not read a store there: nothing to
+/// destroy (a fresh prefix to bootstrap), a SlateDB manifest (a store a peer
+/// created or is still creating — a benign race), or other objects (a damaged
+/// or foreign prefix a bootstrap must refuse to stamp over). A listing that
+/// fails answers `Foreign`: anything short of proof the prefix is empty denies
+/// creation.
+enum PrefixState {
+    Empty,
+    HasManifest,
+    Foreign,
+}
+
+/// The outcome of probing a store before opening it read-write: a reader over
+/// an existing store, an empty prefix to bootstrap, or a peer mid-creation
+/// whose half-written manifest reads no consistent version yet — a race the
+/// caller waits out rather than a store to bootstrap or refuse.
+enum ProbeOutcome {
+    Reader(Box<DbReader>),
+    Empty,
+    Racing,
+}
+
+async fn prefix_state(object_store: &Arc<dyn ObjectStore>, path: &str) -> PrefixState {
     let prefix: Path = path.split('/').filter(|part| !part.is_empty()).collect();
     let mut listing = object_store.list(Some(&prefix));
-    match listing.next().await {
-        None => true,
-        Some(Ok(object)) => {
-            warn!(
-                path,
-                found = %object.location,
-                "refusing to create a store: the prefix already holds objects"
-            );
-            false
+    let mut foreign = false;
+    while let Some(entry) = listing.next().await {
+        match entry {
+            Ok(object) if object.location.as_ref().contains("manifest") => {
+                return PrefixState::HasManifest;
+            }
+            Ok(object) => {
+                warn!(
+                    path,
+                    found = %object.location,
+                    "refusing to create a store: the prefix already holds objects"
+                );
+                foreign = true;
+            }
+            Err(err) => {
+                warn!(
+                    path,
+                    error = %err,
+                    "refusing to create a store: the prefix could not be listed"
+                );
+                foreign = true;
+            }
         }
-        Some(Err(err)) => {
-            warn!(
-                path,
-                error = %err,
-                "refusing to create a store: the prefix could not be listed"
-            );
-            false
-        }
+    }
+
+    if foreign {
+        PrefixState::Foreign
+    } else {
+        PrefixState::Empty
     }
 }
 
@@ -304,6 +397,18 @@ impl Default for MaintenanceRequest {
     }
 }
 
+/// How a [`Catalog::migrate`] call should run.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct MigrationRequest {
+    /// Take a whole-store checkpoint before the first rewrite and release it
+    /// once the last finish batch is durable, leaving a manual recovery point
+    /// if the migration fails partway. Off by default: migrations are
+    /// one-way and there is no automatic rollback, so the checkpoint is the
+    /// sanctioned recovery path when an operator wants one.
+    pub checkpoint: bool,
+}
+
 /// What a maintenance pass reclaimed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -329,6 +434,46 @@ pub struct Contention {
     pub exhaustions: u64,
 }
 
+/// How a handle has served its reads, for the diagnostics a slow attach
+/// needs.
+///
+/// A materialization is meant to be rare — one per handle, then the cache
+/// serves — so the count is the diagnostic: a handle reporting hundreds is
+/// rebuilding the catalog per read, which no amount of reclaiming the store
+/// would fix.
+#[derive(Debug, Default)]
+struct ReadTally {
+    materializations: AtomicU64,
+    refreshes: AtomicU64,
+    cache_hits: AtomicU64,
+    materialize_micros: AtomicU64,
+}
+
+impl ReadTally {
+    /// Records a full rebuild and reports it, with the running totals that
+    /// make one attach's behaviour legible in a log.
+    fn materialized(&self, elapsed: Duration) {
+        let count = self.materializations.fetch_add(1, Ordering::Relaxed) + 1;
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let total = self.materialize_micros.fetch_add(micros, Ordering::Relaxed) + micros;
+        info!(
+            elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+            materializations = count,
+            total_micros = total,
+            cache_hits = self.cache_hits.load(Ordering::Relaxed),
+            refreshes = self.refreshes.load(Ordering::Relaxed),
+            "materialized the catalog from `current`"
+        );
+    }
+}
+
+/// Where a store lives, for the admin-surface verbs that address it by
+/// path rather than through the open handle.
+struct StoreLocation {
+    path: String,
+    object_store: Arc<dyn ObjectStore>,
+}
+
 /// The open store behind a catalog. Every attach — read-write or read-only —
 /// builds [`Store::Slots`].
 enum Store {
@@ -351,6 +496,10 @@ pub(crate) struct SlotStore {
     /// Whether this attach may write: `false` refuses commits and folder-role
     /// work, so a read-only attach never opens the writer.
     pub(crate) read_only: bool,
+    /// Whether this attach is pinned to a checkpoint: a fixed cut that reads
+    /// the folded store the checkpoint captured and never replays the tail
+    /// committed after it.
+    pub(crate) pinned: bool,
     /// Serializes and coalesces this process's slot commits. Shared by every
     /// clone of the handle.
     pub(crate) coalescer: slot_commit::CommitCoalescer,
@@ -413,7 +562,19 @@ pub struct CatalogOptions {
     /// A reader lags the head by up to this interval, replaying that many more
     /// slots per materialization; a shorter interval trades more manifest
     /// reads for less fold lag, the read-side cost axis. Defaults to 10s.
+    /// Ignored by a catalog pinned to a [`checkpoint`](Self::checkpoint),
+    /// which polls for nothing.
     pub refresh_interval: Duration,
+    /// An existing checkpoint id (a UUID) to pin a **read-only** catalog to,
+    /// as reported by [`Catalog::create_checkpoint`].
+    ///
+    /// The default (`None`) follows the latest state, which writes a
+    /// checkpoint of its own into the manifest on open and refreshes it for
+    /// the catalog's lifetime. Set it for a reader whose credentials cannot
+    /// write at all: the open then reads a fixed cut and writes nothing —
+    /// at the cost of never seeing a later commit. Refused by
+    /// [`Catalog::open`], which is a writer.
+    pub checkpoint: Option<String>,
 }
 
 impl Default for CatalogOptions {
@@ -425,8 +586,20 @@ impl Default for CatalogOptions {
             data_path: None,
             commit_batch_window: Duration::ZERO,
             refresh_interval: Duration::from_secs(10),
+            checkpoint: None,
         }
     }
+}
+
+/// Parses a configured checkpoint id, naming the option in the error.
+fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
+    checkpoint
+        .map(|id| {
+            uuid::Uuid::parse_str(id).map_err(|err| {
+                Error::Configuration(format!("checkpoint `{id}` is not a valid id: {err}"))
+            })
+        })
+        .transpose()
 }
 
 /// A handle to a moraine catalog: cheap to clone, drives reads and
@@ -435,6 +608,12 @@ impl Default for CatalogOptions {
 #[derive(Clone)]
 pub struct Catalog {
     store: Arc<Store>,
+    // Shared across handle clones: how this attach has served its reads.
+    reads: Arc<ReadTally>,
+    // Where the store lives. Retained because the census and the store
+    // merge reach SlateDB's admin surface, which addresses a store by path
+    // rather than through an open handle.
+    location: Arc<StoreLocation>,
     // Shared across handle clones: decoded projections folded forward on
     // commit, served without rescanning when their head matches.
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
@@ -473,13 +652,23 @@ impl Catalog {
     /// # Ok::<(), moraine::Error>(()) }).unwrap();
     /// ```
     pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
+        if options.checkpoint.is_some() {
+            return Err(Error::Configuration(
+                "a checkpoint pins a read-only catalog to a fixed cut; a writer commits new \
+                 state and cannot be opened against one"
+                    .to_string(),
+            ));
+        }
         let reader = Self::open_read_write_reader(&object_store, &options).await?;
         info!(
             path = options.path,
             refresh_interval_ms = options.refresh_interval.as_millis(),
             "opened catalog read-write"
         );
-
+        let location = Arc::new(StoreLocation {
+            path: options.path.clone(),
+            object_store: Arc::clone(&object_store),
+        });
         let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
         let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
         Ok(Self {
@@ -489,12 +678,15 @@ impl Catalog {
                 object_store,
                 options,
                 read_only: false,
+                pinned: false,
                 coalescer,
                 head_cache: slot_commit::HeadCache::default(),
                 contention: Arc::new(slot_commit::ContentionCounters::default()),
                 #[cfg(feature = "leader")]
                 forwarding: Arc::new(slot_commit::Forwarding::default()),
             }))),
+            reads: Arc::new(ReadTally::default()),
+            location,
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
     }
@@ -508,15 +700,47 @@ impl Catalog {
         object_store: &Arc<dyn ObjectStore>,
         options: &CatalogOptions,
     ) -> Result<DbReader> {
-        for _ in 0..MIGRATION_ATTEMPTS {
-            let Some(reader) = Self::open_probe_reader(object_store, options).await? else {
-                return Self::bootstrap_slot_reader(object_store, options).await;
+        for attempt in 0..MIGRATION_ATTEMPTS {
+            let reader = match Self::open_probe_reader(object_store, options).await? {
+                ProbeOutcome::Reader(reader) => *reader,
+                // Empty, or a peer mid-creation: route to the writer path, which
+                // SlateDB serializes by fencing. A concurrent creator can still
+                // leave the store half-formed, so a failed bootstrap backs off
+                // and re-probes — one racer wins and the rest adopt it.
+                ProbeOutcome::Empty | ProbeOutcome::Racing => {
+                    match Self::bootstrap_slot_reader(object_store, options).await {
+                        Ok(reader) => return Ok(reader),
+                        // A definitively lost race — a peer already created the
+                        // store — names itself; surface it rather than retry.
+                        Err(err @ Error::OpenRaced(_)) => return Err(err),
+                        Err(_) if attempt + 1 < MIGRATION_ATTEMPTS => {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                1u64 << attempt.min(6),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
             };
             match Self::classify_format(&reader).await? {
                 FormatClass::SlotLog => return Ok(reader),
                 FormatClass::Empty => {
                     reader.close().await.map_err(Error::from)?;
-                    return Self::bootstrap_slot_reader(object_store, options).await;
+                    match Self::bootstrap_slot_reader(object_store, options).await {
+                        Ok(reader) => return Ok(reader),
+                        // A definitively lost race — a peer already created the
+                        // store — names itself; surface it rather than retry.
+                        Err(err @ Error::OpenRaced(_)) => return Err(err),
+                        Err(_) if attempt + 1 < MIGRATION_ATTEMPTS => {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                1u64 << attempt.min(6),
+                            ))
+                            .await;
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
                 FormatClass::TooNew(version) => {
                     reader.close().await.map_err(Error::from)?;
@@ -553,19 +777,17 @@ impl Catalog {
     async fn open_probe_reader(
         object_store: &Arc<dyn ObjectStore>,
         options: &CatalogOptions,
-    ) -> Result<Option<DbReader>> {
+    ) -> Result<ProbeOutcome> {
         let reader_store = StoreBuilder::new(&options.path, object_store.clone())
             .refresh_interval(options.refresh_interval)
             .cache_dir(options.cache_dir.clone());
         match reader_store.open_reader().await {
-            Ok(reader) => Ok(Some(reader)),
-            Err(err) => {
-                if prefix_is_known_empty(object_store, &options.path).await {
-                    Ok(None)
-                } else {
-                    Err(err)
-                }
-            }
+            Ok(reader) => Ok(ProbeOutcome::Reader(Box::new(reader))),
+            Err(err) => match prefix_state(object_store, &options.path).await {
+                PrefixState::Empty => Ok(ProbeOutcome::Empty),
+                PrefixState::HasManifest => Ok(ProbeOutcome::Racing),
+                PrefixState::Foreign => Err(err),
+            },
         }
     }
 
@@ -584,6 +806,13 @@ impl Catalog {
             }
             Some(format) if format.format_version > commit::MAX_FORMAT_VERSION => {
                 Ok(FormatClass::TooNew(format.format_version))
+            }
+            Some(format) if format.format_version < commit::MIN_FORMAT_VERSION => {
+                Err(Error::Configuration(format!(
+                    "store format {} predates this binary's minimum ({}); it cannot be attached",
+                    format.format_version,
+                    commit::MIN_FORMAT_VERSION
+                )))
             }
             Some(_) => Ok(FormatClass::Legacy),
         }
@@ -621,7 +850,8 @@ impl Catalog {
     }
 
     /// Opens the catalog **read-only** in `object_store` at `options.path`,
-    /// as a `DbReader` following the latest manifest.
+    /// as a `DbReader` following the latest manifest — or, when
+    /// [`CatalogOptions::checkpoint`] is set, pinned to that checkpoint.
     ///
     /// A read-only catalog never opens the writer `Db`, so it never fences a
     /// live read-write process — any number of read-only catalogs may attach
@@ -629,17 +859,52 @@ impl Catalog {
     /// store no writer has initialized is refused. [`commit`](Self::commit)
     /// returns [`Error::Constraint`].
     ///
+    /// "Read-only" is a catalog property, not an IAM one: following the
+    /// latest state means writing a checkpoint into the manifest on open and
+    /// refreshing it while the catalog lives, so those credentials still
+    /// need manifest write access. A catalog opened against a checkpoint
+    /// writes nothing whatsoever, and in exchange reads the fixed cut that
+    /// checkpoint names — later commits never appear, however long it stays
+    /// open.
+    ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be opened, is not an initialized
-    /// moraine catalog, or is stamped with an unknown structural format.
+    /// moraine catalog, is stamped with an unknown structural format, or
+    /// names a checkpoint that is not a valid id or no longer exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let object_store = Arc::new(InMemory::new());
+    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+    /// let checkpoint = catalog.create_checkpoint(None).await?;
+    ///
+    /// // A commit after the checkpoint is not in it.
+    /// catalog.commit(|tx| tx.create_schema("ops").map(|_| ())).await?;
+    ///
+    /// let mut options = CatalogOptions::default();
+    /// options.checkpoint = Some(checkpoint);
+    /// let reader = Catalog::open_read_only(object_store, options).await?;
+    /// let view = reader.snapshot().await?;
+    /// assert!(view.schema_by_name("sales").is_some());
+    /// assert!(view.schema_by_name("ops").is_none());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
     pub async fn open_read_only(
         object_store: Arc<dyn ObjectStore>,
         options: CatalogOptions,
     ) -> Result<Self> {
+        let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
         let store = StoreBuilder::new(&options.path, object_store.clone())
             .refresh_interval(options.refresh_interval)
-            .cache_dir(options.cache_dir.clone());
+            .cache_dir(options.cache_dir.clone())
+            .checkpoint(checkpoint);
         // A store with no manifest fails to open at all; the failure propagates
         // (a read-only attach never bootstraps).
         let reader = store.open_reader().await?;
@@ -669,14 +934,23 @@ impl Catalog {
                 return Err(err);
             }
         }
-        info!(path = options.path, "opened catalog read-only");
+        info!(
+            path = options.path,
+            checkpoint = options.checkpoint,
+            "opened catalog read-only"
+        );
 
         // Every readable store serves read-only through the slot topology: a
         // legacy format 1–3 store never migrates (a read-only attach writes
         // nothing), and its absent fold cursor reads as 0 with an empty tail,
         // so it is a slot store with no slots.
+        let location = Arc::new(StoreLocation {
+            path: options.path.clone(),
+            object_store: Arc::clone(&object_store),
+        });
         let slots = moraine_wal::SlotLog::new(object_store.clone(), &options.path);
         let coalescer = slot_commit::CommitCoalescer::new(options.commit_batch_window);
+        let pinned = options.checkpoint.is_some();
         Ok(Self {
             store: Arc::new(Store::Slots(Box::new(SlotStore {
                 reader: Arc::new(reader),
@@ -684,14 +958,176 @@ impl Catalog {
                 object_store,
                 options,
                 read_only: true,
+                pinned,
                 coalescer,
                 head_cache: slot_commit::HeadCache::default(),
                 contention: Arc::new(slot_commit::ContentionCounters::default()),
                 #[cfg(feature = "leader")]
                 forwarding: Arc::new(slot_commit::Forwarding::default()),
             }))),
+            reads: Arc::new(ReadTally::default()),
+            location,
             projections: Arc::new(std::sync::RwLock::new(ProjectionCache::empty())),
         })
+    }
+
+    /// Rewrites the store in place to the newest structural format this
+    /// binary understands, resuming an interrupted migration if one is in
+    /// flight, and reports what it did.
+    ///
+    /// Deliberately **not** part of opening a catalog. A structural rewrite
+    /// walks the keyspace and holds the single writer for its duration, so
+    /// it is the operator's explicit choice, never a side effect of someone
+    /// attaching with a newer binary. It takes the writer epoch exactly as
+    /// [`open`](Self::open) does, so it fences a running catalog and is
+    /// itself fenced by one — exactly one migrator runs.
+    ///
+    /// Running it against a store already at the newest format is a no-op:
+    /// the returned report names the same format twice and no units.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if the store is not an initialized
+    /// moraine catalog, or carries a marker its format stamp contradicts;
+    /// [`Error::Migration`] if a migration is in flight that this binary does
+    /// not carry; or a store error if a batch fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, MigrationRequest};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let object_store = Arc::new(InMemory::new());
+    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+    /// catalog.close().await?;
+    ///
+    /// let report = Catalog::migrate(
+    ///     object_store,
+    ///     CatalogOptions::default(),
+    ///     MigrationRequest::default(),
+    /// )
+    /// .await?;
+    /// // A fresh store is already current, so nothing runs.
+    /// assert_eq!(report.from_format, report.to_format);
+    /// assert!(report.units_run.is_empty());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn migrate(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        request: MigrationRequest,
+    ) -> Result<MigrationReport> {
+        let db = StoreBuilder::new(&options.path, object_store.clone())
+            .cache_dir(options.cache_dir.clone())
+            .open_writer()
+            .await?;
+
+        let checkpoint = if request.checkpoint {
+            let taken = open::create_checkpoint(&db, None).await?;
+            info!(checkpoint = %taken, "took a pre-migration checkpoint");
+            Some(taken)
+        } else {
+            None
+        };
+
+        let report = migration::run(&db).await;
+        let closed = db.close().await.map_err(Error::from);
+
+        // A failed migration keeps its checkpoint: it is the recovery point
+        // the operator asked for, and releasing it here would discard the one
+        // thing that makes the failure recoverable.
+        let report = report.and_then(|report| closed.map(|()| report))?;
+
+        if let Some(checkpoint) = checkpoint {
+            StoreBuilder::new(&options.path, object_store)
+                .delete_checkpoint(checkpoint)
+                .await?;
+        }
+
+        Ok(report)
+    }
+
+    /// Pins everything committed so far as a checkpoint, and reports its id.
+    ///
+    /// A checkpoint is an immutable cut of the store that
+    /// [`CatalogOptions::checkpoint`] opens a reader against — the one way to
+    /// read a moraine catalog with credentials that cannot write at all,
+    /// since a reader that follows the latest state maintains a checkpoint of
+    /// its own and so writes the manifest.
+    ///
+    /// It also pins every object it references against SlateDB's garbage
+    /// collection, so a checkpoint with no `lifetime` holds storage until
+    /// [`delete_checkpoint`](Self::delete_checkpoint) removes it. Give one a
+    /// lifetime unless something will.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
+    /// creating a checkpoint is a manifest write — or a store error if the
+    /// write fails.
+    pub async fn create_checkpoint(&self, lifetime: Option<Duration>) -> Result<String> {
+        // A checkpoint captures the folded store and a pinned reader never
+        // replays the tail, so every committed slot is folded in before the cut
+        // is taken.
+        let Store::Slots(store) = self.store.as_ref();
+        if !store.read_only {
+            folder::fold_sprint(store, u64::MAX).await?;
+        }
+        let id = self
+            .with_writer(async |db| open::create_checkpoint(db, lifetime).await)
+            .await?;
+        info!(checkpoint = %id, "created a checkpoint");
+        Ok(id.to_string())
+    }
+
+    /// Deletes the checkpoint `checkpoint`, releasing the objects it pinned.
+    ///
+    /// Free-standing rather than a method, exactly as
+    /// [`migrate`](Self::migrate) is: it CASes the manifest and never opens
+    /// the writer `Db`, so it runs against a live catalog without fencing
+    /// it. Readers already open against the deleted checkpoint keep
+    /// serving; a reader that opens against it afterwards is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Configuration`] if `checkpoint` is not a valid id,
+    /// or a store error if the manifest update fails.
+    pub async fn delete_checkpoint(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        checkpoint: &str,
+    ) -> Result<()> {
+        let id = parse_checkpoint(Some(checkpoint))?
+            .ok_or_else(|| Error::Configuration("no checkpoint given".to_string()))?;
+        StoreBuilder::new(&options.path, object_store)
+            .delete_checkpoint(id)
+            .await
+    }
+
+    /// Every checkpoint the store's manifest carries, as the ids
+    /// [`create_checkpoint`](Self::create_checkpoint) hands out.
+    ///
+    /// Free-standing for the same reason
+    /// [`delete_checkpoint`](Self::delete_checkpoint) is: it reads the
+    /// manifest and never opens the writer `Db`, so it runs against a live
+    /// catalog without fencing it. A checkpoint given no lifetime pins
+    /// what it references until it is deleted, so this is how an operator
+    /// finds one whose id was lost — reader-established checkpoints show
+    /// up here too, and are not theirs to delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the manifest cannot be read.
+    pub async fn checkpoints(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<Vec<String>> {
+        let ids = StoreBuilder::new(&options.path, object_store)
+            .list_checkpoints()
+            .await?;
+        Ok(ids.iter().map(uuid::Uuid::to_string).collect())
     }
 
     /// The maintained-projection state shared by this handle's clones.
@@ -741,12 +1177,26 @@ impl Catalog {
         }
     }
 
+    /// Runs `body` against the writable folder `Db`, for tests that plant
+    /// direct-store keys under a live handle.
+    #[cfg(test)]
+    pub(crate) async fn with_folder_writer<T, F>(&self, body: F) -> Result<T>
+    where
+        F: AsyncFnOnce(&Db) -> Result<T>,
+    {
+        self.with_writer(body).await
+    }
+
     /// An immutable view of the catalog at the latest committed snapshot.
+    ///
+    /// Shared rather than owned: a warm handle hands back the view it
+    /// already holds, so repeated reads cost neither a store scan nor a
+    /// copy of the catalog.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be read.
-    pub async fn snapshot(&self) -> Result<CatalogSnapshot> {
+    pub async fn snapshot(&self) -> Result<Arc<CatalogSnapshot>> {
         self.view(None).await
     }
 
@@ -756,19 +1206,24 @@ impl Catalog {
     ///
     /// Returns [`Error::NotFound`] if `snapshot` is beyond the head, or
     /// another error if the store cannot be read.
-    pub async fn snapshot_at(&self, snapshot: SnapshotId) -> Result<CatalogSnapshot> {
+    pub async fn snapshot_at(&self, snapshot: SnapshotId) -> Result<Arc<CatalogSnapshot>> {
         self.view(Some(snapshot.get())).await
     }
 
-    async fn view(&self, at: Option<u64>) -> Result<CatalogSnapshot> {
+    async fn view(&self, at: Option<u64>) -> Result<Arc<CatalogSnapshot>> {
         let Store::Slots(store) = self.store.as_ref();
         match at {
             None => {
                 let head = slot_commit::cached_slot_head(store).await?;
                 slot_commit::release_reader(head.reader.as_ref()).await;
-                Ok(head.view)
+                Ok(Arc::new(head.view))
             }
-            Some(snapshot) => slot_commit::materialize_slot_view_at(store, snapshot).await,
+            Some(snapshot) => {
+                let started = Instant::now();
+                let view = slot_commit::materialize_slot_view_at(store, snapshot).await?;
+                self.reads.materialized(started.elapsed());
+                Ok(Arc::new(view))
+            }
         }
     }
 
@@ -791,7 +1246,7 @@ impl Catalog {
     /// entry scans and the catalog they resolve against are one cut. Released
     /// by [`ProbeRead::finish`].
     async fn begin_probe(&self) -> Result<ProbeRead> {
-        let session = self.begin_read();
+        let session = self.begin_read().await?;
         match self.head_view().await {
             Ok(head) => Ok(ProbeRead { session, head }),
             Err(err) => {
@@ -799,6 +1254,194 @@ impl Catalog {
                 Err(err)
             }
         }
+    }
+
+    /// A table's inlined rows live at the latest committed snapshot, in
+    /// row-id order, each carrying the Arrow IPC bytes it decodes from.
+    ///
+    /// These rows are not part of a [`CatalogSnapshot`]: they are row data,
+    /// not catalog metadata, so they are served from the `inline` subspace
+    /// on demand — one contiguous range scan per call — rather than
+    /// materialized into a view every reader of the catalog shares. Rows of
+    /// one chunk share one body and rows of one schema version share one
+    /// schema, so each set of bytes is read and carried once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if a chunk names a schema version with
+    /// no recorded schema, or another error if the store cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, ColumnDef, InlineChunk};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// # let created = std::cell::Cell::new(None);
+    /// catalog
+    ///     .commit(|tx| {
+    ///         let main = tx.schema_by_name("main").expect("bootstrap schema").id;
+    ///         let orders = tx.create_table(
+    ///             main,
+    ///             "orders",
+    ///             &[ColumnDef {
+    ///                 name: "id".into(),
+    ///                 column_type: "BIGINT".into(),
+    ///                 nulls_allowed: false,
+    ///                 default_value: None,
+    ///             }],
+    ///         )?;
+    ///         // The Arrow bytes are the caller's to produce; moraine stores
+    ///         // and returns them verbatim.
+    ///         tx.inline_insert(
+    ///             orders,
+    ///             &InlineChunk {
+    ///                 schema_version: 0,
+    ///                 arrow_schema: arrow_schema_bytes(),
+    ///                 arrow_body: record_batch_bytes(),
+    ///                 row_count: 2,
+    ///             },
+    ///             &[],
+    ///         )?;
+    /// #       created.set(Some(orders));
+    ///         Ok(())
+    ///     })
+    ///     .await?;
+    /// # let orders = created.get().unwrap();
+    ///
+    /// let rows = catalog.recent_rows(orders).await?;
+    /// assert_eq!(rows.len(), 2);
+    /// assert_eq!(rows[0].row_id, 0);
+    /// assert_eq!(rows[1].offset_in_chunk, 1);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// # fn arrow_schema_bytes() -> Vec<u8> { b"schema".to_vec() }
+    /// # fn record_batch_bytes() -> Vec<u8> { b"body".to_vec() }
+    /// ```
+    pub async fn recent_rows(&self, table: TableId) -> Result<Vec<RecentRow>> {
+        let probe = self.begin_probe().await?;
+        let read_at = probe.view().snapshot.snapshot_id;
+        let outcome = self.scan_recent_rows(&probe, table, read_at).await;
+        probe.finish().await;
+
+        outcome
+    }
+
+    /// A table's inlined rows as of `snapshot` (time travel): the rows whose
+    /// insert had landed by then and whose tombstone had not.
+    ///
+    /// Only rows still inlined are found. A flush drains the chunks it
+    /// consumes, so past snapshots of flushed rows read from the backdated
+    /// data file [`CatalogSnapshot::data_files_of`] serves, never from here
+    /// — which is what keeps the rows in exactly one place at every
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::recent_rows`], plus [`Error::NotFound`] if `snapshot` is
+    /// beyond the head and [`Error::SnapshotExpired`] if it has fallen below
+    /// the retention horizon.
+    pub async fn recent_rows_at(
+        &self,
+        table: TableId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<RecentRow>> {
+        let probe = self.begin_probe().await?;
+        let head = probe.view().snapshot.snapshot_id;
+        let read_at = snapshot.get();
+        let outcome = if read_at > head {
+            Err(Error::NotFound(format!(
+                "snapshot {read_at} (head is {head})"
+            )))
+        } else {
+            self.scan_recent_rows(&probe, table, read_at).await
+        };
+        probe.finish().await;
+
+        outcome
+    }
+
+    /// One inlined row of a table by id, or `None` when no live inlined row
+    /// carries it — including when the row lives in a data file instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::recent_rows`].
+    pub async fn recent_row(&self, table: TableId, row_id: u64) -> Result<Option<RecentRow>> {
+        Ok(self
+            .recent_rows(table)
+            .await?
+            .into_iter()
+            .find(|row| row.row_id == row_id))
+    }
+
+    /// The inline rows of `table` live at `read_at`, scanned through the
+    /// probe's head reader and its unfolded slot overlay so a row a winner
+    /// no folder has applied yet is not missed.
+    async fn scan_recent_rows(
+        &self,
+        probe: &ProbeRead,
+        table: TableId,
+        read_at: u64,
+    ) -> Result<Vec<RecentRow>> {
+        let handle = probe.handle();
+        let overlay = probe.tail();
+        let chunks = store_inline::scan_inline_chunks(handle, overlay, table.get()).await?;
+        let tombstones =
+            store_inline::scan_inline_inline_deletes(handle, overlay, table.get()).await?;
+
+        let live = InlineScanKind::Table.select(
+            &materialize_inline_rows(&chunks, &tombstones),
+            read_at,
+            0,
+        );
+        // One body per referenced chunk and one schema per referenced
+        // version, however many rows point at them.
+        let mut bodies: HashMap<usize, Arc<Vec<u8>>> = HashMap::new();
+        let mut schemas: HashMap<u64, Arc<Vec<u8>>> = HashMap::new();
+        let mut rows = Vec::with_capacity(live.len());
+        for row in live {
+            let (operation, chunk) = &chunks[row.chunk];
+            // Every chunk a row was materialized from is an insert.
+            let InlineOperation::Insert { schema_version, .. } = operation else {
+                return Err(Error::Corruption(format!(
+                    "inline row {} of table {table} references a non-insert chunk",
+                    row.row_id
+                )));
+            };
+            let arrow_schema = if let Some(schema) = schemas.get(schema_version) {
+                Arc::clone(schema)
+            } else {
+                let schema =
+                    store_inline::read_inline_schema(handle, overlay, table.get(), *schema_version)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "no inline schema for table {table} version {schema_version}"
+                            ))
+                        })?;
+                let schema = Arc::new(schema.arrow_schema);
+                schemas.insert(*schema_version, Arc::clone(&schema));
+                schema
+            };
+            let chunk_body = Arc::clone(
+                bodies
+                    .entry(row.chunk)
+                    .or_insert_with(|| Arc::new(chunk.body.clone())),
+            );
+
+            rows.push(RecentRow {
+                row_id: row.row_id,
+                begin_snapshot: SnapshotId::new(row.begin_snapshot),
+                schema_version: *schema_version,
+                offset_in_chunk: row.offset_in_chunk,
+                chunk_body,
+                arrow_schema,
+            });
+        }
+
+        Ok(rows)
     }
 
     /// Resolves an equality lookup to the rows currently holding `values`.
@@ -1041,9 +1684,23 @@ impl Catalog {
     /// [`snapshot`](Self::snapshot)/[`snapshot_at`](Self::snapshot_at) use.
     /// Used by [`crate::ffi_support`]'s raw current+history dumps and inline
     /// scans; every other reader goes through `snapshot`/`snapshot_at`.
-    pub(crate) fn begin_read(&self) -> ReadSession {
+    ///
+    /// Every read in the crate opens its session here, so this is where a
+    /// store mid-structural-migration is refused. The check costs one point
+    /// read per session and belongs here rather than at each call site: a
+    /// reader that skips it scans a keyspace being rewritten under it and
+    /// returns a catalog with a hole in it, and an open-time check cannot
+    /// catch a migration that starts after the handle attached.
+    pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
         let Store::Slots(store) = self.store.as_ref();
-        ReadSession::Reader(store.reader.clone())
+        let session = ReadSession::Reader(store.reader.clone());
+
+        if let Err(error) = commit::refuse_mid_migration(session.handle()).await {
+            session.finish();
+            return Err(error);
+        }
+
+        Ok(session)
     }
 
     /// Opens a read for the raw current+history dumps: a single read session
@@ -1052,7 +1709,23 @@ impl Catalog {
     /// reflects a winner no folder has applied yet.
     pub(crate) async fn begin_dump(&self) -> Result<DumpRead> {
         let Store::Slots(store) = self.store.as_ref();
-        let head = slot_commit::materialize_slot_head(store).await?;
+        // A read-write attach reads through a reader opened for this dump, so a
+        // folder-role write — a mid-migration marker above all — is seen and a
+        // dump scanning a keyspace being rewritten refuses rather than serve a
+        // catalog with a hole. A read-only attach cannot be mid-migration (its
+        // open refuses one) and reads through the shared reader, whose warm
+        // block cache keeps a run of dumps from rescanning the store.
+        let head = if store.read_only {
+            slot_commit::cached_slot_head(store).await?
+        } else {
+            slot_commit::materialize_slot_head_fresh(store).await?
+        };
+        if let Err(err) =
+            commit::refuse_mid_migration(head.handle(ReadHandle::Reader(&store.reader))).await
+        {
+            slot_commit::release_reader(head.reader.as_ref()).await;
+            return Err(err);
+        }
         Ok(DumpRead::Slots {
             reader: store.reader.clone(),
             head: Box::new(head),
@@ -1219,7 +1892,7 @@ impl Catalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let session = self.begin_read();
+        let session = self.begin_read().await?;
 
         let outcome = async {
             let head = self.head_view().await?;
@@ -1621,7 +2294,7 @@ impl Catalog {
         table: TableId,
         columns: &[ColumnId],
     ) -> Result<Vec<IndexEntry>> {
-        let session = self.begin_read();
+        let session = self.begin_read().await?;
         let head = match self.head_view().await {
             Ok(head) => head,
             Err(err) => {
@@ -1667,6 +2340,14 @@ impl Catalog {
             return Err(Error::Constraint(format!(
                 "index {index} is still live; drop it before reclaiming its entries"
             )));
+        }
+
+        // The dead entries live in the unfolded tail until a fold applies them;
+        // a reclaim reads and deletes them through the folded store, so it folds
+        // the tail in first.
+        let Store::Slots(store) = self.store.as_ref();
+        if !store.read_only {
+            folder::fold_sprint(store, u64::MAX).await?;
         }
 
         self.with_writer(async |db| {
@@ -1733,6 +2414,12 @@ impl Catalog {
             .flat_map(|per_table| per_table.keys().copied())
             .collect();
 
+        // Dead entries live in the unfolded tail until a fold applies them, and
+        // the sweep reads and deletes them through the folded store, so it folds
+        // the tail in first.
+        let Store::Slots(store) = self.store.as_ref();
+        folder::fold_sprint(store, u64::MAX).await?;
+
         // The entry deletions are derived-state upkeep in the index subspace,
         // never replayed into a view, so they run under the folder role: the
         // single direct writer of a slot-backed store.
@@ -1760,6 +2447,210 @@ impl Catalog {
             Ok(report)
         })
         .await
+    }
+
+    /// What the store weighs, subspace by subspace.
+    ///
+    /// The default request reads the store's manifest and nothing else —
+    /// two object reads, a cost independent of how large the store is — and
+    /// reports physical bytes, SST counts, and sorted-run counts per
+    /// subspace. Those figures include superseded versions and tombstones,
+    /// which is the point: the gap between them and the live count is what
+    /// [`compact_store`](Self::compact_store) reclaims.
+    ///
+    /// Setting [`CensusRequest::count_live_entries`] adds a scan of every
+    /// subspace, which costs a full read of the store.
+    ///
+    /// Available on a read-only catalog: both legs read, neither writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or, for the scanning leg, the store
+    /// cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, CensusRequest, SubspaceName};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+    ///
+    /// let census = catalog.store_census(CensusRequest::default()).await?;
+    /// // Physical figures count what has been written out, so a store whose
+    /// // commits are still in the write-ahead log reports nothing yet.
+    /// assert!(census.total_bytes() >= 0);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn store_census(&self, request: CensusRequest) -> Result<StoreCensus> {
+        let physical = store_census::read_manifest_census(
+            &self.location.path,
+            Arc::clone(&self.location.object_store),
+        )
+        .await?;
+
+        // Every subspace is reported, whether or not the manifest carries a
+        // segment for it: a subspace absent from the manifest is one whose
+        // writes have not been written out, which is a measurement rather
+        // than a reason to omit the row. Two censuses of one store are then
+        // always comparable row by row.
+        let mut subspaces: Vec<SubspaceCensus> = Subspace::ALL
+            .into_iter()
+            .map(|subspace| {
+                let prefix = subspace_prefix(subspace);
+                measure(SubspaceName::from(subspace), physical.segment(&prefix))
+            })
+            .collect();
+        subspaces.extend(
+            physical
+                .segments
+                .iter()
+                .filter(|segment| {
+                    matches!(
+                        SubspaceName::of_prefix(&segment.prefix),
+                        SubspaceName::Unknown(_)
+                    )
+                })
+                .map(|segment| measure(SubspaceName::of_prefix(&segment.prefix), Some(segment))),
+        );
+
+        if request.count_live_entries {
+            // One session for every subspace, so the counts are one
+            // consistent cut rather than a sequence of unrelated ones.
+            let session = self.begin_read().await?;
+            let counted = count_live_entries(session.handle(), &mut subspaces).await;
+            session.finish();
+            counted?;
+        }
+
+        Ok(StoreCensus {
+            manifest_id: physical.manifest_id,
+            subspaces,
+            objects: physical.objects.map(|totals| StoreObjects {
+                total_objects: totals.total_objects,
+                total_bytes: totals.total_bytes,
+                wal_objects: totals.wal_objects,
+                wal_bytes: totals.wal_bytes,
+                manifest_objects: totals.manifest_objects,
+                manifest_bytes: totals.manifest_bytes,
+                sst_objects: totals.sst_objects,
+                sst_bytes: totals.sst_bytes,
+                other_objects: totals.other_objects,
+                other_bytes: totals.other_bytes,
+            }),
+        })
+    }
+
+    /// Merges each targeted subspace's sorted runs into one, reclaiming the
+    /// superseded versions and tombstones they hold.
+    ///
+    /// moraine plans nothing: SlateDB decides which runs merge into which,
+    /// and the plan it makes for a whole tree destines that tree's bottom
+    /// run — which is what permits dropping a tombstone rather than carrying
+    /// it forward. A subspace with no sorted runs is skipped, as is one
+    /// already being merged.
+    ///
+    /// With [`CompactStoreRequest::wait`] set, the call returns once every
+    /// submitted merge has committed or failed. A merge that outlives the
+    /// wait is **not** cancelled: it keeps running, is reported
+    /// [`MergeOutcome::Pending`], and a later census shows the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
+    /// the compactor that executes a submitted merge runs inside the writer,
+    /// so a reader would queue work nothing would run — or a store error if
+    /// the merge cannot be submitted.
+    pub async fn compact_store(&self, request: CompactStoreRequest) -> Result<CompactStoreReport> {
+        self.ensure_writable()?;
+
+        let target = match &request.target {
+            CompactionTarget::WholeStore => None,
+            CompactionTarget::Subspace(name) => match name.subspace() {
+                Some(subspace) => Some(subspace_prefix(subspace)),
+                // An unknown subspace addresses no keys, so there is no
+                // tree to name in a request.
+                None => {
+                    return Err(Error::Configuration(format!(
+                        "{name} is not a subspace this build can merge"
+                    )));
+                }
+            },
+        };
+
+        let before = self.store_census(CensusRequest::default()).await?;
+        let submitted = store_compaction::submit_full_merge(
+            &self.location.path,
+            Arc::clone(&self.location.object_store),
+            target.as_deref(),
+        )
+        .await?;
+
+        let mut merges = Vec::new();
+        for merge in &submitted {
+            let subspace = SubspaceName::of_prefix(&merge.segment);
+            let outcome = match request.wait {
+                None => MergeOutcome::Pending,
+                Some(budget) => match store_compaction::await_merge(
+                    &self.location.path,
+                    Arc::clone(&self.location.object_store),
+                    &merge.compaction,
+                    budget,
+                )
+                .await?
+                {
+                    MergeEnd::Completed => MergeOutcome::Completed,
+                    MergeEnd::Failed => {
+                        MergeOutcome::Failed("the merge ended without committing".to_string())
+                    }
+                    MergeEnd::Pending => MergeOutcome::Pending,
+                },
+            };
+
+            merges.push(SubspaceMerge {
+                subspace: subspace.clone(),
+                outcome,
+                bytes_before: bytes_of(&before, &subspace),
+                bytes_after: None,
+            });
+        }
+
+        // Every subspace the request covered but nothing was submitted for
+        // is reported rather than dropped, so two calls stay comparable.
+        for measured in &before.subspaces {
+            let covered = target
+                .as_ref()
+                .is_none_or(|prefix| SubspaceName::of_prefix(prefix) == measured.subspace);
+            if !covered || merges.iter().any(|m| m.subspace == measured.subspace) {
+                continue;
+            }
+            // The only reason a plan omits a tree: L0 SSTs are not
+            // eligible sources, so a tree without sorted runs has nothing
+            // to merge. A tree already being merged is adopted rather than
+            // omitted, so it never reaches here.
+            merges.push(SubspaceMerge {
+                subspace: measured.subspace.clone(),
+                outcome: MergeOutcome::Skipped("no sorted runs to merge"),
+                bytes_before: measured.bytes,
+                bytes_after: None,
+            });
+        }
+
+        if merges
+            .iter()
+            .any(|merge| merge.outcome == MergeOutcome::Completed)
+        {
+            let after = self.store_census(CensusRequest::default()).await?;
+            for merge in &mut merges {
+                if merge.outcome == MergeOutcome::Completed {
+                    merge.bytes_after = Some(bytes_of(&after, &merge.subspace));
+                }
+            }
+        }
+
+        Ok(CompactStoreReport { merges })
     }
 
     /// The lowest index id at or after `from` holding an entry of `kind`,
@@ -1839,7 +2730,12 @@ impl Catalog {
                 tx.rollback();
                 return Ok(total);
             }
-            tx.commit_with_options(&commit::durable())
+            // Batches commit non-durably: awaiting a flush tick per batch
+            // makes the whole sweep flush-bound, and durability buys nothing
+            // here. A dead index id is never reused and the deletes are
+            // idempotent, so a batch lost to a crash simply leaves entries a
+            // later pass rediscovers.
+            tx.commit_with_options(&commit::non_durable())
                 .await
                 .map_err(Error::from)?;
             total += deleted as u64;

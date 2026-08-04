@@ -31,6 +31,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The default build never compiles the fault-injection seams, so
+      # nothing else would catch the feature rotting.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -53,6 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask check-pins
 
   # e2e builds the loadable extension through the DuckDB toolchain (`make
   # release`), which compiles DuckDB from the `duckdb` submodule and links
@@ -78,12 +90,12 @@ jobs:
           # cold-rebuilding the whole dependency graph.
           restore-keys: |
             duckdb-build-${{ runner.os }}-
-      # The pinned DuckDB CLI xtask downloads, keyed on xtask/src/duckdb.rs,
-      # which owns the pin.
+      # The pinned DuckDB CLI xtask downloads, keyed on the versions
+      # manifest, which owns the pin.
       - uses: actions/cache@v6
         with:
           path: target/duckdb-cli/cli
-          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('xtask/src/duckdb.rs') }}
+          key: duckdb-cli-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
       - run: cargo xtask e2e
 
   s3:

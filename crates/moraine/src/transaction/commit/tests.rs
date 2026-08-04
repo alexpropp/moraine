@@ -82,6 +82,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
         commit_extra_info: None,
         schema_changed_table_ids: Vec::new(),
         transaction_id: None,
+        deleted_data_file_ids: Vec::new(),
     };
     let empty = CatalogSnapshot::build(snap0, vec![], vec![], None);
     let mut setup = Transaction::new(empty, 1);
@@ -115,6 +116,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
                 file_size_bytes: 100,
                 footer_size: 4,
                 encryption_key: None,
+                partition_values: Vec::new(),
                 column_stats: vec![FileColumnStats {
                     column_id: column,
                     column_size_bytes: 10,
@@ -226,6 +228,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
                     file_size_bytes: 10,
                     footer_size: 4,
                     encryption_key: None,
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[],
@@ -479,6 +482,7 @@ async fn register_three_row_file(
                     file_size_bytes: 30,
                     footer_size: 4,
                     encryption_key: None,
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[],
@@ -1419,6 +1423,7 @@ async fn register_data_file_must_supply_index_entries_and_they_are_looked_up() {
         file_size_bytes: 20,
         footer_size: 4,
         encryption_key: None,
+        partition_values: Vec::new(),
         column_stats: vec![],
     };
 
@@ -1487,6 +1492,7 @@ fn bulk_file(path: &str, count: u64) -> crate::catalog::DataFile {
         file_size_bytes: count * 10,
         footer_size: 4,
         encryption_key: None,
+        partition_values: Vec::new(),
         column_stats: vec![],
     }
 }
@@ -1748,6 +1754,7 @@ async fn catalog_with_indexed_data_file() -> (
                     file_size_bytes: 20,
                     footer_size: 4,
                     encryption_key: None,
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[
@@ -1924,6 +1931,7 @@ async fn unique_index_rejects_a_duplicate_value_across_commits() {
             file_size_bytes: 10,
             footer_size: 4,
             encryption_key: None,
+            partition_values: Vec::new(),
             column_stats: vec![],
         };
         (
@@ -2027,6 +2035,7 @@ async fn scoped_read_covers_a_registration_end_to_end() {
                     file_size_bytes: 30,
                     footer_size: 4,
                     encryption_key: None,
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &entries,
@@ -2349,6 +2358,7 @@ async fn a_writer_duplicating_a_value_mid_build_poisons_the_index() {
                     file_size_bytes: 10,
                     footer_size: 4,
                     encryption_key: None,
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[FileIndexEntry {
@@ -2392,6 +2402,7 @@ async fn a_writer_duplicating_a_value_on_a_ready_index_still_fails() {
                     file_size_bytes: 10,
                     footer_size: 4,
                     encryption_key: None,
+                    partition_values: Vec::new(),
                     column_stats: vec![],
                 },
                 &[FileIndexEntry {
@@ -2903,6 +2914,7 @@ async fn maintain_does_not_conflict_with_a_live_writer() {
                         file_size_bytes: 10,
                         footer_size: 4,
                         encryption_key: None,
+                        partition_values: Vec::new(),
                         column_stats: vec![],
                     },
                     &[FileIndexEntry {

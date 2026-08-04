@@ -71,13 +71,25 @@ transaction per batch:
    ducklake_file_partition_value / ducklake_file_variant_stats WHERE
    data_file_id IN (…)` — current and history rows alike, no history
    mirror. Old snapshots resolve the merged file thereafter; the original
-   rows cease to exist.
+   rows cease to exist. A partitioned source's `file_partition_value`
+   rows are embedded in its `file` record (RFC 0013), so one batch
+   hard-deletes a parent **and** its embedded children, in no guaranteed
+   order. Whether an embedded row's parent survives is therefore a
+   question about the batch, not about state accumulated so far: a hard
+   delete leaves the working state alone by design, so the parent still
+   reads as live there.
 4. Each source path is inserted into
    `ducklake_files_scheduled_for_deletion` — merge schedules its
    superseded bytes directly, without waiting for snapshot expiry.
 5. A source carrying live delete files is not plainly merged; its deletes
    are materialized into the output (the rewrite shape below) — a delete
    file must never outlive its data file.
+6. Merge groups by partition and never crosses a boundary. Four files
+   across two partition values merge to two — one per value, as two
+   independent merges — so a merged file always carries exactly one
+   partition value and the governing spec stays satisfied by construction.
+   The eligibility rule is DuckLake's, applied before moraine sees the
+   batch; moraine records the merge it is handed and enforces nothing.
 
 **Rewrite (`rewrite_data_files`)** — also snapshot-minting:
 
@@ -117,6 +129,10 @@ snapshot-minting commit:
 - **`next_row_id` untouched:** compaction stages no `ducklake_table_stats`
   change that advances it; the translation carries whatever DuckLake
   authors, and DuckLake authors no allocation.
+- **Equality-index entries untouched:** entries name rows, not files, and
+  compaction changes neither a row's id nor its values. A commit whose
+  change set is compaction alone stages no index work and does not read
+  the files it registers (RFC 0016).
 
 ### Conflict classification
 
@@ -150,14 +166,6 @@ Live, via `cargo xtask e2e`:
 - **`rewrite_data_files`**: after a DELETE, the rewrite leaves no live
   delete file; survivors keep their row ids; time travel to the
   pre-rewrite snapshot still shows the deleted rows.
-
-## Open questions
-
-- **Compaction of disjoint file sets of the same table.** Two compactions
-  of one `table_id` are a true conflict even on disjoint files. Finer
-  (file-set) grain would let them run concurrently; deferred —
-  maintenance is throughput-insensitive and table grain matches the
-  conflict model.
 
 ## Alternatives considered
 

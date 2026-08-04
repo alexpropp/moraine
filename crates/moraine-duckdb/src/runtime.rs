@@ -107,45 +107,77 @@ impl MoraineCatalogHandle {
     where
         AbiError: From<E>,
     {
-        // Checked before the future is first polled, not left to the
-        // interval below: a timer's first tick is pending at the poll
-        // level even when already elapsed, and a future that completes on
-        // its first poll would otherwise win over a pending interrupt.
-        if let Some(probe) = probe {
-            // SAFETY: caller contract — `probe` is callable with
-            // `probe_ctx` for the duration of this call.
-            if unsafe { probe(probe_ctx) } {
-                return Err(AbiError::interrupted());
-            }
-        }
-
         let _guard = enter_handle(self.log_id);
-        self.runtime.block_on(async {
-            let probe_fired = async {
-                let Some(probe) = probe else {
-                    return std::future::pending::<()>().await;
-                };
-                let mut ticks = tokio::time::interval(INTERRUPT_POLL_INTERVAL);
-                loop {
-                    ticks.tick().await;
-                    // SAFETY: caller contract — `probe` is callable with
-                    // `probe_ctx` for the duration of this call.
-                    if unsafe { probe(probe_ctx) } {
-                        return;
-                    }
-                }
-            };
-
-            // `biased`: a cancellation signal wins whenever ready, even if
-            // the core future is also immediately ready.
-            tokio::select! {
-                biased;
-                () = probe_fired => Err(AbiError::interrupted()),
-                result = future => result.map_err(AbiError::from),
-            }
-        })
+        // SAFETY: forwarded caller contract.
+        unsafe { block_on_cancellable_in(&self.runtime, probe, probe_ctx, future) }
     }
 }
+
+/// Runs `future` on `runtime` unless `probe` cancels it first — the whole
+/// of the cancellation seam, shared by every cancellable entry point.
+///
+/// Cancellation is per **call**, not per handle: the probe and its context
+/// come from the caller, and each in-flight call selects over its own. Two
+/// concurrent reads on one handle therefore cancel independently, and
+/// neither can consume the other's signal.
+///
+/// # Safety
+///
+/// `probe`, if `Some`, must be safe to call with `probe_ctx` from any
+/// thread for the duration of this call.
+pub(crate) unsafe fn block_on_cancellable_in<T, E>(
+    runtime: &Runtime,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, AbiError>
+where
+    AbiError: From<E>,
+{
+    // Checked before the future is first polled, not left to the interval
+    // below: a timer's first tick is pending at the poll level even when
+    // already elapsed, and a future that completes on its first poll would
+    // otherwise win over a pending interrupt.
+    if let Some(probe) = probe {
+        // SAFETY: caller contract — `probe` is callable with `probe_ctx`
+        // for the duration of this call.
+        if unsafe { probe(probe_ctx) } {
+            return Err(AbiError::interrupted());
+        }
+    }
+
+    runtime.block_on(async {
+        let probe_fired = async {
+            let Some(probe) = probe else {
+                return std::future::pending::<()>().await;
+            };
+            let mut ticks = tokio::time::interval(INTERRUPT_POLL_INTERVAL);
+            loop {
+                ticks.tick().await;
+                // SAFETY: caller contract — `probe` is callable with
+                // `probe_ctx` for the duration of this call.
+                if unsafe { probe(probe_ctx) } {
+                    return;
+                }
+            }
+        };
+
+        // `biased`: a cancellation signal wins whenever ready, even if
+        // the core future is also immediately ready.
+        tokio::select! {
+            biased;
+            () = probe_fired => Err(AbiError::interrupted()),
+            result = future => result.map_err(AbiError::from),
+        }
+    })
+}
+
+/// How long a cancelled attach waits for its abandoned runtime to wind
+/// down before abandoning it in turn. An interrupted open drops a
+/// half-built store whose background tasks may still be mid-request, and
+/// a plain runtime drop blocks until every one of them finishes — turning
+/// a cancellation into exactly the hang it was meant to escape.
+pub(crate) const CANCELLED_ATTACH_SHUTDOWN: Duration = Duration::from_secs(5);
 
 /// A materialized snapshot view, held across the FFI boundary so
 /// listing calls need no further store I/O.
@@ -154,22 +186,88 @@ impl MoraineCatalogHandle {
 /// from [`moraine_snapshot`](crate::abi::moraine_snapshot) and released
 /// via [`moraine_snapshot_free`](crate::abi::moraine_snapshot_free).
 pub struct MoraineSnapshotHandle {
-    pub(crate) snapshot: CatalogSnapshot,
+    pub(crate) snapshot: Arc<CatalogSnapshot>,
 }
 
 impl MoraineSnapshotHandle {
-    pub(crate) fn new(snapshot: CatalogSnapshot) -> Self {
+    pub(crate) fn new(snapshot: Arc<CatalogSnapshot>) -> Self {
         Self { snapshot }
     }
 }
 
+/// The fewest workers an attached catalog's runtime may have.
+///
+/// Two, not one: a CPU-bound poll (an SST decode on a large catalog) holds
+/// its worker to completion, and SlateDB's flush and compaction must
+/// progress while it does or durability stalls behind a scan. That is the
+/// same reason the runtime is multi-threaded at all, so it is the floor
+/// rather than a tuning knob.
+const MIN_WORKER_THREADS: usize = 2;
+
+/// The most workers an attached catalog's runtime may have, however many
+/// threads the host asks for.
+///
+/// The pool's work is object-store round trips, which yield their worker
+/// at every await: a four-worker runtime absorbs thirty-two concurrent
+/// materializations with a flat batch time (`BENCHMARK.md` → Core
+/// measurements). Past a handful, further workers only park — and they
+/// park in addition to the host's own threads, on cores the host already
+/// sized itself to.
+const MAX_WORKER_THREADS: usize = 8;
+
+/// The worker count for a host that asks for `requested` threads of its
+/// own, or the [floor](MIN_WORKER_THREADS) if it asks for nothing.
+///
+/// The host's thread setting is the only number in the process that says
+/// how much parallelism the operator wanted, so a session pinned to one
+/// thread does not get a catalog pool sized to the machine.
+pub(crate) fn worker_threads(requested: usize) -> usize {
+    requested.clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS)
+}
+
 /// Builds the one multi-threaded tokio runtime an attached catalog owns
-/// for the lifetime of its handle. Worker threads exist only to run that
-/// handle's work, so each is tagged with `log_id` at spawn — every event
-/// they emit routes to the handle's log sink.
-pub(crate) fn new_runtime(log_id: HandleId) -> std::io::Result<Runtime> {
+/// for the lifetime of its handle, sized for a host running `requested`
+/// threads of its own (`0` when the host does not say). Worker threads
+/// exist only to run that handle's work, so each is tagged with `log_id`
+/// at spawn — every event they emit routes to the handle's log sink.
+///
+/// The size is fixed at attach. A host that changes its own thread count
+/// later keeps the pool it attached with, which is the trade for never
+/// rebuilding a runtime that owns live background tasks.
+pub(crate) fn new_runtime(log_id: HandleId, requested: usize) -> std::io::Result<Runtime> {
     Builder::new_multi_thread()
+        .worker_threads(worker_threads(requested))
         .enable_all()
         .on_thread_start(move || tag_thread_for_handle(log_id))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_WORKER_THREADS, MIN_WORKER_THREADS, worker_threads};
+
+    /// The pool tracks the host between the floor and the ceiling, and is
+    /// never single-threaded — a one-worker runtime would let a CPU-bound
+    /// poll stall SlateDB's flush, which is the whole reason the runtime
+    /// is multi-threaded.
+    #[test]
+    fn the_worker_pool_tracks_the_host_between_its_floor_and_ceiling() {
+        assert_eq!(
+            worker_threads(0),
+            MIN_WORKER_THREADS,
+            "a host that says nothing takes the floor"
+        );
+        assert_eq!(
+            worker_threads(1),
+            MIN_WORKER_THREADS,
+            "`SET threads=1` still gets a background worker"
+        );
+        assert_eq!(worker_threads(4), 4, "in range, the host's setting stands");
+        assert_eq!(
+            worker_threads(128),
+            MAX_WORKER_THREADS,
+            "a huge host thread count is capped"
+        );
+        const { assert!(MIN_WORKER_THREADS >= 2) };
+    }
 }

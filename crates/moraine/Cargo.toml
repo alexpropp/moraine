@@ -22,6 +22,9 @@ leader = [
     "tokio/io-util",
     "tokio/rt",
 ]
+# Exposes crash-injection seams for the format-migration driver.
+# Off by default; production builds carry no seam code.
+fault-injection = []
 
 [dependencies]
 arrow = { workspace = true, features = ["ipc"] }

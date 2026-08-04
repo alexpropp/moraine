@@ -149,14 +149,18 @@ applies it.
   plus tail replay past the fold cursor), allocates ids locally, stages one
   payload, and races it into the next log slot. A win is durable at the ack;
   nothing spans two atomic units.
-- **Table-level conflict detection.** On a lost race, the committer compares
-  the `table_id`s it touched against the intervening commits'. Disjoint sets are
-  a benign race, retried internally; overlapping sets are a true `Conflict`
-  aborted with a typed error — the core is DuckLake-agnostic and cannot replay
-  the originating SQL, so re-driving belongs to whoever authored the operation.
-- **Group commit** is permitted (a process with several pending commits can
-  chain them into one slot) but never required — a chain of one is the
-  normal path.
+- **Table-level conflict detection**, with one file-grain exception. On a lost
+  race, the committer compares the `table_id`s it touched against the
+  intervening commits' — except delete-versus-delete, which compares the data
+  files each targeted, matching the one place DuckLake goes finer. Disjoint
+  sets are a benign race, retried internally; overlapping sets are a true
+  `Conflict` aborted with a typed error — the core is DuckLake-agnostic and
+  cannot replay the originating SQL, so re-driving belongs to whoever authored
+  the operation.
+- **Group commit** is permitted — a process with several pending commits can
+  chain them into one slot, and concurrent committers in one process are
+  coalesced into a single slot without asking — but never required; a chain of
+  one is the normal path.
 
 ## Extension surface
 
@@ -214,10 +218,14 @@ failure mode is silent corruption. Tiers, per
 | **E2E** | `crates/moraine-duckdb/tests/`, via `cargo xtask e2e` | Build the cdylib, load into real DuckDB, run actual DuckLake SQL — validating assumptions about what DuckLake demands, not just that the code does what we think. |
 | **Fuzzing** (future) | `fuzz/` | `cargo-fuzz` on `store` codecs and the commit read-path once codecs stabilize. |
 
-Crash coverage is not left to prose: the reachable failure seams (commit, flush,
-cleanup, takeover, init) are an enumerated matrix in
-[RFC 0011](docs/rfcs/0011-crash-injection-test-matrix.md), each pinned to the
-post-recovery invariant it verifies, iterated mechanically by the suite.
+Crash coverage is not left to prose: [RFC 0011](docs/rfcs/0011-crash-recovery.md)
+names every place a process can die during a state-changing operation — commit,
+flush, cleanup, takeover, genesis — and pins each to what must hold after
+reopen. Each case is survivable for one of two reasons, and which one follows
+from the path: a single-batch path is safe by *atomicity* (one commit is one
+batch, so there is no torn intermediate to find), a multi-step path by
+*ordering* (bytes before the record that references them, bytes after the
+record that referenced them). The suite drives the cases as data.
 
 Process is **TDD** — test first, watch it fail, implement — and every bugfix
 lands with a regression test. The full local gate (fmt, clippy, test, doc, deny,

@@ -108,11 +108,13 @@ to either.
 ### Identity in the key, everything mutable in the value
 
 The `column` key is `(table_id, column_id)` (RFC 0002). The column's
-**ordinal** — its position in the table — is a **value field**, not a key
-component. This split is half the design. The other half: **every change to
-a column record is a version transition** — end the current version into
-`history` (preserving its value verbatim), write the new version at the *same*
-`current` key. Each column operation maps mechanically:
+**ordinal** — DuckLake's `column_order`, a position numbered from 1 that is
+never renumbered, so a drop leaves a gap the survivors keep — is a **value
+field**, not a key component. This split is half the
+design. The other half: **every change to a column record is a version
+transition** — end the current version into `history` (preserving its value
+verbatim), write the new version at the *same* `current` key. Each column
+operation maps mechanically:
 
 | Operation | Key effect | Value effect |
 |---|---|---|
@@ -134,8 +136,8 @@ the "harmless" mutations is real and is rejected in Alternatives.
 The `current` **key** never changes across any of these — identity is the field
 id, and the field id is eternal. What churns is bounded and proportional to
 the change: one `history` record per column actually touched. A rename touches
-one column. A reorder touches the columns whose position changed — under
-dense ordinals (Open questions) that can be most of the table, but it is
+one column. A reorder touches the columns whose position changed — with
+positional ordinals that can be most of the table, but it is
 one small `history` record per moved column in one batch, O(columns), never
 O(data). Untouched siblings produce nothing. `add` allocates the table's
 next per-table `column_id` from the table record's persisted
@@ -230,6 +232,11 @@ member is a new `current` record at a freshly allocated per-table id with
 field's row. The uniformity rule above applies to nested field rows
 unchanged.
 
+moraine allocates nested ids the same way DuckLake does — pre-order from
+the table's own counter, never against a global counter — so the verb path
+and the staged-row path (RFC 0006) assign identical ids to the same
+`CREATE TABLE` or `ADD COLUMN`.
+
 ### Column and name mapping for external Parquet
 
 Externally-written Parquet may not carry DuckLake field ids, so DuckLake
@@ -276,6 +283,17 @@ eventually misclassify in one direction or the other. (On the staged-row
 path the flag does not apply at all — DuckLake authors `schema_version`
 itself; RFC 0004.)
 
+The `schema_version` → snapshot reverse index is not derived and not
+invented: DuckLake persists it as a catalog table.
+`ducklake_schema_versions(begin_snapshot, schema_version)` names the
+snapshot at which each schema version took effect — backfilled from
+`ducklake_snapshot` on metadata upgrade, and carrying a `table_id` column
+for per-table schema versions from metadata version 1.1 onward. moraine
+stores those rows row-faithfully like every other `ducklake_*` table, in
+the `schema_version` subspace (RFC 0002) — their own keys rather than a
+field of the snapshot record, so snapshot expiry (RFC 0007) cannot take
+the reverse index a surviving data file still needs.
+
 ### Conflicts
 
 Two concurrent schema changes to the same table overlap on `table_id` and
@@ -297,7 +315,11 @@ SlateDB on in-memory `object_store` and against real DuckLake SQL in e2e:
   reports for the catalog at `S`.
 - **Field ids are never reused.** Across any sequence including drops and
   re-adds, no `column_id` is ever allocated twice; a dropped id never
-  reappears in a later `add`.
+  reappears in a later `add`. Drop-then-add yields a strictly larger id.
+- **Allocation order matches DuckLake.** Verb-path `add_column` assigns the
+  ids DuckLake would — per-table `MAX(column_id) + 1` over the column
+  history, nested fields in pre-order — so the verb and staged-row paths
+  never diverge.
 - **Rename/reorder are version transitions and time-travel-correct.** After
   a rename (or reorder), reconstruction at a pre-change snapshot yields the
   old name (or order) exactly; at a post-change snapshot, the new. The
@@ -311,46 +333,6 @@ SlateDB on in-memory `object_store` and against real DuckLake SQL in e2e:
 - **`schema_version` transitions match DuckLake** for every operation in
   the table above (the RFC 0004 schema-version matrix, extended to
   column-level ops).
-
-## Open questions
-
-- **`schema_version` → snapshot reverse index — resolved (source-verified,
-  DuckLake main 2026-07).** Neither derive nor invent: DuckLake persists
-  the index itself, as a catalog table.
-  `ducklake_schema_versions(begin_snapshot, schema_version)` maps each
-  schema version to the snapshot where it took effect (backfilled from
-  `ducklake_snapshot` on metadata upgrade, and extended with a `table_id`
-  column for per-table schema versions in metadata ≥ 1.1). moraine stores
-  it row-faithfully like every other `ducklake_*` table; it needs a keyed
-  home in RFC 0002's map when implementation reaches it (the "added as
-  implementation reaches them" convention), not a design decision.
-- **Nested field-id allocation tracking — resolved (source-verified,
-  DuckLake main 2026-07).** `next_catalog_id` is not involved at all:
-  column and nested-field ids are **per-table** (from 1 at `CREATE TABLE`,
-  `MAX(column_id) + 1` over the table's column history at `ADD COLUMN`),
-  assigned pre-order across the nested tree from the table's own counter.
-  moraine stores the resulting `ducklake_column` rows faithfully and does
-  no field-id accounting against any global counter. On the verb path,
-  moraine's `add_column` allocates the same way DuckLake does — per-table
-  MAX-over-history + 1, nested fields pre-order — so the two paths produce
-  identical ids; e2e regression-pins the assignment order.
-- **Exact `column_mapping` / `name_mapping` layout.** Kinds and key
-  components deferred until implementation reaches external-Parquet interop,
-  then added to RFC 0002's keyspace map.
-- **Confirm `column_id` is never reused — resolved (source-verified,
-  DuckLake main 2026-07).** `GetNextColumnId` computes `MAX(column_id) + 1`
-  over **all** `ducklake_column` rows for the table — ended versions and
-  dropped columns included — and its adjacent comment states the id must
-  stay unique across dropped columns precisely so it is never recycled.
-  Drop-then-add produces a strictly larger id by construction. E2e
-  regression-pins it.
-- **Ordinal representation for reorder.** Dense positions (`0..n`, so a
-  reorder transitions every column past the insertion point) vs.
-  sparse/fractional ordinals (only moved columns transition). Dense is
-  simpler and matches DuckLake's `column_order`; sparse minimizes the
-  number of version transitions on large reorders — each transition costs
-  one `history` record, so the totals stay O(columns) per reorder either way.
-  Dense stands unless e2e shows DuckLake expects otherwise.
 
 ## Alternatives considered
 

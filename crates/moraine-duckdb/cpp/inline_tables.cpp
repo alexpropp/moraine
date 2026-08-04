@@ -110,10 +110,11 @@ std::vector<uint8_t> EncodeInlineSchema(duckdb::ClientContext &context,
 	types.reserve(user_columns.size());
 	names.reserve(user_columns.size());
 	for (auto &col : user_columns) {
-		// Inline data is serialized through Arrow, and DuckDB's Arrow format
-		// has no VARIANT support (unlike GEOMETRY, which the spatial extension
-		// registers). Reject it here with a clear message instead of letting
-		// `ToArrowSchema` throw a bare "Unsupported Arrow type VARIANT".
+		// The core refuses this column too, but not in time: DuckLake builds the
+		// inlined data table while flushing the CREATE TABLE, before the
+		// `ducklake_column` rows the core validates reach a commit. Without this
+		// refusal the user sees DuckDB's bare "Unsupported Arrow type VARIANT"
+		// instead, which names neither moraine nor a way forward.
 		if (col.type.id() == duckdb::LogicalTypeId::VARIANT) {
 			throw duckdb::NotImplementedException(
 			    "moraine: column \"%s\" is VARIANT, which moraine cannot store — its inline "
@@ -449,12 +450,17 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineInlineDeleteTableEntry::GetSta
 	throw duckdb::NotImplementedException("moraine: column statistics are not supported yet");
 }
 
-duckdb::TableFunction
-MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
-                                               duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
+// The `(file_id, row_id, begin_snapshot)` rows of
+// `ducklake_inlined_delete_<table_id>`. Shared by the scan and by the
+// DELETE that resolves rowids back into records, so both see one
+// definition of what the table holds — a rowid is an index into this
+// output, and two independent materializations could disagree on the
+// order.
+std::vector<std::vector<duckdb::Value>> ProvideInlineFileDeleteRows(duckdb::ClientContext &context,
+                                                                    MoraineCatalogHandle *handle, uint64_t table_id) {
 	OwnedArray<MoraineInlineFileDeleteRow> file_deletes(moraine_inline_file_deletes_free);
 	MoraineError err {};
-	auto code = moraine_inline_file_deletes(handle_, table_id_, file_deletes.OutItems(), file_deletes.OutLen(),
+	auto code = moraine_inline_file_deletes(handle, table_id, file_deletes.OutItems(), file_deletes.OutLen(),
 	                                        moraine_shim_is_interrupted, &context, &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
@@ -464,8 +470,14 @@ MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
 	for (auto &r : file_deletes) {
 		rows.push_back({Bigint(r.file_id), Bigint(r.row_id), Bigint(r.begin_snapshot)});
 	}
+	return rows;
+}
+
+duckdb::TableFunction
+MoraineInlineDeleteTableEntry::GetScanFunction(duckdb::ClientContext &context,
+                                               duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
-	scan_bind_data->rows = std::move(rows);
+	scan_bind_data->rows = ProvideInlineFileDeleteRows(context, handle_, table_id_);
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);
 	return MetadataScanTableFunction();
@@ -804,6 +816,57 @@ public:
 	}
 };
 
+// Translates every row of its input into one
+// `stage_inline_file_delete_remove` call. Row-grain rather than a
+// table-wide clear: DuckLake's flush happens to delete the whole table,
+// but what it issues is an ordinary SQL DELETE, and resolving each rowid
+// means a filtered one removes exactly what it matched.
+class MoraineInlineDeleteDeleteOp : public MoraineInlineDml {
+public:
+	MoraineInlineDeleteDeleteOp(duckdb::PhysicalPlan &physical_plan, std::vector<duckdb::LogicalType> types,
+	                            duckdb::Catalog &catalog, duckdb::idx_t estimated_cardinality,
+	                            MoraineCatalogHandle *handle, uint64_t table_id, duckdb::idx_t row_id_chunk_index)
+	    : MoraineInlineDml(physical_plan, std::move(types), catalog, estimated_cardinality), handle_(handle),
+	      table_id_(table_id), row_id_chunk_index_(row_id_chunk_index) {
+	}
+
+	MoraineCatalogHandle *handle_;
+	uint64_t table_id_;
+	duckdb::idx_t row_id_chunk_index_;
+
+	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
+	                            duckdb::OperatorSinkInput &input) const override {
+		auto &state = input.global_state.Cast<InlineDmlState>();
+		auto *tx = StagedTx(context.client);
+		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
+			if (!state.old_rows_loaded) {
+				state.old_rows = ProvideInlineFileDeleteRows(context.client, handle_, table_id_);
+				state.old_rows_loaded = true;
+			}
+			auto row_id_value = chunk.GetValue(row_id_chunk_index_, row);
+			if (row_id_value.IsNull()) {
+				throw duckdb::InternalException("moraine: staged write received a NULL rowid");
+			}
+			auto index = static_cast<duckdb::idx_t>(row_id_value.GetValue<int64_t>());
+			if (index >= state.old_rows.size()) {
+				throw duckdb::InternalException(
+				    "moraine: staged write rowid is out of range — the committed head moved between this "
+				    "statement's scan and its write, which the supported topology excludes");
+			}
+			// Columns 0/1 of the scan are `file_id`/`row_id`.
+			auto &old_row = state.old_rows[index];
+			MoraineError err {};
+			auto code = moraine_tx_stage_inline_file_delete_remove(tx, table_id_, CellAsU64(old_row[0]),
+			                                                       CellAsU64(old_row[1]), &err);
+			if (code != MORAINE_OK) {
+				ThrowMoraineError(err);
+			}
+			state.affected_count++;
+		}
+		return duckdb::SinkResultType::NEED_MORE_INPUT;
+	}
+};
+
 } // namespace
 
 duckdb::PhysicalOperator &PlanInlineDataInsert(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalInsert &op,
@@ -855,6 +918,21 @@ duckdb::PhysicalOperator &PlanInlineDeleteInsert(duckdb::PhysicalPlanGenerator &
                                                  MoraineInlineDeleteTableEntry &table_entry) {
 	return planner.Make<MoraineInlineDeleteInsertOp>(op.types, op.table.catalog, op.estimated_cardinality,
 	                                                 table_entry.TableId());
+}
+
+duckdb::PhysicalOperator &PlanInlineDeleteDelete(duckdb::PhysicalPlanGenerator &planner, duckdb::LogicalDelete &op,
+                                                 MoraineInlineDeleteTableEntry &table_entry) {
+	if (op.return_chunk) {
+		throw duckdb::NotImplementedException("moraine: DELETE ... RETURNING is not supported on \"%s\"",
+		                                      op.table.name);
+	}
+	if (op.expressions.size() != 1) {
+		throw duckdb::InternalException("moraine: expected exactly one row-id expression for DELETE on \"%s\"",
+		                                op.table.name);
+	}
+	auto &bound_ref = op.expressions[0]->Cast<duckdb::BoundReferenceExpression>();
+	return planner.Make<MoraineInlineDeleteDeleteOp>(op.types, op.table.catalog, op.estimated_cardinality,
+	                                                 table_entry.Handle(), table_entry.TableId(), bound_ref.index);
 }
 
 } // namespace moraine_duckdb

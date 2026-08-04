@@ -3126,12 +3126,13 @@ async fn macro_rows_land_fold_and_drop() {
 
     let head = catalog.snapshot().await.unwrap();
     assert!(head.macros.is_empty());
-    // Time-travel replays the tail up to snapshot 1, reconstructing the state
-    // as of that snapshot — the macro is live there, its drop (snapshot 2) not
-    // yet applied — so it carries no end.
+    // Time travel filters on the stored lifecycle, the same view a folded
+    // store serves: the macro is live at snapshot 1 (it began there and its
+    // drop at snapshot 2 has not taken effect by then), carrying the end that
+    // drop stamped.
     let past = catalog.snapshot_at(SnapshotId::new(1)).await.unwrap();
     let past_macro = &past.macros[&10];
-    assert_eq!(past_macro.end_snapshot, None);
+    assert_eq!(past_macro.end_snapshot, Some(2));
     assert_eq!(past_macro.implementations.len(), 2);
     catalog.close().await.unwrap();
 }
@@ -3477,7 +3478,7 @@ fn table_kind_wire_order_is_pinned() {
         assert_eq!(*kind as usize, index, "{kind:?}");
         assert_eq!(TableKind::try_from(*kind as i32), Ok(*kind));
     }
-    assert_eq!(TableKind::try_from(25), Err(25));
+    assert_eq!(TableKind::try_from(26), Err(26));
     assert_eq!(TableKind::try_from(-1), Err(-1));
 
     for kind in TableKind::ALL {
@@ -3506,7 +3507,8 @@ fn table_kind_wire_order_is_pinned() {
             | TableKind::MacroImpl
             | TableKind::MacroParameters
             | TableKind::ColumnMapping
-            | TableKind::NameMapping => {}
+            | TableKind::NameMapping
+            | TableKind::Metadata => {}
         }
     }
 }
