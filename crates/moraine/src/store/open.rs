@@ -51,6 +51,25 @@ pub(crate) async fn create_checkpoint(db: &Db, lifetime: Option<Duration>) -> Re
     Ok(created.id)
 }
 
+/// How many bytes of a store a preload bounded by `cache_size` will not
+/// hold, or `None` when all of it fits. An unset `cache_size` is not an
+/// unbounded one — the store's own cap still governs — so the comparison
+/// is against whichever cap will actually apply.
+///
+/// The load stops at the first object that would exceed the cap rather
+/// than skipping it, so a shortfall means the tail of the store goes
+/// unloaded, not that the largest objects do.
+pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Option<u64> {
+    let cap = cache_size.or_else(|| {
+        ObjectStoreCacheOptions::default()
+            .max_cache_size_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    })?;
+    store_bytes
+        .checked_sub(cap)
+        .filter(|shortfall| *shortfall > 0)
+}
+
 /// Opens a moraine store on `object_store` — a read-write [`Db`] via
 /// [`open_writer`](Self::open_writer) or a read-only [`DbReader`] via
 /// [`open_reader`](Self::open_reader) — carrying the shared open
@@ -427,6 +446,26 @@ mod tests {
             capped.cache_options().max_cache_size_bytes,
             Some(usize::MAX)
         );
+    }
+
+    /// A preload that cannot fit reports what it will not hold: the cap
+    /// stands where it is, so the shortfall is the operator's to act on.
+    #[test]
+    fn a_preload_larger_than_the_cap_reports_its_shortfall() {
+        // Room to spare, and exactly enough, both fit.
+        assert_eq!(preload_shortfall(3_400_000_000, Some(8_000_000_000)), None);
+        assert_eq!(preload_shortfall(64, Some(64)), None);
+
+        assert_eq!(preload_shortfall(100, Some(64)), Some(36));
+
+        // No configured cap is not an unbounded one: the store's own cap
+        // still governs what a preload may hold.
+        let default_cap = ObjectStoreCacheOptions::default()
+            .max_cache_size_bytes
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .expect("a default cap");
+        assert_eq!(preload_shortfall(default_cap, None), None);
+        assert_eq!(preload_shortfall(default_cap + 1, None), Some(1));
     }
 
     /// Preloading is off unless asked for, and each level reaches the

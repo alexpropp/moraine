@@ -346,6 +346,32 @@ pub enum CachePreload {
     All,
 }
 
+/// Warns when an `All` preload cannot hold the store it is about to load.
+///
+/// The load stops at the first object that would exceed the cap and says
+/// nothing about having stopped, so an attach that silently warms half a
+/// store looks exactly like one that warmed all of it. Diagnostics only:
+/// a manifest that cannot be read here is left to the open itself to
+/// report, and nothing about the open changes either way.
+async fn warn_if_preload_cannot_fit(options: &CatalogOptions, object_store: Arc<dyn ObjectStore>) {
+    if options.cache_preload != Some(CachePreload::All) || options.cache_dir.is_none() {
+        return;
+    }
+    let Ok(store_bytes) = store_census::manifest_bytes(&options.path, object_store).await else {
+        return;
+    };
+    if let Some(shortfall) = open::preload_shortfall(store_bytes, options.cache_size) {
+        warn!(
+            path = options.path,
+            store_bytes,
+            cache_size = options.cache_size,
+            shortfall,
+            "preload cannot hold this store: the load stops once the cache is full, leaving \
+             the rest to be fetched on demand"
+        );
+    }
+}
+
 /// Parses a configured checkpoint id, naming the option in the error.
 fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
     checkpoint
@@ -424,6 +450,7 @@ impl Catalog {
                     .to_string(),
             ));
         }
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .flush_interval(options.flush_interval)
@@ -503,6 +530,7 @@ impl Catalog {
         options: CatalogOptions,
     ) -> Result<Self> {
         let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
         let located = Arc::clone(&object_store);
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())

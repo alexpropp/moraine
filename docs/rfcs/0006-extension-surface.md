@@ -293,9 +293,15 @@ merely feels slow.
 The cost lands entirely on the attach. The load runs inside the open — the
 handle is returned only once it finishes — fetching each object whole with
 bounded parallelism, and it stops at the first object that would exceed
-`CACHE_SIZE`, so the cap governs the preload as well as the cache. Fetches
-that fail are skipped rather than fatal: a preload is an optimization, and no
-attach should die because one object could not be warmed. `'all'` therefore
+`CACHE_SIZE`, so the cap governs the preload as well as the cache. Stopping
+is not skipping: the objects after the one that did not fit go unloaded even
+where they would have, and the store is enumerated newest-first, so what goes
+unloaded is the levelled tail. Nothing in that path says it happened, which
+would leave a half-warmed attach looking exactly like a warm one, so moraine
+compares the manifest's bytes against the cap as it opens and warns with both
+numbers. Fetches that fail are skipped rather than fatal: a preload is an
+optimization, and no attach should die because one object could not be
+warmed. `'all'` therefore
 suits a store small enough to sit on local disk with room to spare, where the
 trade is a slower ATTACH for a first query that touches object storage not at
 all; `'l0'` suits everything else.

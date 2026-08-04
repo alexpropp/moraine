@@ -162,10 +162,13 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
    META_CACHE_DIR '/var/cache/moraine', META_CACHE_PRELOAD 'all');
 ```
 
-The wait is the attach's: the load runs inside the open, bounded by
-`META_CACHE_SIZE`, skipping anything it cannot fetch. `'all'` pays a slower
-ATTACH for a first query that touches S3 not at all, and is worth it when the
-whole store fits the cache — check with `moraine_store_census`.
+The wait is the attach's: the load runs inside the open and skips anything it
+cannot fetch. It is bounded by `META_CACHE_SIZE`, and it **stops** at the first
+object that would exceed the cap rather than skipping that one and continuing —
+so a cap smaller than the store leaves the tail of it unloaded. moraine logs a
+warning at attach when that is the case. `'all'` pays a slower ATTACH for a
+first query that touches S3 not at all, and is worth it when the whole store
+fits the cache — check with `moraine_store_census`.
 
 ## How it is built
 
