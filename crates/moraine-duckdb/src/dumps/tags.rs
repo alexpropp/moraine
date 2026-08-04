@@ -28,6 +28,39 @@ pub struct MoraineTagRow {
     pub value: *mut c_char,
 }
 
+/// Converts core `ducklake_tag` records into the C row shape. Shared by the
+/// committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn tag_rows(
+    rows: Vec<moraine::ffi_support::TagRow>,
+) -> Result<Vec<MoraineTagRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let key = to_c_string(&row.key)?;
+            let value = to_c_string(&row.value)?;
+            Ok((row, key, value))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, key, value)| {
+            let (has_end, end) = opt_u64(row.end_snapshot);
+            MoraineTagRow {
+                object_id: row.object_id,
+                begin_snapshot: row.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                key: key.into_raw(),
+                value: value.into_raw(),
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_tag` row into `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -56,33 +89,7 @@ pub unsafe extern "C" fn moraine_dump_tags(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_tags(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let key = to_c_string(&row.key)?;
-                        let value = to_c_string(&row.value)?;
-                        Ok((row, key, value))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, key, value)| {
-                        let (has_end, end) = opt_u64(row.end_snapshot);
-                        MoraineTagRow {
-                            object_id: row.object_id,
-                            begin_snapshot: row.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                            key: key.into_raw(),
-                            value: value.into_raw(),
-                        }
-                    })
-                    .collect())
-            },
+            tag_rows,
         )
     }
 }
@@ -126,6 +133,40 @@ pub struct MoraineColumnTagRow {
     pub value: *mut c_char,
 }
 
+/// Converts core `ducklake_column_tag` records into the C row shape. Shared by
+/// the committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn column_tag_rows(
+    rows: Vec<moraine::ffi_support::ColumnTagRow>,
+) -> Result<Vec<MoraineColumnTagRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let key = to_c_string(&row.key)?;
+            let value = to_c_string(&row.value)?;
+            Ok((row, key, value))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, key, value)| {
+            let (has_end, end) = opt_u64(row.end_snapshot);
+            MoraineColumnTagRow {
+                table_id: row.table_id,
+                column_id: row.column_id,
+                begin_snapshot: row.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                key: key.into_raw(),
+                value: value.into_raw(),
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_column_tag` row into `*out_items`/`*out_len`.
 ///
 /// # Safety
@@ -154,34 +195,7 @@ pub unsafe extern "C" fn moraine_dump_column_tags(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_column_tags(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let key = to_c_string(&row.key)?;
-                        let value = to_c_string(&row.value)?;
-                        Ok((row, key, value))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, key, value)| {
-                        let (has_end, end) = opt_u64(row.end_snapshot);
-                        MoraineColumnTagRow {
-                            table_id: row.table_id,
-                            column_id: row.column_id,
-                            begin_snapshot: row.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                            key: key.into_raw(),
-                            value: value.into_raw(),
-                        }
-                    })
-                    .collect())
-            },
+            column_tag_rows,
         )
     }
 }

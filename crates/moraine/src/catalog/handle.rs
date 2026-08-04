@@ -708,6 +708,7 @@ impl Catalog {
     ///                 column_type: "BIGINT".into(),
     ///                 nulls_allowed: false,
     ///                 default_value: None,
+    ///                 children: Vec::new(),
     ///             }],
     ///         )?;
     ///         // The Arrow bytes are the caller's to produce; moraine stores
@@ -2072,6 +2073,7 @@ impl Catalog {
     ///                 column_type: "BIGINT".into(),
     ///                 nulls_allowed: false,
     ///                 default_value: None,
+    ///                 children: Vec::new(),
     ///             }],
     ///         )?;
     ///         Ok(())

@@ -466,6 +466,7 @@ mod tests {
                             column_type: "BIGINT".into(),
                             nulls_allowed: false,
                             default_value: None,
+                            children: Vec::new(),
                         }],
                     )?;
                     if round % 2 == 0 {

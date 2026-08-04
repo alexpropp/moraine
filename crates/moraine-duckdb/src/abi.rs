@@ -2956,12 +2956,14 @@ mod tests {
                                 column_type: "BIGINT".into(),
                                 nulls_allowed: false,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                             ColumnDef {
                                 name: "amount".into(),
                                 column_type: "DOUBLE".into(),
                                 nulls_allowed: true,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                         ],
                     )?;
@@ -3019,12 +3021,14 @@ mod tests {
                                 column_type: "BIGINT".into(),
                                 nulls_allowed: false,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                             ColumnDef {
                                 name: "b".into(),
                                 column_type: "VARCHAR".into(),
                                 nulls_allowed: false,
                                 default_value: None,
+                                children: Vec::new(),
                             },
                         ],
                     )?;
@@ -4262,6 +4266,7 @@ mod tests {
                             column_type: "BIGINT".into(),
                             nulls_allowed: false,
                             default_value: None,
+                            children: Vec::new(),
                         }],
                     )?;
                     Ok(())

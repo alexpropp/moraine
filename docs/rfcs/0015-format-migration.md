@@ -123,7 +123,7 @@ structural version to the binary's:
 | Store vs. binary | Action |
 |---|---|
 | **Within the binary's range** (floor ≤ store ≤ newest it names) | Proceed normally. A store *below* the binary's newest is not migration-eligible: the intervening bumps were additive, so its keys are exactly where this binary looks for them. It is stamped forward lazily if and when it uses the newer feature, never rewritten on open. |
-| **Below the floor** | **Refuse to open.** Return the typed `Migration` error (RFC 0003) naming the store's version and the floor. A rewriting migration put this store's keys somewhere this binary does not look; it must be migrated up first. |
+| **Below the floor** | **Refuse to open.** Return the typed `Migration` error (RFC 0003) naming the store's version, the floor, and the verb that repairs it. A rewriting migration put this store's keys somewhere this binary does not look; it must be migrated up first. |
 | **Newer than the binary names** | **Refuse to open.** Return the typed `Migration` error (RFC 0003, per RFC 0002's meet-a-newer-format rule). Never guess, never downgrade, never write. |
 | **Absent** | The store is uninitialized. A read-write attach bootstraps it; a read-only attach refuses, having nothing committed to read. |
 
@@ -289,6 +289,15 @@ the floor, or carrying a marker. It opens the writer itself — taking the
 same epoch `open` takes, so it fences a running catalog and is fenced by
 one — runs the plan the durable state implies, and closes.
 
+That is also what makes the refusal actionable, and the refusal says so: the
+verb never runs the format check, so the binary that refuses to *open* a
+below-the-floor store is the same binary that migrates it. An operator
+reading "refused" as "wrong binary" would go looking for one that does not
+exist. The refusal names the verb — the core names `Catalog::migrate`, and
+the DuckDB shim, which is the layer that holds the store path and the only
+one that may name a SQL function, turns the same error into one naming
+`moraine_migrate('<path>')`.
+
 Every migration is triggered by the explicit verb; nothing auto-runs on open.
 A **trivial metadata migration** (bounded, O(1)-ish, e.g. rewriting only the
 `system` records with no keyspace walk) carries none of the surprise and could
@@ -300,6 +309,13 @@ explicit for every migration regardless of size.
 These extend [RFC 0011](0011-crash-recovery.md)'s cases; they
 run against real SlateDB on in-memory `object_store`, no store mocks
 (RFC 0001), and are naturally expressed as new `CrashCase`-style cases.
+
+They need a unit to run, and no shipped format has one — every format to
+date is additive. A fault-injection build therefore installs a synthetic
+rewriting unit into the driver's own registry, so the obligations below are
+driven through the public verb against the planner that ships. The unit
+lands the store on the newest format this binary reads, which is what lets
+the post-migration assertions go through an ordinary attach.
 
 - **Crash at every migration seam.** Inject a crash after the start batch,
   after each step batch, before the finish flip, and after it. Each reopen
@@ -318,7 +334,11 @@ run against real SlateDB on in-memory `object_store`, no store mocks
 - **Reader gate mid-migration.** With the `sys/migration` marker present, a
   materialization or refresh — on either binary version — returns the typed
   `Migration` error and never a partial view (the RFC 0009 check; this is
-  the row that forbids the silently-shrinking-catalog failure).
+  the row that forbids the silently-shrinking-catalog failure). Including a
+  read-only handle that was already open and healthy when the marker was
+  planted: it polls object storage on its own cadence, so the marker reaches
+  it a poll late, and the read it is mid-way through when that happens must
+  refuse rather than serve the view it had.
 - **Idempotent re-run of a completed migration.** Running the migration verb
   against an already-migrated store is a no-op (no marker, format already at
   target), not a re-rewrite.

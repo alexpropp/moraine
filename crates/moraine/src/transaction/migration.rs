@@ -55,7 +55,7 @@ pub(crate) struct MigrationUnit {
     pub(crate) step: StepFn,
 }
 
-/// Every structural migration this binary knows, in ascending order.
+/// Every structural migration this binary ships, in ascending order.
 ///
 /// Empty, and correctly so: every format to date is additive — it adds a
 /// subspace without moving a key that already exists — so the lazy stamp
@@ -63,6 +63,20 @@ pub(crate) struct MigrationUnit {
 /// moves an existing key adds the first entry here, and inherits the
 /// start/step/finish protocol below already built and tested.
 pub(crate) const MIGRATIONS: &[MigrationUnit] = &[];
+
+/// The units a call plans over: everything this binary ships, plus whatever
+/// a fault-injection build installed.
+///
+/// One seam, consulted by the planner itself, so a test with a unit to drive
+/// exercises the shipped planner rather than a parallel copy of it. A
+/// production build's `installed_migrations` is the empty slice, so this is
+/// [`MIGRATIONS`] and nothing else.
+fn registry() -> Vec<&'static MigrationUnit> {
+    MIGRATIONS
+        .iter()
+        .chain(crate::fault::installed_migrations().iter().copied())
+        .collect()
+}
 
 /// What one migrate call did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +103,9 @@ struct Plan {
 
 /// The unit that reads `format`, if this binary carries one.
 fn unit_from(format: u64) -> Option<&'static MigrationUnit> {
-    MIGRATIONS.iter().find(|unit| unit.from_format == format)
+    registry()
+        .into_iter()
+        .find(|unit| unit.from_format == format)
 }
 
 /// The chain of units carrying `format` as far as this binary can take it.
@@ -126,8 +142,8 @@ fn plan(format: u64, marker: Option<&proto::MigrationValue>) -> Result<Plan> {
         )));
     }
 
-    let interrupted = MIGRATIONS
-        .iter()
+    let interrupted = registry()
+        .into_iter()
         .find(|unit| unit.from_format == marker.from_format && unit.to_format == marker.to_format)
         .ok_or_else(|| {
             Error::Migration(format!(
@@ -317,6 +333,9 @@ pub(crate) async fn run(db: &Db) -> Result<MigrationReport> {
         resumed,
     })
 }
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub(crate) mod synthetic;
 
 #[cfg(test)]
 mod tests;

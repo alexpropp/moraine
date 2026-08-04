@@ -126,14 +126,14 @@ pub(super) fn decode_schema(cells: &[Cell]) -> Result<proto::SchemaValue> {
 /// `ducklake_table`'s row shape, minus `next_column_id` — moraine-internal
 /// bookkeeping DuckLake never authors (see [`table_value`]).
 pub(super) struct TableCells {
-    table_id: u64,
-    table_uuid: String,
-    begin_snapshot: u64,
-    end_snapshot: Option<u64>,
-    schema_id: u64,
-    table_name: String,
-    path: String,
-    path_is_relative: bool,
+    pub(super) table_id: u64,
+    pub(super) table_uuid: String,
+    pub(super) begin_snapshot: u64,
+    pub(super) end_snapshot: Option<u64>,
+    pub(super) schema_id: u64,
+    pub(super) table_name: String,
+    pub(super) path: String,
+    pub(super) path_is_relative: bool,
 }
 
 pub(super) fn decode_table(cells: &[Cell]) -> Result<TableCells> {
@@ -660,4 +660,18 @@ pub(super) fn decode_metadata(cells: &[Cell]) -> Result<((u64, u64), String, Str
     // A global option carries no id, whatever the row says.
     let scope_id = if scope_kind == 0 { 0 } else { scope_id };
     Ok(((scope_kind, scope_id), key, value))
+}
+
+/// A `ducklake_schema_versions` row: `(table_id, begin_snapshot,
+/// schema_version)`. The cells arrive in DuckLake's declared order
+/// (`begin_snapshot`, `schema_version`, `table_id`); the tuple is keyed the
+/// way the projection reports it.
+pub(super) fn decode_schema_version_row(cells: &[Cell]) -> Result<(u64, u64, u64)> {
+    let mut c = Cursor::new(TableKind::SchemaVersions, cells);
+    let begin_snapshot = c.u64()?;
+    let schema_version = c.u64()?;
+    let table_id = c.u64()?;
+    c.finish()?;
+
+    Ok((table_id, begin_snapshot, schema_version))
 }

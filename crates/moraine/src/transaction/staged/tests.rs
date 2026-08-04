@@ -161,6 +161,7 @@ async fn staged_columns_advance_the_field_id_counter() {
                     column_type: "BIGINT".into(),
                     nulls_allowed: true,
                     default_value: None,
+                    children: Vec::new(),
                 },
             )?));
             Ok(())
@@ -4531,5 +4532,397 @@ async fn staged_rows_enforce_no_name_uniqueness() {
         2,
         "two live columns may share a name"
     );
+    catalog.close().await.unwrap();
+}
+
+/// Read-your-writes for the data-file projection: a transaction that
+/// stages an insert, ends a committed row, and hard-deletes a history one
+/// must see all three in its own scan. Without the overlay a cascade
+/// SELECT reads committed state and re-plans work it has already staged.
+#[tokio::test]
+async fn visible_data_files_overlay_staged_inserts_ends_and_deletes() {
+    let catalog = open().await;
+
+    // Commit two files so the overlay has committed rows to move.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(db_tx);
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 1),
+    });
+    for id in [10, 11] {
+        setup.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: data_file_row(id, 1, 1),
+        });
+    }
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    setup.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    // Committed state, before anything is staged.
+    let mut ids: Vec<u64> = tx
+        .visible_data_files()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.data_file_id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![10, 11]);
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::DataFile,
+        cells: data_file_row(12, 1, 2),
+    });
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(2)],
+    });
+
+    let visible = tx.visible_data_files().await.unwrap();
+    let ended: Vec<Option<u64>> = visible
+        .iter()
+        .filter(|f| f.data_file_id == 10)
+        .map(|f| f.end_snapshot)
+        .collect();
+    assert_eq!(ended, vec![Some(2)], "the staged end is visible at once");
+    assert!(
+        visible.iter().any(|f| f.data_file_id == 12),
+        "the staged insert is visible before commit"
+    );
+
+    // The hard delete a cascade issues against the row it just ended.
+    tx.stage(RowOperation::Delete {
+        table: TableKind::DataFile,
+        cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(2)],
+    });
+    let visible = tx.visible_data_files().await.unwrap();
+    assert!(
+        !visible.iter().any(|f| f.data_file_id == 10),
+        "the staged delete removes exactly the version it names"
+    );
+    assert!(
+        visible.iter().any(|f| f.data_file_id == 11),
+        "and leaves every other row alone"
+    );
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// The unversioned kinds overlay by key: an insert overwrites the row it
+/// keys rather than duplicating it, and a delete removes it. The deletion
+/// schedule is the one a cleanup pass re-reads after staging its own
+/// removals.
+#[tokio::test]
+async fn visible_scheduled_deletions_overlay_by_key() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    let scheduled = |id: u64, path: &str| {
+        vec![
+            Cell::U64(id),
+            Cell::Str(path.to_string()),
+            Cell::Bool(true),
+            Cell::I64(7),
+        ]
+    };
+
+    assert!(tx.visible_scheduled_deletions().await.unwrap().is_empty());
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: scheduled(10, "a.parquet"),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: scheduled(11, "b.parquet"),
+    });
+    // Same key again: an overwrite, not a second row.
+    tx.stage(RowOperation::Insert {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: scheduled(10, "a2.parquet"),
+    });
+
+    let visible = tx.visible_scheduled_deletions().await.unwrap();
+    assert_eq!(visible.len(), 2);
+    assert_eq!(
+        visible
+            .iter()
+            .find(|row| row.data_file_id == 10)
+            .map(|row| row.path.as_str()),
+        Some("a2.parquet")
+    );
+
+    tx.stage(RowOperation::Delete {
+        table: TableKind::FilesScheduledForDeletion,
+        cells: vec![Cell::U64(11)],
+    });
+    let visible = tx.visible_scheduled_deletions().await.unwrap();
+    assert_eq!(
+        visible
+            .iter()
+            .map(|row| row.data_file_id)
+            .collect::<Vec<_>>(),
+        vec![10]
+    );
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// The overlay covers the kinds a cascade walks, not only files: a table
+/// ended in this transaction, and a column inserted by it, are both
+/// visible to its own next read.
+#[tokio::test]
+async fn visible_tables_and_columns_follow_the_staged_rows() {
+    let catalog = open().await;
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut setup = StagedTransaction::begin_detached(db_tx);
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Table,
+        cells: table_row(1, 0, "t", 1, None),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 1, "a", 1),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(1, 1, 2),
+    });
+    setup.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(1, r#"created_table:"main"."t""#),
+    });
+    setup.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::Table,
+        cells: vec![Cell::U64(1), Cell::U64(2)],
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Column,
+        cells: column_row(1, 2, "b", 2),
+    });
+
+    let tables = tx.visible_tables().await.unwrap();
+    assert_eq!(
+        tables
+            .iter()
+            .filter(|t| t.table_id == 1)
+            .map(|t| t.end_snapshot)
+            .collect::<Vec<_>>(),
+        vec![Some(2)]
+    );
+
+    let mut columns: Vec<u64> = tx
+        .visible_columns()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.column_id)
+        .collect();
+    columns.sort_unstable();
+    assert_eq!(columns, vec![1, 2]);
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// The container kinds fold rather than append: a staged `ducklake_tag`
+/// row becomes an entry inside its object's record, an
+/// `UPDATE ... SET end_snapshot` ends that entry, and a delete removes it —
+/// taking an emptied container with it, so the projection stops reporting
+/// the object at all.
+#[tokio::test]
+async fn visible_tag_containers_fold_staged_entries() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    // `ducklake_tag`'s declared order: object_id, begin, end, key, value.
+    let tag = |object_id: u64, key: &str, begin: u64| {
+        vec![
+            Cell::U64(object_id),
+            Cell::U64(begin),
+            Cell::Null,
+            Cell::Str(key.to_string()),
+            Cell::Str("v".to_string()),
+        ]
+    };
+
+    assert!(tx.visible_tag_containers().await.unwrap().is_empty());
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Tag,
+        cells: tag(7, "owner", 1),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Tag,
+        cells: tag(7, "team", 1),
+    });
+    let containers = tx.visible_tag_containers().await.unwrap();
+    assert_eq!(containers.len(), 1, "both entries ride one container");
+    assert_eq!(containers[0].entries.len(), 2);
+
+    tx.stage(RowOperation::UpdateSetEnd {
+        table: TableKind::Tag,
+        cells: vec![Cell::U64(7), Cell::Str("owner".to_string()), Cell::U64(2)],
+    });
+    let ended = tx.visible_tag_containers().await.unwrap();
+    assert_eq!(
+        ended[0]
+            .entries
+            .iter()
+            .find(|e| e.key == "owner")
+            .and_then(|e| e.end_snapshot),
+        Some(2)
+    );
+
+    for key in ["owner", "team"] {
+        tx.stage(RowOperation::Delete {
+            table: TableKind::Tag,
+            cells: vec![Cell::U64(7), Cell::Str(key.to_string()), Cell::U64(1)],
+        });
+    }
+    assert!(
+        tx.visible_tag_containers().await.unwrap().is_empty(),
+        "the emptied container goes with its last entry"
+    );
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// Options live outside the snapshot protocol, so their overlay is
+/// last-write-wins by `(scope, key)`: an insert sets, a repeat overwrites,
+/// a delete removes, and an emptied scope disappears. A delete of a key
+/// already gone is a no-op, as translation treats it.
+#[tokio::test]
+async fn visible_option_scopes_overlay_last_write_wins() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    let option = |scope_kind: u64, scope_id: u64, key: &str, value: &str| {
+        vec![
+            Cell::Str(key.to_string()),
+            Cell::Str(value.to_string()),
+            match scope_kind {
+                1 => Cell::Str("schema".to_string()),
+                2 => Cell::Str("table".to_string()),
+                _ => Cell::Null,
+            },
+            if scope_kind == 0 {
+                Cell::Null
+            } else {
+                Cell::U64(scope_id)
+            },
+        ]
+    };
+
+    // Bootstrap already set the global scope's `encrypted`.
+    let committed = tx.visible_option_scopes().await.unwrap();
+    assert_eq!(committed.len(), 1);
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Metadata,
+        cells: option(2, 9, "k", "first"),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Metadata,
+        cells: option(2, 9, "k", "second"),
+    });
+    let scopes = tx.visible_option_scopes().await.unwrap();
+    let table_scope = scopes
+        .iter()
+        .find(|(kind, id, _)| (*kind, *id) == (2, 9))
+        .expect("the staged table scope");
+    assert_eq!(
+        table_scope.2.options.get("k").map(String::as_str),
+        Some("second")
+    );
+
+    tx.stage(RowOperation::Delete {
+        table: TableKind::Metadata,
+        cells: option(2, 9, "k", "second"),
+    });
+    let scopes = tx.visible_option_scopes().await.unwrap();
+    assert!(
+        !scopes.iter().any(|(kind, id, _)| (*kind, *id) == (2, 9)),
+        "the emptied scope goes with its last key"
+    );
+    assert_eq!(scopes.len(), 1, "and no other scope is touched");
+
+    tx.rollback();
+    catalog.close().await.unwrap();
+}
+
+/// The `schema_version` records this transaction can see: its own inserts
+/// and deletes over the committed ones. The `ducklake_schema_versions`
+/// projection is assembled from these plus the snapshots and data files it
+/// also overlays, so what is pinned here is the record set, not the fold.
+#[tokio::test]
+async fn visible_schema_version_records_follow_the_staged_rows() {
+    let catalog = open().await;
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+
+    // Cells arrive in DuckLake's declared order: begin_snapshot, then
+    // schema_version, then table_id.
+    let row = |begin: u64, version: u64, table: u64| {
+        vec![Cell::U64(begin), Cell::U64(version), Cell::U64(table)]
+    };
+
+    assert!(
+        tx.visible_schema_version_records()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a bootstrapped store has no schema-version records of its own"
+    );
+
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SchemaVersions,
+        cells: row(1, 1, 5),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SchemaVersions,
+        cells: row(2, 2, 6),
+    });
+    assert_eq!(
+        tx.visible_schema_version_records().await.unwrap(),
+        vec![(5, 1, 1), (6, 2, 2)]
+    );
+
+    tx.stage(RowOperation::Delete {
+        table: TableKind::SchemaVersions,
+        cells: row(1, 1, 5),
+    });
+    assert_eq!(
+        tx.visible_schema_version_records().await.unwrap(),
+        vec![(6, 2, 2)]
+    );
+
+    tx.rollback();
     catalog.close().await.unwrap();
 }

@@ -9,12 +9,18 @@
 //! kinds yield only their single current row since they are never mirrored
 //! to history. DuckLake filters lifecycles in SQL over these rows.
 //!
-//! Every function opens one fresh read-only transaction, scans, and rolls
-//! back. Views spanning several `dump_*` calls are not snapshot-consistent:
-//! each call reads at whatever the current head is when it runs. Opening
-//! that transaction refuses a store undergoing a structural migration, so
-//! every function here can return [`crate::Error::Migration`] however it
-//! would otherwise have succeeded.
+//! Every function opens one fresh read session, and most are served from a
+//! maintained projection when its head matches rather than by rescanning.
+//! Views spanning several `dump_*` calls are not snapshot-consistent: each
+//! call reads at whatever the current head is when it runs. Opening that
+//! session refuses a store undergoing a structural migration, so every
+//! function here can return [`crate::Error::Migration`] however it would
+//! otherwise have succeeded.
+//!
+//! All of them report **committed** state. A caller inside an open staged
+//! transaction that must see its own uncommitted rows asks that transaction
+//! instead — [`staged::StagedTransaction`]'s `visible_*` family, which
+//! overlays the staged rows onto the same records these functions scan.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -24,8 +30,9 @@ use crate::{
     store::{
         proto::{
             ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue, GcFileValue,
-            HeadValue, MacroValue, MappingValue, PartitionValue, SchemaValue, SnapshotValue,
-            SortValue, TableColumnStatsValue, TableStatsValue, TableValue, ViewValue,
+            HeadValue, MacroValue, MappingValue, OptionScopeValue, PartitionValue, SchemaValue,
+            SnapshotValue, SortValue, TableColumnStatsValue, TableStatsValue, TableValue, TagValue,
+            ViewValue,
         },
         read::{
             EntityRecord, read_head, scan_current_entities, scan_history_entities,
@@ -64,10 +71,19 @@ pub mod inline;
 #[doc(hidden)]
 pub mod staged;
 
-// Re-exported so the ABI crate can name the row type its snapshot dumps
-// convert from, instead of mirroring it as an anonymous tuple.
+// Re-exported so the ABI crate can name the record types its dumps convert
+// from, instead of mirroring them as anonymous tuples. The transaction-aware
+// dumps convert from the same types, so both share one conversion.
 #[doc(hidden)]
-pub use crate::store::proto::SnapshotValue as SnapshotRecord;
+pub use crate::store::proto::{
+    ColumnValue as ColumnRecord, DataFileValue as DataFileRecord,
+    DeleteFileValue as DeleteFileRecord, FileColumnStatsValue as FileColumnStatsRecord,
+    GcFileValue as GcFileRecord, MacroValue as MacroRecord, MappingValue as MappingRecord,
+    PartitionValue as PartitionRecord, SchemaValue as SchemaRecord,
+    SnapshotValue as SnapshotRecord, SortValue as SortRecord,
+    TableColumnStatsValue as TableColumnStatsRecord, TableStatsValue as TableStatsRecord,
+    TableValue as TableRecord, ViewValue as ViewRecord,
+};
 
 /// The full current+history record set at the session head, served from
 /// the maintained entity projection when its head matches; a fresh scan
@@ -392,22 +408,40 @@ pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersion
     let records = scan_schema_versions(session.handle()).await;
     session.finish();
 
-    let mut rows: BTreeMap<(u64, u64), u64> = records?
+    Ok(schema_version_rows_from(
+        records?,
+        &dump_snapshots(catalog).await?,
+        &dump_data_files(catalog).await?,
+    ))
+}
+
+/// The `ducklake_schema_versions` projection assembled from its three
+/// inputs: the `schema_version` records, the snapshot records that still
+/// fold the same rows in, and the data files the floor rows repair. Shared
+/// by the committed dump and the transaction-aware one, which differ only
+/// in whether those three are overlaid.
+#[doc(hidden)]
+#[must_use]
+pub fn schema_version_rows_from(
+    records: Vec<(u64, u64, u64)>,
+    snapshots: &[SnapshotValue],
+    data_files: &[DataFileValue],
+) -> Vec<SchemaVersionRow> {
+    let mut rows: BTreeMap<(u64, u64), u64> = records
         .into_iter()
         .map(|(table_id, begin_snapshot, schema_version)| {
             ((table_id, begin_snapshot), schema_version)
         })
         .collect();
-    for snapshot in dump_snapshots(catalog).await? {
-        for table_id in snapshot.schema_changed_table_ids {
-            rows.entry((table_id, snapshot.snapshot_id))
+    for snapshot in snapshots {
+        for table_id in &snapshot.schema_changed_table_ids {
+            rows.entry((*table_id, snapshot.snapshot_id))
                 .or_insert(snapshot.schema_version);
         }
     }
-    rows.extend(schema_version_floors(catalog, &rows).await?);
+    rows.extend(schema_version_floors(&rows, snapshots, data_files));
 
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(
             |((table_id, begin_snapshot), schema_version)| SchemaVersionRow {
                 begin_snapshot,
@@ -415,7 +449,7 @@ pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersion
                 table_id,
             },
         )
-        .collect())
+        .collect()
 }
 
 /// The floor rows [`dump_schema_versions`] adds for tables whose oldest
@@ -424,12 +458,13 @@ pub async fn dump_schema_versions(catalog: &Catalog) -> Result<Vec<SchemaVersion
 /// version, or the catalog's current one when the table has no row at
 /// all. A table whose rows are intact — every store this binary has
 /// written from the start — produces nothing here.
-async fn schema_version_floors(
-    catalog: &Catalog,
+fn schema_version_floors(
     rows: &BTreeMap<(u64, u64), u64>,
-) -> Result<BTreeMap<(u64, u64), u64>> {
+    snapshots: &[SnapshotValue],
+    data_files: &[DataFileValue],
+) -> BTreeMap<(u64, u64), u64> {
     let mut oldest_file: BTreeMap<u64, u64> = BTreeMap::new();
-    for file in dump_data_files(catalog).await? {
+    for file in data_files {
         oldest_file
             .entry(file.table_id)
             .and_modify(|oldest| *oldest = (*oldest).min(file.begin_snapshot))
@@ -445,14 +480,13 @@ async fn schema_version_floors(
         })
         .collect();
     if uncovered.is_empty() {
-        return Ok(BTreeMap::new());
+        return BTreeMap::new();
     }
 
-    let current_schema_version = dump_snapshots(catalog)
-        .await?
+    let current_schema_version = snapshots
         .last()
         .map_or(0, |snapshot| snapshot.schema_version);
-    Ok(uncovered
+    uncovered
         .into_iter()
         .map(|(table_id, file_begin_snapshot)| {
             let schema_version = rows
@@ -461,7 +495,7 @@ async fn schema_version_floors(
                 .map_or(current_schema_version, |(_, version)| *version);
             ((table_id, file_begin_snapshot), schema_version)
         })
-        .collect())
+        .collect()
 }
 
 /// Every `ducklake_files_scheduled_for_deletion` row. Live bookkeeping
@@ -497,12 +531,21 @@ pub struct TagRow {
 /// filters in SQL.
 #[doc(hidden)]
 pub async fn dump_tags(catalog: &Catalog) -> Result<Vec<TagRow>> {
-    let containers = dump_current_entities(catalog, |r| match r {
-        EntityRecord::Tag(v) => Some(v.clone()),
-        _ => None,
-    })
-    .await?;
-    Ok(containers
+    Ok(tag_rows_from(
+        dump_current_entities(catalog, |r| match r {
+            EntityRecord::Tag(v) => Some(v.clone()),
+            _ => None,
+        })
+        .await?,
+    ))
+}
+
+/// The `ducklake_tag` rows carried by `containers`, flattened. Shared by
+/// the committed dump and the transaction-aware one.
+#[doc(hidden)]
+#[must_use]
+pub fn tag_rows_from(containers: Vec<TagValue>) -> Vec<TagRow> {
+    containers
         .into_iter()
         .flat_map(|container| {
             let object_id = container.object_id;
@@ -514,7 +557,7 @@ pub async fn dump_tags(catalog: &Catalog) -> Result<Vec<TagRow>> {
                 value: e.value,
             })
         })
-        .collect())
+        .collect()
 }
 
 /// One `ducklake_metadata` row: a catalog option, flattened from its
@@ -538,16 +581,24 @@ pub struct OptionRow {
 /// simply what is set now.
 #[doc(hidden)]
 pub async fn dump_options(catalog: &Catalog) -> Result<Vec<OptionRow>> {
-    let scopes = dump_current_entities(catalog, |r| match r {
-        EntityRecord::Option {
-            scope_kind,
-            scope_id,
-            value,
-        } => Some((*scope_kind, *scope_id, value.clone())),
-        _ => None,
-    })
-    .await?;
+    Ok(option_rows_from(
+        dump_current_entities(catalog, |r| match r {
+            EntityRecord::Option {
+                scope_kind,
+                scope_id,
+                value,
+            } => Some((*scope_kind, *scope_id, value.clone())),
+            _ => None,
+        })
+        .await?,
+    ))
+}
 
+/// The `ducklake_metadata` rows carried by `scopes`, flattened and ordered.
+/// Shared by the committed dump and the transaction-aware one.
+#[doc(hidden)]
+#[must_use]
+pub fn option_rows_from(scopes: Vec<(u64, u64, OptionScopeValue)>) -> Vec<OptionRow> {
     let mut rows: Vec<OptionRow> = scopes
         .into_iter()
         .flat_map(|(scope_kind, scope_id, value)| {
@@ -571,7 +622,7 @@ pub async fn dump_options(catalog: &Catalog) -> Result<Vec<OptionRow>> {
     // A stable order: the store's map iteration is not one callers should
     // depend on, and DuckLake reads these back by key.
     rows.sort_by(|a, b| (&a.scope, a.scope_id, &a.key).cmp(&(&b.scope, b.scope_id, &b.key)));
-    Ok(rows)
+    rows
 }
 
 /// One `ducklake_column_tag` row, flattened from its column's record.
@@ -592,17 +643,14 @@ pub struct ColumnTagRow {
     pub value: String,
 }
 
-/// Every `ducklake_column_tag` row. Entries are authoritative on each
-/// column's latest record (a version transition carries them forward),
-/// so rows are emitted from that record only — emitting from every
-/// version would duplicate them.
+/// The `ducklake_column_tag` rows carried by `columns`, flattened. Shared by
+/// the committed dump and the transaction-aware one.
 #[doc(hidden)]
-pub async fn dump_column_tags(catalog: &Catalog) -> Result<Vec<ColumnTagRow>> {
-    let columns = dump_columns(catalog).await?;
-
+#[must_use]
+pub fn column_tag_rows_from(columns: &[ColumnValue]) -> Vec<ColumnTagRow> {
     let mut latest: std::collections::BTreeMap<(u64, u64), &ColumnValue> =
         std::collections::BTreeMap::new();
-    for column in &columns {
+    for column in columns {
         let entry = latest
             .entry((column.table_id, column.column_id))
             .or_insert(column);
@@ -618,7 +666,7 @@ pub async fn dump_column_tags(catalog: &Catalog) -> Result<Vec<ColumnTagRow>> {
         }
     }
 
-    Ok(latest
+    latest
         .into_values()
         .flat_map(|column| {
             column.tags.iter().map(|t| ColumnTagRow {
@@ -630,7 +678,16 @@ pub async fn dump_column_tags(catalog: &Catalog) -> Result<Vec<ColumnTagRow>> {
                 value: t.value.clone(),
             })
         })
-        .collect())
+        .collect()
+}
+
+/// Every `ducklake_column_tag` row. Entries are authoritative on each
+/// column's latest record (a version transition carries them forward),
+/// so rows are emitted from that record only — emitting from every
+/// version would duplicate them.
+#[doc(hidden)]
+pub async fn dump_column_tags(catalog: &Catalog) -> Result<Vec<ColumnTagRow>> {
+    Ok(column_tag_rows_from(&dump_columns(catalog).await?))
 }
 
 /// One `ducklake_macro_impl` row, flattened from its macro's record.
@@ -649,11 +706,13 @@ pub struct MacroImplRow {
     pub macro_type: String,
 }
 
-/// Every `ducklake_macro_impl` row, current and history.
+/// The `MacroImpl` rows carried by `parents`, flattened. Shared by the
+/// committed dump and the transaction-aware one, so a staged parent's rows
+/// and a committed one's are shaped by the same code.
 #[doc(hidden)]
-pub async fn dump_macro_impl_rows(catalog: &Catalog) -> Result<Vec<MacroImplRow>> {
-    Ok(dump_macros(catalog)
-        .await?
+#[must_use]
+pub fn macro_impl_rows_from(parents: Vec<MacroValue>) -> Vec<MacroImplRow> {
+    parents
         .into_iter()
         .flat_map(|value| {
             let macro_id = value.macro_id;
@@ -668,7 +727,13 @@ pub async fn dump_macro_impl_rows(catalog: &Catalog) -> Result<Vec<MacroImplRow>
                     macro_type: implementation.macro_type,
                 })
         })
-        .collect())
+        .collect()
+}
+
+/// Every `ducklake_macro_impl` row, current and history.
+#[doc(hidden)]
+pub async fn dump_macro_impl_rows(catalog: &Catalog) -> Result<Vec<MacroImplRow>> {
+    Ok(macro_impl_rows_from(dump_macros(catalog).await?))
 }
 
 /// One `ducklake_macro_parameters` row, flattened from its macro's
@@ -692,11 +757,13 @@ pub struct MacroParameterRow {
     pub default_value_type: String,
 }
 
-/// Every `ducklake_macro_parameters` row, current and history.
+/// The `MacroParameter` rows carried by `parents`, flattened. Shared by the
+/// committed dump and the transaction-aware one, so a staged parent's rows
+/// and a committed one's are shaped by the same code.
 #[doc(hidden)]
-pub async fn dump_macro_parameter_rows(catalog: &Catalog) -> Result<Vec<MacroParameterRow>> {
-    Ok(dump_macros(catalog)
-        .await?
+#[must_use]
+pub fn macro_parameter_rows_from(parents: Vec<MacroValue>) -> Vec<MacroParameterRow> {
+    parents
         .into_iter()
         .flat_map(|value| {
             let macro_id = value.macro_id;
@@ -713,7 +780,13 @@ pub async fn dump_macro_parameter_rows(catalog: &Catalog) -> Result<Vec<MacroPar
                 })
             })
         })
-        .collect())
+        .collect()
+}
+
+/// Every `ducklake_macro_parameters` row, current and history.
+#[doc(hidden)]
+pub async fn dump_macro_parameter_rows(catalog: &Catalog) -> Result<Vec<MacroParameterRow>> {
+    Ok(macro_parameter_rows_from(dump_macros(catalog).await?))
 }
 
 /// One `ducklake_name_mapping` row, flattened from its mapping's record.
@@ -734,11 +807,13 @@ pub struct NameMappingRow {
     pub is_partition: bool,
 }
 
-/// Every `ducklake_name_mapping` row (mappings are unversioned).
+/// The `NameMapping` rows carried by `parents`, flattened. Shared by the
+/// committed dump and the transaction-aware one, so a staged parent's rows
+/// and a committed one's are shaped by the same code.
 #[doc(hidden)]
-pub async fn dump_name_mapping_rows(catalog: &Catalog) -> Result<Vec<NameMappingRow>> {
-    Ok(dump_mappings(catalog)
-        .await?
+#[must_use]
+pub fn name_mapping_rows_from(parents: Vec<MappingValue>) -> Vec<NameMappingRow> {
+    parents
         .into_iter()
         .flat_map(|value| {
             let mapping_id = value.mapping_id;
@@ -754,7 +829,13 @@ pub async fn dump_name_mapping_rows(catalog: &Catalog) -> Result<Vec<NameMapping
                     is_partition: row.is_partition,
                 })
         })
-        .collect())
+        .collect()
+}
+
+/// Every `ducklake_name_mapping` row (mappings are unversioned).
+#[doc(hidden)]
+pub async fn dump_name_mapping_rows(catalog: &Catalog) -> Result<Vec<NameMappingRow>> {
+    Ok(name_mapping_rows_from(dump_mappings(catalog).await?))
 }
 
 /// One `ducklake_partition_column` row, flattened from its spec's record.
@@ -773,11 +854,13 @@ pub struct PartitionColumnRow {
     pub transform: String,
 }
 
-/// Every `ducklake_partition_column` row, current and history.
+/// The `PartitionColumn` rows carried by `parents`, flattened. Shared by the
+/// committed dump and the transaction-aware one, so a staged parent's rows
+/// and a committed one's are shaped by the same code.
 #[doc(hidden)]
-pub async fn dump_partition_column_rows(catalog: &Catalog) -> Result<Vec<PartitionColumnRow>> {
-    Ok(dump_partition_info(catalog)
-        .await?
+#[must_use]
+pub fn partition_column_rows_from(parents: Vec<PartitionValue>) -> Vec<PartitionColumnRow> {
+    parents
         .into_iter()
         .flat_map(|spec| {
             let (partition_id, table_id) = (spec.partition_id, spec.table_id);
@@ -791,7 +874,15 @@ pub async fn dump_partition_column_rows(catalog: &Catalog) -> Result<Vec<Partiti
                     transform: column.transform,
                 })
         })
-        .collect())
+        .collect()
+}
+
+/// Every `ducklake_partition_column` row, current and history.
+#[doc(hidden)]
+pub async fn dump_partition_column_rows(catalog: &Catalog) -> Result<Vec<PartitionColumnRow>> {
+    Ok(partition_column_rows_from(
+        dump_partition_info(catalog).await?,
+    ))
 }
 
 /// One `ducklake_file_partition_value` row, flattened from its file's
@@ -809,13 +900,13 @@ pub struct FilePartitionValueRow {
     pub partition_value: String,
 }
 
-/// Every `ducklake_file_partition_value` row, current and history.
+/// The `FilePartitionValue` rows carried by `parents`, flattened. Shared by the
+/// committed dump and the transaction-aware one, so a staged parent's rows
+/// and a committed one's are shaped by the same code.
 #[doc(hidden)]
-pub async fn dump_file_partition_value_rows(
-    catalog: &Catalog,
-) -> Result<Vec<FilePartitionValueRow>> {
-    Ok(dump_data_files(catalog)
-        .await?
+#[must_use]
+pub fn file_partition_value_rows_from(parents: Vec<DataFileValue>) -> Vec<FilePartitionValueRow> {
+    parents
         .into_iter()
         .flat_map(|file| {
             let (data_file_id, table_id) = (file.data_file_id, file.table_id);
@@ -828,7 +919,17 @@ pub async fn dump_file_partition_value_rows(
                     partition_value: value.partition_value,
                 })
         })
-        .collect())
+        .collect()
+}
+
+/// Every `ducklake_file_partition_value` row, current and history.
+#[doc(hidden)]
+pub async fn dump_file_partition_value_rows(
+    catalog: &Catalog,
+) -> Result<Vec<FilePartitionValueRow>> {
+    Ok(file_partition_value_rows_from(
+        dump_data_files(catalog).await?,
+    ))
 }
 
 /// One `ducklake_sort_expression` row, flattened from its spec's record.
@@ -851,11 +952,13 @@ pub struct SortExpressionRow {
     pub null_order: String,
 }
 
-/// Every `ducklake_sort_expression` row, current and history.
+/// The `SortExpression` rows carried by `parents`, flattened. Shared by the
+/// committed dump and the transaction-aware one, so a staged parent's rows
+/// and a committed one's are shaped by the same code.
 #[doc(hidden)]
-pub async fn dump_sort_expression_rows(catalog: &Catalog) -> Result<Vec<SortExpressionRow>> {
-    Ok(dump_sort_info(catalog)
-        .await?
+#[must_use]
+pub fn sort_expression_rows_from(parents: Vec<SortValue>) -> Vec<SortExpressionRow> {
+    parents
         .into_iter()
         .flat_map(|spec| {
             let (sort_id, table_id) = (spec.sort_id, spec.table_id);
@@ -871,7 +974,13 @@ pub async fn dump_sort_expression_rows(catalog: &Catalog) -> Result<Vec<SortExpr
                     null_order: expression.null_order,
                 })
         })
-        .collect())
+        .collect()
+}
+
+/// Every `ducklake_sort_expression` row, current and history.
+#[doc(hidden)]
+pub async fn dump_sort_expression_rows(catalog: &Catalog) -> Result<Vec<SortExpressionRow>> {
+    Ok(sort_expression_rows_from(dump_sort_info(catalog).await?))
 }
 
 #[cfg(test)]
@@ -906,12 +1015,14 @@ mod tests {
                             column_type: "BIGINT".into(),
                             nulls_allowed: false,
                             default_value: None,
+                            children: Vec::new(),
                         },
                         ColumnDef {
                             name: "amount".into(),
                             column_type: "DOUBLE".into(),
                             nulls_allowed: true,
                             default_value: None,
+                            children: Vec::new(),
                         },
                     ],
                 )?;

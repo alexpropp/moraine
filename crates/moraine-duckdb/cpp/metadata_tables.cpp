@@ -1,6 +1,7 @@
 #include "metadata_tables.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -203,256 +204,305 @@ std::vector<std::vector<duckdb::Value>> ProvideSnapshotChanges(MoraineCatalogHan
 	                                    SnapshotChangesShape);
 }
 
+// One `ducklake_schema` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> SchemaShape(const MoraineSchemaRow &r) {
+	return {
+	    Bigint(r.schema_id),         Uuid(r.schema_uuid),
+	    Bigint(r.begin_snapshot),    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    Varchar(r.schema_name),      Varchar(r.path),
+	    Boolean(r.path_is_relative),
+	};
+}
+
 std::vector<std::vector<duckdb::Value>> ProvideSchemas(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                        void *probe_ctx) {
-	return DumpRows<MoraineSchemaRow>(
-	    handle, probe, probe_ctx, moraine_dump_schemas, moraine_dump_schemas_free,
-	    [](const MoraineSchemaRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.schema_id),         Uuid(r.schema_uuid),
-		        Bigint(r.begin_snapshot),    OptBigint(r.has_end_snapshot, r.end_snapshot),
-		        Varchar(r.schema_name),      Varchar(r.path),
-		        Boolean(r.path_is_relative),
-		    };
-	    });
+	return DumpRows<MoraineSchemaRow>(handle, probe, probe_ctx, moraine_dump_schemas, moraine_dump_schemas_free,
+	                                  SchemaShape);
+}
+
+// One `ducklake_table` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> TableShape(const MoraineTableRow &r) {
+	return {
+	    Bigint(r.table_id),       Uuid(r.table_uuid),
+	    Bigint(r.begin_snapshot), OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    Bigint(r.schema_id),      Varchar(r.table_name),
+	    Varchar(r.path),          Boolean(r.path_is_relative),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideTables(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                       void *probe_ctx) {
 	return DumpRows<MoraineTableRow>(handle, probe, probe_ctx, moraine_dump_tables, moraine_dump_tables_free,
-	                                 [](const MoraineTableRow &r) -> std::vector<duckdb::Value> {
-		                                 return {
-		                                     Bigint(r.table_id),       Uuid(r.table_uuid),
-		                                     Bigint(r.begin_snapshot), OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                     Bigint(r.schema_id),      Varchar(r.table_name),
-		                                     Varchar(r.path),          Boolean(r.path_is_relative),
-		                                 };
-	                                 });
+	                                 TableShape);
+}
+
+// One `ducklake_view` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> ViewShape(const MoraineViewRow &r) {
+	return {
+	    Bigint(r.view_id),
+	    Uuid(r.view_uuid),
+	    Bigint(r.begin_snapshot),
+	    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    Bigint(r.schema_id),
+	    Varchar(r.view_name),
+	    Varchar(r.dialect),
+	    Varchar(r.sql),
+	    OptVarchar(r.column_aliases),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideViews(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                      void *probe_ctx) {
-	return DumpRows<MoraineViewRow>(handle, probe, probe_ctx, moraine_dump_views, moraine_dump_views_free,
-	                                [](const MoraineViewRow &r) -> std::vector<duckdb::Value> {
-		                                return {
-		                                    Bigint(r.view_id),
-		                                    Uuid(r.view_uuid),
-		                                    Bigint(r.begin_snapshot),
-		                                    OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                    Bigint(r.schema_id),
-		                                    Varchar(r.view_name),
-		                                    Varchar(r.dialect),
-		                                    Varchar(r.sql),
-		                                    OptVarchar(r.column_aliases),
-		                                };
-	                                });
+	return DumpRows<MoraineViewRow>(handle, probe, probe_ctx, moraine_dump_views, moraine_dump_views_free, ViewShape);
+}
+
+// One `ducklake_macro` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> MacroShape(const MoraineMacroRow &r) {
+	return {
+	    Bigint(r.schema_id),
+	    Bigint(r.macro_id),
+	    Varchar(r.macro_name),
+	    Bigint(r.begin_snapshot),
+	    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideMacros(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                       void *probe_ctx) {
 	return DumpRows<MoraineMacroRow>(handle, probe, probe_ctx, moraine_dump_macros, moraine_dump_macros_free,
-	                                 [](const MoraineMacroRow &r) -> std::vector<duckdb::Value> {
-		                                 return {
-		                                     Bigint(r.schema_id),
-		                                     Bigint(r.macro_id),
-		                                     Varchar(r.macro_name),
-		                                     Bigint(r.begin_snapshot),
-		                                     OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                 };
-	                                 });
+	                                 MacroShape);
 }
 
 // Impl and parameter rows come back flattened from the embedded children
 // in `(macro_id, impl_id[, column_id])` order, and that order is served
 // as-is: DuckLake reconstructs macros with LIST() aggregations that carry
 // no ORDER BY, so served row order is the reconstruction order.
+// One `ducklake_macro_impl` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> MacroImplShape(const MoraineMacroImplRow &r) {
+	return {
+	    Bigint(r.macro_id), Bigint(r.impl_id), Varchar(r.dialect), Varchar(r.sql), Varchar(r.macro_type),
+	};
+}
+
 std::vector<std::vector<duckdb::Value>> ProvideMacroImpls(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                           void *probe_ctx) {
-	return DumpRows<MoraineMacroImplRow>(
-	    handle, probe, probe_ctx, moraine_dump_macro_impls, moraine_dump_macro_impls_free,
-	    [](const MoraineMacroImplRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.macro_id), Bigint(r.impl_id), Varchar(r.dialect), Varchar(r.sql), Varchar(r.macro_type),
-		    };
-	    });
+	return DumpRows<MoraineMacroImplRow>(handle, probe, probe_ctx, moraine_dump_macro_impls,
+	                                     moraine_dump_macro_impls_free, MacroImplShape);
+}
+
+// One `ducklake_macro_parameters` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> MacroParameterShape(const MoraineMacroParameterRow &r) {
+	return {
+	    Bigint(r.macro_id),
+	    Bigint(r.impl_id),
+	    Bigint(r.column_id),
+	    Varchar(r.parameter_name),
+	    Varchar(r.parameter_type),
+	    OptVarchar(r.default_value),
+	    Varchar(r.default_value_type),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideMacroParameters(MoraineCatalogHandle *handle,
                                                                MoraineInterruptProbe probe, void *probe_ctx) {
 	return DumpRows<MoraineMacroParameterRow>(handle, probe, probe_ctx, moraine_dump_macro_parameters,
-	                                          moraine_dump_macro_parameters_free,
-	                                          [](const MoraineMacroParameterRow &r) -> std::vector<duckdb::Value> {
-		                                          return {
-		                                              Bigint(r.macro_id),
-		                                              Bigint(r.impl_id),
-		                                              Bigint(r.column_id),
-		                                              Varchar(r.parameter_name),
-		                                              Varchar(r.parameter_type),
-		                                              OptVarchar(r.default_value),
-		                                              Varchar(r.default_value_type),
-		                                          };
-	                                          });
+	                                          moraine_dump_macro_parameters_free, MacroParameterShape);
+}
+
+// One `ducklake_column_mapping` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> ColumnMappingShape(const MoraineColumnMappingRow &r) {
+	return {
+	    Bigint(r.mapping_id),
+	    Bigint(r.table_id),
+	    Varchar(r.map_type),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideColumnMappings(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                               void *probe_ctx) {
 	return DumpRows<MoraineColumnMappingRow>(handle, probe, probe_ctx, moraine_dump_column_mappings,
-	                                         moraine_dump_column_mappings_free,
-	                                         [](const MoraineColumnMappingRow &r) -> std::vector<duckdb::Value> {
-		                                         return {
-		                                             Bigint(r.mapping_id),
-		                                             Bigint(r.table_id),
-		                                             Varchar(r.map_type),
-		                                         };
-	                                         });
+	                                         moraine_dump_column_mappings_free, ColumnMappingShape);
+}
+
+// One `ducklake_name_mapping` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> NameMappingShape(const MoraineNameMappingRow &r) {
+	return {
+	    Bigint(r.mapping_id),
+	    Bigint(r.column_id),
+	    Varchar(r.source_name),
+	    Bigint(r.target_field_id),
+	    OptBigint(r.has_parent_column, r.parent_column),
+	    Boolean(r.is_partition),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideNameMappings(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                             void *probe_ctx) {
 	return DumpRows<MoraineNameMappingRow>(handle, probe, probe_ctx, moraine_dump_name_mappings,
-	                                       moraine_dump_name_mappings_free,
-	                                       [](const MoraineNameMappingRow &r) -> std::vector<duckdb::Value> {
-		                                       return {
-		                                           Bigint(r.mapping_id),
-		                                           Bigint(r.column_id),
-		                                           Varchar(r.source_name),
-		                                           Bigint(r.target_field_id),
-		                                           OptBigint(r.has_parent_column, r.parent_column),
-		                                           Boolean(r.is_partition),
-		                                       };
-	                                       });
+	                                       moraine_dump_name_mappings_free, NameMappingShape);
+}
+
+// One `ducklake_column` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> ColumnShape(const MoraineColumnRow &r) {
+	return {
+	    Bigint(r.column_id),
+	    Bigint(r.begin_snapshot),
+	    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    Bigint(r.table_id),
+	    Bigint(r.column_order),
+	    Varchar(r.column_name),
+	    DuckLakeColumnType(r.column_type),
+	    OptVarchar(r.initial_default),
+	    OptVarchar(r.default_value),
+	    Boolean(r.nulls_allowed),
+	    OptBigint(r.has_parent_column, r.parent_column),
+	    OptVarchar(r.default_value_type),
+	    OptVarchar(r.default_value_dialect),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideColumns(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                        void *probe_ctx) {
 	return DumpRows<MoraineColumnRow>(handle, probe, probe_ctx, moraine_dump_columns, moraine_dump_columns_free,
-	                                  [](const MoraineColumnRow &r) -> std::vector<duckdb::Value> {
-		                                  return {
-		                                      Bigint(r.column_id),
-		                                      Bigint(r.begin_snapshot),
-		                                      OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                      Bigint(r.table_id),
-		                                      Bigint(r.column_order),
-		                                      Varchar(r.column_name),
-		                                      DuckLakeColumnType(r.column_type),
-		                                      OptVarchar(r.initial_default),
-		                                      OptVarchar(r.default_value),
-		                                      Boolean(r.nulls_allowed),
-		                                      OptBigint(r.has_parent_column, r.parent_column),
-		                                      OptVarchar(r.default_value_type),
-		                                      OptVarchar(r.default_value_dialect),
-		                                  };
-	                                  });
+	                                  ColumnShape);
+}
+
+// One `ducklake_data_file` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> DataFileShape(const MoraineDataFileRow &r) {
+	return {
+	    Bigint(r.data_file_id),
+	    Bigint(r.table_id),
+	    Bigint(r.begin_snapshot),
+	    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    OptBigint(r.has_file_order, r.file_order),
+	    Varchar(r.path),
+	    Boolean(r.path_is_relative),
+	    Varchar(r.file_format),
+	    Bigint(r.record_count),
+	    Bigint(r.file_size_bytes),
+	    Bigint(r.footer_size),
+	    OptBigint(r.has_row_id_start, r.row_id_start),
+	    OptBigint(r.has_partition_id, r.partition_id),
+	    OptVarchar(r.encryption_key),
+	    OptBigint(r.has_mapping_id, r.mapping_id),
+	    OptBigint(r.has_partial_max, r.partial_max),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideDataFiles(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                          void *probe_ctx) {
 	return DumpRows<MoraineDataFileRow>(handle, probe, probe_ctx, moraine_dump_data_files, moraine_dump_data_files_free,
-	                                    [](const MoraineDataFileRow &r) -> std::vector<duckdb::Value> {
-		                                    return {
-		                                        Bigint(r.data_file_id),
-		                                        Bigint(r.table_id),
-		                                        Bigint(r.begin_snapshot),
-		                                        OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                        OptBigint(r.has_file_order, r.file_order),
-		                                        Varchar(r.path),
-		                                        Boolean(r.path_is_relative),
-		                                        Varchar(r.file_format),
-		                                        Bigint(r.record_count),
-		                                        Bigint(r.file_size_bytes),
-		                                        Bigint(r.footer_size),
-		                                        OptBigint(r.has_row_id_start, r.row_id_start),
-		                                        OptBigint(r.has_partition_id, r.partition_id),
-		                                        OptVarchar(r.encryption_key),
-		                                        OptBigint(r.has_mapping_id, r.mapping_id),
-		                                        OptBigint(r.has_partial_max, r.partial_max),
-		                                    };
-	                                    });
+	                                    DataFileShape);
+}
+
+// One `ducklake_delete_file` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> DeleteFileShape(const MoraineDeleteFileRow &r) {
+	return {
+	    Bigint(r.delete_file_id),
+	    Bigint(r.table_id),
+	    Bigint(r.begin_snapshot),
+	    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    Bigint(r.data_file_id),
+	    Varchar(r.path),
+	    Boolean(r.path_is_relative),
+	    Varchar(r.format),
+	    Bigint(r.delete_count),
+	    Bigint(r.file_size_bytes),
+	    Bigint(r.footer_size),
+	    OptVarchar(r.encryption_key),
+	    OptBigint(r.has_partial_max, r.partial_max),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideDeleteFiles(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                            void *probe_ctx) {
 	return DumpRows<MoraineDeleteFileRow>(handle, probe, probe_ctx, moraine_dump_delete_files,
-	                                      moraine_dump_delete_files_free,
-	                                      [](const MoraineDeleteFileRow &r) -> std::vector<duckdb::Value> {
-		                                      return {
-		                                          Bigint(r.delete_file_id),
-		                                          Bigint(r.table_id),
-		                                          Bigint(r.begin_snapshot),
-		                                          OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                          Bigint(r.data_file_id),
-		                                          Varchar(r.path),
-		                                          Boolean(r.path_is_relative),
-		                                          Varchar(r.format),
-		                                          Bigint(r.delete_count),
-		                                          Bigint(r.file_size_bytes),
-		                                          Bigint(r.footer_size),
-		                                          OptVarchar(r.encryption_key),
-		                                          OptBigint(r.has_partial_max, r.partial_max),
-		                                      };
-	                                      });
+	                                      moraine_dump_delete_files_free, DeleteFileShape);
+}
+
+// One `ducklake_table_stats` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> TableStatsShape(const MoraineTableStatsRow &r) {
+	return {
+	    Bigint(r.table_id),
+	    Bigint(r.record_count),
+	    Bigint(r.next_row_id),
+	    Bigint(r.file_size_bytes),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideTableStats(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                           void *probe_ctx) {
 	return DumpRows<MoraineTableStatsRow>(handle, probe, probe_ctx, moraine_dump_table_stats,
-	                                      moraine_dump_table_stats_free,
-	                                      [](const MoraineTableStatsRow &r) -> std::vector<duckdb::Value> {
-		                                      return {
-		                                          Bigint(r.table_id),
-		                                          Bigint(r.record_count),
-		                                          Bigint(r.next_row_id),
-		                                          Bigint(r.file_size_bytes),
-		                                      };
-	                                      });
+	                                      moraine_dump_table_stats_free, TableStatsShape);
+}
+
+// One `ducklake_table_column_stats` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> TableColumnStatsShape(const MoraineTableColumnStatsRow &r) {
+	return {
+	    Bigint(r.table_id),
+	    Bigint(r.column_id),
+	    OptBoolean(r.has_contains_null, r.contains_null),
+	    OptBoolean(r.has_contains_nan, r.contains_nan),
+	    OptVarchar(r.min_value),
+	    OptVarchar(r.max_value),
+	    OptVarchar(r.extra_stats),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideTableColumnStats(MoraineCatalogHandle *handle,
                                                                 MoraineInterruptProbe probe, void *probe_ctx) {
 	return DumpRows<MoraineTableColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_table_column_stats,
-	                                            moraine_dump_table_column_stats_free,
-	                                            [](const MoraineTableColumnStatsRow &r) -> std::vector<duckdb::Value> {
-		                                            return {
-		                                                Bigint(r.table_id),
-		                                                Bigint(r.column_id),
-		                                                OptBoolean(r.has_contains_null, r.contains_null),
-		                                                OptBoolean(r.has_contains_nan, r.contains_nan),
-		                                                OptVarchar(r.min_value),
-		                                                OptVarchar(r.max_value),
-		                                                OptVarchar(r.extra_stats),
-		                                            };
-	                                            });
+	                                            moraine_dump_table_column_stats_free, TableColumnStatsShape);
+}
+
+// One `ducklake_file_column_stats` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> FileColumnStatsShape(const MoraineFileColumnStatsRow &r) {
+	return {
+	    Bigint(r.data_file_id),      Bigint(r.table_id),      Bigint(r.column_id),
+	    Bigint(r.column_size_bytes), Bigint(r.value_count),   Bigint(r.null_count),
+	    OptVarchar(r.min_value),     OptVarchar(r.max_value), OptBoolean(r.has_contains_nan, r.contains_nan),
+	    OptVarchar(r.extra_stats),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideFileColumnStats(MoraineCatalogHandle *handle,
                                                                MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineFileColumnStatsRow>(
-	    handle, probe, probe_ctx, moraine_dump_file_column_stats, moraine_dump_file_column_stats_free,
-	    [](const MoraineFileColumnStatsRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.data_file_id),      Bigint(r.table_id),      Bigint(r.column_id),
-		        Bigint(r.column_size_bytes), Bigint(r.value_count),   Bigint(r.null_count),
-		        OptVarchar(r.min_value),     OptVarchar(r.max_value), OptBoolean(r.has_contains_nan, r.contains_nan),
-		        OptVarchar(r.extra_stats),
-		    };
-	    });
+	return DumpRows<MoraineFileColumnStatsRow>(handle, probe, probe_ctx, moraine_dump_file_column_stats,
+	                                           moraine_dump_file_column_stats_free, FileColumnStatsShape);
 }
 
 // `ducklake_schema_versions` rows are flattened out of the snapshot
 // records they fold into (the staged path stores only the per-snapshot
 // table-id set — begin_snapshot/schema_version are the snapshot's own
 // values, revalidated at commit).
+// One `ducklake_schema_versions` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> SchemaVersionShape(const MoraineSchemaVersionRow &r) {
+	return {
+	    Bigint(r.begin_snapshot),
+	    Bigint(r.schema_version),
+	    Bigint(r.table_id),
+	};
+}
+
 std::vector<std::vector<duckdb::Value>> ProvideSchemaVersions(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                               void *probe_ctx) {
 	return DumpRows<MoraineSchemaVersionRow>(handle, probe, probe_ctx, moraine_dump_schema_versions,
-	                                         moraine_dump_schema_versions_free,
-	                                         [](const MoraineSchemaVersionRow &r) -> std::vector<duckdb::Value> {
-		                                         return {
-		                                             Bigint(r.begin_snapshot),
-		                                             Bigint(r.schema_version),
-		                                             Bigint(r.table_id),
-		                                         };
-	                                         });
+	                                         moraine_dump_schema_versions_free, SchemaVersionShape);
 }
 
 // Always-empty stand-in for a `ducklake_*` table covering a feature the
@@ -464,108 +514,132 @@ std::vector<std::vector<duckdb::Value>> ProvideEmpty(MoraineCatalogHandle *, Mor
 	return {};
 }
 
+// One `ducklake_partition_info` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> PartitionInfoShape(const MorainePartitionInfoRow &r) {
+	return {
+	    Bigint(r.partition_id),
+	    Bigint(r.table_id),
+	    Bigint(r.begin_snapshot),
+	    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	};
+}
+
 std::vector<std::vector<duckdb::Value>> ProvidePartitionInfo(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                              void *probe_ctx) {
 	return DumpRows<MorainePartitionInfoRow>(handle, probe, probe_ctx, moraine_dump_partition_info,
-	                                         moraine_dump_partition_info_free,
-	                                         [](const MorainePartitionInfoRow &r) -> std::vector<duckdb::Value> {
-		                                         return {
-		                                             Bigint(r.partition_id),
-		                                             Bigint(r.table_id),
-		                                             Bigint(r.begin_snapshot),
-		                                             OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                         };
-	                                         });
+	                                         moraine_dump_partition_info_free, PartitionInfoShape);
+}
+
+// One `ducklake_partition_column` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> PartitionColumnShape(const MorainePartitionColumnRow &r) {
+	return {
+	    Bigint(r.partition_id), Bigint(r.table_id),   Bigint(r.partition_key_index),
+	    Bigint(r.column_id),    Varchar(r.transform),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvidePartitionColumns(MoraineCatalogHandle *handle,
                                                                 MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MorainePartitionColumnRow>(
-	    handle, probe, probe_ctx, moraine_dump_partition_columns, moraine_dump_partition_columns_free,
-	    [](const MorainePartitionColumnRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.partition_id), Bigint(r.table_id),   Bigint(r.partition_key_index),
-		        Bigint(r.column_id),    Varchar(r.transform),
-		    };
-	    });
+	return DumpRows<MorainePartitionColumnRow>(handle, probe, probe_ctx, moraine_dump_partition_columns,
+	                                           moraine_dump_partition_columns_free, PartitionColumnShape);
+}
+
+// One `ducklake_file_partition_value` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> FilePartitionValueShape(const MoraineFilePartitionValueRow &r) {
+	return {
+	    Bigint(r.data_file_id),
+	    Bigint(r.table_id),
+	    Bigint(r.partition_key_index),
+	    Varchar(r.partition_value),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideFilePartitionValues(MoraineCatalogHandle *handle,
                                                                    MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineFilePartitionValueRow>(
-	    handle, probe, probe_ctx, moraine_dump_file_partition_values, moraine_dump_file_partition_values_free,
-	    [](const MoraineFilePartitionValueRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.data_file_id),
-		        Bigint(r.table_id),
-		        Bigint(r.partition_key_index),
-		        Varchar(r.partition_value),
-		    };
-	    });
+	return DumpRows<MoraineFilePartitionValueRow>(handle, probe, probe_ctx, moraine_dump_file_partition_values,
+	                                              moraine_dump_file_partition_values_free, FilePartitionValueShape);
+}
+
+// One `ducklake_sort_info` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> SortInfoShape(const MoraineSortInfoRow &r) {
+	return {
+	    Bigint(r.sort_id),
+	    Bigint(r.table_id),
+	    Bigint(r.begin_snapshot),
+	    OptBigint(r.has_end_snapshot, r.end_snapshot),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideSortInfo(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                         void *probe_ctx) {
 	return DumpRows<MoraineSortInfoRow>(handle, probe, probe_ctx, moraine_dump_sort_info, moraine_dump_sort_info_free,
-	                                    [](const MoraineSortInfoRow &r) -> std::vector<duckdb::Value> {
-		                                    return {
-		                                        Bigint(r.sort_id),
-		                                        Bigint(r.table_id),
-		                                        Bigint(r.begin_snapshot),
-		                                        OptBigint(r.has_end_snapshot, r.end_snapshot),
-		                                    };
-	                                    });
+	                                    SortInfoShape);
+}
+
+// One `ducklake_sort_expression` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> SortExpressionShape(const MoraineSortExpressionRow &r) {
+	return {
+	    Bigint(r.sort_id),  Bigint(r.table_id),        Bigint(r.sort_key_index), Varchar(r.expression),
+	    Varchar(r.dialect), Varchar(r.sort_direction), Varchar(r.null_order),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideSortExpressions(MoraineCatalogHandle *handle,
                                                                MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineSortExpressionRow>(
-	    handle, probe, probe_ctx, moraine_dump_sort_expressions, moraine_dump_sort_expressions_free,
-	    [](const MoraineSortExpressionRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.sort_id),  Bigint(r.table_id),        Bigint(r.sort_key_index), Varchar(r.expression),
-		        Varchar(r.dialect), Varchar(r.sort_direction), Varchar(r.null_order),
-		    };
-	    });
+	return DumpRows<MoraineSortExpressionRow>(handle, probe, probe_ctx, moraine_dump_sort_expressions,
+	                                          moraine_dump_sort_expressions_free, SortExpressionShape);
+}
+
+// One `ducklake_tag` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> TagShape(const MoraineTagRow &r) {
+	return {
+	    Bigint(r.object_id), Bigint(r.begin_snapshot), OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    Varchar(r.key),      Varchar(r.value),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideTags(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                     void *probe_ctx) {
-	return DumpRows<MoraineTagRow>(
-	    handle, probe, probe_ctx, moraine_dump_tags, moraine_dump_tags_free,
-	    [](const MoraineTagRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.object_id), Bigint(r.begin_snapshot), OptBigint(r.has_end_snapshot, r.end_snapshot),
-		        Varchar(r.key),      Varchar(r.value),
-		    };
-	    });
+	return DumpRows<MoraineTagRow>(handle, probe, probe_ctx, moraine_dump_tags, moraine_dump_tags_free, TagShape);
+}
+
+// One `ducklake_column_tag` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> ColumnTagShape(const MoraineColumnTagRow &r) {
+	return {
+	    Bigint(r.table_id),       Bigint(r.column_id),
+	    Bigint(r.begin_snapshot), OptBigint(r.has_end_snapshot, r.end_snapshot),
+	    Varchar(r.key),           Varchar(r.value),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideColumnTags(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                           void *probe_ctx) {
-	return DumpRows<MoraineColumnTagRow>(
-	    handle, probe, probe_ctx, moraine_dump_column_tags, moraine_dump_column_tags_free,
-	    [](const MoraineColumnTagRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.table_id),       Bigint(r.column_id),
-		        Bigint(r.begin_snapshot), OptBigint(r.has_end_snapshot, r.end_snapshot),
-		        Varchar(r.key),           Varchar(r.value),
-		    };
-	    });
+	return DumpRows<MoraineColumnTagRow>(handle, probe, probe_ctx, moraine_dump_column_tags,
+	                                     moraine_dump_column_tags_free, ColumnTagShape);
+}
+
+// One `ducklake_files_scheduled_for_deletion` record's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> ScheduledDeletionShape(const MoraineScheduledDeletionRow &r) {
+	return {
+	    Bigint(r.data_file_id),
+	    Varchar(r.path),
+	    duckdb::Value::BOOLEAN(r.path_is_relative),
+	    TimestampTz(r.schedule_start_micros),
+	};
 }
 
 std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalogHandle *handle,
                                                                   MoraineInterruptProbe probe, void *probe_ctx) {
-	return DumpRows<MoraineScheduledDeletionRow>(
-	    handle, probe, probe_ctx, moraine_dump_scheduled_deletions, moraine_dump_scheduled_deletions_free,
-	    [](const MoraineScheduledDeletionRow &r) -> std::vector<duckdb::Value> {
-		    return {
-		        Bigint(r.data_file_id),
-		        Varchar(r.path),
-		        duckdb::Value::BOOLEAN(r.path_is_relative),
-		        TimestampTz(r.schedule_start_micros),
-		    };
-	    });
+	return DumpRows<MoraineScheduledDeletionRow>(handle, probe, probe_ctx, moraine_dump_scheduled_deletions,
+	                                             moraine_dump_scheduled_deletions_free, ScheduledDeletionShape);
 }
 
 // `ducklake_metadata` rows. All are fixed here except `encrypted`, which
@@ -587,8 +661,12 @@ std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalog
 //     entirely. inline_tables.cpp serves the dynamic inline catalog surface
 //     this drives.
 // All rows are global (scope/scope_id NULL).
-std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
-                                                        void *probe_ctx) {
+// The `ducklake_metadata` rows moraine serves from its own facts rather
+// than from stored options: the protocol version, the writer, the
+// creation-time `encrypted` flag, the inlining default, and the recorded
+// data root in the normalized form DuckLake compares against.
+std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                          void *probe_ctx) {
 	bool encrypted = false;
 	MoraineError err {};
 	auto code = moraine_catalog_encrypted(handle, &encrypted, probe, probe_ctx, &err);
@@ -636,19 +714,35 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *ha
 	// stored option holds it verbatim, which would not match). Those are
 	// moraine's to project, so a stored row of the same key is dropped
 	// rather than served twice or allowed to win.
-	static const std::set<std::string> kServedByMoraine = {"version", "created_by", "encrypted",
-	                                                       "data_path"};
-	auto stored = DumpRows<MoraineOptionRow>(handle, probe, probe_ctx, moraine_dump_options,
-	                                         moraine_dump_options_free,
-	                                         [](const MoraineOptionRow &r) -> std::vector<duckdb::Value> {
-		                                         return {
-		                                             Varchar(r.key),
-		                                             Varchar(r.value),
-		                                             OptVarchar(r.scope),
-		                                             r.has_scope_id ? Bigint(r.scope_id)
-		                                                            : duckdb::Value(duckdb::LogicalType::BIGINT),
-		                                         };
-	                                         });
+	return rows;
+}
+
+// One `ducklake_metadata` option row's column list, shared by the committed
+// dump and the transaction-aware one.
+std::vector<duckdb::Value> OptionShape(const MoraineOptionRow &r) {
+	return {
+	    Varchar(r.key),
+	    Varchar(r.value),
+	    OptVarchar(r.scope),
+	    r.has_scope_id ? Bigint(r.scope_id) : duckdb::Value(duckdb::LogicalType::BIGINT),
+	};
+}
+
+// Merges the store's own option rows over the fixed ones. Most override a
+// fixed row of the same key and scope — the fixed rows are what a store
+// *without* a setting serves, and `set_option` is what replaces one; without
+// the override a user could set `data_inlining_row_limit` and never see it
+// take effect.
+//
+// The exceptions are the keys that are *store facts* rather than defaults:
+// `version` is the protocol constant, `encrypted` is fixed when the catalog
+// is created, and `data_path` is served in the normalized form DuckLake
+// compares against the ATTACH value (the stored option holds it verbatim,
+// which would not match). Those are moraine's to project, so a stored row of
+// the same key is dropped rather than served twice or allowed to win.
+void MergeStoredMetadataRows(std::vector<std::vector<duckdb::Value>> &rows,
+                             std::vector<std::vector<duckdb::Value>> stored) {
+	static const std::set<std::string> kServedByMoraine = {"version", "created_by", "encrypted", "data_path"};
 	for (auto &row : stored) {
 		// Only the global scope: a table-scoped option of the same name is
 		// a user setting, not one of these store facts.
@@ -670,6 +764,13 @@ std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *ha
 		rows.erase(std::remove_if(rows.begin(), rows.end(), same_key), rows.end());
 		rows.push_back(std::move(row));
 	}
+}
+
+std::vector<std::vector<duckdb::Value>> ProvideMetadata(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
+                                                        void *probe_ctx) {
+	auto rows = FixedMetadataRows(handle, probe, probe_ctx);
+	MergeStoredMetadataRows(rows, DumpRows<MoraineOptionRow>(handle, probe, probe_ctx, moraine_dump_options,
+	                                                         moraine_dump_options_free, OptionShape));
 	return rows;
 }
 
@@ -1274,42 +1375,153 @@ duckdb::unique_ptr<duckdb::BaseStatistics> MoraineMetadataTableEntry::GetStatist
 	throw duckdb::NotImplementedException("moraine: column statistics are not supported yet");
 }
 
-// The two snapshot-backed tables share one dump; a scan inside a write
-// transaction that already staged rows must observe that transaction's
-// own snapshot deletes (the expiry cascade's `NOT EXISTS` subqueries
-// re-read `ducklake_snapshot` after staging them), so their rows come
-// from the tx-aware dump when a staged tx is open. Every other kind — and
-// every scan outside a write transaction — serves committed state.
-static std::vector<std::vector<duckdb::Value>> TxAwareSnapshotRows(MoraineTxHandle *tx, bool changes_shape) {
-	OwnedArray<MoraineSnapshotRow> rows(moraine_dump_snapshots_free);
+namespace {
+
+// The shared body of every tx-aware provider: run one `moraine_tx_dump_*`
+// and shape its rows exactly as the committed dump shapes its own. The
+// mirror of `DumpRows`, against an open transaction rather than the
+// catalog handle.
+template <typename Row, typename DumpFn, typename ShapeFn>
+std::vector<std::vector<duckdb::Value>> TxDumpRows(MoraineTxHandle *tx, DumpFn dump, void (*free_fn)(Row *, size_t),
+                                                   ShapeFn shape) {
+	OwnedArray<Row> rows(free_fn);
 	MoraineError err {};
-	auto code = moraine_tx_dump_snapshots(tx, rows.OutItems(), rows.OutLen(), &err);
+	auto code = dump(tx, rows.OutItems(), rows.OutLen(), &err);
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
 	std::vector<std::vector<duckdb::Value>> result;
 	result.reserve(rows.size());
 	for (auto &r : rows) {
-		result.push_back(changes_shape ? SnapshotChangesShape(r) : SnapshotShape(r));
+		result.push_back(shape(r));
 	}
 	return result;
+}
+
+// The transaction-aware rows for one `write_table_kind`, or an empty
+// optional where no such dump exists yet.
+//
+// A scan inside a write transaction that already staged rows must observe
+// them: DuckLake's expiry and cleanup cascades re-read these tables after
+// staging their own deletes, so a committed-state scan would make them
+// re-plan work they have already done. Kinds absent from this switch — and
+// every scan outside a write transaction — serve committed state, which is
+// right for a kind the transaction has not written and is exactly the gap
+// this table closes for one it has.
+//
+// The cases are `write_table_kind` values — the same integers the spec
+// table above declares, which are the staged ABI's `table_kind`
+// discriminants. Ordered by DuckLake's own cascade: the file tables first,
+// then the catalog tables they hang off.
+std::optional<std::vector<std::vector<duckdb::Value>>> TxAwareRows(MoraineTxHandle *tx, MoraineCatalogHandle *handle,
+                                                                   duckdb::ClientContext &context,
+                                                                   int32_t write_table_kind) {
+	switch (write_table_kind) {
+	case 0:
+		return TxDumpRows<MoraineSnapshotRow>(tx, moraine_tx_dump_snapshots, moraine_dump_snapshots_free,
+		                                      SnapshotShape);
+	case 1:
+		return TxDumpRows<MoraineSnapshotRow>(tx, moraine_tx_dump_snapshots, moraine_dump_snapshots_free,
+		                                      SnapshotChangesShape);
+	case 6:
+		return TxDumpRows<MoraineDataFileRow>(tx, moraine_tx_dump_data_files, moraine_dump_data_files_free,
+		                                      DataFileShape);
+	case 7:
+		return TxDumpRows<MoraineDeleteFileRow>(tx, moraine_tx_dump_delete_files, moraine_dump_delete_files_free,
+		                                        DeleteFileShape);
+	case 10:
+		return TxDumpRows<MoraineFileColumnStatsRow>(tx, moraine_tx_dump_file_column_stats,
+		                                             moraine_dump_file_column_stats_free, FileColumnStatsShape);
+	case 19:
+		return TxDumpRows<MoraineScheduledDeletionRow>(tx, moraine_tx_dump_scheduled_deletions,
+		                                               moraine_dump_scheduled_deletions_free, ScheduledDeletionShape);
+	case 5:
+		return TxDumpRows<MoraineColumnRow>(tx, moraine_tx_dump_columns, moraine_dump_columns_free, ColumnShape);
+	case 3:
+		return TxDumpRows<MoraineTableRow>(tx, moraine_tx_dump_tables, moraine_dump_tables_free, TableShape);
+	case 2:
+		return TxDumpRows<MoraineSchemaRow>(tx, moraine_tx_dump_schemas, moraine_dump_schemas_free, SchemaShape);
+	case 4:
+		return TxDumpRows<MoraineViewRow>(tx, moraine_tx_dump_views, moraine_dump_views_free, ViewShape);
+	case 8:
+		return TxDumpRows<MoraineTableStatsRow>(tx, moraine_tx_dump_table_stats, moraine_dump_table_stats_free,
+		                                        TableStatsShape);
+	case 9:
+		return TxDumpRows<MoraineTableColumnStatsRow>(tx, moraine_tx_dump_table_column_stats,
+		                                              moraine_dump_table_column_stats_free, TableColumnStatsShape);
+	case 11:
+		return TxDumpRows<MoraineSchemaVersionRow>(tx, moraine_tx_dump_schema_versions,
+		                                           moraine_dump_schema_versions_free, SchemaVersionShape);
+	case 12:
+		return TxDumpRows<MorainePartitionInfoRow>(tx, moraine_tx_dump_partition_info, moraine_dump_partition_info_free,
+		                                           PartitionInfoShape);
+	case 13:
+		return TxDumpRows<MorainePartitionColumnRow>(tx, moraine_tx_dump_partition_columns,
+		                                             moraine_dump_partition_columns_free, PartitionColumnShape);
+	case 14:
+		return TxDumpRows<MoraineFilePartitionValueRow>(tx, moraine_tx_dump_file_partition_values,
+		                                                moraine_dump_file_partition_values_free,
+		                                                FilePartitionValueShape);
+	case 15:
+		return TxDumpRows<MoraineSortInfoRow>(tx, moraine_tx_dump_sort_info, moraine_dump_sort_info_free,
+		                                      SortInfoShape);
+	case 16:
+		return TxDumpRows<MoraineSortExpressionRow>(tx, moraine_tx_dump_sort_expressions,
+		                                            moraine_dump_sort_expressions_free, SortExpressionShape);
+	case 17:
+		return TxDumpRows<MoraineTagRow>(tx, moraine_tx_dump_tags, moraine_dump_tags_free, TagShape);
+	case 18:
+		return TxDumpRows<MoraineColumnTagRow>(tx, moraine_tx_dump_column_tags, moraine_dump_column_tags_free,
+		                                       ColumnTagShape);
+	case 20:
+		return TxDumpRows<MoraineMacroRow>(tx, moraine_tx_dump_macros, moraine_dump_macros_free, MacroShape);
+	case 21:
+		return TxDumpRows<MoraineMacroImplRow>(tx, moraine_tx_dump_macro_impls, moraine_dump_macro_impls_free,
+		                                       MacroImplShape);
+	case 22:
+		return TxDumpRows<MoraineMacroParameterRow>(tx, moraine_tx_dump_macro_parameters,
+		                                            moraine_dump_macro_parameters_free, MacroParameterShape);
+	case 23:
+		return TxDumpRows<MoraineColumnMappingRow>(tx, moraine_tx_dump_column_mappings,
+		                                           moraine_dump_column_mappings_free, ColumnMappingShape);
+	case 24:
+		return TxDumpRows<MoraineNameMappingRow>(tx, moraine_tx_dump_name_mappings, moraine_dump_name_mappings_free,
+		                                         NameMappingShape);
+	case 25: {
+		// The fixed rows are store facts, not stored options, so they are
+		// the same either way; only the stored half is overlaid.
+		auto rows = FixedMetadataRows(handle, moraine_shim_is_interrupted, &context);
+		MergeStoredMetadataRows(
+		    rows, TxDumpRows<MoraineOptionRow>(tx, moraine_tx_dump_options, moraine_dump_options_free, OptionShape));
+		return rows;
+	}
+	default:
+		return std::nullopt;
+	}
+}
+
+} // namespace
+
+std::optional<std::vector<std::vector<duckdb::Value>>>
+MetadataTxAwareRows(duckdb::ClientContext &context, duckdb::Catalog &catalog, int32_t write_table_kind) {
+	if (write_table_kind == kNotWritable) {
+		return std::nullopt;
+	}
+	auto catalog_transaction = catalog.GetCatalogTransaction(context);
+	auto *staged_tx = catalog_transaction.transaction->Cast<MoraineTransaction>().StagedTxIfOpen();
+	if (staged_tx == nullptr) {
+		return std::nullopt;
+	}
+	return TxAwareRows(staged_tx, catalog.Cast<MoraineCatalog>().Handle(), context, write_table_kind);
 }
 
 duckdb::TableFunction MoraineMetadataTableEntry::GetScanFunction(duckdb::ClientContext &context,
                                                                  duckdb::unique_ptr<duckdb::FunctionData> &bind_data) {
 	auto scan_bind_data = duckdb::make_uniq<MetadataScanBindData>();
 
-	// write_table_kind 0/1 are ducklake_snapshot / ducklake_snapshot_changes.
-	MoraineTxHandle *staged_tx = nullptr;
-	if (spec_.write_table_kind == 0 || spec_.write_table_kind == 1) {
-		auto catalog_transaction = ParentCatalog().GetCatalogTransaction(context);
-		staged_tx = catalog_transaction.transaction->Cast<MoraineTransaction>().StagedTxIfOpen();
-	}
-	if (staged_tx != nullptr) {
-		scan_bind_data->rows = TxAwareSnapshotRows(staged_tx, spec_.write_table_kind == 1);
-	} else {
-		scan_bind_data->rows = spec_.provider(handle_, moraine_shim_is_interrupted, &context);
-	}
+	auto tx_rows = MetadataTxAwareRows(context, ParentCatalog(), spec_.write_table_kind);
+	scan_bind_data->rows =
+	    tx_rows ? std::move(*tx_rows) : spec_.provider(handle_, moraine_shim_is_interrupted, &context);
 
 	scan_bind_data->table_entry = this;
 	bind_data = std::move(scan_bind_data);

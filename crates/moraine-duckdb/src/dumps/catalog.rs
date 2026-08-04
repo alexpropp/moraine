@@ -31,6 +31,42 @@ pub struct MoraineSchemaRow {
     pub path_is_relative: bool,
 }
 
+/// Converts core `ducklake_schema` records into the C row shape. Shared by the
+/// committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn schema_rows(
+    rows: Vec<moraine::ffi_support::SchemaRecord>,
+) -> Result<Vec<MoraineSchemaRow>, AbiError> {
+    // Owned-first: every string in the whole batch converts before any
+    // raw pointer is minted, so a partial failure leaks nothing.
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let schema_uuid = to_c_string(&v.schema_uuid)?;
+            let schema_name = to_c_string(&v.schema_name)?;
+            let path = to_c_string(&v.path)?;
+            Ok((v, schema_uuid, schema_name, path))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(v, schema_uuid, schema_name, path)| {
+            let (has_end, end) = opt_u64(v.end_snapshot);
+            MoraineSchemaRow {
+                schema_id: v.schema_id,
+                schema_uuid: schema_uuid.into_raw(),
+                begin_snapshot: v.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                schema_name: schema_name.into_raw(),
+                path: path.into_raw(),
+                path_is_relative: v.path_is_relative,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_schema` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -60,36 +96,7 @@ pub unsafe extern "C" fn moraine_dump_schemas(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_schemas(catalog)),
-            |rows| {
-                // Owned-first: every string in the whole batch converts before any
-                // raw pointer is minted, so a partial failure leaks nothing.
-                let owned = rows
-                    .into_iter()
-                    .map(|v| {
-                        let schema_uuid = to_c_string(&v.schema_uuid)?;
-                        let schema_name = to_c_string(&v.schema_name)?;
-                        let path = to_c_string(&v.path)?;
-                        Ok((v, schema_uuid, schema_name, path))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(v, schema_uuid, schema_name, path)| {
-                        let (has_end, end) = opt_u64(v.end_snapshot);
-                        MoraineSchemaRow {
-                            schema_id: v.schema_id,
-                            schema_uuid: schema_uuid.into_raw(),
-                            begin_snapshot: v.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                            schema_name: schema_name.into_raw(),
-                            path: path.into_raw(),
-                            path_is_relative: v.path_is_relative,
-                        }
-                    })
-                    .collect())
-            },
+            schema_rows,
         )
     }
 }
@@ -137,6 +144,42 @@ pub struct MoraineTableRow {
     pub path_is_relative: bool,
 }
 
+/// Converts core `ducklake_table` records into the C row shape. Shared by the
+/// committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn table_rows(
+    rows: Vec<moraine::ffi_support::TableRecord>,
+) -> Result<Vec<MoraineTableRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let table_uuid = to_c_string(&v.table_uuid)?;
+            let table_name = to_c_string(&v.table_name)?;
+            let path = to_c_string(&v.path)?;
+            Ok((v, table_uuid, table_name, path))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+    Ok(owned
+        .into_iter()
+        .map(|(v, table_uuid, table_name, path)| {
+            let (has_end, end) = opt_u64(v.end_snapshot);
+            MoraineTableRow {
+                table_id: v.table_id,
+                table_uuid: table_uuid.into_raw(),
+                begin_snapshot: v.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                schema_id: v.schema_id,
+                table_name: table_name.into_raw(),
+                path: path.into_raw(),
+                path_is_relative: v.path_is_relative,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_table` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -166,36 +209,7 @@ pub unsafe extern "C" fn moraine_dump_tables(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_tables(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|v| {
-                        let table_uuid = to_c_string(&v.table_uuid)?;
-                        let table_name = to_c_string(&v.table_name)?;
-                        let path = to_c_string(&v.path)?;
-                        Ok((v, table_uuid, table_name, path))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-                Ok(owned
-                    .into_iter()
-                    .map(|(v, table_uuid, table_name, path)| {
-                        let (has_end, end) = opt_u64(v.end_snapshot);
-                        MoraineTableRow {
-                            table_id: v.table_id,
-                            table_uuid: table_uuid.into_raw(),
-                            begin_snapshot: v.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                            schema_id: v.schema_id,
-                            table_name: table_name.into_raw(),
-                            path: path.into_raw(),
-                            path_is_relative: v.path_is_relative,
-                        }
-                    })
-                    .collect())
-            },
+            table_rows,
         )
     }
 }
@@ -243,6 +257,46 @@ pub struct MoraineViewRow {
     pub column_aliases: *mut c_char,
 }
 
+/// Converts core `ducklake_view` records into the C row shape. Shared by the
+/// committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn view_rows(
+    rows: Vec<moraine::ffi_support::ViewRecord>,
+) -> Result<Vec<MoraineViewRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let view_uuid = to_c_string(&v.view_uuid)?;
+            let view_name = to_c_string(&v.view_name)?;
+            let dialect = to_c_string(&v.dialect)?;
+            let sql = to_c_string(&v.sql)?;
+            let column_aliases = opt_c_string(v.column_aliases.as_deref())?;
+            Ok((v, view_uuid, view_name, dialect, sql, column_aliases))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(v, view_uuid, view_name, dialect, sql, column_aliases)| {
+            let (has_end, end) = opt_u64(v.end_snapshot);
+            MoraineViewRow {
+                view_id: v.view_id,
+                view_uuid: view_uuid.into_raw(),
+                begin_snapshot: v.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+                schema_id: v.schema_id,
+                view_name: view_name.into_raw(),
+                dialect: dialect.into_raw(),
+                sql: sql.into_raw(),
+                column_aliases: opt_into_raw(column_aliases),
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_view` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -272,40 +326,7 @@ pub unsafe extern "C" fn moraine_dump_views(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_views(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|v| {
-                        let view_uuid = to_c_string(&v.view_uuid)?;
-                        let view_name = to_c_string(&v.view_name)?;
-                        let dialect = to_c_string(&v.dialect)?;
-                        let sql = to_c_string(&v.sql)?;
-                        let column_aliases = opt_c_string(v.column_aliases.as_deref())?;
-                        Ok((v, view_uuid, view_name, dialect, sql, column_aliases))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(v, view_uuid, view_name, dialect, sql, column_aliases)| {
-                        let (has_end, end) = opt_u64(v.end_snapshot);
-                        MoraineViewRow {
-                            view_id: v.view_id,
-                            view_uuid: view_uuid.into_raw(),
-                            begin_snapshot: v.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                            schema_id: v.schema_id,
-                            view_name: view_name.into_raw(),
-                            dialect: dialect.into_raw(),
-                            sql: sql.into_raw(),
-                            column_aliases: opt_into_raw(column_aliases),
-                        }
-                    })
-                    .collect())
-            },
+            view_rows,
         )
     }
 }
@@ -367,6 +388,71 @@ pub struct MoraineColumnRow {
     pub default_value_dialect: *mut c_char,
 }
 
+/// Converts core `ducklake_column` records into the C row shape. Shared by the
+/// committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+pub(crate) fn column_rows(
+    rows: Vec<moraine::ffi_support::ColumnRecord>,
+) -> Result<Vec<MoraineColumnRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|v| {
+            let column_name = to_c_string(&v.column_name)?;
+            let column_type = to_c_string(&v.column_type)?;
+            let initial_default = opt_c_string(v.initial_default.as_deref())?;
+            let default_value = opt_c_string(v.default_value.as_deref())?;
+            let default_value_type = opt_c_string(v.default_value_type.as_deref())?;
+            let default_value_dialect = opt_c_string(v.default_value_dialect.as_deref())?;
+            Ok((
+                v,
+                column_name,
+                column_type,
+                initial_default,
+                default_value,
+                default_value_type,
+                default_value_dialect,
+            ))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+    Ok(owned
+        .into_iter()
+        .map(
+            |(
+                v,
+                column_name,
+                column_type,
+                initial_default,
+                default_value,
+                default_value_type,
+                default_value_dialect,
+            )| {
+                let (has_end, end) = opt_u64(v.end_snapshot);
+                let (has_parent, parent) = opt_u64(v.parent_column);
+
+                MoraineColumnRow {
+                    column_id: v.column_id,
+                    begin_snapshot: v.begin_snapshot,
+                    has_end_snapshot: has_end,
+                    end_snapshot: end,
+                    table_id: v.table_id,
+                    column_order: v.column_order,
+                    column_name: column_name.into_raw(),
+                    column_type: column_type.into_raw(),
+                    initial_default: opt_into_raw(initial_default),
+                    default_value: opt_into_raw(default_value),
+                    nulls_allowed: v.nulls_allowed,
+                    has_parent_column: has_parent,
+                    parent_column: parent,
+                    default_value_type: opt_into_raw(default_value_type),
+                    default_value_dialect: opt_into_raw(default_value_dialect),
+                }
+            },
+        )
+        .collect())
+}
+
 /// Dumps every `ducklake_column` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -396,66 +482,7 @@ pub unsafe extern "C" fn moraine_dump_columns(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_columns(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|v| {
-                        let column_name = to_c_string(&v.column_name)?;
-                        let column_type = to_c_string(&v.column_type)?;
-                        let initial_default = opt_c_string(v.initial_default.as_deref())?;
-                        let default_value = opt_c_string(v.default_value.as_deref())?;
-                        let default_value_type = opt_c_string(v.default_value_type.as_deref())?;
-                        let default_value_dialect =
-                            opt_c_string(v.default_value_dialect.as_deref())?;
-                        Ok((
-                            v,
-                            column_name,
-                            column_type,
-                            initial_default,
-                            default_value,
-                            default_value_type,
-                            default_value_dialect,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-                Ok(owned
-                    .into_iter()
-                    .map(
-                        |(
-                            v,
-                            column_name,
-                            column_type,
-                            initial_default,
-                            default_value,
-                            default_value_type,
-                            default_value_dialect,
-                        )| {
-                            let (has_end, end) = opt_u64(v.end_snapshot);
-                            let (has_parent, parent) = opt_u64(v.parent_column);
-
-                            MoraineColumnRow {
-                                column_id: v.column_id,
-                                begin_snapshot: v.begin_snapshot,
-                                has_end_snapshot: has_end,
-                                end_snapshot: end,
-                                table_id: v.table_id,
-                                column_order: v.column_order,
-                                column_name: column_name.into_raw(),
-                                column_type: column_type.into_raw(),
-                                initial_default: opt_into_raw(initial_default),
-                                default_value: opt_into_raw(default_value),
-                                nulls_allowed: v.nulls_allowed,
-                                has_parent_column: has_parent,
-                                parent_column: parent,
-                                default_value_type: opt_into_raw(default_value_type),
-                                default_value_dialect: opt_into_raw(default_value_dialect),
-                            }
-                        },
-                    )
-                    .collect())
-            },
+            column_rows,
         )
     }
 }

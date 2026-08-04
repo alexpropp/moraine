@@ -13,8 +13,8 @@ moraine-specific prefix, path suffix, or option. Read-write is the default
 (flag absent). moraine invents no grammar; it reads the access mode DuckDB
 already threads through `ATTACH` and maps it to the topology RFC 0004 fixed.
 The single load-bearing unknown — whether DuckLake forwards its outer
-`READ_ONLY` into the nested metadata-catalog attach — is recorded as an open
-question with a self-contained fallback, not asserted.
+`READ_ONLY` into the nested metadata-catalog attach — is now answered: it
+does, observed by fencing rather than by reading rows back.
 
 ## Goals
 
@@ -124,8 +124,10 @@ The bit travels one path, whichever entry point produced it:
 - **The DuckLake path** (`ducklake:moraine:<uri>` → nested
   `ATTACH 'moraine:<uri>'`) reaches step 1 only if DuckLake forwards its
   outer `READ_ONLY` into the access mode of the nested metadata-catalog
-  attach. This is the primary surface and the one unverified link — see Open
-  questions.
+  attach. It does, at the tracked version — so the primary surface needs no
+  moraine-specific option, and the self-contained `moraine: (READ_ONLY)`
+  fallback stays what it was designed as: the reference case, not a
+  workaround anyone has to know about.
 - **The standalone path** (`ATTACH '<uri>' AS m (TYPE moraine, READ_ONLY)`)
   has no chain: DuckDB sets the access mode directly from the attach flag and
   the shim reads it. This path always works and is the reference case the
@@ -151,6 +153,18 @@ selector this RFC decides and is not re-specified here.
 - **DuckLake forwarding (e2e).** Attach `ducklake:moraine:` with outer
   `READ_ONLY` and assert the moraine metadata attach opened read-only —
   pinned against the tracked DuckLake version.
+
+  Rows reading back does not show this: they read back whichever handle the
+  nested attach opened. The decisive observation is a fencing one, and it
+  needs two live processes, because a single CLI session has already exited
+  and dropped its epoch before the next one opens. So: one process holds a
+  read-write chain open across a pause, a second attaches the same store
+  through the same chain with outer `READ_ONLY` and reads, and the first
+  writes again. Its write landing means the reader never took the epoch,
+  which means the nested attach opened a `DbReader`, which means the flag
+  was forwarded. Its write failing fenced would have meant the opposite —
+  and would have promoted the deferred `moraine:`-level `READ_ONLY`
+  documentation from a fallback to a requirement.
 
 ## Alternatives considered
 

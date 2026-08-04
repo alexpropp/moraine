@@ -191,12 +191,65 @@ files.
 
 The extension surface therefore serves projections **through the active
 staged transaction** when one exists: the dump overlays the transaction's
-accumulated operations on the committed state (the same materialization
-the commit-time translation applies), so a statement reads what its
-transaction already wrote. Outside a write transaction, dumps serve
-committed state as before. This is an RFC 0006 obligation; the snapshot
-projection is the load-bearing case, and entity kinds opt in as features
-need them.
+accumulated operations on the committed state, so a statement reads what
+its transaction already wrote. Outside a write transaction, dumps serve
+committed state as before. This is an RFC 0006 obligation.
+
+The overlay is **not** commit-time translation run early, and that is what
+makes it cheap. A staged row is stored untranslated — DuckLake's own cells,
+carrying the snapshot ids DuckLake itself authored — so what a transaction
+will see is fully determined the moment it stages the row. The overlay
+therefore decodes each staged row with the same decoders translation uses
+and applies it to the scanned records in stage order: an insert appends, a
+hard delete drops exactly the version it names, an `UPDATE ... SET
+end_snapshot` ends the live version, an `UPDATE ... SET begin_snapshot`
+rebases it, and the unversioned kinds overwrite or remove by key. It
+validates nothing and diffs nothing; a row translation would refuse still
+appears here and fails at commit, where the refusal belongs.
+
+One overlay serves every kind, so a kind is added by naming its key, its
+lifecycle accessors, and its row decoder — never by hand-writing a
+projection. Committed records are scanned once per transaction and shared
+across kinds, since the transaction is snapshot-isolated and a metadata
+population asks for one kind after another.
+
+Four shapes cover the whole catalog:
+
+- **Versioned records** — the entity kinds, keyed by their `EntityKey` and
+  moved by the lifecycle rules above.
+- **Unversioned records** — the statistics kinds, the deletion schedule, and
+  the mappings: overwritten or removed by key, no lifecycle at all.
+- **Embedded rows** — a partition spec's columns, a file's partition values,
+  a macro's implementations and their parameters, a mapping's name rows, a
+  column's tags. These ride their parent's record, so the projection is its
+  parents' rows plus the rows this transaction staged for parents it is
+  inserting. A staged child always names a parent the same batch inserts —
+  translation refuses one that does not — and an embedded row is only ever
+  removed alongside the parent that carries it, so the parent's own overlay
+  is the delete.
+- **Derived projections** — `ducklake_schema_versions`, assembled from the
+  `schema_version` records plus the snapshots that still fold the same rows
+  in plus the data files the floor rows repair, and `ducklake_metadata`,
+  whose fixed rows are store facts and whose stored half is an option
+  overlay. Each is built from its overlaid inputs by the very function the
+  committed dump uses, so the two cannot diverge.
+
+**Every kind is tx-aware, and that is not merely thoroughness.** Partial
+coverage is *worse* than none: a cascade joining an overlaid table against a
+committed-state one sees a torn view — a data file this transaction deleted,
+still carrying partition-value rows that name it. Uniformity is what makes
+the view a view.
+
+**The scan and the write path must overlay identically.** A rowid a
+metadata scan emits is the row's index into whatever list that scan
+materialized, and the staged-write sink resolves the index back by
+re-materializing the same list. Making a kind tx-aware for the scan alone
+is therefore not a partial improvement but a corruption: an
+`UPDATE`/`DELETE ... WHERE ctid`-shaped statement would resolve an index
+into the overlaid list against the committed one, and name a different row
+or none. The sink materializes on the first row it resolves — before that
+statement has staged anything of its own — which is what keeps its list
+equal to the one the scan handed out.
 
 ### Reader safety
 
