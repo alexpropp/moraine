@@ -238,9 +238,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		if (chunk.size() > 0) {
-			PinScannedRows(state, context.client);
-		}
+		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		// Pinned layout: the row-id column is the last column of the sink
@@ -312,9 +310,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		if (chunk.size() > 0) {
-			PinScannedRows(state, context.client);
-		}
+		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {
@@ -380,9 +376,7 @@ public:
 	duckdb::SinkResultType Sink(duckdb::ExecutionContext &context, duckdb::DataChunk &chunk,
 	                            duckdb::OperatorSinkInput &input) const override {
 		auto &state = input.global_state.Cast<MetadataDmlState>();
-		if (chunk.size() > 0) {
-			PinScannedRows(state, context.client);
-		}
+		PinScannedRows(state, context.client);
 		auto *tx = StagedTx(context.client);
 
 		for (duckdb::idx_t row = 0; row < chunk.size(); row++) {

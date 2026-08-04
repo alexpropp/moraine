@@ -56,20 +56,14 @@ ATTACH 'ducklake:moraine:__TEST_DIR__/pin-store' AS lake (DATA_PATH '__TEST_DIR_
 statement ok
 CREATE TABLE lake.main.t(a BIGINT);
 
-# The snapshot count before the race, held outside any explicit transaction
-# so the comparisons below need no absolute snapshot id.
-statement ok
-CREATE TEMP TABLE baseline AS
-SELECT count(*) AS n FROM __ducklake_metadata_lake.ducklake_snapshot;
-
 statement ok con1
 BEGIN;
 
 # con1's first read materializes `ducklake_snapshot` for its transaction.
-query I con1
-SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = (SELECT n FROM baseline);
-----
-true
+# Held in a connection-local variable so every comparison below is against
+# what con1 itself saw, and none needs an absolute snapshot id.
+statement ok con1
+SET VARIABLE baseline = (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot);
 
 statement ok con2
 INSERT INTO lake.main.t VALUES (1);
@@ -77,7 +71,7 @@ INSERT INTO lake.main.t VALUES (1);
 # The commit landed under con1, and con1 still reads the rows it took. A
 # second dump here would have returned con2's snapshot as well.
 query I con1
-SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = (SELECT n FROM baseline);
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = getvariable('baseline');
 ----
 true
 
@@ -96,7 +90,7 @@ COMMIT;
 # The pin is the transaction's, not the connection's: con1's next
 # transaction sees the commit.
 query I con1
-SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) > (SELECT n FROM baseline);
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) > getvariable('baseline');
 ----
 true
 
