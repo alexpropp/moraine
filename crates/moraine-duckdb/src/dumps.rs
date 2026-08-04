@@ -99,7 +99,7 @@ pub(crate) unsafe fn dump_rows<Row, Rows>(
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
     fetch: impl for<'c> FnOnce(
-        &'c moraine::Catalog,
+        &'c moraine::ReadOnlyCatalog,
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<Rows, moraine::Error>> + 'c>,
     >,
@@ -116,7 +116,7 @@ pub(crate) unsafe fn dump_rows<Row, Rows>(
         let handle_ref = unsafe { &*handle };
         // SAFETY: `probe`/`probe_ctx` validity is the caller's contract.
         let rows = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, fetch(&handle_ref.catalog))
+            handle_ref.block_on_cancellable(probe, probe_ctx, fetch(handle_ref.catalog.reads()))
         }?;
         convert(rows)
     };

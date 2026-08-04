@@ -32,7 +32,7 @@ use tracing::warn;
 use crate::{
     error::{AbiError, INTERNAL_PANIC_MESSAGE, MoraineError, codes},
     runtime::{
-        CANCELLED_ATTACH_SHUTDOWN, MoraineCatalogHandle, MoraineInterruptProbe,
+        AttachedCatalog, CANCELLED_ATTACH_SHUTDOWN, MoraineCatalogHandle, MoraineInterruptProbe,
         MoraineSnapshotHandle, block_on_cancellable_in, new_runtime,
     },
 };
@@ -407,10 +407,11 @@ impl StoreKind {
                     // its region-derived endpoint and misroutes every request.
                     // Only apply a genuinely custom (non-AWS) endpoint; for AWS,
                     // let object_store derive the endpoint from the region.
-                    if let Some(v) = c.endpoint {
-                        if !v.is_empty() && !v.contains("amazonaws.com") {
-                            builder = builder.with_endpoint(v);
-                        }
+                    if let Some(v) = c.endpoint
+                        && !v.is_empty()
+                        && !v.contains("amazonaws.com")
+                    {
+                        builder = builder.with_endpoint(v);
                     }
                     if c.url_style == Some("path") {
                         builder = builder.with_virtual_hosted_style_request(false);
@@ -534,14 +535,14 @@ fn refuse_overlapping_data_path(store_path: &str, data_path: &str) -> Result<(),
 /// from then on. `None`/`None` yields no store.
 fn resolve_data_store(
     runtime: &tokio::runtime::Runtime,
-    catalog: &moraine::Catalog,
+    catalog: &AttachedCatalog,
     store_path: &str,
     data_path_arg: Option<String>,
     read_only: bool,
     s3_creds: Option<&S3Creds>,
 ) -> Result<(Option<Arc<dyn ObjectStore>>, String), AbiError> {
     let recorded = runtime
-        .block_on(catalog.snapshot())
+        .block_on(catalog.reads().snapshot())
         .map_err(AbiError::from)?
         .data_path();
     // Whether this attach is the one adopting the value, recorded only
@@ -572,7 +573,7 @@ fn resolve_data_store(
     if adopting {
         let to_record = data_root.clone().unwrap_or_default();
         runtime
-            .block_on(catalog.commit(move |tx| {
+            .block_on(catalog.writer()?.commit(move |tx| {
                 tx.set_option(moraine::OptionScope::Global, "data_path", &to_record)?;
                 Ok(())
             }))
@@ -822,6 +823,7 @@ pub unsafe extern "C" fn moraine_attach(
                     probe_ctx,
                     moraine::Catalog::open_read_only(object_store, options),
                 )
+                .map(AttachedCatalog::Reader)
                 // A read-only attach never bootstraps; on a fresh store the
                 // open fails, so surface the reason (DuckDB defaults remote
                 // attaches to read-only) and the fix (add READ_WRITE).
@@ -833,6 +835,7 @@ pub unsafe extern "C" fn moraine_attach(
                     probe_ctx,
                     moraine::Catalog::open(object_store, options),
                 )
+                .map(AttachedCatalog::Writer)
             }
         };
         let catalog = match opened {
@@ -857,7 +860,7 @@ pub unsafe extern "C" fn moraine_attach(
                 // The catalog is already open (and may have committed the
                 // adopted data_path); flush and release it before failing
                 // the attach instead of dropping it un-closed.
-                let _ = runtime.block_on(catalog.close());
+                let _ = runtime.block_on(catalog.reads().close());
                 return Err(error);
             }
         };
@@ -915,7 +918,7 @@ pub unsafe extern "C" fn moraine_data_path(
         let handle_ref = unsafe { &*handle };
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let path_ptr = match snapshot.data_path() {
             Some(path) => to_c_string(&path)?.into_raw(),
@@ -1114,7 +1117,7 @@ pub unsafe extern "C" fn moraine_catalog_encrypted(
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
 
         Ok(snapshot
@@ -1153,7 +1156,7 @@ pub unsafe extern "C" fn moraine_detach(handle: *mut MoraineCatalogHandle) {
     let attempt = || {
         // SAFETY: caller contract above; dropped exactly once.
         let boxed = unsafe { Box::from_raw(handle) };
-        if let Err(err) = boxed.block_on(boxed.catalog.close()) {
+        if let Err(err) = boxed.block_on(boxed.catalog.reads().close()) {
             // Detach has no error channel, so the failed close (a final
             // flush that did not land) is logged rather than lost. The
             // event surfaces through any remaining drain point or a host
@@ -1199,7 +1202,7 @@ pub unsafe extern "C" fn moraine_snapshot(
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         Ok(Box::new(MoraineSnapshotHandle::new(snapshot)))
     };
@@ -1766,7 +1769,7 @@ unsafe fn create_index_in_one_commit(
                 handle.block_on_cancellable(
                     probe,
                     probe_ctx,
-                    handle.catalog.scoped_backfill_entries(
+                    handle.catalog.reads().scoped_backfill_entries(
                         store,
                         &handle.data_prefix,
                         table_id,
@@ -1784,6 +1787,7 @@ unsafe fn create_index_in_one_commit(
             probe_ctx,
             handle
                 .catalog
+                .reads()
                 .inline_backfill_entries(table_id, &def.columns),
         )
     }?;
@@ -1794,7 +1798,7 @@ unsafe fn create_index_in_one_commit(
         handle.block_on_cancellable(
             probe,
             probe_ctx,
-            handle.catalog.commit(|tx| {
+            handle.catalog.writer()?.commit(|tx| {
                 if orders.is_empty() {
                     tx.create_index(table_id, def, &backfill)?;
                 } else {
@@ -1849,7 +1853,7 @@ pub unsafe extern "C" fn moraine_index_create(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let live_columns = snapshot.columns_of(table_id);
@@ -1898,7 +1902,7 @@ pub unsafe extern "C" fn moraine_index_create(
                 handle_ref.block_on_cancellable(
                     probe,
                     probe_ctx,
-                    handle_ref.catalog.create_index_staged(
+                    handle_ref.catalog.writer()?.create_index_staged(
                         table_id,
                         &def,
                         &orders,
@@ -1963,7 +1967,7 @@ pub unsafe extern "C" fn moraine_index_drop(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let index = snapshot
@@ -1975,7 +1979,10 @@ pub unsafe extern "C" fn moraine_index_drop(
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
-                handle_ref.catalog.commit(move |tx| tx.drop_index(index_id)),
+                handle_ref
+                    .catalog
+                    .writer()?
+                    .commit(move |tx| tx.drop_index(index_id)),
             )
         }?;
         Ok(())
@@ -2035,7 +2042,11 @@ pub unsafe extern "C" fn moraine_maintain(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let report = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.maintain(request))
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.writer()?.maintain(request),
+            )
         }?;
 
         if !indexes_swept.is_null() {
@@ -2147,7 +2158,7 @@ pub unsafe extern "C" fn moraine_store_census(
                 handle_ref.block_on_cancellable(
                     probe,
                     probe_ctx,
-                    handle_ref.catalog.store_census(request),
+                    handle_ref.catalog.reads().store_census(request),
                 )
             }?;
 
@@ -2281,7 +2292,7 @@ pub unsafe extern "C" fn moraine_compact_store(
                 handle_ref.block_on_cancellable(
                     probe,
                     probe_ctx,
-                    handle_ref.catalog.compact_store(request),
+                    handle_ref.catalog.writer()?.compact_store(request),
                 )
             }?;
 
@@ -2435,7 +2446,7 @@ pub unsafe extern "C" fn moraine_indexes(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         // Owned-first: no raw pointers until every string converts.
@@ -2651,7 +2662,7 @@ pub unsafe extern "C" fn moraine_index_lookup(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let index = snapshot
@@ -2678,7 +2689,10 @@ pub unsafe extern "C" fn moraine_index_lookup(
             handle_ref.block_on_cancellable(
                 probe,
                 probe_ctx,
-                handle_ref.catalog.index_lookup(table_id, index.id, &key),
+                handle_ref
+                    .catalog
+                    .reads()
+                    .index_lookup(table_id, index.id, &key),
             )
         }?;
         Ok(locations
@@ -2770,7 +2784,7 @@ pub unsafe extern "C" fn moraine_index_range(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let index = snapshot
@@ -2815,6 +2829,7 @@ pub unsafe extern "C" fn moraine_index_range(
                 probe_ctx,
                 handle_ref
                     .catalog
+                    .reads()
                     .index_range(table_id, index.id, lower, upper, reverse),
             )
         }?;
@@ -2899,7 +2914,7 @@ pub unsafe extern "C" fn moraine_index_nulls(
 
         // SAFETY: caller contract for `probe`/`probe_ctx`.
         let snapshot = unsafe {
-            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.snapshot())
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
         }?;
         let table_id = resolve_table(&snapshot, schema, table)?;
         let index = snapshot
@@ -2924,6 +2939,7 @@ pub unsafe extern "C" fn moraine_index_nulls(
                 probe_ctx,
                 handle_ref
                     .catalog
+                    .reads()
                     .index_nulls(table_id, index.id, values, reverse),
             )
         }?;
@@ -4793,7 +4809,7 @@ mod tests {
         // SAFETY: `handle` is attached for the duration of the caller.
         let handle_ref = unsafe { &*handle };
         handle_ref
-            .block_on(handle_ref.catalog.snapshot())
+            .block_on(handle_ref.catalog.reads().snapshot())
             .expect("read head")
             .current_snapshot()
             .id

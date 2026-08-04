@@ -42,6 +42,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
+  # The declared MSRV, compiled with the toolchain it names. The version is
+  # read out of the workspace manifest rather than repeated here, so the
+  # gate and the declaration cannot drift apart. `check --all-targets`
+  # rather than `test`: what the MSRV promises is that the workspace
+  # compiles, and the test job already runs the suite on the pinned
+  # toolchain.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - id: declared
+        run: echo "version=$(grep -oP '(?<=^rust-version = ")[^"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - run: rustup toolchain install ${{ steps.declared.outputs.version }} --profile minimal
+      - run: cargo +${{ steps.declared.outputs.version }} check --workspace --locked --all-targets
+
   doc:
     runs-on: ubuntu-latest
     env:
@@ -56,6 +72,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # An `ignore` entry whose advisory no longer matches anything is
+          # only a warning, and the check still exits 0 — which is how two
+          # suppressions outlived their advisories unnoticed. Failing on it
+          # makes a stale one say so. `command-arguments` lands after the
+          # subcommand, which is where a `check` flag belongs.
+          command-arguments: -D advisory-not-detected
 
   pins:
     runs-on: ubuntu-latest

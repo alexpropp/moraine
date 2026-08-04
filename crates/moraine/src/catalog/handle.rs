@@ -390,11 +390,48 @@ fn parse_checkpoint(checkpoint: Option<&str>) -> Result<Option<uuid::Uuid>> {
 /// closure satisfies that on its own.
 pub type CommitMember<'a> = &'a (dyn Fn(&mut Transaction) -> Result<()> + Sync);
 
-/// A handle to a moraine catalog: cheap to clone, drives reads and
-/// commits. The storage substrate never appears in this API — a catalog
+/// The read surface of a moraine catalog: cheap to clone, drives every
+/// read. This is what a read-only attach hands back, and what a
+/// read-write [`Catalog`] derefs to, so the reads are written once and
+/// both modes serve them.
+///
+/// It carries no mutator at all. That is the point: a `commit` against a
+/// catalog opened read-only is a compile error rather than a runtime
+/// [`Error::Constraint`], so the mode a handle was opened in is visible in
+/// its type. The storage substrate never appears in this API — a catalog
 /// lives in a bucket reachable through any [`ObjectStore`].
+///
+/// ```compile_fail
+/// # use std::sync::Arc;
+/// # use moraine::{Catalog, CatalogOptions};
+/// # use object_store::memory::InMemory;
+/// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+/// # let object_store = Arc::new(InMemory::new());
+/// # let writer = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+/// # writer.close().await?;
+/// let reader = Catalog::open_read_only(object_store, CatalogOptions::default()).await?;
+/// // There is no `commit` on a read-only handle, so this does not build.
+/// reader.commit(|tx| tx.create_schema("nope").map(|_| ())).await?;
+/// # Ok::<(), moraine::Error>(()) }).unwrap();
+/// ```
+///
+/// The reads it does carry work exactly as they do on a writer:
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use moraine::{Catalog, CatalogOptions};
+/// # use object_store::memory::InMemory;
+/// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+/// # let object_store = Arc::new(InMemory::new());
+/// # let writer = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+/// # writer.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+/// # writer.close().await?;
+/// let reader = Catalog::open_read_only(object_store, CatalogOptions::default()).await?;
+/// assert!(reader.snapshot().await?.schema_by_name("sales").is_some());
+/// # Ok::<(), moraine::Error>(()) }).unwrap();
+/// ```
 #[derive(Clone)]
-pub struct Catalog {
+pub struct ReadOnlyCatalog {
     store: Arc<Store>,
     // Shared across handle clones: how this attach has served its reads.
     reads: Arc<ReadTally>,
@@ -410,6 +447,25 @@ pub struct Catalog {
     commits: Arc<commit::Coalescer>,
 }
 
+impl std::fmt::Debug for ReadOnlyCatalog {
+    // `slatedb::Db` carries no `Debug` impl.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadOnlyCatalog").finish_non_exhaustive()
+    }
+}
+
+/// A read-write handle to a moraine catalog: cheap to clone, drives reads
+/// and commits.
+///
+/// Every read lives on [`ReadOnlyCatalog`] and reaches this type through
+/// `Deref`, so a writer serves the whole read surface without restating
+/// it; what this type adds is the mutators. Exactly one process may hold
+/// one per store.
+#[derive(Clone)]
+pub struct Catalog {
+    inner: ReadOnlyCatalog,
+}
+
 impl std::fmt::Debug for Catalog {
     // `slatedb::Db` carries no `Debug` impl.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -417,302 +473,18 @@ impl std::fmt::Debug for Catalog {
     }
 }
 
-impl Catalog {
-    /// Opens (creating and initializing if empty) the catalog in
-    /// `object_store` at `options.path`.
-    ///
-    /// Exactly one process may hold a read-write catalog per store —
-    /// opening a second fences the first.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store cannot be opened, is mid-migration,
-    /// or is stamped with a structural format this binary does not
-    /// understand.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// // Bootstrap mints the default `main` schema.
-    /// assert_eq!(catalog.snapshot().await?.schemas().len(), 1);
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
-    pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
-        if options.checkpoint.is_some() {
-            return Err(Error::Configuration(
-                "a checkpoint pins a read-only catalog to a fixed cut; a writer commits new \
-                 state and cannot be opened against one"
-                    .to_string(),
-            ));
-        }
-        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
-        let located = Arc::clone(&object_store);
-        let store = StoreBuilder::new(&options.path, object_store)
-            .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone())
-            .cache_size(options.cache_size)
-            .cache_preload(options.cache_preload)
-            .cache_puts(options.cache_puts);
-        let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
-            .await?;
-        info!(
-            path = options.path,
-            flush_interval_ms = options.flush_interval.as_millis(),
-            "opened catalog read-write"
-        );
-        let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
-        Ok(Self {
-            store: Arc::new(Store::Writer(db)),
-            location: Arc::new(StoreLocation {
-                path: options.path,
-                object_store: located,
-            }),
-            reads: Arc::new(ReadTally::default()),
-            commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
-            projections,
-        })
+/// The whole read surface, without restating a method of it. Field access
+/// through the deref is what lets the mutators below read `self.store` and
+/// `self.commits` unchanged.
+impl std::ops::Deref for Catalog {
+    type Target = ReadOnlyCatalog;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
+}
 
-    /// Opens the catalog **read-only** in `object_store` at `options.path`,
-    /// as a `DbReader` following the latest manifest — or, when
-    /// [`CatalogOptions::checkpoint`] is set, pinned to that checkpoint.
-    ///
-    /// A read-only catalog never opens the writer `Db`, so it never fences a
-    /// live read-write process — any number of read-only catalogs may attach
-    /// alongside the one writer. It never bootstraps: opening a
-    /// store no writer has initialized is refused. [`commit`](Self::commit)
-    /// returns [`Error::Constraint`].
-    ///
-    /// "Read-only" is a catalog property, not an IAM one: following the
-    /// latest state means writing a checkpoint into the manifest on open and
-    /// refreshing it while the catalog lives, so those credentials still
-    /// need manifest write access. A catalog opened against a checkpoint
-    /// writes nothing whatsoever, and in exchange reads the fixed cut that
-    /// checkpoint names — later commits never appear, however long it stays
-    /// open.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store cannot be opened, is not an initialized
-    /// moraine catalog, is stamped with an unknown structural format, or
-    /// names a checkpoint that is not a valid id or no longer exists.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// let object_store = Arc::new(InMemory::new());
-    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
-    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
-    /// let checkpoint = catalog.create_checkpoint(None).await?;
-    ///
-    /// // A commit after the checkpoint is not in it.
-    /// catalog.commit(|tx| tx.create_schema("ops").map(|_| ())).await?;
-    ///
-    /// let mut options = CatalogOptions::default();
-    /// options.checkpoint = Some(checkpoint);
-    /// let reader = Catalog::open_read_only(object_store, options).await?;
-    /// let view = reader.snapshot().await?;
-    /// assert!(view.schema_by_name("sales").is_some());
-    /// assert!(view.schema_by_name("ops").is_none());
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
-    pub async fn open_read_only(
-        object_store: Arc<dyn ObjectStore>,
-        options: CatalogOptions,
-    ) -> Result<Self> {
-        let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
-        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
-        let located = Arc::clone(&object_store);
-        let store = StoreBuilder::new(&options.path, object_store)
-            .cache_dir(options.cache_dir.clone())
-            .cache_size(options.cache_size)
-            .cache_preload(options.cache_preload)
-            .cache_puts(options.cache_puts)
-            .poll_interval(options.reader_poll_interval)
-            .checkpoint(checkpoint);
-
-        let reader = commit::open_reader_initialized(store).await?;
-        info!(
-            path = options.path,
-            checkpoint = options.checkpoint,
-            "opened catalog read-only"
-        );
-        let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
-        Ok(Self {
-            store: Arc::new(Store::Reader(Arc::new(reader))),
-            location: Arc::new(StoreLocation {
-                path: options.path,
-                object_store: located,
-            }),
-            reads: Arc::new(ReadTally::default()),
-            commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
-            projections,
-        })
-    }
-
-    /// Rewrites the store in place to the newest structural format this
-    /// binary understands, resuming an interrupted migration if one is in
-    /// flight, and reports what it did.
-    ///
-    /// Deliberately **not** part of opening a catalog. A structural rewrite
-    /// walks the keyspace and holds the single writer for its duration, so
-    /// it is the operator's explicit choice, never a side effect of someone
-    /// attaching with a newer binary. It takes the writer epoch exactly as
-    /// [`open`](Self::open) does, so it fences a running catalog and is
-    /// itself fenced by one — exactly one migrator runs.
-    ///
-    /// Running it against a store already at the newest format is a no-op:
-    /// the returned report names the same format twice and no units.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Corruption`] if the store is not an initialized
-    /// moraine catalog, or carries a marker its format stamp contradicts;
-    /// [`Error::Migration`] if a migration is in flight that this binary does
-    /// not carry; or a store error if a batch fails.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions, MigrationRequest};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// let object_store = Arc::new(InMemory::new());
-    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
-    /// catalog.close().await?;
-    ///
-    /// let report = Catalog::migrate(
-    ///     object_store,
-    ///     CatalogOptions::default(),
-    ///     MigrationRequest::default(),
-    /// )
-    /// .await?;
-    /// // A fresh store is already current, so nothing runs.
-    /// assert_eq!(report.from_format, report.to_format);
-    /// assert!(report.units_run.is_empty());
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
-    pub async fn migrate(
-        object_store: Arc<dyn ObjectStore>,
-        options: CatalogOptions,
-        request: MigrationRequest,
-    ) -> Result<MigrationReport> {
-        let db = StoreBuilder::new(&options.path, object_store.clone())
-            .flush_interval(options.flush_interval)
-            .cache_dir(options.cache_dir.clone())
-            .cache_size(options.cache_size)
-            .cache_preload(options.cache_preload)
-            .cache_puts(options.cache_puts)
-            .open_writer()
-            .await?;
-
-        let checkpoint = if request.checkpoint {
-            let taken = open::create_checkpoint(&db, None).await?;
-            info!(checkpoint = %taken, "took a pre-migration checkpoint");
-            Some(taken)
-        } else {
-            None
-        };
-
-        let report = migration::run(&db).await;
-        let closed = db.close().await.map_err(Error::from);
-
-        // A failed migration keeps its checkpoint: it is the recovery point
-        // the operator asked for, and releasing it here would discard the one
-        // thing that makes the failure recoverable.
-        let report = report.and_then(|report| closed.map(|()| report))?;
-
-        if let Some(checkpoint) = checkpoint {
-            StoreBuilder::new(&options.path, object_store)
-                .delete_checkpoint(checkpoint)
-                .await?;
-        }
-
-        Ok(report)
-    }
-
-    /// Pins everything committed so far as a checkpoint, and reports its id.
-    ///
-    /// A checkpoint is an immutable cut of the store that
-    /// [`CatalogOptions::checkpoint`] opens a reader against — the one way to
-    /// read a moraine catalog with credentials that cannot write at all,
-    /// since a reader that follows the latest state maintains a checkpoint of
-    /// its own and so writes the manifest.
-    ///
-    /// It also pins every object it references against SlateDB's garbage
-    /// collection, so a checkpoint with no `lifetime` holds storage until
-    /// [`delete_checkpoint`](Self::delete_checkpoint) removes it. Give one a
-    /// lifetime unless something will.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
-    /// creating a checkpoint is a manifest write — or a store error if the
-    /// write fails.
-    pub async fn create_checkpoint(&self, lifetime: Option<Duration>) -> Result<String> {
-        let id = open::create_checkpoint(self.writer()?, lifetime).await?;
-        info!(checkpoint = %id, "created a checkpoint");
-        Ok(id.to_string())
-    }
-
-    /// Deletes the checkpoint `checkpoint`, releasing the objects it pinned.
-    ///
-    /// Free-standing rather than a method, exactly as
-    /// [`migrate`](Self::migrate) is: it CASes the manifest and never opens
-    /// the writer `Db`, so it runs against a live catalog without fencing
-    /// it. Readers already open against the deleted checkpoint keep
-    /// serving; a reader that opens against it afterwards is refused.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Configuration`] if `checkpoint` is not a valid id,
-    /// or a store error if the manifest update fails.
-    pub async fn delete_checkpoint(
-        object_store: Arc<dyn ObjectStore>,
-        options: CatalogOptions,
-        checkpoint: &str,
-    ) -> Result<()> {
-        let id = parse_checkpoint(Some(checkpoint))?
-            .ok_or_else(|| Error::Configuration("no checkpoint given".to_string()))?;
-        StoreBuilder::new(&options.path, object_store)
-            .delete_checkpoint(id)
-            .await
-    }
-
-    /// Every checkpoint the store's manifest carries, as the ids
-    /// [`create_checkpoint`](Self::create_checkpoint) hands out.
-    ///
-    /// Free-standing for the same reason
-    /// [`delete_checkpoint`](Self::delete_checkpoint) is: it reads the
-    /// manifest and never opens the writer `Db`, so it runs against a live
-    /// catalog without fencing it. A checkpoint given no lifetime pins
-    /// what it references until it is deleted, so this is how an operator
-    /// finds one whose id was lost — reader-established checkpoints show
-    /// up here too, and are not theirs to delete.
-    ///
-    /// # Errors
-    ///
-    /// Returns a store error if the manifest cannot be read.
-    pub async fn checkpoints(
-        object_store: Arc<dyn ObjectStore>,
-        options: CatalogOptions,
-    ) -> Result<Vec<String>> {
-        let ids = StoreBuilder::new(&options.path, object_store)
-            .list_checkpoints()
-            .await?;
-        Ok(ids.iter().map(uuid::Uuid::to_string).collect())
-    }
-
+impl ReadOnlyCatalog {
     /// The maintained-projection state shared by this handle's clones.
     pub(crate) fn projections(&self) -> &Arc<std::sync::RwLock<ProjectionCache>> {
         &self.projections
@@ -723,17 +495,6 @@ impl Catalog {
     /// always scan.
     pub(crate) fn maintains_projections(&self) -> bool {
         matches!(self.store.as_ref(), Store::Writer(_))
-    }
-
-    /// The read-write writer, or [`Error::Constraint`] if the catalog was
-    /// opened read-only.
-    fn writer(&self) -> Result<&Db> {
-        match self.store.as_ref() {
-            Store::Writer(db) => Ok(db),
-            Store::Reader(_) => Err(Error::Constraint(
-                "catalog opened read-only; writes are unavailable".to_string(),
-            )),
-        }
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -1261,15 +1022,6 @@ impl Catalog {
         Ok(session)
     }
 
-    /// Opens a read-write transaction for the staged-row commit path. Fails
-    /// with [`Error::Constraint`] on a read-only catalog.
-    pub(crate) async fn begin_write_tx(&self) -> Result<DbTransaction> {
-        self.writer()?
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(Error::from)
-    }
-
     /// Derives the index entries for a file the extension path registers, by
     /// scoped-reading it — DuckLake supplies none, so moraine reads them.
     /// The caller resolves each of the index's columns to its physical
@@ -1430,190 +1182,6 @@ impl Catalog {
         outcome
     }
 
-    /// Creates an index by a staged (multi-commit) build, driving it to
-    /// `ready` before returning — for a table whose backfill exceeds what
-    /// one commit may stage.
-    ///
-    /// The definition lands `building` in its own commit; each pass then
-    /// derives the table's live entries (external files through
-    /// `data_store`, inline rows from the catalog store), orders them by row
-    /// id, and commits them in steps of `step_entries`, defaulting to a
-    /// million. Writers maintain entries from the first commit forward.
-    ///
-    /// Interrupting the call leaves the definition `building`: calling again
-    /// with the same `def` resumes from the persisted cursor, and
-    /// [`Transaction::drop_index`](crate::Transaction::drop_index) abandons
-    /// the build. A concurrent write to the table conflicts with a step,
-    /// which re-derives at a fresh snapshot rather than staging entries for
-    /// rows the winner deleted.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::AlreadyExists`] if the table already holds a ready
-    /// index of this name, or [`Error::Constraint`] if `step_entries` is
-    /// zero, the resumed definition differs from `def`, or the rows
-    /// duplicate a unique value. A failed build drops its definition.
-    pub async fn create_index_staged(
-        &self,
-        table: TableId,
-        def: &IndexDef,
-        orders: &[ColumnOrder],
-        data_store: Option<Arc<dyn ObjectStore>>,
-        data_prefix: &str,
-        step_entries: Option<usize>,
-    ) -> Result<IndexId> {
-        let step_entries = step_entries.unwrap_or(BUILD_STEP_ENTRIES);
-        if step_entries == 0 {
-            return Err(Error::Constraint(
-                "a staged build's step size must be at least one entry".to_owned(),
-            ));
-        }
-
-        let index = self.begin_staged_index(table, def, orders).await?;
-        let outcome = self
-            .drive_staged_build(table, def, index, data_store, data_prefix, step_entries)
-            .await;
-
-        // A build that cannot finish leaves no half-covered index behind.
-        // A cleanup that itself fails is logged, never substituted for the
-        // failure that caused it.
-        if outcome.is_err()
-            && let Err(cleanup) = self.commit(|tx| tx.drop_index(index)).await
-        {
-            warn!(
-                index = index.get(),
-                error = %cleanup,
-                "could not drop the definition of a failed staged build"
-            );
-        }
-        outcome.map(|()| index)
-    }
-
-    /// Commits the `building` definition, or adopts the one already there.
-    /// A ready definition of the same name belongs to a finished index.
-    async fn begin_staged_index(
-        &self,
-        table: TableId,
-        def: &IndexDef,
-        orders: &[ColumnOrder],
-    ) -> Result<IndexId> {
-        if let Some(existing) = self.snapshot().await?.index_by_name(table, &def.name) {
-            return match existing.state {
-                IndexState::Ready => Err(Error::AlreadyExists(format!(
-                    "index {} on table {table}",
-                    def.name
-                ))),
-                IndexState::Building | IndexState::Poisoned => {
-                    // Resuming adopts the stored definition, whose entries
-                    // are encoded under its own orders.
-                    let (directions, nulls) = requested_orders(orders, def.columns.len());
-                    if existing.columns != def.columns
-                        || existing.unique != def.unique
-                        || existing.directions != directions
-                        || existing.nulls != nulls
-                    {
-                        return Err(Error::Constraint(format!(
-                            "index {} on table {table} is already building over a different \
-                             definition; drop it to rebuild",
-                            def.name
-                        )));
-                    }
-                    Ok(existing.id)
-                }
-            };
-        }
-
-        let index = std::cell::Cell::new(None);
-        self.commit(|tx| {
-            let id = tx.create_index_staged_ordered(table, def, orders)?;
-            index.set(Some(id));
-            Ok(())
-        })
-        .await?;
-
-        index
-            .get()
-            .ok_or_else(|| Error::Corruption("staged create returned no index id".to_owned()))
-    }
-
-    /// Derives the live backfill and commits it in bounded steps until the
-    /// index is ready, re-deriving at a fresh snapshot after a lost race.
-    async fn drive_staged_build(
-        &self,
-        table: TableId,
-        def: &IndexDef,
-        index: IndexId,
-        data_store: Option<Arc<dyn ObjectStore>>,
-        data_prefix: &str,
-        step_entries: usize,
-    ) -> Result<()> {
-        for _ in 0..BUILD_DERIVATION_ATTEMPTS {
-            let mut entries = match &data_store {
-                Some(store) => {
-                    self.scoped_backfill_entries(
-                        Arc::clone(store),
-                        data_prefix,
-                        table,
-                        &def.columns,
-                    )
-                    .await?
-                }
-                None => Vec::new(),
-            };
-            entries.extend(self.inline_backfill_entries(table, &def.columns).await?);
-            // One watermark can describe the covered set only in row-id
-            // order, which per-row-id rewrite files would otherwise break.
-            entries.sort_unstable_by_key(|entry| entry.row_id);
-
-            if let BuildProgress::Ready = self
-                .commit_build_steps(table, index, &entries, step_entries)
-                .await?
-            {
-                return Ok(());
-            }
-        }
-        Err(Error::CommitConflict(format!(
-            "staged build of index {index} lost its race {BUILD_DERIVATION_ATTEMPTS} times; \
-             the table is under concurrent write"
-        )))
-    }
-
-    /// Commits `entries` above the persisted cursor in steps, the last one
-    /// flipping the index ready.
-    async fn commit_build_steps(
-        &self,
-        table: TableId,
-        index: IndexId,
-        entries: &[IndexEntry],
-        step_entries: usize,
-    ) -> Result<BuildProgress> {
-        loop {
-            let cursor = self.staged_build_cursor(table, index).await?;
-            // The cursor is the highest row id covered; absent means none
-            // is, so row id 0 is still pending.
-            let pending = match cursor {
-                Some(covered) => entries.partition_point(|entry| entry.row_id <= covered),
-                None => 0,
-            };
-            let remaining = &entries[pending..];
-            let step = &remaining[..remaining.len().min(step_entries)];
-            let is_final = step.len() == remaining.len();
-
-            match self
-                .commit(|tx| tx.build_index_step(index, step, is_final).map(|_| ()))
-                .await
-            {
-                Ok(_) => {
-                    if is_final {
-                        return Ok(BuildProgress::Ready);
-                    }
-                }
-                Err(Error::CommitConflict(_)) => return Ok(BuildProgress::Conflicted),
-                Err(other) => return Err(other),
-            }
-        }
-    }
-
     /// The staged build's persisted watermark. An index that is no longer
     /// building is refused.
     async fn staged_build_cursor(&self, table: TableId, index: IndexId) -> Result<Option<u64>> {
@@ -1715,111 +1283,6 @@ impl Catalog {
         outcome
     }
 
-    /// Deletes up to `limit` orphaned entries of a dropped index, in one
-    /// bounded batch outside the commit protocol (entries are not catalog
-    /// entities, and the dropping commit's batch must stay bounded). Returns
-    /// the number deleted; a host loops until it returns 0. Index ids are
-    /// never reused, so a concurrent create cannot collide with a sweep.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Constraint`] if the index is still live (reclaiming
-    /// a live index's entries would corrupt it), or a store error.
-    pub async fn reclaim_index_entries(&self, index: IndexId, limit: usize) -> Result<usize> {
-        let head = self.snapshot().await?;
-        if head
-            .indexes
-            .values()
-            .any(|per_table| per_table.contains_key(&index.get()))
-        {
-            return Err(Error::Constraint(format!(
-                "index {index} is still live; drop it before reclaiming its entries"
-            )));
-        }
-
-        let tx = self.begin_write_tx().await?;
-        let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
-        commit::commit_durable(tx, "entry reclamation")
-            .await
-            .map_err(Error::from)?;
-
-        Ok(deleted)
-    }
-
-    /// Runs one maintenance pass, reclaiming what only moraine knows is
-    /// dead, and reports what it did.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Constraint`] on a read-only catalog,
-    /// [`Error::Configuration`] for a zero `batch_size`, or a store error.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions, MaintenanceRequest};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// // A fresh catalog has nothing to reclaim.
-    /// let report = catalog.maintain(MaintenanceRequest::default()).await?;
-    /// assert_eq!(report.index_entries_reclaimed, 0);
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
-    pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
-        // Refuse before doing anything, including before the
-        // nothing-to-do shortcut: a pass that reclaims nothing is still a
-        // pass, and answering it differently on a read-only catalog would
-        // make the outcome depend on the request rather than the handle.
-        self.writer()?;
-        if request.batch_size == 0 {
-            return Err(Error::Configuration(
-                "batch_size must be nonzero; zero would reclaim nothing and never terminate"
-                    .to_string(),
-            ));
-        }
-
-        let mut report = MaintenanceReport::default();
-        if !request.sweep_orphaned_index_entries {
-            return Ok(report);
-        }
-
-        // Index ids come from the monotonic catalog-id counter and are
-        // never reused, so an id absent from this view can never become
-        // live again: deciding liveness once, here, is sound for the
-        // whole pass however long it runs.
-        let live: HashSet<u64> = self
-            .snapshot()
-            .await?
-            .indexes
-            .values()
-            .flat_map(|per_table| per_table.keys().copied())
-            .collect();
-
-        for kind in [IndexKind::Unique, IndexKind::Multi] {
-            let mut from = 0u64;
-            while let Some(index_id) = self.first_index_id_from(kind, from).await? {
-                if !live.contains(&index_id) {
-                    let reclaimed = self
-                        .reclaim_dead_range(kind, index_id, request.batch_size)
-                        .await?;
-                    if reclaimed > 0 {
-                        report.indexes_swept += 1;
-                        report.index_entries_reclaimed += reclaimed;
-                    }
-                }
-                // Seek past this index rather than walking its entries.
-                match index_id.checked_add(1) {
-                    Some(next) => from = next,
-                    None => break,
-                }
-            }
-        }
-
-        Ok(report)
-    }
-
     /// What the store weighs, subspace by subspace.
     ///
     /// The default request reads the store's manifest and nothing else —
@@ -1827,7 +1290,7 @@ impl Catalog {
     /// reports physical bytes, SST counts, and sorted-run counts per
     /// subspace. Those figures include superseded versions and tombstones,
     /// which is the point: the gap between them and the live count is what
-    /// [`compact_store`](Self::compact_store) reclaims.
+    /// [`compact_store`](Catalog::compact_store) reclaims.
     ///
     /// Setting [`CensusRequest::count_live_entries`] adds a scan of every
     /// subspace, which costs a full read of the store.
@@ -1914,116 +1377,6 @@ impl Catalog {
         })
     }
 
-    /// Merges each targeted subspace's sorted runs into one, reclaiming the
-    /// superseded versions and tombstones they hold.
-    ///
-    /// moraine plans nothing: SlateDB decides which runs merge into which,
-    /// and the plan it makes for a whole tree destines that tree's bottom
-    /// run — which is what permits dropping a tombstone rather than carrying
-    /// it forward. A subspace with no sorted runs is skipped, as is one
-    /// already being merged.
-    ///
-    /// With [`CompactStoreRequest::wait`] set, the call returns once every
-    /// submitted merge has committed or failed. A merge that outlives the
-    /// wait is **not** cancelled: it keeps running, is reported
-    /// [`MergeOutcome::Pending`], and a later census shows the result.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
-    /// the compactor that executes a submitted merge runs inside the writer,
-    /// so a reader would queue work nothing would run — or a store error if
-    /// the merge cannot be submitted.
-    pub async fn compact_store(&self, request: CompactStoreRequest) -> Result<CompactStoreReport> {
-        self.writer()?;
-
-        let target = match &request.target {
-            CompactionTarget::WholeStore => None,
-            CompactionTarget::Subspace(name) => match name.subspace() {
-                Some(subspace) => Some(subspace_prefix(subspace)),
-                // An unknown subspace addresses no keys, so there is no
-                // tree to name in a request.
-                None => {
-                    return Err(Error::Configuration(format!(
-                        "{name} is not a subspace this build can merge"
-                    )));
-                }
-            },
-        };
-
-        let before = self.store_census(CensusRequest::default()).await?;
-        let submitted = store_compaction::submit_full_merge(
-            &self.location.path,
-            Arc::clone(&self.location.object_store),
-            target.as_deref(),
-        )
-        .await?;
-
-        let mut merges = Vec::new();
-        for merge in &submitted {
-            let subspace = SubspaceName::of_prefix(&merge.segment);
-            let outcome = match request.wait {
-                None => MergeOutcome::Pending,
-                Some(budget) => match store_compaction::await_merge(
-                    &self.location.path,
-                    Arc::clone(&self.location.object_store),
-                    &merge.compaction,
-                    budget,
-                )
-                .await?
-                {
-                    MergeEnd::Completed => MergeOutcome::Completed,
-                    MergeEnd::Failed => {
-                        MergeOutcome::Failed("the merge ended without committing".to_string())
-                    }
-                    MergeEnd::Pending => MergeOutcome::Pending,
-                },
-            };
-
-            merges.push(SubspaceMerge {
-                subspace: subspace.clone(),
-                outcome,
-                bytes_before: bytes_of(&before, &subspace),
-                bytes_after: None,
-            });
-        }
-
-        // Every subspace the request covered but nothing was submitted for
-        // is reported rather than dropped, so two calls stay comparable.
-        for measured in &before.subspaces {
-            let covered = target
-                .as_ref()
-                .is_none_or(|prefix| SubspaceName::of_prefix(prefix) == measured.subspace);
-            if !covered || merges.iter().any(|m| m.subspace == measured.subspace) {
-                continue;
-            }
-            // The only reason a plan omits a tree: L0 SSTs are not
-            // eligible sources, so a tree without sorted runs has nothing
-            // to merge. A tree already being merged is adopted rather than
-            // omitted, so it never reaches here.
-            merges.push(SubspaceMerge {
-                subspace: measured.subspace.clone(),
-                outcome: MergeOutcome::Skipped("no sorted runs to merge"),
-                bytes_before: measured.bytes,
-                bytes_after: None,
-            });
-        }
-
-        if merges
-            .iter()
-            .any(|merge| merge.outcome == MergeOutcome::Completed)
-        {
-            let after = self.store_census(CensusRequest::default()).await?;
-            for merge in &mut merges {
-                if merge.outcome == MergeOutcome::Completed {
-                    merge.bytes_after = Some(bytes_of(&after, &merge.subspace));
-                }
-            }
-        }
-
-        Ok(CompactStoreReport { merges })
-    }
-
     /// The lowest index id at or after `from` holding an entry of `kind`,
     /// or `None` past the last one. One seek per distinct index present —
     /// the scan stops at the first key rather than walking the range.
@@ -2061,48 +1414,6 @@ impl Catalog {
         }
     }
 
-    /// Deletes every entry of one dead index, `batch_size` per commit,
-    /// returning the total. The caller has already established that the
-    /// index is not live.
-    async fn reclaim_dead_range(
-        &self,
-        kind: IndexKind,
-        index_id: u64,
-        batch_size: usize,
-    ) -> Result<u64> {
-        let mut total = 0u64;
-        // Each batch resumes where the last one stopped. Restarting at
-        // the range's beginning would make every batch step over the
-        // tombstones its predecessors left, which is quadratic in the
-        // size of the range.
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            let tx = self.begin_write_tx().await?;
-            let (deleted, last) = index_maintenance::reclaim_entries_from(
-                &tx,
-                kind,
-                index_id,
-                batch_size,
-                cursor.as_deref(),
-            )
-            .await?;
-            if deleted == 0 {
-                tx.rollback();
-                return Ok(total);
-            }
-            // Batches commit non-durably: awaiting a flush tick per batch
-            // makes the whole sweep flush-bound, and durability buys nothing
-            // here. A dead index id is never reused and the deletes are
-            // idempotent, so a batch lost to a crash simply leaves entries a
-            // later pass rediscovers.
-            tx.commit_with_options(&commit::non_durable())
-                .await
-                .map_err(Error::from)?;
-            total += deleted as u64;
-            cursor = last;
-        }
-    }
-
     /// Closes the catalog, flushing background work.
     ///
     /// A [`Catalog`] is cheaply cloneable, and all clones share one
@@ -2118,113 +1429,6 @@ impl Catalog {
             Store::Writer(db) => db.close().await.map_err(Error::from),
             Store::Reader(reader) => reader.close().await.map_err(Error::from),
         }
-    }
-
-    /// Commits catalog mutations atomically, producing one new snapshot.
-    ///
-    /// The closure stages mutations on the [`Transaction`]; reads on the
-    /// `Transaction` observe its own staged state. It may be re-run against
-    /// fresh state after a lost race with a concurrent commit, so it must
-    /// be pure: no I/O, no effects other than the `Transaction` calls. A
-    /// closure that stages nothing commits nothing and returns the
-    /// unchanged head snapshot id.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever error the closure returns (the commit is
-    /// aborted), or an error from the underlying store. Returns
-    /// [`Error::CommitConflict`] when a concurrent commit truly conflicts
-    /// — it touched the same tables or the schema list. Returns
-    /// [`Error::RetryBudgetExhausted`] when the bounded internal retry
-    /// budget runs out before a benign race resolves; unlike a conflict,
-    /// that is terminal, and the caller re-drives the work itself —
-    /// usually as smaller commits.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions, ColumnDef};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// let snapshot = catalog
-    ///     .commit(|tx| {
-    ///         let sales = tx.create_schema("sales")?;
-    ///         tx.create_table(
-    ///             sales,
-    ///             "orders",
-    ///             &[ColumnDef {
-    ///                 name: "id".into(),
-    ///                 column_type: "BIGINT".into(),
-    ///                 nulls_allowed: false,
-    ///                 default_value: None,
-    ///                 children: Vec::new(),
-    ///             }],
-    ///         )?;
-    ///         Ok(())
-    ///     })
-    ///     .await?;
-    /// // `main` plus the newly created `sales` schema.
-    /// assert_eq!(catalog.snapshot_at(snapshot).await?.schemas().len(), 2);
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
-    pub async fn commit<F>(&self, f: F) -> Result<SnapshotId>
-    where
-        F: Fn(&mut Transaction) -> Result<()>,
-    {
-        let ids =
-            commit::commit_cycle(self.writer()?, std::slice::from_ref(&f), &self.commits).await?;
-        ids.first().copied().ok_or_else(|| {
-            Error::Corruption("a commit of one member reported no snapshot".to_string())
-        })
-    }
-
-    /// Commits several mutations as one batch, made durable by one flush.
-    ///
-    /// Each closure is its own logical commit with its own snapshot — a
-    /// group batches commits, it does not merge them — so the returned ids
-    /// are one per member, in member order, and time travel resolves each
-    /// separately. Members run in the order given, and each stages against
-    /// the state the members before it left, so a group never conflicts
-    /// with itself. Where [`Catalog::commit`] costs one durable flush per
-    /// mutation, a group costs one for all of them.
-    ///
-    /// The batch is the unit of durability: a crash leaves every member
-    /// committed or none of them, and a member that fails aborts the whole
-    /// group, including members that already staged. Closures may be re-run
-    /// as a group after a lost race with a concurrent commit, so the purity
-    /// requirement of [`Catalog::commit`] applies to every member.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever error any member returns (the whole group is
-    /// aborted), or the errors [`Catalog::commit`] documents — a conflict
-    /// or an exhausted retry budget applies to the group as a whole.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use moraine::{Catalog, CatalogOptions, Transaction};
-    /// # use object_store::memory::InMemory;
-    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
-    /// let ids = catalog
-    ///     .commit_group(&[
-    ///         &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
-    ///         &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
-    ///     ])
-    ///     .await?;
-    ///
-    /// // Two snapshots, one flush.
-    /// assert_eq!(ids.len(), 2);
-    /// assert_eq!(ids[1].get(), ids[0].get() + 1);
-    /// assert!(catalog.snapshot_at(ids[0]).await?.schema_by_name("ops").is_none());
-    /// # Ok::<(), moraine::Error>(()) }).unwrap();
-    /// ```
-    pub async fn commit_group(&self, members: &[CommitMember<'_>]) -> Result<Vec<SnapshotId>> {
-        commit::commit_cycle(self.writer()?, members, &self.commits).await
     }
 }
 
@@ -2345,6 +1549,878 @@ impl RowHolders {
         match self.ranges[..above].last() {
             Some(&(_, end, file)) if row_id < end => RowHolder::DataFile(file),
             _ => RowHolder::Inline,
+        }
+    }
+}
+
+impl Catalog {
+    /// The underlying store handle.
+    ///
+    /// A `Catalog` is only ever built around a `Store::Writer` — that is
+    /// what makes it a `Catalog` rather than a [`ReadOnlyCatalog`] — so the
+    /// reader arm is unreachable by construction. It still returns a
+    /// `Result` rather than asserting, because the invariant lives in the
+    /// two constructors above rather than in the type of the field, and a
+    /// wrong answer here would be a silent write to the wrong handle.
+    fn writer(&self) -> Result<&Db> {
+        match self.store.as_ref() {
+            Store::Writer(db) => Ok(db),
+            Store::Reader(_) => Err(Error::Constraint(
+                "catalog opened read-only; writes are unavailable".to_string(),
+            )),
+        }
+    }
+
+    /// Opens (creating and initializing if empty) the catalog in
+    /// `object_store` at `options.path`.
+    ///
+    /// Exactly one process may hold a read-write catalog per store —
+    /// opening a second fences the first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened, is mid-migration,
+    /// or is stamped with a structural format this binary does not
+    /// understand.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// // Bootstrap mints the default `main` schema.
+    /// assert_eq!(catalog.snapshot().await?.schemas().len(), 1);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn open(object_store: Arc<dyn ObjectStore>, options: CatalogOptions) -> Result<Self> {
+        if options.checkpoint.is_some() {
+            return Err(Error::Configuration(
+                "a checkpoint pins a read-only catalog to a fixed cut; a writer commits new \
+                 state and cannot be opened against one"
+                    .to_string(),
+            ));
+        }
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
+        let located = Arc::clone(&object_store);
+        let store = StoreBuilder::new(&options.path, object_store)
+            .flush_interval(options.flush_interval)
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts);
+        let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
+            .await?;
+        info!(
+            path = options.path,
+            flush_interval_ms = options.flush_interval.as_millis(),
+            "opened catalog read-write"
+        );
+        let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
+        Ok(Self {
+            inner: ReadOnlyCatalog {
+                store: Arc::new(Store::Writer(db)),
+                location: Arc::new(StoreLocation {
+                    path: options.path,
+                    object_store: located,
+                }),
+                reads: Arc::new(ReadTally::default()),
+                commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
+                projections,
+            },
+        })
+    }
+
+    /// Opens the catalog **read-only** in `object_store` at `options.path`,
+    /// as a `DbReader` following the latest manifest — or, when
+    /// [`CatalogOptions::checkpoint`] is set, pinned to that checkpoint.
+    ///
+    /// A read-only catalog never opens the writer `Db`, so it never fences a
+    /// live read-write process — any number of read-only catalogs may attach
+    /// alongside the one writer. It never bootstraps: opening a
+    /// store no writer has initialized is refused. [`commit`](Self::commit)
+    /// returns [`Error::Constraint`].
+    ///
+    /// "Read-only" is a catalog property, not an IAM one: following the
+    /// latest state means writing a checkpoint into the manifest on open and
+    /// refreshing it while the catalog lives, so those credentials still
+    /// need manifest write access. A catalog opened against a checkpoint
+    /// writes nothing whatsoever, and in exchange reads the fixed cut that
+    /// checkpoint names — later commits never appear, however long it stays
+    /// open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be opened, is not an initialized
+    /// moraine catalog, is stamped with an unknown structural format, or
+    /// names a checkpoint that is not a valid id or no longer exists.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let object_store = Arc::new(InMemory::new());
+    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+    /// catalog.commit(|tx| tx.create_schema("sales").map(|_| ())).await?;
+    /// let checkpoint = catalog.create_checkpoint(None).await?;
+    ///
+    /// // A commit after the checkpoint is not in it.
+    /// catalog.commit(|tx| tx.create_schema("ops").map(|_| ())).await?;
+    ///
+    /// let mut options = CatalogOptions::default();
+    /// options.checkpoint = Some(checkpoint);
+    /// let reader = Catalog::open_read_only(object_store, options).await?;
+    /// let view = reader.snapshot().await?;
+    /// assert!(view.schema_by_name("sales").is_some());
+    /// assert!(view.schema_by_name("ops").is_none());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn open_read_only(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<ReadOnlyCatalog> {
+        let checkpoint = parse_checkpoint(options.checkpoint.as_deref())?;
+        warn_if_preload_cannot_fit(&options, Arc::clone(&object_store)).await;
+        let located = Arc::clone(&object_store);
+        let store = StoreBuilder::new(&options.path, object_store)
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts)
+            .poll_interval(options.reader_poll_interval)
+            .checkpoint(checkpoint);
+
+        let reader = commit::open_reader_initialized(store).await?;
+        info!(
+            path = options.path,
+            checkpoint = options.checkpoint,
+            "opened catalog read-only"
+        );
+        let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
+        Ok(ReadOnlyCatalog {
+            store: Arc::new(Store::Reader(Arc::new(reader))),
+            location: Arc::new(StoreLocation {
+                path: options.path,
+                object_store: located,
+            }),
+            reads: Arc::new(ReadTally::default()),
+            commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
+            projections,
+        })
+    }
+
+    /// Rewrites the store in place to the newest structural format this
+    /// binary understands, resuming an interrupted migration if one is in
+    /// flight, and reports what it did.
+    ///
+    /// Deliberately **not** part of opening a catalog. A structural rewrite
+    /// walks the keyspace and holds the single writer for its duration, so
+    /// it is the operator's explicit choice, never a side effect of someone
+    /// attaching with a newer binary. It takes the writer epoch exactly as
+    /// [`open`](Self::open) does, so it fences a running catalog and is
+    /// itself fenced by one — exactly one migrator runs.
+    ///
+    /// Running it against a store already at the newest format is a no-op:
+    /// the returned report names the same format twice and no units.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Corruption`] if the store is not an initialized
+    /// moraine catalog, or carries a marker its format stamp contradicts;
+    /// [`Error::Migration`] if a migration is in flight that this binary does
+    /// not carry; or a store error if a batch fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, MigrationRequest};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let object_store = Arc::new(InMemory::new());
+    /// let catalog = Catalog::open(object_store.clone(), CatalogOptions::default()).await?;
+    /// catalog.close().await?;
+    ///
+    /// let report = Catalog::migrate(
+    ///     object_store,
+    ///     CatalogOptions::default(),
+    ///     MigrationRequest::default(),
+    /// )
+    /// .await?;
+    /// // A fresh store is already current, so nothing runs.
+    /// assert_eq!(report.from_format, report.to_format);
+    /// assert!(report.units_run.is_empty());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn migrate(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        request: MigrationRequest,
+    ) -> Result<MigrationReport> {
+        let db = StoreBuilder::new(&options.path, object_store.clone())
+            .flush_interval(options.flush_interval)
+            .cache_dir(options.cache_dir.clone())
+            .cache_size(options.cache_size)
+            .cache_preload(options.cache_preload)
+            .cache_puts(options.cache_puts)
+            .open_writer()
+            .await?;
+
+        let checkpoint = if request.checkpoint {
+            let taken = open::create_checkpoint(&db, None).await?;
+            info!(checkpoint = %taken, "took a pre-migration checkpoint");
+            Some(taken)
+        } else {
+            None
+        };
+
+        let report = migration::run(&db).await;
+        let closed = db.close().await.map_err(Error::from);
+
+        // A failed migration keeps its checkpoint: it is the recovery point
+        // the operator asked for, and releasing it here would discard the one
+        // thing that makes the failure recoverable.
+        let report = report.and_then(|report| closed.map(|()| report))?;
+
+        if let Some(checkpoint) = checkpoint {
+            StoreBuilder::new(&options.path, object_store)
+                .delete_checkpoint(checkpoint)
+                .await?;
+        }
+
+        Ok(report)
+    }
+
+    /// Pins everything committed so far as a checkpoint, and reports its id.
+    ///
+    /// A checkpoint is an immutable cut of the store that
+    /// [`CatalogOptions::checkpoint`] opens a reader against — the one way to
+    /// read a moraine catalog with credentials that cannot write at all,
+    /// since a reader that follows the latest state maintains a checkpoint of
+    /// its own and so writes the manifest.
+    ///
+    /// It also pins every object it references against SlateDB's garbage
+    /// collection, so a checkpoint with no `lifetime` holds storage until
+    /// [`delete_checkpoint`](Self::delete_checkpoint) removes it. Give one a
+    /// lifetime unless something will.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
+    /// creating a checkpoint is a manifest write — or a store error if the
+    /// write fails.
+    pub async fn create_checkpoint(&self, lifetime: Option<Duration>) -> Result<String> {
+        let id = open::create_checkpoint(self.writer()?, lifetime).await?;
+        info!(checkpoint = %id, "created a checkpoint");
+        Ok(id.to_string())
+    }
+
+    /// Deletes the checkpoint `checkpoint`, releasing the objects it pinned.
+    ///
+    /// Free-standing rather than a method, exactly as
+    /// [`migrate`](Self::migrate) is: it CASes the manifest and never opens
+    /// the writer `Db`, so it runs against a live catalog without fencing
+    /// it. Readers already open against the deleted checkpoint keep
+    /// serving; a reader that opens against it afterwards is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Configuration`] if `checkpoint` is not a valid id,
+    /// or a store error if the manifest update fails.
+    pub async fn delete_checkpoint(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+        checkpoint: &str,
+    ) -> Result<()> {
+        let id = parse_checkpoint(Some(checkpoint))?
+            .ok_or_else(|| Error::Configuration("no checkpoint given".to_string()))?;
+        StoreBuilder::new(&options.path, object_store)
+            .delete_checkpoint(id)
+            .await
+    }
+
+    /// Every checkpoint the store's manifest carries, as the ids
+    /// [`create_checkpoint`](Self::create_checkpoint) hands out.
+    ///
+    /// Free-standing for the same reason
+    /// [`delete_checkpoint`](Self::delete_checkpoint) is: it reads the
+    /// manifest and never opens the writer `Db`, so it runs against a live
+    /// catalog without fencing it. A checkpoint given no lifetime pins
+    /// what it references until it is deleted, so this is how an operator
+    /// finds one whose id was lost — reader-established checkpoints show
+    /// up here too, and are not theirs to delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error if the manifest cannot be read.
+    pub async fn checkpoints(
+        object_store: Arc<dyn ObjectStore>,
+        options: CatalogOptions,
+    ) -> Result<Vec<String>> {
+        let ids = StoreBuilder::new(&options.path, object_store)
+            .list_checkpoints()
+            .await?;
+        Ok(ids.iter().map(uuid::Uuid::to_string).collect())
+    }
+
+    /// Opens a read-write transaction for the staged-row commit path. Fails
+    /// with [`Error::Constraint`] on a read-only catalog.
+    pub(crate) async fn begin_write_tx(&self) -> Result<DbTransaction> {
+        self.writer()?
+            .begin(IsolationLevel::Snapshot)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Creates an index by a staged (multi-commit) build, driving it to
+    /// `ready` before returning — for a table whose backfill exceeds what
+    /// one commit may stage.
+    ///
+    /// The definition lands `building` in its own commit; each pass then
+    /// derives the table's live entries (external files through
+    /// `data_store`, inline rows from the catalog store), orders them by row
+    /// id, and commits them in steps of `step_entries`, defaulting to a
+    /// million. Writers maintain entries from the first commit forward.
+    ///
+    /// Interrupting the call leaves the definition `building`: calling again
+    /// with the same `def` resumes from the persisted cursor, and
+    /// [`Transaction::drop_index`](crate::Transaction::drop_index) abandons
+    /// the build. A concurrent write to the table conflicts with a step,
+    /// which re-derives at a fresh snapshot rather than staging entries for
+    /// rows the winner deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AlreadyExists`] if the table already holds a ready
+    /// index of this name, or [`Error::Constraint`] if `step_entries` is
+    /// zero, the resumed definition differs from `def`, or the rows
+    /// duplicate a unique value. A failed build drops its definition.
+    pub async fn create_index_staged(
+        &self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        data_store: Option<Arc<dyn ObjectStore>>,
+        data_prefix: &str,
+        step_entries: Option<usize>,
+    ) -> Result<IndexId> {
+        let step_entries = step_entries.unwrap_or(BUILD_STEP_ENTRIES);
+        if step_entries == 0 {
+            return Err(Error::Constraint(
+                "a staged build's step size must be at least one entry".to_owned(),
+            ));
+        }
+
+        let index = self.begin_staged_index(table, def, orders).await?;
+        let outcome = self
+            .drive_staged_build(table, def, index, data_store, data_prefix, step_entries)
+            .await;
+
+        // A build that cannot finish leaves no half-covered index behind.
+        // A cleanup that itself fails is logged, never substituted for the
+        // failure that caused it.
+        if outcome.is_err()
+            && let Err(cleanup) = self.commit(|tx| tx.drop_index(index)).await
+        {
+            warn!(
+                index = index.get(),
+                error = %cleanup,
+                "could not drop the definition of a failed staged build"
+            );
+        }
+        outcome.map(|()| index)
+    }
+
+    /// Commits `entries` above the persisted cursor in steps, the last one
+    /// flipping the index ready.
+    async fn commit_build_steps(
+        &self,
+        table: TableId,
+        index: IndexId,
+        entries: &[IndexEntry],
+        step_entries: usize,
+    ) -> Result<BuildProgress> {
+        loop {
+            let cursor = self.staged_build_cursor(table, index).await?;
+            // The cursor is the highest row id covered; absent means none
+            // is, so row id 0 is still pending.
+            let pending = match cursor {
+                Some(covered) => entries.partition_point(|entry| entry.row_id <= covered),
+                None => 0,
+            };
+            let remaining = &entries[pending..];
+            let step = &remaining[..remaining.len().min(step_entries)];
+            let is_final = step.len() == remaining.len();
+
+            match self
+                .commit(|tx| tx.build_index_step(index, step, is_final).map(|_| ()))
+                .await
+            {
+                Ok(_) => {
+                    if is_final {
+                        return Ok(BuildProgress::Ready);
+                    }
+                }
+                Err(Error::CommitConflict(_)) => return Ok(BuildProgress::Conflicted),
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    /// Deletes up to `limit` orphaned entries of a dropped index, in one
+    /// bounded batch outside the commit protocol (entries are not catalog
+    /// entities, and the dropping commit's batch must stay bounded). Returns
+    /// the number deleted; a host loops until it returns 0. Index ids are
+    /// never reused, so a concurrent create cannot collide with a sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the index is still live (reclaiming
+    /// a live index's entries would corrupt it), or a store error.
+    pub async fn reclaim_index_entries(&self, index: IndexId, limit: usize) -> Result<usize> {
+        let head = self.snapshot().await?;
+        if head
+            .indexes
+            .values()
+            .any(|per_table| per_table.contains_key(&index.get()))
+        {
+            return Err(Error::Constraint(format!(
+                "index {index} is still live; drop it before reclaiming its entries"
+            )));
+        }
+
+        let tx = self.begin_write_tx().await?;
+        let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
+        commit::commit_durable(tx, "entry reclamation")
+            .await
+            .map_err(Error::from)?;
+
+        Ok(deleted)
+    }
+
+    /// Runs one maintenance pass, reclaiming what only moraine knows is
+    /// dead, and reports what it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] on a read-only catalog,
+    /// [`Error::Configuration`] for a zero `batch_size`, or a store error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, MaintenanceRequest};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// // A fresh catalog has nothing to reclaim.
+    /// let report = catalog.maintain(MaintenanceRequest::default()).await?;
+    /// assert_eq!(report.index_entries_reclaimed, 0);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn maintain(&self, request: MaintenanceRequest) -> Result<MaintenanceReport> {
+        // Refuse before doing anything, including before the
+        // nothing-to-do shortcut: a pass that reclaims nothing is still a
+        // pass, and answering it differently on a read-only catalog would
+        // make the outcome depend on the request rather than the handle.
+        self.writer()?;
+        if request.batch_size == 0 {
+            return Err(Error::Configuration(
+                "batch_size must be nonzero; zero would reclaim nothing and never terminate"
+                    .to_string(),
+            ));
+        }
+
+        let mut report = MaintenanceReport::default();
+        if !request.sweep_orphaned_index_entries {
+            return Ok(report);
+        }
+
+        // Index ids come from the monotonic catalog-id counter and are
+        // never reused, so an id absent from this view can never become
+        // live again: deciding liveness once, here, is sound for the
+        // whole pass however long it runs.
+        let live: HashSet<u64> = self
+            .snapshot()
+            .await?
+            .indexes
+            .values()
+            .flat_map(|per_table| per_table.keys().copied())
+            .collect();
+
+        for kind in [IndexKind::Unique, IndexKind::Multi] {
+            let mut from = 0u64;
+            while let Some(index_id) = self.first_index_id_from(kind, from).await? {
+                if !live.contains(&index_id) {
+                    let reclaimed = self
+                        .reclaim_dead_range(kind, index_id, request.batch_size)
+                        .await?;
+                    if reclaimed > 0 {
+                        report.indexes_swept += 1;
+                        report.index_entries_reclaimed += reclaimed;
+                    }
+                }
+                // Seek past this index rather than walking its entries.
+                match index_id.checked_add(1) {
+                    Some(next) => from = next,
+                    None => break,
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Merges each targeted subspace's sorted runs into one, reclaiming the
+    /// superseded versions and tombstones they hold.
+    ///
+    /// moraine plans nothing: SlateDB decides which runs merge into which,
+    /// and the plan it makes for a whole tree destines that tree's bottom
+    /// run — which is what permits dropping a tombstone rather than carrying
+    /// it forward. A subspace with no sorted runs is skipped, as is one
+    /// already being merged.
+    ///
+    /// With [`CompactStoreRequest::wait`] set, the call returns once every
+    /// submitted merge has committed or failed. A merge that outlives the
+    /// wait is **not** cancelled: it keeps running, is reported
+    /// [`MergeOutcome::Pending`], and a later census shows the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Constraint`] if the catalog was opened read-only —
+    /// the compactor that executes a submitted merge runs inside the writer,
+    /// so a reader would queue work nothing would run — or a store error if
+    /// the merge cannot be submitted.
+    pub async fn compact_store(&self, request: CompactStoreRequest) -> Result<CompactStoreReport> {
+        self.writer()?;
+
+        let target = match &request.target {
+            CompactionTarget::WholeStore => None,
+            CompactionTarget::Subspace(name) => match name.subspace() {
+                Some(subspace) => Some(subspace_prefix(subspace)),
+                // An unknown subspace addresses no keys, so there is no
+                // tree to name in a request.
+                None => {
+                    return Err(Error::Configuration(format!(
+                        "{name} is not a subspace this build can merge"
+                    )));
+                }
+            },
+        };
+
+        let before = self.store_census(CensusRequest::default()).await?;
+        let submitted = store_compaction::submit_full_merge(
+            &self.location.path,
+            Arc::clone(&self.location.object_store),
+            target.as_deref(),
+        )
+        .await?;
+
+        let mut merges = Vec::new();
+        for merge in &submitted {
+            let subspace = SubspaceName::of_prefix(&merge.segment);
+            let outcome = match request.wait {
+                None => MergeOutcome::Pending,
+                Some(budget) => match store_compaction::await_merge(
+                    &self.location.path,
+                    Arc::clone(&self.location.object_store),
+                    &merge.compaction,
+                    budget,
+                )
+                .await?
+                {
+                    MergeEnd::Completed => MergeOutcome::Completed,
+                    MergeEnd::Failed => {
+                        MergeOutcome::Failed("the merge ended without committing".to_string())
+                    }
+                    MergeEnd::Pending => MergeOutcome::Pending,
+                },
+            };
+
+            merges.push(SubspaceMerge {
+                subspace: subspace.clone(),
+                outcome,
+                bytes_before: bytes_of(&before, &subspace),
+                bytes_after: None,
+            });
+        }
+
+        // Every subspace the request covered but nothing was submitted for
+        // is reported rather than dropped, so two calls stay comparable.
+        for measured in &before.subspaces {
+            let covered = target
+                .as_ref()
+                .is_none_or(|prefix| SubspaceName::of_prefix(prefix) == measured.subspace);
+            if !covered || merges.iter().any(|m| m.subspace == measured.subspace) {
+                continue;
+            }
+            // The only reason a plan omits a tree: L0 SSTs are not
+            // eligible sources, so a tree without sorted runs has nothing
+            // to merge. A tree already being merged is adopted rather than
+            // omitted, so it never reaches here.
+            merges.push(SubspaceMerge {
+                subspace: measured.subspace.clone(),
+                outcome: MergeOutcome::Skipped("no sorted runs to merge"),
+                bytes_before: measured.bytes,
+                bytes_after: None,
+            });
+        }
+
+        if merges
+            .iter()
+            .any(|merge| merge.outcome == MergeOutcome::Completed)
+        {
+            let after = self.store_census(CensusRequest::default()).await?;
+            for merge in &mut merges {
+                if merge.outcome == MergeOutcome::Completed {
+                    merge.bytes_after = Some(bytes_of(&after, &merge.subspace));
+                }
+            }
+        }
+
+        Ok(CompactStoreReport { merges })
+    }
+
+    /// Commits catalog mutations atomically, producing one new snapshot.
+    ///
+    /// The closure stages mutations on the [`Transaction`]; reads on the
+    /// `Transaction` observe its own staged state. It may be re-run against
+    /// fresh state after a lost race with a concurrent commit, so it must
+    /// be pure: no I/O, no effects other than the `Transaction` calls. A
+    /// closure that stages nothing commits nothing and returns the
+    /// unchanged head snapshot id.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever error the closure returns (the commit is
+    /// aborted), or an error from the underlying store. Returns
+    /// [`Error::CommitConflict`] when a concurrent commit truly conflicts
+    /// — it touched the same tables or the schema list. Returns
+    /// [`Error::RetryBudgetExhausted`] when the bounded internal retry
+    /// budget runs out before a benign race resolves; unlike a conflict,
+    /// that is terminal, and the caller re-drives the work itself —
+    /// usually as smaller commits.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, ColumnDef};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// let snapshot = catalog
+    ///     .commit(|tx| {
+    ///         let sales = tx.create_schema("sales")?;
+    ///         tx.create_table(
+    ///             sales,
+    ///             "orders",
+    ///             &[ColumnDef {
+    ///                 name: "id".into(),
+    ///                 column_type: "BIGINT".into(),
+    ///                 nulls_allowed: false,
+    ///                 default_value: None,
+    ///                 children: Vec::new(),
+    ///             }],
+    ///         )?;
+    ///         Ok(())
+    ///     })
+    ///     .await?;
+    /// // `main` plus the newly created `sales` schema.
+    /// assert_eq!(catalog.snapshot_at(snapshot).await?.schemas().len(), 2);
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn commit<F>(&self, f: F) -> Result<SnapshotId>
+    where
+        F: Fn(&mut Transaction) -> Result<()>,
+    {
+        let ids =
+            commit::commit_cycle(self.writer()?, std::slice::from_ref(&f), &self.commits).await?;
+        ids.first().copied().ok_or_else(|| {
+            Error::Corruption("a commit of one member reported no snapshot".to_string())
+        })
+    }
+
+    /// Commits several mutations as one batch, made durable by one flush.
+    ///
+    /// Each closure is its own logical commit with its own snapshot — a
+    /// group batches commits, it does not merge them — so the returned ids
+    /// are one per member, in member order, and time travel resolves each
+    /// separately. Members run in the order given, and each stages against
+    /// the state the members before it left, so a group never conflicts
+    /// with itself. Where [`Catalog::commit`] costs one durable flush per
+    /// mutation, a group costs one for all of them.
+    ///
+    /// The batch is the unit of durability: a crash leaves every member
+    /// committed or none of them, and a member that fails aborts the whole
+    /// group, including members that already staged. Closures may be re-run
+    /// as a group after a lost race with a concurrent commit, so the purity
+    /// requirement of [`Catalog::commit`] applies to every member.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever error any member returns (the whole group is
+    /// aborted), or the errors [`Catalog::commit`] documents — a conflict
+    /// or an exhausted retry budget applies to the group as a whole.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions, Transaction};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// # let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// let ids = catalog
+    ///     .commit_group(&[
+    ///         &|tx: &mut Transaction| tx.create_schema("sales").map(|_| ()),
+    ///         &|tx: &mut Transaction| tx.create_schema("ops").map(|_| ()),
+    ///     ])
+    ///     .await?;
+    ///
+    /// // Two snapshots, one flush.
+    /// assert_eq!(ids.len(), 2);
+    /// assert_eq!(ids[1].get(), ids[0].get() + 1);
+    /// assert!(catalog.snapshot_at(ids[0]).await?.schema_by_name("ops").is_none());
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    pub async fn commit_group(&self, members: &[CommitMember<'_>]) -> Result<Vec<SnapshotId>> {
+        commit::commit_cycle(self.writer()?, members, &self.commits).await
+    }
+    /// Commits the `building` definition, or adopts the one already there.
+    /// A ready definition of the same name belongs to a finished index.
+    async fn begin_staged_index(
+        &self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+    ) -> Result<IndexId> {
+        if let Some(existing) = self.snapshot().await?.index_by_name(table, &def.name) {
+            return match existing.state {
+                IndexState::Ready => Err(Error::AlreadyExists(format!(
+                    "index {} on table {table}",
+                    def.name
+                ))),
+                IndexState::Building | IndexState::Poisoned => {
+                    // Resuming adopts the stored definition, whose entries
+                    // are encoded under its own orders.
+                    let (directions, nulls) = requested_orders(orders, def.columns.len());
+                    if existing.columns != def.columns
+                        || existing.unique != def.unique
+                        || existing.directions != directions
+                        || existing.nulls != nulls
+                    {
+                        return Err(Error::Constraint(format!(
+                            "index {} on table {table} is already building over a different \
+                             definition; drop it to rebuild",
+                            def.name
+                        )));
+                    }
+                    Ok(existing.id)
+                }
+            };
+        }
+
+        let index = std::cell::Cell::new(None);
+        self.commit(|tx| {
+            let id = tx.create_index_staged_ordered(table, def, orders)?;
+            index.set(Some(id));
+            Ok(())
+        })
+        .await?;
+
+        index
+            .get()
+            .ok_or_else(|| Error::Corruption("staged create returned no index id".to_owned()))
+    }
+
+    /// Derives the live backfill and commits it in bounded steps until the
+    /// index is ready, re-deriving at a fresh snapshot after a lost race.
+    async fn drive_staged_build(
+        &self,
+        table: TableId,
+        def: &IndexDef,
+        index: IndexId,
+        data_store: Option<Arc<dyn ObjectStore>>,
+        data_prefix: &str,
+        step_entries: usize,
+    ) -> Result<()> {
+        for _ in 0..BUILD_DERIVATION_ATTEMPTS {
+            let mut entries = match &data_store {
+                Some(store) => {
+                    self.scoped_backfill_entries(
+                        Arc::clone(store),
+                        data_prefix,
+                        table,
+                        &def.columns,
+                    )
+                    .await?
+                }
+                None => Vec::new(),
+            };
+            entries.extend(self.inline_backfill_entries(table, &def.columns).await?);
+            // One watermark can describe the covered set only in row-id
+            // order, which per-row-id rewrite files would otherwise break.
+            entries.sort_unstable_by_key(|entry| entry.row_id);
+
+            if let BuildProgress::Ready = self
+                .commit_build_steps(table, index, &entries, step_entries)
+                .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(Error::CommitConflict(format!(
+            "staged build of index {index} lost its race {BUILD_DERIVATION_ATTEMPTS} times; \
+             the table is under concurrent write"
+        )))
+    }
+
+    /// Deletes every entry of one dead index, `batch_size` per commit,
+    /// returning the total. The caller has already established that the
+    /// index is not live.
+    async fn reclaim_dead_range(
+        &self,
+        kind: IndexKind,
+        index_id: u64,
+        batch_size: usize,
+    ) -> Result<u64> {
+        let mut total = 0u64;
+        // Each batch resumes where the last one stopped. Restarting at
+        // the range's beginning would make every batch step over the
+        // tombstones its predecessors left, which is quadratic in the
+        // size of the range.
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let tx = self.begin_write_tx().await?;
+            let (deleted, last) = index_maintenance::reclaim_entries_from(
+                &tx,
+                kind,
+                index_id,
+                batch_size,
+                cursor.as_deref(),
+            )
+            .await?;
+            if deleted == 0 {
+                tx.rollback();
+                return Ok(total);
+            }
+            // Batches commit non-durably: awaiting a flush tick per batch
+            // makes the whole sweep flush-bound, and durability buys nothing
+            // here. A dead index id is never reused and the deletes are
+            // idempotent, so a batch lost to a crash simply leaves entries a
+            // later pass rediscovers.
+            tx.commit_with_options(&commit::non_durable())
+                .await
+                .map_err(Error::from)?;
+            total += deleted as u64;
+            cursor = last;
         }
     }
 }

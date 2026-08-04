@@ -4926,3 +4926,192 @@ async fn visible_schema_version_records_follow_the_staged_rows() {
     tx.rollback();
     catalog.close().await.unwrap();
 }
+
+/// The dead-table cleanup's `DELETE FROM ducklake_column_mapping WHERE
+/// table_id IN (...)`: the record goes, and its embedded name-mapping rows
+/// go with it. The delete carries the key columns the metadata table
+/// declares — `(mapping_id, table_id)` — and no `end_snapshot`, mappings
+/// being unversioned.
+#[tokio::test]
+async fn column_mapping_delete_reclaims_the_record_and_its_embedded_rows() {
+    let catalog = open().await;
+    stage_mapping_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+            (
+                TableKind::NameMapping,
+                name_mapping_row(21, 0, "payload", 1, None, false),
+            ),
+            (
+                TableKind::NameMapping,
+                name_mapping_row(21, 1, "id", 2, Some(0), false),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        catalog.snapshot().await.unwrap().mappings[&1][&21]
+            .name_mappings
+            .len(),
+        2
+    );
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ColumnMapping,
+        cells: vec![Cell::U64(21), Cell::U64(1)],
+    });
+    tx.commit().await.unwrap();
+
+    let head = catalog.snapshot().await.unwrap();
+    assert!(
+        head.mappings
+            .get(&1)
+            .is_none_or(|per| !per.contains_key(&21)),
+        "the mapping record must be gone"
+    );
+    // Embedded rows have no keys of their own, so the parent's deletion is
+    // the whole reclamation — nothing survives to sweep.
+    assert!(
+        crate::ffi_support::dump_mappings(&catalog)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no mapping row may survive its record"
+    );
+    catalog.close().await.unwrap();
+}
+
+/// DuckLake follows the mapping delete with an orphan sweep over
+/// `ducklake_name_mapping`. In this keyspace those rows are embedded in
+/// the record just deleted, so the sweep has nothing left to remove — it
+/// must be accepted and land as a no-op rather than refused.
+#[tokio::test]
+async fn the_name_mapping_orphan_sweep_rides_its_parents_deletion() {
+    let catalog = open().await;
+    stage_mapping_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+            (
+                TableKind::NameMapping,
+                name_mapping_row(21, 0, "payload", 1, None, false),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Both DELETEs in one transaction, in DuckLake's order.
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ColumnMapping,
+        cells: vec![Cell::U64(21), Cell::U64(1)],
+    });
+    tx.stage(RowOperation::Delete {
+        table: TableKind::NameMapping,
+        cells: vec![Cell::U64(21)],
+    });
+    tx.commit().await.unwrap();
+
+    assert!(
+        crate::ffi_support::dump_mappings(&catalog)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    catalog.close().await.unwrap();
+}
+
+/// A sweep that arrives after its parent is already gone — the two DELETE
+/// streams landing in separate transactions — is equally benign.
+#[tokio::test]
+async fn a_name_mapping_sweep_after_its_parent_is_gone_is_accepted() {
+    let catalog = open().await;
+    stage_mapping_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+            (
+                TableKind::NameMapping,
+                name_mapping_row(21, 0, "payload", 1, None, false),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ColumnMapping,
+        cells: vec![Cell::U64(21), Cell::U64(1)],
+    });
+    tx.commit().await.unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::NameMapping,
+        cells: vec![Cell::U64(21)],
+    });
+    tx.commit().await.unwrap();
+
+    assert!(
+        crate::ffi_support::dump_mappings(&catalog)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    catalog.close().await.unwrap();
+}
+
+/// Read-your-writes across the delete: the transaction that staged it no
+/// longer sees the mapping, while the committed state still does until it
+/// lands.
+#[tokio::test]
+async fn a_staged_mapping_delete_is_invisible_to_its_own_transaction() {
+    let catalog = open().await;
+    stage_mapping_batch(
+        &catalog,
+        1,
+        vec![
+            (TableKind::ColumnMapping, column_mapping_row(21, 1)),
+            (
+                TableKind::NameMapping,
+                name_mapping_row(21, 0, "payload", 1, None, false),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached(db_tx);
+    tx.stage(RowOperation::Delete {
+        table: TableKind::ColumnMapping,
+        cells: vec![Cell::U64(21), Cell::U64(1)],
+    });
+    assert!(
+        tx.visible_mappings().await.unwrap().is_empty(),
+        "the staging transaction must not serve a mapping it deleted"
+    );
+    tx.rollback();
+
+    assert_eq!(
+        crate::ffi_support::dump_mappings(&catalog)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a rolled-back delete leaves the record"
+    );
+    catalog.close().await.unwrap();
+}

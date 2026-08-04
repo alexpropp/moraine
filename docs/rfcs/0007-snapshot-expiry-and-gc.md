@@ -156,10 +156,15 @@ moraine must translate into one atomic batch:
   record ceases to exist.
 - **Embedded rows.** Deletes against tables whose rows embed in a parent
   record (`ducklake_column_tag`, `ducklake_partition_column`,
-  `ducklake_sort_expression`, `ducklake_file_partition_value`) ride their
-  parent's deletion in the same cascade and translate as validated
-  no-ops. Unmodeled stand-in tables (macros, mappings, variant stats)
-  accept void-deletes — they can never have a live row.
+  `ducklake_sort_expression`, `ducklake_file_partition_value`,
+  `ducklake_name_mapping`) ride their parent's deletion in the same cascade
+  and translate as validated no-ops. Step 6's orphan sweep over
+  `ducklake_name_mapping` is one of these: the rows it looks for were freed
+  with the record step 5 deleted, so the sweep is accepted and lands as a
+  no-op whether it shares that transaction or follows it.
+- **The mapping record itself** takes a real hard delete in step 5, keyed
+  `(mapping_id, table_id)` and carrying no `end_snapshot` — the one
+  unversioned kind on that path.
 - **Schema-version rows.** `ducklake_schema_versions` rows are **not**
   expired with the snapshots that wrote them. They live in their own
   subspace (RFC 0002) and are deleted only where DuckLake's own catalogs
@@ -268,9 +273,9 @@ already lost.
 
 ### Reader safety
 
-The safety contract is unchanged from DuckLake's own and must be
-documented for operators: **the retention window must exceed the maximum
-expected read/attach duration**, and the cleanup grace period
+The safety contract is unchanged from DuckLake's own, and is documented
+for operators in the "Operating a lake" guide: **the retention window must
+exceed the maximum expected read/attach duration**, and the cleanup grace period
 (`cleanup_old_files`' `older_than`) must exceed the maximum reader/scan
 duration. Logical expiry deletes no bytes; a reader holding a view of an
 expired snapshot keeps scanning bytes that survive until a cleanup whose

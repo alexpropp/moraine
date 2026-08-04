@@ -182,7 +182,7 @@ pub unsafe extern "C" fn moraine_tx_begin(
                 probe,
                 probe_ctx,
                 staged_begin(
-                    &handle_ref.catalog,
+                    handle_ref.catalog.writer()?,
                     handle_ref.data_store.clone(),
                     handle_ref.data_prefix.clone(),
                 ),

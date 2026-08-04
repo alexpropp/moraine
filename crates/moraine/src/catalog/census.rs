@@ -102,7 +102,7 @@ impl fmt::Display for SubspaceName {
     }
 }
 
-/// How a [`Catalog::store_census`](crate::Catalog::store_census) call
+/// How a [`ReadOnlyCatalog::store_census`](crate::ReadOnlyCatalog::store_census) call
 /// should run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]

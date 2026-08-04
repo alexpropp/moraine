@@ -19,7 +19,7 @@ pub use census::{
 };
 pub use handle::{
     CachePreload, Catalog, CatalogOptions, CommitMember, MaintenanceReport, MaintenanceRequest,
-    MigrationRequest,
+    MigrationRequest, ReadOnlyCatalog,
 };
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;

@@ -448,11 +448,11 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn delete_index(&mut self, table_id: u64, index_id: u64) {
-        if let Some(per_table) = self.indexes.get_mut(&table_id) {
-            if let Some(old) = per_table.remove(&index_id) {
-                let (_, scope, name) = index_identity(&old);
-                remove_scoped_name(&mut self.index_names, scope, name);
-            }
+        if let Some(per_table) = self.indexes.get_mut(&table_id)
+            && let Some(old) = per_table.remove(&index_id)
+        {
+            let (_, scope, name) = index_identity(&old);
+            remove_scoped_name(&mut self.index_names, scope, name);
         }
     }
 

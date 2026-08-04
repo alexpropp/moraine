@@ -94,7 +94,7 @@ pub unsafe extern "C" fn moraine_create_checkpoint(
         let handle_ref = unsafe { &*handle };
         let lifetime = (lifetime_ms > 0).then(|| std::time::Duration::from_millis(lifetime_ms));
         let checkpoint = handle_ref
-            .block_on(handle_ref.catalog.create_checkpoint(lifetime))
+            .block_on(handle_ref.catalog.writer()?.create_checkpoint(lifetime))
             .map_err(AbiError::from)?;
 
         let id = to_c_string(&checkpoint)?.into_raw();

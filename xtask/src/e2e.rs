@@ -20,14 +20,14 @@ const DUCKDB_LOAD_TEST_NAME: &str = "attach_lists_and_scans_through_real_duckdb"
 /// `--exact`, since there are many). Needs network access to `INSTALL
 /// ducklake`. Adding a test there means bumping this count, or `e2e`
 /// fails — deliberate, so a silently-filtered test can never pass.
-const DUCKLAKE_LOAD_TEST_COUNT: &str = "92 passed";
+const DUCKLAKE_LOAD_TEST_COUNT: &str = "93 passed";
 
 /// Every file under `test/sql`, run together through DuckDB's own
 /// sqllogictest runner. Adding one means bumping this count, exactly as for
 /// the suites above — and a file that *skips* (its `require-env` unmet, or
 /// an extension download failing) reports no passing case at all, so a
 /// silent skip fails the gate instead of looking like a pass.
-const SQLLOGIC_TEST_COUNT: &str = "2 test cases";
+const SQLLOGIC_TEST_COUNT: &str = "3 test cases";
 
 /// Downloads/caches the pinned DuckDB CLI, builds and packages the
 /// extension, runs the crate's test suite, then runs `duckdb_load.rs`
@@ -70,8 +70,9 @@ pub fn e2e() -> anyhow::Result<()> {
 
     run_sqllogictests(&extension)?;
     println!(
-        "ok: over several connections — two DuckLake transactions raced over one lake, and a \
-         commit landed under an open reader without moving what it reads"
+        "ok: over several connections — two DuckLake transactions raced over one lake, a commit \
+         landed under an open reader without moving what it reads, and maintenance contended \
+         with a held write transaction instead of deadlocking behind it"
     );
 
     Ok(())

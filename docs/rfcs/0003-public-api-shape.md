@@ -8,9 +8,10 @@ Defines the public API of the `moraine` core crate: how a host opens a
 catalog, reads it, and commits changes to it. This is the third
 expensive-to-reverse decision the project requires an RFC for (key layout —
 RFC 0002/0005; commit protocol — RFC 0004; public API shape — here). The
-surface is three types — `Catalog` (the handle), `CatalogSnapshot` (an
-immutable materialized read view), and `Transaction` (the mutation handle passed to a
-commit closure) — over an error taxonomy with one variant per failure domain.
+surface is four types — `Catalog` (the read-write handle), `ReadOnlyCatalog`
+(the read surface a read-only attach gets, which `Catalog` derefs to),
+`CatalogSnapshot` (an immutable materialized read view), and `Transaction`
+(the mutation handle passed to a commit closure) — over an error taxonomy with one variant per failure domain.
 Writes go through a closure-with-retry model so the RFC 0002 single-`WriteBatch`
 atomicity invariant and conflict-retry loop live in the core, not duplicated in
 every host. SlateDB never appears in a public signature: the substrate is an
@@ -74,9 +75,21 @@ Three public types map onto the existing private modules (`catalog`, `store`,
 `transaction`). `store` stays entirely private; `lib.rs` re-exports the public types
 alongside `Error`/`Result`.
 
-- **`Catalog`** — the handle. Owns the `slatedb::Db` (private field).
-  Constructed once via `open`, cheap to clone (an `Arc` internally), drives
-  reads and commits. Lives in `catalog`.
+- **`ReadOnlyCatalog`** — the read surface, and the whole of it. Every read
+  is defined here once; it carries no mutator at all. Lives in `catalog`.
+- **`Catalog`** — the read-write handle. Owns the store handle (private
+  field), constructed via `open`, cheap to clone (an `Arc` internally). It
+  adds the mutators and reaches the reads through
+  `Deref<Target = ReadOnlyCatalog>`, so a writer serves the whole read
+  surface without restating a method of it.
+
+  **The mode is in the type.** `Catalog::open_read_only` returns a
+  `ReadOnlyCatalog`, so `commit` on a read-only handle is a compile error
+  rather than a runtime `Error::Constraint` — a `compile_fail` doctest on
+  `ReadOnlyCatalog` pins that, and the tests that used to assert the runtime
+  refusal are gone with it. The runtime check survives in exactly one place,
+  the extension shim, because a C ABI has one handle type and no types of
+  its own to refuse with; that is the boundary where a type argument ends.
 - **`CatalogSnapshot`** — an immutable, materialized read view built by
   scanning `current` (or `current` + the relevant `history` ranges, for time travel) per
   RFC 0002. All accessors are in-memory; after construction it never touches

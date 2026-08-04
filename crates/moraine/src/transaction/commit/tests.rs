@@ -3026,7 +3026,7 @@ async fn maintain_refuses_a_zero_batch_size() {
 /// reporting a no-op pass.
 #[tokio::test]
 async fn maintain_refuses_a_read_only_catalog() {
-    use crate::catalog::{Catalog, CatalogOptions, MaintenanceRequest};
+    use crate::catalog::{Catalog, CatalogOptions};
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
 
     // Bootstrap and release the writer so the reader has a store to open.
@@ -3038,21 +3038,13 @@ async fn maintain_refuses_a_read_only_catalog() {
     let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
         .await
         .unwrap();
-    assert!(matches!(
-        reader.maintain(MaintenanceRequest::default()).await,
-        Err(Error::Constraint(_))
-    ));
-    // A request with nothing to do is refused just the same: the answer
-    // depends on the handle, not on what the request happens to ask for.
-    assert!(matches!(
-        reader
-            .maintain(MaintenanceRequest {
-                sweep_orphaned_index_entries: false,
-                ..MaintenanceRequest::default()
-            })
-            .await,
-        Err(Error::Constraint(_))
-    ));
+    // `maintain` is a mutator and lives on the read-write handle alone, so
+    // there is no runtime refusal to assert — `reader.maintain(..)` does not
+    // compile. What a reader keeps is the read surface.
+    assert_eq!(
+        reader.snapshot().await.unwrap().current_snapshot().id.get(),
+        0
+    );
     reader.close().await.unwrap();
 }
 
@@ -4244,4 +4236,105 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
     assert!(view.schema_by_name("late").is_some());
 
     writer.close().await.unwrap();
+}
+
+/// The store state a retry meets when its base predates an expiry: three
+/// commits, with the middle one's snapshot record reclaimed as expiry past
+/// the retention horizon leaves it.
+async fn catalog_with_a_reclaimed_snapshot()
+-> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
+    let object_store: Arc<InMemory> = Arc::new(InMemory::new());
+    let db = open_initialized(StoreBuilder::new("", object_store), false, None)
+        .await
+        .unwrap();
+    let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
+    let coalescer = Arc::new(Coalescer::new(Arc::clone(&projections)));
+
+    for name in ["a", "b", "c"] {
+        commit_cycle(
+            &db,
+            &[|tx: &mut Transaction| tx.create_schema(name).map(|_| ())],
+            &coalescer,
+        )
+        .await
+        .unwrap();
+    }
+
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    tx.delete(Key::Snapshot { snapshot_id: 2 }.encode())
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    (db, projections, coalescer)
+}
+
+/// A retry whose base predates a concurrent expiry classifies against a
+/// hole where an intervening snapshot record used to be. The verdict must
+/// be conservative — a reclaimed commit's changes are unknowable, so it
+/// conflicts — and must never read as corruption: expiry reclaiming a
+/// record below the retention horizon is ordinary catalog life, not a
+/// damaged store.
+#[tokio::test]
+async fn a_retry_across_a_reclaimed_snapshot_conflicts_rather_than_corrupting() {
+    let (db, _projections, _coalescer) = catalog_with_a_reclaimed_snapshot().await;
+
+    // What a losing attempt that read head 1 classifies: everything that
+    // landed above it, reclaimed record included.
+    let intervening = intervening_changes(&db, 1).await.unwrap();
+    let ids: Vec<u64> = intervening.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![2, 3]);
+
+    let reclaimed = &intervening[0].1;
+    let surviving = &intervening[1].1;
+    assert!(
+        reclaimed.has_unknown,
+        "a reclaimed record leaves its commit's changes unknowable"
+    );
+    assert!(!surviving.has_unknown);
+
+    // Ours is disjoint from what actually landed, so the hole is the only
+    // thing that conflicts: the conservative verdict comes from the missing
+    // record, not from the commits around it.
+    let ours = ChangeSet::parse("inserted_into_table:7");
+    assert!(!crate::transaction::operations::conflicts(&ours, surviving));
+    assert!(crate::transaction::operations::conflicts(&ours, reclaimed));
+
+    db.close().await.unwrap();
+}
+
+/// The other half of that path. An expiry is head-preserving, so it clears
+/// the cached view, and the next verb commit rematerializes over a keyspace
+/// whose intervening snapshot records are gone. It must land: a
+/// materialization resolves head, and head is not what expiry reclaimed.
+#[tokio::test]
+async fn a_verb_commit_rematerializes_over_a_reclaimed_snapshot() {
+    let (db, projections, coalescer) = catalog_with_a_reclaimed_snapshot().await;
+    invalidate_head_view(&projections);
+
+    commit_cycle(
+        &db,
+        &[|tx: &mut Transaction| tx.create_schema("d").map(|_| ())],
+        &coalescer,
+    )
+    .await
+    .unwrap();
+
+    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
+    let handle = ReadHandle::Tx(&tx);
+    let view = materialize(handle, None).await.unwrap();
+    assert_eq!(view.snapshot.snapshot_id, 4);
+    for name in ["main", "a", "b", "c", "d"] {
+        assert!(
+            view.schema_by_name(name).is_some(),
+            "{name} must survive the reclaimed record"
+        );
+    }
+
+    // And the reclaimed snapshot itself reads as expired rather than
+    // missing or corrupt, since ids are sequential to head.
+    let expired = materialize(handle, Some(2)).await.unwrap_err();
+    assert!(matches!(expired, Error::SnapshotExpired(_)), "{expired}");
+    tx.rollback();
+
+    db.close().await.unwrap();
 }

@@ -74,6 +74,9 @@ store encrypts every SST and WAL object at rest, keys live in the KMS, and
 moraine reads and writes plaintext through the object-store client. The
 entire cost is bucket configuration.
 
+Key policy, grants, and rotation posture are documented for operators in
+the "Operating a lake" guide.
+
 This mirrors DuckLake's own trust model. Its manifesto pitches "zero-trust
 data hosting" with "keys managed by the catalog database", and its FAQ
 delegates catalog protection to the catalog DBMS's authentication (e.g.
