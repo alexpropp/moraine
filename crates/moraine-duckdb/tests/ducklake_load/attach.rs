@@ -167,6 +167,72 @@ fn ducklake_read_only_attach_reads_through_a_reader() {
     );
 }
 
+/// Whether DuckLake forwards an outer `READ_ONLY` into the nested moraine
+/// metadata attach — the question the test above cannot answer, because
+/// rows read back either way.
+///
+/// The decisive observation is a fencing one, and it needs two live
+/// processes: A holds a read-write chain open, B attaches the *same* store
+/// through the same chain with outer `READ_ONLY` and reads, then A writes
+/// again.
+///
+/// - **Forwarded:** B's metadata attach opened moraine's `DbReader`, never took
+///   the writer epoch, and A's second write lands.
+/// - **Not forwarded:** B's metadata attach opened the writer `Db`, took the
+///   epoch, and A's second write fails fenced.
+///
+/// The assertion pins the answer this DuckLake version gives, so a change
+/// on either side surfaces here rather than as a mystery fence in the
+/// field.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_forwards_read_only_into_the_metadata_attach() {
+    let dir = TempDir::new("ro-forward-store");
+    let data_dir = TempDir::new("ro-forward-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(store, data_path, "CREATE TABLE lake.main.t (a BIGINT);");
+
+    let read = std::cell::RefCell::new(Vec::new());
+    let output = run_ducklake_sql_around(
+        store,
+        data_path,
+        "INSERT INTO lake.main.t VALUES (1);\n",
+        std::time::Duration::from_secs(2),
+        || {
+            // Process B, while A still holds the store's writer epoch.
+            *read.borrow_mut() = csv_rows(&run_ducklake_read_only_sql(
+                store,
+                data_path,
+                "SELECT a FROM lake.main.t ORDER BY a;",
+            ));
+        },
+        "INSERT INTO lake.main.t VALUES (2);\n",
+    );
+
+    // B read what A had committed, whichever handle it opened.
+    assert_eq!(read.into_inner(), vec![vec!["1"]]);
+
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "DuckLake did not forward the outer READ_ONLY: the read-only chain \
+         opened moraine's writer and fenced the live one. Promote RFC 0017's \
+         deferred entry — document READ_ONLY on the `moraine:` attach itself \
+         as the escape hatch.\nstdout+stderr: {combined}"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT a FROM lake.main.t ORDER BY a;",
+        )),
+        vec![vec!["1"], vec!["2"]],
+        "the writer's second commit is durable, so nothing fenced it"
+    );
+}
+
 /// `FLUSH_INTERVAL_MS` end to end: `ATTACH (META_FLUSH_INTERVAL_MS
 /// 5)` → DuckLake's `META_` passthrough → this shim's inner attach →
 /// the store's WAL flush cadence. The setting is visible only as

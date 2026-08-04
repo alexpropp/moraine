@@ -1849,6 +1849,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "moraine",
  "object_store",
  "parquet",
  "proptest",

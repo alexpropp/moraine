@@ -436,6 +436,94 @@ fn ducklake_column_ids_and_positions_match_stock_ducklake() {
         &vec!["e".to_string(), "5".to_string(), "5".to_string()],
         "the re-add must allocate above the maximum, not fill the gap"
     );
+
+    // A rename and a widening promotion, so the history the sweep below
+    // walks carries every column-version transition, not only add and drop.
+    apply("ALTER TABLE lake.main.t RENAME COLUMN c TO c2;");
+    apply("ALTER TABLE lake.main.t ALTER COLUMN d TYPE BIGINT;");
+    nested_columns_match_stock_ducklake(&apply, &probe);
+
+    // Head agreement is one row of the table. The reconstruction is the
+    // whole of it: every version between the two catalogs must carry the
+    // same live column set, since a divergence that cancels out by head is
+    // exactly what a head-only probe cannot see. One statement, evaluated
+    // per version, rather than a session per version — a CLI round trip
+    // each would cost minutes.
+    let history = "SELECT s.snapshot_id, c.column_name, c.column_id, c.column_order, c.column_type \
+                   FROM __ducklake_metadata_lake.ducklake_snapshot s \
+                   JOIN __ducklake_metadata_lake.ducklake_column c \
+                     ON c.begin_snapshot <= s.snapshot_id \
+                    AND (c.end_snapshot IS NULL OR c.end_snapshot > s.snapshot_id) \
+                   ORDER BY s.snapshot_id, c.column_order;";
+    let rebuilt = probe(history);
+    assert!(
+        !rebuilt.is_empty(),
+        "the history sweep matched no rows; the join or the metadata schema moved"
+    );
+    // The last version's rows are the live set the head probe just pinned,
+    // so the sweep is anchored rather than merely self-consistent.
+    let last_version = rebuilt.last().expect("at least one row")[0].clone();
+    let at_head: Vec<Vec<String>> = rebuilt
+        .iter()
+        .filter(|row| row[0] == last_version)
+        .map(|row| row[1..4].to_vec())
+        .collect();
+    assert_eq!(
+        at_head,
+        vec![
+            vec!["a".to_string(), "1".to_string(), "1".to_string()],
+            vec!["c2".to_string(), "3".to_string(), "3".to_string()],
+            vec!["d".to_string(), "4".to_string(), "4".to_string()],
+            vec!["e".to_string(), "5".to_string(), "5".to_string()],
+            vec!["s".to_string(), "6".to_string(), "6".to_string()],
+            vec!["x".to_string(), "7".to_string(), "7".to_string()],
+            vec!["y".to_string(), "8".to_string(), "8".to_string()],
+        ],
+        "the newest version of the sweep must be the live set"
+    );
+}
+
+/// The nested half of the differential above, split out to keep each
+/// readable: a parent plus one row per field, allocated in pre-order out of
+/// the same counter the top-level columns draw from, each field naming its
+/// parent. The core pins the verb path against this same layout; here the
+/// staged path is held to it against stock DuckLake.
+fn nested_columns_match_stock_ducklake(
+    apply: &dyn Fn(&str),
+    probe: &dyn Fn(&str) -> Vec<Vec<String>>,
+) {
+    apply("ALTER TABLE lake.main.t ADD COLUMN s STRUCT(x BIGINT, y VARCHAR);");
+    assert_eq!(
+        probe(
+            "SELECT column_name, column_id, column_order, column_type, parent_column \
+             FROM __ducklake_metadata_lake.ducklake_column \
+             WHERE end_snapshot IS NULL AND column_id >= 6 ORDER BY column_id;"
+        ),
+        vec![
+            vec![
+                "s".to_string(),
+                "6".to_string(),
+                "6".to_string(),
+                "struct".to_string(),
+                "NULL".to_string(),
+            ],
+            vec![
+                "x".to_string(),
+                "7".to_string(),
+                "7".to_string(),
+                "int64".to_string(),
+                "6".to_string(),
+            ],
+            vec![
+                "y".to_string(),
+                "8".to_string(),
+                "8".to_string(),
+                "varchar".to_string(),
+                "6".to_string(),
+            ],
+        ],
+        "a nested column's fields take the ids after their parent, in pre-order"
+    );
 }
 
 /// Column-level schema evolution through DuckLake's own `ALTER TABLE`:

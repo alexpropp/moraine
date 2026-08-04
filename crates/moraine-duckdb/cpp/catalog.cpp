@@ -214,6 +214,19 @@ void ThrowMoraineError(MoraineError &err) {
 	}
 }
 
+void ThrowMigrationRefusal(MoraineError &err, const std::string &path) {
+	std::string message = err.message ? std::string(err.message) : std::string("moraine: unknown error");
+	if (err.message != nullptr) {
+		moraine_error_free(err.message);
+		err.message = nullptr;
+	}
+	// `moraine_migrate` takes a store path precisely because the stores it
+	// repairs are the ones no ATTACH will open, so the refusal and the
+	// remedy are reachable from the same session and the same binary.
+	throw duckdb::IOException("%s. Its SQL surface is moraine_migrate: SELECT * FROM moraine_migrate('%s')", message,
+	                          path);
+}
+
 duckdb::LogicalType MapColumnType(const std::string &ducklake_type) {
 	std::string upper = ToUpperAscii(ducklake_type);
 
@@ -770,6 +783,12 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// would otherwise sit buffered until some later commit — or forever, on
 	// a read-only attach that never commits.
 	DrainMoraineLogs(context);
+	if (code == MORAINE_MIGRATION) {
+		// The core names its own verb; only this attach holds the path, and
+		// only the shim may name a SQL function. A store refused here is
+		// exactly one `moraine_migrate` repairs.
+		ThrowMigrationRefusal(err, info.path);
+	}
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}

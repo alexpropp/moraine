@@ -153,7 +153,10 @@ pub(crate) fn non_durable() -> WriteOptions {
 async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue>> {
     if read::read_migration(tx).await?.is_some() {
         return Err(Error::Migration(
-            "store is mid-migration; refusing to open".to_string(),
+            "store is mid-migration; refusing to open — Catalog::migrate resumes it from the \
+             durable cursor, and takes a store path rather than an open catalog, so it runs \
+             against a store no attach will touch"
+                .to_string(),
         ));
     }
     match read::read_format(tx).await? {
@@ -167,7 +170,9 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
         Some(format) if format.format_version < MIN_FORMAT_VERSION => {
             Err(Error::Migration(format!(
                 "store format {} predates this binary's minimum ({MIN_FORMAT_VERSION}); \
-             it must be migrated up before this binary can open it",
+             migrate it up with Catalog::migrate, which takes a store path rather than an \
+             open catalog and so runs on this same binary against the store it refuses to \
+             open",
                 format.format_version
             )))
         }

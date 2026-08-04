@@ -122,13 +122,25 @@ async fn migration_marker_is_refused() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, Error::Migration(_)), "{err:?}");
+    match err {
+        Error::Migration(msg) => assert!(
+            msg.contains("Catalog::migrate"),
+            "mid-migration message names no verb: {msg}"
+        ),
+        other => panic!("expected Migration, got {other:?}"),
+    }
 }
 
 /// A format below this binary's floor refuses toward the migrate path,
 /// distinct from the newer-than-binary message. The floor sits at the base
 /// format while every format is additive, so only a synthetic store reaches
 /// this arm; the test holds it correct for the first format that raises it.
+///
+/// The message must name the verb, and name it as something this binary
+/// runs: `Catalog::migrate` takes a store path and never goes through the
+/// format check, so the store an attach refuses is still migratable by the
+/// binary that refused it. That is the non-obvious half, and the half an
+/// operator gets wrong.
 #[tokio::test]
 async fn older_format_refuses_toward_migrate() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
@@ -152,7 +164,16 @@ async fn older_format_refuses_toward_migrate() {
         .err()
         .unwrap();
     match err {
-        Error::Migration(msg) => assert!(msg.contains("migrate"), "older-store message: {msg}"),
+        Error::Migration(msg) => {
+            assert!(
+                msg.contains("Catalog::migrate"),
+                "older-store message names no verb: {msg}"
+            );
+            assert!(
+                msg.contains("this same binary"),
+                "older-store message does not say who can run it: {msg}"
+            );
+        }
         other => panic!("expected Migration, got {other:?}"),
     }
 }
@@ -209,6 +230,7 @@ fn renaming_one_column_stages_no_write_for_any_sibling() {
         column_type: "BIGINT".into(),
         nulls_allowed: true,
         default_value: None,
+        children: Vec::new(),
     };
 
     let snap0 = proto::SnapshotValue {
@@ -303,6 +325,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
                 column_type: "BIGINT".into(),
                 nulls_allowed: true,
                 default_value: None,
+                children: Vec::new(),
             }],
         )
         .unwrap();
@@ -418,6 +441,7 @@ async fn verb_ddl_records_schema_changed_table_ids() {
                     column_type: "BIGINT".into(),
                     nulls_allowed: true,
                     default_value: None,
+                    children: Vec::new(),
                 }],
             )?;
             tx.rename_table(table, "t2")?;
@@ -480,6 +504,7 @@ async fn catalog_with_two_column_table() -> (crate::catalog::Catalog, crate::cat
                 column_type: "BIGINT".into(),
                 nulls_allowed: true,
                 default_value: None,
+                children: Vec::new(),
             };
             let created = tx.create_table(schema, "t", &[column("a"), column("b")])?;
             table.set(Some(created));
@@ -3233,6 +3258,7 @@ async fn folded_head_view_matches_a_fresh_scan() {
         column_type: "BIGINT".into(),
         nulls_allowed: true,
         default_value: None,
+        children: Vec::new(),
     };
 
     let keep = std::cell::Cell::new(None);
@@ -3327,6 +3353,7 @@ async fn seeded_catalog(tables: usize) -> (crate::catalog::Catalog, Vec<crate::c
         column_type: "BIGINT".into(),
         nulls_allowed: true,
         default_value: None,
+        children: Vec::new(),
     };
 
     let ids = std::cell::RefCell::new(Vec::new());
@@ -3546,6 +3573,7 @@ async fn an_incremental_refresh_matches_a_full_rematerialization() {
                     column_type: "BIGINT".into(),
                     nulls_allowed: true,
                     default_value: None,
+                    children: Vec::new(),
                 }],
             )
             .map(|_| ())
@@ -3941,6 +3969,7 @@ async fn seeded_wide_catalog(
             column_type: "BIGINT".into(),
             nulls_allowed: true,
             default_value: None,
+            children: Vec::new(),
         })
         .collect();
 
@@ -4091,6 +4120,7 @@ async fn a_commit_landing_mid_materialization_is_invisible_to_the_whole_pass() {
                     column_type: "BIGINT".into(),
                     nulls_allowed: true,
                     default_value: None,
+                    children: Vec::new(),
                 }],
             )?;
             tx.register_data_file(tables[0], bulk_file("mid.parquet", 3), &[])

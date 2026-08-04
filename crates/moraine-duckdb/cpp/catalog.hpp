@@ -35,6 +35,13 @@ duckdb::LogicalType MapColumnType(const std::string &ducklake_type);
 // InternalException) and throws it. Frees `err.message` first if non-null.
 [[noreturn]] void ThrowMoraineError(MoraineError &err);
 
+// Throws a MORAINE_MIGRATION refusal from an attach of `path`, naming the
+// SQL function that repairs it. The core diagnoses the store and names its
+// own Rust verb; only the attach holds the path, and only the shim may name
+// a DuckDB function, so the two halves of the remedy meet here. Frees
+// `err.message` first if non-null.
+[[noreturn]] void ThrowMigrationRefusal(MoraineError &err, const std::string &path);
+
 // Drains the core's buffered `tracing` events into DuckDB's logger under
 // the `moraine` log type, so they surface in `duckdb_logs`. Events are
 // emitted on the core's own worker threads, where no ClientContext is in

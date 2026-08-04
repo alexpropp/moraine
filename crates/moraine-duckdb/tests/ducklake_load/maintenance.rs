@@ -100,6 +100,89 @@ fn ducklake_expire_and_cleanup_reclaims_files() {
     );
 }
 
+/// Read-your-writes for the metadata projections: inside one transaction, a
+/// scan of a metadata table observes the rows that transaction has already
+/// staged against it.
+///
+/// DuckLake's expiry and cleanup cascades are written this way — they stage
+/// deletes and then re-read the same tables with `NOT EXISTS` subqueries to
+/// decide what is dead — so a committed-state scan would make a cascade
+/// re-plan work it has already done, or refuse to plan work that is now
+/// due. Driven directly rather than through a cascade: a cascade that
+/// happens not to re-read a given table at the tracked DuckLake version
+/// would pass whether or not the overlay existed.
+///
+/// Every transaction here rolls back, so the assertion after each one is the
+/// other half: the overlay is a view, not a write.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn metadata_scans_observe_their_own_transactions_staged_rows() {
+    let store = TempDir::new("ryw-store");
+    let data = TempDir::new("ryw-data");
+
+    // A real Parquet file, so every file-shaped metadata table has a row:
+    // an inlined insert would leave `ducklake_data_file` empty and the
+    // whole probe vacuous.
+    run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "CREATE TABLE lake.main.t(a BIGINT);\
+         INSERT INTO lake.main.t SELECT i FROM range(100) t(i);",
+    );
+
+    // Every kind whose emptiness a plain DELETE can show. Three are left
+    // out on purpose: `ducklake_metadata`'s bare DELETE is not a shape the
+    // staged path accepts, `ducklake_tag` has no rows to delete here, and
+    // `ducklake_schema_versions` is *derived* — its rows re-fold out of the
+    // surviving snapshot records, so deleting the stored ones changes
+    // nothing, exactly as it does not for the committed projection.
+    for table in [
+        "ducklake_data_file",
+        "ducklake_file_column_stats",
+        "ducklake_column",
+        "ducklake_table",
+        "ducklake_schema",
+        "ducklake_table_stats",
+        "ducklake_table_column_stats",
+        "ducklake_snapshot",
+    ] {
+        let before = csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            &format!("SELECT count(*) FROM __ducklake_metadata_lake.{table};"),
+        ));
+        assert_ne!(
+            before,
+            vec![vec!["0".to_string()]],
+            "{table} is empty, so deleting from it would prove nothing"
+        );
+
+        let staged = csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            &format!(
+                "BEGIN TRANSACTION;\
+                 DELETE FROM __ducklake_metadata_lake.{table};\
+                 SELECT count(*) FROM __ducklake_metadata_lake.{table};\
+                 ROLLBACK;"
+            ),
+        ));
+        assert_eq!(
+            staged,
+            vec![vec!["0".to_string()]],
+            "a scan of {table} inside the transaction that emptied it still \
+             reported committed rows"
+        );
+
+        let after = csv_rows(&run_ducklake_sql(
+            store.path(),
+            data.path(),
+            &format!("SELECT count(*) FROM __ducklake_metadata_lake.{table};"),
+        ));
+        assert_eq!(after, before, "the rolled-back {table} delete left a mark");
+    }
+}
+
 /// Orphaned-file deletion, differential against a stock DuckLake
 /// catalog: a stray Parquet no catalog row ever referenced is deleted
 /// on both, while every catalogued file survives and both catalogs

@@ -29,6 +29,31 @@ pub struct MorainePartitionInfoRow {
     pub end_snapshot: u64,
 }
 
+/// Converts core `ducklake_partition_info` records into the C row shape. Shared
+/// by the committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+// Infallible — this kind's row carries no strings — but it keeps the
+// fallible signature every converter shares, so `dump_rows` and the
+// transaction-aware dumps take them all the same way.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn partition_info_rows(
+    rows: Vec<moraine::ffi_support::PartitionRecord>,
+) -> Result<Vec<MorainePartitionInfoRow>, AbiError> {
+    Ok(rows
+        .into_iter()
+        .map(|v| {
+            let (has_end, end) = opt_u64(v.end_snapshot);
+            MorainePartitionInfoRow {
+                partition_id: v.partition_id,
+                table_id: v.table_id,
+                begin_snapshot: v.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_partition_info` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -58,21 +83,7 @@ pub unsafe extern "C" fn moraine_dump_partition_info(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_partition_info(catalog)),
-            |rows| {
-                Ok(rows
-                    .into_iter()
-                    .map(|v| {
-                        let (has_end, end) = opt_u64(v.end_snapshot);
-                        MorainePartitionInfoRow {
-                            partition_id: v.partition_id,
-                            table_id: v.table_id,
-                            begin_snapshot: v.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                        }
-                    })
-                    .collect())
-            },
+            partition_info_rows,
         )
     }
 }
@@ -111,6 +122,34 @@ pub struct MorainePartitionColumnRow {
     pub transform: *mut c_char,
 }
 
+/// Converts core `ducklake_partition_column` records into the C row shape.
+/// Shared by the committed dump and the transaction-aware one, so the two can
+/// never drift in what they report.
+pub(crate) fn partition_column_rows(
+    rows: Vec<moraine::ffi_support::PartitionColumnRow>,
+) -> Result<Vec<MorainePartitionColumnRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let transform = to_c_string(&row.transform)?;
+            Ok((row, transform))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(|(row, transform)| MorainePartitionColumnRow {
+            partition_id: row.partition_id,
+            table_id: row.table_id,
+            partition_key_index: row.partition_key_index,
+            column_id: row.column_id,
+            transform: transform.into_raw(),
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_partition_column` row — one per embedded column
 /// of every partition record, current and history — into
 /// `*out_items`/`*out_len`.
@@ -141,28 +180,7 @@ pub unsafe extern "C" fn moraine_dump_partition_columns(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_partition_column_rows(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let transform = to_c_string(&row.transform)?;
-                        Ok((row, transform))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, transform)| MorainePartitionColumnRow {
-                        partition_id: row.partition_id,
-                        table_id: row.table_id,
-                        partition_key_index: row.partition_key_index,
-                        column_id: row.column_id,
-                        transform: transform.into_raw(),
-                    })
-                    .collect())
-            },
+            partition_column_rows,
         )
     }
 }
@@ -204,6 +222,31 @@ pub struct MoraineSortInfoRow {
     pub end_snapshot: u64,
 }
 
+/// Converts core `ducklake_sort_info` records into the C row shape. Shared by
+/// the committed dump and the transaction-aware one, so the two can never
+/// drift in what they report.
+// Infallible — this kind's row carries no strings — but it keeps the
+// fallible signature every converter shares, so `dump_rows` and the
+// transaction-aware dumps take them all the same way.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn sort_info_rows(
+    rows: Vec<moraine::ffi_support::SortRecord>,
+) -> Result<Vec<MoraineSortInfoRow>, AbiError> {
+    Ok(rows
+        .into_iter()
+        .map(|v| {
+            let (has_end, end) = opt_u64(v.end_snapshot);
+            MoraineSortInfoRow {
+                sort_id: v.sort_id,
+                table_id: v.table_id,
+                begin_snapshot: v.begin_snapshot,
+                has_end_snapshot: has_end,
+                end_snapshot: end,
+            }
+        })
+        .collect())
+}
+
 /// Dumps every `ducklake_sort_info` row — current and history — into
 /// `*out_items`/`*out_len`.
 ///
@@ -233,21 +276,7 @@ pub unsafe extern "C" fn moraine_dump_sort_info(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_sort_info(catalog)),
-            |rows| {
-                Ok(rows
-                    .into_iter()
-                    .map(|v| {
-                        let (has_end, end) = opt_u64(v.end_snapshot);
-                        MoraineSortInfoRow {
-                            sort_id: v.sort_id,
-                            table_id: v.table_id,
-                            begin_snapshot: v.begin_snapshot,
-                            has_end_snapshot: has_end,
-                            end_snapshot: end,
-                        }
-                    })
-                    .collect())
-            },
+            sort_info_rows,
         )
     }
 }
@@ -287,6 +316,41 @@ pub struct MoraineSortExpressionRow {
     pub null_order: *mut c_char,
 }
 
+/// Converts core `ducklake_sort_expression` records into the C row shape.
+/// Shared by the committed dump and the transaction-aware one, so the two can
+/// never drift in what they report.
+pub(crate) fn sort_expression_rows(
+    rows: Vec<moraine::ffi_support::SortExpressionRow>,
+) -> Result<Vec<MoraineSortExpressionRow>, AbiError> {
+    // Owned-first (see `moraine_dump_schemas`): every string in the
+    // whole batch converts before any raw pointer is minted.
+    let owned = rows
+        .into_iter()
+        .map(|row| {
+            let expression = to_c_string(&row.expression)?;
+            let dialect = to_c_string(&row.dialect)?;
+            let sort_direction = to_c_string(&row.sort_direction)?;
+            let null_order = to_c_string(&row.null_order)?;
+            Ok((row, expression, dialect, sort_direction, null_order))
+        })
+        .collect::<Result<Vec<_>, AbiError>>()?;
+
+    Ok(owned
+        .into_iter()
+        .map(
+            |(row, expression, dialect, sort_direction, null_order)| MoraineSortExpressionRow {
+                sort_id: row.sort_id,
+                table_id: row.table_id,
+                sort_key_index: row.sort_key_index,
+                expression: expression.into_raw(),
+                dialect: dialect.into_raw(),
+                sort_direction: sort_direction.into_raw(),
+                null_order: null_order.into_raw(),
+            },
+        )
+        .collect())
+}
+
 /// Dumps every `ducklake_sort_expression` row — one per embedded
 /// expression of every sort record, current and history — into
 /// `*out_items`/`*out_len`.
@@ -317,35 +381,7 @@ pub unsafe extern "C" fn moraine_dump_sort_expressions(
             probe_ctx,
             err,
             |catalog| Box::pin(moraine::ffi_support::dump_sort_expression_rows(catalog)),
-            |rows| {
-                // Owned-first (see `moraine_dump_schemas`): every string in the
-                // whole batch converts before any raw pointer is minted.
-                let owned = rows
-                    .into_iter()
-                    .map(|row| {
-                        let expression = to_c_string(&row.expression)?;
-                        let dialect = to_c_string(&row.dialect)?;
-                        let sort_direction = to_c_string(&row.sort_direction)?;
-                        let null_order = to_c_string(&row.null_order)?;
-                        Ok((row, expression, dialect, sort_direction, null_order))
-                    })
-                    .collect::<Result<Vec<_>, AbiError>>()?;
-
-                Ok(owned
-                    .into_iter()
-                    .map(|(row, expression, dialect, sort_direction, null_order)| {
-                        MoraineSortExpressionRow {
-                            sort_id: row.sort_id,
-                            table_id: row.table_id,
-                            sort_key_index: row.sort_key_index,
-                            expression: expression.into_raw(),
-                            dialect: dialect.into_raw(),
-                            sort_direction: sort_direction.into_raw(),
-                            null_order: null_order.into_raw(),
-                        }
-                    })
-                    .collect())
-            },
+            sort_expression_rows,
         )
     }
 }

@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
-use futures::FutureExt;
 use object_store::memory::InMemory;
 
-use super::*;
+use super::{
+    synthetic::{SOURCE_SCOPE, TARGET_SCOPE},
+    *,
+};
 use crate::{
     catalog::{Catalog, CatalogOptions, MigrationRequest},
-    fault::inject_crash,
+    fault::{SyntheticMigration, inject_crash, install_migration},
     store::{
         key::EntityKey,
         open::StoreBuilder,
@@ -15,120 +17,16 @@ use crate::{
     transaction::commit::{FORMAT_VERSION, MAX_FORMAT_VERSION, MIN_FORMAT_VERSION, durable},
 };
 
-/// The format the test units migrate into: past every real one, so a test
-/// store is never mistaken for one this binary could open normally.
-const TEST_TO_FORMAT: u64 = MAX_FORMAT_VERSION + 1;
+/// The format the rewriting synthetic unit lands on: the newest this binary
+/// reads, so a store it migrated still attaches.
+const REWRITTEN_FORMAT: u64 = MAX_FORMAT_VERSION;
 
-/// The scope kind the test records start under, and the one the test
-/// migration moves them to. Moving a record between scope kinds changes
-/// where its key sorts, which is exactly what makes a change structural.
-const SOURCE_SCOPE: u64 = 1;
-const TARGET_SCOPE: u64 = 2;
+/// The format the second link lands on: past the newest this binary reads,
+/// so the composed jump's end state is distinguishable from one link's.
+const CHAINED_FORMAT: u64 = MAX_FORMAT_VERSION + 1;
 
 /// How many option records the fixture plants.
 const SEEDED_RECORDS: u64 = 3;
-
-/// A rewriting migration in miniature: it walks the option records under
-/// [`SOURCE_SCOPE`] in key order and moves each to [`TARGET_SCOPE`], one
-/// record per batch, writing the new key before deleting the old. Shaped
-/// exactly like a real unit — idempotent, and resumable from the cursor it
-/// returns.
-fn move_scope_step<'a>(
-    tx: &'a DbTransaction,
-    cursor: &'a [u8],
-) -> BoxFuture<'a, Result<StepOutcome>> {
-    async move {
-        let start = decode_cursor(cursor)?;
-
-        let Some((scope_id, value)) = next_source_record(tx, start).await? else {
-            return Ok(None);
-        };
-
-        // New key first, old key second. Within one batch the pair is
-        // atomic; the ordering is the discipline a unit that ever split its
-        // work across batches would need, so it is written that way here.
-        tx.put(
-            Key::current(EntityKey::Option {
-                scope_kind: TARGET_SCOPE,
-                scope_id,
-            })
-            .encode(),
-            value::encode_value(&value),
-        )
-        .map_err(Error::from)?;
-        tx.delete(
-            Key::current(EntityKey::Option {
-                scope_kind: SOURCE_SCOPE,
-                scope_id,
-            })
-            .encode(),
-        )
-        .map_err(Error::from)?;
-
-        Ok(Some(scope_id.to_be_bytes().to_vec()))
-    }
-    .boxed()
-}
-
-/// The scope id a cursor names, or `None` at the start of the walk.
-fn decode_cursor(cursor: &[u8]) -> Result<Option<u64>> {
-    if cursor.is_empty() {
-        return Ok(None);
-    }
-    let bytes: [u8; 8] = cursor
-        .try_into()
-        .map_err(|_| Error::Corruption("migration cursor is not a scope id".to_string()))?;
-    Ok(Some(u64::from_be_bytes(bytes)))
-}
-
-/// The first record still under [`SOURCE_SCOPE`] past `start`. Records
-/// already moved sort under the target scope and are never returned, which
-/// is what makes re-running an applied step a no-op.
-async fn next_source_record(
-    tx: &DbTransaction,
-    start: Option<u64>,
-) -> Result<Option<(u64, proto::OptionScopeValue)>> {
-    let mut found: Vec<(u64, proto::OptionScopeValue)> = scan_current_entities(ReadHandle::Tx(tx))
-        .await?
-        .into_iter()
-        .filter_map(|record| match record {
-            EntityRecord::Option {
-                scope_kind,
-                scope_id,
-                value,
-            } if scope_kind == SOURCE_SCOPE => Some((scope_id, value)),
-            _ => None,
-        })
-        .filter(|(scope_id, _)| start.is_none_or(|start| *scope_id > start))
-        .collect();
-    found.sort_by_key(|(scope_id, _)| *scope_id);
-
-    Ok(found.into_iter().next())
-}
-
-const MOVE_SCOPE: MigrationUnit = MigrationUnit {
-    name: "move-option-scope",
-    from_format: FORMAT_VERSION,
-    to_format: TEST_TO_FORMAT,
-    step: move_scope_step,
-};
-
-/// A second link, so a multi-version jump has something to compose. It walks
-/// nothing: its whole job is to prove the driver runs a chain, each link with
-/// its own start, steps, and finish.
-fn no_work_step<'a>(
-    _tx: &'a DbTransaction,
-    _cursor: &'a [u8],
-) -> BoxFuture<'a, Result<StepOutcome>> {
-    async move { Ok(None) }.boxed()
-}
-
-const SECOND_LINK: MigrationUnit = MigrationUnit {
-    name: "second-link",
-    from_format: TEST_TO_FORMAT,
-    to_format: TEST_TO_FORMAT + 1,
-    step: no_work_step,
-};
 
 /// A bootstrapped catalog carrying [`SEEDED_RECORDS`] option records under
 /// [`SOURCE_SCOPE`], closed so a migrator can take the writer.
@@ -218,41 +116,18 @@ fn migrated_scopes() -> Vec<(u64, u64)> {
     expected
 }
 
-/// Runs the plan the durable state implies over a caller-supplied registry —
-/// [`run`], but driving units the production registry does not carry.
+/// Installs `units` and runs the shipped driver against the store — [`run`],
+/// reached exactly as [`Catalog::migrate`] reaches it, so what these tests
+/// cover is the planner that ships rather than a parallel one.
 async fn migrate_with(
     object_store: &Arc<InMemory>,
-    units: &[&'static MigrationUnit],
-) -> Result<()> {
+    units: SyntheticMigration,
+) -> Result<MigrationReport> {
+    install_migration(units);
     let db = open_migrator(object_store).await;
-    let outcome = drive(&db, units).await;
+    let outcome = run(&db).await;
     db.close().await.unwrap();
     outcome
-}
-
-async fn drive(db: &Db, units: &[&'static MigrationUnit]) -> Result<()> {
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
-    let format = read::read_format(ReadHandle::Tx(&tx)).await?;
-    let marker = read::read_migration(ReadHandle::Tx(&tx)).await?;
-    tx.rollback();
-
-    let mut current = format
-        .ok_or_else(|| Error::Corruption("uninitialized store".to_string()))?
-        .format_version;
-    let mut resume = marker.map(|marker| marker.cursor);
-
-    for unit in units {
-        if unit.to_format <= current {
-            continue;
-        }
-        run_unit(db, unit, resume.take()).await?;
-        current = unit.to_format;
-    }
-
-    Ok(())
 }
 
 /// The whole point of the marker: with one present the store is stamped old
@@ -262,7 +137,7 @@ async fn a_crash_mid_rewrite_leaves_the_store_old_and_unreadable() {
     let object_store = seeded_store().await;
 
     inject_crash(Some(CrashPoint::AfterStep));
-    let error = migrate_with(&object_store, &[&MOVE_SCOPE])
+    let error = migrate_with(&object_store, SyntheticMigration::MoveOptionScope)
         .await
         .err()
         .unwrap();
@@ -272,7 +147,7 @@ async fn a_crash_mid_rewrite_leaves_the_store_old_and_unreadable() {
     assert_eq!(format, FORMAT_VERSION, "the flip has not happened");
     let marker = marker.expect("a crashed migration leaves its marker");
     assert_eq!(marker.from_format, FORMAT_VERSION);
-    assert_eq!(marker.to_format, TEST_TO_FORMAT);
+    assert_eq!(marker.to_format, REWRITTEN_FORMAT);
     assert_eq!(marker.cursor, 1_u64.to_be_bytes().to_vec());
 
     let error = Catalog::open(object_store.clone(), CatalogOptions::default())
@@ -295,20 +170,20 @@ async fn a_crash_at_every_seam_resumes_to_a_coherent_store() {
         let object_store = seeded_store().await;
 
         inject_crash(Some(point));
-        let crashed = migrate_with(&object_store, &[&MOVE_SCOPE]).await;
+        let crashed = migrate_with(&object_store, SyntheticMigration::MoveOptionScope).await;
 
         let (format, marker) = durable_state(&object_store).await;
 
         // Never the one combination the protocol forbids.
         assert!(
-            !(format == TEST_TO_FORMAT && marker.is_some()),
+            !(format == REWRITTEN_FORMAT && marker.is_some()),
             "new format with the marker still present at {point:?}"
         );
 
         if matches!(point, CrashPoint::AfterFinish) {
             // The finish batch was already durable, so this seam stops a
             // migration that had in fact completed.
-            assert_eq!(format, TEST_TO_FORMAT, "{point:?}");
+            assert_eq!(format, REWRITTEN_FORMAT, "{point:?}");
             assert!(marker.is_none(), "{point:?}");
         } else {
             assert!(crashed.is_err(), "{point:?}");
@@ -317,12 +192,12 @@ async fn a_crash_at_every_seam_resumes_to_a_coherent_store() {
         }
 
         inject_crash(None);
-        migrate_with(&object_store, &[&MOVE_SCOPE])
+        migrate_with(&object_store, SyntheticMigration::MoveOptionScope)
             .await
             .unwrap_or_else(|error| panic!("resume after {point:?}: {error:?}"));
 
         let (format, marker) = durable_state(&object_store).await;
-        assert_eq!(format, TEST_TO_FORMAT, "{point:?}");
+        assert_eq!(format, REWRITTEN_FORMAT, "{point:?}");
         assert!(marker.is_none(), "{point:?}");
         assert_eq!(
             option_scopes(&object_store).await,
@@ -337,13 +212,17 @@ async fn a_crash_at_every_seam_resumes_to_a_coherent_store() {
 #[tokio::test]
 async fn a_completed_migration_reruns_as_a_noop() {
     let object_store = seeded_store().await;
-    migrate_with(&object_store, &[&MOVE_SCOPE]).await.unwrap();
+    migrate_with(&object_store, SyntheticMigration::MoveOptionScope)
+        .await
+        .unwrap();
 
-    migrate_with(&object_store, &[&MOVE_SCOPE]).await.unwrap();
+    migrate_with(&object_store, SyntheticMigration::MoveOptionScope)
+        .await
+        .unwrap();
 
     assert_eq!(option_scopes(&object_store).await, migrated_scopes());
     let (format, marker) = durable_state(&object_store).await;
-    assert_eq!(format, TEST_TO_FORMAT);
+    assert_eq!(format, REWRITTEN_FORMAT);
     assert!(marker.is_none());
 }
 
@@ -354,12 +233,12 @@ async fn a_completed_migration_reruns_as_a_noop() {
 async fn a_multi_version_jump_composes_its_links() {
     let object_store = seeded_store().await;
 
-    migrate_with(&object_store, &[&MOVE_SCOPE, &SECOND_LINK])
+    migrate_with(&object_store, SyntheticMigration::MoveOptionScopeThenLink)
         .await
         .unwrap();
 
     let (format, marker) = durable_state(&object_store).await;
-    assert_eq!(format, SECOND_LINK.to_format);
+    assert_eq!(format, CHAINED_FORMAT);
     assert!(marker.is_none());
     assert_eq!(option_scopes(&object_store).await, migrated_scopes());
 }
@@ -389,18 +268,18 @@ async fn a_migrated_store_still_time_travels() {
         .unwrap();
     catalog.close().await.unwrap();
 
-    migrate_with(&object_store, &[&MOVE_SCOPE]).await.unwrap();
-
-    // The store now names a format this binary cannot attach to, which is
-    // the honest end state of a migration into the future — so the
-    // historical read runs through the migrator's own handle.
-    let db = open_migrator(&object_store).await;
-    let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
-    let past = crate::transaction::commit::materialize(ReadHandle::Tx(&tx), Some(first.get()))
+    migrate_with(&object_store, SyntheticMigration::MoveOptionScope)
         .await
         .unwrap();
-    tx.rollback();
-    db.close().await.unwrap();
+
+    // The rewriting unit lands on the newest format this binary reads, so the
+    // historical read goes through an ordinary attach — the way an operator
+    // would check that a migration preserved history.
+    let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let past = catalog.snapshot_at(first).await.unwrap();
+    catalog.close().await.unwrap();
 
     let mut names: Vec<String> = past
         .schemas()
@@ -415,6 +294,7 @@ async fn a_migrated_store_still_time_travels() {
 /// the protocol, so meeting one is corruption, not a resume.
 #[test]
 fn a_marker_the_format_contradicts_is_corruption() {
+    install_migration(SyntheticMigration::None);
     let error = plan(
         FORMAT_VERSION,
         Some(&proto::MigrationValue {
@@ -433,6 +313,7 @@ fn a_marker_the_format_contradicts_is_corruption() {
 /// guessed at — the same discipline as meeting a newer format.
 #[test]
 fn an_unknown_migration_in_flight_is_refused() {
+    install_migration(SyntheticMigration::None);
     let error = plan(
         FORMAT_VERSION,
         Some(&proto::MigrationValue {
@@ -451,6 +332,7 @@ fn an_unknown_migration_in_flight_is_refused() {
 /// verb reports a no-op rather than pretending it rewrote anything.
 #[tokio::test]
 async fn the_migrate_verb_is_a_noop_against_a_current_store() {
+    install_migration(SyntheticMigration::None);
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
     let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
         .await
@@ -476,6 +358,7 @@ async fn the_migrate_verb_is_a_noop_against_a_current_store() {
 /// not a lingering cost.
 #[tokio::test]
 async fn the_checkpoint_flag_takes_and_releases_one() {
+    install_migration(SyntheticMigration::None);
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
     let catalog = Catalog::open(object_store.clone(), CatalogOptions::default())
         .await

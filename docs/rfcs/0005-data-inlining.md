@@ -199,6 +199,22 @@ that order — data before metadata, like any DuckLake write):
 1. Write live inlined rows to Parquet data file(s); write a partial
    deletion file consolidating tombstones if any, preserving per-row
    snapshot metadata.
+
+   The rows reach DuckLake's writer **column-wise**. A chunk decodes once,
+   through DuckDB's own Arrow importer, and stays as the `DataChunk` that
+   importer produced; the scan then emits its output by copying whole runs
+   of it across, vector to vector. Runs are long in practice: the scan
+   orders by `row_id`, and row ids within a chunk follow insertion order.
+   The three metadata columns are written straight into flat vectors, and a
+   column no one projected is never copied at all. Nothing is transcoded
+   through `duckdb::Value` in either direction, which is the point — a
+   row-by-row materialization would undo the transcode-free property the
+   format was chosen for, one `Value` per cell, twice.
+
+   A rowid the scan emits stays its index into that scan's row list, since
+   the UPDATE and DELETE paths resolve one back by re-materializing the
+   list. They need only `row_id` and `begin_snapshot`, so that
+   re-materialization decodes no Arrow body at all.
 2. In the commit batch: create the `file` (and `delfile`) records — the
    file record backdated to the minimum per-row snapshot, row-faithfully,
    as DuckLake writes it — and **delete** the flushed `inline/insert` chunks
