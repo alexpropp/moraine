@@ -238,18 +238,11 @@ pub(crate) async fn plan_index_entries(
 
     let mut writes: Vec<StagedWrite> = Vec::new();
     let mut deleted_unique: HashSet<Vec<u8>> = HashSet::new();
-    // The exact entries this commit removes. An add of one that is also deleted
-    // is a dead-on-arrival row — a flush registers a file and deletes rows from
-    // it in one commit — and cancels: the store applies adds after deletes, so
-    // the add would otherwise resurrect the entry. A re-insert of the same value
-    // for a *different* row carries a different id and is not cancelled.
-    let mut deleted_pairs: HashSet<(Vec<u8>, u64)> = HashSet::new();
     for entry in entries.iter().filter(|entry| entry.delete) {
         let key_bytes = entry_key(entry).encode();
         if entry.unique {
             deleted_unique.insert(key_bytes.clone());
         }
-        deleted_pairs.insert((key_bytes.clone(), entry.row_id));
         writes.push((key_bytes, None));
     }
 
@@ -262,9 +255,6 @@ pub(crate) async fn plan_index_entries(
     let mut poisoned: Vec<u64> = Vec::new();
     for entry in entries.iter().filter(|entry| !entry.delete) {
         let key_bytes = entry_key(entry).encode();
-        if deleted_pairs.contains(&(key_bytes.clone(), entry.row_id)) {
-            continue;
-        }
         if !entry.unique {
             // The row id lives in the key; the value is empty.
             writes.push((key_bytes, Some(Vec::new())));
