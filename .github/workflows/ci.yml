@@ -7,7 +7,14 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseding a push is right on a branch and wrong on `main`: a
+  # cancelled job skips every post step, so the run loses the caches it
+  # just spent twenty minutes filling — and `main` is the only ref whose
+  # caches every other run can read. Merges landing inside one CI run
+  # cancelled two in a row that way, which is enough to keep the caches
+  # permanently cold. Without cancellation the group queues instead, so
+  # the second merge starts from what the first one saved.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -95,10 +102,6 @@ jobs:
   # and the caches that keep that build off the critical path.
   e2e:
     runs-on: ubuntu-latest
-    env:
-      # Room for the whole DuckDB object set with headroom for a few
-      # generations of it, well under the 10 GB the repo's caches share.
-      CCACHE_MAXSIZE: 1G
     steps:
       - uses: actions/checkout@v7
         with:
@@ -144,6 +147,13 @@ jobs:
           path: target/duckdb-extensions
           key: duckdb-extensions-${{ runner.os }}-${{ hashFiles('.github/duckdb-versions') }}
       - run: cargo xtask e2e
+        env:
+          # Room for the whole DuckDB object set with headroom for a few
+          # generations of it, well under the 10 GB the repo's caches
+          # share. On this step rather than the job: rust-cache hashes
+          # every job-level variable whose name starts with CC into its
+          # key, so a job-level `CCACHE_*` throws away the Rust cache.
+          CCACHE_MAXSIZE: 1G
       # A collapsed hit rate is the first sign the cache stopped working,
       # and it is invisible unless the run prints it.
       - run: ccache --show-stats
