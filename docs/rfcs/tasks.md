@@ -84,14 +84,22 @@ deliberately not itemized here.
   `new_transaction`) — no store I/O, but a serialization point a wide
   client fleet funnels through. A production trace attributing a warm
   read's time between those two settles whether either is worth removing.
-- **DECISION** — Whether a read-write handle may cache the `sys/migration`
-  probe as well, which is the last store read on a warm path. The marker is
-  only ever written by a migrator, and a migrator takes the writer epoch and
-  so fences the handle — which would make the probe answerable locally. Two
-  tests deliberately assert the opposite (a marker planted under a live
-  read-write handle refuses every read seam, warm cache included), so
-  settling this means settling whether that scenario is reachable outside a
-  test seam, not just deleting the read.
+- **IMPL** — Drop the `sys/migration` probe from a read-write handle's read
+  path, the last store read left on a warm one. Settled by measurement
+  rather than argument: a marker written by the writer that fenced this
+  handle is invisible to it, and it reports `Fenced`, never `Migration`
+  (`a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration`).
+  The probe is not the guard on a writer — the fence check is. What the two
+  planted-marker tests assert is reachable only by writing the marker
+  through the handle's own transaction, which no migrator does, so the same
+  change re-scopes them to the read-only handle. A writer still probes once
+  while cold, so a migration a crashed predecessor left behind is caught.
+- **DEFERRED** — Carry the migration state as a field on the `sys/head`
+  record, so a probe rides along with a read already being issued instead
+  of being a guaranteed miss that must consult every level's filter. A
+  read-only handle follows another process and must keep probing per read,
+  so this is where the saving lands once a writer stops probing at all.
+  Needs a format-version bump for a reader to know when to trust the field.
 
 ## 0013 — Partitioning, sorting, and pruning
 

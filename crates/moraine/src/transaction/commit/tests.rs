@@ -4338,3 +4338,81 @@ async fn a_verb_commit_rematerializes_over_a_reclaimed_snapshot() {
 
     db.close().await.unwrap();
 }
+
+/// What a real migrator does to a live read-write handle, as against what
+/// a planted marker models.
+///
+/// `Catalog::migrate` takes the writer epoch before it writes anything, so
+/// the handle it displaces is already fenced by the time a marker exists —
+/// and a fenced handle reads its own state, which that marker never
+/// reached. So the displaced handle does not report `Migration` for this
+/// sequence at any point: it reads no marker, serves the view it holds
+/// until it notices the fence, and reports `Fenced` from then on.
+///
+/// Pinned because the per-read marker probe looks like the guard here and
+/// is not — the fence check is. A marker planted through a handle's *own*
+/// transaction is the only way to make that probe fire, and no writer
+/// reaches that state.
+#[tokio::test]
+async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
+    use crate::catalog::{Catalog, CatalogOptions};
+
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+    let displaced = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    displaced
+        .commit(|tx| tx.create_schema("before").map(|_| ()))
+        .await
+        .unwrap();
+    // Warm: the handle now holds a head view and serves reads from it.
+    displaced.snapshot().await.unwrap();
+
+    // The displacing writer, taking the epoch exactly as a migrator does,
+    // then writing the marker a migration's start batch writes.
+    let migrator = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    let tx = migrator.begin_write_tx().await.unwrap();
+    tx.put(
+        Key::Sys(SysKey::Migration).encode(),
+        value::encode_value(&proto::MigrationValue {
+            from_format: 1,
+            to_format: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
+
+    // Fencing is reported by a background task, so the displaced handle
+    // does not learn of it in the same breath. Whatever it answers in that
+    // window, it is never `Migration`.
+    let mut noticed = None;
+    for _ in 0..100 {
+        match displaced.begin_read().await {
+            Ok(session) => {
+                assert_eq!(
+                    crate::store::read::read_migration(session.handle())
+                        .await
+                        .unwrap(),
+                    None,
+                    "the displaced handle read the marker of the writer that fenced it"
+                );
+                session.finish();
+            }
+            Err(err) => {
+                noticed = Some(err);
+                break;
+            }
+        }
+        if let Err(err) = displaced.snapshot().await {
+            noticed = Some(err);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let noticed = noticed.expect("the displaced handle never noticed it had been fenced");
+    assert!(matches!(noticed, Error::Fenced(_)), "{noticed:?}");
+}

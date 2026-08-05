@@ -200,6 +200,14 @@ would answer from a catalog the store has moved past, and quietly. And the
 session still refuses a store mid-structural-migration, so a planted
 marker stops a warm handle exactly as it stops a cold one.
 
+The second of those is conservatism, not necessity, and the difference is
+measured rather than argued. A migrator takes the writer epoch before it
+writes anything, so a handle it displaces is fenced before a marker
+exists — and a fenced handle reads its own state, which that marker never
+reached. It therefore reports `Fenced`, never `Migration`. The marker
+probe fires on a read-write handle only for a marker written through that
+handle's own transaction, which no migrator does.
+
 Making the head write unconditional has a second effect the design wants:
 `sys/head` becomes the one key every batch touches, so SlateDB's
 write-write detection makes it the single conflict anchor. A maintenance
