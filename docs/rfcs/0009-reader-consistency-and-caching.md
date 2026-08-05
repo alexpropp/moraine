@@ -655,10 +655,13 @@ split is the tuning:
 - **The meta slot — SST indexes, filters, stats — is memory-only and
   sized to fit.** Every probe walks a filter and an index before it can
   touch a data block, and metadata is a small fraction of store bytes
-  even where one `index` run is multi-GiB; the census reports the target
-  size. Data blocks cannot compete for the slot, so the worst eviction —
-  a scan pushing filters out, after which every probe pays a fetch to
-  learn "not here" — cannot happen.
+  even where one `index` run is multi-GiB. Data blocks cannot compete for
+  the slot, so the worst eviction — a scan pushing filters out, after
+  which every probe pays a fetch to learn "not here" — cannot happen.
+  The slot takes a fixed fifth of the memory budget, which is SlateDB's
+  own metadata-to-block ratio and holds all of it on any ordinary store;
+  `moraine_store_census` reports a store's index and filter bytes for
+  sizing the budget against one that disagrees.
 - **The block slot — data blocks — is the foyer hybrid**: a memory tier
   spilling at block grain to the `CACHE_DIR` device.
 
@@ -705,21 +708,34 @@ The attach options keep their surface (RFC 0006) and change machinery:
 - `CACHE_PUTS` — the flush/compaction insertion policy: written SSTs'
   blocks enter decoded, on write. Opt-in as before: compaction output
   evicts what reads warmed.
-- `CACHE_PRELOAD` — a manifest walk of per-SST warms, segment-aware: the
-  leading tag byte gives each subspace its own SSTs, so every selected
-  SST warms index + filters, and data blocks warm only for the
-  scan-shaped subspaces (`current`, `sys`, `history`, changelog). The
-  `index` data bulk — the tail that made `'all'` unaffordable — is
-  skipped, one fetch per probed block behind its warmed filters.
-  `'l0'`/`'all'` still select which SSTs; the attach contract (warm
-  inside the open, caps govern, shortfall warned, failures skipped)
-  holds.
+- `CACHE_PRELOAD` — a segment-aware warm, run as reads rather than as a
+  manifest walk. SlateDB's per-SST warm call takes an id type its crate
+  does not export, so no caller outside it can name one; reading is in
+  any case the cheaper instrument, because a scan admits the blocks it
+  touches and SlateDB caches every SST index and filter it walks whatever
+  the scan's own admission says. So the levels differ by *subspace*, not
+  by SST level: `'l0'` touches every subspace just far enough to pull its
+  SST metadata — the bytes that make a cold probe tolerable — and `'all'`
+  additionally walks the scan-shaped subspaces (`current`, `sys`,
+  `history`, `snapshot`, changelog) whole, so an attach's first
+  materialization reads no object storage at all. Neither walks the
+  `index` subspace's data bulk, the tail that made `'all'` unaffordable;
+  it stays one fetch per probed block behind the filters just warmed. The
+  attach contract holds: warm inside the open, caps govern, a shortfall
+  is warned with both numbers, a failure is skipped rather than fatal.
 
 **Hit rates before tuning.** The tiers report — meta hits, block-memory
 hits, disk hits, store GETs — through the diagnostics the extension
 already forwards, beside the existing row-tier counters; the census
 supplies the meta target. Budgets are sized from measured curves, not
 defaults. The SQL shape is RFC 0006's to pin.
+
+**One cache means one shape per process.** The first store to open builds
+it and its numbers stand; a later attach asking for different ones shares
+what is there. That is the budget being the process's rather than the
+store's, which is the whole point, but it makes the *first* attach's
+options the ones that decide — including whether there is a disk device
+at all.
 
 Three losses, taken knowingly. Part-grain prefetch: replaced by the scan
 path's own read-ahead (the measured fix for the 277 s materialization in

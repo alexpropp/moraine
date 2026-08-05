@@ -737,6 +737,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
 	uint64_t cache_size_bytes = 0;
+	uint64_t cache_memory_bytes = 0;
 	bool cache_puts = false;
 	uint8_t cache_preload = 0;
 	std::string checkpoint;
@@ -771,6 +772,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			cache_dir = option.second.GetValue<std::string>();
 		} else if (name == "cache_size") {
 			cache_size_bytes = option.second.GetValue<uint64_t>();
+		} else if (name == "cache_memory") {
+			cache_memory_bytes = option.second.GetValue<uint64_t>();
 		} else if (name == "cache_puts") {
 			cache_puts = option.second.GetValue<bool>();
 		} else if (name == "cache_preload") {
@@ -802,7 +805,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_preload, cache_puts,
+	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
+	                           cache_preload, cache_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);

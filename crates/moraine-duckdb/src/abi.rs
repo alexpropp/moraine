@@ -716,6 +716,7 @@ pub unsafe extern "C" fn moraine_attach(
     flush_interval_ms: u64,
     cache_dir: *const c_char,
     cache_size_bytes: u64,
+    cache_memory_bytes: u64,
     cache_preload: u8,
     cache_puts: bool,
     data_path: *const c_char,
@@ -801,6 +802,7 @@ pub unsafe extern "C" fn moraine_attach(
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
+        options.cache_memory = cache_size_option(cache_memory_bytes);
         options.cache_preload = cache_preload_option(cache_preload)?;
         options.cache_puts = cache_puts;
         options.checkpoint = checkpoint.map(str::to_owned);
@@ -3556,6 +3558,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 c_bad.as_ptr(),
                 ptr::null(),
@@ -3593,6 +3596,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3635,6 +3639,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3708,6 +3713,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3805,6 +3811,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3956,6 +3963,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 c_data.as_ptr(),
                 ptr::null(),
@@ -3995,6 +4003,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4040,6 +4049,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 c_first.as_ptr(),
                 ptr::null(),
@@ -4073,6 +4083,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4118,6 +4129,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4168,6 +4180,7 @@ mod tests {
                 true,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4516,6 +4529,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 ptr::null(),
                 ptr::null(),
@@ -4556,6 +4570,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4617,6 +4632,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -5028,6 +5044,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 ptr::null(),
                 ptr::null(),
@@ -5154,12 +5171,12 @@ mod tests {
         assert!(refused.message.contains('7'), "{}", refused.message);
     }
 
-    /// An attach that caches its writes fills the cache directory from the
-    /// write path: bootstrapping a fresh store leaves what it wrote behind,
-    /// where an attach that does not cache writes leaves nothing.
+    /// `cache_puts` crosses the ABI and opens either way. What it governs
+    /// is the block cache's insertion policy, which the core tests
+    /// directly (`store::open`): admission is in-memory and reaches disk
+    /// only by eviction, so no directory listing can stand in for it.
     #[test]
-    fn an_attach_caching_writes_fills_the_cache_directory() {
-        let mut cached = Vec::new();
+    fn an_attach_takes_the_write_admission_flag() {
         for cache_puts in [false, true] {
             let dir = TempDir::new("put-cache-store");
             let cache = TempDir::new("put-cache-dir");
@@ -5180,6 +5197,7 @@ mod tests {
                     c_cache.as_ptr(),
                     0,
                     0,
+                    0,
                     cache_puts,
                     ptr::null(),
                     ptr::null(),
@@ -5195,14 +5213,7 @@ mod tests {
             assert_eq!(code, codes::OK, "attach failed: {message:?}");
             // SAFETY: attached above and not yet detached.
             unsafe { moraine_detach(handle) };
-            cached.push(std::fs::read_dir(cache.path()).map_or(0, Iterator::count));
         }
-        assert!(
-            cached[1] > cached[0],
-            "caching writes cached {} entries against {} without it",
-            cached[1],
-            cached[0]
-        );
     }
 
     /// An attach given a cache directory and a cap opens against them: the
@@ -5227,6 +5238,7 @@ mod tests {
                 0,
                 c_cache.as_ptr(),
                 64 * 1024 * 1024,
+                0,
                 0,
                 false,
                 ptr::null(),

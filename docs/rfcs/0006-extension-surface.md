@@ -241,7 +241,9 @@ default), only the memory tier applies. Redundant for local/`memory://`
 stores.
 
 There is one cache, in two slots, shared by every store the process
-attaches (RFC 0009). The meta slot pins SST indexes and filters in
+attaches (RFC 0009). The first attach to open sizes it and later ones
+share what it built, so these options are the process's rather than the
+attach's. The meta slot pins SST indexes and filters in
 memory, sized to what the store's metadata actually needs; the block slot
 holds data blocks in memory and spills them at block grain to the disk
 device `CACHE_DIR` names, capped by `CACHE_SIZE`, with `CACHE_MEMORY`
@@ -264,9 +266,10 @@ disk tier to bound. It threads through the shim (`moraine_attach`'s
 the memory side — `META_CACHE_MEMORY` through the DuckLake attach,
 `CACHE_MEMORY` standalone — and the one cache option that is never inert,
 because the memory slots exist with or without a disk device. It is one
-budget across both slots: the meta slot takes what the store's metadata
-needs (`moraine_store_census` reports the number), the block slot takes
-the remainder. Unset, the budget is what SlateDB would give a *single*
+budget across both slots: the meta slot takes a fixed fifth —
+`moraine_store_census` reports a store's index and filter bytes for
+sizing the budget against a store that needs more — and the block slot
+takes the remainder. Unset, the budget is what SlateDB would give a *single*
 store by default — now for the whole process, so a multi-store host is
 strictly smaller than before, and a single-store host is unchanged. This
 is the number to weigh against DuckDB's `memory_limit` when sizing a
@@ -292,12 +295,11 @@ decide what stays. The option threads through the shim (`moraine_attach`'s
 **`CACHE_PRELOAD` — fill it before the first query, not during it.** Both of
 the above leave a fresh process cold: the cache fills as queries ask for
 blocks, so the first query of an attach pays every first touch itself.
-`CACHE_PRELOAD` warms the store into the cache while the attach opens,
-walking the manifest — `'l0'` for the SSTs no merge has folded down yet,
-`'all'` for every SST the manifest references, `'none'` (the default) for
-today's behaviour. The warm is segment-aware (RFC 0009): every selected
-SST warms its index and filters, and data blocks warm only for the
-scan-shaped subspaces, so a store whose bulk is a multi-GiB `index` run
+`CACHE_PRELOAD` warms the store into the cache while the attach opens, by
+reading it (RFC 0009) — `'l0'` touches every subspace far enough to pull
+its SST metadata, `'all'` additionally walks the scan-shaped subspaces
+whole, `'none'` (the default) warms nothing. Neither pulls the `index`
+subspace's data bulk, so a store whose weight is a multi-GiB `index` run
 preloads in metadata-sized bytes rather than store-sized ones. It crosses
 the ABI as a level code (`0`, `1`, `2`) on `moraine_attach` and
 `moraine_migrate`, and any other code is refused rather than treated as
@@ -311,10 +313,10 @@ by the cache's own policy, newest-first enumeration putting the levelled
 tail last in line. Nothing in that path says it happened, which would leave
 a half-warmed attach looking exactly like a warm one, so moraine compares
 the bytes the warm would fetch against the governing cap as it opens and
-warns with both numbers. SSTs that fail to warm are skipped rather than
-fatal: a preload is an optimization, and no attach should die because one
-object could not be fetched. Segment-awareness makes `'all'` the normal
-choice — it fetches metadata plus the scan-shaped subspaces, not the
+warns with both numbers. A subspace that fails to warm is skipped rather
+than fatal: a preload is an optimization, and no attach should die
+because one read did not land. Subspace-awareness makes `'all'` the
+normal choice — it fetches metadata plus the scan-shaped subspaces, not the
 store — trading a slower ATTACH for a first query that touches object
 storage not at all; `'l0'` suits an attach that must return fast against a
 store with a deep unfolded tail.
