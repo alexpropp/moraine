@@ -111,7 +111,7 @@ pub use crate::store::proto::{
 /// issues ~two dozen `dump_*` calls, and this collapses their store cost
 /// to one scan pair per head.
 async fn all_entities(catalog: &ReadOnlyCatalog) -> Result<Arc<Vec<EntityRecord>>> {
-    let session = catalog.begin_read().await?;
+    let session = catalog.open_session().await?;
 
     if let Some(head) = writer_head(catalog)
         && let Some(records) = projections_read(catalog).entities_at(&head)
@@ -120,6 +120,7 @@ async fn all_entities(catalog: &ReadOnlyCatalog) -> Result<Arc<Vec<EntityRecord>
         return Ok(records);
     }
 
+    let session = session.gate().await?;
     let head = session_head(catalog, &session).await?;
 
     let cache_at = match head {
@@ -302,7 +303,7 @@ async fn dump_projected_current<T: Clone>(
     install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    let session = catalog.begin_read().await?;
+    let session = catalog.open_session().await?;
 
     if let Some(head) = writer_head(catalog)
         && let Some(rows) = read(&projections_read(catalog), &head)
@@ -311,6 +312,7 @@ async fn dump_projected_current<T: Clone>(
         return Ok(rows);
     }
 
+    let session = session.gate().await?;
     let head = session_head(catalog, &session).await?;
 
     // Readers serve from this too: each of these dumps scans the whole of
@@ -393,7 +395,7 @@ pub async fn dump_file_column_stats(
 /// installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
-    let session = catalog.begin_read().await?;
+    let session = catalog.open_session().await?;
 
     if let Some(head) = writer_head(catalog)
         && let Some(rows) = projections_read(catalog).snapshots_at(&head)
@@ -402,6 +404,7 @@ pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotVal
         return Ok(rows);
     }
 
+    let session = session.gate().await?;
     let head = session_head(catalog, &session).await?;
     if let Some(head) = head {
         if let Some(rows) = projections_read(catalog).snapshots_at(&head) {
@@ -1053,7 +1056,13 @@ mod tests {
     /// a current row and (for the versioned kinds) a history row with exact
     /// lifecycle values.
     async fn seed() -> Catalog {
-        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        seed_on(Arc::new(InMemory::new())).await
+    }
+
+    /// As [`seed`], over a store the caller keeps — for the tests that open
+    /// a second handle on it.
+    async fn seed_on(store: Arc<InMemory>) -> Catalog {
+        let catalog = Catalog::open(store, CatalogOptions::default())
             .await
             .unwrap();
 
@@ -1205,8 +1214,27 @@ mod tests {
     /// thing standing between them and a silently shrinking view.
     #[tokio::test]
     async fn a_planted_marker_refuses_every_read_seam() {
-        let catalog = seed().await;
-        plant_migration_marker(&catalog).await;
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let writer = seed_on(Arc::clone(&store)).await;
+
+        // The handle a migration can start under: a migrator takes the
+        // writer epoch, which fences a read-write handle rather than
+        // leaving it reading, so the reader is the one that meets a marker
+        // it did not already refuse to open against.
+        let options = CatalogOptions {
+            reader_poll_interval: std::time::Duration::from_millis(20),
+            ..CatalogOptions::default()
+        };
+        let catalog = Catalog::open_read_only(store, options).await.unwrap();
+        catalog.snapshot().await.unwrap();
+
+        plant_migration_marker(&writer).await;
+        for _ in 0..100 {
+            if catalog.snapshot().await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         assert!(refuses(&catalog.snapshot().await), "snapshot");
         assert!(refuses(&dump_schemas(&catalog).await), "dump_schemas");

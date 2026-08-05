@@ -1207,3 +1207,113 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
     small.close().await.unwrap();
     println!();
 }
+
+/// 0009 — what a warm read on a read-write handle costs, and where.
+///
+/// A warm read no longer resolves the head from the store, and no longer
+/// probes `sys/migration`: what it does is open a session, take the held
+/// view, and release. The remaining cost is therefore `Db::begin` — no
+/// store IO, but a global write lock on SlateDB's transaction manager, so
+/// the figure that matters is how it behaves as concurrent readers pile
+/// onto it. This attributes a warm read between the two by measuring the
+/// same reads with the session and without it.
+///
+/// In-memory `object_store`, so a remote store's per-GET latency is absent
+/// by construction — which is the point: what is left here is lock and
+/// compute, and anything a production trace shows above it is IO the warm
+/// path no longer issues.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "measurement harness"]
+async fn measure_warm_read_attribution() {
+    const TABLES: usize = 50;
+    const READS: usize = 2_000;
+    let concurrency = [1usize, 2, 4, 8, 16, 24];
+
+    let store = Arc::new(InMemory::new());
+    let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+    let columns: Vec<_> = (0..8).map(|c| col(&format!("c{c}"))).collect();
+    for t in 0..TABLES {
+        let columns = columns.clone();
+        catalog
+            .commit(move |tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, &format!("t{t}"), &columns)?;
+                for _ in 0..16 {
+                    tx.register_data_file(table, datafile(100), &[])?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    // Warm the handle: from here every read below is served from the view.
+    catalog.snapshot().await.unwrap();
+
+    println!("\n# 0009 warm read on a read-write handle (in-memory object_store)");
+    println!("# {TABLES} tables, {READS} reads per thread, all served from the held view\n");
+    println!(
+        "{:>8}  {:>14}  {:>16}  {:>10}",
+        "threads", "us_per_read", "total_reads_per_s", "wall_ms"
+    );
+
+    let catalog = Arc::new(catalog);
+    for &threads in &concurrency {
+        let started = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let catalog = Arc::clone(&catalog);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..READS {
+                    catalog.snapshot().await.unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = started.elapsed();
+
+        let reads = (threads * READS) as f64;
+        let wall_s = elapsed.as_secs_f64();
+        println!(
+            "{threads:>8}  {:>14.2}  {:>16.0}  {:>10.1}",
+            wall_s * 1_000_000.0 * threads as f64 / reads,
+            reads / wall_s,
+            wall_s * 1_000.0
+        );
+    }
+
+    // The floor: handing back the same `Arc` with no session around it.
+    // The gap between the two series is what opening and releasing the
+    // session costs, which is the only store-side work a warm read has
+    // left.
+    let view = catalog.snapshot().await.unwrap();
+    println!("\n# Serving the held view alone, no session:");
+    println!(
+        "{:>8}  {:>14}  {:>16}",
+        "threads", "us_per_read", "total_reads_per_s"
+    );
+    for &threads in &concurrency {
+        let started = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let view = Arc::clone(&view);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..READS {
+                    std::hint::black_box(Arc::clone(&view));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = started.elapsed();
+        let reads = (threads * READS) as f64;
+        let wall_s = elapsed.as_secs_f64();
+        println!(
+            "{threads:>8}  {:>14.2}  {:>16.0}",
+            wall_s * 1_000_000.0 * threads as f64 / reads,
+            reads / wall_s
+        );
+    }
+}

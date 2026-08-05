@@ -3368,14 +3368,39 @@ async fn seeded_catalog(tables: usize) -> (crate::catalog::Catalog, Vec<crate::c
 
 /// A migration may be moving keys mid-scan, so a read refuses rather than
 /// return a view that is silently missing records — and a warm cache is no
-/// exception. The first read below installs a view; the marker must still
-/// win over it, or a cached reader would sail through a migration.
+/// exception. The handle below materializes first; the marker must still
+/// win over that view, or a cached reader would sail through a migration.
+///
+/// Read-only, because that is the handle a migration can start under. A
+/// migrator takes the writer epoch, which fences a read-write handle but
+/// leaves a reader following the store — so the reader is the one that
+/// meets a marker mid-flight, and its refusal is per read for that reason.
 #[tokio::test]
 async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
-    let (catalog, _) = seeded_catalog(3).await;
-    catalog.snapshot().await.unwrap();
+    use crate::catalog::{Catalog, CatalogOptions};
 
-    let tx = catalog.begin_write_tx().await.unwrap();
+    let store: Arc<InMemory> = Arc::new(InMemory::new());
+    let writer = Catalog::open(store.clone(), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| tx.create_schema("before").map(|_| ()))
+        .await
+        .unwrap();
+
+    // A reader never fences the writer, so the two run side by side. Its
+    // poll interval is the wait below, so it is set short rather than left
+    // at the ten-second default.
+    let options = CatalogOptions {
+        reader_poll_interval: std::time::Duration::from_millis(20),
+        ..CatalogOptions::default()
+    };
+    let reader = Catalog::open_read_only(store.clone(), options)
+        .await
+        .unwrap();
+    reader.snapshot().await.unwrap();
+
+    let tx = writer.begin_write_tx().await.unwrap();
     tx.put(
         Key::Sys(SysKey::Migration).encode(),
         value::encode_value(&proto::MigrationValue {
@@ -3385,20 +3410,23 @@ async fn the_migration_marker_refuses_reads_even_with_a_warm_cache() {
         }),
     )
     .unwrap();
-    tx.commit().await.unwrap();
+    tx.commit_with_options(&durable()).await.unwrap();
 
-    let tx = catalog.begin_write_tx().await.unwrap();
-    let materialized = materialize(ReadHandle::Tx(&tx), None).await.err().unwrap();
-    tx.rollback();
+    // A reader's state advances when its manifest poller runs, not on the
+    // write, so the refusal arrives within a bounded wait rather than at
+    // the next call.
+    let mut refused = None;
+    for _ in 0..100 {
+        if let Err(err) = reader.snapshot().await {
+            refused = Some(err);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
-    let served = catalog.snapshot().await.err().unwrap();
-
-    assert!(
-        matches!(materialized, Error::Migration(_)),
-        "{materialized:?}"
-    );
-    assert!(matches!(served, Error::Migration(_)), "{served:?}");
-    catalog.close().await.unwrap();
+    let refused = refused.expect("a warm reader served every read through a planted marker");
+    assert!(matches!(refused, Error::Migration(_)), "{refused:?}");
+    writer.close().await.unwrap();
 }
 
 /// A commit resolves its base view from the same warm cache a read serves

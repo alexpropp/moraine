@@ -77,29 +77,24 @@ deliberately not itemized here.
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
 
-- **MEASURE** — Where a warm read's remaining latency lands. A read-write
-  handle no longer reads `sys/head`, but a warm read still opens a session:
-  one `sys/migration` point read, and a `Db::begin` that takes the SlateDB
-  transaction manager's global write lock (`transaction_manager.rs`,
-  `new_transaction`) — no store I/O, but a serialization point a wide
-  client fleet funnels through. A production trace attributing a warm
-  read's time between those two settles whether either is worth removing.
-- **IMPL** — Drop the `sys/migration` probe from a read-write handle's read
-  path, the last store read left on a warm one. Settled by measurement
-  rather than argument: a marker written by the writer that fenced this
-  handle is invisible to it, and it reports `Fenced`, never `Migration`
-  (`a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration`).
-  The probe is not the guard on a writer — the fence check is. What the two
-  planted-marker tests assert is reachable only by writing the marker
-  through the handle's own transaction, which no migrator does, so the same
-  change re-scopes them to the read-only handle. A writer still probes once
-  while cold, so a migration a crashed predecessor left behind is caught.
+- **DEFERRED** — Serve a warm read without opening a session at all. What
+  a warm read has left is the session, and it issues no store IO — but
+  `Db::begin` registers under SlateDB's transaction-manager global write
+  lock, and warm throughput therefore *falls* from 2.7M reads/s at one
+  reader to 519k at 24 while the same reads without the session hold flat
+  at ~27M/s (`BENCHMARK.md`). Removing it means finding another fence
+  check: opening the session is what fails on a `Db` closed under a newer
+  writer, and a handle that skipped it would serve its cache past a fence,
+  silently. `Db::status().close_reason` is the candidate and clones a
+  manifest, so it is not obviously cheaper. Half a million warm reads per
+  second is far past what a DuckLake fleet asks for, so this waits for a
+  workload that wants it.
 - **DEFERRED** — Carry the migration state as a field on the `sys/head`
   record, so a probe rides along with a read already being issued instead
   of being a guaranteed miss that must consult every level's filter. A
   read-only handle follows another process and must keep probing per read,
-  so this is where the saving lands once a writer stops probing at all.
-  Needs a format-version bump for a reader to know when to trust the field.
+  so that is where the saving now lands. Needs a format-version bump for a
+  reader to know when to trust the field.
 
 ## 0013 — Partitioning, sorting, and pruning
 

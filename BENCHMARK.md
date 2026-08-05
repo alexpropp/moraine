@@ -422,6 +422,45 @@ the changelog, and the changelog subspace is flat: each commit deletes the
 record 64 snapshots back, so a sliding window bounds it whatever the commit
 count and nothing else has to reclaim it.
 
+### What a warm read on a read-write handle has left
+
+A read-write handle holds the writer epoch, so it resolves the head from
+the view it already holds rather than reading `sys/head`, and skips the
+`sys/migration` probe a scan it will not perform would need. What a warm
+read does now is open a read session, take the held view, and release. The
+session is the fence check, and it issues no store IO — `Db::begin` is a
+closed-check plus a registration in SlateDB's transaction manager, under
+that manager's global write lock.
+
+So the question is not what the session costs but how it behaves as
+readers pile onto that lock. Both series below serve the same view over the
+same 50-table catalog; the second omits only the session:
+
+| threads | warm read µs | warm reads/s | view alone µs | view alone reads/s |
+|---|---|---|---|---|
+| 1 | 0.37 | 2 731 274 | 0.05 | 18 213 775 |
+| 2 | 1.46 | 1 368 651 | 0.05 | 42 647 561 |
+| 4 | 4.34 | 920 875 | 0.13 | 30 503 382 |
+| 8 | 9.38 | 852 588 | 0.29 | 27 674 479 |
+| 16 | 25.73 | 621 906 | 0.58 | 27 420 831 |
+| 24 | 46.26 | 518 850 | 0.87 | 27 590 980 |
+
+**The session is free in absolute terms and does not scale.** One reader
+pays 0.37 µs, of which 0.05 µs is the view; the rest is the session. But
+aggregate throughput *falls* from 2.7M reads/s to 519k as readers go 1 → 24,
+while the same reads without the session hold flat at ~27M/s across the
+whole ladder. That shape is the global write lock, and it is the only
+contention a warm read has left. (The 2-thread view-alone row is noise —
+the loop is a few instructions and the timer is not.)
+
+The absolute figures matter for reading a production trace: even fully
+contended at 24 threads, a warm read costs tens of microseconds. A warm
+read measured in the hundreds of milliseconds is therefore not this — it is
+either IO the warm path no longer issues, or serialization above moraine
+(DuckLake's own metadata connection is serialized; see RFC 0006). Half a
+million warm reads per second is far past what a DuckLake fleet asks for,
+so the lock is a recorded property rather than a target.
+
 ### Read concurrency under IO latency
 
 Does slow object-store IO starve the worker pool, so concurrent scans

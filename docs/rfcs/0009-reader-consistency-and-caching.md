@@ -193,20 +193,28 @@ place of one. A dump whose projection does not stand at that stamp falls
 through to the ordinary session path and reads the head there, so rows are
 never installed under a stamp the store did not supply.
 
-Two things this deliberately does not skip, both premises rather than
-costs. The read session still opens, because opening it is what fails on a
-`Db` closed under a newer writer — a fenced handle that served its cache
-would answer from a catalog the store has moved past, and quietly. And the
-session still refuses a store mid-structural-migration, so a planted
-marker stops a warm handle exactly as it stops a cold one.
+What a warm read does not skip is the read session, because opening it is
+what fails on a `Db` closed under a newer writer — a fenced handle that
+served its cache would answer from a catalog the store has moved past, and
+quietly. It issues no store read of its own, so this is the whole store-side
+cost a warm read has left.
 
-The second of those is conservatism, not necessity, and the difference is
-measured rather than argued. A migrator takes the writer epoch before it
-writes anything, so a handle it displaces is fenced before a marker
-exists — and a fenced handle reads its own state, which that marker never
-reached. It therefore reports `Fenced`, never `Migration`. The marker
-probe fires on a read-write handle only for a marker written through that
-handle's own transaction, which no migrator does.
+What it *does* skip, on a writer only, is the `sys/migration` refusal that
+session otherwise carries. The marker exists to stop a scan of a keyspace
+being rewritten, and a read served from the held view performs no scan —
+but the deeper reason is that on a read-write handle the probe was never
+the guard. A migrator takes the writer epoch before it writes anything, so
+a handle it displaces is fenced before a marker exists, and a fenced handle
+reads its own state, which that marker never reached: it reports `Fenced`,
+never `Migration`. The probe fires on a writer only for a marker written
+through that handle's *own* transaction, which no migrator does. The fence
+check is the guard, and that is the one the session still performs.
+
+A **read-only** handle is the one a migration can start under — a migrator
+fences a writer but leaves a reader following the store — so it probes on
+every read, and its cold-open refuses a store already carrying a marker. A
+writer probes once while cold, which is what catches a migration a crashed
+predecessor left behind.
 
 Making the head write unconditional has a second effect the design wants:
 `sys/head` becomes the one key every batch touches, so SlateDB's

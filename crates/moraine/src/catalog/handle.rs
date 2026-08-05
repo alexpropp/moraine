@@ -204,6 +204,33 @@ impl ReadTally {
     }
 }
 
+/// A read session whose fence check has run and whose mid-migration
+/// refusal has not.
+///
+/// A read served from a held view touches no keyspace, so it releases the
+/// session here rather than paying the refusal's point read to protect a
+/// scan it will not perform. Anything that goes on to read the store calls
+/// [`gate`](Self::gate) — the only way to reach a read handle from here, so
+/// no path can read past the refusal by forgetting it.
+pub(crate) struct UngatedSession(ReadSession);
+
+impl UngatedSession {
+    /// Releases the session without reading anything.
+    pub(crate) fn finish(self) {
+        self.0.finish();
+    }
+
+    /// Applies the mid-migration refusal and yields the readable session.
+    pub(crate) async fn gate(self) -> Result<ReadSession> {
+        if let Err(error) = commit::refuse_mid_migration(self.0.handle()).await {
+            self.0.finish();
+            return Err(error);
+        }
+
+        Ok(self.0)
+    }
+}
+
 /// Where a store lives, for the admin-surface verbs that address it by
 /// path rather than through the open handle.
 struct StoreLocation {
@@ -765,7 +792,7 @@ impl ReadOnlyCatalog {
         // Captured before the first store read, so an invalidation racing
         // this read cannot be overwritten by what it invalidated.
         let epoch = cache_epoch(&self.projections);
-        let session = self.begin_read().await?;
+        let session = self.open_session().await?;
 
         if let Some(view) = self.writer_head_view() {
             session.finish();
@@ -773,6 +800,7 @@ impl ReadOnlyCatalog {
             return Ok(view);
         }
 
+        let session = session.gate().await?;
         let view = self.head_view(session.handle()).await;
         session.finish();
 
@@ -1044,28 +1072,35 @@ impl ReadOnlyCatalog {
     /// Used by [`crate::ffi_support`]'s raw current+history dumps and inline
     /// scans; every other reader goes through `snapshot`/`snapshot_at`.
     ///
-    /// Every read in the crate opens its session here, so this is where a
+    /// Every read of the store opens its session here, so this is where a
     /// store mid-structural-migration is refused. The check costs one point
     /// read per session and belongs here rather than at each call site: a
     /// reader that skips it scans a keyspace being rewritten under it and
     /// returns a catalog with a hole in it, and an open-time check cannot
     /// catch a migration that starts after the handle attached.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
-        let session = match self.store.as_ref() {
+        self.open_session().await?.gate().await
+    }
+
+    /// Opens a session without the refusal [`begin_read`](Self::begin_read)
+    /// carries — the fence check, and nothing else.
+    ///
+    /// For the paths that may answer from a held view instead of reading.
+    /// The marker exists to stop a *scan* of a keyspace being rewritten,
+    /// and a read served from the cache performs none; paying a point read
+    /// to learn that is the whole cost such a read has left. A path that
+    /// falls through to the store calls [`UngatedSession::gate`] first,
+    /// which the type makes unavoidable — an ungated session lends out no
+    /// read handle.
+    pub(crate) async fn open_session(&self) -> Result<UngatedSession> {
+        Ok(UngatedSession(match self.store.as_ref() {
             Store::Writer(db) => ReadSession::Tx(
                 db.begin(IsolationLevel::Snapshot)
                     .await
                     .map_err(Error::from)?,
             ),
             Store::Reader(reader) => ReadSession::Reader(reader.clone()),
-        };
-
-        if let Err(error) = commit::refuse_mid_migration(session.handle()).await {
-            session.finish();
-            return Err(error);
-        }
-
-        Ok(session)
+        }))
     }
 
     /// Derives the index entries for a file the extension path registers, by
