@@ -405,9 +405,13 @@ async fn a_read_only_catalog_serves_a_cached_view_that_matches_the_store() {
     writer.close().await.unwrap();
 }
 
-/// A cache size bounds the on-disk object cache without disabling it: the
-/// catalog is served through a capped cache on the writer's side and the
-/// reader's alike, and the cache directory fills.
+/// A cache size bounds the cache without disabling it: the catalog is
+/// served through a capped cache on the writer's side and the reader's
+/// alike.
+///
+/// That a directory becomes a device is `store::cache`'s to assert, not
+/// this test's: one cache serves the whole process, so whichever store
+/// opens first in this binary decides whether there is a device at all.
 #[tokio::test]
 async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
     let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
@@ -443,7 +447,5 @@ async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
     assert!(view.table_by_name(schema, "t").is_some());
     reader.close().await.unwrap();
 
-    let populated = std::fs::read_dir(&cache).is_ok_and(|mut entries| entries.next().is_some());
-    assert!(populated, "expected an object cache under {cache:?}");
     let _ = std::fs::remove_dir_all(&cache);
 }
