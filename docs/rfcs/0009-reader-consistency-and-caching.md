@@ -161,6 +161,91 @@ manifest poller runs, not on every commit, so a pass that loses one round
 very rarely loses the next, and a bounded budget of them ends in a typed
 error rather than a torn view.
 
+### A read-write handle resolves the head without reading it
+
+The stamp above is what a *read-only* handle needs, because it follows
+another process's commits and cannot know when one landed. A **read-write**
+handle is in the opposite position: it holds the writer epoch, so it is the
+store's only writer and nothing can move `sys/head` under it. Reading the
+record back to learn where head is asks the store a question the handle
+already knows the answer to — and that point read is on every catalog
+read, every metadata dump, and so under every DuckLake statement.
+
+So a read-write handle resolves the head from **the view it already
+holds**: a `CatalogSnapshot` carries the snapshot id and batch count it was
+built at, which on a sole writer *is* the head. The premise is that a held
+view is never behind the store, and that rests on four rules, all in the
+commit path:
+
+- A head-advancing batch folds the view forward as it lands, or drops it if
+  the fold cannot be applied faithfully.
+- A head-preserving batch drops the view *before* its write becomes
+  visible, since it reuses the snapshot id and only the batch count would
+  give it away.
+- A durable write that fails for any reason other than a lost race drops
+  the view: a lost race provably did not land, and everything else leaves
+  that open.
+- A durable write whose task never reports back drops it too, for the same
+  reason.
+
+The held view is only ever a **lookup key**, never an answer inferred in
+place of one. A dump whose projection does not stand at that stamp falls
+through to the ordinary session path and reads the head there, so rows are
+never installed under a stamp the store did not supply.
+
+What a warm read does not skip is the fence check, because a handle that
+served its cache past its own displacement would answer from a catalog the
+store has moved on from, and quietly. It does not open a session to perform
+it: SlateDB reports a close by setting it on a status channel the handle
+subscribes to at open, so the check is a watch borrow — no store read, no
+manifest copy, and no entry in the transaction manager, which is what
+opening a session takes a global write lock to make. The reach is identical,
+since closing the `Db` is what the fence does. The difference is that a
+watch borrow shares between readers and the lock does not: measured, warm
+throughput plateaus where it used to fall away (`BENCHMARK.md`).
+
+What a warm read *does* skip, on a writer only, is the `sys/migration`
+refusal a session otherwise carries. The marker exists to stop a scan of a keyspace
+being rewritten, and a read served from the held view performs no scan —
+but the deeper reason is that on a read-write handle the probe was never
+the guard. A migrator takes the writer epoch before it writes anything, so
+a handle it displaces is fenced before a marker exists, and a fenced handle
+reads its own state, which that marker never reached: it reports `Fenced`,
+never `Migration`. The probe fires on a writer only for a marker written
+through that handle's *own* transaction, which no migrator does. The fence
+check is the guard, and that is the one the session still performs.
+
+A **read-only** handle is the one a migration can start under — a migrator
+fences a writer but leaves a reader following the store — so it probes on
+every read, and its cold-open refuses a store already carrying a marker. A
+writer probes once while cold, which is what catches a migration a crashed
+predecessor left behind.
+
+So a reader pays two point reads to serve a cache hit where a writer pays
+none: 6.4 µs against 0.1 µs (`BENCHMARK.md`). Both are cheaper than they
+look — measured under injected per-GET latency, a warm read-only read
+issues **no object-store GET at all**, at any latency, so the two reads are
+memory and lock rather than round trips. Halving them was worth having as a
+question and is worth nothing as a change.
+
+Carrying the migration state as a field on the head record would halve
+them, and the design is recorded here as **rejected**, because the encoding
+is the easy half and the version gate is not. A reader may trust such a field only if every migration
+maintains it, and an older binary starts one by writing the marker alone —
+so field presence cannot be the signal, and the guarantee has to come from
+the format stamp. That stamp is raised lazily, by the feature needing it:
+creating an index raises it today, which is an act an operator chooses. A
+field on *every* head record is not chosen. The first commit after a binary
+upgrade would raise it, and from that moment the store cannot be opened by
+the binary that wrote it the day before — a one-way door, taken by default,
+for microseconds on a path nothing is waiting on.
+
+Overlapping the two reads was the cheaper alternative, and the same
+measurement closes it: they are independent and issued in sequence, but a
+warm read makes no round trip for either, and a cold one makes four for its
+materialization of which they are at most one. It was built against that
+idea and reverted by the number.
+
 Making the head write unconditional has a second effect the design wants:
 `sys/head` becomes the one key every batch touches, so SlateDB's
 write-write detection makes it the single conflict anchor. A maintenance

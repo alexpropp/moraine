@@ -2553,7 +2553,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
     // Commit 1: table + column + spec 10 (identity on column 1) + one
     // data file written under it, carrying one partition value.
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2603,7 +2603,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
 
     // Commit 2: repartition — end spec 10, insert spec 11.
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::PartitionInfo,
         cells: vec![Cell::U64(1), Cell::U64(10), Cell::U64(2)],
@@ -2657,7 +2657,7 @@ async fn partition_spec_rows_land_fold_and_time_travel() {
 
     // Commit 3: clear — end spec 11, insert nothing.
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::PartitionInfo,
         cells: vec![Cell::U64(1), Cell::U64(11), Cell::U64(3)],
@@ -2711,7 +2711,7 @@ async fn sort_spec_rows_land_fold_and_time_travel() {
     let catalog = open().await;
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     tx.stage(RowOperation::Insert {
         table: TableKind::Table,
         cells: table_row(1, 0, "t", 1, None),
@@ -2750,7 +2750,7 @@ async fn sort_spec_rows_land_fold_and_time_travel() {
     // End spec 20, insert spec 21 — the snapshot row keeps the same
     // schema_version: DuckLake does not bump it for sort changes.
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::SortInfo,
         cells: vec![Cell::U64(1), Cell::U64(20), Cell::U64(2)],
@@ -3698,7 +3698,7 @@ async fn macro_rows_land_fold_and_drop() {
 
     // Drop: the one UPDATE DuckLake issues, nothing touching children.
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     tx.stage(RowOperation::UpdateSetEnd {
         table: TableKind::Macro,
         cells: vec![Cell::U64(10), Cell::U64(2)],
@@ -4960,7 +4960,7 @@ async fn column_mapping_delete_reclaims_the_record_and_its_embedded_rows() {
     );
 
     let db_tx = catalog.begin_write_tx().await.unwrap();
-    let mut tx = StagedTransaction::begin_detached(db_tx);
+    let mut tx = StagedTransaction::begin_detached_on(&catalog, db_tx);
     tx.stage(RowOperation::Delete {
         table: TableKind::ColumnMapping,
         cells: vec![Cell::U64(21), Cell::U64(1)],

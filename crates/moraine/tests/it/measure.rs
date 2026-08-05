@@ -1207,3 +1207,240 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
     small.close().await.unwrap();
     println!();
 }
+
+/// Runs `worker` on each of `threads` tasks and prints one row per rung:
+/// the per-read cost one caller sees, and the rate all of them together
+/// sustain. The gap between rungs is what a shared resource is doing.
+#[allow(clippy::unwrap_used)]
+async fn read_ladder(
+    label: &str,
+    concurrency: &[usize],
+    reads: usize,
+    worker: impl Fn() -> tokio::task::JoinHandle<()>,
+) {
+    println!("\n# {label}");
+    println!(
+        "{:>8}  {:>14}  {:>16}",
+        "threads", "us_per_read", "total_reads_per_s"
+    );
+    for &threads in concurrency {
+        let started = Instant::now();
+        let handles: Vec<_> = (0..threads).map(|_| worker()).collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let elapsed = started.elapsed().as_secs_f64();
+        let total = (threads * reads) as f64;
+        println!(
+            "{threads:>8}  {:>14.2}  {:>16.0}",
+            elapsed * 1_000_000.0 * threads as f64 / total,
+            total / elapsed
+        );
+    }
+}
+
+/// 0009 — what a warm read on a read-write handle costs, and where.
+///
+/// A warm read no longer resolves the head from the store, probes
+/// `sys/migration`, or opens a session at all: it checks the writer's
+/// status channel for a fence and hands back the held view. So what is
+/// left is a watch borrow, and the figure that matters is whether it
+/// scales where opening a session did not.
+///
+/// Three ladders: the read-write handle, a read-only one (which holds no
+/// writer-local premise, so it opens a session and issues both point reads
+/// before it can serve its cache), and the floor of handing back the view
+/// with no check at all.
+///
+/// In-memory `object_store`, so a remote store's per-GET latency is absent
+/// by construction — which is the point: what is left here is lock and
+/// compute, and anything a production trace shows above it is IO the warm
+/// path no longer issues.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "measurement harness"]
+async fn measure_warm_read_attribution() {
+    const TABLES: usize = 50;
+    const READS: usize = 2_000;
+    let concurrency = [1usize, 2, 4, 8, 16, 24];
+
+    let store = Arc::new(InMemory::new());
+    let catalog = open_with(store.clone(), SEED_FLUSH_MS).await;
+    let columns: Vec<_> = (0..8).map(|c| col(&format!("c{c}"))).collect();
+    for t in 0..TABLES {
+        let columns = columns.clone();
+        catalog
+            .commit(move |tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, &format!("t{t}"), &columns)?;
+                for _ in 0..16 {
+                    tx.register_data_file(table, datafile(100), &[])?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    // Warm the handle: from here every read below is served from the view.
+    catalog.snapshot().await.unwrap();
+
+    println!("\n# 0009 warm read (in-memory object_store)");
+    println!("# {TABLES} tables, {READS} reads per thread, all served from a held view");
+
+    let catalog = Arc::new(catalog);
+    read_ladder(
+        "Read-write handle (fence check, then the held view):",
+        &concurrency,
+        READS,
+        || {
+            let catalog = Arc::clone(&catalog);
+            tokio::spawn(async move {
+                for _ in 0..READS {
+                    catalog.snapshot().await.unwrap();
+                }
+            })
+        },
+    )
+    .await;
+
+    let reader = Arc::new(open_reader(store.clone()).await);
+    reader.snapshot().await.unwrap();
+    read_ladder(
+        "Read-only handle (session, then two point reads):",
+        &concurrency,
+        READS,
+        || {
+            let reader = Arc::clone(&reader);
+            tokio::spawn(async move {
+                for _ in 0..READS {
+                    reader.snapshot().await.unwrap();
+                }
+            })
+        },
+    )
+    .await;
+
+    // The floor: handing back the same `Arc` with no check around it. The
+    // gap to the first ladder is what checking the fence costs, which is
+    // all a warm read does beyond serving the view.
+    let view = catalog.snapshot().await.unwrap();
+    read_ladder(
+        "The held view alone, no fence check:",
+        &concurrency,
+        READS,
+        || {
+            let view = Arc::clone(&view);
+            tokio::spawn(async move {
+                for _ in 0..READS {
+                    std::hint::black_box(Arc::clone(&view));
+                }
+            })
+        },
+    )
+    .await;
+}
+
+/// 0009 — how many round trips a warm read-only read costs.
+///
+/// A read-only handle holds no writer-local premise, so serving a cache
+/// hit still means asking the store two questions: whether a structural
+/// migration is in flight, and where head is. They are independent, and
+/// are now issued together rather than one after the other.
+///
+/// The number of *round trips* is what that changes, and a get has to cost
+/// something before round trips are visible — so this injects per-GET
+/// latency and reads the answer off the ratio. One injected latency per
+/// warm read means one round trip; two means the reads serialized.
+#[tokio::test]
+#[ignore = "measurement harness"]
+async fn measure_reader_round_trips_under_get_latency() {
+    const TABLES: usize = 20;
+    const REPEATS: usize = 9;
+    let latencies = [2u64, 5, 10, 20];
+
+    let store = Arc::new(InMemory::new());
+    let writer = open_with(store.clone(), SEED_FLUSH_MS).await;
+    let columns: Vec<_> = (0..4).map(|c| col(&format!("c{c}"))).collect();
+    for t in 0..TABLES {
+        let columns = columns.clone();
+        writer
+            .commit(move |tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                tx.create_table(schema, &format!("t{t}"), &columns)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+
+    println!("\n# 0009 warm read-only read, per-GET latency injected");
+    println!("# {TABLES} tables, median of {REPEATS} warm reads\n");
+    println!(
+        "{:>12}  {:>11}  {:>9}  {:>9}  {:>13}",
+        "get_latency", "median_ms", "min_ms", "max_ms", "round_trips"
+    );
+
+    for &latency_ms in &latencies {
+        let config = ThrottleConfig {
+            wait_get_per_call: Duration::from_millis(latency_ms),
+            ..ThrottleConfig::default()
+        };
+        let throttled = Arc::new(ThrottledStore::new((*store).clone(), config));
+        let throttled: Arc<dyn object_store::ObjectStore> = throttled;
+
+        // The poller is held off so its own gets stay out of the window.
+        let mut options = CatalogOptions::default();
+        options.reader_poll_interval = Duration::from_secs(60);
+        let reader = Catalog::open_read_only(Arc::clone(&throttled), options)
+            .await
+            .unwrap();
+        // Warm: from here a read is two point reads and a cache hit.
+        reader.snapshot().await.unwrap();
+
+        let mut samples = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            let view = reader.snapshot().await.unwrap();
+            samples.push(start.elapsed());
+            std::hint::black_box(&view);
+        }
+        let stats = Stats::of(samples);
+        reader.close().await.unwrap();
+
+        // The same read on a handle that has never read: nothing of the
+        // store is in its block cache, so any round trip the two point
+        // reads owe is owed here.
+        let mut cold = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let mut options = CatalogOptions::default();
+            options.reader_poll_interval = Duration::from_secs(60);
+            let fresh = Catalog::open_read_only(Arc::clone(&throttled), options)
+                .await
+                .unwrap();
+            let start = Instant::now();
+            let view = fresh.snapshot().await.unwrap();
+            cold.push(start.elapsed());
+            std::hint::black_box(&view);
+            fresh.close().await.unwrap();
+        }
+        let cold = Stats::of(cold);
+        println!(
+            "{:>10} ms  {:>11.2}  {:>9.2}  {:>9.2}  {:>13.2}   (cold handle)",
+            latency_ms,
+            cold.median_ms,
+            cold.min_ms,
+            cold.max_ms,
+            cold.median_ms / latency_ms as f64
+        );
+
+        println!(
+            "{:>10} ms  {:>11.2}  {:>9.2}  {:>9.2}  {:>13.2}",
+            latency_ms,
+            stats.median_ms,
+            stats.min_ms,
+            stats.max_ms,
+            stats.median_ms / latency_ms as f64
+        );
+    }
+}

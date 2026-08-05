@@ -12,7 +12,8 @@ use std::{
 };
 
 use object_store::{ObjectStore, path::Path};
-use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
+use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::{
@@ -181,6 +182,7 @@ struct ReadTally {
     materializations: AtomicU64,
     refreshes: AtomicU64,
     cache_hits: AtomicU64,
+    head_reads: AtomicU64,
     materialize_micros: AtomicU64,
 }
 
@@ -197,6 +199,7 @@ impl ReadTally {
             total_micros = total,
             cache_hits = self.cache_hits.load(Ordering::Relaxed),
             refreshes = self.refreshes.load(Ordering::Relaxed),
+            head_reads = self.head_reads.load(Ordering::Relaxed),
             "materialized the catalog from `current`"
         );
     }
@@ -445,6 +448,10 @@ pub struct ReadOnlyCatalog {
     // Shared across handle clones: where concurrent commits meet so
     // several of them become one batch and one flush.
     commits: Arc<commit::Coalescer>,
+    // The writer `Db`'s status channel, so a read served from the held view
+    // can check the fence without opening a transaction to do it. `None` on
+    // a read-only handle, which holds no writer to lose.
+    writer_status: Option<watch::Receiver<DbStatus>>,
 }
 
 impl std::fmt::Debug for ReadOnlyCatalog {
@@ -495,6 +502,66 @@ impl ReadOnlyCatalog {
     /// always scan.
     pub(crate) fn maintains_projections(&self) -> bool {
         matches!(self.store.as_ref(), Store::Writer(_))
+    }
+
+    /// Records that a read resolved the head from the store.
+    pub(crate) fn note_head_read(&self) {
+        self.reads.head_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many reads have resolved the head from the store.
+    #[cfg(test)]
+    pub(crate) fn head_reads(&self) -> u64 {
+        self.reads.head_reads.load(Ordering::Relaxed)
+    }
+
+    /// Refuses if this handle has lost the writer epoch, or its `Db` has
+    /// closed for any other reason.
+    ///
+    /// The fence check a read served from the held view performs in place
+    /// of opening a session. SlateDB reports a close by setting it on the
+    /// status channel this handle subscribed to at open, so reading it is a
+    /// borrow of a watch value — no store read, no manifest copy, and no
+    /// entry in the transaction manager, which is what opening a session
+    /// takes a global write lock to make.
+    ///
+    /// Same reach as a session's: both fail exactly once the `Db` is
+    /// closed, because closing it is what the fence does. A handle that
+    /// skipped this would serve its cache past its own displacement, and
+    /// quietly.
+    pub(crate) fn refuse_if_closed(&self) -> Result<()> {
+        let Some(status) = &self.writer_status else {
+            return Ok(());
+        };
+        match status.borrow().close_reason {
+            None => Ok(()),
+            Some(CloseReason::Fenced) => Err(crate::error::fenced()),
+            Some(reason) => Err(Error::Interrupted(format!(
+                "this catalog's store handle has closed ({reason:?}); re-attach to use it"
+            ))),
+        }
+    }
+
+    /// The held view a read may serve without resolving the head from the
+    /// store, or `None` when it must resolve it there.
+    ///
+    /// A read-write handle holds the writer epoch, so this process is the
+    /// store's only writer: nothing can move `sys/head` under it, and every
+    /// batch that lands either folds the held view forward or drops it — a
+    /// durable write whose fate is unknown drops it too. The held view is
+    /// therefore never behind the store, and its own stamp is the head.
+    ///
+    /// Paired with [`refuse_if_closed`](Self::refuse_if_closed), never
+    /// served alone: that this handle still holds the writer is the premise
+    /// of the paragraph above, not a cost it can skip.
+    ///
+    /// A read-only handle follows another process's commits and has no
+    /// such premise, so it always reads.
+    pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
+        if !self.maintains_projections() {
+            return None;
+        }
+        held_head_view(&self.projections)
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -728,6 +795,12 @@ impl ReadOnlyCatalog {
 
         // Captured before the first store read, so an invalidation racing
         // this read cannot be overwritten by what it invalidated.
+        if let Some(view) = self.writer_head_view() {
+            self.refuse_if_closed()?;
+            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(view);
+        }
+
         let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
         let view = self.head_view(session.handle()).await;
@@ -741,10 +814,13 @@ impl ReadOnlyCatalog {
 
     /// The cached view when it already stands at head, a view refreshed
     /// across the gap when it has fallen behind and the gap is replayable,
-    /// else a fresh materialization. A reader polling a quiet catalog pays
-    /// one point read and no copy: the committer folds each batch forward,
-    /// so the cache is normally current.
+    /// else a fresh materialization. A read-only handle polling a quiet
+    /// catalog pays one point read and no copy: the committer folds each
+    /// batch forward, so the cache is normally current. A read-write
+    /// handle does not reach here at all while its view is held —
+    /// [`writer_head_view`](Self::writer_head_view) serves it first.
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
+        self.note_head_read();
         let head = commit::read_head_value(handle).await?;
         if let Some(cached) = cached_head_view(&self.projections, &head) {
             self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -998,7 +1074,7 @@ impl ReadOnlyCatalog {
     /// Used by [`crate::ffi_support`]'s raw current+history dumps and inline
     /// scans; every other reader goes through `snapshot`/`snapshot_at`.
     ///
-    /// Every read in the crate opens its session here, so this is where a
+    /// Every read of the store opens its session here, so this is where a
     /// store mid-structural-migration is refused. The check costs one point
     /// read per session and belongs here rather than at each call site: a
     /// reader that skips it scans a keyspace being rewritten under it and
@@ -1625,6 +1701,7 @@ impl Catalog {
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(Self {
             inner: ReadOnlyCatalog {
+                writer_status: Some(db.subscribe()),
                 store: Arc::new(Store::Writer(db)),
                 location: Arc::new(StoreLocation {
                     path: options.path,
@@ -1707,6 +1784,7 @@ impl Catalog {
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(ReadOnlyCatalog {
+            writer_status: None,
             store: Arc::new(Store::Reader(Arc::new(reader))),
             location: Arc::new(StoreLocation {
                 path: options.path,

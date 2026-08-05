@@ -43,8 +43,29 @@ use crate::{
 
 /// The head snapshot id inside an open read session, or `None` on a
 /// store that has no head yet (mid-bootstrap).
-async fn session_head(session: &crate::store::handle::ReadSession) -> Result<Option<HeadValue>> {
+async fn session_head(
+    catalog: &ReadOnlyCatalog,
+    session: &crate::store::handle::ReadSession,
+) -> Result<Option<HeadValue>> {
+    catalog.note_head_read();
     read_head(session.handle()).await
+}
+
+/// The head a dump may key its projection lookup on without reading it:
+/// the stamp of the view a read-write handle already holds. `None` on a
+/// read-only handle, or on a writer whose view is not held — both then
+/// resolve the head through the open session, as they always have.
+///
+/// Only ever a lookup key. A miss falls through to the session path, so
+/// rows installed under a stamp are installed under one the store told
+/// this handle, never under one inferred here.
+fn writer_head(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
+    let Some(view) = catalog.writer_head_view() else {
+        return Ok(None);
+    };
+    catalog.refuse_if_closed()?;
+
+    Ok(Some(crate::catalog::projection::view_head(&view)))
 }
 
 /// Locks the shared projection state for reading, recovering a poisoned
@@ -93,8 +114,14 @@ pub use crate::store::proto::{
 /// issues ~two dozen `dump_*` calls, and this collapses their store cost
 /// to one scan pair per head.
 async fn all_entities(catalog: &ReadOnlyCatalog) -> Result<Arc<Vec<EntityRecord>>> {
+    if let Some(head) = writer_head(catalog)?
+        && let Some(records) = projections_read(catalog).entities_at(&head)
+    {
+        return Ok(records);
+    }
+
     let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
+    let head = session_head(catalog, &session).await?;
 
     let cache_at = match head {
         Some(head) => {
@@ -276,8 +303,14 @@ async fn dump_projected_current<T: Clone>(
     install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
+    if let Some(head) = writer_head(catalog)?
+        && let Some(rows) = read(&projections_read(catalog), &head)
+    {
+        return Ok(rows);
+    }
+
     let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
+    let head = session_head(catalog, &session).await?;
 
     // Readers serve from this too: each of these dumps scans the whole of
     // `current`, so rescanning per call costs a reader exactly what the
@@ -359,8 +392,14 @@ pub async fn dump_file_column_stats(
 /// installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
+    if let Some(head) = writer_head(catalog)?
+        && let Some(rows) = projections_read(catalog).snapshots_at(&head)
+    {
+        return Ok(rows);
+    }
+
     let session = catalog.begin_read().await?;
-    let head = session_head(&session).await?;
+    let head = session_head(catalog, &session).await?;
     if let Some(head) = head {
         if let Some(rows) = projections_read(catalog).snapshots_at(&head) {
             session.finish();
@@ -1011,7 +1050,13 @@ mod tests {
     /// a current row and (for the versioned kinds) a history row with exact
     /// lifecycle values.
     async fn seed() -> Catalog {
-        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+        seed_on(Arc::new(InMemory::new())).await
+    }
+
+    /// As [`seed`], over a store the caller keeps — for the tests that open
+    /// a second handle on it.
+    async fn seed_on(store: Arc<InMemory>) -> Catalog {
+        let catalog = Catalog::open(store, CatalogOptions::default())
             .await
             .unwrap();
 
@@ -1163,8 +1208,27 @@ mod tests {
     /// thing standing between them and a silently shrinking view.
     #[tokio::test]
     async fn a_planted_marker_refuses_every_read_seam() {
-        let catalog = seed().await;
-        plant_migration_marker(&catalog).await;
+        let store: Arc<InMemory> = Arc::new(InMemory::new());
+        let writer = seed_on(Arc::clone(&store)).await;
+
+        // The handle a migration can start under: a migrator takes the
+        // writer epoch, which fences a read-write handle rather than
+        // leaving it reading, so the reader is the one that meets a marker
+        // it did not already refuse to open against.
+        let options = CatalogOptions {
+            reader_poll_interval: std::time::Duration::from_millis(20),
+            ..CatalogOptions::default()
+        };
+        let catalog = Catalog::open_read_only(store, options).await.unwrap();
+        catalog.snapshot().await.unwrap();
+
+        plant_migration_marker(&writer).await;
+        for _ in 0..100 {
+            if catalog.snapshot().await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         assert!(refuses(&catalog.snapshot().await), "snapshot");
         assert!(refuses(&dump_schemas(&catalog).await), "dump_schemas");

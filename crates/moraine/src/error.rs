@@ -126,17 +126,23 @@ pub enum Error {
 pub(crate) const MANIFEST_VERSION_EXISTS: &str =
     "transactional object (e.g. manifest) version already exists";
 
+/// The fenced error, worded once: a read that checks the writer's status
+/// directly reports the same displacement a failed store call does.
+pub(crate) fn fenced() -> Error {
+    warn!("another process attached this catalog read-write; this writer is fenced");
+    Error::Fenced(
+        "another process attached this catalog read-write and took over as \
+         the writer; this handle can no longer commit — re-attach to write"
+            .to_string(),
+    )
+}
+
 impl From<slatedb::Error> for Error {
     fn from(err: slatedb::Error) -> Self {
         // Every store error crosses here, so this is the one place fencing
         // can be told apart from ordinary I/O failure.
         if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) {
-            warn!("another process attached this catalog read-write; this writer is fenced");
-            return Self::Fenced(
-                "another process attached this catalog read-write and took over as \
-                 the writer; this handle can no longer commit — re-attach to write"
-                    .to_string(),
-            );
+            return fenced();
         }
 
         if err.kind() == slatedb::ErrorKind::Data
