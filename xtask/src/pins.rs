@@ -1,5 +1,6 @@
 //! The `check-pins` task: every place that names a DuckDB version must
-//! name the one `.github/duckdb-versions` calls primary.
+//! name the one `.github/duckdb-versions` calls primary, and every place
+//! that names a DuckLake commit must name the one DuckDB declares.
 //!
 //! A C++-ABI extension is refused by any DuckDB whose version string
 //! differs from the one in its metadata footer, so the pin is not a
@@ -9,6 +10,10 @@
 //! table), and a bump that misses one produces an artifact that builds,
 //! passes CI, and then fails to load. This makes that a build failure
 //! instead.
+//!
+//! The DuckLake commit rides along because it is not moraine's to pick:
+//! DuckDB hard-codes it, so a DuckDB bump moves it silently. Left
+//! unchecked it surfaces only in `e2e`, a whole extension build later.
 
 use std::process::Command;
 
@@ -17,6 +22,23 @@ use anyhow::{Context, bail, ensure};
 use crate::duckdb::{
     duckdb_pin, primary_submodule_pins, supported_duckdb_versions, workspace_root,
 };
+
+/// Where DuckDB names the DuckLake commit `INSTALL ducklake` resolves to.
+pub const DUCKLAKE_CONFIG: &str = "duckdb/.github/config/extensions/ducklake.cmake";
+
+/// The wire-contract suite, which pins that commit as the version the
+/// behaviour it describes was observed against.
+const WIRE_CONTRACT: &str = "crates/moraine-duckdb/tests/ducklake_load/wire_contract.rs";
+
+/// Prose that names the pinned DuckLake commit.
+const DUCKLAKE_PROSE: [&str; 2] = [
+    "crates/moraine-duckdb/README.md",
+    "docs/rfcs/0006-extension-surface.md",
+];
+
+/// How much of a commit `duckdb_extensions()` reports as
+/// `extension_version`, and so how much the pins carry.
+const SHORT_COMMIT: usize = 8;
 
 /// Checks every pinned DuckDB version reference against the primary entry
 /// in `.github/duckdb-versions`, reporting all mismatches at once rather
@@ -84,13 +106,82 @@ pub fn check_pins() -> anyhow::Result<()> {
         }
     }
 
+    let ducklake = pinned_ducklake_commit();
+    match &ducklake {
+        Ok(commit) => problems.extend(ducklake_problems(commit)?),
+        Err(problem) => problems.push(problem.clone()),
+    }
+
     ensure!(
         problems.is_empty(),
         "the DuckDB pin is inconsistent:\n  - {}",
         problems.join("\n  - ")
     );
     println!("ok: every DuckDB version reference matches .github/duckdb-versions");
+    if let Ok(commit) = &ducklake {
+        println!("ok: every DuckLake commit reference matches the one {pin} declares ({commit})");
+    }
     Ok(())
+}
+
+/// The DuckLake commit the pinned DuckDB declares, or the problem that
+/// stopped it being read.
+fn pinned_ducklake_commit() -> Result<String, String> {
+    let config = read(DUCKLAKE_CONFIG).map_err(|error| {
+        format!("could not read {DUCKLAKE_CONFIG}: {error} (run `git submodule update --init`)")
+    })?;
+    declared_ducklake_commit(&config)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{DUCKLAKE_CONFIG} names no `GIT_TAG` commit"))
+}
+
+/// The DuckLake commit DuckDB's extension config declares — the one
+/// `INSTALL ducklake` against the pinned CLI resolves to.
+fn declared_ducklake_commit(config: &str) -> Option<&str> {
+    config
+        .split_whitespace()
+        .skip_while(|word| *word != "GIT_TAG")
+        .nth(1)
+        .map(|commit| commit.trim_end_matches(')'))
+        .filter(|commit| !commit.is_empty())
+}
+
+/// The value of a `const NAME: &str = "…";` declaration.
+fn string_constant<'a>(contents: &'a str, name: &str) -> Option<&'a str> {
+    let opening = format!("const {name}: &str = \"");
+    let start = contents.find(&opening)? + opening.len();
+    let rest = contents.get(start..)?;
+    rest.find('"').and_then(|end| rest.get(..end))
+}
+
+/// Every place naming a DuckLake commit that disagrees with `commit`.
+///
+/// The suite's constant must match exactly; prose only has to carry it,
+/// since the same file quotes the commit in more than one form.
+fn ducklake_problems(commit: &str) -> anyhow::Result<Vec<String>> {
+    let short = commit.get(..SHORT_COMMIT).unwrap_or(commit);
+    let mut problems = Vec::new();
+
+    match string_constant(&read(WIRE_CONTRACT)?, "DUCKLAKE_EXTENSION_VERSION") {
+        Some(pinned) if pinned == short => {}
+        Some(pinned) => problems.push(format!(
+            "{WIRE_CONTRACT} pins DuckLake `{pinned}`, but {DUCKLAKE_CONFIG} declares \
+             `{short}` — re-verify every pin in that file against the new DuckLake"
+        )),
+        None => problems.push(format!(
+            "{WIRE_CONTRACT} declares no `DUCKLAKE_EXTENSION_VERSION`"
+        )),
+    }
+
+    for file in DUCKLAKE_PROSE {
+        if !read(file)?.contains(short) {
+            problems.push(format!(
+                "{file} never names the DuckLake commit `{short}` that {DUCKLAKE_CONFIG} declares"
+            ));
+        }
+    }
+
+    Ok(problems)
 }
 
 /// A repo-relative file, read whole.
@@ -166,6 +257,49 @@ mod tests {
                 "`{version}` is not a `vMAJOR.MINOR.PATCH` DuckDB release"
             );
         }
+    }
+
+    /// The declaration this parses is DuckDB's, in the exact shape its
+    /// extension config writes.
+    #[test]
+    fn the_ducklake_commit_is_read_out_of_duckdbs_extension_config() {
+        let config = "duckdb_extension_load(ducklake\n    \
+             GIT_URL https://github.com/duckdb/ducklake\n    \
+             GIT_TAG d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4\n)\n";
+        assert_eq!(
+            declared_ducklake_commit(config),
+            Some("d8a1881e22516ea3d186d73e83c65fe5bd1a1dc4")
+        );
+        // A one-line form closes the call on the same word.
+        assert_eq!(
+            declared_ducklake_commit("duckdb_extension_load(ducklake GIT_TAG abc123)"),
+            Some("abc123")
+        );
+        assert_eq!(declared_ducklake_commit("GIT_URL only\n"), None);
+    }
+
+    #[test]
+    fn a_string_constant_is_read_by_name() {
+        let source = "const OTHER: &str = \"no\";\nconst WANTED: &str = \"yes\";\n";
+        assert_eq!(string_constant(source, "WANTED"), Some("yes"));
+        assert_eq!(string_constant(source, "MISSING"), None);
+    }
+
+    /// The checked-in tree agrees with the submodule it is pinned to —
+    /// the same assertion `check-pins` makes, run without the submodule
+    /// present being a hard requirement.
+    #[test]
+    fn the_wire_contract_pins_the_commit_duckdb_declares() {
+        let Ok(config) = read(DUCKLAKE_CONFIG) else {
+            return;
+        };
+        let Some(commit) = declared_ducklake_commit(&config) else {
+            panic!("{DUCKLAKE_CONFIG} names no GIT_TAG commit");
+        };
+        assert_eq!(
+            ducklake_problems(commit).expect("reading the pinned files"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
