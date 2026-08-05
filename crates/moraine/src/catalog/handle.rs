@@ -1575,13 +1575,17 @@ impl Catalog {
     /// `object_store` at `options.path`.
     ///
     /// Exactly one process may hold a read-write catalog per store —
-    /// opening a second fences the first.
+    /// opening a second fences the first. An open that is fenced while
+    /// *creating* the catalog re-attempts a few times before reporting it:
+    /// nothing of the fenced attempt reached the store, so the re-attempt
+    /// either adopts the catalog the other process created or creates it.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be opened, is mid-migration,
-    /// or is stamped with a structural format this binary does not
-    /// understand.
+    /// is stamped with a structural format this binary does not
+    /// understand, or is still being created out from under this open once
+    /// the re-attempts are spent ([`Error::Fenced`]).
     ///
     /// # Examples
     ///

@@ -258,33 +258,81 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
     )
 }
 
+/// How many attempts an open that is fenced while creating the catalog
+/// gets before the fence reaches the caller.
+///
+/// Two are enough for the ordinary case — the initializer that displaced
+/// the first has finished by then, so the second adopts the catalog it
+/// left. The third is headroom for initializers that keep arriving. The
+/// count stays small because every attempt takes the writer epoch in turn,
+/// so two openers that keep displacing each other would otherwise loop
+/// rather than fail.
+const GENESIS_ATTEMPTS: u32 = 3;
+
+/// Why an open attempt returned no catalog.
+enum OpenFailure {
+    /// Fenced while creating the catalog. The staged genesis never landed
+    /// and the attempt wrote nothing else, so opening again can neither
+    /// double-initialize nor find a half-made store.
+    FencedAtGenesis(Error),
+    /// Anything else: opening again would reach the same answer.
+    Fatal(Error),
+}
+
 /// Opens the store, bootstrapping an empty one in one atomic batch under
 /// conflict detection — a lost bootstrap race re-validates instead of
 /// double-initializing. Every exit that does not commit rolls back.
 ///
-/// The open is deliberately **not** retried. Every open takes the writer
-/// epoch by a manifest compare-and-swap, so a concurrent open loses that
-/// CAS — and re-attempting it takes the epoch in turn, fencing whichever
-/// initializer had just won. Two initializers that both re-attempt can
-/// therefore both lose, which is worse than the loss the retry was meant to
-/// smooth over: the race currently always leaves a winner.
+/// A genesis displaced by another initializer re-attempts, up to
+/// [`GENESIS_ATTEMPTS`]. Only genesis does: an open that finds a catalog
+/// returns before it stages anything, so a fence from anywhere else means
+/// a live writer took the store over, and re-taking it is the caller's
+/// decision rather than this function's. Re-attempting genesis takes the
+/// writer epoch in turn and so may displace an initializer that had just
+/// won — which is what opening read-write does anyway, and what the
+/// attempt this retry replaces would have done had it been a moment
+/// slower.
 pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
 ) -> Result<Db> {
+    let mut attempt = 1;
+    loop {
+        match open_attempt(&store, encrypted, data_path).await {
+            Ok(db) => return Ok(db),
+            Err(OpenFailure::Fatal(err)) => return Err(err),
+            Err(OpenFailure::FencedAtGenesis(err)) => {
+                if attempt == GENESIS_ATTEMPTS {
+                    return Err(err);
+                }
+                warn!(
+                    attempt,
+                    "another writer took the store over while this open was creating the \
+                     catalog; nothing was written, so this open re-attempts"
+                );
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// One attempt at [`open_initialized`], separating the fence that a second
+/// attempt can get past from the failures it cannot.
+async fn open_attempt(
+    store: &StoreBuilder<'_>,
+    encrypted: bool,
+    data_path: Option<&str>,
+) -> std::result::Result<Db, OpenFailure> {
     // Timed for the same reason the read-only open is: a writer open reads
     // the manifest and replays the log before any catalog work begins.
     let started = Instant::now();
-    let db = store.open_writer().await?;
+    let db = store.open_writer().await.map_err(OpenFailure::Fatal)?;
     info!(
         writer_open_ms = started.elapsed().as_secs_f64() * 1_000.0,
         "opened the store read-write"
     );
-    let tx = db
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .map_err(Error::from)?;
+    let tx = begin_snapshot(&db).await?;
 
     match validate_format(ReadHandle::Tx(&tx)).await {
         Ok(Some(_)) => {
@@ -294,13 +342,13 @@ pub(crate) async fn open_initialized(
         Ok(None) => {}
         Err(err) => {
             tx.rollback();
-            return Err(err);
+            return Err(OpenFailure::Fatal(err));
         }
     }
 
     if let Err(err) = stage_bootstrap(&tx, encrypted, data_path) {
         tx.rollback();
-        return Err(err);
+        return Err(OpenFailure::Fatal(err));
     }
 
     match commit_durable(tx, "bootstrap").await {
@@ -311,22 +359,32 @@ pub(crate) async fn open_initialized(
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
-            let tx = db
-                .begin(IsolationLevel::Snapshot)
-                .await
-                .map_err(Error::from)?;
+            let tx = begin_snapshot(&db).await?;
             let validated = validate_format(ReadHandle::Tx(&tx)).await;
             tx.rollback();
-            if validated?.is_some() {
-                Ok(db)
-            } else {
-                Err(Error::Corruption(
+            match validated {
+                Ok(Some(_)) => Ok(db),
+                Ok(None) => Err(OpenFailure::Fatal(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
-                ))
+                ))),
+                Err(err) => Err(OpenFailure::Fatal(err)),
             }
         }
-        Err(err) => Err(err.into()),
+        Err(err) if err.kind() == slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => {
+            Err(OpenFailure::FencedAtGenesis(err.into()))
+        }
+        Err(err) => Err(OpenFailure::Fatal(err.into())),
     }
+}
+
+/// Begins a snapshot-isolated transaction for an open attempt. A fence
+/// caught here ends the attempt: the format has not been read yet, so
+/// nothing tells a displaced genesis apart from a live writer taking the
+/// store over.
+async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailure> {
+    db.begin(IsolationLevel::Snapshot)
+        .await
+        .map_err(|err| OpenFailure::Fatal(Error::from(err)))
 }
 
 /// Opens the store read-only as a [`DbReader`], validating the format it
