@@ -5302,4 +5302,88 @@ mod tests {
         // SAFETY: attached above and not yet detached.
         unsafe { moraine_detach(handle) };
     }
+
+    /// An attach that outlives the one which built the block cache still
+    /// reads.
+    ///
+    /// The cache is process-wide and its tasks are foyer's, spawned on a
+    /// runtime fixed when the cache is built. Left to default that is the
+    /// *first attach's* runtime, which a detach drops — after which tokio
+    /// cancels the tasks it owned, dropping an in-flight fetch takes
+    /// foyer's inflight lock, and nothing is left running to release it.
+    /// The second attach below then blocks forever.
+    ///
+    /// A cache directory is what makes the first attach build the hybrid,
+    /// so it is load-bearing here rather than incidental. Written as one
+    /// test because the sequence is the bug: split across two, a reorder
+    /// stops covering it.
+    #[test]
+    fn a_second_attach_outlives_the_cache_builders_runtime() {
+        let cache = TempDir::new("cache-runtime-dir");
+        let c_cache = cache.c_path();
+
+        let attach = |path: &std::ffi::CString| {
+            let mut handle: *mut MoraineCatalogHandle = ptr::null_mut();
+            let mut err = MoraineError::default();
+            // SAFETY: both C strings outlive the call; outputs are valid
+            // local slots; null s3/data_path/checkpoint are the documented
+            // "none" cases.
+            let code = unsafe {
+                moraine_attach(
+                    path.as_ptr(),
+                    ptr::null(),
+                    false,
+                    false,
+                    0,
+                    c_cache.as_ptr(),
+                    0,
+                    0,
+                    0,
+                    false,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    None,
+                    ptr::null_mut(),
+                    &raw mut handle,
+                    &raw mut err,
+                )
+            };
+            // SAFETY: `err.message` is null or was just written.
+            let message = unsafe { err.message.as_ref() };
+            assert_eq!(code, codes::OK, "attach failed: {message:?}");
+            handle
+        };
+
+        // The first attach builds the cache, then takes its runtime away.
+        let first_dir = TempDir::new("cache-runtime-first");
+        let first = attach(&first_dir.c_path());
+        // SAFETY: attached above and not yet detached.
+        unsafe { moraine_detach(first) };
+
+        // A different store, so this reads through the cache rather than
+        // answering from anything the first attach left in memory.
+        let second_dir = TempDir::new("cache-runtime-second");
+        seed(second_dir.path());
+        let second = attach(&second_dir.c_path());
+
+        // Any read reaches the cache; a snapshot is the cheapest.
+        let mut snapshot: *mut MoraineSnapshotHandle = ptr::null_mut();
+        let mut err = MoraineError::default();
+        // SAFETY: `second` is attached; the out-params are valid slots.
+        let code = unsafe {
+            moraine_snapshot(
+                second,
+                &raw mut snapshot,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK, "the second attach could not read");
+        // SAFETY: taken from the call above, not yet freed.
+        unsafe { moraine_snapshot_free(snapshot) };
+        // SAFETY: attached above and not yet detached.
+        unsafe { moraine_detach(second) };
+    }
 }
