@@ -1208,15 +1208,50 @@ async fn measure_cpu_bound_decode_under_worker_pressure() {
     println!();
 }
 
+/// Runs `worker` on each of `threads` tasks and prints one row per rung:
+/// the per-read cost one caller sees, and the rate all of them together
+/// sustain. The gap between rungs is what a shared resource is doing.
+#[allow(clippy::unwrap_used)]
+async fn read_ladder(
+    label: &str,
+    concurrency: &[usize],
+    reads: usize,
+    worker: impl Fn() -> tokio::task::JoinHandle<()>,
+) {
+    println!("\n# {label}");
+    println!(
+        "{:>8}  {:>14}  {:>16}",
+        "threads", "us_per_read", "total_reads_per_s"
+    );
+    for &threads in concurrency {
+        let started = Instant::now();
+        let handles: Vec<_> = (0..threads).map(|_| worker()).collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let elapsed = started.elapsed().as_secs_f64();
+        let total = (threads * reads) as f64;
+        println!(
+            "{threads:>8}  {:>14.2}  {:>16.0}",
+            elapsed * 1_000_000.0 * threads as f64 / total,
+            total / elapsed
+        );
+    }
+}
+
 /// 0009 — what a warm read on a read-write handle costs, and where.
 ///
-/// A warm read no longer resolves the head from the store, and no longer
-/// probes `sys/migration`: what it does is open a session, take the held
-/// view, and release. The remaining cost is therefore `Db::begin` — no
-/// store IO, but a global write lock on SlateDB's transaction manager, so
-/// the figure that matters is how it behaves as concurrent readers pile
-/// onto it. This attributes a warm read between the two by measuring the
-/// same reads with the session and without it.
+/// A warm read no longer resolves the head from the store, probes
+/// `sys/migration`, or opens a session at all: it checks the writer's
+/// status channel for a fence and hands back the held view. So what is
+/// left is a watch borrow, and the figure that matters is whether it
+/// scales where opening a session did not.
+///
+/// Three ladders: the read-write handle, a read-only one (which holds no
+/// writer-local premise, so it opens a session and issues both point reads
+/// before it can serve its cache), and the floor of handing back the view
+/// with no check at all.
 ///
 /// In-memory `object_store`, so a remote store's per-GET latency is absent
 /// by construction — which is the point: what is left here is lock and
@@ -1249,71 +1284,58 @@ async fn measure_warm_read_attribution() {
     // Warm the handle: from here every read below is served from the view.
     catalog.snapshot().await.unwrap();
 
-    println!("\n# 0009 warm read on a read-write handle (in-memory object_store)");
-    println!("# {TABLES} tables, {READS} reads per thread, all served from the held view\n");
-    println!(
-        "{:>8}  {:>14}  {:>16}  {:>10}",
-        "threads", "us_per_read", "total_reads_per_s", "wall_ms"
-    );
+    println!("\n# 0009 warm read (in-memory object_store)");
+    println!("# {TABLES} tables, {READS} reads per thread, all served from a held view");
 
     let catalog = Arc::new(catalog);
-    for &threads in &concurrency {
-        let started = Instant::now();
-        let mut handles = Vec::new();
-        for _ in 0..threads {
+    read_ladder(
+        "Read-write handle (fence check, then the held view):",
+        &concurrency,
+        READS,
+        || {
             let catalog = Arc::clone(&catalog);
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 for _ in 0..READS {
                     catalog.snapshot().await.unwrap();
                 }
-            }));
-        }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-        let elapsed = started.elapsed();
+            })
+        },
+    )
+    .await;
 
-        let reads = (threads * READS) as f64;
-        let wall_s = elapsed.as_secs_f64();
-        println!(
-            "{threads:>8}  {:>14.2}  {:>16.0}  {:>10.1}",
-            wall_s * 1_000_000.0 * threads as f64 / reads,
-            reads / wall_s,
-            wall_s * 1_000.0
-        );
-    }
+    let reader = Arc::new(open_reader(store.clone()).await);
+    reader.snapshot().await.unwrap();
+    read_ladder(
+        "Read-only handle (session, then two point reads):",
+        &concurrency,
+        READS,
+        || {
+            let reader = Arc::clone(&reader);
+            tokio::spawn(async move {
+                for _ in 0..READS {
+                    reader.snapshot().await.unwrap();
+                }
+            })
+        },
+    )
+    .await;
 
-    // The floor: handing back the same `Arc` with no session around it.
-    // The gap between the two series is what opening and releasing the
-    // session costs, which is the only store-side work a warm read has
-    // left.
+    // The floor: handing back the same `Arc` with no check around it. The
+    // gap to the first ladder is what checking the fence costs, which is
+    // all a warm read does beyond serving the view.
     let view = catalog.snapshot().await.unwrap();
-    println!("\n# Serving the held view alone, no session:");
-    println!(
-        "{:>8}  {:>14}  {:>16}",
-        "threads", "us_per_read", "total_reads_per_s"
-    );
-    for &threads in &concurrency {
-        let started = Instant::now();
-        let mut handles = Vec::new();
-        for _ in 0..threads {
+    read_ladder(
+        "The held view alone, no fence check:",
+        &concurrency,
+        READS,
+        || {
             let view = Arc::clone(&view);
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 for _ in 0..READS {
                     std::hint::black_box(Arc::clone(&view));
                 }
-            }));
-        }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-        let elapsed = started.elapsed();
-        let reads = (threads * READS) as f64;
-        let wall_s = elapsed.as_secs_f64();
-        println!(
-            "{threads:>8}  {:>14.2}  {:>16.0}",
-            wall_s * 1_000_000.0 * threads as f64 / reads,
-            reads / wall_s
-        );
-    }
+            })
+        },
+    )
+    .await;
 }

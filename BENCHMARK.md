@@ -432,34 +432,48 @@ session is the fence check, and it issues no store IO — `Db::begin` is a
 closed-check plus a registration in SlateDB's transaction manager, under
 that manager's global write lock.
 
-So the question is not what the session costs but how it behaves as
-readers pile onto that lock. Both series below serve the same view over the
-same 50-table catalog; the second omits only the session:
+A session was measured first and then removed, because it did not scale:
+serving the view *through* one ran at 2.7M reads/s with a single reader and
+fell to **519k** at 24, where the same reads without it held flat at ~27M/s.
+That shape is the global write lock, not any work being done. A warm read
+now checks the fence on the writer's status channel instead — a watch
+borrow, which readers share.
 
-| threads | warm read µs | warm reads/s | view alone µs | view alone reads/s |
-|---|---|---|---|---|
-| 1 | 0.37 | 2 731 274 | 0.05 | 18 213 775 |
-| 2 | 1.46 | 1 368 651 | 0.05 | 42 647 561 |
-| 4 | 4.34 | 920 875 | 0.13 | 30 503 382 |
-| 8 | 9.38 | 852 588 | 0.29 | 27 674 479 |
-| 16 | 25.73 | 621 906 | 0.58 | 27 420 831 |
-| 24 | 46.26 | 518 850 | 0.87 | 27 590 980 |
+Three series over one 50-table catalog: a warm read on the read-write
+handle, the same on a read-only handle (which has no writer-local premise,
+so it opens a session and issues both point reads), and the floor of
+handing back the view with no check at all.
 
-**The session is free in absolute terms and does not scale.** One reader
-pays 0.37 µs, of which 0.05 µs is the view; the rest is the session. But
-aggregate throughput *falls* from 2.7M reads/s to 519k as readers go 1 → 24,
-while the same reads without the session hold flat at ~27M/s across the
-whole ladder. That shape is the global write lock, and it is the only
-contention a warm read has left. (The 2-thread view-alone row is noise —
-the loop is a few instructions and the timer is not.)
+| threads | read-write µs | read-write /s | read-only µs | read-only /s | floor µs | floor /s |
+|---|---|---|---|---|---|---|
+| 1 | 0.12 | 8 118 267 | 6.36 | 157 263 | 0.05 | 22 178 604 |
+| 2 | 0.70 | 2 844 847 | 8.70 | 229 925 | 0.09 | 22 244 096 |
+| 4 | 0.85 | 4 718 678 | 13.86 | 288 599 | 0.18 | 22 494 405 |
+| 8 | 1.80 | 4 434 621 | 25.81 | 309 965 | 0.33 | 24 125 416 |
+| 16 | 3.52 | 4 544 039 | 51.96 | 307 900 | 0.68 | 23 627 536 |
+| 24 | 5.07 | 4 736 871 | 45.95 | 522 321 | 0.98 | 24 421 714 |
 
-The absolute figures matter for reading a production trace: even fully
-contended at 24 threads, a warm read costs tens of microseconds. A warm
-read measured in the hundreds of milliseconds is therefore not this — it is
-either IO the warm path no longer issues, or serialization above moraine
-(DuckLake's own metadata connection is serialized; see RFC 0006). Half a
-million warm reads per second is far past what a DuckLake fleet asks for,
-so the lock is a recorded property rather than a target.
+One run per rung, so aggregate rates move a few tens of percent between
+runs; the single-reader costs and the *shapes* are what reproduce.
+
+**A warm read is ~0.1 µs and plateaus rather than degrades.** Against the
+session it is 3× faster with one reader and **~9× at 24** (4.7M/s against
+519k), and the curve flattens from four readers on instead of falling away.
+The residue against the floor is the watch borrow's read lock, which shares.
+
+**A read-only warm read costs ~70× a read-write one** — 6.36 µs against
+0.12 µs, the most stable figure in the table. It cannot hold a writer-local
+premise, so it opens a session and issues two point reads before it can
+serve a cache hit, and one of those (`sys/migration`) is a guaranteed miss
+that must consult every level's filter. That gap is what folding the
+migration state onto `sys/head` would close, and it is why that idea is a
+reader-path item rather than a writer one (RFC 0009 / `tasks.md`).
+
+The absolute figures matter for reading a production trace. Even a
+read-only read fully contended at 24 threads costs tens of microseconds. A
+warm read measured in the hundreds of milliseconds is therefore neither of
+these — it is IO the warm path no longer issues, or serialization above
+moraine (DuckLake's own metadata connection is serialized; see RFC 0006).
 
 ### Read concurrency under IO latency
 

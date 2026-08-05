@@ -193,14 +193,19 @@ place of one. A dump whose projection does not stand at that stamp falls
 through to the ordinary session path and reads the head there, so rows are
 never installed under a stamp the store did not supply.
 
-What a warm read does not skip is the read session, because opening it is
-what fails on a `Db` closed under a newer writer — a fenced handle that
-served its cache would answer from a catalog the store has moved past, and
-quietly. It issues no store read of its own, so this is the whole store-side
-cost a warm read has left.
+What a warm read does not skip is the fence check, because a handle that
+served its cache past its own displacement would answer from a catalog the
+store has moved on from, and quietly. It does not open a session to perform
+it: SlateDB reports a close by setting it on a status channel the handle
+subscribes to at open, so the check is a watch borrow — no store read, no
+manifest copy, and no entry in the transaction manager, which is what
+opening a session takes a global write lock to make. The reach is identical,
+since closing the `Db` is what the fence does. The difference is that a
+watch borrow shares between readers and the lock does not: measured, warm
+throughput plateaus where it used to fall away (`BENCHMARK.md`).
 
-What it *does* skip, on a writer only, is the `sys/migration` refusal that
-session otherwise carries. The marker exists to stop a scan of a keyspace
+What a warm read *does* skip, on a writer only, is the `sys/migration`
+refusal a session otherwise carries. The marker exists to stop a scan of a keyspace
 being rewritten, and a read served from the held view performs no scan —
 but the deeper reason is that on a read-write handle the probe was never
 the guard. A migrator takes the writer epoch before it writes anything, so

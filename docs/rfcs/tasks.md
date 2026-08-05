@@ -77,24 +77,22 @@ deliberately not itemized here.
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
 
-- **DEFERRED** — Serve a warm read without opening a session at all. What
-  a warm read has left is the session, and it issues no store IO — but
-  `Db::begin` registers under SlateDB's transaction-manager global write
-  lock, and warm throughput therefore *falls* from 2.7M reads/s at one
-  reader to 519k at 24 while the same reads without the session hold flat
-  at ~27M/s (`BENCHMARK.md`). Removing it means finding another fence
-  check: opening the session is what fails on a `Db` closed under a newer
-  writer, and a handle that skipped it would serve its cache past a fence,
-  silently. `Db::status().close_reason` is the candidate and clones a
-  manifest, so it is not obviously cheaper. Half a million warm reads per
-  second is far past what a DuckLake fleet asks for, so this waits for a
-  workload that wants it.
-- **DEFERRED** — Carry the migration state as a field on the `sys/head`
-  record, so a probe rides along with a read already being issued instead
-  of being a guaranteed miss that must consult every level's filter. A
-  read-only handle follows another process and must keep probing per read,
-  so that is where the saving now lands. Needs a format-version bump for a
-  reader to know when to trust the field.
+- **DECISION** — Whether to carry the migration state as a field on the
+  `sys/head` record, so a read-only handle's probe rides along with a read
+  it already issues instead of being a guaranteed miss that must consult
+  every level's filter. Sized rather than guessed: a read-only warm read
+  costs 6.35 µs against a read-write one's 0.09 µs, ~70×, because it opens
+  a session and issues both point reads before it can serve a cache hit
+  (`BENCHMARK.md`). So the saving is real and lands entirely on the reader.
+  What blocks it is the compatibility gate, not the encoding. Field
+  presence cannot be the signal on its own: an old binary starts a
+  migration by writing the marker and never touching `sys/head`, so a new
+  reader would find a head record that says "no migration" beside a marker
+  that says otherwise, and sail through a keyspace being rewritten. Closing
+  that needs `MAX_FORMAT_VERSION` raised, which makes the store unopenable
+  by older binaries — and rolling a fleet across a structural bump with
+  mixed versions online is itself deferred under 0015. Settle that first,
+  or accept the reader cost.
 
 ## 0013 — Partitioning, sorting, and pruning
 

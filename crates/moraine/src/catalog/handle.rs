@@ -12,7 +12,8 @@ use std::{
 };
 
 use object_store::{ObjectStore, path::Path};
-use slatedb::{Db, DbReader, DbTransaction, IsolationLevel};
+use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::{
@@ -201,33 +202,6 @@ impl ReadTally {
             head_reads = self.head_reads.load(Ordering::Relaxed),
             "materialized the catalog from `current`"
         );
-    }
-}
-
-/// A read session whose fence check has run and whose mid-migration
-/// refusal has not.
-///
-/// A read served from a held view touches no keyspace, so it releases the
-/// session here rather than paying the refusal's point read to protect a
-/// scan it will not perform. Anything that goes on to read the store calls
-/// [`gate`](Self::gate) — the only way to reach a read handle from here, so
-/// no path can read past the refusal by forgetting it.
-pub(crate) struct UngatedSession(ReadSession);
-
-impl UngatedSession {
-    /// Releases the session without reading anything.
-    pub(crate) fn finish(self) {
-        self.0.finish();
-    }
-
-    /// Applies the mid-migration refusal and yields the readable session.
-    pub(crate) async fn gate(self) -> Result<ReadSession> {
-        if let Err(error) = commit::refuse_mid_migration(self.0.handle()).await {
-            self.0.finish();
-            return Err(error);
-        }
-
-        Ok(self.0)
     }
 }
 
@@ -474,6 +448,10 @@ pub struct ReadOnlyCatalog {
     // Shared across handle clones: where concurrent commits meet so
     // several of them become one batch and one flush.
     commits: Arc<commit::Coalescer>,
+    // The writer `Db`'s status channel, so a read served from the held view
+    // can check the fence without opening a transaction to do it. `None` on
+    // a read-only handle, which holds no writer to lose.
+    writer_status: Option<watch::Receiver<DbStatus>>,
 }
 
 impl std::fmt::Debug for ReadOnlyCatalog {
@@ -537,6 +515,33 @@ impl ReadOnlyCatalog {
         self.reads.head_reads.load(Ordering::Relaxed)
     }
 
+    /// Refuses if this handle has lost the writer epoch, or its `Db` has
+    /// closed for any other reason.
+    ///
+    /// The fence check a read served from the held view performs in place
+    /// of opening a session. SlateDB reports a close by setting it on the
+    /// status channel this handle subscribed to at open, so reading it is a
+    /// borrow of a watch value — no store read, no manifest copy, and no
+    /// entry in the transaction manager, which is what opening a session
+    /// takes a global write lock to make.
+    ///
+    /// Same reach as a session's: both fail exactly once the `Db` is
+    /// closed, because closing it is what the fence does. A handle that
+    /// skipped this would serve its cache past its own displacement, and
+    /// quietly.
+    pub(crate) fn refuse_if_closed(&self) -> Result<()> {
+        let Some(status) = &self.writer_status else {
+            return Ok(());
+        };
+        match status.borrow().close_reason {
+            None => Ok(()),
+            Some(CloseReason::Fenced) => Err(crate::error::fenced()),
+            Some(reason) => Err(Error::Interrupted(format!(
+                "this catalog's store handle has closed ({reason:?}); re-attach to use it"
+            ))),
+        }
+    }
+
     /// The held view a read may serve without resolving the head from the
     /// store, or `None` when it must resolve it there.
     ///
@@ -546,10 +551,9 @@ impl ReadOnlyCatalog {
     /// durable write whose fate is unknown drops it too. The held view is
     /// therefore never behind the store, and its own stamp is the head.
     ///
-    /// Called inside an open read session, never instead of one: the
-    /// session is what fails on a `Db` closed under a newer writer, and
-    /// what refuses a store mid-structural-migration. Both are premises of
-    /// the paragraph above, not costs this can skip.
+    /// Paired with [`refuse_if_closed`](Self::refuse_if_closed), never
+    /// served alone: that this handle still holds the writer is the premise
+    /// of the paragraph above, not a cost it can skip.
     ///
     /// A read-only handle follows another process's commits and has no
     /// such premise, so it always reads.
@@ -791,16 +795,14 @@ impl ReadOnlyCatalog {
 
         // Captured before the first store read, so an invalidation racing
         // this read cannot be overwritten by what it invalidated.
-        let epoch = cache_epoch(&self.projections);
-        let session = self.open_session().await?;
-
         if let Some(view) = self.writer_head_view() {
-            session.finish();
+            self.refuse_if_closed()?;
             self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(view);
         }
 
-        let session = session.gate().await?;
+        let epoch = cache_epoch(&self.projections);
+        let session = self.begin_read().await?;
         let view = self.head_view(session.handle()).await;
         session.finish();
 
@@ -1079,28 +1081,21 @@ impl ReadOnlyCatalog {
     /// returns a catalog with a hole in it, and an open-time check cannot
     /// catch a migration that starts after the handle attached.
     pub(crate) async fn begin_read(&self) -> Result<ReadSession> {
-        self.open_session().await?.gate().await
-    }
-
-    /// Opens a session without the refusal [`begin_read`](Self::begin_read)
-    /// carries — the fence check, and nothing else.
-    ///
-    /// For the paths that may answer from a held view instead of reading.
-    /// The marker exists to stop a *scan* of a keyspace being rewritten,
-    /// and a read served from the cache performs none; paying a point read
-    /// to learn that is the whole cost such a read has left. A path that
-    /// falls through to the store calls [`UngatedSession::gate`] first,
-    /// which the type makes unavoidable — an ungated session lends out no
-    /// read handle.
-    pub(crate) async fn open_session(&self) -> Result<UngatedSession> {
-        Ok(UngatedSession(match self.store.as_ref() {
+        let session = match self.store.as_ref() {
             Store::Writer(db) => ReadSession::Tx(
                 db.begin(IsolationLevel::Snapshot)
                     .await
                     .map_err(Error::from)?,
             ),
             Store::Reader(reader) => ReadSession::Reader(reader.clone()),
-        }))
+        };
+
+        if let Err(error) = commit::refuse_mid_migration(session.handle()).await {
+            session.finish();
+            return Err(error);
+        }
+
+        Ok(session)
     }
 
     /// Derives the index entries for a file the extension path registers, by
@@ -1706,6 +1701,7 @@ impl Catalog {
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(Self {
             inner: ReadOnlyCatalog {
+                writer_status: Some(db.subscribe()),
                 store: Arc::new(Store::Writer(db)),
                 location: Arc::new(StoreLocation {
                     path: options.path,
@@ -1788,6 +1784,7 @@ impl Catalog {
         );
         let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));
         Ok(ReadOnlyCatalog {
+            writer_status: None,
             store: Arc::new(Store::Reader(Arc::new(reader))),
             location: Arc::new(StoreLocation {
                 path: options.path,

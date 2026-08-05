@@ -59,10 +59,13 @@ async fn session_head(
 /// Only ever a lookup key. A miss falls through to the session path, so
 /// rows installed under a stamp are installed under one the store told
 /// this handle, never under one inferred here.
-fn writer_head(catalog: &ReadOnlyCatalog) -> Option<HeadValue> {
-    catalog
-        .writer_head_view()
-        .map(|view| crate::catalog::projection::view_head(&view))
+fn writer_head(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
+    let Some(view) = catalog.writer_head_view() else {
+        return Ok(None);
+    };
+    catalog.refuse_if_closed()?;
+
+    Ok(Some(crate::catalog::projection::view_head(&view)))
 }
 
 /// Locks the shared projection state for reading, recovering a poisoned
@@ -111,16 +114,13 @@ pub use crate::store::proto::{
 /// issues ~two dozen `dump_*` calls, and this collapses their store cost
 /// to one scan pair per head.
 async fn all_entities(catalog: &ReadOnlyCatalog) -> Result<Arc<Vec<EntityRecord>>> {
-    let session = catalog.open_session().await?;
-
-    if let Some(head) = writer_head(catalog)
+    if let Some(head) = writer_head(catalog)?
         && let Some(records) = projections_read(catalog).entities_at(&head)
     {
-        session.finish();
         return Ok(records);
     }
 
-    let session = session.gate().await?;
+    let session = catalog.begin_read().await?;
     let head = session_head(catalog, &session).await?;
 
     let cache_at = match head {
@@ -303,16 +303,13 @@ async fn dump_projected_current<T: Clone>(
     install: impl Fn(&mut ProjectionCache, HeadValue, Vec<T>),
     extract: impl Fn(EntityRecord) -> Option<T>,
 ) -> Result<Vec<T>> {
-    let session = catalog.open_session().await?;
-
-    if let Some(head) = writer_head(catalog)
+    if let Some(head) = writer_head(catalog)?
         && let Some(rows) = read(&projections_read(catalog), &head)
     {
-        session.finish();
         return Ok(rows);
     }
 
-    let session = session.gate().await?;
+    let session = catalog.begin_read().await?;
     let head = session_head(catalog, &session).await?;
 
     // Readers serve from this too: each of these dumps scans the whole of
@@ -395,16 +392,13 @@ pub async fn dump_file_column_stats(
 /// installs it otherwise.
 #[doc(hidden)]
 pub async fn dump_snapshots(catalog: &ReadOnlyCatalog) -> Result<Vec<SnapshotValue>> {
-    let session = catalog.open_session().await?;
-
-    if let Some(head) = writer_head(catalog)
+    if let Some(head) = writer_head(catalog)?
         && let Some(rows) = projections_read(catalog).snapshots_at(&head)
     {
-        session.finish();
         return Ok(rows);
     }
 
-    let session = session.gate().await?;
+    let session = catalog.begin_read().await?;
     let head = session_head(catalog, &session).await?;
     if let Some(head) = head {
         if let Some(rows) = projections_read(catalog).snapshots_at(&head) {
