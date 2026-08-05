@@ -599,15 +599,26 @@ The shim's per-transaction pin is correct but wasteful as a lifetime:
 DuckLake re-reads metadata at every transaction start, autocommit makes
 every statement a transaction, and each rebuild pays the full ABI
 crossing for rows that are byte-identical whenever no commit landed in
-between. So the head stamp crosses the ABI: each dump carries the stamp
-its rows were served at, the shim keys its held `MetadataRows` per table
-by it, and a transaction's first scan of a table reads the current stamp
-(one point read) and reuses on a match instead of re-dumping. The pin
-becomes what it logically was — capture the stamp at first scan, serve
-the transaction at it — and steady-state reads cross the ABI once per
-table per *commit*, not per transaction. The writer rule outranks this:
-staged dumps are never cached over. And the stamp is the whole stamp, id
-and batch count, because a maintenance batch reuses the id.
+between. So the head stamp crosses the ABI: the attach holds one dumped
+row set per synthesized table under the stamp it was dumped at, and a
+transaction's first scan asks the store where it stands before paying to
+re-dump. The pin becomes what it logically was — capture the stamp at
+first scan, serve the transaction at it — and steady-state reads cross
+the ABI once per table per *commit*, not per transaction.
+
+Asking costs a read-write handle nothing: its held view is at head by
+construction, so the stamp comes from the view rather than the store, and
+the write path's saving is the whole ABI crossing with no read added to
+buy it. A read-only handle pays the one point read it would have paid
+anyway.
+
+Rows that straddled a commit are not held. The stamp is read before and
+after the dump and they must agree, because rows spanning two states
+stand at neither, and holding them under the earlier one would serve a
+concurrent reader at that stamp a row set from beyond it. The writer rule
+outranks all of this: staged dumps are never cached over. And the stamp
+is the whole stamp, id and batch count, because a maintenance batch
+reuses the id.
 
 ### DuckLake's caches sit on top, and the stamps compose
 
