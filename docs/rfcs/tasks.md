@@ -77,22 +77,15 @@ deliberately not itemized here.
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
 
-- **DECISION** — Whether to carry the migration state as a field on the
-  `sys/head` record, so a read-only handle's probe rides along with a read
-  it already issues instead of being a guaranteed miss that must consult
-  every level's filter. Sized rather than guessed: a read-only warm read
-  costs 6.35 µs against a read-write one's 0.09 µs, ~70×, because it opens
-  a session and issues both point reads before it can serve a cache hit
-  (`BENCHMARK.md`). So the saving is real and lands entirely on the reader.
-  What blocks it is the compatibility gate, not the encoding. Field
-  presence cannot be the signal on its own: an old binary starts a
-  migration by writing the marker and never touching `sys/head`, so a new
-  reader would find a head record that says "no migration" beside a marker
-  that says otherwise, and sail through a keyspace being rewritten. Closing
-  that needs `MAX_FORMAT_VERSION` raised, which makes the store unopenable
-  by older binaries — and rolling a fleet across a structural bump with
-  mixed versions online is itself deferred under 0015. Settle that first,
-  or accept the reader cost.
+- **DEFERRED** — Overlap a read-only handle's two point reads. The marker
+  probe and the head read are independent and issued in sequence, so a
+  reader pays two round trips where one would do — invisible on a local
+  store, the whole latency against a remote one. This is the cheap half of
+  what carrying migration state on `sys/head` would have bought, and it
+  needs no format bump and no new invariant (RFC 0009 records why that
+  other route was rejected). Unmeasured: the injected-per-GET-latency
+  harness is the one that would show it, since in-memory reads are too fast
+  to separate.
 
 ## 0013 — Partitioning, sorting, and pruning
 

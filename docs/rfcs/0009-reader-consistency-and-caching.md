@@ -221,6 +221,25 @@ every read, and its cold-open refuses a store already carrying a marker. A
 writer probes once while cold, which is what catches a migration a crashed
 predecessor left behind.
 
+So a reader pays two point reads to serve a cache hit where a writer pays
+none: 6.4 µs against 0.1 µs (`BENCHMARK.md`). Carrying the migration state
+as a field on the head record would halve that, and the design is recorded
+here as **rejected**, because the encoding is the easy half and the version
+gate is not. A reader may trust such a field only if every migration
+maintains it, and an older binary starts one by writing the marker alone —
+so field presence cannot be the signal, and the guarantee has to come from
+the format stamp. That stamp is raised lazily, by the feature needing it:
+creating an index raises it today, which is an act an operator chooses. A
+field on *every* head record is not chosen. The first commit after a binary
+upgrade would raise it, and from that moment the store cannot be opened by
+the binary that wrote it the day before — a one-way door, taken by default,
+for microseconds on a path nothing is waiting on.
+
+The move to make first, if reader latency ever does matter, needs no format
+question at all: the marker probe and the head read are independent and are
+issued in sequence, so overlapping them costs one round trip instead of two
+against a store whose GETs are remote.
+
 Making the head write unconditional has a second effect the design wants:
 `sys/head` becomes the one key every batch touches, so SlateDB's
 write-write detection makes it the single conflict anchor. A maintenance

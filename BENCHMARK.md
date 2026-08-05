@@ -465,9 +465,11 @@ The residue against the floor is the watch borrow's read lock, which shares.
 0.12 µs, the most stable figure in the table. It cannot hold a writer-local
 premise, so it opens a session and issues two point reads before it can
 serve a cache hit, and one of those (`sys/migration`) is a guaranteed miss
-that must consult every level's filter. That gap is what folding the
-migration state onto `sys/head` would close, and it is why that idea is a
-reader-path item rather than a writer one (RFC 0009 / `tasks.md`).
+that must consult every level's filter. Folding the migration state onto
+`sys/head` would halve it and is rejected on cost — it would put the store
+behind a format stamp older binaries cannot open, by default, on the first
+commit after an upgrade (RFC 0009). The two reads are independent and
+sequential, so overlapping them is the move that needs nothing in return.
 
 The absolute figures matter for reading a production trace. Even a
 read-only read fully contended at 24 threads costs tens of microseconds. A
