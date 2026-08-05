@@ -88,49 +88,78 @@ incumbent's committer. Every process past the first should attach
 
 ## Faster repeat queries on S3
 
-Point SlateDB's on-disk object cache at a local directory so fetched object
-parts survive restarts and repeat queries skip the GETs:
+moraine keeps one block cache per process, shared by every store the process
+attaches. It holds SST metadata — the indexes and filters every lookup walks
+first — in memory, and data blocks in memory over an optional disk tier.
+
+Give it a directory and the data blocks spill there, so a warm working set
+survives more than memory alone would hold:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (READ_WRITE, META_CACHE_DIR '/var/cache/moraine');
 ```
 
-That cache is capped at 16 GiB per attached store, and the cap is per store
-rather than per directory — four stores sharing a directory can fill four
-times as much. Set it yourself with `META_CACHE_SIZE`, a byte count:
+Two byte counts size it, both for the whole process rather than per store:
+`META_CACHE_MEMORY` caps memory across both halves, `META_CACHE_SIZE` caps the
+directory (16 GiB if unset).
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
-  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_SIZE 2147483648);
+  (READ_WRITE, META_CACHE_DIR '/var/cache/moraine',
+   META_CACHE_MEMORY 1073741824, META_CACHE_SIZE 2147483648);
 ```
 
-By default that cache fills only as queries read, so an object the writer just
-wrote is fetched back from S3 the first time it is read. `META_CACHE_PUTS true`
-caches it at write time instead, and since store objects are immutable, the
-read-only sessions sharing that directory on the same host get it too:
+`META_CACHE_MEMORY` is the number to weigh against DuckDB's own `memory_limit`
+when sizing a host: DuckDB's budget covers its buffers and its Parquet cache,
+and this is the one memory consumer beside it.
+
+By default the cache fills only as queries read, so blocks the writer just
+flushed are fetched back from S3 the first time something reads them.
+`META_CACHE_PUTS true` admits them as they are written instead:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_PUTS true);
 ```
 
-It is off by default because compaction output is cached the same way, and a
-large merge can evict what queries had warmed.
+It is off by default because compaction output goes through the same policy,
+and a large merge can evict what queries had warmed.
 
-A fresh process still starts cold, though, and the first query pays every
-first touch. `META_CACHE_PRELOAD` moves that cost into the ATTACH — `'all'`
-loads every object the store references before the attach returns, `'l0'` only
-the newest, `'none'` (the default) nothing:
+A fresh process still starts cold, and the first query pays every first touch.
+`META_CACHE_PRELOAD` moves that cost into the ATTACH — `'l0'` warms every
+subspace's SST metadata, `'all'` additionally reads the catalog subspaces
+whole, `'none'` (the default) warms nothing:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
   (READ_WRITE, META_CACHE_DIR '/var/cache/moraine', META_CACHE_PRELOAD 'all');
 ```
 
-`'all'` is worth it when the whole store fits the cache — `moraine_store_census`
-tells you how big it is.
+Neither level pulls the index subspace's data blocks, which on an
+index-carrying store is most of its bytes — so `'all'` costs metadata-sized
+reads, not store-sized ones, and equality lookups stay one fetch per block
+behind the filters it just warmed. `moraine_store_census` reports how the
+bytes are distributed.
 
-All of this is the disk tier only. SlateDB also keeps an in-memory block cache
-and metadata cache per attached store; moraine leaves both at SlateDB's own
-sizes and neither is settable on the attach.
+The first attach in a process sizes the cache; later attaches share what it
+built. On a host that attaches several catalogs, set these on the first one.
+
+## Caching the data files
+
+The cache above is the *catalog's*. Parquet data files are read by DuckDB
+itself, through its external file cache, and land inside `memory_limit` —
+moraine never touches a data byte and adds no cache of its own for them.
+
+DuckLake data files are immutable once written, so a process serving repeat
+queries wants three DuckDB settings that are off by default:
+
+```sql
+SET validate_external_file_cache = 'NO_VALIDATION';
+SET parquet_metadata_cache = true;
+SET enable_http_metadata_cache = true;
+```
+
+These are global, so moraine will not set them from an ATTACH — that would
+reach into every other database in the process. Set them in the session that
+attaches the lake.

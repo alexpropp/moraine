@@ -58,12 +58,6 @@ deliberately not itemized here.
   the rates observable; the shape — a `moraine_cache_stats` function
   beside `moraine_store_census`, or rows through the log sink — is this
   RFC's to pin when the shared cache lands).
-- **DOC** — The site guide documents the per-store object-cache behaviour
-  (per-store 16 GiB caps, cross-process `CACHE_DIR` sharing under
-  `CACHE_PUTS`); rewrite it when the shared-cache implementation lands, and
-  add the embedding guidance (`validate_external_file_cache`,
-  `parquet_metadata_cache`, `enable_http_metadata_cache`) beside the attach
-  options.
 
 ## 0007 — Snapshot expiry and garbage collection
 
