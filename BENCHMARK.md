@@ -574,23 +574,28 @@ probe rides another's block, against a counting object store. On an
 in-memory store a fetch costs no round trip, so the milliseconds are
 decode and the **bytes** are the transferable number.
 
-| entries | index bytes | cold bytes/probe | warm bytes/probe | cold ms/probe | warm ms/probe |
-|---|---|---|---|---|---|
-| 8 192 | 297 KB | 5 032 | 493 | 0.153 | 0.137 |
-| 65 536 | 2.38 MB | 8 673 | 970 | 0.191 | 0.161 |
-| 262 144 | 9.48 MB | 21 211 | 2 665 | 0.264 | 0.222 |
-| 1 048 576 | 37.8 MB | 71 193 | 9 566 | 0.589 | 0.527 |
+| entries | index bytes | cold gets | cold bytes/probe | warm gets | warm bytes/probe | warm ms/probe |
+|---|---|---|---|---|---|---|
+| 8 192 | 297 KB | 48 | 4 554 | 0 | 0 | 0.086 |
+| 65 536 | 2.38 MB | 48 | 7 733 | 0 | 0 | 0.097 |
+| 262 144 | 9.48 MB | 48 | 18 630 | 0 | 0 | 0.107 |
+| 1 048 576 | 37.8 MB | 54 | 61 926 | 0 | 0 | 0.154 |
 
 **The grain claim holds with room to spare.** A cold probe into a
-37.8 MB run fetches 71 KB — against the 4 MiB a part-grained cache would
-have faulted to answer the same lookup, a 59× difference, and the gap
+37.8 MB run fetches 62 KB — against the 4 MiB a part-grained cache would
+have faulted to answer the same lookup, a 68× difference, and the gap
 widens as the run grows because a part is a fixed size while a probe's
-block working set is not. Warming cuts the fetch another 7–10×.
+block working set is not.
 
-**But a warm probe is not free, and should be.** It still fetches 0.5–9.6
-KB and issues one to two GETs. The cause is not the cache: `index_lookup`
-calls `materialize` directly rather than serving the handle's held view,
-so every probe re-scans `current` — a bulk-shaped scan, which by design
-admits no blocks. The fix is the one the head-view path already has, and
-the row above is what it is worth: the warm column is the floor a probe
-would drop to, near zero, once the lookup stops rematerializing.
+**A warm probe fetches nothing at all.** Zero bytes and zero GETs at
+every size: the blocks are resident and the probe's own scan admits
+them, which is what the block slot and the probe shape are for.
+
+That row is the *second* reading. The first found a warm probe still
+costing one to two GETs and 0.5–9.6 KB, which was not the cache failing
+but `index_lookup` calling `materialize` instead of serving the handle's
+held view — so every probe re-scanned `current` under a bulk shape that
+admits nothing. Serving the held view took warm probes to zero and cut
+the cold path too (79 GETs to 48, 71 KB to 62 KB per probe), because the
+rescan was in both. The measurement found the defect; the numbers above
+are after the fix.

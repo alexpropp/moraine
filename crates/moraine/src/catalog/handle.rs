@@ -924,7 +924,12 @@ impl ReadOnlyCatalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            // The head view, not a fresh materialization: a probe that
+            // rematerializes re-scans `current` under a bulk shape, which
+            // admits no blocks, so every lookup pays a store read for a
+            // view the handle already holds. The scan the probe actually
+            // needs is the `index` one below, and that one is warm.
+            let view = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -992,7 +997,12 @@ impl ReadOnlyCatalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            // The head view, not a fresh materialization: a probe that
+            // rematerializes re-scans `current` under a bulk shape, which
+            // admits no blocks, so every lookup pays a store read for a
+            // view the handle already holds. The scan the probe actually
+            // needs is the `index` one below, and that one is warm.
+            let view = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -1072,7 +1082,12 @@ impl ReadOnlyCatalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            // The head view, not a fresh materialization: a probe that
+            // rematerializes re-scans `current` under a bulk shape, which
+            // admits no blocks, so every lookup pays a store read for a
+            // view the handle already holds. The scan the probe actually
+            // needs is the `index` one below, and that one is warm.
+            let view = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;

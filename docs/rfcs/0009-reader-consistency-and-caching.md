@@ -657,47 +657,45 @@ split is the tuning:
   sized to fit.** Every probe walks a filter and an index before it can
   touch a data block, and metadata is a small fraction of store bytes
   even where one `index` run is multi-GiB. Data blocks cannot compete for
-  the slot, so the worst eviction — a scan pushing filters out, after
-  which every probe pays a fetch to learn "not here" — cannot happen.
-  The slot takes a fixed fifth of the memory budget, which is SlateDB's
-  own metadata-to-block ratio and holds all of it on any ordinary store;
-  `moraine_store_census` reports a store's index and filter bytes for
-  sizing the budget against one that disagrees.
+  the slot, so a scan cannot push filters out and leave every later probe
+  fetching to learn "not here". The slot takes a fixed fifth of the
+  budget — SlateDB's own metadata-to-block ratio, which holds all of it
+  on any ordinary store; `moraine_store_census` reports a store's index
+  and filter bytes for sizing against one that disagrees.
 - **The block slot — data blocks — is the foyer hybrid**: a memory tier
   spilling at block grain to the `CACHE_DIR` device.
 
 `CachedObjectStore` is no longer configured — coexisting it with a hybrid
 cache double-writes disk (SlateDB's own warning). Against it, this buys
 one budget however many stores attach (the multiply-by-stores sizing rule
-is deleted), block-grain disk hits (a probe into a 3.34 GiB `index` run
-reads its blocks, not 4 MiB parts), admission control, and no double
-residency.
+is deleted), block-grain fetches, admission control, and no double
+residency. Measured: a cold probe into a 37.8 MB `index` run fetches
+62 KB where a part cache would have faulted 4 MiB, and a warm one
+fetches nothing (`BENCHMARK.md`).
 
-The replacement is sound because the two caches, though at different
-layers, cover the same *reusable* reads. The object cache wraps the store
-and caches every GET; but manifest versions and WAL objects are read once
-per version and held in memory thereafter, so the only byte traffic worth
-caching is SST blocks, indexes, and filters — exactly what the table
-store already routes through the `DbCache` interface, with concurrent
-misses on one key deduplicated into a single fetch. One caveat is stated
-here so the implementation cannot discover it late: SlateDB scopes a
-shared cache's keys per opened handle (which is what keeps two stores'
-same-numbered WAL SSTs apart), so the shared instance shares *budget*
-unconditionally but shares *entries* only within a handle — satisfied,
-since moraine holds one `Db` or `DbReader` per attached store. The same
-scoping makes foyer's disk recovery inert across restarts: a fresh
-process draws fresh scopes that match none of the recovered keys. Until
-SlateDB accepts a caller-supplied stable scope (an upstream
-contribution), restart warmth comes from the segment-aware preload below,
-at re-fetch cost.
+The replacement covers the same *reusable* reads despite sitting a layer
+up. The object cache caught every GET, but manifest versions and WAL
+objects are read once per version and held in memory after, so the only
+traffic worth caching is SST blocks, indexes, and filters — exactly what
+the table store routes through the `DbCache` interface, deduplicating
+concurrent misses on one key into a single fetch.
+
+Two consequences of SlateDB scoping a shared cache's keys per opened
+handle (which is what keeps two stores' same-numbered WAL SSTs apart).
+The instance shares *budget* unconditionally but *entries* only within a
+handle — satisfied, since moraine holds one handle per attached store.
+And foyer's disk recovery is inert across restarts, because a fresh
+process draws scopes matching none of the recovered keys; until SlateDB
+takes a caller-supplied stable scope, restart warmth is the preload's
+job, at re-fetch cost.
 
 **Admission follows read shape.** SlateDB's defaults already split it —
 point reads cache their blocks, scans do not — and moraine makes the
 split deliberate: two scan-option constructors, bulk (admits nothing; the
-row caches absorb scan reuse, so admitting is pollution) and probe
-(admits; the reuse is real and block-grained), with every read path
-naming one. Foyer's admission picker repeats the rule at the disk device:
-scan and compaction churn cannot wear it or evict the probe set.
+row caches absorb scan reuse) and probe (admits; the reuse is real and
+block-grained), with every read path naming one. Foyer's admission picker
+repeats the rule at the disk device, so scan and compaction churn cannot
+wear it or evict the probe set.
 
 The attach options keep their surface (RFC 0006) and change machinery:
 
@@ -753,60 +751,50 @@ frequent than restarts, and reversible by the upstream scope work above.
 
 ### The data path is DuckDB's, and is not yet cached
 
-moraine never touches a data-file byte, and adds no data cache, footer
+moraine never touches a data-file byte and adds no data cache, footer
 cache, or read-through layer: a lakehouse's data path belongs to the
 engine reading it, and duplicating DuckDB's would be the mistake this
 RFC removes from the catalog tier.
 
 What the design assumed, and measurement refuted, is that DuckDB was
-already caching it. The external-file cache is on by default and holds
-remote ranges as buffer-manager blocks inside `memory_limit`, validated
-by version tag — but at the tracked version **DuckLake's scan path does
-not go through the caching file system**, so a lake read populates it
-with nothing. The same Parquet file read directly through `read_parquet`
-in the same session does cache. The e2e pins that difference, asserting
-the gap so its closing is the signal (`metadata_read_pinning.test`).
+already caching it. **DuckLake's scan path does not go through the
+caching file system**, so a lake read populates the external-file cache
+with nothing, while the same Parquet file read through `read_parquet` in
+the same session does. The e2e pins that difference, asserting the gap
+so its closing is the signal.
 
-So the data tier is *un-budgeted*, not unified: on a moraine host today,
-DuckDB's `memory_limit` covers its buffers and whatever it caches for
-direct reads, `CACHE_MEMORY` covers the catalog, and lake data files are
-re-read per query from storage. That is upstream's to close and moraine
-must not close it locally — a data cache under the catalog layer would
-be invisible to `memory_limit` for exactly the reason the object cache
-was, and would have to be unwound the day DuckLake starts caching.
+The gap's shape decides what an operator can do about it. DuckDB's
+external-file cache sits *in the reader* — the Parquet reader holds a
+`CachingFileSystem` and reads through it — so a reader that opens its
+files another way misses the cache however the bytes arrive. The
+mechanism is transport-independent, so an `s3://` `DATA_PATH` is very
+likely no different; measured only against a local one, worth confirming
+before sizing a host.
 
-The gap has a shape worth stating, because it decides what an operator
-can do about it. DuckDB's external-file cache sits *in the reader*: the
-Parquet reader holds a `CachingFileSystem` and reads through it, so a
-reader that opens its files another way misses the cache however the
-bytes arrive. That is what the measurement shows, and the mechanism is
-transport-independent, so an `s3://` `DATA_PATH` is very likely no
-different — untested here, worth confirming before sizing a host.
+A *filesystem*-level cache is therefore the lever that still works,
+intercepting below the reader: on S3 that is the `cache_httpfs`
+community extension. It closes the gap at the cost this RFC spent the
+catalog tier removing — its cache is sized by its own knobs, outside
+`memory_limit`, and keeps a read-through memory cache even on disk. So
+it is an operator's trade, made knowingly, and not something the attach
+should arrange: moraine arranging it would re-create the un-budgeted
+tier one layer down, and have to be unwound the day DuckLake starts
+caching.
 
-A *filesystem*-level cache is therefore the lever that still works: it
-intercepts below the reader, so it catches reads the EFC never sees. On
-S3 that is the `cache_httpfs` community extension, which replaces the
-`s3://` filesystem with a caching one. It closes the data-tier gap at
-the cost this RFC spent the catalog tier removing — its cache is sized
-by its own knobs, outside `memory_limit` — so it is an operator's
-trade, made knowingly, and not something the attach should arrange.
+So the data tier is *un-budgeted* rather than unified. A host runs three
+memory consumers, of which DuckDB sees two: its own `memory_limit`,
+moraine's `CACHE_MEMORY`, and whatever a filesystem cache is given.
 
-Two of the settings below survive the gap regardless, because neither is
-the external-file cache: `parquet_metadata_cache` lives in DuckDB's
-`ObjectCache` keyed on the file path, and the httpfs metadata and
-connection caches sit at the filesystem layer.
-
-What remains is embedder configuration, not attach behaviour. DuckLake
-data files are immutable, so a serving host wants
-`validate_external_file_cache = 'NO_VALIDATION'`,
-`parquet_metadata_cache = true`, and `enable_http_metadata_cache = true` —
-all off by default, all global, and the shim must set none of them (an
+The embedder configuration that survives the gap, because none of it is
+the external-file cache: `parquet_metadata_cache` (DuckDB's
+`ObjectCache`, keyed on file path) and the httpfs metadata and
+connection caches (filesystem layer).
+`validate_external_file_cache = 'NO_VALIDATION'` is inert for lake data
+today and becomes live if DuckLake starts caching, so it is worth
+setting anyway. All are global, so the shim sets none of them — an
 `ATTACH` that mutates global state reaches every other database in the
-process). They are documented as embedding guidance beside the attach
-options. The e2e suite pins the load-bearing assumption via
-`duckdb_external_file_cache()`: data files read through a moraine attach
-appear there, so a DuckDB change that stopped covering the DuckLake path
-fails a test.
+process — and they are documented as embedding guidance beside the
+attach options (RFC 0006).
 
 ### Test obligations
 
@@ -878,29 +866,26 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   no commit between serves the same metadata rows without a dump rebuild;
   with a commit it re-dumps; a staged-write transaction is served staged
   dumps regardless.
-- **The disk tier serves without the store.** A point read whose blocks
-  were evicted from memory but sit on disk issues no GET; a preloaded
-  attach's first probe issues none.
-- **One budget across attaches.** Several attached stores share the one
-  cache; memory residency is bounded by the cap, not the attach count; a
-  detach leaves the other stores' entries warm.
+- **A warm probe costs no store read.** An index lookup repeated against
+  a resident working set issues no GET and fetches no bytes.
+- **One budget across attaches.** Several attached stores share one cache
+  and one tally; a later attach's differing options are reported as
+  ignored rather than silently applied.
 - **Scans cannot evict the probe path.** After a whole-subspace scan and a
   compaction through a warm cache, a probe that was GET-free stays
   GET-free.
 - **Admission follows the declared shape.** A bulk scan admits no data
-  blocks; a probe admits its own; every read path is pinned to one
-  constructor.
-- **Preload is segment-aware.** Against a store whose `index` dwarfs its
-  `current`, an `'all'` preload fetches metadata plus the scan-shaped
-  subspaces only, and a probe after it fetches at most its own data
-  blocks.
-- **The data path's cache gap stays visible.** An e2e reads a lake table
-  and asserts `duckdb_external_file_cache()` holds nothing for it, while
-  the same file read directly does cache — so the day DuckLake routes its
-  reads through the caching file system, the test fails and says so.
+  blocks; a probe admits its own.
+- **Preload warms before the first read.** An attach that preloads has
+  consulted the cache by the time it returns, and warms no `index` data
+  blocks at either level.
 - **The cache reports what it served.** A cold read moves the tally, the
   slots are counted apart, and a rate is absent rather than zero until
   something has been looked up.
+- **The data path's cache gap stays visible.** A lake read leaves
+  `duckdb_external_file_cache()` empty for its files while the same file
+  read directly does cache — so the day DuckLake routes through the
+  caching file system, the test fails and says so.
 
 ## Alternatives considered
 

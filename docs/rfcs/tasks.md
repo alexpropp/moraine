@@ -91,30 +91,17 @@ deliberately not itemized here.
   subspace-grained rather than SST-grained, so an export would buy
   precision rather than capability. Worth filing upstream; nothing here
   waits on it.
-- **MEASURE** — SST block size (0002's layout, 4 KiB today): a sweep over
+- **DEFERRED** — SST block size (0002's layout, 4 KiB today): a sweep over
   4/16/64 KiB on the scan-heavy `current` and probe-heavy `index`
-  workloads. Attempted and withdrawn: the sweep has to set a block size,
-  which moraine exposes nowhere, so the harness drove SlateDB directly —
-  and that harness hangs during its write/scan loop even at 8 000 rows,
-  which is its own investigation and not the cache work's. Either debug
-  it, or decide the block size is worth an option and measure through
-  moraine's own harness, which works.
-- **IMPL** — Serve `index_lookup` from the held head view instead of
-  calling `materialize`. Measured cost of not doing so: a *warm* probe
-  still fetches 0.5–9.6 KB and one to two GETs, because every lookup
-  re-scans `current` under a bulk shape that admits no blocks
-  (`BENCHMARK.md` → What an index probe fetches). The head-view path
-  already has the fix; the probe path never got it.
-- **DECISION** — Whether the data tier deserves an answer from moraine at
-  all. Measured: DuckLake's scan path does not go through DuckDB's
-  external file cache, so lake data files are cached by nothing on a
-  default host (`metadata_read_pinning.test` pins the gap). The reader-
-  level cache cannot be reached from outside the reader, so the only
-  lever is a filesystem-level one — `cache_httpfs` on S3 — whose cache
-  sits outside `memory_limit`, which is exactly the property this work
-  removed from the catalog tier. Today's answer is operator guidance;
-  the alternative is moraine arranging it, which would re-create the
-  un-budgeted tier one layer down. Revisit if upstream does not close it.
+  workloads. Attempted and withdrawn twice over. The sweep must set a
+  block size, which moraine exposes nowhere, so the harness drove SlateDB
+  directly — and that harness hangs in its write/scan loop even at 8 000
+  rows, which is its own investigation. The reason to push through it has
+  also weakened: the 4 KiB block size mattered when a scan paid a round
+  trip per block, and the scan path's read-ahead fixed that, while probes
+  now cost nothing warm and 62 KB cold (`BENCHMARK.md`). Revive it if a
+  profile puts weight back on block grain; it would need a public option
+  to be measurable through moraine's own harness, which works.
 - **DEFERRED** — A cross-process row cache (serialized projections on
   disk, stamped with the head; one point read validates, the changelog
   replays a small gap). Would collapse a process-cold attach from

@@ -151,18 +151,17 @@ The cache above is the *catalog's*. Parquet data files are read by DuckDB
 itself, and moraine never touches a data byte or adds a cache of its own
 for them.
 
-Be aware of a gap there: at the tracked version, DuckLake's scan path does
-not go through DuckDB's external file cache, so lake data files are re-read
-from storage per query even with that cache enabled. On S3 the lever that
-does work is the `cache_httpfs` community extension, which caches at the
-filesystem layer — below the reader — and so catches reads the built-in
-cache never sees. Its cache is sized by its own settings, outside DuckDB's
-`memory_limit`, so budget for it separately.
+There is a gap there worth knowing about. DuckDB's built-in external file
+cache lives *in the Parquet reader*, and at the tracked version DuckLake's
+scan path does not go through it — so a lake read populates it with
+nothing, while reading the very same file with `read_parquet` does. Lake
+data files are therefore re-read from storage per query, however the
+built-in cache is configured.
 
 DuckLake data files are immutable once written, so a process serving repeat
-queries wants three DuckDB settings that are off by default. The last two
-work regardless of the gap above — the footer cache is keyed on the file
-path in DuckDB's object cache, and the HTTP metadata cache sits at the
+queries still wants three DuckDB settings that are off by default. The last
+two work regardless of the gap — the footer cache is keyed on the file path
+in DuckDB's object cache, and the HTTP metadata cache sits at the
 filesystem layer:
 
 ```sql
@@ -174,3 +173,50 @@ SET enable_http_metadata_cache = true;
 These are global, so moraine will not set them from an ATTACH — that would
 reach into every other database in the process. Set them in the session that
 attaches the lake.
+
+### Caching S3 data files with cache_httpfs
+
+To actually cache lake data on S3, use a cache that sits *below* the
+reader rather than inside it. The `cache_httpfs` community extension
+replaces the `s3://` filesystem, so it catches reads the built-in cache
+never sees:
+
+```sql
+INSTALL cache_httpfs FROM community;
+LOAD cache_httpfs;
+
+SET cache_httpfs_type = 'on_disk';
+SET cache_httpfs_cache_directory = '/var/cache/duckdb-httpfs';
+SET cache_httpfs_cache_block_size = 524288;             -- 512 KiB
+-- Keep 8 GiB of the volume free; the cache evicts to stay under it.
+SET cache_httpfs_min_disk_bytes_for_cache = 8589934592;
+-- Cache reads run on DuckDB's scheduler, so `SET threads` caps them too.
+SET cache_httpfs_parallel_read_mode = 'duckdb_task_scheduler';
+```
+
+**Budget its memory separately from `memory_limit`.** This cache is not
+DuckDB's and does not answer to DuckDB's budget, and even in `on_disk`
+mode it keeps a read-through memory cache. Two knobs bound it, and both
+multiply by the block size:
+
+```sql
+-- on_disk mode: the read-through cache in front of the cache files.
+--   256 blocks x 512 KiB = 128 MiB
+SET cache_httpfs_disk_cache_reader_mem_cache_block_count = 256;
+
+-- in_mem mode (cache_httpfs_type = 'in_mem'): the cache itself.
+--   256 blocks x 512 KiB = 128 MiB
+SET cache_httpfs_max_in_mem_cache_block_count = 256;
+```
+
+So a host running this alongside moraine has three memory consumers to
+size, not one: DuckDB's `memory_limit`, moraine's `META_CACHE_MEMORY`,
+and cache_httpfs's block count times its block size. Only the first two
+are visible to DuckDB. Set the block counts before the first read —
+they take effect once.
+
+Two smaller notes. `cache_httpfs_max_in_mem_cache_block_count` must be
+set before any filesystem access to take effect. And DuckLake never
+rewrites a data file, so the default
+`cache_httpfs_enable_cache_validation = false` is safe here — the file
+under a cached block cannot have changed.
