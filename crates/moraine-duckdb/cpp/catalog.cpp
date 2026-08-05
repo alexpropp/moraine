@@ -985,6 +985,29 @@ std::string MoraineCatalog::GetDBPath() {
 	return path_;
 }
 
+std::shared_ptr<const MetadataRows> MoraineCatalog::HeldMetadataRows(const MetadataTableSpec &spec,
+                                                                     uint64_t snapshot_id,
+                                                                     uint64_t batch_seq) const {
+	std::lock_guard<std::mutex> guard(held_rows_lock_);
+	auto it = held_rows_.find(&spec);
+	if (it == held_rows_.end()) {
+		return nullptr;
+	}
+	// The whole stamp, not the snapshot id alone: a maintenance batch
+	// reuses the id while changing what a scan finds, so an id-keyed hit
+	// would serve the state that batch reclaimed.
+	if (it->second.snapshot_id != snapshot_id || it->second.batch_seq != batch_seq) {
+		return nullptr;
+	}
+	return it->second.rows;
+}
+
+void MoraineCatalog::HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
+                                      std::shared_ptr<const MetadataRows> rows) {
+	std::lock_guard<std::mutex> guard(held_rows_lock_);
+	held_rows_[&spec] = HeldRows {snapshot_id, batch_seq, std::move(rows)};
+}
+
 void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {
 	// The handle is deliberately *not* freed here: doing so would race a
 	// concurrent StartTransaction reading it via Handle(); only the

@@ -108,6 +108,22 @@ pub use crate::store::proto::{
     TableValue as TableRecord, ViewValue as ViewRecord,
 };
 
+/// The store state every dump's rows stand at: the head snapshot id and
+/// batch count, or `None` on a store that has no head yet.
+///
+/// One point read. A caller holding rows it took earlier compares this
+/// against the stamp they were served at and re-dumps only on a move —
+/// which is what makes a quiet catalog cost one read per table per
+/// commit rather than per transaction. Both halves matter: a maintenance
+/// batch reuses the snapshot id while changing what a scan finds.
+#[doc(hidden)]
+pub async fn head_stamp(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
+    let session = catalog.begin_read().await?;
+    let head = session_head(&session).await;
+    session.finish();
+    head
+}
+
 /// The shared record set's two halves at the session head, each served
 /// from the projection cache when its stamp matches and scanned at most
 /// once otherwise — the whole point: populating DuckLake's metadata
@@ -1195,6 +1211,38 @@ mod tests {
             .unwrap();
 
         catalog
+    }
+
+    /// The stamp a holder of dumped rows compares against: it stands still
+    /// while nothing commits, and moves for every batch — a snapshot-
+    /// minting one and an option write that reuses the id alike, which is
+    /// why both halves cross the ABI.
+    #[tokio::test]
+    async fn the_head_stamp_moves_for_every_batch() {
+        use crate::catalog::OptionScope;
+
+        let catalog = seed().await;
+
+        let first = head_stamp(&catalog).await.unwrap().unwrap();
+        let repeat = head_stamp(&catalog).await.unwrap().unwrap();
+        assert_eq!(first, repeat, "the stamp moved with no commit");
+
+        catalog
+            .commit(|tx| tx.create_schema("more").map(|_| ()))
+            .await
+            .unwrap();
+        let minted = head_stamp(&catalog).await.unwrap().unwrap();
+        assert_eq!(minted.snapshot_id, first.snapshot_id + 1);
+        assert_eq!(minted.batch_seq, first.batch_seq + 1);
+
+        // Reuses the snapshot id; only the batch count says the store moved.
+        catalog
+            .commit(|tx| tx.set_option(OptionScope::Global, "answer", "42"))
+            .await
+            .unwrap();
+        let reused = head_stamp(&catalog).await.unwrap().unwrap();
+        assert_eq!(reused.snapshot_id, minted.snapshot_id);
+        assert_eq!(reused.batch_seq, minted.batch_seq + 1);
     }
 
     /// At one head stamp, `current` and `history` are each scanned at most

@@ -127,3 +127,48 @@ query I
 SELECT count(*) = max(snapshot_id) + 1 FROM __ducklake_metadata_lake.ducklake_snapshot;
 ----
 true
+
+# Rows dumped for one transaction are held for the next, keyed on the store's
+# head stamp, so a quiet catalog re-crosses the ABI once per commit rather
+# than once per transaction. Held rows must never outlive the state they
+# stand at, which is what the rest of this file pins: each round commits on
+# one connection and reads on the other, so a stamp that failed to
+# invalidate would serve the round's reader the previous round's rows.
+statement ok con2
+INSERT INTO lake.main.t VALUES (3);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+3
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (4);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+# Two held tables read in one statement, so a stale hold on either would
+# disagree with the other: every data file the file table names belongs to a
+# snapshot the snapshot table has, and the snapshot lineage is unbroken.
+query II con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file f
+        WHERE f.begin_snapshot > (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot)),
+       (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = max(snapshot_id) + 1
+FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+0	true
+
+# A batch that mints no snapshot still moves the stamp's other half. Setting
+# an option is such a batch: the snapshot id is unchanged, so rows held under
+# it would keep serving if the batch count were not part of the key.
+statement ok con2
+CALL lake.set_option('parquet_compression', 'zstd');
+
+query I con1
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata
+WHERE key = 'parquet_compression' AND value = 'zstd';
+----
+1

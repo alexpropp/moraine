@@ -1414,6 +1414,31 @@ void moraine_compact_store_free(struct MoraineSubspaceMerge *items, size_t len);
 // `name`, if non-null, must be a valid C string.
 bool moraine_subspace_is_known(const char *name);
 
+// The store state the catalog's dumps currently serve: the head
+// snapshot id and batch count. `out_present` is false on a store with no
+// head yet (mid-bootstrap), where the other outputs are left unwritten.
+//
+// One point read, so a caller holding rows it dumped earlier can ask
+// whether anything moved before paying to re-dump them. Both halves are
+// reported because a maintenance batch reuses the snapshot id while
+// changing what a scan finds, so the id alone would let a stale row set
+// keep serving.
+//
+// # Safety
+//
+// `handle` must be a pointer previously returned by [`moraine_attach`]
+// and not yet detached. `out_snapshot_id`, `out_batch_seq`, and
+// `out_present` must be valid, writable pointers. `probe`, if non-null,
+// must be safe to call with `probe_ctx` from any thread. `err`, if
+// non-null, must be a valid, writable [`MoraineError`].
+int32_t moraine_head_stamp(struct MoraineCatalogHandle *handle,
+                           uint64_t *out_snapshot_id,
+                           uint64_t *out_batch_seq,
+                           bool *out_present,
+                           MoraineInterruptProbe probe,
+                           void *probe_ctx,
+                           struct MoraineError *err);
+
 // The subspaces a merge can target, comma-separated, for an error
 // message. Owned — free via `moraine_error_free`; null if allocation
 // fails.

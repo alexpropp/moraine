@@ -2381,6 +2381,73 @@ pub unsafe extern "C" fn moraine_subspace_is_known(name: *const c_char) -> bool 
     catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(false)
 }
 
+/// The store state the catalog's dumps currently serve: the head
+/// snapshot id and batch count. `out_present` is false on a store with no
+/// head yet (mid-bootstrap), where the other outputs are left unwritten.
+///
+/// One point read, so a caller holding rows it dumped earlier can ask
+/// whether anything moved before paying to re-dump them. Both halves are
+/// reported because a maintenance batch reuses the snapshot id while
+/// changing what a scan finds, so the id alone would let a stale row set
+/// keep serving.
+///
+/// # Safety
+///
+/// `handle` must be a pointer previously returned by [`moraine_attach`]
+/// and not yet detached. `out_snapshot_id`, `out_batch_seq`, and
+/// `out_present` must be valid, writable pointers. `probe`, if non-null,
+/// must be safe to call with `probe_ctx` from any thread. `err`, if
+/// non-null, must be a valid, writable [`MoraineError`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_head_stamp(
+    handle: *mut MoraineCatalogHandle,
+    out_snapshot_id: *mut u64,
+    out_batch_seq: *mut u64,
+    out_present: *mut bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Option<(u64, u64)>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_snapshot_id.is_null() || out_batch_seq.is_null() || out_present.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is the caller's contract.
+        let head = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::head_stamp(handle_ref.catalog.reads()),
+            )
+        }?;
+        Ok(head.map(|head| (head.snapshot_id, head.batch_seq)))
+    };
+
+    // SAFETY: `err` validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(stamp) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe {
+                match stamp {
+                    Some((snapshot_id, batch_seq)) => {
+                        *out_snapshot_id = snapshot_id;
+                        *out_batch_seq = batch_seq;
+                        *out_present = true;
+                    }
+                    None => *out_present = false,
+                }
+            }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// The subspaces a merge can target, comma-separated, for an error
 /// message. Owned — free via `moraine_error_free`; null if allocation
 /// fails.

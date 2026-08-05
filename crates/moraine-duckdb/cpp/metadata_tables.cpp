@@ -14,6 +14,29 @@ namespace moraine_duckdb {
 
 namespace {
 
+// The store state a dump's rows stand at.
+struct MoraineHeadStamp {
+	uint64_t snapshot_id;
+	uint64_t batch_seq;
+};
+
+// Reads the head stamp, reporting whether one exists. A store with no
+// head yet (mid-bootstrap) and a failed read both report false, which
+// costs a caller only the caching it would otherwise have done — never
+// correctness, so the error is swallowed rather than raised.
+bool ReadHeadStamp(MoraineCatalogHandle *handle, duckdb::ClientContext &context, MoraineHeadStamp &out) {
+	MoraineError err {};
+	bool present = false;
+	if (moraine_head_stamp(handle, &out.snapshot_id, &out.batch_seq, &present, moraine_shim_is_interrupted, &context,
+	                       &err) != MORAINE_OK) {
+		if (err.message != nullptr) {
+			moraine_error_free(err.message);
+		}
+		return false;
+	}
+	return present;
+}
+
 duckdb::Value OptVarchar(const char *s) {
 	if (s == nullptr) {
 		return duckdb::Value(duckdb::LogicalType::VARCHAR);
@@ -1529,8 +1552,33 @@ std::shared_ptr<const MetadataRows> MetadataRowsFor(duckdb::ClientContext &conte
 	if (auto cached = transaction.GetMetadataRows(spec)) {
 		return cached;
 	}
+
+	// The rows this attach dumped last time are byte-identical to a fresh
+	// dump whenever no batch landed since, so ask the store where it
+	// stands (one point read) before paying the ABI crossing again. A
+	// store with no head yet, or a stamp read that fails, simply dumps.
+	auto &moraine_catalog = catalog.Cast<MoraineCatalog>();
+	MoraineHeadStamp before;
+	const bool stamped = ReadHeadStamp(handle, context, before);
+	if (stamped) {
+		if (auto held = moraine_catalog.HeldMetadataRows(spec, before.snapshot_id, before.batch_seq)) {
+			transaction.PutMetadataRows(spec, held);
+			return held;
+		}
+	}
+
 	auto rows = std::make_shared<const MetadataRows>(spec.provider(handle, moraine_shim_is_interrupted, &context));
 	transaction.PutMetadataRows(spec, rows);
+
+	// Hold them for the next transaction only if the store did not move
+	// under the dump: rows that straddled a commit stand at no single
+	// stamp, and holding them under the earlier one would serve a
+	// concurrent reader at that stamp a row set from beyond it.
+	MoraineHeadStamp after;
+	if (stamped && ReadHeadStamp(handle, context, after) && after.snapshot_id == before.snapshot_id &&
+	    after.batch_seq == before.batch_seq) {
+		moraine_catalog.HoldMetadataRows(spec, before.snapshot_id, before.batch_seq, rows);
+	}
 	return rows;
 }
 
