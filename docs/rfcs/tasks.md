@@ -82,9 +82,14 @@ deliberately not itemized here.
   (`BENCHMARK.md`), so this would bound that too.
 - **IMPL** — Per-tier cache hit rates surfaced beside the existing
   row-tier counters (meta hits, block-memory hits, disk hits, store GETs),
-  so `CACHE_MEMORY`/`CACHE_SIZE` are sized from measured curves. SlateDB
-  takes a `MetricsRecorder` and its `DbCacheStats` counts per wrapper, so
-  the plumbing exists; the SQL surface is 0006's DECISION.
+  so `CACHE_MEMORY`/`CACHE_SIZE` are sized from measured curves. The
+  counters exist: SlateDB's cache wrapper records hit/miss per entry kind
+  (`filter`, `index`, `data_block`, `stats`) against whatever
+  `MetricsRecorder` the builder is given, under
+  `slatedb.db_cache.access_count`. The cost is a dependency — the trait
+  lives in `slatedb-common`, a separate crate moraine does not take
+  today and would have to pin in lockstep with `slatedb`, as it already
+  does for `object_store` and `foyer`. Decide that before building.
 - **VALIDATE** — The test obligations still unwritten: disk-tier hits
   without GETs, one budget across attaches, scans unable to evict the
   probe path, preload bounds, and `duckdb_external_file_cache()` coverage
