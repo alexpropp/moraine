@@ -302,11 +302,46 @@ pub fn cache_tally() -> CacheTally {
 /// an optimization, and no attach should fail because a device would not
 /// open.
 pub(crate) async fn shared(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
-    SHARED
-        .get_or_init(|| async { build(config).await })
+    let cache = SHARED
+        .get_or_init(|| async {
+            let built = build(config).await;
+            let mut settled = BUILT_WITH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *settled = Some(config.clone());
+            built
+        })
         .await
-        .clone()
+        .clone();
+
+    // A later store asking for something else gets what was built. That
+    // is the budget being the process's rather than the store's, and
+    // refusing would fail an attach over a cache — but a mismatch nobody
+    // can see is a host sized from options that never took effect, so it
+    // is said out loud once per attach that disagrees.
+    let settled = BUILT_WITH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(settled) = settled.as_ref()
+        && settled != config
+    {
+        warn!(
+            requested_memory = config.memory,
+            requested_disk_size = config.disk_size,
+            requested_dir = ?config.dir,
+            in_force_memory = settled.memory,
+            in_force_disk_size = settled.disk_size,
+            in_force_dir = ?settled.dir,
+            "the block cache is process-wide and already built; this attach's cache options              are ignored. Set them on the first attach in the process."
+        );
+    }
+
+    cache
 }
+
+/// What the process's cache was built with, for telling a later attach
+/// that its own numbers did not take effect.
+static BUILT_WITH: std::sync::Mutex<Option<CacheConfig>> = std::sync::Mutex::new(None);
 
 async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
     let (meta_bytes, block_bytes) = config.slots();
@@ -420,6 +455,35 @@ mod tests {
         assert_eq!(meta + block, DEFAULT_CACHE_MEMORY);
         assert_eq!(meta, 128 * 1024 * 1024);
         assert_eq!(block, 512 * 1024 * 1024);
+    }
+
+    /// A later store's cache options do not take effect, and the process
+    /// says so rather than leaving a host sized from numbers that never
+    /// applied. The first config to arrive is what stands.
+    #[tokio::test]
+    async fn a_later_attachs_cache_options_are_reported_as_ignored() {
+        let first = CacheConfig {
+            memory: Some(4 * 1024 * 1024),
+            ..CacheConfig::default()
+        };
+        let built = shared(&first).await;
+
+        // Whatever the second asks for, it is served the first's cache.
+        let second = CacheConfig {
+            memory: Some(64 * 1024 * 1024),
+            dir: Some(std::path::PathBuf::from("/tmp/moraine-ignored")),
+            disk_size: Some(1),
+        };
+        let served = shared(&second).await;
+        assert_eq!(built.is_some(), served.is_some());
+        assert!(
+            BUILT_WITH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|settled| settled.memory != second.memory),
+            "the first config must be the one in force"
+        );
     }
 
     /// The recorder routes SlateDB's cache counters by label: the meta

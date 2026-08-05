@@ -76,50 +76,45 @@ deliberately not itemized here.
   Whichever is taken first pulls the other with it. A replay's base-view
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
-- **IMPL** — Per-tier cache hit rates surfaced beside the existing
-  row-tier counters (meta hits, block-memory hits, disk hits, store GETs),
-  so `CACHE_MEMORY`/`CACHE_SIZE` are sized from measured curves. The
-  counters exist: SlateDB's cache wrapper records hit/miss per entry kind
-  (`filter`, `index`, `data_block`, `stats`) against whatever
-  `MetricsRecorder` the builder is given, under
-  `slatedb.db_cache.access_count`. The cost is a dependency — the trait
-  lives in `slatedb-common`, a separate crate moraine does not take
-  today and would have to pin in lockstep with `slatedb`, as it already
-  does for `object_store` and `foyer`. Decide that before building.
-- **VALIDATE** — The test obligations still unwritten: disk-tier hits
-  without GETs, one budget across attaches, scans unable to evict the
-  probe path, preload bounds, and `duckdb_external_file_cache()` coverage
-  of the DuckLake read path. The rest are written — one scan pair per
-  head, stamp reuse across transactions, and shape-declared admission all
-  have tests. The first three want the hit-rate counters above to be
-  observable rather than inferred from timing, so they follow that IMPL.
-- **DECISION** — Upstream: a caller-supplied stable cache scope in
+- **DEFERRED** — Upstream: a caller-supplied stable cache scope in
   SlateDB. Shared-cache keys are scoped per opened handle by a
   process-local counter, so foyer's disk recovery matches nothing after a
   restart; a scope derived from the store path would make the disk tier
   restart-warm and reclaim the one property the object cache still holds.
-  Until then the restart story is preload, at re-fetch cost.
-- **DECISION** — Upstream: export `SsTableId`. `DbCacheManagerOps::warm_sst`
-  and `evict_cached_sst` are public methods whose parameter type lives in
-  a private module (`db_state`), so no caller outside slatedb can name an
-  argument for them. The preload warms by reading instead — cheaper, and
-  subspace-grained rather than SST-grained — so this buys precision
-  rather than capability, and nothing waits on it.
-- **DECISION** — Whether the first attach sizing the process-wide cache
-  is the right rule. One cache means one shape: a second attach naming a
-  different `CACHE_MEMORY`, or a `CACHE_DIR` where the first named none,
-  is ignored today. The alternatives are refusing the mismatch loudly or
-  letting a later attach grow the budget; neither is obviously right, and
-  a single-catalog host never notices.
-- **MEASURE** — Index-probe latency served from the hybrid disk tier
-  against the object cache it replaces, on a multi-GiB `index` run: the
-  block-grain-beats-part-grain claim is argued from grain arithmetic, not
-  yet from a row in `BENCHMARK.md`.
+  Until then the restart story is preload, at re-fetch cost. Filed as an
+  upstream ask rather than a decision to take: nothing here blocks on it,
+  and the cross-process row cache below is the other way to the same end.
+- **DEFERRED** — Upstream: export `SsTableId`, so
+  `DbCacheManagerOps::warm_sst` and `evict_cached_sst` can be called at
+  all (their parameter type is in a private module). Closed as a
+  decision: the preload warms by reading, which is cheaper and
+  subspace-grained rather than SST-grained, so an export would buy
+  precision rather than capability. Worth filing upstream; nothing here
+  waits on it.
 - **MEASURE** — SST block size (0002's layout, 4 KiB today): a sweep over
   4/16/64 KiB on the scan-heavy `current` and probe-heavy `index`
-  workloads. Larger blocks shrink SST indexes and per-block overhead,
-  cost read amplification per probe; the sweet spot is a benchmark row,
-  not an argument, and the setting applies only to newly written SSTs.
+  workloads. Attempted and withdrawn: the sweep has to set a block size,
+  which moraine exposes nowhere, so the harness drove SlateDB directly —
+  and that harness hangs during its write/scan loop even at 8 000 rows,
+  which is its own investigation and not the cache work's. Either debug
+  it, or decide the block size is worth an option and measure through
+  moraine's own harness, which works.
+- **IMPL** — Serve `index_lookup` from the held head view instead of
+  calling `materialize`. Measured cost of not doing so: a *warm* probe
+  still fetches 0.5–9.6 KB and one to two GETs, because every lookup
+  re-scans `current` under a bulk shape that admits no blocks
+  (`BENCHMARK.md` → What an index probe fetches). The head-view path
+  already has the fix; the probe path never got it.
+- **DECISION** — Whether the data tier deserves an answer from moraine at
+  all. Measured: DuckLake's scan path does not go through DuckDB's
+  external file cache, so lake data files are cached by nothing on a
+  default host (`metadata_read_pinning.test` pins the gap). The reader-
+  level cache cannot be reached from outside the reader, so the only
+  lever is a filesystem-level one — `cache_httpfs` on S3 — whose cache
+  sits outside `memory_limit`, which is exactly the property this work
+  removed from the catalog tier. Today's answer is operator guidance;
+  the alternative is moraine arranging it, which would re-create the
+  un-budgeted tier one layer down. Revisit if upstream does not close it.
 - **DEFERRED** — A cross-process row cache (serialized projections on
   disk, stamped with the head; one point read validates, the changelog
   replays a small gap). Would collapse a process-cold attach from

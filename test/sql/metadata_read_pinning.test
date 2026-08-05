@@ -196,3 +196,42 @@ SELECT metadata_hit_rate IS NOT NULL
 FROM moraine_cache_tally();
 ----
 true
+
+# Data files are DuckDB's to cache, not moraine's — but at the tracked
+# version DuckLake's scan path does not route through DuckDB's caching
+# file system, so reading a lake table populates the external file cache
+# not at all, while reading the very same Parquet file directly does.
+#
+# This asserts the *gap*, in the same spirit as the listing-race test: its
+# failure is the signal that DuckLake started caching its data reads and
+# that the data tier is finally inside `memory_limit` as the design wants.
+# Past the inlining row limit deliberately — below it a table has no
+# Parquet file at all and the comparison would be vacuous.
+statement ok con1
+SET enable_external_file_cache = true;
+
+statement ok con1
+CREATE TABLE lake.main.wide AS SELECT range AS a FROM range(500);
+
+query I con1
+SELECT count(*) FROM lake.main.wide;
+----
+500
+
+# Nothing cached from the lake read.
+query I con1
+SELECT count(*) FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+----
+0
+
+# The same bytes, read directly, do cache — so the harness has the cache
+# on and the file system supports it. The lake path is the difference.
+statement ok con1
+SELECT count(*) FROM read_parquet('__TEST_DIR__/pin-data/**/*.parquet');
+
+query I con1
+SELECT count(*) > 0 FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+----
+true

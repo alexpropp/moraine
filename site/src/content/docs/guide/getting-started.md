@@ -148,11 +148,22 @@ built. On a host that attaches several catalogs, set these on the first one.
 ## Caching the data files
 
 The cache above is the *catalog's*. Parquet data files are read by DuckDB
-itself, through its external file cache, and land inside `memory_limit` —
-moraine never touches a data byte and adds no cache of its own for them.
+itself, and moraine never touches a data byte or adds a cache of its own
+for them.
+
+Be aware of a gap there: at the tracked version, DuckLake's scan path does
+not go through DuckDB's external file cache, so lake data files are re-read
+from storage per query even with that cache enabled. On S3 the lever that
+does work is the `cache_httpfs` community extension, which caches at the
+filesystem layer — below the reader — and so catches reads the built-in
+cache never sees. Its cache is sized by its own settings, outside DuckDB's
+`memory_limit`, so budget for it separately.
 
 DuckLake data files are immutable once written, so a process serving repeat
-queries wants three DuckDB settings that are off by default:
+queries wants three DuckDB settings that are off by default. The last two
+work regardless of the gap above — the footer cache is keyed on the file
+path in DuckDB's object cache, and the HTTP metadata cache sits at the
+filesystem layer:
 
 ```sql
 SET validate_external_file_cache = 'NO_VALIDATION';

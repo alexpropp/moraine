@@ -342,9 +342,10 @@ A rate is NULL, not zero, before anything has been looked up: zero would
 read as a cold cache to a monitoring query, and "nothing asked" is not
 the same fact.
 
-The data path needs none of this, and gets none of it: Parquet reads go
-through DuckDB's own filesystem and land in its external-file cache, inside
-`memory_limit` (RFC 0009). What the embedding host should set beside a
+The data path needs none of this and gets none of it. Parquet reads are
+DuckDB's, not moraine's — though at the tracked version DuckLake's scan
+path does not route through DuckDB's caching file system, so lake data
+files are not cached by anything (RFC 0009). What the embedding host should set beside a
 moraine attach — `validate_external_file_cache = 'NO_VALIDATION'` (safe:
 DuckLake data files are immutable), `parquet_metadata_cache = true`,
 `enable_http_metadata_cache = true` — is embedding guidance, documented

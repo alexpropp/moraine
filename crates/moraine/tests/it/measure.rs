@@ -1444,3 +1444,165 @@ async fn measure_reader_round_trips_under_get_latency() {
         );
     }
 }
+
+/// 0009 — what an index probe fetches, cold and warm.
+///
+/// The design replaced a part-grained object cache with a block-grained
+/// one and argued the swap from grain arithmetic: a probe into a large
+/// `index` run touches a handful of blocks, where a part cache faulted
+/// whole 4 MiB parts to serve the same lookup. This puts bytes under that.
+///
+/// Read the `bytes/probe` column, not the milliseconds: on an in-memory
+/// store a fetch costs no round trip, so time here is decode and nothing
+/// else — while against real storage the bytes *are* the cost. A cold
+/// probe fetching block-sized bytes rather than part-sized ones is the
+/// whole claim.
+///
+/// Warm rows are the same probes repeated. They should fetch nothing:
+/// the blocks are resident, which is what the block slot is for.
+#[tokio::test]
+#[ignore = "measurement, not a test: run with --ignored --nocapture"]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+async fn measure_probe_cost_by_index_size() {
+    const BATCH: u64 = 8_192;
+    const PROBES: u64 = 32;
+    let commit_ladder = [1usize, 8, 32, 128];
+
+    println!("\n# 0009 index-probe cost against the shared block cache");
+    println!("# in-memory store: bytes are the transferable number, ms is decode only\n");
+    println!(
+        "{:>8}  {:>11}  {:>10}  {:>12}  {:>13}  {:>10}  {:>12}  {:>9}",
+        "entries",
+        "index_bytes",
+        "cold_gets",
+        "cold_bytes/p",
+        "cold_ms/probe",
+        "warm_gets",
+        "warm_bytes/p",
+        "warm_ms/p"
+    );
+
+    for &commits in &commit_ladder {
+        let inner = Arc::new(InMemory::new());
+        let counting = Arc::new(crate::counting_store::CountingStore::new(Arc::clone(
+            &inner,
+        )));
+        let catalog = Catalog::open(
+            Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+            {
+                let mut options = CatalogOptions::default();
+                options.flush_interval = Duration::from_millis(SEED_FLUSH_MS);
+                options
+            },
+        )
+        .await
+        .unwrap();
+
+        let created = std::cell::Cell::new(None);
+        catalog
+            .commit(|tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                let table = tx.create_table(schema, "t", &[col("a")])?;
+                let def = IndexDef {
+                    name: "idx".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: true,
+                };
+                created.set(Some((table, tx.create_index(table, &def, &[])?)));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (table, index) = created.get().expect("index created");
+
+        for k in 0..commits {
+            let k = k as u64;
+            let entries: Vec<FileIndexEntry> = (0..BATCH)
+                .map(|ordinal| FileIndexEntry {
+                    index,
+                    ordinal,
+                    values: vec![Some(IndexKeyValue::Int {
+                        value: i128::from(k * BATCH + ordinal),
+                        width: IntWidth::I64,
+                    })],
+                })
+                .collect();
+            catalog
+                .commit(move |tx| {
+                    let file = DataFile {
+                        path: format!("f{k}.parquet"),
+                        ..datafile(BATCH)
+                    };
+                    tx.register_data_file(table, file, &entries)?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        catalog.close().await.unwrap();
+
+        let entries = commits as u64 * BATCH;
+        let probe = Catalog::open_read_only(
+            Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
+            CatalogOptions::default(),
+        )
+        .await
+        .unwrap();
+        let census = probe.store_census(CensusRequest::default()).await.unwrap();
+        let index_bytes = census
+            .subspaces
+            .iter()
+            .find(|s| s.subspace == SubspaceName::Index)
+            .map_or(0, |s| s.bytes);
+
+        // Keys spread across the whole run, so the probes are not all in
+        // one block and the cost is not one block's amortized over many.
+        let keys: Vec<i128> = (0..PROBES)
+            .map(|n| i128::from(n * (entries / PROBES).max(1)))
+            .collect();
+
+        let round = |label: &str| {
+            let keys = keys.clone();
+            let probe = &probe;
+            let counting = &counting;
+            async move {
+                counting.take_reads();
+                counting.take_bytes();
+                let start = Instant::now();
+                for key in keys {
+                    let found = probe
+                        .index_lookup(
+                            table,
+                            index,
+                            &[IndexKeyValue::Int {
+                                value: key,
+                                width: IntWidth::I64,
+                            }],
+                        )
+                        .await
+                        .unwrap();
+                    std::hint::black_box(&found);
+                }
+                let elapsed = start.elapsed();
+                let _ = label;
+                (
+                    counting.take_reads(),
+                    counting.take_bytes(),
+                    elapsed.as_secs_f64() * 1_000.0 / PROBES as f64,
+                )
+            }
+        };
+
+        let (cold_gets, cold_bytes, cold_ms) = round("cold").await;
+        let (warm_gets, warm_bytes, warm_ms) = round("warm").await;
+        probe.close().await.unwrap();
+
+        println!(
+            "{entries:>8}  {index_bytes:>11}  {cold_gets:>10}  {:>12}  {cold_ms:>13.4}  \
+             {warm_gets:>10}  {:>12}  {warm_ms:>9.4}",
+            cold_bytes / PROBES,
+            warm_bytes / PROBES,
+        );
+    }
+    println!();
+}

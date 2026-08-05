@@ -564,3 +564,33 @@ scheduled promptly, and a `spawn_blocking` discipline buys nothing on this
 axis. Both halves of the worker-pool question are now answered the same
 way: the pool does not need protecting from either IO latency or decode
 compute.
+
+### What an index probe fetches, cold and warm
+
+The design replaced a part-grained object cache (4 MiB parts) with a
+block-grained one, and argued the swap from grain arithmetic alone. This
+puts bytes under it: 32 probes spread across the whole `index` run, so no
+probe rides another's block, against a counting object store. On an
+in-memory store a fetch costs no round trip, so the milliseconds are
+decode and the **bytes** are the transferable number.
+
+| entries | index bytes | cold bytes/probe | warm bytes/probe | cold ms/probe | warm ms/probe |
+|---|---|---|---|---|---|
+| 8 192 | 297 KB | 5 032 | 493 | 0.153 | 0.137 |
+| 65 536 | 2.38 MB | 8 673 | 970 | 0.191 | 0.161 |
+| 262 144 | 9.48 MB | 21 211 | 2 665 | 0.264 | 0.222 |
+| 1 048 576 | 37.8 MB | 71 193 | 9 566 | 0.589 | 0.527 |
+
+**The grain claim holds with room to spare.** A cold probe into a
+37.8 MB run fetches 71 KB — against the 4 MiB a part-grained cache would
+have faulted to answer the same lookup, a 59× difference, and the gap
+widens as the run grows because a part is a fixed size while a probe's
+block working set is not. Warming cuts the fetch another 7–10×.
+
+**But a warm probe is not free, and should be.** It still fetches 0.5–9.6
+KB and issues one to two GETs. The cause is not the cache: `index_lookup`
+calls `materialize` directly rather than serving the handle's held view,
+so every probe re-scans `current` — a bulk-shaped scan, which by design
+admits no blocks. The fix is the one the head-view path already has, and
+the row above is what it is worth: the warm column is the floor a probe
+would drop to, near zero, once the lookup stops rematerializing.
