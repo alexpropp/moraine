@@ -197,41 +197,66 @@ FROM moraine_cache_tally();
 ----
 true
 
-# Data files are DuckDB's to cache, not moraine's — but at the tracked
-# version DuckLake's scan path does not route through DuckDB's caching
-# file system, so reading a lake table populates the external file cache
-# not at all, while reading the very same Parquet file directly does.
+# Data files are DuckDB's to cache, not moraine's, and DuckDB does cache
+# them: a lake read goes through its caching file system, which is what
+# keeps the data tier inside `memory_limit`. This pins that, and pins the
+# two shapes that make a working cache look like an absent one.
 #
-# This asserts the *gap*, in the same spirit as the listing-race test: its
-# failure is the signal that DuckLake started caching its data reads and
-# that the data tier is finally inside `memory_limit` as the design wants.
 # Past the inlining row limit deliberately — below it a table has no
-# Parquet file at all and the comparison would be vacuous.
+# Parquet file at all and every reading below would be vacuous.
 statement ok con1
 SET enable_external_file_cache = true;
 
 statement ok con1
 CREATE TABLE lake.main.wide AS SELECT range AS a FROM range(500);
 
+# First shape: a lake `count(*)` is answered from catalog statistics and
+# opens no data file, so it caches nothing no matter how the reader works.
 query I con1
 SELECT count(*) FROM lake.main.wide;
 ----
 500
 
-# Nothing cached from the lake read.
 query I con1
 SELECT count(*) FROM duckdb_external_file_cache()
 WHERE path LIKE '%pin-data%';
 ----
 0
 
-# The same bytes, read directly, do cache — so the harness has the cache
-# on and the file system supports it. The lake path is the difference.
+# A read that touches data does cache — the lake path reaches the caching
+# file system. A regression that routes lake reads around it fails here.
 statement ok con1
-SELECT count(*) FROM read_parquet('__TEST_DIR__/pin-data/**/*.parquet');
+SELECT sum(a) FROM lake.main.wide WHERE a % 7 = 3;
 
 query I con1
 SELECT count(*) > 0 FROM duckdb_external_file_cache()
 WHERE path LIKE '%pin-data%';
+----
+true
+
+# Second shape: data ranges are cached only when the Parquet reader
+# prefetches, which it does for remote files and not for local ones — so
+# this local harness has cached the footer and stopped there. Remember how
+# much that was, to compare against.
+statement ok con1
+CREATE TEMP TABLE footer_only_bytes AS
+SELECT coalesce(sum(nr_bytes), 0) AS bytes FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+
+# Forcing the prefetch a deployment's `s3://` path takes anyway extends the
+# cache past the footer to the data ranges — the property that puts lake
+# data under `memory_limit`. Relative to the footer reading rather than a
+# byte count: how large DuckLake writes a 500-row file is not this test's
+# business, and a threshold would silently pass once it changed.
+statement ok con1
+SET prefetch_all_parquet_files = true;
+
+statement ok con1
+SELECT sum(a) FROM lake.main.wide WHERE a % 11 = 5;
+
+query I con1
+SELECT (SELECT coalesce(sum(nr_bytes), 0) FROM duckdb_external_file_cache()
+        WHERE path LIKE '%pin-data%')
+     > (SELECT bytes FROM footer_only_bytes);
 ----
 true

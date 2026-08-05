@@ -343,13 +343,14 @@ read as a cold cache to a monitoring query, and "nothing asked" is not
 the same fact.
 
 The data path needs none of this and gets none of it. Parquet reads are
-DuckDB's, not moraine's — though at the tracked version DuckLake's scan
-path does not route through DuckDB's caching file system, so lake data
-files are not cached by anything (RFC 0009). What the embedding host should set beside a
-moraine attach — `validate_external_file_cache = 'NO_VALIDATION'` (safe:
-DuckLake data files are immutable), `parquet_metadata_cache = true`,
-`enable_http_metadata_cache = true` — is embedding guidance, documented
-with the attach options; the shim never sets a global for the user.
+DuckDB's, not moraine's, and DuckDB caches them itself: a lake read goes
+through its caching file system, so data bytes sit under `memory_limit`
+rather than in a budget of moraine's (RFC 0009). What the embedding host
+should set beside a moraine attach — `validate_external_file_cache =
+'NO_VALIDATION'` (safe: DuckLake data files are immutable),
+`parquet_metadata_cache = true`, `enable_http_metadata_cache = true` —
+is embedding guidance, documented with the attach options; the shim
+never sets a global for the user.
 
 ### Interception level: catalog-entry, row-faithful (B1)
 

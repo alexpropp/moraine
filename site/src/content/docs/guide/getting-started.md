@@ -151,18 +151,19 @@ The cache above is the *catalog's*. Parquet data files are read by DuckDB
 itself, and moraine never touches a data byte or adds a cache of its own
 for them.
 
-There is a gap there worth knowing about. DuckDB's built-in external file
-cache lives *in the Parquet reader*, and at the tracked version DuckLake's
-scan path does not go through it — so a lake read populates it with
-nothing, while reading the very same file with `read_parquet` does. Lake
-data files are therefore re-read from storage per query, however the
-built-in cache is configured.
+DuckDB caches them for you. A lake read goes through DuckDB's built-in
+external file cache, so the data ranges a query fetches are held under
+`memory_limit` and a repeat read of the same bytes costs no storage
+request at all. One caveat worth knowing when you measure it: data-range
+caching rides on the Parquet reader's prefetch, which is used for remote
+files but not for files on local disk, so a local `DATA_PATH` caches only
+footers. A deployment reading `s3://` takes the remote path.
+
+That cache is memory, and it dies with the process — see below if you need
+warmth to survive a restart.
 
 DuckLake data files are immutable once written, so a process serving repeat
-queries still wants three DuckDB settings that are off by default. The last
-two work regardless of the gap — the footer cache is keyed on the file path
-in DuckDB's object cache, and the HTTP metadata cache sits at the
-filesystem layer:
+queries wants three DuckDB settings that are off by default:
 
 ```sql
 SET validate_external_file_cache = 'NO_VALIDATION';
@@ -174,12 +175,13 @@ These are global, so moraine will not set them from an ATTACH — that would
 reach into every other database in the process. Set them in the session that
 attaches the lake.
 
-### Caching S3 data files with cache_httpfs
+### Keeping S3 data files cached across processes with cache_httpfs
 
-To actually cache lake data on S3, use a cache that sits *below* the
-reader rather than inside it. The `cache_httpfs` community extension
-replaces the `s3://` filesystem, so it catches reads the built-in cache
-never sees:
+The built-in cache above serves repeat reads within a live process. If
+your processes are short-lived — a serverless handler, a redeploy every
+few minutes — every one of them starts cold, and a cache on disk is what
+survives. The `cache_httpfs` community extension replaces the `s3://`
+filesystem, caching below the reader and outliving the instance:
 
 ```sql
 INSTALL cache_httpfs FROM community;
