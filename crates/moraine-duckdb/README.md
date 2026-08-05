@@ -215,7 +215,7 @@ submodules, both workflow files, and the table below.
 | DuckDB | **v1.5.5** (git hash `d8cdaa33fd`, codename Variegata) |
 | Toolchain | `duckdb/extension-ci-tools` branch **v1.5.5** |
 | C++ standard | C++17 |
-| DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/` (never committed) |
+| DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/<version>/` (never committed) |
 | DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
 
 **Bumping** means putting the new release at the top of the manifest with
@@ -288,7 +288,9 @@ https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-linux-arm64
 # (+ windows-amd64/arm64, and -musl variants for linux)
 ```
 
-Cached under `target/duckdb-cli/` (gitignored, never committed). The CLI is
+Cached under `target/duckdb-cli/<version>/` (gitignored, never committed) —
+keyed by version, so a pin bump downloads afresh rather than handing back
+a CLI the new build cannot load into. The CLI is
 downloaded from a release asset; the DuckDB *source* the extension builds
 against comes from the `duckdb` submodule, not this download.
 
@@ -299,7 +301,7 @@ resolves and installs DuckLake — no version pin of our own is needed beyond
 the DuckDB version:
 
 ```
-$ target/duckdb-cli/cli/duckdb \
+$ target/duckdb-cli/v1.5.5/cli/duckdb \
     -c "INSTALL ducklake;" -c "LOAD ducklake;" \
     -c "SELECT extension_name, extension_version, install_mode, installed_from \
         FROM duckdb_extensions() WHERE extension_name='ducklake';"
