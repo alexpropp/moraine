@@ -18,10 +18,10 @@ use std::{path::Path, process::Command};
 use crate::helpers::*;
 
 /// The exact DuckLake commit whose behaviour these pins describe, as
-/// `INSTALL ducklake` against the pinned CLI resolves it. DuckDB v1.5.4
+/// `INSTALL ducklake` against the pinned CLI resolves it. DuckDB v1.5.5
 /// hard-codes this in `.github/config/extensions/ducklake.cmake`, so the
 /// pair moves only when the DuckDB pin does.
-const DUCKLAKE_EXTENSION_VERSION: &str = "d318a545";
+const DUCKLAKE_EXTENSION_VERSION: &str = "d8a1881e";
 
 /// Runs `statements` in one CLI session with `QueryLog` capture on, and
 /// returns every statement DuckDB executed — DuckLake's own metadata SQL
@@ -239,7 +239,7 @@ fn ducklakes_catalog_access_set_is_pinned() {
         })
         .collect();
 
-    // Pinned against DuckLake d318a545. Every entry is a table moraine
+    // Pinned against DuckLake d8a1881e. Every entry is a table moraine
     // serves; the two dynamic inline families carry the ids this workload
     // happens to allocate.
     let expected = [
@@ -396,7 +396,7 @@ fn moraine_serves_the_conflict_resolution_read_inside_a_transaction() {
 /// The DuckDB/DuckLake build pair the loadable is linked against, checked
 /// by running rather than assumed.
 ///
-/// moraine statically links DuckDB v1.5.4; the DuckLake extension that
+/// moraine statically links DuckDB v1.5.5; the DuckLake extension that
 /// CLI installs is built by DuckDB's own CI against v1.5.3. Patch-level
 /// ABI friction between the two would show up as a load failure, a crash,
 /// or a wrong answer at the boundary where DuckLake hands moraine C++

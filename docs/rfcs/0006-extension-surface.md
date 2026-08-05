@@ -648,9 +648,9 @@ extension boundary; the rest of this section is what paying it looks like.
 **A build is bound to one DuckDB version string, exactly.** DuckDB refuses a
 C++-ABI extension whose metadata footer names a different version —
 `ParsedExtensionMetaData::GetInvalidMetadataError` compares the strings, patch
-releases included — so a v1.5.3 user cannot load a v1.5.4 build. "Supporting
-v1.5" therefore means building each v1.5.x release separately, and the
-distribution unit is a DuckDB *release*, not a series.
+releases included — so a user on one patch release cannot load another's
+build. Supporting a series therefore means building each release in it
+separately, and the distribution unit is a DuckDB *release*, not a series.
 
 **One manifest owns the pin.** `.github/duckdb-versions` lists the releases
 moraine builds for, newest first, the first line carrying the commit each
@@ -660,7 +660,11 @@ matrix from it, assets are published as
 coexist in one release, and `cargo xtask check-pins` fails if any other place
 naming a version disagrees. That check exists because the failure mode is
 silent: a bump that misses one of the six places produces an artifact that
-builds, passes every other job, and then refuses to load.
+builds, passes every other job, and then refuses to load. `cargo xtask
+bump-duckdb <version>` writes those places, so the check guards a
+transcription no one has to make by hand. It covers the DuckLake commit
+too, which DuckDB chooses rather than moraine — otherwise a DuckDB bump
+moves it silently and only e2e says so.
 
 **Which releases are listed** is a judgement, and a short list is the default.
 Each entry multiplies the release build by five platforms, and only the
@@ -690,14 +694,14 @@ consequence of DuckDB's design rather than an unbuilt piece of moraine's.
 
 | What | Pinned at | Notes |
 |---|---|---|
-| DuckDB | **v1.5.4** | the primary entry of `.github/duckdb-versions`; both submodules sit on it, and it is the version the e2e suite proves the chain against |
-| DuckLake extension | **`d318a545`** | what `INSTALL ducklake` resolves to against the pinned CLI: DuckDB v1.5.4 hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. Verified by running, not assumed |
+| DuckDB | **v1.5.5** | the primary entry of `.github/duckdb-versions`; both submodules sit on it, and it is the version the e2e suite proves the chain against |
+| DuckLake extension | **`d8a1881e`** | what `INSTALL ducklake` resolves to against the pinned CLI: DuckDB v1.5.5 hard-codes the commit in `.github/config/extensions/ducklake.cmake`, so the pair moves only when the DuckDB pin does. Verified by running, not assumed |
 | DuckLake branch | **`v1.5-variegata`** | DuckLake publishes no release tags — it versions by DuckDB-series branches (`v1.3-ossivalis`, `v1.4-andium`, `v1.5-variegata`); `main` is development |
 | DuckLake catalog format | **`1.0`** (`DuckLakeVersion::V1_0`) | the highest version the stable branch writes (its migration chain ends at `'1.0'`); `V1_1_DEV_1` exists on `main` only and is not targeted |
 
 **Patch-level ABI friction between the two does not appear.** DuckDB's own CI
 builds the DuckLake extension against v1.5.3 while moraine statically links
-v1.5.4, and the concern was that objects crossing the extension↔host boundary
+v1.5.5, and the concern was that objects crossing the extension↔host boundary
 by pointer between those two builds might disagree. They do not: both
 extensions load into one process and the full chain answers correctly, pinned
 by `wire_contract.rs` alongside the version strings, so a bump that introduces

@@ -127,8 +127,14 @@ pub fn workspace_root() -> PathBuf {
 
 /// Cache root for the downloaded CLI, gitignored (`/target`) and never
 /// committed.
+///
+/// Keyed by version: a CLI only loads an extension built for its own
+/// version string, so a pin bump must miss the cache rather than serve
+/// the release it downloaded before.
 fn duckdb_cli_root() -> PathBuf {
-    workspace_root().join("target/duckdb-cli")
+    workspace_root()
+        .join("target/duckdb-cli")
+        .join(duckdb_pin())
 }
 
 /// Cache root for `INSTALL ducklake`-style downloaded extensions,
@@ -148,6 +154,11 @@ fn cli_binary_name() -> &'static str {
 /// Downloads and unpacks the pinned DuckDB CLI for the host platform into
 /// the gitignored cache, skipping both the download and the unpack if the
 /// binary is already cached there. Returns the CLI's path.
+///
+/// The cache is keyed by the pinned version, so a bump downloads afresh
+/// instead of handing back the previous release — which would build the
+/// extension for the new version and then fail to load it into the old
+/// CLI, reported as a load error rather than a stale cache.
 pub fn ensure_duckdb_cli() -> anyhow::Result<PathBuf> {
     let duckdb_root = duckdb_cli_root();
     let cli_dir = duckdb_root.join("cli");
