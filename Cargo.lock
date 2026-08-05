@@ -1848,6 +1848,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "foyer",
  "futures",
  "moraine",
  "object_store",

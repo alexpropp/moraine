@@ -2,6 +2,7 @@
 //!
 //! Knows nothing about DuckLake semantics.
 
+pub(crate) mod cache;
 pub(crate) mod census;
 pub(crate) mod compaction;
 pub(crate) mod frame;

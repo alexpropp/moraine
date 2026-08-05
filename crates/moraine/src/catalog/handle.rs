@@ -268,21 +268,27 @@ pub struct CatalogOptions {
     /// in-memory caches: a block cache and a metadata cache, both at
     /// SlateDB's own sizes and not configurable here.
     pub cache_dir: Option<std::path::PathBuf>,
-    /// How many bytes of disk the on-disk object cache may hold. The cap is
-    /// per open catalog, not per directory, so catalogs sharing a
-    /// [`cache_dir`](Self::cache_dir) each spend up to it — size the volume
-    /// for the number of catalogs a process attaches. `None` (the default)
-    /// leaves SlateDB's own cap of 16 GiB in force, and without a
-    /// `cache_dir` there is no object cache to bound. The in-memory caches
-    /// are a separate mechanism and are unaffected.
+    /// How many bytes of disk the block cache's device may hold, for the
+    /// whole process rather than per catalog: one cache is shared by every
+    /// store a process opens, and the first to open sizes it. `None` (the
+    /// default) leaves a cap of 16 GiB in force, and without a
+    /// [`cache_dir`](Self::cache_dir) there is no device to bound.
     pub cache_size: Option<u64>,
-    /// What to load into the on-disk object cache while the catalog opens,
-    /// so the first query pays no first touch. The load is bounded by
-    /// [`cache_size`](Self::cache_size) and best-effort — a fetch that
-    /// fails is skipped, never fatal — but it is part of the open, so an
+    /// How much memory that cache may hold across both of its slots — SST
+    /// metadata, which is pinned so a scan cannot evict the filters every
+    /// probe walks, and data blocks, which tier to the device when one is
+    /// configured. Process-wide, like [`cache_size`](Self::cache_size).
+    /// `None` (the default) takes what SlateDB gives a single store, now
+    /// for the whole process. Never inert: the memory slots exist with or
+    /// without a `cache_dir`, and this is the number to weigh against
+    /// DuckDB's own `memory_limit` when sizing a host.
+    pub cache_memory: Option<u64>,
+    /// What to warm into the cache while the catalog opens, so the first
+    /// query pays no first touch. Warming is reading, so it is bounded by
+    /// the same caps and best-effort throughout — a subspace that cannot
+    /// be read is skipped, never fatal — but it is part of the open, so an
     /// open that preloads returns only once it has. `None` (the default)
-    /// loads nothing, leaving the cache to fill as reads ask for objects.
-    /// Inert without a [`cache_dir`](Self::cache_dir).
+    /// warms nothing, leaving the cache to fill as reads ask for blocks.
     pub cache_preload: Option<CachePreload>,
     /// Whether objects this catalog writes are cached as they are written,
     /// rather than only when something reads them back. A flushed or
@@ -330,6 +336,7 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
             cache_size: None,
+            cache_memory: None,
             cache_preload: None,
             cache_puts: false,
             data_path: None,
@@ -1740,6 +1747,7 @@ impl Catalog {
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts);
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
@@ -1822,6 +1830,7 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .poll_interval(options.reader_poll_interval)
@@ -1899,6 +1908,7 @@ impl Catalog {
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .open_writer()
