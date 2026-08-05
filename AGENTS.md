@@ -67,6 +67,10 @@ cargo +nightly fmt --check && cargo clippy --workspace --all-targets -- -D warni
   && cargo xtask check-pins && cargo xtask e2e
 ```
 
+`e2e` compiles DuckDB itself, and DuckDB's cmake picks up `ccache` or
+`sccache` off `PATH` on its own. Installing one is the difference between
+a ten-minute and a one-minute rebuild in a fresh worktree.
+
 The fmt/clippy portion also runs as a pre-commit hook from `.githooks/`,
 and a commit-msg hook there rejects non-conventional commit subjects (the
 changelog is generated from them; CI validates PR titles the same way).
