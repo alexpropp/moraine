@@ -19,6 +19,12 @@ commit wrote rather than rematerialized; it observes **snapshot isolation**
 reader must re-resolve from head. This is the read-side companion to RFC
 0004's write-side commit protocol.
 
+It also names the cache stack end to end, assigns every byte to one tier,
+and collapses the catalog's physical tier to one process-shared block
+cache — SST metadata pinned in memory, data blocks tiered to disk — under
+one budget. Data bytes get no moraine cache: DuckDB's external-file cache
+already holds them inside `memory_limit`.
+
 ## Goals
 
 - **Consistent materialization.** The `current` / `history` / `snapshot` scans that build
@@ -43,6 +49,13 @@ reader must re-resolve from head. This is the read-side companion to RFC
   so a read-only catalog's freshness is bounded by how often it polls —
   an explicit, configurable property of the handle rather than an accident
   of the store layer's default.
+- **One cache per byte, one budget per host.** Catalog bytes live in one
+  shared block cache with explicit memory and disk budgets; data bytes in
+  DuckDB's external-file cache under `memory_limit`. No tier duplicates
+  another, and no cache is invisible to sizing.
+- **One store scan per head.** At a given head stamp, `current` (and
+  `history` when needed) is scanned and decoded at most once; every
+  logical cache derives from the shared record set.
 
 Non-goals:
 
@@ -53,6 +66,8 @@ Non-goals:
 - **Reclamation policy** — RFC 0007. This RFC defines only how a reader
   *reacts* to a view falling outside the retention window.
 - **The sync↔async / runtime model** under the DuckDB extension — RFC 0010.
+- **The attach-option surface** that configures the cache tiers — RFC
+  0006. This RFC defines the machinery those options drive.
 
 ## Background
 
@@ -474,11 +489,11 @@ There is:
 - **No cross-process cache.** RFC 0004's "many readers" are independent
   processes/handles; each materializes its own view. Coordinating a shared
   logical cache would reintroduce exactly the coordination the topology avoids.
-- **No separate physical cache.** SlateDB's own block cache serves repeated
-  physical reads underneath; this RFC's cache is the *logical* materialized
-  catalog, cheap to rebuild from `current` because RFC 0002 keeps the live catalog
-  small. A cold reader pays one `current` scan; a warm reader pays incremental
-  refresh.
+- **One physical cache, specified below.** Beneath the logical caches sits
+  exactly one byte-tier cache for the catalog ("One block cache: two
+  slots, one budget") and none beside it. This RFC's cache is the
+  *logical* materialized catalog; the block cache keeps its rebuild cheap
+  when the store is remote.
 
 The view is whole-catalog, and that fixes where filtering can usefully
 happen. DuckDB pushes projection into the `ducklake_*` scans but never a row
@@ -539,6 +554,193 @@ principle as committer read-your-writes:
   it whole — populating DuckLake's metadata tables issues two dozen of
   them, and copying the catalog per call would make the cache the expensive
   path.
+
+### The stack, named end to end
+
+The caches a moraine-backed query crosses, top to bottom:
+
+| tier | holds | keyed by | budget | who evicts |
+|---|---|---|---|---|
+| DuckDB external-file cache | Parquet byte ranges of data files | path + version tag | `memory_limit` (buffer-manager blocks) | DuckDB buffer manager |
+| DuckDB metadata caches | Parquet footers, HTTP metadata | path | unbounded, opt-in | never / on error |
+| DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
+| shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
+| core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size | replaced on stamp move |
+| SlateDB block + meta cache | decoded SST blocks, indexes, filters | SST id + offset | in-memory, per open store | LRU-ish (foyer) |
+| SlateDB object cache (`CACHE_DIR`) | raw object parts on disk | object path + part | per open store | part-file LRU |
+
+Two findings drive this section. One catalog byte can be resident in five
+tiers at once, four of them refilled from the tier below on every miss —
+duplication that costs copies as well as memory. And the SlateDB tiers are
+invisible to every budget: their per-store defaults (hundreds of MiB in
+memory, 16 GiB on disk, *multiplied by attached stores*) are bounded by
+nothing DuckDB can see, so a host attaching several catalogs is
+over-committed by construction. The subsections below take the row tiers
+(duplication), DuckLake's tier (composed with, not consolidated), the byte
+tier (consolidated), and the data tier (DuckDB's, untouched).
+
+### One scan pair per head
+
+View materialization and the entity dumps each scan the store and each
+hold their own decoded copy of the same records at the same head. The rule
+replacing that: **at one head stamp, `current` and `history` are each
+scanned and decoded at most once, into a shared record set every logical
+cache derives from by reference.** Whichever read misses first runs the
+scan under its consistent cut and installs; the halves install
+independently (a head view needs `current` only and must not grow a
+`history` scan; the dumps add `history` when first to want it). The commit
+fold and the changelog replay advance view and record set together — one
+cache entry with two faces, installed and invalidated under the existing
+install-epoch rule.
+
+### The stamp crosses the ABI
+
+The shim's per-transaction pin is correct but wasteful as a lifetime:
+DuckLake re-reads metadata at every transaction start, autocommit makes
+every statement a transaction, and each rebuild pays the full ABI
+crossing for rows that are byte-identical whenever no commit landed in
+between. So the head stamp crosses the ABI: each dump carries the stamp
+its rows were served at, the shim keys its held `MetadataRows` per table
+by it, and a transaction's first scan of a table reads the current stamp
+(one point read) and reuses on a match instead of re-dumping. The pin
+becomes what it logically was — capture the stamp at first scan, serve
+the transaction at it — and steady-state reads cross the ABI once per
+table per *commit*, not per transaction. The writer rule outranks this:
+staged dumps are never cached over. And the stamp is the whole stamp, id
+and batch count, because a maintenance batch reuses the id.
+
+### DuckLake's caches sit on top, and the stamps compose
+
+DuckLake keeps two caches above all this: the per-transaction snapshot
+(which the validity-window section already leans on), and a
+schema-metadata cache keyed on the snapshot record's `schema_version`,
+which RFC 0004 advances only on shape-changing commits. Its freshness
+protocol is a read of `ducklake_snapshot` at every transaction start;
+`schema_version` then decides whether any *other* metadata table is read
+at all. So the tables DuckLake touches unconditionally — snapshots and
+the stats kinds — are exactly the maintained projections, and the read
+that validates DuckLake's cache is the read the stamp work above makes
+one point read. The same validate-by-comparison runs at three altitudes
+on one signal, which makes `schema_version` honesty a cache-stack
+obligation, not only a protocol one: always-increment defeats DuckLake's
+tier and re-fetches every table's columns through every tier below;
+never-increment serves stale schema from a perfectly coherent moraine
+stack.
+
+The granularity seam is safe by construction: a maintenance batch moves
+neither snapshot id nor `schema_version` — invisible to DuckLake's
+caches, correctly, since it changes files and history, never schema — and
+what DuckLake cannot see is what the batch count exists for, one tier
+down. DuckLake's own catalog-cache race (`SET threads=1`) is upstream's
+bug in upstream's tier, tracked by the presence test and nothing more.
+
+### One block cache: two slots, one budget
+
+The physical tier is one shared cache instance per process, passed to
+every `Db` and `DbReader` the extension opens (SlateDB supports sharing;
+the sharer owns shutdown). SlateDB's split structure is kept, because the
+split is the tuning:
+
+- **The meta slot — SST indexes, filters, stats — is memory-only and
+  sized to fit.** Every probe walks a filter and an index before it can
+  touch a data block, and metadata is a small fraction of store bytes
+  even where one `index` run is multi-GiB; the census reports the target
+  size. Data blocks cannot compete for the slot, so the worst eviction —
+  a scan pushing filters out, after which every probe pays a fetch to
+  learn "not here" — cannot happen.
+- **The block slot — data blocks — is the foyer hybrid**: a memory tier
+  spilling at block grain to the `CACHE_DIR` device.
+
+`CachedObjectStore` is no longer configured — coexisting it with a hybrid
+cache double-writes disk (SlateDB's own warning). Against it, this buys
+one budget however many stores attach (the multiply-by-stores sizing rule
+is deleted), block-grain disk hits (a probe into a 3.34 GiB `index` run
+reads its blocks, not 4 MiB parts), admission control, and no double
+residency.
+
+The replacement is sound because the two caches, though at different
+layers, cover the same *reusable* reads. The object cache wraps the store
+and caches every GET; but manifest versions and WAL objects are read once
+per version and held in memory thereafter, so the only byte traffic worth
+caching is SST blocks, indexes, and filters — exactly what the table
+store already routes through the `DbCache` interface, with concurrent
+misses on one key deduplicated into a single fetch. One caveat is stated
+here so the implementation cannot discover it late: SlateDB scopes a
+shared cache's keys per opened handle (which is what keeps two stores'
+same-numbered WAL SSTs apart), so the shared instance shares *budget*
+unconditionally but shares *entries* only within a handle — satisfied,
+since moraine holds one `Db` or `DbReader` per attached store. The same
+scoping makes foyer's disk recovery inert across restarts: a fresh
+process draws fresh scopes that match none of the recovered keys. Until
+SlateDB accepts a caller-supplied stable scope (an upstream
+contribution), restart warmth comes from the segment-aware preload below,
+at re-fetch cost.
+
+**Admission follows read shape.** SlateDB's defaults already split it —
+point reads cache their blocks, scans do not — and moraine makes the
+split deliberate: two scan-option constructors, bulk (admits nothing; the
+row caches absorb scan reuse, so admitting is pollution) and probe
+(admits; the reuse is real and block-grained), with every read path
+naming one. Foyer's admission picker repeats the rule at the disk device:
+scan and compaction churn cannot wear it or evict the probe set.
+
+The attach options keep their surface (RFC 0006) and change machinery:
+
+- `CACHE_DIR` / `CACHE_SIZE` — the block slot's disk device and cap.
+- `CACHE_MEMORY` (new) — one memory budget across both slots: meta takes
+  what the census says the metadata needs, blocks the remainder. Unset:
+  what SlateDB gave a single store, now for the whole process. Never
+  inert — the memory tiers exist without a `CACHE_DIR`.
+- `CACHE_PUTS` — the flush/compaction insertion policy: written SSTs'
+  blocks enter decoded, on write. Opt-in as before: compaction output
+  evicts what reads warmed.
+- `CACHE_PRELOAD` — a manifest walk of per-SST warms, segment-aware: the
+  leading tag byte gives each subspace its own SSTs, so every selected
+  SST warms index + filters, and data blocks warm only for the
+  scan-shaped subspaces (`current`, `sys`, `history`, changelog). The
+  `index` data bulk — the tail that made `'all'` unaffordable — is
+  skipped, one fetch per probed block behind its warmed filters.
+  `'l0'`/`'all'` still select which SSTs; the attach contract (warm
+  inside the open, caps govern, shortfall warned, failures skipped)
+  holds.
+
+**Hit rates before tuning.** The tiers report — meta hits, block-memory
+hits, disk hits, store GETs — through the diagnostics the extension
+already forwards, beside the existing row-tier counters; the census
+supplies the meta target. Budgets are sized from measured curves, not
+defaults. The SQL shape is RFC 0006's to pin.
+
+Three losses, taken knowingly. Part-grain prefetch: replaced by the scan
+path's own read-ahead (the measured fix for the 277 s materialization in
+`BENCHMARK.md`), with admission per the shape rule. A `CACHE_DIR` shared
+between processes: a foyer device has one owner — but the deployed
+topology never shared a directory across hosts, and within one process
+the shared cache serves the same end better. And restart-persistent
+bytes: the object cache served a restarted process from disk with zero
+GETs, where preload re-fetches — taken on the bet that probes are more
+frequent than restarts, and reversible by the upstream scope work above.
+
+### The data path already has its unified cache
+
+moraine never touches a data-file byte. DuckLake reads Parquet through
+DuckDB's own filesystem, and the external-file cache — on by default at
+the pinned version — holds every remote range as buffer-manager blocks
+inside `memory_limit`, validated by version tag. The data tier is already
+unified with DuckDB's budget; the un-budgeted bytes were always the
+catalog's, and the previous subsection is the whole fix. moraine adds no
+data cache, footer cache, or read-through layer.
+
+What remains is embedder configuration, not attach behaviour. DuckLake
+data files are immutable, so a serving host wants
+`validate_external_file_cache = 'NO_VALIDATION'`,
+`parquet_metadata_cache = true`, and `enable_http_metadata_cache = true` —
+all off by default, all global, and the shim must set none of them (an
+`ATTACH` that mutates global state reaches every other database in the
+process). They are documented as embedding guidance beside the attach
+options. The e2e suite pins the load-bearing assumption via
+`duckdb_external_file_cache()`: data files read through a moraine attach
+appear there, so a DuckDB change that stopped covering the DuckLake path
+fails a test.
 
 ### Test obligations
 
@@ -603,6 +805,32 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **Reads survive an expiry pass under them.** With the scheduler expiring
   everything below head on a sub-second tick, a session that keeps reading
   and committing never sees "No snapshot found".
+- **One scan pair per head.** Populating every metadata table and
+  materializing the head view at one head costs one `current` scan and at
+  most one `history` scan; a head view alone scans no `history`.
+- **The stamp crosses the ABI.** A read transaction following another with
+  no commit between serves the same metadata rows without a dump rebuild;
+  with a commit it re-dumps; a staged-write transaction is served staged
+  dumps regardless.
+- **The disk tier serves without the store.** A point read whose blocks
+  were evicted from memory but sit on disk issues no GET; a preloaded
+  attach's first probe issues none.
+- **One budget across attaches.** Several attached stores share the one
+  cache; memory residency is bounded by the cap, not the attach count; a
+  detach leaves the other stores' entries warm.
+- **Scans cannot evict the probe path.** After a whole-subspace scan and a
+  compaction through a warm cache, a probe that was GET-free stays
+  GET-free.
+- **Admission follows the declared shape.** A bulk scan admits no data
+  blocks; a probe admits its own; every read path is pinned to one
+  constructor.
+- **Preload is segment-aware.** Against a store whose `index` dwarfs its
+  `current`, an `'all'` preload fetches metadata plus the scan-shaped
+  subspaces only, and a probe after it fetches at most its own data
+  blocks.
+- **The data path is cached where claimed.** An e2e reads a
+  moraine-attached table twice and asserts the file appears in
+  `duckdb_external_file_cache()`.
 
 ## Alternatives considered
 
@@ -649,3 +877,24 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
   0004 forbids and RFC 0007's reference-counting alternative already rejected.
   The retention *window* plus a typed `SnapshotExpired` is the coordination-free
   contract.
+- **Keeping SlateDB's object cache as the disk tier.** Rejected: per-store
+  caps, 4 MiB parts against a point-probe workload, and it cannot coexist
+  with a hybrid cache without double-writing disk. Prefetch is covered by
+  the scan path's read-ahead, write-side warming by the insertion policy;
+  the loss is a cross-process cache directory, weighed above.
+- **One pooled hybrid cache, no slots.** Rejected: a pool lets data blocks
+  evict filters, after which every probe pays a fetch to learn "not
+  here". The metadata is small enough to pin; only data blocks need
+  tiering.
+- **A moraine-level data-file or Parquet-footer cache.** Rejected:
+  DuckDB's external-file cache already holds data bytes inside
+  `memory_limit`; adding one re-creates the double-caching this RFC
+  removes.
+- **Setting DuckDB's cache settings from the attach.** Rejected: they are
+  global, and an `ATTACH` that mutates global state reaches every other
+  database in the process. Guidance over mutation.
+- **A cross-process row cache (serialized projections on disk).** Rejected
+  for now: preload bounds process-cold cost (at re-fetch cost, per the
+  scoping caveat), and a persisted row snapshot is a second durable
+  encoding to version and migrate (RFC 0015). Revisit when deploy-cold
+  attach cost is measured; the tasks file carries the case for it.

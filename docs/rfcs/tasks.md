@@ -54,6 +54,22 @@ deliberately not itemized here.
   `CREATE TABLE` is enough). A test now asserts the race's *presence* against
   the reference chain, so its failure is the signal that the workaround can
   go.
+- **IMPL** — `CACHE_MEMORY` / `META_CACHE_MEMORY`, and the re-mapped
+  machinery behind the existing cache options: `CACHE_DIR`/`CACHE_SIZE` as
+  the block slot's disk tier, `CACHE_PUTS` as the flush/compaction
+  insertion policy, `CACHE_PRELOAD` as the segment-aware manifest-walk
+  warm. The option surface and semantics are specified; the backing is
+  still the per-store object cache today.
+- **DECISION** — The SQL surface for cache-tier hit rates (0009 requires
+  the rates observable; the shape — a `moraine_cache_stats` function
+  beside `moraine_store_census`, or rows through the log sink — is this
+  RFC's to pin when the shared cache lands).
+- **DOC** — The site guide documents the per-store object-cache behaviour
+  (per-store 16 GiB caps, cross-process `CACHE_DIR` sharing under
+  `CACHE_PUTS`); rewrite it when the shared-cache implementation lands, and
+  add the embedding guidance (`validate_external_file_cache`,
+  `parquet_metadata_cache`, `enable_http_metadata_cache`) beside the attach
+  options.
 
 ## 0007 — Snapshot expiry and garbage collection
 
@@ -76,6 +92,54 @@ deliberately not itemized here.
   Whichever is taken first pulls the other with it. A replay's base-view
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
+- **IMPL** — One scan pair per head: the shared decoded record set that the
+  view, the entity dumps, and the unversioned projections all derive from.
+  Today `materialize` and the entity projection each run their own scans
+  and hold their own decoded copies at the same head.
+- **IMPL** — The stamp across the ABI: dumps carrying their head stamp, the
+  shim holding `MetadataRows` per table keyed by it, and the
+  per-transaction pin becoming capture-and-match instead of rebuild.
+- **IMPL** — The process-shared block cache — meta slot pinned in memory,
+  block slot foyer-hybrid to disk — replacing the per-store in-memory
+  caches and the `CachedObjectStore` disk tier, with segment-aware preload
+  via the per-SST warm call and puts via the insertion policy.
+- **IMPL** — Bulk vs probe scan-option constructors, so every read path
+  declares its admission behaviour instead of inheriting a default.
+  Independent of the shared cache: the store layer owns this today.
+- **IMPL** — Per-tier cache hit rates surfaced beside the existing
+  row-tier counters (meta hits, block-memory hits, disk hits, store GETs),
+  so `CACHE_MEMORY`/`CACHE_SIZE` are sized from measured curves. The SQL
+  surface is 0006's DECISION.
+- **VALIDATE** — The new test obligations (one scan pair per head, stamp
+  reuse across transactions, disk-tier hits without GETs, one budget across
+  attaches, scans unable to evict the probe path, shape-declared
+  admission, segment-aware preload bounds,
+  `duckdb_external_file_cache()` coverage of the DuckLake read path).
+  Blocked on the IMPL items above.
+- **DECISION** — Upstream: a caller-supplied stable cache scope in
+  SlateDB. Shared-cache keys are scoped per opened handle by a
+  process-local counter, so foyer's disk recovery matches nothing after a
+  restart; a scope derived from the store path would make the disk tier
+  restart-warm and reclaim the one property the object cache still holds.
+  Until then the restart story is preload, at re-fetch cost.
+- **MEASURE** — Index-probe latency served from the hybrid disk tier
+  against the object cache it replaces, on a multi-GiB `index` run: the
+  block-grain-beats-part-grain claim is argued from grain arithmetic, not
+  yet from a row in `BENCHMARK.md`.
+- **MEASURE** — SST block size (0002's layout, 4 KiB today): a sweep over
+  4/16/64 KiB on the scan-heavy `current` and probe-heavy `index`
+  workloads. Larger blocks shrink SST indexes and per-block overhead,
+  cost read amplification per probe; the sweet spot is a benchmark row,
+  not an argument, and the setting applies only to newly written SSTs.
+- **DEFERRED** — A cross-process row cache (serialized projections on
+  disk, stamped with the head; one point read validates, the changelog
+  replays a small gap). Would collapse a process-cold attach from
+  fetch + decode + materialize to load + validate — the deploy-restart
+  case, where every process starts row-cold today. Deferred because it is
+  a second durable encoding to version and migrate; revisit when
+  deploy-cold attach cost is measured, and note the byte tier's restart
+  story is currently preload-at-re-fetch-cost (the stable-scope DECISION
+  above), which strengthens this item's case until that lands.
 
 ## 0013 — Partitioning, sorting, and pruning
 
