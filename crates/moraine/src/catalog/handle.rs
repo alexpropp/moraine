@@ -28,6 +28,7 @@ use crate::{
         inline::{InlineScanKind, materialize_inline_rows},
         projection::{
             ProjectionCache, cache_epoch, cached_head_view, held_head_view, install_head_view_at,
+            install_shared_current_entities, shared_current_entities,
         },
         scoped_read,
     },
@@ -45,6 +46,7 @@ use crate::{
             index_kind_prefix, subspace_prefix,
         },
         open::{self, StoreBuilder},
+        proto::HeadValue,
     },
     transaction::{MigrationReport, Transaction, commit, index_maintenance, migration},
 };
@@ -184,6 +186,12 @@ struct ReadTally {
     cache_hits: AtomicU64,
     head_reads: AtomicU64,
     materialize_micros: AtomicU64,
+    // How many times each half of the shared record set was actually
+    // scanned from the store. At one head each should move at most once,
+    // however many consumers read at it — the tally is what tests pin
+    // that with.
+    current_scans: AtomicU64,
+    history_scans: AtomicU64,
 }
 
 impl ReadTally {
@@ -497,11 +505,25 @@ impl ReadOnlyCatalog {
         &self.projections
     }
 
-    /// Whether this catalog maintains served projections: read-write only —
-    /// a read-only catalog has no local commits to fold, so its dumps
-    /// always scan.
-    pub(crate) fn maintains_projections(&self) -> bool {
-        matches!(self.store.as_ref(), Store::Writer(_))
+    /// Records that the `current` half of the shared record set was
+    /// scanned from the store.
+    pub(crate) fn tally_current_scan(&self) {
+        self.reads.current_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that the `history` half was scanned from the store.
+    pub(crate) fn tally_history_scan(&self) {
+        self.reads.history_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many times each half of the shared record set has been scanned:
+    /// `(current, history)`. At one head each moves at most once.
+    #[cfg(test)]
+    pub(crate) fn entity_scan_tallies(&self) -> (u64, u64) {
+        (
+            self.reads.current_scans.load(Ordering::Relaxed),
+            self.reads.history_scans.load(Ordering::Relaxed),
+        )
     }
 
     /// Records that a read resolved the head from the store.
@@ -558,10 +580,16 @@ impl ReadOnlyCatalog {
     /// A read-only handle follows another process's commits and has no
     /// such premise, so it always reads.
     pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
-        if !self.maintains_projections() {
+        if !self.holds_the_writer() {
             return None;
         }
         held_head_view(&self.projections)
+    }
+
+    /// Whether this handle is the store's writer, and so the only thing
+    /// that can move `sys/head`.
+    pub(crate) fn holds_the_writer(&self) -> bool {
+        matches!(self.store.as_ref(), Store::Writer(_))
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -834,9 +862,32 @@ impl ReadOnlyCatalog {
             return Ok(Arc::new(refreshed));
         }
 
+        // Derive from the shared `current` half before paying a scan. The
+        // stamp is re-verified under the same consistent cut the build
+        // reads through, so a derived view equals a scanned one; a store
+        // that moved in between reports `None` and falls through.
+        if let Some(current) = shared_current_entities(&self.projections, &head)
+            && let Some(view) = commit::materialize_from(handle, &head, &current).await?
+        {
+            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::new(view));
+        }
+
         let started = Instant::now();
-        let view = commit::materialize(handle, None).await?;
+        let (view, records) = commit::materialize_capturing(handle).await?;
         self.reads.materialized(started.elapsed());
+        self.tally_current_scan();
+        // Stamped with the state the *view* settled at — the consistent
+        // cut may be newer than the head read above, never mismatched
+        // with the records.
+        install_shared_current_entities(
+            &self.projections,
+            HeadValue {
+                snapshot_id: view.snapshot.snapshot_id,
+                batch_seq: view.batch_seq,
+            },
+            records,
+        );
 
         Ok(Arc::new(view))
     }

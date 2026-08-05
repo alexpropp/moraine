@@ -24,7 +24,9 @@ use crate::{
         handle::ReadHandle,
         key::{EntityKey, Key, SysKey},
         open::StoreBuilder,
-        proto, read, value,
+        proto,
+        read::{self, EntityRecord},
+        value,
     },
     transaction::{
         index_maintenance, inline,
@@ -509,10 +511,40 @@ async fn resolve_below(
 /// (`current` only); `at: Some(s)` also scans `history` to reconstruct the
 /// entities live at `s`.
 pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<CatalogSnapshot> {
+    match at {
+        None => Ok(materialize_capturing(tx).await?.0),
+        Some(_) => {
+            read::consistent(tx, || async move {
+                refuse_mid_migration(tx).await?;
+                let head = read_head_value(tx).await?;
+                let (target, snapshot) = resolve_below(tx, at, head.snapshot_id).await?;
+
+                let current = read::scan_current_entities(tx).await?;
+                let history = read::scan_history_entities(tx).await?;
+
+                Ok(CatalogSnapshot::build(
+                    snapshot,
+                    &current,
+                    &history,
+                    Some(target),
+                ))
+            })
+            .await
+        }
+    }
+}
+
+/// As [`materialize`] at head, also handing back the scanned `current`
+/// records so the caller can install them as the shared record set — the
+/// view and the records come from one consistent cut and stand at one
+/// stamp by construction.
+pub(crate) async fn materialize_capturing(
+    tx: ReadHandle<'_>,
+) -> Result<(CatalogSnapshot, Arc<Vec<EntityRecord>>)> {
     read::consistent(tx, || async move {
         refuse_mid_migration(tx).await?;
         let head = read_head_value(tx).await?;
-        let (target, snapshot) = resolve_below(tx, at, head.snapshot_id).await?;
+        let (_, snapshot) = resolve_below(tx, None, head.snapshot_id).await?;
 
         // Timed apart from the decode that follows: a materialization that
         // is slow is either fetching `current` or building from it, and the
@@ -520,25 +552,43 @@ pub(crate) async fn materialize(tx: ReadHandle<'_>, at: Option<u64>) -> Result<C
         let started = Instant::now();
         let current = read::scan_current_entities(tx).await?;
         let scanned = started.elapsed();
-        let history = match at {
-            Some(_) => read::scan_history_entities(tx).await?,
-            None => Vec::new(),
-        };
         info!(
             records = current.len(),
             scan_ms = scanned.as_secs_f64() * 1_000.0,
-            history_records = history.len(),
             "scanned `current`"
         );
 
-        let mut view = CatalogSnapshot::build(snapshot, current, history, at.map(|_| target));
-        // A head view stands at the store state the head record names; a
-        // time-travel view stands outside that lineage and carries none.
-        if at.is_none() {
-            view.batch_seq = head.batch_seq;
-        }
+        let mut view = CatalogSnapshot::build(snapshot, &current, &[], None);
+        // A head view stands at the store state the head record names.
+        view.batch_seq = head.batch_seq;
 
-        Ok(view)
+        Ok((view, Arc::new(current)))
+    })
+    .await
+}
+
+/// Builds a head view from the shared `current` half instead of scanning,
+/// or reports `None` when the store no longer stands at `expected` — the
+/// records would not match, and the caller falls back to a scan. The
+/// migration marker outranks the shared records exactly as it outranks
+/// every other cache.
+pub(crate) async fn materialize_from(
+    tx: ReadHandle<'_>,
+    expected: &proto::HeadValue,
+    current: &[EntityRecord],
+) -> Result<Option<CatalogSnapshot>> {
+    read::consistent(tx, || async move {
+        refuse_mid_migration(tx).await?;
+        let head = read_head_value(tx).await?;
+        if head.snapshot_id != expected.snapshot_id || head.batch_seq != expected.batch_seq {
+            return Ok(None);
+        }
+        let (_, snapshot) = resolve_below(tx, None, head.snapshot_id).await?;
+
+        let mut view = CatalogSnapshot::build(snapshot, current, &[], None);
+        view.batch_seq = head.batch_seq;
+
+        Ok(Some(view))
     })
     .await
 }
