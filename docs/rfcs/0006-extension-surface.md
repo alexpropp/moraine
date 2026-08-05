@@ -648,9 +648,9 @@ extension boundary; the rest of this section is what paying it looks like.
 **A build is bound to one DuckDB version string, exactly.** DuckDB refuses a
 C++-ABI extension whose metadata footer names a different version —
 `ParsedExtensionMetaData::GetInvalidMetadataError` compares the strings, patch
-releases included — so a v1.5.3 user cannot load a v1.5.4 build. "Supporting
-v1.5" therefore means building each v1.5.x release separately, and the
-distribution unit is a DuckDB *release*, not a series.
+releases included — so a user on one patch release cannot load another's
+build. Supporting a series therefore means building each release in it
+separately, and the distribution unit is a DuckDB *release*, not a series.
 
 **One manifest owns the pin.** `.github/duckdb-versions` lists the releases
 moraine builds for, newest first, the first line carrying the commit each

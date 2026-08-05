@@ -229,8 +229,8 @@ attach text, DuckLake's catalog access set, and the DuckLake commit
 **Which releases get builds.** Every one still listed in the manifest.
 This is not a preference: DuckDB refuses a C++-ABI extension whose footer
 names a different version *string*, patch releases included
-(`ParsedExtensionMetaData::GetInvalidMetadataError`), so a v1.5.3 user
-cannot load a v1.5.4 build. The list is short by design — each entry
+(`ParsedExtensionMetaData::GetInvalidMetadataError`), so a user on one patch
+release cannot load another's build. The list is short by design — each entry
 multiplies the release build by five platforms, and only the primary is
 proven end-to-end against a real DuckLake — so it holds the releases users
 are plausibly on, and older ones keep whatever assets they were already

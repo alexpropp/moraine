@@ -30,11 +30,11 @@ pub const DUCKLAKE_CONFIG: &str = "duckdb/.github/config/extensions/ducklake.cma
 /// behaviour it describes was observed against.
 const WIRE_CONTRACT: &str = "crates/moraine-duckdb/tests/ducklake_load/wire_contract.rs";
 
+/// The crate README, whose pin table names the version and its commit.
+const README: &str = "crates/moraine-duckdb/README.md";
+
 /// Prose that names the pinned DuckLake commit.
-const DUCKLAKE_PROSE: [&str; 2] = [
-    "crates/moraine-duckdb/README.md",
-    "docs/rfcs/0006-extension-surface.md",
-];
+const DUCKLAKE_PROSE: [&str; 2] = [README, "docs/rfcs/0006-extension-surface.md"];
 
 /// How much of a commit `duckdb_extensions()` reports as
 /// `extension_version`, and so how much the pins carry.
@@ -65,9 +65,9 @@ pub fn check_pins() -> anyhow::Result<()> {
         pinned_submodules.len()
     );
 
-    for (path, expected) in pinned_submodules {
-        match submodule_commit(&path) {
-            Ok(commit) if commit == expected => {}
+    for (path, expected) in &pinned_submodules {
+        match submodule_commit(path) {
+            Ok(commit) if &commit == expected => {}
             Ok(commit) => problems.push(format!(
                 "the `{path}` submodule is at `{commit}`, but .github/duckdb-versions \
                  pins `{expected}` for {pin} — `git -C {path} checkout {expected}`"
@@ -81,8 +81,8 @@ pub fn check_pins() -> anyhow::Result<()> {
 
     // Two levels of check, because the files differ in kind. In a workflow
     // every DuckDB version is a pin, so an unlisted one is a mistake; in
-    // prose a version is often an example ("a v1.5.3 user cannot load a
-    // v1.5.4 build"), so only the primary's presence is required.
+    // prose a version is often an example, so only the primary's presence
+    // is required.
     for file in [
         ".github/workflows/extension.yml",
         ".github/workflows/release.yml",
@@ -98,11 +98,28 @@ pub fn check_pins() -> anyhow::Result<()> {
         }
     }
 
-    for file in ["crates/moraine-duckdb/README.md"] {
-        if !read(file)?.contains(pin) {
-            problems.push(format!(
-                "{file}'s pin table never names the primary pin `{pin}`"
-            ));
+    let readme = read(README)?;
+    if !readme.contains(pin) {
+        problems.push(format!(
+            "{README}'s pin table never names the primary pin `{pin}`"
+        ));
+    }
+
+    // The pin table is the one place a version and its commit are written
+    // side by side, so a bump that moves one and not the other reads as
+    // agreeing with itself. Abbreviated to whatever length the table uses.
+    if let Some(expected) = pinned_submodules
+        .iter()
+        .find(|(path, _)| path == "duckdb")
+        .map(|(_, commit)| commit)
+    {
+        match backticked_after(&readme, "git hash ") {
+            Some(abbreviated) if expected.starts_with(abbreviated) => {}
+            Some(abbreviated) => problems.push(format!(
+                "{README}'s pin table gives git hash `{abbreviated}`, which is not a prefix \
+                 of the `duckdb` commit .github/duckdb-versions pins (`{expected}`)"
+            )),
+            None => problems.push(format!("{README}'s pin table gives no `git hash`")),
         }
     }
 
@@ -137,13 +154,22 @@ fn pinned_ducklake_commit() -> Result<String, String> {
 
 /// The DuckLake commit DuckDB's extension config declares — the one
 /// `INSTALL ducklake` against the pinned CLI resolves to.
-fn declared_ducklake_commit(config: &str) -> Option<&str> {
+pub fn declared_ducklake_commit(config: &str) -> Option<&str> {
     config
         .split_whitespace()
         .skip_while(|word| *word != "GIT_TAG")
         .nth(1)
         .map(|commit| commit.trim_end_matches(')'))
         .filter(|commit| !commit.is_empty())
+}
+
+/// What the first pair of backticks after `marker` encloses.
+fn backticked_after<'a>(contents: &'a str, marker: &str) -> Option<&'a str> {
+    let after = contents.find(marker)? + marker.len();
+    let rest = contents.get(after..)?;
+    let open = rest.find('`')? + 1;
+    let quoted = rest.get(open..)?;
+    quoted.find('`').and_then(|end| quoted.get(..end))
 }
 
 /// The value of a `const NAME: &str = "…";` declaration.
@@ -276,6 +302,13 @@ mod tests {
             Some("abc123")
         );
         assert_eq!(declared_ducklake_commit("GIT_URL only\n"), None);
+    }
+
+    #[test]
+    fn a_backticked_value_is_read_after_its_marker() {
+        let table = "| DuckDB | **v1.5.5** (git hash `d8cdaa33fd`, codename Variegata) |";
+        assert_eq!(backticked_after(table, "git hash "), Some("d8cdaa33fd"));
+        assert_eq!(backticked_after(table, "no such marker"), None);
     }
 
     #[test]
