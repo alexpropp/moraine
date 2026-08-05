@@ -58,7 +58,9 @@ jobs:
     # name this same ref: it decides which distribution matrix the build is
     # generated from, and a matrix from an older ref omits fields this one's
     # jobs read — v1.5.4's carries no macOS runner, which drops both macOS
-    # legs with no job and no failure. `cargo xtask check-pins` enforces it.
+    # legs. A dropped leg leaves no job, no check run and no annotation: the
+    # run goes red with every visible job green, and `publish` is skipped.
+    # `cargo xtask check-pins` enforces it.
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
     with:
       extension_name: moraine

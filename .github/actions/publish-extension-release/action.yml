@@ -32,9 +32,9 @@ runs:
              "dist/moraine.${duckdb_version}.${arch}.duckdb_extension"
         done
         ls -l dist
-    # A build matrix leg that never starts produces no job and no failure,
-    # so nothing else here notices a version that built for only some
-    # platforms. Refuse to publish that release rather than ship one.
+    # The last check that a release is whole, and the only one that says
+    # which build is missing: a leg the upstream matrix never starts leaves
+    # no job and no annotation behind to name.
     - name: Require a build for every supported version on every platform
       shell: bash
       run: cargo run -q -p xtask -- check-release-assets dist
