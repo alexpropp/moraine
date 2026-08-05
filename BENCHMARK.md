@@ -464,18 +464,44 @@ The residue against the floor is the watch borrow's read lock, which shares.
 **A read-only warm read costs ~70× a read-write one** — 6.36 µs against
 0.12 µs, the most stable figure in the table. It cannot hold a writer-local
 premise, so it opens a session and issues two point reads before it can
-serve a cache hit, and one of those (`sys/migration`) is a guaranteed miss
-that must consult every level's filter. Folding the migration state onto
-`sys/head` would halve it and is rejected on cost — it would put the store
-behind a format stamp older binaries cannot open, by default, on the first
-commit after an upgrade (RFC 0009). The two reads are independent and
-sequential, so overlapping them is the move that needs nothing in return.
+serve a cache hit. Folding the migration state onto `sys/head` would halve
+that and is rejected on cost — it would put the store behind a format stamp
+older binaries cannot open, by default, on the first commit after an upgrade
+(RFC 0009). The next section measures what those two reads are worth in
+round trips, which is the other half of why.
 
 The absolute figures matter for reading a production trace. Even a
 read-only read fully contended at 24 threads costs tens of microseconds. A
 warm read measured in the hundreds of milliseconds is therefore neither of
 these — it is IO the warm path no longer issues, or serialization above
 moraine (DuckLake's own metadata connection is serialized; see RFC 0006).
+
+### How many round trips a read-only read costs
+
+The section above measures a read-only read at ~6 µs and attributes it to a
+session and two point reads. That says nothing about *round trips*, and a
+get has to cost something before round trips are visible — so this injects
+per-GET latency and reads the answer off the ratio. 20 tables, median of 9:
+
+| get latency | warm median | warm round trips | cold median | cold round trips |
+|---|---|---|---|---|
+| 2 ms | 0.02 ms | 0.01 | 13.26 ms | 6.63 |
+| 5 ms | 0.02 ms | 0.00 | 25.44 ms | 5.09 |
+| 10 ms | 0.02 ms | 0.00 | 45.45 ms | 4.54 |
+| 20 ms | 0.02 ms | 0.00 | 85.49 ms | 4.27 |
+
+**A warm read-only read issues no object-store GET at all.** 0.02 ms at
+every injected latency, including 20 ms — so both point reads are served
+from SlateDB's in-memory state, and the ~6 µs the section above measures is
+CPU and lock, not IO. The `sys/migration` probe is a guaranteed *key* miss,
+but a miss the filters answer in memory once they are resident; it is not a
+round trip.
+
+The cold column fits `4 × latency + 5.4 ms` at every rung — a constant four
+GETs, which is the manifest and the SSTs a first materialization touches,
+not the point reads. So a reader's two point reads are worth no round trip
+warm and at most one of four cold. Overlapping them was implemented against
+this measurement and reverted by it: there was nothing there to save.
 
 ### Read concurrency under IO latency
 

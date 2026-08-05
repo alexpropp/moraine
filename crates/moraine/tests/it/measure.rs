@@ -1339,3 +1339,108 @@ async fn measure_warm_read_attribution() {
     )
     .await;
 }
+
+/// 0009 — how many round trips a warm read-only read costs.
+///
+/// A read-only handle holds no writer-local premise, so serving a cache
+/// hit still means asking the store two questions: whether a structural
+/// migration is in flight, and where head is. They are independent, and
+/// are now issued together rather than one after the other.
+///
+/// The number of *round trips* is what that changes, and a get has to cost
+/// something before round trips are visible — so this injects per-GET
+/// latency and reads the answer off the ratio. One injected latency per
+/// warm read means one round trip; two means the reads serialized.
+#[tokio::test]
+#[ignore = "measurement harness"]
+async fn measure_reader_round_trips_under_get_latency() {
+    const TABLES: usize = 20;
+    const REPEATS: usize = 9;
+    let latencies = [2u64, 5, 10, 20];
+
+    let store = Arc::new(InMemory::new());
+    let writer = open_with(store.clone(), SEED_FLUSH_MS).await;
+    let columns: Vec<_> = (0..4).map(|c| col(&format!("c{c}"))).collect();
+    for t in 0..TABLES {
+        let columns = columns.clone();
+        writer
+            .commit(move |tx| {
+                let schema = tx.schema_by_name("main").expect("bootstrap").id;
+                tx.create_table(schema, &format!("t{t}"), &columns)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    writer.close().await.unwrap();
+
+    println!("\n# 0009 warm read-only read, per-GET latency injected");
+    println!("# {TABLES} tables, median of {REPEATS} warm reads\n");
+    println!(
+        "{:>12}  {:>11}  {:>9}  {:>9}  {:>13}",
+        "get_latency", "median_ms", "min_ms", "max_ms", "round_trips"
+    );
+
+    for &latency_ms in &latencies {
+        let config = ThrottleConfig {
+            wait_get_per_call: Duration::from_millis(latency_ms),
+            ..ThrottleConfig::default()
+        };
+        let throttled = Arc::new(ThrottledStore::new((*store).clone(), config));
+        let throttled: Arc<dyn object_store::ObjectStore> = throttled;
+
+        // The poller is held off so its own gets stay out of the window.
+        let mut options = CatalogOptions::default();
+        options.reader_poll_interval = Duration::from_secs(60);
+        let reader = Catalog::open_read_only(Arc::clone(&throttled), options)
+            .await
+            .unwrap();
+        // Warm: from here a read is two point reads and a cache hit.
+        reader.snapshot().await.unwrap();
+
+        let mut samples = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let start = Instant::now();
+            let view = reader.snapshot().await.unwrap();
+            samples.push(start.elapsed());
+            std::hint::black_box(&view);
+        }
+        let stats = Stats::of(samples);
+        reader.close().await.unwrap();
+
+        // The same read on a handle that has never read: nothing of the
+        // store is in its block cache, so any round trip the two point
+        // reads owe is owed here.
+        let mut cold = Vec::with_capacity(REPEATS);
+        for _ in 0..REPEATS {
+            let mut options = CatalogOptions::default();
+            options.reader_poll_interval = Duration::from_secs(60);
+            let fresh = Catalog::open_read_only(Arc::clone(&throttled), options)
+                .await
+                .unwrap();
+            let start = Instant::now();
+            let view = fresh.snapshot().await.unwrap();
+            cold.push(start.elapsed());
+            std::hint::black_box(&view);
+            fresh.close().await.unwrap();
+        }
+        let cold = Stats::of(cold);
+        println!(
+            "{:>10} ms  {:>11.2}  {:>9.2}  {:>9.2}  {:>13.2}   (cold handle)",
+            latency_ms,
+            cold.median_ms,
+            cold.min_ms,
+            cold.max_ms,
+            cold.median_ms / latency_ms as f64
+        );
+
+        println!(
+            "{:>10} ms  {:>11.2}  {:>9.2}  {:>9.2}  {:>13.2}",
+            latency_ms,
+            stats.median_ms,
+            stats.min_ms,
+            stats.max_ms,
+            stats.median_ms / latency_ms as f64
+        );
+    }
+}
