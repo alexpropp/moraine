@@ -111,15 +111,21 @@ pub use crate::store::proto::{
 /// The store state every dump's rows stand at: the head snapshot id and
 /// batch count, or `None` on a store that has no head yet.
 ///
-/// One point read. A caller holding rows it took earlier compares this
-/// against the stamp they were served at and re-dumps only on a move —
-/// which is what makes a quiet catalog cost one read per table per
-/// commit rather than per transaction. Both halves matter: a maintenance
-/// batch reuses the snapshot id while changing what a scan finds.
+/// At most one point read — none at all on a read-write handle, whose
+/// held view is at head by construction. A caller holding rows it took
+/// earlier compares this against the stamp they were served at and
+/// re-dumps only on a move, which is what makes a quiet catalog cost one
+/// read per table per commit rather than per transaction. Both halves
+/// matter: a maintenance batch reuses the snapshot id while changing what
+/// a scan finds.
 #[doc(hidden)]
 pub async fn head_stamp(catalog: &ReadOnlyCatalog) -> Result<Option<HeadValue>> {
+    if let Some(head) = writer_head(catalog)? {
+        return Ok(Some(head));
+    }
+
     let session = catalog.begin_read().await?;
-    let head = session_head(&session).await;
+    let head = session_head(catalog, &session).await;
     session.finish();
     head
 }
