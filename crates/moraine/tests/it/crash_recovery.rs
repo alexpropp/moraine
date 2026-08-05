@@ -214,27 +214,37 @@ async fn durable_commit_survives_a_crash_before_its_acknowledgement() {
 /// the real ones: SlateDB's writer epoch across processes (the second
 /// `Db::open` fences the first, so the fenced initializer's genesis batch
 /// writes nothing) and write-write conflict detection on `sys/format`
-/// within one writer. Exactly one wins, and reopen shows a single coherent
-/// genesis — never a second `sys/format`, a divergent genesis snapshot, or
-/// a conflicting head.
+/// within one writer. At most one genesis lands, and reopen shows it —
+/// never a second `sys/format`, a divergent genesis snapshot, or a
+/// conflicting head.
 ///
 /// The race runs repeatedly because its two guards trip at different
 /// points and one round samples only one of them.
 ///
-/// The loser fails typed, whichever of the two guards caught it: it lost
-/// the manifest race and never created the store ([`Error::OpenRaced`]),
-/// or it created the store and was displaced ([`Error::Fenced`]). What it
-/// never does is fail as an untyped store error, which "adopts it, or
-/// returns a typed error" does not admit.
+/// A round may still leave *both* initializers failed, and that is not a
+/// torn store. A writer claims the writer epoch and its compactor claims
+/// the compactor epoch in two races that are ordered independently, so the
+/// handle that wins the writer epoch can lose the compactor epoch — and a
+/// fenced compactor closes the handle it belongs to. A fenced genesis
+/// re-attempts, which is why this is rare rather than routine, but the
+/// re-attempts are bounded and initializers that keep arriving can spend
+/// them. Genesis is whole or absent either way, and the recovery is the
+/// same one this test then performs: open again.
+///
+/// [`a_genesis_fenced_mid_bootstrap_re_attempts_and_lands`] stages that
+/// fence deterministically and pins the re-attempt, which a round here
+/// samples too rarely to hold up on its own.
+///
+/// A loser fails typed, whichever guard caught it: it lost the manifest
+/// race and never created the store ([`Error::OpenRaced`]), or it created
+/// the store and was displaced ([`Error::Fenced`]). What it never does is
+/// fail as an untyped store error, which "adopts it, or returns a typed
+/// error" does not admit.
 ///
 /// The typing rests on matching SlateDB's message text, which a round that
 /// happens not to collide would not exercise —
 /// [`a_lost_manifest_race_surfaces_typed_rather_than_as_a_store_error`]
 /// stages the collision deterministically and pins the wording.
-///
-/// Re-attempting the losing open was tried and rejected: the re-attempt
-/// takes the writer epoch in turn and fences whichever initializer had
-/// just won, so both can lose. That is what the first assertion pins.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_genesis_leaves_exactly_one_catalog() {
     for round in 0..25 {
@@ -248,11 +258,7 @@ async fn concurrent_genesis_leaves_exactly_one_catalog() {
             tokio::spawn(async move { Catalog::open(second, CatalogOptions::default()).await });
         let results = [left.await.unwrap(), right.await.unwrap()];
 
-        assert!(
-            results.iter().any(Result::is_ok),
-            "round {round}: at least one initializer must win"
-        );
-        // A fresh store is not a true conflict, so the loser's failure is
+        // A fresh store is not a true conflict, so a loser's failure is
         // benign. It must never be a *catalog* error: reporting corruption,
         // a duplicate, or a missing entity would mean genesis itself tore.
         for result in &results {
@@ -282,6 +288,36 @@ async fn concurrent_genesis_leaves_exactly_one_catalog() {
         assert_eq!(schemas[0].name, "main");
         reopened.close().await.unwrap();
     }
+}
+
+/// A genesis open displaced mid-bootstrap re-attempts instead of handing
+/// the caller a fence. The staged genesis never landed, so the store still
+/// has no catalog and the second attempt creates it — the caller sees the
+/// catalog it asked for rather than an error it could only answer by
+/// opening again itself.
+///
+/// The displacement is staged from outside: refusing the first batch the
+/// writer flushes is what a writer that lost the epoch finds, so the fence
+/// here is SlateDB's real one.
+#[tokio::test]
+async fn a_genesis_fenced_mid_bootstrap_re_attempts_and_lands() {
+    let backing: Arc<InMemory> = Arc::new(InMemory::new());
+    let store = Arc::new(RacingStore::losing_the_first_batch_write(backing.clone()));
+
+    let catalog = Catalog::open(store, CatalogOptions::default())
+        .await
+        .expect("the re-attempt creates the catalog the fenced attempt could not");
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.current_snapshot().id.get(),
+        0,
+        "one genesis, not one per attempt"
+    );
+    let schemas = snapshot.schemas();
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].name, "main");
+    catalog.close().await.unwrap();
 }
 
 /// The genesis race's loser fails **typed**, and this pins the one thread
