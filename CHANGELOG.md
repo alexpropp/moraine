@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0](https://github.com/morainedb/moraine/compare/v0.4.4...v0.5.0) - 2026-08-05
+## [0.4.5](https://github.com/morainedb/moraine/compare/v0.4.4...v0.4.5) - 2026-08-05
 
 ### Added
 
