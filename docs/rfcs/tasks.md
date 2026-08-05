@@ -77,6 +77,22 @@ deliberately not itemized here.
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
 
+- **MEASURE** — Where a warm read's remaining latency lands. A read-write
+  handle no longer reads `sys/head`, but a warm read still opens a session:
+  one `sys/migration` point read, and a `Db::begin` that takes the SlateDB
+  transaction manager's global write lock (`transaction_manager.rs`,
+  `new_transaction`) — no store I/O, but a serialization point a wide
+  client fleet funnels through. A production trace attributing a warm
+  read's time between those two settles whether either is worth removing.
+- **DECISION** — Whether a read-write handle may cache the `sys/migration`
+  probe as well, which is the last store read on a warm path. The marker is
+  only ever written by a migrator, and a migrator takes the writer epoch and
+  so fences the handle — which would make the probe answerable locally. Two
+  tests deliberately assert the opposite (a marker planted under a live
+  read-write handle refuses every read seam, warm cache included), so
+  settling this means settling whether that scenario is reachable outside a
+  test seam, not just deleting the read.
+
 ## 0013 — Partitioning, sorting, and pruning
 
 - **DEFERRED** — Server-side partition-pruning pushdown. One deferral with

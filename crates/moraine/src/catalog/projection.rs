@@ -52,6 +52,15 @@ fn same_head(a: &HeadValue, b: &HeadValue) -> bool {
     a.snapshot_id == b.snapshot_id && a.batch_seq == b.batch_seq
 }
 
+/// The head record a materialized view stands at. On a read-write handle
+/// this is the head itself, so a cache lookup keys on it without a read.
+pub(crate) fn view_head(view: &CatalogSnapshot) -> HeadValue {
+    HeadValue {
+        snapshot_id: view.snapshot.snapshot_id,
+        batch_seq: view.batch_seq,
+    }
+}
+
 impl<K: Ord, V> Maintained<K, V> {
     fn empty() -> Self {
         Self {
@@ -243,8 +252,14 @@ impl ProjectionCache {
         self.epoch
     }
 
+    /// Installs unconditionally, and moves the epoch with it. A read-write
+    /// handle serves this view as head without re-reading `sys/head`, so an
+    /// installer holding an older view must not be able to land on top of a
+    /// commit's folded one; bumping here is what makes
+    /// [`set_head_view_at`](Self::set_head_view_at) refuse it.
     pub(crate) fn set_head_view(&mut self, view: Arc<CatalogSnapshot>) {
         self.head_view = Some(view);
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     /// Installs only if no invalidation has intervened since `epoch`.
@@ -496,6 +511,160 @@ mod tests {
             let _ = dump_table_stats(&catalog).await.unwrap();
             let _ = dump_table_column_stats(&catalog).await.unwrap();
         }
+    }
+
+    /// Commits one table, so the handle has a head view to hold.
+    async fn seed_one_table(catalog: &Catalog, name: &str) {
+        catalog
+            .commit(|tx| {
+                let main = tx.schemas()[0].id;
+                tx.create_table(
+                    main,
+                    name,
+                    &[ColumnDef {
+                        name: "id".into(),
+                        column_type: "BIGINT".into(),
+                        nulls_allowed: false,
+                        default_value: None,
+                        children: Vec::new(),
+                    }],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Every read seam a warm handle serves, once.
+    async fn read_every_seam(catalog: &Catalog) {
+        let _ = catalog.snapshot().await.unwrap();
+        let _ = dump_snapshots(catalog).await.unwrap();
+        let _ = dump_table_stats(catalog).await.unwrap();
+        let _ = dump_table_column_stats(catalog).await.unwrap();
+    }
+
+    /// A read-write handle is the store's only writer, so the view it holds
+    /// is at head by construction. Once warm it must resolve the head from
+    /// that view and never from the store — the point read per call is the
+    /// floor under every probe and dump on the write path.
+    #[tokio::test]
+    async fn a_warm_writer_resolves_head_without_reading_the_store() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        seed_one_table(&catalog, "t").await;
+
+        // The first pass installs each projection; from here it is warm.
+        read_every_seam(&catalog).await;
+        let warmed = catalog.head_reads();
+
+        for _ in 0..8 {
+            read_every_seam(&catalog).await;
+        }
+
+        assert_eq!(
+            catalog.head_reads(),
+            warmed,
+            "a warm read-write handle read `sys/head`"
+        );
+    }
+
+    /// The warm path must not go stale: a commit folds the held view
+    /// forward, so the read that follows serves the new state without ever
+    /// having read the head.
+    #[tokio::test]
+    async fn a_warm_writer_still_sees_its_own_later_commits() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        seed_one_table(&catalog, "first").await;
+        read_every_seam(&catalog).await;
+        let warmed = catalog.head_reads();
+
+        seed_one_table(&catalog, "second").await;
+
+        let view = catalog.snapshot().await.unwrap();
+        let main = view.schemas()[0].id;
+        assert!(
+            view.table_by_name(main, "second").is_some(),
+            "a warm read missed the commit that preceded it"
+        );
+        assert_eq!(
+            dump_snapshots(&catalog).await.unwrap(),
+            scanned_snapshots(&catalog).await,
+            "the warm dump disagreed with the store"
+        );
+        assert_eq!(
+            catalog.head_reads(),
+            warmed,
+            "seeing the commit cost a head read"
+        );
+    }
+
+    /// A read-only handle follows another process's commits, so it has no
+    /// such premise and must keep resolving the head from the store.
+    #[tokio::test]
+    async fn a_read_only_handle_resolves_head_from_the_store_every_read() {
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+            .await
+            .unwrap();
+        seed_one_table(&writer, "t").await;
+        writer.close().await.unwrap();
+
+        let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+            .await
+            .unwrap();
+        let _ = reader.snapshot().await.unwrap();
+        let after_first = reader.head_reads();
+
+        for _ in 0..4 {
+            let _ = reader.snapshot().await.unwrap();
+        }
+
+        assert_eq!(
+            reader.head_reads(),
+            after_first + 4,
+            "a read-only handle served a read without resolving the head"
+        );
+    }
+
+    /// Dropping the view is what stops a writer serving state the store has
+    /// left — a head-preserving batch reuses the snapshot id, so the stamp
+    /// alone would not give it away.
+    #[tokio::test]
+    async fn an_invalidated_view_sends_the_writer_back_to_the_store() {
+        let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default())
+            .await
+            .unwrap();
+        seed_one_table(&catalog, "t").await;
+        let _ = catalog.snapshot().await.unwrap();
+        assert!(catalog.writer_head_view().is_some());
+
+        invalidate_head_view(catalog.projections());
+
+        assert!(
+            catalog.writer_head_view().is_none(),
+            "an invalidated cache still served a warm read"
+        );
+    }
+
+    /// A commit's folded view outranks anything a read materialized before
+    /// it: the writer serves the held view as head, so an install landing
+    /// on top of one would answer from a state the store has left.
+    #[test]
+    fn a_commit_install_refuses_an_older_readers_install() {
+        let cache = std::sync::RwLock::new(ProjectionCache::empty());
+
+        // A read captures the epoch, then a commit installs its fold.
+        let epoch = cache_epoch(&cache);
+        install_head_view(&cache, view_at(9));
+
+        // The read's own install, now stale, must not land.
+        install_head_view_at(&cache, epoch, view_at(7));
+
+        assert!(cached_head_view(&cache, &head_at(9)).is_some());
+        assert!(cached_head_view(&cache, &head_at(7)).is_none());
     }
 
     fn snapshot_value(id: u64) -> SnapshotValue {

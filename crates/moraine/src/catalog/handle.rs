@@ -181,6 +181,7 @@ struct ReadTally {
     materializations: AtomicU64,
     refreshes: AtomicU64,
     cache_hits: AtomicU64,
+    head_reads: AtomicU64,
     materialize_micros: AtomicU64,
 }
 
@@ -197,6 +198,7 @@ impl ReadTally {
             total_micros = total,
             cache_hits = self.cache_hits.load(Ordering::Relaxed),
             refreshes = self.refreshes.load(Ordering::Relaxed),
+            head_reads = self.head_reads.load(Ordering::Relaxed),
             "materialized the catalog from `current`"
         );
     }
@@ -497,6 +499,40 @@ impl ReadOnlyCatalog {
         matches!(self.store.as_ref(), Store::Writer(_))
     }
 
+    /// Records that a read resolved the head from the store.
+    pub(crate) fn note_head_read(&self) {
+        self.reads.head_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many reads have resolved the head from the store.
+    #[cfg(test)]
+    pub(crate) fn head_reads(&self) -> u64 {
+        self.reads.head_reads.load(Ordering::Relaxed)
+    }
+
+    /// The held view a read may serve without resolving the head from the
+    /// store, or `None` when it must resolve it there.
+    ///
+    /// A read-write handle holds the writer epoch, so this process is the
+    /// store's only writer: nothing can move `sys/head` under it, and every
+    /// batch that lands either folds the held view forward or drops it — a
+    /// durable write whose fate is unknown drops it too. The held view is
+    /// therefore never behind the store, and its own stamp is the head.
+    ///
+    /// Called inside an open read session, never instead of one: the
+    /// session is what fails on a `Db` closed under a newer writer, and
+    /// what refuses a store mid-structural-migration. Both are premises of
+    /// the paragraph above, not costs this can skip.
+    ///
+    /// A read-only handle follows another process's commits and has no
+    /// such premise, so it always reads.
+    pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
+        if !self.maintains_projections() {
+            return None;
+        }
+        held_head_view(&self.projections)
+    }
+
     /// An immutable view of the catalog at the latest committed snapshot.
     ///
     /// Shared rather than owned: a warm handle hands back the view it
@@ -730,6 +766,13 @@ impl ReadOnlyCatalog {
         // this read cannot be overwritten by what it invalidated.
         let epoch = cache_epoch(&self.projections);
         let session = self.begin_read().await?;
+
+        if let Some(view) = self.writer_head_view() {
+            session.finish();
+            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(view);
+        }
+
         let view = self.head_view(session.handle()).await;
         session.finish();
 
@@ -741,10 +784,13 @@ impl ReadOnlyCatalog {
 
     /// The cached view when it already stands at head, a view refreshed
     /// across the gap when it has fallen behind and the gap is replayable,
-    /// else a fresh materialization. A reader polling a quiet catalog pays
-    /// one point read and no copy: the committer folds each batch forward,
-    /// so the cache is normally current.
+    /// else a fresh materialization. A read-only handle polling a quiet
+    /// catalog pays one point read and no copy: the committer folds each
+    /// batch forward, so the cache is normally current. A read-write
+    /// handle does not reach here at all while its view is held —
+    /// [`writer_head_view`](Self::writer_head_view) serves it first.
     async fn head_view(&self, handle: ReadHandle<'_>) -> Result<Arc<CatalogSnapshot>> {
+        self.note_head_read();
         let head = commit::read_head_value(handle).await?;
         if let Some(cached) = cached_head_view(&self.projections, &head) {
             self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);

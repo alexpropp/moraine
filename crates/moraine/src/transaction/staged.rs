@@ -417,6 +417,21 @@ impl StagedTransaction {
         )
     }
 
+    /// As [`begin_detached`](Self::begin_detached), but sharing `catalog`'s
+    /// projections — for tests that commit here and then read back through
+    /// the handle. A throwaway state would leave that handle holding a view
+    /// the store has moved past, which a staged commit through a `Catalog`
+    /// never does.
+    #[cfg(test)]
+    pub(crate) fn begin_detached_on(catalog: &crate::Catalog, db_tx: DbTransaction) -> Self {
+        Self::begin(
+            db_tx,
+            Arc::clone(catalog.projections()),
+            None,
+            String::new(),
+        )
+    }
+
     /// As [`begin_detached`](Self::begin_detached), but reading registered
     /// files from `data_store` — for tests that exercise the file paths.
     #[cfg(test)]
@@ -1003,14 +1018,14 @@ impl StagedTransaction {
                 // interrupt races the wait for it rather than the write
                 // itself.
                 let head_before = base_ref.snapshot.snapshot_id;
-                let landed = commit::join_commit_batch(commit::spawn_commit_batch(
+                let landed = commit::commit_batch_off_task(
                     db_tx,
                     head_before,
                     result_id,
                     writes,
                     Arc::clone(&base),
                     projections,
-                ))
+                )
                 .await?;
                 match landed {
                     commit::Landed::Committed => {

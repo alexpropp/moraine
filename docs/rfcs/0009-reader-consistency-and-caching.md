@@ -161,6 +161,45 @@ manifest poller runs, not on every commit, so a pass that loses one round
 very rarely loses the next, and a bounded budget of them ends in a typed
 error rather than a torn view.
 
+### A read-write handle resolves the head without reading it
+
+The stamp above is what a *read-only* handle needs, because it follows
+another process's commits and cannot know when one landed. A **read-write**
+handle is in the opposite position: it holds the writer epoch, so it is the
+store's only writer and nothing can move `sys/head` under it. Reading the
+record back to learn where head is asks the store a question the handle
+already knows the answer to — and that point read is on every catalog
+read, every metadata dump, and so under every DuckLake statement.
+
+So a read-write handle resolves the head from **the view it already
+holds**: a `CatalogSnapshot` carries the snapshot id and batch count it was
+built at, which on a sole writer *is* the head. The premise is that a held
+view is never behind the store, and that rests on four rules, all in the
+commit path:
+
+- A head-advancing batch folds the view forward as it lands, or drops it if
+  the fold cannot be applied faithfully.
+- A head-preserving batch drops the view *before* its write becomes
+  visible, since it reuses the snapshot id and only the batch count would
+  give it away.
+- A durable write that fails for any reason other than a lost race drops
+  the view: a lost race provably did not land, and everything else leaves
+  that open.
+- A durable write whose task never reports back drops it too, for the same
+  reason.
+
+The held view is only ever a **lookup key**, never an answer inferred in
+place of one. A dump whose projection does not stand at that stamp falls
+through to the ordinary session path and reads the head there, so rows are
+never installed under a stamp the store did not supply.
+
+Two things this deliberately does not skip, both premises rather than
+costs. The read session still opens, because opening it is what fails on a
+`Db` closed under a newer writer — a fenced handle that served its cache
+would answer from a catalog the store has moved past, and quietly. And the
+session still refuses a store mid-structural-migration, so a planted
+marker stops a warm handle exactly as it stops a cold one.
+
 Making the head write unconditional has a second effect the design wants:
 `sys/head` becomes the one key every batch touches, so SlateDB's
 write-write detection makes it the single conflict anchor. A maintenance
