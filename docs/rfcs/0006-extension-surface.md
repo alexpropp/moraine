@@ -660,7 +660,11 @@ matrix from it, assets are published as
 coexist in one release, and `cargo xtask check-pins` fails if any other place
 naming a version disagrees. That check exists because the failure mode is
 silent: a bump that misses one of the six places produces an artifact that
-builds, passes every other job, and then refuses to load.
+builds, passes every other job, and then refuses to load. `cargo xtask
+bump-duckdb <version>` writes those places, so the check guards a
+transcription no one has to make by hand. It covers the DuckLake commit
+too, which DuckDB chooses rather than moraine — otherwise a DuckDB bump
+moves it silently and only e2e says so.
 
 **Which releases are listed** is a judgement, and a short list is the default.
 Each entry multiplies the release build by five platforms, and only the

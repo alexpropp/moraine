@@ -218,13 +218,21 @@ submodules, both workflow files, and the table below.
 | DuckDB CLI (for `LOAD` testing) | downloaded from the GitHub release, cached under `target/duckdb-cli/<version>/` (never committed) |
 | DuckLake extension | `INSTALL ducklake` against the pinned CLI — see "Obtaining the DuckLake extension" below |
 
-**Bumping** means putting the new release at the top of the manifest with
-both submodule commits, moving the submodules there, and running `cargo
-xtask check-pins`, which names whatever is still stale. Then `cargo xtask
-e2e` re-proves the whole chain against the new pair, including the
+**Bumping** is `cargo xtask bump-duckdb v1.5.6`: it moves both submodules
+to that release, rewrites the manifest around it, and carries every derived
+reference along — the workflow refs, the table above, and the DuckLake
+commit the new DuckDB declares. It stops short of the two things that are
+judgement rather than transcription: the codename above, and whether an
+older release should now leave the manifest.
+
+Then `cargo xtask check-pins` names whatever is still stale, and `cargo
+xtask e2e` re-proves the whole chain against the new pair, including the
 regression pins in `tests/ducklake_load/wire_contract.rs` — the nested
 attach text, DuckLake's catalog access set, and the DuckLake commit
-`INSTALL ducklake` resolves to.
+`INSTALL ducklake` resolves to. Expect that last one to move: DuckDB
+hard-codes which DuckLake it installs, so a DuckDB bump changes it without
+asking, and the bump prints the upstream compare URL for exactly that
+reason.
 
 **Which releases get builds.** Every one still listed in the manifest.
 This is not a preference: DuckDB refuses a C++-ABI extension whose footer
