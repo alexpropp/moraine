@@ -766,7 +766,11 @@ async fn index_entry_keys(catalog: &Catalog, unique: bool, index_id: u64) -> Vec
     };
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(kind, index_id), ..)
+        .scan_prefix(
+            index_index_prefix(kind, index_id),
+            ..,
+            crate::store::handle::ScanShape::Bulk,
+        )
         .await
         .unwrap();
     let mut keys = Vec::new();
@@ -1608,7 +1612,11 @@ async fn embedded_ids_win_over_a_recorded_dense_start() {
     // The unique entries hold ids 100 and 102 — not 100 and 101.
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(IndexKind::Unique, index_id), ..)
+        .scan_prefix(
+            index_index_prefix(IndexKind::Unique, index_id),
+            ..,
+            crate::store::handle::ScanShape::Bulk,
+        )
         .await
         .unwrap();
     let mut row_ids = Vec::new();

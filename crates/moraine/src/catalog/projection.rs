@@ -197,21 +197,50 @@ pub(crate) fn invalidate_head_view(cache: &std::sync::RwLock<ProjectionCache>) {
         .clear_head_view();
 }
 
+/// The shared `current` half at exactly `head`, if installed.
+pub(crate) fn shared_current_entities(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    head: &HeadValue,
+) -> Option<Arc<Vec<EntityRecord>>> {
+    cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .current_entities_at(head)
+}
+
+/// Installs the shared `current` half. Unconditional: the stamp keying
+/// makes a stale install self-invalidating, unlike the head view whose
+/// install races the invalidation epoch.
+pub(crate) fn install_shared_current_entities(
+    cache: &std::sync::RwLock<ProjectionCache>,
+    head: HeadValue,
+    records: Arc<Vec<EntityRecord>>,
+) {
+    cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .install_current_entities(head, records);
+}
+
 /// The projections DuckLake re-reads per transaction, maintained on a
 /// read-write catalog so serving them does not rescan the store.
 pub(crate) struct ProjectionCache {
     snapshots: Maintained<u64, SnapshotValue>,
     table_stats: Maintained<u64, TableStatsValue>,
     table_column_stats: Maintained<(u64, u64), TableColumnStatsValue>,
-    /// The full current+history entity scan at one head: populating
-    /// DuckLake's metadata tables issues ~two dozen per-kind dumps, and
-    /// this serves them all from one scan pair. Not folded forward —
-    /// entity writes are too varied — so any committed batch drops it
-    /// and the next dump re-installs it at the new head.
+    /// The shared decoded record set: at one head stamp each half is
+    /// scanned at most once, and the head view, the entity dumps, and the
+    /// unversioned projections all derive from it. The halves install
+    /// independently — a head view needs `current` only, and the dumps add
+    /// `history` when first to want it. Not folded forward — entity writes
+    /// are too varied — so any committed batch drops both halves and the
+    /// next read re-installs at the new head.
     // Keyed on the whole head stamp, not the snapshot id alone: a
     // maintenance batch reuses the id while changing what a scan would
     // find, so an id-keyed entry would serve the state it reclaimed.
-    entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
+    current_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
+    /// The `history` half of the shared record set, stamped the same way.
+    history_entities: Option<(HeadValue, Arc<Vec<EntityRecord>>)>,
     /// The materialized head view, folded forward on every commit and
     /// served to the commit path so it stages against known state without
     /// rescanning. Carries its own head (`snapshot.snapshot_id`); a fold
@@ -228,7 +257,8 @@ impl ProjectionCache {
             snapshots: Maintained::empty(),
             table_stats: Maintained::empty(),
             table_column_stats: Maintained::empty(),
-            entities: None,
+            current_entities: None,
+            history_entities: None,
             head_view: None,
             epoch: 0,
         }
@@ -274,15 +304,41 @@ impl ProjectionCache {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    pub(crate) fn install_entities(&mut self, head: HeadValue, records: Vec<EntityRecord>) {
-        self.entities = Some((head, Arc::new(records)));
+    pub(crate) fn install_current_entities(
+        &mut self,
+        head: HeadValue,
+        records: Arc<Vec<EntityRecord>>,
+    ) {
+        self.current_entities = Some((head, records));
     }
 
-    /// Serves the entity scan if it stands at exactly `expected` — both
-    /// halves of the stamp, so a maintenance batch that reused the
-    /// snapshot id invalidates it like any other.
-    pub(crate) fn entities_at(&self, expected: &HeadValue) -> Option<Arc<Vec<EntityRecord>>> {
-        self.entities
+    pub(crate) fn install_history_entities(
+        &mut self,
+        head: HeadValue,
+        records: Arc<Vec<EntityRecord>>,
+    ) {
+        self.history_entities = Some((head, records));
+    }
+
+    /// Serves the `current` half of the shared record set if it stands at
+    /// exactly `expected` — both halves of the stamp, so a maintenance
+    /// batch that reused the snapshot id invalidates it like any other.
+    pub(crate) fn current_entities_at(
+        &self,
+        expected: &HeadValue,
+    ) -> Option<Arc<Vec<EntityRecord>>> {
+        self.current_entities
+            .as_ref()
+            .and_then(|(head, records)| same_head(head, expected).then(|| Arc::clone(records)))
+    }
+
+    /// As [`current_entities_at`](Self::current_entities_at), for the
+    /// `history` half.
+    pub(crate) fn history_entities_at(
+        &self,
+        expected: &HeadValue,
+    ) -> Option<Arc<Vec<EntityRecord>>> {
+        self.history_entities
             .as_ref()
             .and_then(|(head, records)| same_head(head, expected).then(|| Arc::clone(records)))
     }
@@ -335,7 +391,8 @@ impl ProjectionCache {
     /// everything: the batch cannot be attributed, so no projection may
     /// claim the state it left.
     pub(crate) fn apply_batch(&mut self, writes: &[StagedWrite], new_head: u64) {
-        self.entities = None;
+        self.current_entities = None;
+        self.history_entities = None;
         for (encoded_key, write) in writes {
             let bytes = write.as_deref();
             match Key::decode(encoded_key) {

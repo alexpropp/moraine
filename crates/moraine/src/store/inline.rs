@@ -5,7 +5,7 @@
 use crate::{
     error::{Error, Result},
     store::{
-        handle::ReadHandle,
+        handle::{ReadHandle, ScanShape},
         key::{
             InlineKey, InlineOperation, InlineOperationKind, Key, inline_live_table_prefix,
             inline_schema_prefix, inline_schema_table_prefix,
@@ -29,6 +29,7 @@ pub(crate) async fn scan_inline_chunks(
     scan_decode(
         handle,
         inline_live_table_prefix(InlineOperationKind::Insert, table_id),
+        ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(op @ InlineOperation::Insert { .. })) => {
                 Ok((op, value::decode_value(bytes)?))
@@ -49,6 +50,7 @@ pub(crate) async fn scan_inline_inline_deletes(
     scan_decode(
         handle,
         inline_live_table_prefix(InlineOperationKind::InlineDelete, table_id),
+        ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(InlineOperation::InlineDelete { row_id, .. })) => {
                 Ok((row_id, value::decode_value(bytes)?))
@@ -70,6 +72,7 @@ pub(crate) async fn scan_inline_file_deletes(
     scan_decode(
         handle,
         inline_live_table_prefix(InlineOperationKind::FileDelete, table_id),
+        ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Live(InlineOperation::FileDelete {
                 data_file_id,
@@ -119,6 +122,7 @@ pub(crate) async fn scan_inline_schemas(
     scan_decode(
         handle,
         inline_schema_table_prefix(table_id),
+        ScanShape::Probe,
         |key, bytes| match key {
             Key::Inline(InlineKey::Schema { schema_version, .. }) => {
                 Ok((schema_version, value::decode_value(bytes)?))
@@ -136,15 +140,20 @@ pub(crate) async fn scan_inline_schemas(
 pub(crate) async fn scan_all_inline_schemas(
     handle: ReadHandle<'_>,
 ) -> Result<Vec<(u64, u64, InlineSchemaValue)>> {
-    scan_decode(handle, inline_schema_prefix(), |key, bytes| match key {
-        Key::Inline(InlineKey::Schema {
-            table_id,
-            schema_version,
-        }) => Ok((table_id, schema_version, value::decode_value(bytes)?)),
-        other => Err(Error::Corruption(format!(
-            "non-schema key in all-table inline schema scan: {other:?}"
-        ))),
-    })
+    scan_decode(
+        handle,
+        inline_schema_prefix(),
+        ScanShape::Probe,
+        |key, bytes| match key {
+            Key::Inline(InlineKey::Schema {
+                table_id,
+                schema_version,
+            }) => Ok((table_id, schema_version, value::decode_value(bytes)?)),
+            other => Err(Error::Corruption(format!(
+                "non-schema key in all-table inline schema scan: {other:?}"
+            ))),
+        },
+    )
     .await
 }
 

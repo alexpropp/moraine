@@ -564,3 +564,38 @@ scheduled promptly, and a `spawn_blocking` discipline buys nothing on this
 axis. Both halves of the worker-pool question are now answered the same
 way: the pool does not need protecting from either IO latency or decode
 compute.
+
+### What an index probe fetches, cold and warm
+
+The design replaced a part-grained object cache (4 MiB parts) with a
+block-grained one, and argued the swap from grain arithmetic alone. This
+puts bytes under it: 32 probes spread across the whole `index` run, so no
+probe rides another's block, against a counting object store. On an
+in-memory store a fetch costs no round trip, so the milliseconds are
+decode and the **bytes** are the transferable number.
+
+| entries | index bytes | cold gets | cold bytes/probe | warm gets | warm bytes/probe | warm ms/probe |
+|---|---|---|---|---|---|---|
+| 8 192 | 297 KB | 48 | 4 554 | 0 | 0 | 0.086 |
+| 65 536 | 2.38 MB | 48 | 7 733 | 0 | 0 | 0.097 |
+| 262 144 | 9.48 MB | 48 | 18 630 | 0 | 0 | 0.107 |
+| 1 048 576 | 37.8 MB | 54 | 61 926 | 0 | 0 | 0.154 |
+
+**The grain claim holds with room to spare.** A cold probe into a
+37.8 MB run fetches 62 KB — against the 4 MiB a part-grained cache would
+have faulted to answer the same lookup, a 68× difference, and the gap
+widens as the run grows because a part is a fixed size while a probe's
+block working set is not.
+
+**A warm probe fetches nothing at all.** Zero bytes and zero GETs at
+every size: the blocks are resident and the probe's own scan admits
+them, which is what the block slot and the probe shape are for.
+
+That row is the *second* reading. The first found a warm probe still
+costing one to two GETs and 0.5–9.6 KB, which was not the cache failing
+but `index_lookup` calling `materialize` instead of serving the handle's
+held view — so every probe re-scanned `current` under a bulk shape that
+admits nothing. Serving the held view took warm probes to zero and cut
+the cold path too (79 GETs to 48, 71 KB to 62 KB per probe), because the
+rescan was in both. The measurement found the defect; the numbers above
+are after the fix.

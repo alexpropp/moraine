@@ -76,6 +76,41 @@ deliberately not itemized here.
   Whichever is taken first pulls the other with it. A replay's base-view
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
+- **DEFERRED** — Upstream: a caller-supplied stable cache scope in
+  SlateDB. Shared-cache keys are scoped per opened handle by a
+  process-local counter, so foyer's disk recovery matches nothing after a
+  restart; a scope derived from the store path would make the disk tier
+  restart-warm and reclaim the one property the object cache still holds.
+  Until then the restart story is preload, at re-fetch cost. Filed as an
+  upstream ask rather than a decision to take: nothing here blocks on it,
+  and the cross-process row cache below is the other way to the same end.
+- **DEFERRED** — Upstream: export `SsTableId`, so
+  `DbCacheManagerOps::warm_sst` and `evict_cached_sst` can be called at
+  all (their parameter type is in a private module). Closed as a
+  decision: the preload warms by reading, which is cheaper and
+  subspace-grained rather than SST-grained, so an export would buy
+  precision rather than capability. Worth filing upstream; nothing here
+  waits on it.
+- **DEFERRED** — SST block size (0002's layout, 4 KiB today): a sweep over
+  4/16/64 KiB on the scan-heavy `current` and probe-heavy `index`
+  workloads. Attempted and withdrawn twice over. The sweep must set a
+  block size, which moraine exposes nowhere, so the harness drove SlateDB
+  directly — and that harness hangs in its write/scan loop even at 8 000
+  rows, which is its own investigation. The reason to push through it has
+  also weakened: the 4 KiB block size mattered when a scan paid a round
+  trip per block, and the scan path's read-ahead fixed that, while probes
+  now cost nothing warm and 62 KB cold (`BENCHMARK.md`). Revive it if a
+  profile puts weight back on block grain; it would need a public option
+  to be measurable through moraine's own harness, which works.
+- **DEFERRED** — A cross-process row cache (serialized projections on
+  disk, stamped with the head; one point read validates, the changelog
+  replays a small gap). Would collapse a process-cold attach from
+  fetch + decode + materialize to load + validate — the deploy-restart
+  case, where every process starts row-cold today. Deferred because it is
+  a second durable encoding to version and migrate; revisit when
+  deploy-cold attach cost is measured, and note the byte tier's restart
+  story is currently preload-at-re-fetch-cost (the stable-scope DECISION
+  above), which strengthens this item's case until that lands.
 
 ## 0013 — Partitioning, sorting, and pruning
 

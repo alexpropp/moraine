@@ -716,6 +716,7 @@ pub unsafe extern "C" fn moraine_attach(
     flush_interval_ms: u64,
     cache_dir: *const c_char,
     cache_size_bytes: u64,
+    cache_memory_bytes: u64,
     cache_preload: u8,
     cache_puts: bool,
     data_path: *const c_char,
@@ -801,6 +802,7 @@ pub unsafe extern "C" fn moraine_attach(
         }
         options.cache_dir = cache_dir.map(std::path::PathBuf::from);
         options.cache_size = cache_size_option(cache_size_bytes);
+        options.cache_memory = cache_size_option(cache_memory_bytes);
         options.cache_preload = cache_preload_option(cache_preload)?;
         options.cache_puts = cache_puts;
         options.checkpoint = checkpoint.map(str::to_owned);
@@ -2381,6 +2383,119 @@ pub unsafe extern "C" fn moraine_subspace_is_known(name: *const c_char) -> bool 
     catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(false)
 }
 
+/// What the process's block cache has served since it was built.
+///
+/// Process-wide, not per attach: one cache serves every store a process
+/// opens, so these are the host's numbers. Needs no handle for the same
+/// reason, and reports zeros before anything has read.
+///
+/// Metadata (SST indexes, filters, stats) and data blocks are counted
+/// apart because they are budgeted apart — a healthy stack keeps
+/// metadata near fully served, while blocks land wherever the working
+/// set does.
+///
+/// # Safety
+///
+/// Every out-pointer must be valid and writable for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_cache_tally(
+    out_metadata_hits: *mut u64,
+    out_metadata_misses: *mut u64,
+    out_block_hits: *mut u64,
+    out_block_misses: *mut u64,
+    out_errors: *mut u64,
+) -> i32 {
+    let attempt = || {
+        if out_metadata_hits.is_null()
+            || out_metadata_misses.is_null()
+            || out_block_hits.is_null()
+            || out_block_misses.is_null()
+            || out_errors.is_null()
+        {
+            return codes::INVALID_ARGUMENT;
+        }
+        let tally = moraine::cache_tally();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_metadata_hits = tally.metadata_hits;
+            *out_metadata_misses = tally.metadata_misses;
+            *out_block_hits = tally.block_hits;
+            *out_block_misses = tally.block_misses;
+            *out_errors = tally.errors;
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
+/// The store state the catalog's dumps currently serve: the head
+/// snapshot id and batch count. `out_present` is false on a store with no
+/// head yet (mid-bootstrap), where the other outputs are left unwritten.
+///
+/// One point read, so a caller holding rows it dumped earlier can ask
+/// whether anything moved before paying to re-dump them. Both halves are
+/// reported because a maintenance batch reuses the snapshot id while
+/// changing what a scan finds, so the id alone would let a stale row set
+/// keep serving.
+///
+/// # Safety
+///
+/// `handle` must be a pointer previously returned by [`moraine_attach`]
+/// and not yet detached. `out_snapshot_id`, `out_batch_seq`, and
+/// `out_present` must be valid, writable pointers. `probe`, if non-null,
+/// must be safe to call with `probe_ctx` from any thread. `err`, if
+/// non-null, must be a valid, writable [`MoraineError`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_head_stamp(
+    handle: *mut MoraineCatalogHandle,
+    out_snapshot_id: *mut u64,
+    out_batch_seq: *mut u64,
+    out_present: *mut bool,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let attempt = || -> Result<Option<(u64, u64)>, AbiError> {
+        if handle.is_null() {
+            return Err(AbiError::invalid_argument("`handle` is null"));
+        }
+        if out_snapshot_id.is_null() || out_batch_seq.is_null() || out_present.is_null() {
+            return Err(AbiError::invalid_argument("output pointer is null"));
+        }
+        // SAFETY: caller contract for `handle`.
+        let handle_ref = unsafe { &*handle };
+        // SAFETY: `probe`/`probe_ctx` validity is the caller's contract.
+        let head = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                moraine::ffi_support::head_stamp(handle_ref.catalog.reads()),
+            )
+        }?;
+        Ok(head.map(|head| (head.snapshot_id, head.batch_seq)))
+    };
+
+    // SAFETY: `err` validity is the caller's contract.
+    match unsafe { guard(err, attempt) } {
+        Ok(stamp) => {
+            // SAFETY: checked non-null above; caller contract.
+            unsafe {
+                match stamp {
+                    Some((snapshot_id, batch_seq)) => {
+                        *out_snapshot_id = snapshot_id;
+                        *out_batch_seq = batch_seq;
+                        *out_present = true;
+                    }
+                    None => *out_present = false,
+                }
+            }
+            codes::OK
+        }
+        Err(code) => code,
+    }
+}
+
 /// The subspaces a merge can target, comma-separated, for an error
 /// message. Owned — free via `moraine_error_free`; null if allocation
 /// fails.
@@ -3489,6 +3604,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 c_bad.as_ptr(),
                 ptr::null(),
@@ -3526,6 +3642,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3568,6 +3685,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3641,6 +3759,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3738,6 +3857,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3889,6 +4009,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 c_data.as_ptr(),
                 ptr::null(),
@@ -3928,6 +4049,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -3973,6 +4095,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 c_first.as_ptr(),
                 ptr::null(),
@@ -4006,6 +4129,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4051,6 +4175,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4101,6 +4226,7 @@ mod tests {
                 true,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4449,6 +4575,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 ptr::null(),
                 ptr::null(),
@@ -4489,6 +4616,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4550,6 +4678,7 @@ mod tests {
                 false,
                 0,
                 ptr::null(),
+                0,
                 0,
                 0,
                 false,
@@ -4961,6 +5090,7 @@ mod tests {
                 ptr::null(),
                 0,
                 0,
+                0,
                 false,
                 ptr::null(),
                 ptr::null(),
@@ -5087,12 +5217,12 @@ mod tests {
         assert!(refused.message.contains('7'), "{}", refused.message);
     }
 
-    /// An attach that caches its writes fills the cache directory from the
-    /// write path: bootstrapping a fresh store leaves what it wrote behind,
-    /// where an attach that does not cache writes leaves nothing.
+    /// `cache_puts` crosses the ABI and opens either way. What it governs
+    /// is the block cache's insertion policy, which the core tests
+    /// directly (`store::open`): admission is in-memory and reaches disk
+    /// only by eviction, so no directory listing can stand in for it.
     #[test]
-    fn an_attach_caching_writes_fills_the_cache_directory() {
-        let mut cached = Vec::new();
+    fn an_attach_takes_the_write_admission_flag() {
         for cache_puts in [false, true] {
             let dir = TempDir::new("put-cache-store");
             let cache = TempDir::new("put-cache-dir");
@@ -5113,6 +5243,7 @@ mod tests {
                     c_cache.as_ptr(),
                     0,
                     0,
+                    0,
                     cache_puts,
                     ptr::null(),
                     ptr::null(),
@@ -5128,14 +5259,7 @@ mod tests {
             assert_eq!(code, codes::OK, "attach failed: {message:?}");
             // SAFETY: attached above and not yet detached.
             unsafe { moraine_detach(handle) };
-            cached.push(std::fs::read_dir(cache.path()).map_or(0, Iterator::count));
         }
-        assert!(
-            cached[1] > cached[0],
-            "caching writes cached {} entries against {} without it",
-            cached[1],
-            cached[0]
-        );
     }
 
     /// An attach given a cache directory and a cap opens against them: the
@@ -5160,6 +5284,7 @@ mod tests {
                 0,
                 c_cache.as_ptr(),
                 64 * 1024 * 1024,
+                0,
                 0,
                 false,
                 ptr::null(),

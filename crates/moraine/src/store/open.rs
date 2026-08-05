@@ -10,19 +10,17 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use object_store::ObjectStore;
 use slatedb::{
-    Db, DbReader, DbReaderMode,
+    BlockCachePolicy, CacheTarget, Db, DbReader, DbReaderMode,
     admin::AdminBuilder,
-    config::{
-        CheckpointOptions, CheckpointScope, DbReaderOptions, ObjectStoreCacheOptions, PreloadLevel,
-        Settings,
-    },
+    config::{CheckpointOptions, CheckpointScope, DbReaderOptions, Settings},
 };
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
     catalog::CachePreload,
     error::{Error, Result},
-    store::segment::TagSegmentExtractor,
+    store::{cache, handle::ScanShape, key, segment::TagSegmentExtractor},
 };
 
 /// The default WAL flush cadence when none is configured.
@@ -60,11 +58,7 @@ pub(crate) async fn create_checkpoint(db: &Db, lifetime: Option<Duration>) -> Re
 /// than skipping it, so a shortfall means the tail of the store goes
 /// unloaded, not that the largest objects do.
 pub(crate) fn preload_shortfall(store_bytes: u64, cache_size: Option<u64>) -> Option<u64> {
-    let cap = cache_size.or_else(|| {
-        ObjectStoreCacheOptions::default()
-            .max_cache_size_bytes
-            .and_then(|bytes| u64::try_from(bytes).ok())
-    })?;
+    let cap = cache_size.unwrap_or(cache::DEFAULT_CACHE_DISK);
     store_bytes
         .checked_sub(cap)
         .filter(|shortfall| *shortfall > 0)
@@ -82,6 +76,7 @@ pub(crate) struct StoreBuilder<'a> {
     poll_interval: Duration,
     cache_dir: Option<PathBuf>,
     cache_size: Option<u64>,
+    cache_memory: Option<u64>,
     cache_preload: Option<CachePreload>,
     cache_puts: bool,
     checkpoint: Option<Uuid>,
@@ -98,6 +93,7 @@ impl<'a> StoreBuilder<'a> {
             poll_interval: DEFAULT_POLL_INTERVAL,
             cache_dir: None,
             cache_size: None,
+            cache_memory: None,
             cache_preload: None,
             cache_puts: false,
             checkpoint: None,
@@ -144,6 +140,17 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
+    /// Sets how much memory the process-shared cache may hold across both
+    /// slots. Process-wide, not per store: the first store to open sizes
+    /// it and later ones share what it built. `None` (the default) takes
+    /// what SlateDB gives a single store, now for the whole process.
+    /// Never inert — the memory slots exist with or without a
+    /// [`cache_dir`](Self::cache_dir).
+    pub(crate) fn cache_memory(mut self, cache_memory: Option<u64>) -> Self {
+        self.cache_memory = cache_memory;
+        self
+    }
+
     /// Sets what to load into the on-disk object cache while the store
     /// opens. The load is bounded by [`cache_size`](Self::cache_size) and
     /// skips what it cannot fetch, but it runs as part of the open, so an
@@ -177,12 +184,24 @@ impl<'a> StoreBuilder<'a> {
     /// Opens (or creates) the store as a read-write [`Db`].
     pub(crate) async fn open_writer(&self) -> Result<Db> {
         let settings = self.settings();
-        Db::builder(self.path, Arc::clone(&self.object_store))
+        let mut builder = Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
-            .build()
-            .await
-            .map_err(Error::from)
+            .with_block_cache_policy(self.block_cache_policy())
+            .with_metrics_recorder(cache::recorder());
+        if let Some(cache) = cache::shared(&self.cache_config()).await {
+            builder = builder.with_db_cache(cache);
+        }
+        let db = builder.build().await.map_err(Error::from)?;
+        if self.cache_preload.is_some() {
+            let tx = db
+                .begin(slatedb::IsolationLevel::Snapshot)
+                .await
+                .map_err(Error::from)?;
+            self.warm(crate::store::handle::ReadHandle::Tx(&tx)).await;
+            tx.rollback();
+        }
+        Ok(db)
     }
 
     /// Opens the store read-only as a [`DbReader`]. A `DbReader` never opens
@@ -195,17 +214,25 @@ impl<'a> StoreBuilder<'a> {
     /// nothing at all, and reads the fixed cut that checkpoint names.
     pub(crate) async fn open_reader(&self) -> Result<DbReader> {
         let options = DbReaderOptions {
-            object_store_cache_options: self.cache_options(),
             manifest_poll_interval: self.poll_interval,
             ..Default::default()
         };
         let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_metrics_recorder(cache::recorder())
             .with_options(options);
+        if let Some(cache) = cache::shared(&self.cache_config()).await {
+            builder = builder.with_db_cache(cache);
+        }
         if let Some(checkpoint) = self.checkpoint {
             builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint));
         }
-        builder.build().await.map_err(Error::from)
+        let reader = builder.build().await.map_err(Error::from)?;
+        if self.cache_preload.is_some() {
+            self.warm(crate::store::handle::ReadHandle::Reader(&reader))
+                .await;
+        }
+        Ok(reader)
     }
 
     /// Deletes the checkpoint `checkpoint`, unpinning whatever it held
@@ -237,35 +264,118 @@ impl<'a> StoreBuilder<'a> {
     fn settings(&self) -> Settings {
         Settings {
             flush_interval: Some(self.flush_interval),
-            object_store_cache_options: self.cache_options(),
             ..Default::default()
         }
     }
 
-    /// SlateDB's on-disk object cache: fetched object parts under
-    /// `cache_dir` when set, otherwise none, holding at most `cache_size`
-    /// bytes. Every other field stays at SlateDB's defaults (16 GiB,
-    /// 4 MiB parts). A cap wider than the platform can address saturates.
-    /// The in-memory block and metadata caches are a separate mechanism and
-    /// keep their own defaults.
-    fn cache_options(&self) -> ObjectStoreCacheOptions {
-        let defaults = ObjectStoreCacheOptions::default();
-
-        ObjectStoreCacheOptions {
-            root_folder: self.cache_dir.clone(),
-            max_cache_size_bytes: match self.cache_size {
-                Some(bytes) => Some(usize::try_from(bytes).unwrap_or(usize::MAX)),
-                None => defaults.max_cache_size_bytes,
-            },
-            cache_on_flush: self.cache_puts,
-            cache_on_compaction: self.cache_puts,
-            preload_disk_cache_on_startup: self.cache_preload.map(|preload| match preload {
-                CachePreload::L0 => PreloadLevel::L0Sst,
-                CachePreload::All => PreloadLevel::AllSst,
-            }),
-            ..defaults
+    /// How this store asks for the process-shared cache. The first store
+    /// to open builds it; a later one with different numbers shares what
+    /// was built, since the budget is the process's and not the store's.
+    fn cache_config(&self) -> cache::CacheConfig {
+        cache::CacheConfig {
+            memory: self.cache_memory,
+            dir: self.cache_dir.clone(),
+            disk_size: self.cache_size,
         }
     }
+
+    /// Whether the blocks of flushed and compacted SSTs enter the cache
+    /// as they are written. Off by default: compaction output goes through
+    /// the same policy, and a merge admitting everything evicts what reads
+    /// had warmed.
+    fn block_cache_policy(&self) -> BlockCachePolicy {
+        let targets: &[CacheTarget] = if self.cache_puts {
+            &[CacheTarget::Index, CacheTarget::Filters, CacheTarget::Stats]
+        } else {
+            &[]
+        };
+        BlockCachePolicy::default()
+            .with_flush_targets(targets)
+            .with_compaction_output_targets(targets)
+    }
+
+    /// Warms the cache before the first query, per `cache_preload`.
+    ///
+    /// Warming is reading: a scan admits the blocks it touches (probe
+    /// shape) and SlateDB caches every SST index and filter it walks
+    /// regardless, so a bounded read over the right subspaces populates
+    /// both slots without naming a single SST. That matters beyond
+    /// convenience — SlateDB's per-SST warm call takes an id type its
+    /// crate does not export, so no caller outside it can name one.
+    ///
+    /// Which subspaces is the whole difference between the levels.
+    /// `'l0'` touches each one just far enough to pull its SST metadata,
+    /// which is what makes a cold probe tolerable; `'all'` additionally
+    /// walks the scan-shaped subspaces whole, so an attach's first
+    /// materialization reads no object storage at all. Neither walks the
+    /// `index` subspace's data blocks: that is the multi-GiB bulk a
+    /// preload must not pull, and it stays reachable at one fetch per
+    /// probed block behind the filters just warmed.
+    ///
+    /// Best-effort throughout: a preload is an optimization, and no open
+    /// should fail because one subspace could not be read.
+    async fn warm(&self, handle: crate::store::handle::ReadHandle<'_>) {
+        let Some(preload) = self.cache_preload else {
+            return;
+        };
+
+        // Every subspace, so each one's SST metadata is resident.
+        let metadata_only = [
+            key::Subspace::System,
+            key::Subspace::Current,
+            key::Subspace::History,
+            key::Subspace::Snapshot,
+            key::Subspace::Changelog,
+            key::Subspace::Index,
+            key::Subspace::Inline,
+        ];
+        // The scan-shaped ones, whose data a materialization walks whole.
+        let whole = [
+            key::Subspace::System,
+            key::Subspace::Current,
+            key::Subspace::History,
+            key::Subspace::Snapshot,
+            key::Subspace::Changelog,
+        ];
+
+        let mut warmed = 0_usize;
+        let mut failed = 0_usize;
+        for subspace in metadata_only {
+            let deep = matches!(preload, CachePreload::All) && whole.contains(&subspace);
+            match warm_subspace(handle, subspace, deep).await {
+                Ok(()) => warmed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        info!(
+            warmed,
+            failed,
+            level = match preload {
+                CachePreload::L0 => "l0",
+                CachePreload::All => "all",
+            },
+            "warmed the cache"
+        );
+    }
+}
+
+/// Reads `subspace` far enough to warm it: one entry for its SST
+/// metadata, or the whole range when `deep`. Blocks are admitted (probe
+/// shape) so what this touches stays resident.
+async fn warm_subspace(
+    handle: crate::store::handle::ReadHandle<'_>,
+    subspace: key::Subspace,
+    deep: bool,
+) -> Result<()> {
+    let mut iterator = handle
+        .scan_prefix(key::subspace_prefix(subspace), .., ScanShape::Probe)
+        .await?;
+    while iterator.next().await?.is_some() {
+        if !deep {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -379,11 +489,12 @@ mod tests {
         assert!(bare.is_err(), "unsegmented reopen must be refused");
     }
 
-    /// A configured `cache_dir` reaches SlateDB: a fresh `DbReader`, whose
-    /// in-memory caches have never seen the store's objects, serves committed
-    /// data and in doing so populates the object cache directory.
+    /// A configured cache directory leaves the store readable. Whether a
+    /// device is created is the shared cache's business and is tested
+    /// there — the process builds one cache, so the first store to open
+    /// decides its shape and a later one cannot assert its own.
     #[tokio::test]
-    async fn cache_dir_backs_the_reader_with_an_on_disk_cache() {
+    async fn cache_dir_backs_the_block_slot_with_a_device() {
         let object_store = memory_store();
         let cache = std::env::temp_dir().join(format!("moraine-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache);
@@ -398,8 +509,6 @@ mod tests {
         db.put(&head, b"head").await.unwrap();
         db.close().await.unwrap();
 
-        // The reader is cold: it must GET the store's blocks, which the disk
-        // cache records under `cache`.
         let reader = StoreBuilder::new("s", object_store)
             .cache_dir(Some(cache.clone()))
             .open_reader()
@@ -408,44 +517,29 @@ mod tests {
         assert_eq!(reader.get(head).await.unwrap().unwrap().as_ref(), b"head");
         reader.close().await.unwrap();
 
-        let populated = std::fs::read_dir(&cache).is_ok_and(|mut entries| entries.next().is_some());
-        assert!(populated, "expected an object cache under {cache:?}");
         let _ = std::fs::remove_dir_all(&cache);
     }
 
-    /// A configured cache size caps the object cache for the writer and the
-    /// reader alike; unset, SlateDB's own default cap stands.
+    /// The cache options a store asks for reach the shared cache's config
+    /// verbatim: memory across both slots, the device and its cap.
     #[test]
-    fn cache_size_caps_the_on_disk_cache() {
+    fn the_cache_config_carries_what_was_asked_for() {
         let object_store = memory_store();
         let unset = StoreBuilder::new("s", Arc::clone(&object_store));
-        assert_eq!(
-            unset.cache_options().max_cache_size_bytes,
-            ObjectStoreCacheOptions::default().max_cache_size_bytes
-        );
+        assert_eq!(unset.cache_config(), cache::CacheConfig::default());
 
-        let capped = StoreBuilder::new("s", object_store).cache_size(Some(64 * 1024 * 1024));
+        let dir = std::path::PathBuf::from("/tmp/moraine-config-test");
+        let configured = StoreBuilder::new("s", object_store)
+            .cache_memory(Some(1 << 30))
+            .cache_dir(Some(dir.clone()))
+            .cache_size(Some(64 * 1024 * 1024));
         assert_eq!(
-            capped.cache_options().max_cache_size_bytes,
-            Some(64 * 1024 * 1024)
-        );
-        assert_eq!(
-            capped
-                .settings()
-                .object_store_cache_options
-                .max_cache_size_bytes,
-            Some(64 * 1024 * 1024)
-        );
-    }
-
-    /// A cap wider than the platform can address saturates rather than
-    /// wrapping to something small.
-    #[test]
-    fn cache_size_saturates_at_the_addressable_maximum() {
-        let capped = StoreBuilder::new("s", memory_store()).cache_size(Some(u64::MAX));
-        assert_eq!(
-            capped.cache_options().max_cache_size_bytes,
-            Some(usize::MAX)
+            configured.cache_config(),
+            cache::CacheConfig {
+                memory: Some(1 << 30),
+                dir: Some(dir),
+                disk_size: Some(64 * 1024 * 1024),
+            }
         );
     }
 
@@ -459,159 +553,69 @@ mod tests {
 
         assert_eq!(preload_shortfall(100, Some(64)), Some(36));
 
-        // No configured cap is not an unbounded one: the store's own cap
+        // No configured cap is not an unbounded one: the device's own cap
         // still governs what a preload may hold.
-        let default_cap = ObjectStoreCacheOptions::default()
-            .max_cache_size_bytes
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .expect("a default cap");
-        assert_eq!(preload_shortfall(default_cap, None), None);
-        assert_eq!(preload_shortfall(default_cap + 1, None), Some(1));
+        assert_eq!(preload_shortfall(cache::DEFAULT_CACHE_DISK, None), None);
+        assert_eq!(
+            preload_shortfall(cache::DEFAULT_CACHE_DISK + 1, None),
+            Some(1)
+        );
     }
 
-    /// Preloading is off unless asked for, and each level reaches the
-    /// writer and the reader alike when it is.
+    /// Writes enter the cache on flush only when asked: compaction output
+    /// goes through the same policy, so admitting everything by default
+    /// would let a merge evict what reads had warmed.
     #[test]
-    fn cache_preload_is_off_until_requested() {
+    fn cache_puts_is_off_until_requested() {
         let object_store = memory_store();
         let unset = StoreBuilder::new("s", Arc::clone(&object_store));
-        assert_eq!(unset.cache_options().preload_disk_cache_on_startup, None);
-
-        let l0 =
-            StoreBuilder::new("s", Arc::clone(&object_store)).cache_preload(Some(CachePreload::L0));
         assert_eq!(
-            l0.cache_options().preload_disk_cache_on_startup,
-            Some(PreloadLevel::L0Sst)
+            unset.block_cache_policy(),
+            BlockCachePolicy::default()
+                .with_flush_targets(&[])
+                .with_compaction_output_targets(&[]),
+            "writes must not be admitted unless asked for"
         );
 
-        let all = StoreBuilder::new("s", object_store).cache_preload(Some(CachePreload::All));
+        let admitted = [CacheTarget::Index, CacheTarget::Filters, CacheTarget::Stats];
+        let caching = StoreBuilder::new("s", object_store).cache_puts(true);
         assert_eq!(
-            all.settings()
-                .object_store_cache_options
-                .preload_disk_cache_on_startup,
-            Some(PreloadLevel::AllSst)
+            caching.block_cache_policy(),
+            BlockCachePolicy::default()
+                .with_flush_targets(&admitted)
+                .with_compaction_output_targets(&admitted)
         );
     }
 
-    /// A reader asked to preload fills its cache directory as it opens —
-    /// before anything has read a key through it.
+    /// A preload leaves the store readable and costs nothing that a read
+    /// would not: it is a read, so the levels differ in reach, not in
+    /// what they may observe.
     #[tokio::test]
-    async fn cache_preload_fills_the_cache_as_the_store_opens() {
+    async fn a_preload_opens_a_readable_store_at_every_level() {
         let object_store = memory_store();
-        let root = std::env::temp_dir().join(format!("moraine-preload-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let head = Key::Sys(SysKey::Head).encode();
 
         let db = StoreBuilder::new("s", Arc::clone(&object_store))
             .flush_interval(Duration::from_millis(1))
             .open_writer()
             .await
             .unwrap();
-        for index in 0..64u64 {
-            let key = Key::Snapshot { snapshot_id: index }.encode();
-            db.put(&key, &vec![b'v'; 16 * 1024]).await.unwrap();
-        }
+        db.put(&head, b"head").await.unwrap();
         db.flush().await.unwrap();
         db.close().await.unwrap();
 
-        // Two cold readers over the same store, differing only in whether
-        // they preload. Neither is read from, so only the preloading one
-        // has any reason to have fetched anything.
-        let mut cached = Vec::new();
-        for (tag, preload) in [("off", None), ("on", Some(CachePreload::All))] {
-            let cache = root.join(tag);
+        for preload in [None, Some(CachePreload::L0), Some(CachePreload::All)] {
             let reader = StoreBuilder::new("s", Arc::clone(&object_store))
-                .cache_dir(Some(cache.clone()))
                 .cache_preload(preload)
                 .open_reader()
                 .await
                 .unwrap();
+            assert_eq!(
+                reader.get(head.clone()).await.unwrap().unwrap().as_ref(),
+                b"head",
+                "preload {preload:?} left the store unreadable"
+            );
             reader.close().await.unwrap();
-            cached.push(cached_bytes(&cache));
         }
-
-        assert!(
-            cached[1] > cached[0],
-            "preloading cached {} bytes against {} without it: the open is not filling the cache",
-            cached[1],
-            cached[0]
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Caching writes is off unless asked for, and reaches the writer and
-    /// the reader alike when it is.
-    #[test]
-    fn cache_puts_is_off_until_requested() {
-        let object_store = memory_store();
-        let unset = StoreBuilder::new("s", Arc::clone(&object_store));
-        assert!(!unset.cache_options().cache_on_flush);
-        assert!(!unset.cache_options().cache_on_compaction);
-
-        let caching = StoreBuilder::new("s", object_store).cache_puts(true);
-        assert!(caching.cache_options().cache_on_flush);
-        assert!(caching.cache_options().cache_on_compaction);
-        assert!(caching.settings().object_store_cache_options.cache_on_flush);
-        assert!(
-            caching
-                .settings()
-                .object_store_cache_options
-                .cache_on_compaction
-        );
-    }
-
-    /// A writer that caches its writes fills the cache directory with what
-    /// it flushed, without anything having read the store back.
-    #[tokio::test]
-    async fn cache_puts_fills_the_cache_from_the_write_path() {
-        let object_store = memory_store();
-        let root = std::env::temp_dir().join(format!("moraine-put-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-
-        // The same workload twice, differing only in whether writes are
-        // cached: what the flush wrote must show up on disk only in the
-        // second, since nothing here reads the store back.
-        let mut sizes = Vec::new();
-        for (tag, cache_puts) in [("off", false), ("on", true)] {
-            let cache = root.join(tag);
-            let db = StoreBuilder::new(tag, Arc::clone(&object_store))
-                .flush_interval(Duration::from_millis(1))
-                .cache_dir(Some(cache.clone()))
-                .cache_puts(cache_puts)
-                .open_writer()
-                .await
-                .unwrap();
-            for index in 0..64u64 {
-                let key = Key::Snapshot { snapshot_id: index }.encode();
-                db.put(&key, &vec![b'v'; 16 * 1024]).await.unwrap();
-            }
-            db.flush().await.unwrap();
-            db.close().await.unwrap();
-            sizes.push(cached_bytes(&cache));
-        }
-
-        assert!(
-            sizes[1] > sizes[0],
-            "caching writes left {} bytes cached against {} without it: the flush is not \
-             reaching the cache",
-            sizes[1],
-            sizes[0]
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Total size of every file under `dir`, zero if it does not exist.
-    fn cached_bytes(dir: &std::path::Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return 0;
-        };
-        entries.flatten().fold(0, |total, entry| {
-            let Ok(kind) = entry.file_type() else {
-                return total;
-            };
-            if kind.is_dir() {
-                return total + cached_bytes(&entry.path());
-            }
-            total + entry.metadata().map_or(0, |meta| meta.len())
-        })
     }
 }

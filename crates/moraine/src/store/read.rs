@@ -4,7 +4,7 @@
 use crate::{
     error::{Error, Result},
     store::{
-        handle::ReadHandle,
+        handle::{ReadHandle, ScanShape},
         key::{CurrentKey, EntityKey, Key, Subspace, SysKey, subspace_prefix},
         proto::{
             ChangelogValue, ColumnValue, DataFileValue, DeleteFileValue, FileColumnStatsValue,
@@ -103,15 +103,16 @@ pub(crate) async fn read_singleton<M: prost::Message + Default>(
         .transpose()
 }
 
-/// Scans every key under `prefix`, decoding each entry with `extract`;
-/// `extract` rejects keys of the wrong kind with its scan's corruption
-/// error.
+/// Scans every key under `prefix` with the admission behaviour `shape`
+/// names, decoding each entry with `extract`; `extract` rejects keys of
+/// the wrong kind with its scan's corruption error.
 pub(crate) async fn scan_decode<T>(
     handle: ReadHandle<'_>,
     prefix: Vec<u8>,
+    shape: ScanShape,
     mut extract: impl FnMut(Key, &[u8]) -> Result<T>,
 ) -> Result<Vec<T>> {
-    let mut iter = handle.scan_prefix(prefix, ..).await?;
+    let mut iter = handle.scan_prefix(prefix, .., shape).await?;
     let mut records = Vec::new();
     while let Some(entry) = iter.next().await? {
         records.push(extract(Key::decode(&entry.key)?, &entry.value)?);
@@ -202,6 +203,7 @@ pub(crate) async fn scan_snapshots(handle: ReadHandle<'_>) -> Result<Vec<Snapsho
     scan_decode(
         handle,
         subspace_prefix(Subspace::Snapshot),
+        ScanShape::Bulk,
         |key, bytes| match key {
             Key::Snapshot { .. } => value::decode_value(bytes),
             other => Err(Error::Corruption(format!(
@@ -252,6 +254,7 @@ pub(crate) async fn scan_schema_versions(handle: ReadHandle<'_>) -> Result<Vec<(
     scan_decode(
         handle,
         subspace_prefix(Subspace::SchemaVersion),
+        ScanShape::Bulk,
         |key, bytes| match key {
             Key::SchemaVersion {
                 table_id,
@@ -273,6 +276,7 @@ pub(crate) async fn scan_current_entities(handle: ReadHandle<'_>) -> Result<Vec<
     scan_decode(
         handle,
         subspace_prefix(Subspace::Current),
+        ScanShape::Bulk,
         |key, bytes| match key {
             Key::Current(CurrentKey::Entity(entity)) => decode_entity(entity, bytes),
             Key::Current(CurrentKey::GcFile { .. }) => {
@@ -295,6 +299,7 @@ pub(crate) async fn scan_history_entities(handle: ReadHandle<'_>) -> Result<Vec<
     scan_decode(
         handle,
         subspace_prefix(Subspace::History),
+        ScanShape::Bulk,
         |key, bytes| match key {
             Key::History(history) if !history.entity.is_versioned() => Err(Error::Corruption(
                 format!("unversioned key in history scan: {:?}", history.entity),

@@ -152,6 +152,77 @@ void CensusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 	output.SetCardinality(count);
 }
 
+// moraine_cache_tally: what the block cache has served.
+//
+// Takes no lake name because it has nothing to take one for: a process
+// keeps one cache and every attached store reads through it, so the
+// numbers are the host's. One row, so it composes into a monitoring
+// query without an aggregate.
+struct TallyBindData : public duckdb::FunctionData {
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		return duckdb::make_uniq<TallyBindData>();
+	}
+	bool Equals(const duckdb::FunctionData &) const override {
+		return true;
+	}
+};
+
+duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &,
+                                                   duckdb::vector<duckdb::LogicalType> &return_types,
+                                                   duckdb::vector<duckdb::string> &names) {
+	names = {"metadata_hits",  "metadata_misses",   "metadata_hit_rate", "block_hits",
+	         "block_misses",   "block_hit_rate",    "errors"};
+	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
+	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
+	                duckdb::LogicalType::UBIGINT};
+	return duckdb::make_uniq<TallyBindData>();
+}
+
+struct TallyGlobalState : public duckdb::GlobalTableFunctionState {
+	bool emitted = false;
+};
+
+duckdb::unique_ptr<duckdb::GlobalTableFunctionState> TallyInitGlobal(duckdb::ClientContext &,
+                                                                     duckdb::TableFunctionInitInput &) {
+	return duckdb::make_uniq<TallyGlobalState>();
+}
+
+void TallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &state = data.global_state->Cast<TallyGlobalState>();
+	if (state.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.emitted = true;
+
+	uint64_t metadata_hits = 0;
+	uint64_t metadata_misses = 0;
+	uint64_t block_hits = 0;
+	uint64_t block_misses = 0;
+	uint64_t errors = 0;
+	if (moraine_cache_tally(&metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors) != MORAINE_OK) {
+		throw duckdb::InternalException("moraine_cache_tally: could not read the cache counters");
+	}
+
+	// NULL rather than zero before anything has been looked up: a rate
+	// over no lookups is not zero, it is absent, and a monitoring query
+	// that averaged the difference would be reading a lie.
+	auto rate = [](uint64_t hits, uint64_t misses) {
+		auto total = hits + misses;
+		return total == 0 ? duckdb::Value(duckdb::LogicalType::DOUBLE)
+		                  : duckdb::Value::DOUBLE(static_cast<double>(hits) / static_cast<double>(total));
+	};
+
+	output.SetValue(0, 0, duckdb::Value::UBIGINT(metadata_hits));
+	output.SetValue(1, 0, duckdb::Value::UBIGINT(metadata_misses));
+	output.SetValue(2, 0, rate(metadata_hits, metadata_misses));
+	output.SetValue(3, 0, duckdb::Value::UBIGINT(block_hits));
+	output.SetValue(4, 0, duckdb::Value::UBIGINT(block_misses));
+	output.SetValue(5, 0, rate(block_hits, block_misses));
+	output.SetValue(6, 0, duckdb::Value::UBIGINT(errors));
+	output.SetCardinality(1);
+}
+
 } // namespace
 
 void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
@@ -159,6 +230,9 @@ void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	                             CensusInitGlobal);
 	census.named_parameters["live"] = duckdb::LogicalType::BOOLEAN;
 	loader.RegisterFunction(census);
+
+	duckdb::TableFunction tally("moraine_cache_tally", {}, TallyImpl, TallyBind, TallyInitGlobal);
+	loader.RegisterFunction(tally);
 }
 
 } // namespace moraine_duckdb

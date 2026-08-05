@@ -25,13 +25,48 @@ const SCAN_READ_AHEAD_BYTES: usize = 4 * 1024 * 1024;
 /// from a round-trip count into a throughput number.
 const SCAN_FETCH_TASKS: usize = 8;
 
+/// The shape of a scan, which decides its block-cache admission. Every
+/// scanning read path names one; none inherits a default it never chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanShape {
+    /// A whole-subspace walk (materialization, census, reclamation).
+    /// Its reuse is absorbed by the row-level caches, so its blocks are
+    /// not admitted — caching them would only evict the probe working set.
+    Bulk,
+    /// A targeted lookup (index probes, changelog replays). Its reuse is
+    /// real and block-grained, so its blocks are admitted.
+    Probe,
+}
+
 /// Scan options for reading a whole subspace, as every materialization
-/// does.
+/// does. Blocks are not admitted to the cache.
 fn bulk_scan_options() -> ScanOptions {
     ScanOptions {
         read_ahead_bytes: SCAN_READ_AHEAD_BYTES,
         max_fetch_tasks: SCAN_FETCH_TASKS,
+        cache_blocks: false,
         ..ScanOptions::default()
+    }
+}
+
+/// Scan options for a targeted lookup. Same read-ahead as a bulk scan —
+/// the fetch stops at the range's end, so a small probe never over-reads —
+/// but its blocks are admitted to the cache.
+fn probe_scan_options() -> ScanOptions {
+    ScanOptions {
+        read_ahead_bytes: SCAN_READ_AHEAD_BYTES,
+        max_fetch_tasks: SCAN_FETCH_TASKS,
+        cache_blocks: true,
+        ..ScanOptions::default()
+    }
+}
+
+impl ScanShape {
+    fn options(self) -> ScanOptions {
+        match self {
+            Self::Bulk => bulk_scan_options(),
+            Self::Probe => probe_scan_options(),
+        }
     }
 }
 
@@ -65,21 +100,23 @@ impl ReadHandle<'_> {
         matches!(self, Self::Tx(_))
     }
 
-    /// Scan keys sharing `prefix`, restricted to `subrange`.
+    /// Scan keys sharing `prefix`, restricted to `subrange`, with the
+    /// admission behaviour `shape` names.
     ///
-    /// Reads ahead and fetches concurrently: every caller here walks a
-    /// range rather than probing it, so paying a round trip per block is
-    /// never what is wanted.
+    /// Reads ahead and fetches concurrently either way: even a probe walks
+    /// its matching range, and paying a round trip per block is never what
+    /// is wanted.
     pub(crate) async fn scan_prefix<P, T>(
         &self,
         prefix: P,
         subrange: T,
+        shape: ScanShape,
     ) -> Result<DbIterator, slatedb::Error>
     where
         P: AsRef<[u8]> + Send,
         T: ByteRangeBounds + Send,
     {
-        let options = bulk_scan_options();
+        let options = shape.options();
         match self {
             Self::Tx(tx) => {
                 tx.scan_prefix_with_options(prefix, subrange, &options)
@@ -119,5 +156,30 @@ impl ReadSession {
         if let Self::Tx(tx) = self {
             tx.rollback();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bulk scan reads ahead but admits nothing: its reuse is served by
+    /// the row-level caches, so caching its blocks is pure pollution.
+    #[test]
+    fn bulk_scans_read_ahead_and_admit_nothing() {
+        let options = ScanShape::Bulk.options();
+        assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
+        assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
+        assert!(!options.cache_blocks);
+    }
+
+    /// A probe admits its blocks — its reuse is real and block-grained —
+    /// and keeps the same read-ahead, which stops at the range's end.
+    #[test]
+    fn probe_scans_admit_their_blocks() {
+        let options = ScanShape::Probe.options();
+        assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
+        assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
+        assert!(options.cache_blocks);
     }
 }

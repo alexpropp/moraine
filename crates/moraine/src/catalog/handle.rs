@@ -28,6 +28,7 @@ use crate::{
         inline::{InlineScanKind, materialize_inline_rows},
         projection::{
             ProjectionCache, cache_epoch, cached_head_view, held_head_view, install_head_view_at,
+            install_shared_current_entities, shared_current_entities,
         },
         scoped_read,
     },
@@ -35,7 +36,7 @@ use crate::{
     store::{
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
-        handle::{ReadHandle, ReadSession},
+        handle::{ReadHandle, ReadSession, ScanShape},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
@@ -45,6 +46,7 @@ use crate::{
             index_kind_prefix, subspace_prefix,
         },
         open::{self, StoreBuilder},
+        proto::HeadValue,
     },
     transaction::{MigrationReport, Transaction, commit, index_maintenance, migration},
 };
@@ -184,6 +186,12 @@ struct ReadTally {
     cache_hits: AtomicU64,
     head_reads: AtomicU64,
     materialize_micros: AtomicU64,
+    // How many times each half of the shared record set was actually
+    // scanned from the store. At one head each should move at most once,
+    // however many consumers read at it — the tally is what tests pin
+    // that with.
+    current_scans: AtomicU64,
+    history_scans: AtomicU64,
 }
 
 impl ReadTally {
@@ -260,21 +268,27 @@ pub struct CatalogOptions {
     /// in-memory caches: a block cache and a metadata cache, both at
     /// SlateDB's own sizes and not configurable here.
     pub cache_dir: Option<std::path::PathBuf>,
-    /// How many bytes of disk the on-disk object cache may hold. The cap is
-    /// per open catalog, not per directory, so catalogs sharing a
-    /// [`cache_dir`](Self::cache_dir) each spend up to it — size the volume
-    /// for the number of catalogs a process attaches. `None` (the default)
-    /// leaves SlateDB's own cap of 16 GiB in force, and without a
-    /// `cache_dir` there is no object cache to bound. The in-memory caches
-    /// are a separate mechanism and are unaffected.
+    /// How many bytes of disk the block cache's device may hold, for the
+    /// whole process rather than per catalog: one cache is shared by every
+    /// store a process opens, and the first to open sizes it. `None` (the
+    /// default) leaves a cap of 16 GiB in force, and without a
+    /// [`cache_dir`](Self::cache_dir) there is no device to bound.
     pub cache_size: Option<u64>,
-    /// What to load into the on-disk object cache while the catalog opens,
-    /// so the first query pays no first touch. The load is bounded by
-    /// [`cache_size`](Self::cache_size) and best-effort — a fetch that
-    /// fails is skipped, never fatal — but it is part of the open, so an
+    /// How much memory that cache may hold across both of its slots — SST
+    /// metadata, which is pinned so a scan cannot evict the filters every
+    /// probe walks, and data blocks, which tier to the device when one is
+    /// configured. Process-wide, like [`cache_size`](Self::cache_size).
+    /// `None` (the default) takes what SlateDB gives a single store, now
+    /// for the whole process. Never inert: the memory slots exist with or
+    /// without a `cache_dir`, and this is the number to weigh against
+    /// DuckDB's own `memory_limit` when sizing a host.
+    pub cache_memory: Option<u64>,
+    /// What to warm into the cache while the catalog opens, so the first
+    /// query pays no first touch. Warming is reading, so it is bounded by
+    /// the same caps and best-effort throughout — a subspace that cannot
+    /// be read is skipped, never fatal — but it is part of the open, so an
     /// open that preloads returns only once it has. `None` (the default)
-    /// loads nothing, leaving the cache to fill as reads ask for objects.
-    /// Inert without a [`cache_dir`](Self::cache_dir).
+    /// warms nothing, leaving the cache to fill as reads ask for blocks.
     pub cache_preload: Option<CachePreload>,
     /// Whether objects this catalog writes are cached as they are written,
     /// rather than only when something reads them back. A flushed or
@@ -322,6 +336,7 @@ impl Default for CatalogOptions {
             flush_interval: Duration::from_millis(100),
             cache_dir: None,
             cache_size: None,
+            cache_memory: None,
             cache_preload: None,
             cache_puts: false,
             data_path: None,
@@ -497,11 +512,25 @@ impl ReadOnlyCatalog {
         &self.projections
     }
 
-    /// Whether this catalog maintains served projections: read-write only —
-    /// a read-only catalog has no local commits to fold, so its dumps
-    /// always scan.
-    pub(crate) fn maintains_projections(&self) -> bool {
-        matches!(self.store.as_ref(), Store::Writer(_))
+    /// Records that the `current` half of the shared record set was
+    /// scanned from the store.
+    pub(crate) fn tally_current_scan(&self) {
+        self.reads.current_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that the `history` half was scanned from the store.
+    pub(crate) fn tally_history_scan(&self) {
+        self.reads.history_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many times each half of the shared record set has been scanned:
+    /// `(current, history)`. At one head each moves at most once.
+    #[cfg(test)]
+    pub(crate) fn entity_scan_tallies(&self) -> (u64, u64) {
+        (
+            self.reads.current_scans.load(Ordering::Relaxed),
+            self.reads.history_scans.load(Ordering::Relaxed),
+        )
     }
 
     /// Records that a read resolved the head from the store.
@@ -558,10 +587,16 @@ impl ReadOnlyCatalog {
     /// A read-only handle follows another process's commits and has no
     /// such premise, so it always reads.
     pub(crate) fn writer_head_view(&self) -> Option<Arc<CatalogSnapshot>> {
-        if !self.maintains_projections() {
+        if !self.holds_the_writer() {
             return None;
         }
         held_head_view(&self.projections)
+    }
+
+    /// Whether this handle is the store's writer, and so the only thing
+    /// that can move `sys/head`.
+    pub(crate) fn holds_the_writer(&self) -> bool {
+        matches!(self.store.as_ref(), Store::Writer(_))
     }
 
     /// An immutable view of the catalog at the latest committed snapshot.
@@ -834,9 +869,32 @@ impl ReadOnlyCatalog {
             return Ok(Arc::new(refreshed));
         }
 
+        // Derive from the shared `current` half before paying a scan. The
+        // stamp is re-verified under the same consistent cut the build
+        // reads through, so a derived view equals a scanned one; a store
+        // that moved in between reports `None` and falls through.
+        if let Some(current) = shared_current_entities(&self.projections, &head)
+            && let Some(view) = commit::materialize_from(handle, &head, &current).await?
+        {
+            self.reads.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::new(view));
+        }
+
         let started = Instant::now();
-        let view = commit::materialize(handle, None).await?;
+        let (view, records) = commit::materialize_capturing(handle).await?;
         self.reads.materialized(started.elapsed());
+        self.tally_current_scan();
+        // Stamped with the state the *view* settled at — the consistent
+        // cut may be newer than the head read above, never mismatched
+        // with the records.
+        install_shared_current_entities(
+            &self.projections,
+            HeadValue {
+                snapshot_id: view.snapshot.snapshot_id,
+                batch_seq: view.batch_seq,
+            },
+            records,
+        );
 
         Ok(Arc::new(view))
     }
@@ -866,7 +924,12 @@ impl ReadOnlyCatalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            // The head view, not a fresh materialization: a probe that
+            // rematerializes re-scans `current` under a bulk shape, which
+            // admits no blocks, so every lookup pays a store read for a
+            // view the handle already holds. The scan the probe actually
+            // needs is the `index` one below, and that one is warm.
+            let view = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -934,7 +997,12 @@ impl ReadOnlyCatalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            // The head view, not a fresh materialization: a probe that
+            // rematerializes re-scans `current` under a bulk shape, which
+            // admits no blocks, so every lookup pays a store read for a
+            // view the handle already holds. The scan the probe actually
+            // needs is the `index` one below, and that one is warm.
+            let view = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -1014,7 +1082,12 @@ impl ReadOnlyCatalog {
         let handle = session.handle();
 
         let outcome = async {
-            let view = commit::materialize(handle, None).await?;
+            // The head view, not a fresh materialization: a probe that
+            // rematerializes re-scans `current` under a bulk shape, which
+            // admits no blocks, so every lookup pays a store read for a
+            // view the handle already holds. The scan the probe actually
+            // needs is the `index` one below, and that one is warm.
+            let view = self.head_view(handle).await?;
             let info = view
                 .index_by_id(table, index)
                 .ok_or_else(|| Error::NotFound(format!("index {index} on table {table}")))?;
@@ -1469,7 +1542,7 @@ impl ReadOnlyCatalog {
         let session = self.begin_read().await?;
         let first = session
             .handle()
-            .scan_prefix(kind_prefix, suffix..)
+            .scan_prefix(kind_prefix, suffix.., ScanShape::Probe)
             .await
             .map_err(Error::from)?
             .next()
@@ -1689,6 +1762,7 @@ impl Catalog {
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts);
         let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
@@ -1771,6 +1845,7 @@ impl Catalog {
         let store = StoreBuilder::new(&options.path, object_store)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .poll_interval(options.reader_poll_interval)
@@ -1848,6 +1923,7 @@ impl Catalog {
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)
+            .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts)
             .open_writer()

@@ -246,7 +246,7 @@ fn renaming_one_column_stages_no_write_for_any_sibling() {
         schema_changed_table_ids: Vec::new(),
         deleted_data_file_ids: Vec::new(),
     };
-    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, vec![], vec![], None), 1);
+    let mut setup = Transaction::new(CatalogSnapshot::build(snap0, &[], &[], None), 1);
     let schema = setup.create_schema("s").unwrap();
     let table = setup
         .create_table(
@@ -313,7 +313,7 @@ fn register_then_expire_in_one_commit_stages_no_orphaned_file_column_stats() {
         schema_changed_table_ids: Vec::new(),
         deleted_data_file_ids: Vec::new(),
     };
-    let empty = CatalogSnapshot::build(snap0, vec![], vec![], None);
+    let empty = CatalogSnapshot::build(snap0, &[], &[], None);
     let mut setup = Transaction::new(empty, 1);
     let schema = setup.create_schema("s").unwrap();
     let table = setup
@@ -605,7 +605,11 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
     // Both backfill rows produced a stored entry.
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(IndexKind::Unique, index_id.get()), ..)
+        .scan_prefix(
+            index_index_prefix(IndexKind::Unique, index_id.get()),
+            ..,
+            crate::store::handle::ScanShape::Bulk,
+        )
         .await
         .unwrap();
     let mut count = 0;
@@ -2364,7 +2368,11 @@ async fn scan_index_entries(
     let mut entries = Vec::new();
     for kind in [IndexKind::Unique, IndexKind::Multi] {
         let mut iter = ReadHandle::Tx(&tx)
-            .scan_prefix(index_index_prefix(kind, index.get()), ..)
+            .scan_prefix(
+                index_index_prefix(kind, index.get()),
+                ..,
+                crate::store::handle::ScanShape::Bulk,
+            )
             .await
             .unwrap();
         while let Some(entry) = iter.next().await.unwrap() {
@@ -2774,7 +2782,11 @@ async fn reclaiming_a_dropped_index_deletes_its_orphaned_entries() {
     // The index range is empty afterward.
     let tx = catalog.begin_write_tx().await.unwrap();
     let mut iter = ReadHandle::Tx(&tx)
-        .scan_prefix(index_index_prefix(IndexKind::Unique, index.get()), ..)
+        .scan_prefix(
+            index_index_prefix(IndexKind::Unique, index.get()),
+            ..,
+            crate::store::handle::ScanShape::Bulk,
+        )
         .await
         .unwrap();
     assert!(iter.next().await.unwrap().is_none());
@@ -2818,7 +2830,11 @@ async fn index_entry_count(catalog: &crate::catalog::Catalog) -> usize {
     let mut total = 0;
     for kind in [IndexKind::Unique, IndexKind::Multi] {
         let mut iter = ReadHandle::Tx(&tx)
-            .scan_prefix(index_kind_prefix(kind), ..)
+            .scan_prefix(
+                index_kind_prefix(kind),
+                ..,
+                crate::store::handle::ScanShape::Bulk,
+            )
             .await
             .unwrap();
         while iter.next().await.unwrap().is_some() {

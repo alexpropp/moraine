@@ -18,7 +18,7 @@ use tracing::warn;
 use crate::{
     error::{Error, Result},
     store::{
-        handle::ReadHandle,
+        handle::{ReadHandle, ScanShape},
         key::{CurrentKey, Key, Subspace, subspace_prefix},
     },
 };
@@ -255,7 +255,9 @@ fn count(value: usize) -> u32 {
 ///
 /// Costs a full read of the subspace.
 pub(crate) async fn scan_live(handle: ReadHandle<'_>, subspace: Subspace) -> Result<LiveTally> {
-    let mut iterator = handle.scan_prefix(subspace_prefix(subspace), ..).await?;
+    let mut iterator = handle
+        .scan_prefix(subspace_prefix(subspace), .., ScanShape::Bulk)
+        .await?;
     let mut tally = LiveTally::default();
 
     while let Some(entry) = iterator.next().await? {

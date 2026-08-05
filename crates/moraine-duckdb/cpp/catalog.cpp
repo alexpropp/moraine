@@ -737,6 +737,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	uint64_t flush_interval_ms = 0;
 	std::string cache_dir;
 	uint64_t cache_size_bytes = 0;
+	uint64_t cache_memory_bytes = 0;
 	bool cache_puts = false;
 	uint8_t cache_preload = 0;
 	std::string checkpoint;
@@ -771,6 +772,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 			cache_dir = option.second.GetValue<std::string>();
 		} else if (name == "cache_size") {
 			cache_size_bytes = option.second.GetValue<uint64_t>();
+		} else if (name == "cache_memory") {
+			cache_memory_bytes = option.second.GetValue<uint64_t>();
 		} else if (name == "cache_puts") {
 			cache_puts = option.second.GetValue<bool>();
 		} else if (name == "cache_preload") {
@@ -802,7 +805,8 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// since the pool is fixed for the attach's life.
 	uint64_t host_threads = duckdb::DatabaseInstance::GetDatabase(context).NumberOfThreads();
 	auto code = moraine_attach(info.path.c_str(), is_s3 ? &s3 : nullptr, read_only, encrypted, flush_interval_ms,
-	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_preload, cache_puts,
+	                           cache_dir.empty() ? nullptr : cache_dir.c_str(), cache_size_bytes, cache_memory_bytes,
+	                           cache_preload, cache_puts,
 	                           data_path.empty() ? nullptr : data_path.c_str(),
 	                           checkpoint.empty() ? nullptr : checkpoint.c_str(), host_threads,
 	                           moraine_shim_is_interrupted, &context, &handle, &err);
@@ -983,6 +987,29 @@ bool MoraineCatalog::InMemory() {
 
 std::string MoraineCatalog::GetDBPath() {
 	return path_;
+}
+
+std::shared_ptr<const MetadataRows> MoraineCatalog::HeldMetadataRows(const MetadataTableSpec &spec,
+                                                                     uint64_t snapshot_id,
+                                                                     uint64_t batch_seq) const {
+	std::lock_guard<std::mutex> guard(held_rows_lock_);
+	auto it = held_rows_.find(&spec);
+	if (it == held_rows_.end()) {
+		return nullptr;
+	}
+	// The whole stamp, not the snapshot id alone: a maintenance batch
+	// reuses the id while changing what a scan finds, so an id-keyed hit
+	// would serve the state that batch reclaimed.
+	if (it->second.snapshot_id != snapshot_id || it->second.batch_seq != batch_seq) {
+		return nullptr;
+	}
+	return it->second.rows;
+}
+
+void MoraineCatalog::HoldMetadataRows(const MetadataTableSpec &spec, uint64_t snapshot_id, uint64_t batch_seq,
+                                      std::shared_ptr<const MetadataRows> rows) {
+	std::lock_guard<std::mutex> guard(held_rows_lock_);
+	held_rows_[&spec] = HeldRows {snapshot_id, batch_seq, std::move(rows)};
 }
 
 void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {

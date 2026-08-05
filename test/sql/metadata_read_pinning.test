@@ -127,3 +127,111 @@ query I
 SELECT count(*) = max(snapshot_id) + 1 FROM __ducklake_metadata_lake.ducklake_snapshot;
 ----
 true
+
+# Rows dumped for one transaction are held for the next, keyed on the store's
+# head stamp, so a quiet catalog re-crosses the ABI once per commit rather
+# than once per transaction. Held rows must never outlive the state they
+# stand at, which is what the rest of this file pins: each round commits on
+# one connection and reads on the other, so a stamp that failed to
+# invalidate would serve the round's reader the previous round's rows.
+statement ok con2
+INSERT INTO lake.main.t VALUES (3);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+3
+
+statement ok con2
+INSERT INTO lake.main.t VALUES (4);
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+4
+
+# Two held tables read in one statement, so a stale hold on either would
+# disagree with the other: every data file the file table names belongs to a
+# snapshot the snapshot table has, and the snapshot lineage is unbroken.
+query II con1
+SELECT (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file f
+        WHERE f.begin_snapshot > (SELECT max(snapshot_id) FROM __ducklake_metadata_lake.ducklake_snapshot)),
+       (SELECT count(*) FROM __ducklake_metadata_lake.ducklake_snapshot) = max(snapshot_id) + 1
+FROM __ducklake_metadata_lake.ducklake_snapshot;
+----
+0	true
+
+# A batch that mints no snapshot still moves the stamp's other half. Setting
+# an option is such a batch: the snapshot id is unchanged, so rows held under
+# it would keep serving if the batch count were not part of the key.
+statement ok con2
+CALL lake.set_option('parquet_compression', 'zstd');
+
+query I con1
+SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata
+WHERE key = 'parquet_compression' AND value = 'zstd';
+----
+1
+
+# The block cache reports what it served, so the budgets can be sized from
+# measured curves instead of from the defaults. Process-wide and so
+# handle-free: every attached store reads through the one cache.
+query I
+SELECT count(*) FROM moraine_cache_tally();
+----
+1
+
+# Rates are NULL before a lookup and a fraction after — never zero for
+# "nothing asked", which a monitoring query would read as a cold cache.
+query I
+SELECT metadata_hit_rate IS NULL OR metadata_hit_rate BETWEEN 0 AND 1
+FROM moraine_cache_tally();
+----
+true
+
+# Hits and misses are counted apart per slot and add up to the lookups.
+query I
+SELECT metadata_hit_rate IS NOT NULL
+   = ((metadata_hits + metadata_misses) > 0)
+FROM moraine_cache_tally();
+----
+true
+
+# Data files are DuckDB's to cache, not moraine's — but at the tracked
+# version DuckLake's scan path does not route through DuckDB's caching
+# file system, so reading a lake table populates the external file cache
+# not at all, while reading the very same Parquet file directly does.
+#
+# This asserts the *gap*, in the same spirit as the listing-race test: its
+# failure is the signal that DuckLake started caching its data reads and
+# that the data tier is finally inside `memory_limit` as the design wants.
+# Past the inlining row limit deliberately — below it a table has no
+# Parquet file at all and the comparison would be vacuous.
+statement ok con1
+SET enable_external_file_cache = true;
+
+statement ok con1
+CREATE TABLE lake.main.wide AS SELECT range AS a FROM range(500);
+
+query I con1
+SELECT count(*) FROM lake.main.wide;
+----
+500
+
+# Nothing cached from the lake read.
+query I con1
+SELECT count(*) FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+----
+0
+
+# The same bytes, read directly, do cache — so the harness has the cache
+# on and the file system supports it. The lake path is the difference.
+statement ok con1
+SELECT count(*) FROM read_parquet('__TEST_DIR__/pin-data/**/*.parquet');
+
+query I con1
+SELECT count(*) > 0 FROM duckdb_external_file_cache()
+WHERE path LIKE '%pin-data%';
+----
+true

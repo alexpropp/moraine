@@ -1032,6 +1032,7 @@ int32_t moraine_attach(const char *path,
                        uint64_t flush_interval_ms,
                        const char *cache_dir,
                        uint64_t cache_size_bytes,
+                       uint64_t cache_memory_bytes,
                        uint8_t cache_preload,
                        bool cache_puts,
                        const char *data_path,
@@ -1413,6 +1414,52 @@ void moraine_compact_store_free(struct MoraineSubspaceMerge *items, size_t len);
 //
 // `name`, if non-null, must be a valid C string.
 bool moraine_subspace_is_known(const char *name);
+
+// What the process's block cache has served since it was built.
+//
+// Process-wide, not per attach: one cache serves every store a process
+// opens, so these are the host's numbers. Needs no handle for the same
+// reason, and reports zeros before anything has read.
+//
+// Metadata (SST indexes, filters, stats) and data blocks are counted
+// apart because they are budgeted apart — a healthy stack keeps
+// metadata near fully served, while blocks land wherever the working
+// set does.
+//
+// # Safety
+//
+// Every out-pointer must be valid and writable for the duration of the
+// call.
+int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
+                            uint64_t *out_metadata_misses,
+                            uint64_t *out_block_hits,
+                            uint64_t *out_block_misses,
+                            uint64_t *out_errors);
+
+// The store state the catalog's dumps currently serve: the head
+// snapshot id and batch count. `out_present` is false on a store with no
+// head yet (mid-bootstrap), where the other outputs are left unwritten.
+//
+// One point read, so a caller holding rows it dumped earlier can ask
+// whether anything moved before paying to re-dump them. Both halves are
+// reported because a maintenance batch reuses the snapshot id while
+// changing what a scan finds, so the id alone would let a stale row set
+// keep serving.
+//
+// # Safety
+//
+// `handle` must be a pointer previously returned by [`moraine_attach`]
+// and not yet detached. `out_snapshot_id`, `out_batch_seq`, and
+// `out_present` must be valid, writable pointers. `probe`, if non-null,
+// must be safe to call with `probe_ctx` from any thread. `err`, if
+// non-null, must be a valid, writable [`MoraineError`].
+int32_t moraine_head_stamp(struct MoraineCatalogHandle *handle,
+                           uint64_t *out_snapshot_id,
+                           uint64_t *out_batch_seq,
+                           bool *out_present,
+                           MoraineInterruptProbe probe,
+                           void *probe_ctx,
+                           struct MoraineError *err);
 
 // The subspaces a merge can target, comma-separated, for an error
 // message. Owned — free via `moraine_error_free`; null if allocation
