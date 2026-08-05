@@ -54,12 +54,6 @@ deliberately not itemized here.
   `CREATE TABLE` is enough). A test now asserts the race's *presence* against
   the reference chain, so its failure is the signal that the workaround can
   go.
-- **IMPL** — `CACHE_MEMORY` / `META_CACHE_MEMORY`, and the re-mapped
-  machinery behind the existing cache options: `CACHE_DIR`/`CACHE_SIZE` as
-  the block slot's disk tier, `CACHE_PUTS` as the flush/compaction
-  insertion policy, `CACHE_PRELOAD` as the segment-aware manifest-walk
-  warm. The option surface and semantics are specified; the backing is
-  still the per-store object cache today.
 - **DECISION** — The SQL surface for cache-tier hit rates (0009 requires
   the rates observable; the shape — a `moraine_cache_stats` function
   beside `moraine_store_census`, or rows through the log sink — is this
@@ -92,36 +86,36 @@ deliberately not itemized here.
   Whichever is taken first pulls the other with it. A replay's base-view
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
-- **IMPL** — One scan pair per head: the shared decoded record set that the
-  view, the entity dumps, and the unversioned projections all derive from.
-  Today `materialize` and the entity projection each run their own scans
-  and hold their own decoded copies at the same head.
-- **IMPL** — The stamp across the ABI: dumps carrying their head stamp, the
-  shim holding `MetadataRows` per table keyed by it, and the
-  per-transaction pin becoming capture-and-match instead of rebuild.
-- **IMPL** — The process-shared block cache — meta slot pinned in memory,
-  block slot foyer-hybrid to disk — replacing the per-store in-memory
-  caches and the `CachedObjectStore` disk tier, with segment-aware preload
-  via the per-SST warm call and puts via the insertion policy.
-- **IMPL** — Bulk vs probe scan-option constructors, so every read path
-  declares its admission behaviour instead of inheriting a default.
-  Independent of the shared cache: the store layer owns this today.
 - **IMPL** — Per-tier cache hit rates surfaced beside the existing
   row-tier counters (meta hits, block-memory hits, disk hits, store GETs),
-  so `CACHE_MEMORY`/`CACHE_SIZE` are sized from measured curves. The SQL
-  surface is 0006's DECISION.
-- **VALIDATE** — The new test obligations (one scan pair per head, stamp
-  reuse across transactions, disk-tier hits without GETs, one budget across
-  attaches, scans unable to evict the probe path, shape-declared
-  admission, segment-aware preload bounds,
-  `duckdb_external_file_cache()` coverage of the DuckLake read path).
-  Blocked on the IMPL items above.
+  so `CACHE_MEMORY`/`CACHE_SIZE` are sized from measured curves. SlateDB
+  takes a `MetricsRecorder` and its `DbCacheStats` counts per wrapper, so
+  the plumbing exists; the SQL surface is 0006's DECISION.
+- **VALIDATE** — The test obligations still unwritten: disk-tier hits
+  without GETs, one budget across attaches, scans unable to evict the
+  probe path, preload bounds, and `duckdb_external_file_cache()` coverage
+  of the DuckLake read path. The rest are written — one scan pair per
+  head, stamp reuse across transactions, and shape-declared admission all
+  have tests. The first three want the hit-rate counters above to be
+  observable rather than inferred from timing, so they follow that IMPL.
 - **DECISION** — Upstream: a caller-supplied stable cache scope in
   SlateDB. Shared-cache keys are scoped per opened handle by a
   process-local counter, so foyer's disk recovery matches nothing after a
   restart; a scope derived from the store path would make the disk tier
   restart-warm and reclaim the one property the object cache still holds.
   Until then the restart story is preload, at re-fetch cost.
+- **DECISION** — Upstream: export `SsTableId`. `DbCacheManagerOps::warm_sst`
+  and `evict_cached_sst` are public methods whose parameter type lives in
+  a private module (`db_state`), so no caller outside slatedb can name an
+  argument for them. The preload warms by reading instead — cheaper, and
+  subspace-grained rather than SST-grained — so this buys precision
+  rather than capability, and nothing waits on it.
+- **DECISION** — Whether the first attach sizing the process-wide cache
+  is the right rule. One cache means one shape: a second attach naming a
+  different `CACHE_MEMORY`, or a `CACHE_DIR` where the first named none,
+  is ignored today. The alternatives are refusing the mismatch loudly or
+  letting a later attach grow the budget; neither is obviously right, and
+  a single-catalog host never notices.
 - **MEASURE** — Index-probe latency served from the hybrid disk tier
   against the object cache it replaces, on a multi-GiB `index` run: the
   block-grain-beats-part-grain claim is argued from grain arithmetic, not
