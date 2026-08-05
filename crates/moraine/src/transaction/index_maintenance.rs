@@ -19,7 +19,7 @@ use tracing::warn;
 use crate::{
     error::{Error, Result},
     store::{
-        handle::ReadHandle,
+        handle::{ReadHandle, ScanShape},
         index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
         key::{
             IndexKey, IndexKind, Key, index_index_prefix, index_multi_value_prefix,
@@ -348,7 +348,9 @@ pub(crate) async fn reclaim_entries_from(
         _ => Vec::new(),
     };
 
-    let mut iter = ReadHandle::Tx(tx).scan_prefix(prefix, suffix..).await?;
+    let mut iter = ReadHandle::Tx(tx)
+        .scan_prefix(prefix, suffix.., ScanShape::Bulk)
+        .await?;
     let mut deleted = 0;
     let mut last = None;
     while deleted < limit {
@@ -387,7 +389,10 @@ pub(crate) async fn lookup_row_ids(
     }
 
     let prefix = index_multi_value_prefix(index_id, key);
-    let mut iter = reader.scan_prefix(prefix, ..).await.map_err(Error::from)?;
+    let mut iter = reader
+        .scan_prefix(prefix, .., ScanShape::Probe)
+        .await
+        .map_err(Error::from)?;
     let mut row_ids = Vec::new();
     while let Some(entry) = iter.next().await.map_err(Error::from)? {
         match Key::decode(&entry.key)? {
@@ -453,7 +458,7 @@ pub(crate) async fn range_row_ids(
     };
 
     let mut iter = reader
-        .scan_prefix(prefix, (start, end))
+        .scan_prefix(prefix, (start, end), ScanShape::Probe)
         .await
         .map_err(Error::from)?;
     let mut row_ids = Vec::new();
@@ -489,7 +494,7 @@ pub(crate) async fn null_prefix_row_ids(
     // exact-value scan; dropping it turns the bytes into a true leading prefix.
     scan_prefix.pop();
     let mut iter = reader
-        .scan_prefix(scan_prefix, ..)
+        .scan_prefix(scan_prefix, .., ScanShape::Probe)
         .await
         .map_err(Error::from)?;
     let mut row_ids = Vec::new();

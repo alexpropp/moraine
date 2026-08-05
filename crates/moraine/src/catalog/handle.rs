@@ -35,7 +35,7 @@ use crate::{
     store::{
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
-        handle::{ReadHandle, ReadSession},
+        handle::{ReadHandle, ReadSession, ScanShape},
         index_encoding::{
             CanonicalKey, Direction, IndexKeyValue, NullOrder, encode_ordered_values,
         },
@@ -1469,7 +1469,7 @@ impl ReadOnlyCatalog {
         let session = self.begin_read().await?;
         let first = session
             .handle()
-            .scan_prefix(kind_prefix, suffix..)
+            .scan_prefix(kind_prefix, suffix.., ScanShape::Probe)
             .await
             .map_err(Error::from)?
             .next()
