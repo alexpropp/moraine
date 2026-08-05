@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "moraine"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "moraine-duckdb"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "arrow",
  "cbindgen",

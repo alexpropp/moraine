@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/morainedb/moraine/compare/v0.4.4...v0.4.5) - 2026-08-05
+
+### Added
+
+- close out the open work across RFCs 0001, 0007, 0011, 0012, 0014, 0017, 0018, 0021 ([#86](https://github.com/morainedb/moraine/pull/86))
+
+### Fixed
+
+- keep the block cache's tasks off an attach's runtime ([#98](https://github.com/morainedb/moraine/pull/98))
+- re-attempt a genesis open that is fenced mid-bootstrap ([#93](https://github.com/morainedb/moraine/pull/93))
+- materialize a metadata table once per DuckDB transaction ([#87](https://github.com/morainedb/moraine/pull/87))
+
+### Other
+
+- unify the cache stack across DuckDB, the shim, and SlateDB ([#96](https://github.com/morainedb/moraine/pull/96))
+- read a commit's index-maintenance files concurrently ([#95](https://github.com/morainedb/moraine/pull/95))
+- resolve the head from the held view on a read-write handle ([#94](https://github.com/morainedb/moraine/pull/94))
+- *(deps)* Bump slatedb from 0.14.1 to 0.15.0 ([#85](https://github.com/morainedb/moraine/pull/85))
+- pin DuckDB v1.5.5 and stop Dependabot raising the ci-tools ref ([#89](https://github.com/morainedb/moraine/pull/89))
+
 ## [0.4.4](https://github.com/morainedb/moraine/compare/v0.4.3...v0.4.4) - 2026-08-04
 
 ### Added
