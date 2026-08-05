@@ -4,6 +4,8 @@
 
 use std::collections::BTreeSet;
 
+use futures::{StreamExt, TryStreamExt, stream};
+
 use super::{
     Arc, CatalogSnapshot, Cell, ColumnInfo, DbTransaction, Error, HashMap, HashSet, IndexInfo,
     InlineOperation, ObjectStore, ReadHandle, Result, RowOperation, ScopedReadEntry,
@@ -12,6 +14,14 @@ use super::{
     encode_ordered_values, proto, scoped_read, stage_index_entries, store_inline,
 };
 use crate::transaction::operations::ChangeSet;
+
+/// How many files one upkeep phase reads at once. Each read is an
+/// independent fetch of an independent file, so reading them one after
+/// another costs a commit one round trip of store latency per file — the
+/// term that dominates a commit touching many. Bounding the fan-out
+/// instead keeps a single commit from monopolizing the store's request
+/// budget.
+const FILE_READ_CONCURRENCY: usize = 64;
 
 /// What a commit's registered and targeted files need before their entries
 /// can be derived: where the bytes live, and which tables the commit merely
@@ -26,23 +36,26 @@ pub(super) struct FileContext<'a> {
     compacted: BTreeSet<u64>,
 }
 
-/// Derives and appends the equality-index entries for one registered data
-/// file (a `RowOperation::Insert` into `TableKind::DataFile`), by scoped-
-/// reading the file. A no-op if the file's table has no live index. Refuses
-/// (rather than silently under-covering) when the file must be read but no
-/// store is available.
-pub(super) async fn stage_data_file_index_entries(
+/// Derives the equality-index entries for one registered data file (a
+/// `RowOperation::Insert` into `TableKind::DataFile`), by scoped-reading
+/// the file. Empty if the file's table has no live index. Refuses (rather
+/// than silently under-covering) when the file must be read but no store is
+/// available.
+///
+/// Returns its entries rather than appending them, so the files one commit
+/// registers can be read concurrently and their entries appended in stage
+/// order afterwards.
+pub(super) async fn data_file_index_entries(
     base: &CatalogSnapshot,
     cells: &[Cell],
     killed: Option<&KilledRows>,
     context: &FileContext<'_>,
-    entries: &mut Vec<StagedIndexEntry>,
-) -> Result<()> {
+) -> Result<Vec<StagedIndexEntry>> {
     let file = decode_data_file(cells)?;
     let table = TableId::new(file.table_id);
     let indexes = base.indexes_of(table);
     if indexes.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // The file must be read to maintain the index; no store to read it means
@@ -71,6 +84,7 @@ pub(super) async fn stage_data_file_index_entries(
     // interchangeable: an entry's key carries no file, so a removal beside
     // an add would be indistinguishable from an UPDATE's — which rewrites
     // a row into a new file under its preserved id and must keep its entry.
+    let mut entries = Vec::new();
     for (index, scoped) in indexes.iter().zip(per_index) {
         let surviving = scoped
             .into_iter()
@@ -78,9 +92,9 @@ pub(super) async fn stage_data_file_index_entries(
             .filter(|(ordinal, _)| !killed.is_some_and(|k| k.contains(&(*ordinal as u64))))
             .map(|(_, entry)| entry)
             .collect();
-        push_index_entries(entries, index, surviving, false)?;
+        push_index_entries(&mut entries, index, surviving, false)?;
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// One scoped read of `file` covering every index's columns at once — the
@@ -181,21 +195,26 @@ pub(super) async fn stage_index_maintenance(
         )
         .await?;
     }
-    for ((table_id, data_file_id), killed) in &file_deletes {
-        // Already resolved at the add: the rows this delete kills were left
-        // out of the file's entries rather than staged and removed.
-        if registered.contains(&(*table_id, *data_file_id)) {
-            continue;
-        }
-        stage_file_delete_entries(
-            base,
-            *table_id,
-            *data_file_id,
-            killed,
-            &context,
-            &mut entries,
-        )
-        .await?;
+    // A target already resolved at the add is skipped: the rows that delete
+    // kills were left out of the file's entries rather than staged and
+    // removed. The rest are sorted before they are read, so which target a
+    // failure names depends on neither the map's iteration order nor on
+    // which read finished first.
+    let mut targets: Vec<(&(u64, u64), &KilledRows)> = file_deletes
+        .iter()
+        .filter(|((table_id, data_file_id), _)| !registered.contains(&(*table_id, *data_file_id)))
+        .collect();
+    targets.sort_by_key(|(target, _)| *target);
+
+    let mut removed = std::pin::pin!(
+        stream::iter(targets)
+            .map(|((table_id, data_file_id), killed)| {
+                file_delete_index_entries(base, *table_id, *data_file_id, killed, &context)
+            })
+            .buffered(FILE_READ_CONCURRENCY)
+    );
+    while let Some(target_entries) = removed.try_next().await? {
+        entries.extend(target_entries);
     }
 
     if entries.is_empty() {
@@ -213,13 +232,14 @@ async fn collect_deletes(
     inline_deletes: &mut HashMap<u64, Vec<u64>>,
     file_deletes: &mut HashMap<(u64, u64), KilledRows>,
 ) -> Result<()> {
+    let mut delete_files: Vec<&[Cell]> = Vec::new();
     for op in ops {
         match op {
             RowOperation::Insert {
                 table: TableKind::DeleteFile,
                 cells,
             } => {
-                collect_delete_file_rows(base, cells, context, file_deletes).await?;
+                delete_files.push(cells);
             }
             RowOperation::InlineFileDelete {
                 table_id,
@@ -242,6 +262,25 @@ async fn collect_deletes(
             _ => {}
         }
     }
+
+    // Each delete file is its own fetch and names its own target, so the
+    // whole commit's are read together and merged in stage order. A
+    // target's positions are a set, so a merge order never changes them.
+    let mut collected = std::pin::pin!(
+        stream::iter(&delete_files)
+            .map(|cells| delete_file_rows(base, cells, context))
+            .buffered(FILE_READ_CONCURRENCY)
+    );
+    while let Some(killed) = collected.try_next().await? {
+        if let Some((target, positions)) = killed {
+            file_deletes
+                .entry(target)
+                .or_default()
+                .positions
+                .extend(positions);
+        }
+    }
+
     Ok(())
 }
 
@@ -261,6 +300,7 @@ async fn stage_adds(
     entries: &mut Vec<StagedIndexEntry>,
 ) -> Result<HashSet<(u64, u64)>> {
     let mut registered: HashSet<(u64, u64)> = HashSet::new();
+    let mut adds: Vec<Add<'_>> = Vec::new();
     for op in ops {
         match op {
             RowOperation::Insert {
@@ -283,14 +323,10 @@ async fn stage_adds(
 
                 let key = (file.table_id, file.data_file_id);
                 registered.insert(key);
-                stage_data_file_index_entries(
-                    base,
+                adds.push(Add::File {
                     cells,
-                    file_deletes.get(&key),
-                    context,
-                    entries,
-                )
-                .await?;
+                    killed: file_deletes.get(&key),
+                });
             }
             RowOperation::InlineInsert {
                 table_id,
@@ -300,27 +336,71 @@ async fn stage_adds(
                 arrow_body,
                 ..
             } => {
-                stage_inline_chunk_entries(
-                    db_tx,
-                    base,
-                    pending_schemas,
-                    *table_id,
-                    &InlineChunk {
+                adds.push(Add::Inline {
+                    table_id: *table_id,
+                    chunk: InlineChunk {
                         schema_version: *schema_version,
                         row_id_start: *row_id_start,
                         row_count: *row_count,
                         body: arrow_body,
                     },
-                    None,
-                    entries,
-                )
-                .await?;
+                });
             }
             _ => {}
         }
     }
 
+    // Every add reads its own bytes and none depends on another, so they
+    // are read together: a commit registering many files costs one store
+    // round trip per wave rather than one per file. Entries come back in
+    // stage order, so which add a failure names does not depend on which
+    // read happened to finish first.
+    let mut derived = std::pin::pin!(
+        stream::iter(&adds)
+            .map(|add| async move {
+                match add {
+                    Add::File { cells, killed } => {
+                        data_file_index_entries(base, cells, *killed, context).await
+                    }
+                    Add::Inline { table_id, chunk } => {
+                        inline_chunk_index_entries(
+                            db_tx,
+                            base,
+                            pending_schemas,
+                            *table_id,
+                            chunk,
+                            None,
+                        )
+                        .await
+                    }
+                }
+            })
+            .buffered(FILE_READ_CONCURRENCY)
+    );
+    // Drained rather than collected: the reads stay in flight together
+    // while each add's entries land in `entries` as they arrive, so the
+    // batch's largest part is never held twice.
+    while let Some(add_entries) = derived.try_next().await? {
+        entries.extend(add_entries);
+    }
+
     Ok(registered)
+}
+
+/// One add a commit derives entries from, held in stage order until every
+/// add's bytes have been read.
+enum Add<'a> {
+    /// A registered data file, read from the data store.
+    File {
+        cells: &'a [Cell],
+        killed: Option<&'a KilledRows>,
+    },
+    /// An inlined chunk, whose rows the commit already carries and whose
+    /// schema comes from the catalog.
+    Inline {
+        table_id: u64,
+        chunk: InlineChunk<'a>,
+    },
 }
 
 /// The tables this commit compacts and otherwise leaves alone, read from
@@ -380,27 +460,27 @@ pub(super) async fn inline_schema_for<'a>(
     Ok(std::borrow::Cow::Owned(stored.arrow_schema))
 }
 
-/// Appends the index entries for one inline chunk's rows: every row when
-/// `held` is `None` (the chunk is being inserted), or just those rows when
-/// it is `Some` (they are being deleted, so their entries are removals).
-pub(super) async fn stage_inline_chunk_entries(
+/// The index entries for one inline chunk's rows: every row when `held` is
+/// `None` (the chunk is being inserted), or just those rows when it is
+/// `Some` (they are being deleted, so their entries are removals).
+pub(super) async fn inline_chunk_index_entries(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
     pending_schemas: &HashMap<(u64, u64), &[u8]>,
     table_id: u64,
     chunk: &InlineChunk<'_>,
     held: Option<&HashSet<u64>>,
-    entries: &mut Vec<StagedIndexEntry>,
-) -> Result<()> {
+) -> Result<Vec<StagedIndexEntry>> {
     let table = TableId::new(table_id);
     let indexes = base.indexes_of(table);
     if indexes.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let schema_ipc =
         inline_schema_for(db_tx, pending_schemas, table_id, chunk.schema_version).await?;
     let live_columns = base.columns_of(table);
+    let mut entries = Vec::new();
     for index in &indexes {
         let positions = index_positions(&live_columns, index, table)?;
         let scoped = scoped_read::inline_batch_entries(
@@ -412,9 +492,9 @@ pub(super) async fn stage_inline_chunk_entries(
         .into_iter()
         .filter(|entry| held.is_none_or(|rows| rows.contains(&entry.row_id)))
         .collect();
-        push_index_entries(entries, index, scoped, held.is_some())?;
+        push_index_entries(&mut entries, index, scoped, held.is_some())?;
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// One inline chunk this commit can read: already committed, or staged by
@@ -495,16 +575,10 @@ pub(super) async fn stage_inline_delete_entries(
         if held.is_empty() {
             continue;
         }
-        stage_inline_chunk_entries(
-            db_tx,
-            base,
-            pending_schemas,
-            table_id,
-            chunk,
-            Some(&held),
-            entries,
-        )
-        .await?;
+        entries.extend(
+            inline_chunk_index_entries(db_tx, base, pending_schemas, table_id, chunk, Some(&held))
+                .await?,
+        );
         covered.extend(held);
     }
 
@@ -535,19 +609,22 @@ impl KilledRows {
     }
 }
 
-/// Records the positions a staged `register_delete_file` kills, read out
-/// of the delete file verbatim — resolving them to row ids would bake in
-/// the dense assumption the target's scoped read decides.
-pub(super) async fn collect_delete_file_rows(
+/// The target a staged `register_delete_file` names and the positions it
+/// kills, read out of the delete file verbatim — resolving them to row ids
+/// would bake in the dense assumption the target's scoped read decides.
+/// `None` when the table carries no index, so nothing is read.
+///
+/// Returns them rather than recording them, so a commit's delete files can
+/// be read concurrently and merged afterwards.
+pub(super) async fn delete_file_rows(
     base: &CatalogSnapshot,
     cells: &[Cell],
     context: &FileContext<'_>,
-    file_deletes: &mut HashMap<(u64, u64), KilledRows>,
-) -> Result<()> {
+) -> Result<Option<((u64, u64), Vec<u64>)>> {
     let delete_file = decode_delete_file(cells)?;
     let table = TableId::new(delete_file.table_id);
     if base.indexes_of(table).is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let data_store = context.store.ok_or_else(|| {
@@ -560,12 +637,10 @@ pub(super) async fn collect_delete_file_rows(
 
     let path = delete_file_object_path(base, &delete_file, context.prefix)?;
     let positions = scoped_read::delete_file_positions(data_store, &path).await?;
-    file_deletes
-        .entry((delete_file.table_id, delete_file.data_file_id))
-        .or_default()
-        .positions
-        .extend(positions);
-    Ok(())
+    Ok(Some((
+        (delete_file.table_id, delete_file.data_file_id),
+        positions,
+    )))
 }
 
 /// Derives the entry removals for rows killed inside one data file the
@@ -573,18 +648,20 @@ pub(super) async fn collect_delete_file_rows(
 /// the rows this commit marks dead. A delete against a file this same
 /// commit registers never reaches here — those rows are left unindexed at
 /// the add instead.
-pub(super) async fn stage_file_delete_entries(
+///
+/// Returns its entries rather than appending them, so a commit's targets
+/// can be read concurrently and their entries appended in target order.
+pub(super) async fn file_delete_index_entries(
     base: &CatalogSnapshot,
     table_id: u64,
     data_file_id: u64,
     killed: &KilledRows,
     context: &FileContext<'_>,
-    entries: &mut Vec<StagedIndexEntry>,
-) -> Result<()> {
+) -> Result<Vec<StagedIndexEntry>> {
     let table = TableId::new(table_id);
     let indexes = base.indexes_of(table);
     if indexes.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let file = live_data_file(base, table_id, data_file_id)?;
@@ -603,6 +680,7 @@ pub(super) async fn stage_file_delete_entries(
     // An entry dies when a delete names its physical position; the scoped
     // read resolves that position to the row it holds — one rule for dense
     // and per-row-id targets alike.
+    let mut entries = Vec::new();
     for (index, scoped) in indexes.iter().zip(per_index) {
         let scoped = scoped
             .into_iter()
@@ -610,9 +688,9 @@ pub(super) async fn stage_file_delete_entries(
             .filter(|(ordinal, _)| killed.positions.contains(&(*ordinal as u64)))
             .map(|(_, entry)| entry)
             .collect();
-        push_index_entries(entries, index, scoped, true)?;
+        push_index_entries(&mut entries, index, scoped, true)?;
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// One live data file of a table.

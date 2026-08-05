@@ -1,6 +1,13 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
-use object_store::memory::InMemory;
+use futures::stream::BoxStream;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+};
 
 use super::*;
 use crate::catalog::{Catalog, CatalogOptions};
@@ -958,19 +965,31 @@ async fn write_parquet(store: &InMemory, path: &str, batch: &arrow::array::Recor
 /// A `ducklake_data_file` row for a file of `record_count` rows and
 /// `file_size_bytes` bytes on the store.
 fn indexed_data_file_row(record_count: u64, file_size_bytes: u64) -> Vec<Cell> {
+    indexed_data_file_row_at(1, "data.parquet", record_count, file_size_bytes, 0)
+}
+
+/// As [`indexed_data_file_row`], for one of several files a commit
+/// registers: its own id, path, and dense row-id range.
+fn indexed_data_file_row_at(
+    data_file_id: u64,
+    path: &str,
+    record_count: u64,
+    file_size_bytes: u64,
+    row_id_start: u64,
+) -> Vec<Cell> {
     vec![
-        Cell::U64(1),
+        Cell::U64(data_file_id),
         Cell::U64(1),
         Cell::U64(3),
         Cell::Null,
         Cell::Null,
-        Cell::Str("data.parquet".into()),
+        Cell::Str(path.into()),
         Cell::Bool(true),
         Cell::Str("parquet".into()),
         Cell::U64(record_count),
         Cell::U64(file_size_bytes),
         Cell::U64(64),
-        Cell::U64(0), // row_id_start
+        Cell::U64(row_id_start),
         Cell::Null,
         Cell::Null,
         Cell::Null,
@@ -1002,6 +1021,324 @@ async fn register_indexed_data_file(catalog: &Catalog, values: &[i64]) -> Arc<In
     });
     tx.commit().await.unwrap();
     store
+}
+
+/// Wraps an [`InMemory`] store, recording the most reads it ever held in
+/// flight at once. Every read suspends before it is served, so a caller
+/// that issues its reads concurrently holds all of them at once, while one
+/// that awaits them in turn never holds more than a single read.
+#[derive(Debug)]
+struct InFlightStore {
+    inner: InMemory,
+    in_flight: AtomicUsize,
+    peak_in_flight: AtomicUsize,
+}
+
+impl InFlightStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            in_flight: AtomicUsize::new(0),
+            peak_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn peak_in_flight(&self) -> usize {
+        self.peak_in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Forgets the reads a fixture's own setup issued, so a measurement
+    /// covers only the commit under test.
+    fn reset(&self) {
+        self.peak_in_flight.store(0, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Display for InFlightStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InFlightStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for InFlightStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        // A `head` probe carries no payload and is not a read.
+        if options.head {
+            return self.inner.get_opts(location, options).await;
+        }
+
+        let held = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak_in_flight.fetch_max(held, Ordering::AcqRel);
+        // The suspension point a real store's round trip would have: a
+        // concurrent caller reaches it on every read before any completes.
+        tokio::task::yield_now().await;
+        let result = self.inner.get_opts(location, options).await;
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Registers `files` Parquet data files of `rows_per_file` rows each on
+/// the indexed table, in one commit minting snapshot 3. Values are
+/// distinct throughout, so a unique index admits every row, and each file
+/// carries a dense row-id range of its own — file `n` is `f<n>.parquet`,
+/// data file id `n + 1`.
+async fn register_indexed_data_files(
+    catalog: &Catalog,
+    store: &Arc<InFlightStore>,
+    files: usize,
+    rows_per_file: usize,
+) {
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    for file in 0..files {
+        let first = file * rows_per_file;
+        let values: Vec<i64> = (first..first + rows_per_file)
+            .map(|value| i64::try_from(value).unwrap())
+            .collect();
+        let (_, batch) = bigint_batch(&values);
+        let name = format!("f{file}.parquet");
+        let size = write_parquet(&store.inner, &format!("main/t/{name}"), &batch).await;
+
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DataFile,
+            cells: indexed_data_file_row_at(
+                u64::try_from(file).unwrap() + 1,
+                &name,
+                u64::try_from(rows_per_file).unwrap(),
+                size,
+                u64::try_from(first).unwrap(),
+            ),
+        });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(3, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(3, "inserted_into_table:1"),
+    });
+    tx.commit().await.unwrap();
+}
+
+/// A DuckLake delete file naming `positions` in `target`.
+async fn write_delete_file(store: &InMemory, name: &str, target: &str, positions: &[usize]) -> u64 {
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![target; positions.len()])),
+            Arc::new(Int64Array::from(
+                positions
+                    .iter()
+                    .map(|position| i64::try_from(*position).unwrap())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    write_parquet(store, &format!("main/t/{name}"), &batch).await
+}
+
+/// A `ducklake_delete_file` row for one of several files a commit
+/// registers against `data_file_id`.
+fn delete_file_row_at(
+    delete_file_id: u64,
+    path: &str,
+    data_file_id: u64,
+    delete_count: u64,
+    file_size_bytes: u64,
+) -> Vec<Cell> {
+    vec![
+        Cell::U64(delete_file_id),
+        Cell::U64(1),
+        Cell::U64(4),
+        Cell::Null,
+        Cell::U64(data_file_id),
+        Cell::Str(path.into()),
+        Cell::Bool(true),
+        Cell::Str("parquet".into()),
+        Cell::U64(delete_count),
+        Cell::U64(file_size_bytes),
+        Cell::U64(64),
+        Cell::Null,
+        Cell::Null,
+    ]
+}
+
+/// A commit registering several data files scoped-reads them concurrently.
+/// Each read is an independent fetch of an independent file, so a commit
+/// that awaited them in turn would cost one round trip of store latency
+/// per file — the peak reads in flight is that difference made visible.
+#[tokio::test]
+async fn registering_many_data_files_reads_them_concurrently() {
+    const FILES: usize = 8;
+    const ROWS_PER_FILE: usize = 3;
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = Arc::new(InFlightStore::new());
+    register_indexed_data_files(&catalog, &store, FILES, ROWS_PER_FILE).await;
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        FILES * ROWS_PER_FILE,
+        "every registered file's rows are indexed"
+    );
+    assert_eq!(
+        store.peak_in_flight(),
+        FILES,
+        "every file's scoped read is in flight at once"
+    );
+}
+
+/// A commit registering several delete files reads them concurrently too:
+/// collecting the positions they kill is one independent fetch apiece.
+///
+/// Every delete file targets the same data file, so resolving the killed
+/// positions to their values costs a single scoped read — leaving the
+/// delete files' own reads as the only ones that can overlap.
+#[tokio::test]
+async fn registering_many_delete_files_reads_them_concurrently() {
+    const DELETES: usize = 8;
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = Arc::new(InFlightStore::new());
+    register_indexed_data_files(&catalog, &store, 1, DELETES).await;
+    store.reset();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    for position in 0..DELETES {
+        let name = format!("d{position}.parquet");
+        let size = write_delete_file(&store.inner, &name, "f0.parquet", &[position]).await;
+        tx.stage(RowOperation::Insert {
+            table: TableKind::DeleteFile,
+            cells: delete_file_row_at(u64::try_from(position).unwrap() + 2, &name, 1, 1, size),
+        });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "deleted_from_table:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        0,
+        "every position is killed, so no entry survives"
+    );
+    assert_eq!(
+        store.peak_in_flight(),
+        DELETES,
+        "every delete file's read is in flight at once"
+    );
+}
+
+/// Deletes landing on several already-committed data files scoped-read
+/// those files concurrently: each target is read to resolve its killed
+/// positions to the values their entries are keyed by, and no target
+/// depends on another.
+///
+/// Inlined file-deletes carry their target and position outright, so
+/// collecting them reads nothing — leaving the targets' own reads as the
+/// only ones that can overlap.
+#[tokio::test]
+async fn deletes_against_many_data_files_read_them_concurrently() {
+    const FILES: usize = 8;
+
+    let (catalog, index_id) = catalog_with_indexed_inline_table(true).await;
+    let store = Arc::new(InFlightStore::new());
+    register_indexed_data_files(&catalog, &store, FILES, 1).await;
+    store.reset();
+
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let mut tx = StagedTransaction::begin_detached_with_store(db_tx, store.clone());
+    for file in 0..FILES {
+        tx.stage(RowOperation::InlineFileDelete {
+            table_id: 1,
+            data_file_id: u64::try_from(file).unwrap() + 1,
+            row_id: 0,
+            begin_snapshot: 4,
+        });
+    }
+    tx.stage(RowOperation::Insert {
+        table: TableKind::Snapshot,
+        cells: snapshot_row(4, 1, 20),
+    });
+    tx.stage(RowOperation::Insert {
+        table: TableKind::SnapshotChanges,
+        cells: snapshot_changes_row(4, "inlined_delete:1"),
+    });
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        index_entry_count(&catalog, true, index_id).await,
+        0,
+        "each file's only row is killed, so no entry survives"
+    );
+    assert_eq!(
+        store.peak_in_flight(),
+        FILES,
+        "every target file's scoped read is in flight at once"
+    );
 }
 
 /// Writes a two-column Parquet of `values` beside their preserved
