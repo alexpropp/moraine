@@ -680,6 +680,16 @@ traffic worth caching is SST blocks, indexes, and filters — exactly what
 the table store routes through the `DbCache` interface, deduplicating
 concurrent misses on one key into a single fetch.
 
+A process-wide cache needs a process-wide executor, and this is the one
+place that is not automatic. foyer fixes the hybrid's task spawner when
+the cache is *built*, so left to default the cache borrows the runtime of
+whichever attach happened to build it — a runtime a detach then drops,
+after which tokio cancels the tasks it owned and dropping an in-flight
+fetch takes foyer's inflight lock with nothing left running to release
+it. The next attach to touch the cache blocks forever. So the cache
+builds its own runtime and hands foyer that; nothing the cache does runs
+on an attach's runtime.
+
 Two consequences of SlateDB scoping a shared cache's keys per opened
 handle (which is what keeps two stores' same-numbered WAL SSTs apart).
 The instance shares *budget* unconditionally but *entries* only within a

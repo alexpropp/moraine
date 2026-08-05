@@ -22,6 +22,7 @@ use std::{
 
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
+    Spawner,
 };
 use slatedb::db_cache::{
     CachedEntry, CachedKey, DbCache, SplitCache,
@@ -382,9 +383,37 @@ async fn build(config: &CacheConfig) -> Option<Arc<dyn DbCache>> {
     ) as Arc<dyn DbCache>)
 }
 
+/// The runtime the hybrid cache spawns its fetch and flush tasks on.
+///
+/// It must not be an attach's runtime. The cache outlives every attach,
+/// but foyer fixes its spawner when the cache is *built* — so the first
+/// store to open would lend the process-wide cache a runtime that dies at
+/// its detach. Tokio then cancels the tasks that runtime owned, and
+/// dropping an in-flight fetch takes foyer's inflight lock with nothing
+/// left running to release it: the next attach to touch the cache blocks
+/// forever. Two workers is plenty; these tasks fetch and flush, they do
+/// not compute.
+fn cache_runtime() -> Option<tokio::runtime::Runtime> {
+    match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("moraine-cache")
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            warn!(
+                %error,
+                "could not start the cache runtime; the block cache stays in memory"
+            );
+            None
+        }
+    }
+}
+
 /// The block slot backed by memory over a disk device at `dir`. `None`
-/// if the device will not open, which the caller degrades from rather
-/// than failing.
+/// if the device or its runtime will not open, which the caller degrades
+/// from rather than failing.
 async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<Arc<dyn DbCache>> {
     if let Err(error) = std::fs::create_dir_all(dir) {
         warn!(
@@ -412,6 +441,9 @@ async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<Arc<dyn
         .memory(usize::try_from(memory).unwrap_or(usize::MAX))
         .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
         .storage()
+        // Keeps the cache's tasks off the runtime of whichever attach
+        // happened to build it.
+        .with_spawner(Spawner::from(cache_runtime()?))
         .with_io_engine_config(PsyncIoEngineConfig::new())
         .with_engine_config(BlockEngineConfig::new(device))
         .build()
