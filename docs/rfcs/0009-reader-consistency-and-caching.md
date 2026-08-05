@@ -759,52 +759,61 @@ bytes: the object cache served a restarted process from disk with zero
 GETs, where preload re-fetches — taken on the bet that probes are more
 frequent than restarts, and reversible by the upstream scope work above.
 
-### The data path is DuckDB's, and is not yet cached
+### The data path is DuckDB's, and DuckDB caches it
 
 moraine never touches a data-file byte and adds no data cache, footer
 cache, or read-through layer: a lakehouse's data path belongs to the
 engine reading it, and duplicating DuckDB's would be the mistake this
 RFC removes from the catalog tier.
 
-What the design assumed, and measurement refuted, is that DuckDB was
-already caching it. **DuckLake's scan path does not go through the
-caching file system**, so a lake read populates the external-file cache
-with nothing, while the same Parquet file read through `read_parquet` in
-the same session does. The e2e pins that difference, asserting the gap
-so its closing is the signal.
+It does not have to. **A lake read goes through DuckDB's caching file
+system and populates the external-file cache**, so data bytes are held
+under `memory_limit` and evicted by the buffer manager alongside every
+other allocation. Measured over a remote `DATA_PATH`: one query fetches
+the file's footer and its data ranges, a second differently shaped query
+over the same data fetches nothing, and the same pair under
+`enable_external_file_cache = false` fetches everything twice.
 
-The gap's shape decides what an operator can do about it. DuckDB's
-external-file cache sits *in the reader* — the Parquet reader holds a
-`CachingFileSystem` and reads through it — so a reader that opens its
-files another way misses the cache however the bytes arrive. The
-mechanism is transport-independent, so an `s3://` `DATA_PATH` is very
-likely no different; measured only against a local one, worth confirming
-before sizing a host.
+**Data-block caching rides on the Parquet reader's prefetch, taken only
+for files that are not on local disk** — without it the reader issues a
+deliberately non-caching read. So a local `DATA_PATH` caches the footer
+and stops there, and `prefetch_all_parquet_files` forces the remote
+behaviour, which is how the property stays observable in a test with no
+object store. The gate is locality rather than scheme, so a deployment
+on S3 takes the prefetching path.
 
-A *filesystem*-level cache is therefore the lever that still works,
-intercepting below the reader: on S3 that is the `cache_httpfs`
-community extension. It closes the gap at the cost this RFC spent the
-catalog tier removing — its cache is sized by its own knobs, outside
-`memory_limit`, and keeps a read-through memory cache even on disk. So
-it is an operator's trade, made knowingly, and not something the attach
-should arrange: moraine arranging it would re-create the un-budgeted
-tier one layer down, and have to be unwound the day DuckLake starts
-caching.
+Two shapes therefore report a working cache as an absent one, and a
+measurement must avoid both: a lake `count(*)`, answered from catalog
+statistics without opening a file at all, and a local path's
+footer-only caching.
 
-So the data tier is *un-budgeted* rather than unified. A host runs three
-memory consumers, of which DuckDB sees two: its own `memory_limit`,
-moraine's `CACHE_MEMORY`, and whatever a filesystem cache is given.
+So the data tier is *unified, not un-budgeted*: it is DuckDB's cache,
+inside DuckDB's budget. A host sizes two memory consumers, both visible
+to whoever sets them — DuckDB's `memory_limit` and moraine's
+`CACHE_MEMORY` — and a third only if an operator adds a filesystem
+cache.
 
-The embedder configuration that survives the gap, because none of it is
-the external-file cache: `parquet_metadata_cache` (DuckDB's
-`ObjectCache`, keyed on file path) and the httpfs metadata and
-connection caches (filesystem layer).
-`validate_external_file_cache = 'NO_VALIDATION'` is inert for lake data
-today and becomes live if DuckLake starts caching, so it is worth
-setting anyway. All are global, so the shim sets none of them — an
-`ATTACH` that mutates global state reaches every other database in the
-process — and they are documented as embedding guidance beside the
-attach options (RFC 0006).
+That remains a real option, and its value is what the external-file
+cache does not do: survive the process. The external-file cache is
+buffer-manager memory and dies with the instance, so a redeploy or a new
+process reads cold. A *filesystem*-level cache intercepts below the
+reader and keeps bytes on disk across processes — on S3 the
+`cache_httpfs` community extension. It buys that at the cost this RFC
+spent the catalog tier removing: its cache is sized by its own knobs,
+outside `memory_limit`, and keeps a read-through memory cache even in
+its on-disk mode. So it is an operator's trade, made knowingly, and not
+something the attach should arrange — moraine arranging it would
+re-create an un-budgeted tier one layer down.
+
+The embedder configuration worth setting beside an attach:
+`validate_external_file_cache = 'NO_VALIDATION'`, which is live for lake
+data and safe because DuckLake never rewrites a data file, so a cached
+range cannot go stale under it; `parquet_metadata_cache` (DuckDB's
+`ObjectCache`, keyed on file path); and the httpfs metadata and
+connection caches at the filesystem layer. All are global, so the shim
+sets none of them — an `ATTACH` that mutates global state reaches every
+other database in the process — and they are documented as embedding
+guidance beside the attach options (RFC 0006).
 
 ### Test obligations
 
@@ -892,10 +901,13 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **The cache reports what it served.** A cold read moves the tally, the
   slots are counted apart, and a rate is absent rather than zero until
   something has been looked up.
-- **The data path's cache gap stays visible.** A lake read leaves
-  `duckdb_external_file_cache()` empty for its files while the same file
-  read directly does cache — so the day DuckLake routes through the
-  caching file system, the test fails and says so.
+- **The data path is cached by DuckDB.** A lake read that touches data
+  populates `duckdb_external_file_cache()` for its file, and forcing the
+  prefetch a remote path takes anyway extends that from the footer to the
+  data ranges — so the tier stays inside `memory_limit`, and a regression
+  that routes lake reads around the caching file system fails the test. A
+  lake `count(*)`, answered from catalog statistics, is pinned as reading
+  no file at all: it is the shape that makes a working cache look absent.
 
 ## Alternatives considered
 
