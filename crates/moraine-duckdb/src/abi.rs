@@ -2383,6 +2383,52 @@ pub unsafe extern "C" fn moraine_subspace_is_known(name: *const c_char) -> bool 
     catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(false)
 }
 
+/// What the process's block cache has served since it was built.
+///
+/// Process-wide, not per attach: one cache serves every store a process
+/// opens, so these are the host's numbers. Needs no handle for the same
+/// reason, and reports zeros before anything has read.
+///
+/// Metadata (SST indexes, filters, stats) and data blocks are counted
+/// apart because they are budgeted apart — a healthy stack keeps
+/// metadata near fully served, while blocks land wherever the working
+/// set does.
+///
+/// # Safety
+///
+/// Every out-pointer must be valid and writable for the duration of the
+/// call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_cache_tally(
+    out_metadata_hits: *mut u64,
+    out_metadata_misses: *mut u64,
+    out_block_hits: *mut u64,
+    out_block_misses: *mut u64,
+    out_errors: *mut u64,
+) -> i32 {
+    let attempt = || {
+        if out_metadata_hits.is_null()
+            || out_metadata_misses.is_null()
+            || out_block_hits.is_null()
+            || out_block_misses.is_null()
+            || out_errors.is_null()
+        {
+            return codes::INVALID_ARGUMENT;
+        }
+        let tally = moraine::cache_tally();
+        // SAFETY: checked non-null above; caller contract for validity.
+        unsafe {
+            *out_metadata_hits = tally.metadata_hits;
+            *out_metadata_misses = tally.metadata_misses;
+            *out_block_hits = tally.block_hits;
+            *out_block_misses = tally.block_misses;
+            *out_errors = tally.errors;
+        }
+        codes::OK
+    };
+    catch_unwind(AssertUnwindSafe(attempt)).unwrap_or(codes::INTERNAL)
+}
+
 /// The store state the catalog's dumps currently serve: the head
 /// snapshot id and batch count. `out_present` is false on a store with no
 /// head yet (mid-bootstrap), where the other outputs are left unwritten.

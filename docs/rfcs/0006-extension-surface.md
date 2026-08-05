@@ -321,6 +321,27 @@ store — trading a slower ATTACH for a first query that touches object
 storage not at all; `'l0'` suits an attach that must return fast against a
 store with a deep unfolded tail.
 
+**`moraine_cache_tally()` — what the cache has served.** One row, no
+arguments: `metadata_hits`/`metadata_misses` and `block_hits`/
+`block_misses` with a rate beside each, plus `errors` for lookups the
+cache itself failed and read through. It takes no lake name because it
+has nothing to take one for — a process keeps one cache and every
+attached store reads through it, so the numbers are the host's, not any
+one catalog's.
+
+The two slots are reported apart because they are budgeted apart: a
+healthy stack keeps metadata near fully served — that is the slot being
+sized to hold the store's filters and indexes — while blocks land
+wherever the working set does. A metadata rate that is not near 1 says
+`CACHE_MEMORY` is too small for the store's SST metadata, which
+`moraine_store_census` measures directly; a low block rate with a healthy
+metadata rate says the working set exceeds the block slot, which is a
+`CACHE_MEMORY` or `CACHE_DIR` decision rather than a correctness one.
+
+A rate is NULL, not zero, before anything has been looked up: zero would
+read as a cold cache to a monitoring query, and "nothing asked" is not
+the same fact.
+
 The data path needs none of this, and gets none of it: Parquet reads go
 through DuckDB's own filesystem and land in its external-file cache, inside
 `memory_limit` (RFC 0009). What the embedding host should set beside a

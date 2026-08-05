@@ -724,11 +724,14 @@ The attach options keep their surface (RFC 0006) and change machinery:
   attach contract holds: warm inside the open, caps govern, a shortfall
   is warned with both numbers, a failure is skipped rather than fatal.
 
-**Hit rates before tuning.** The tiers report — meta hits, block-memory
-hits, disk hits, store GETs — through the diagnostics the extension
-already forwards, beside the existing row-tier counters; the census
-supplies the meta target. Budgets are sized from measured curves, not
-defaults. The SQL shape is RFC 0006's to pin.
+**Hit rates before tuning.** The tiers report: hits and misses per slot,
+process-wide, through `moraine_cache_tally()` (RFC 0006). Metadata and
+blocks are counted apart because they are budgeted apart — a metadata
+rate short of ~1 says the meta slot cannot hold the store's filters and
+indexes, which the census measures directly, while a low block rate
+beside a healthy metadata one is a working set larger than the block
+slot. A rate is absent rather than zero before any lookup. Budgets are
+sized from these curves, not from the defaults.
 
 **One cache means one shape per process.** The first store to open builds
 it and its numbers stand; a later attach asking for different ones shares
@@ -858,6 +861,9 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **The data path is cached where claimed.** An e2e reads a
   moraine-attached table twice and asserts the file appears in
   `duckdb_external_file_cache()`.
+- **The cache reports what it served.** A cold read moves the tally, the
+  slots are counted apart, and a rate is absent rather than zero until
+  something has been looked up.
 
 ## Alternatives considered
 

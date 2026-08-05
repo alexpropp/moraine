@@ -187,7 +187,8 @@ impl<'a> StoreBuilder<'a> {
         let mut builder = Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
-            .with_block_cache_policy(self.block_cache_policy());
+            .with_block_cache_policy(self.block_cache_policy())
+            .with_metrics_recorder(cache::recorder());
         if let Some(cache) = cache::shared(&self.cache_config()).await {
             builder = builder.with_db_cache(cache);
         }
@@ -218,6 +219,7 @@ impl<'a> StoreBuilder<'a> {
         };
         let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
+            .with_metrics_recorder(cache::recorder())
             .with_options(options);
         if let Some(cache) = cache::shared(&self.cache_config()).await {
             builder = builder.with_db_cache(cache);

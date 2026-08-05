@@ -54,10 +54,6 @@ deliberately not itemized here.
   `CREATE TABLE` is enough). A test now asserts the race's *presence* against
   the reference chain, so its failure is the signal that the workaround can
   go.
-- **DECISION** — The SQL surface for cache-tier hit rates (0009 requires
-  the rates observable; the shape — a `moraine_cache_stats` function
-  beside `moraine_store_census`, or rows through the log sink — is this
-  RFC's to pin when the shared cache lands).
 
 ## 0007 — Snapshot expiry and garbage collection
 

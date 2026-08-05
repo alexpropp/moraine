@@ -19,6 +19,7 @@ parquet = { workspace = true }
 prost = { workspace = true }
 foyer = { workspace = true }
 slatedb = { workspace = true }
+slatedb-common = { workspace = true }
 storekey = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }

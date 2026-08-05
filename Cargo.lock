@@ -1859,6 +1859,7 @@ dependencies = [
  "prost-build",
  "protox",
  "slatedb",
+ "slatedb-common",
  "storekey",
  "thiserror 2.0.19",
  "tokio",

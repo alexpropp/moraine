@@ -12,7 +12,13 @@
 //! bounded per store, so a host attaching several catalogs is
 //! over-committed by however many it attached.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
@@ -21,7 +27,9 @@ use slatedb::db_cache::{
     CachedEntry, CachedKey, DbCache, SplitCache,
     foyer::{FoyerCache, FoyerCacheOptions},
     foyer_hybrid::FoyerHybridCache,
+    stats,
 };
+use slatedb_common::metrics::{CounterFn, GaugeFn, HistogramFn, MetricsRecorder, UpDownCounterFn};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
@@ -70,6 +78,223 @@ impl CacheConfig {
 /// once is not retried — the store simply runs uncached rather than
 /// failing an attach over a cache.
 static SHARED: OnceCell<Option<Arc<dyn DbCache>>> = OnceCell::const_new();
+
+/// What the cache has served, by tier. Every sizing claim about the
+/// budget is checkable only if the tiers report, so they do.
+///
+/// The counts are the process's, like the cache: every store's reads run
+/// through the one instance and land here together.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheTally {
+    /// Filter, index, and stats lookups the meta slot served.
+    pub metadata_hits: u64,
+    /// Those it did not, each one a fetch and a decode.
+    pub metadata_misses: u64,
+    /// Data-block lookups the block slot served, from either of its
+    /// tiers — foyer reports a hybrid hit without saying which.
+    pub block_hits: u64,
+    /// Those it did not, each one an object-store read.
+    pub block_misses: u64,
+    /// Lookups the cache itself failed, which read through rather than
+    /// failing the caller.
+    pub errors: u64,
+}
+
+impl CacheTally {
+    /// The share of lookups the cache served, `None` before it has served
+    /// any. Metadata and blocks are counted apart because they are sized
+    /// apart: a healthy stack has metadata near 1.0 and blocks wherever
+    /// the working set puts them.
+    #[must_use]
+    pub fn metadata_hit_rate(&self) -> Option<f64> {
+        rate(self.metadata_hits, self.metadata_misses)
+    }
+
+    /// As [`metadata_hit_rate`](Self::metadata_hit_rate), for data blocks.
+    #[must_use]
+    pub fn block_hit_rate(&self) -> Option<f64> {
+        rate(self.block_hits, self.block_misses)
+    }
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a hit rate is a ratio; f64 holds counts far past any real one exactly"
+)]
+fn rate(hits: u64, misses: u64) -> Option<f64> {
+    let total = hits.checked_add(misses).filter(|total| *total > 0)?;
+    Some(hits as f64 / total as f64)
+}
+
+/// The counters SlateDB increments as the cache serves. Registered once
+/// and shared by every store the process opens, so the tally spans them
+/// all rather than the last one to attach.
+#[derive(Debug, Default)]
+struct CacheCounters {
+    metadata_hits: AtomicU64,
+    metadata_misses: AtomicU64,
+    block_hits: AtomicU64,
+    block_misses: AtomicU64,
+    errors: AtomicU64,
+}
+
+impl CacheCounters {
+    fn tally(&self) -> CacheTally {
+        CacheTally {
+            metadata_hits: self.metadata_hits.load(Ordering::Relaxed),
+            metadata_misses: self.metadata_misses.load(Ordering::Relaxed),
+            block_hits: self.block_hits.load(Ordering::Relaxed),
+            block_misses: self.block_misses.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One counter's home in [`CacheCounters`], or nowhere: SlateDB registers
+/// far more than the cache's, and everything else increments a sink.
+struct Slot {
+    counters: Arc<CacheCounters>,
+    which: Option<Which>,
+}
+
+#[derive(Clone, Copy)]
+enum Which {
+    MetadataHit,
+    MetadataMiss,
+    BlockHit,
+    BlockMiss,
+    Error,
+}
+
+impl CounterFn for Slot {
+    fn increment(&self, value: u64) {
+        let counter = match self.which {
+            Some(Which::MetadataHit) => &self.counters.metadata_hits,
+            Some(Which::MetadataMiss) => &self.counters.metadata_misses,
+            Some(Which::BlockHit) => &self.counters.block_hits,
+            Some(Which::BlockMiss) => &self.counters.block_misses,
+            Some(Which::Error) => &self.counters.errors,
+            None => return,
+        };
+        counter.fetch_add(value, Ordering::Relaxed);
+    }
+}
+
+/// Routes SlateDB's cache counters into [`CacheCounters`] and drops
+/// everything else on the floor.
+///
+/// The cache reports one counter per `(entry_kind, result)` pair —
+/// `filter`, `index`, and `stats` are the meta slot's, `data_block` the
+/// block slot's — so the routing is by label, and a kind SlateDB adds
+/// later lands in neither rather than being miscounted as one.
+#[derive(Debug)]
+struct CacheRecorder {
+    counters: Arc<CacheCounters>,
+}
+
+impl MetricsRecorder for CacheRecorder {
+    fn register_counter(
+        &self,
+        name: &str,
+        _description: &str,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn CounterFn> {
+        let label = |key: &str| {
+            labels
+                .iter()
+                .find_map(|(name, value)| (*name == key).then_some(*value))
+        };
+        let which = match name {
+            stats::ERROR_COUNT => Some(Which::Error),
+            stats::ACCESS_COUNT => match (label("entry_kind"), label("result")) {
+                (Some("filter" | "index" | "stats"), Some("hit")) => Some(Which::MetadataHit),
+                (Some("filter" | "index" | "stats"), Some("miss")) => Some(Which::MetadataMiss),
+                (Some("data_block"), Some("hit")) => Some(Which::BlockHit),
+                (Some("data_block"), Some("miss")) => Some(Which::BlockMiss),
+                _ => None,
+            },
+            _ => None,
+        };
+        Arc::new(Slot {
+            counters: Arc::clone(&self.counters),
+            which,
+        })
+    }
+
+    fn register_gauge(&self, _: &str, _: &str, _: &[(&str, &str)]) -> Arc<dyn GaugeFn> {
+        Arc::new(Sink)
+    }
+
+    fn register_up_down_counter(
+        &self,
+        _: &str,
+        _: &str,
+        _: &[(&str, &str)],
+    ) -> Arc<dyn UpDownCounterFn> {
+        Arc::new(Sink)
+    }
+
+    fn register_histogram(
+        &self,
+        _: &str,
+        _: &str,
+        _: &[(&str, &str)],
+        _: &[f64],
+    ) -> Arc<dyn HistogramFn> {
+        Arc::new(Sink)
+    }
+}
+
+/// Every instrument this crate does not read.
+struct Sink;
+
+impl GaugeFn for Sink {
+    fn set(&self, _: i64) {}
+}
+
+impl UpDownCounterFn for Sink {
+    fn increment(&self, _: i64) {}
+}
+
+impl HistogramFn for Sink {
+    fn record(&self, _: f64) {}
+}
+
+/// The counters behind the process's cache, alive from the first
+/// registration so a store opened before anything reads them still counts.
+static COUNTERS: std::sync::LazyLock<Arc<CacheCounters>> =
+    std::sync::LazyLock::new(|| Arc::new(CacheCounters::default()));
+
+/// The recorder every store's builder is given, so their reads tally
+/// together.
+pub(crate) fn recorder() -> Arc<dyn MetricsRecorder> {
+    Arc::new(CacheRecorder {
+        counters: Arc::clone(&COUNTERS),
+    })
+}
+
+/// What the process's block cache has served since it was built —
+/// metadata and data blocks counted apart, because they are sized apart.
+///
+/// Process-wide, like the cache itself: every catalog a process attaches
+/// reads through the one instance, so these are the host's numbers rather
+/// than any one catalog's. Use them to size
+/// [`CatalogOptions::cache_memory`](crate::CatalogOptions::cache_memory)
+/// and [`cache_size`](crate::CatalogOptions::cache_size) from measured
+/// curves rather than from the defaults.
+///
+/// ```
+/// let tally = moraine::cache_tally();
+/// // Nothing has read yet, so there is no rate to report.
+/// assert_eq!(
+///     tally.metadata_hit_rate().is_none(),
+///     tally.metadata_hits == 0 && tally.metadata_misses == 0
+/// );
+/// ```
+#[must_use]
+pub fn cache_tally() -> CacheTally {
+    COUNTERS.tally()
+}
 
 /// The cache every store in this process shares, built to `config` if
 /// nothing has built it yet. `None` when the disk tier could not be
@@ -195,6 +420,60 @@ mod tests {
         assert_eq!(meta + block, DEFAULT_CACHE_MEMORY);
         assert_eq!(meta, 128 * 1024 * 1024);
         assert_eq!(block, 512 * 1024 * 1024);
+    }
+
+    /// The recorder routes SlateDB's cache counters by label: the meta
+    /// slot's three entry kinds tally together, data blocks apart, and a
+    /// kind nobody here models lands in neither rather than being
+    /// miscounted as one.
+    #[test]
+    fn the_recorder_routes_counters_by_entry_kind() {
+        let counters = Arc::new(CacheCounters::default());
+        let recorder = CacheRecorder {
+            counters: Arc::clone(&counters),
+        };
+        let counter = |kind: &str, result: &str| {
+            recorder.register_counter(
+                stats::ACCESS_COUNT,
+                "",
+                &[("entry_kind", kind), ("result", result)],
+            )
+        };
+
+        counter("filter", "hit").increment(1);
+        counter("index", "hit").increment(2);
+        counter("stats", "miss").increment(3);
+        counter("data_block", "hit").increment(4);
+        counter("data_block", "miss").increment(5);
+        counter("something_new", "hit").increment(99);
+        recorder
+            .register_counter(stats::ERROR_COUNT, "", &[])
+            .increment(6);
+
+        let tally = counters.tally();
+        assert_eq!(tally.metadata_hits, 3);
+        assert_eq!(tally.metadata_misses, 3);
+        assert_eq!(tally.block_hits, 4);
+        assert_eq!(tally.block_misses, 5);
+        assert_eq!(tally.errors, 6);
+    }
+
+    /// A rate is reported only once something has been looked up, and is
+    /// the served share of those lookups.
+    #[test]
+    fn hit_rates_need_a_lookup_to_report() {
+        assert_eq!(CacheTally::default().metadata_hit_rate(), None);
+        assert_eq!(CacheTally::default().block_hit_rate(), None);
+
+        let tally = CacheTally {
+            metadata_hits: 3,
+            metadata_misses: 1,
+            block_hits: 1,
+            block_misses: 3,
+            errors: 0,
+        };
+        assert!((tally.metadata_hit_rate().unwrap() - 0.75).abs() < f64::EPSILON);
+        assert!((tally.block_hit_rate().unwrap() - 0.25).abs() < f64::EPSILON);
     }
 
     /// A budget too small to split still yields usable slots rather than

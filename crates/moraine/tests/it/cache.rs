@@ -449,3 +449,55 @@ async fn a_bounded_disk_cache_serves_a_writer_and_a_reader() {
 
     let _ = std::fs::remove_dir_all(&cache);
 }
+
+/// The cache reports what it served. Reads run through the process's one
+/// instance, so the counters move as soon as anything reads a store —
+/// which is what makes the budget sizable from measurement instead of
+/// from the defaults.
+///
+/// Asserted as a delta, not an absolute: every other test in this binary
+/// shares the same process-wide cache, so only this test's own reads are
+/// its to claim.
+#[tokio::test]
+async fn the_cache_reports_what_it_served() {
+    let object_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+
+    let before = moraine::cache_tally();
+
+    let writer = Catalog::open(Arc::clone(&object_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            tx.create_table(schema, "t", &[col("a")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    // A cold reader must fetch and decode the store's SSTs to answer, so
+    // the metadata slot is consulted whatever it can serve.
+    let reader = Catalog::open_read_only(object_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let view = reader.snapshot().await.unwrap();
+    assert!(
+        view.table_by_name(view.schema_by_name("main").expect("bootstrap").id, "t")
+            .is_some()
+    );
+    reader.close().await.unwrap();
+
+    let after = moraine::cache_tally();
+    let metadata_lookups = (after.metadata_hits + after.metadata_misses)
+        - (before.metadata_hits + before.metadata_misses);
+    assert!(
+        metadata_lookups > 0,
+        "reads did not reach the cache: {before:?} then {after:?}"
+    );
+    assert!(
+        after.metadata_hit_rate().is_some(),
+        "a cache that has served has a rate to report"
+    );
+}

@@ -1415,6 +1415,27 @@ void moraine_compact_store_free(struct MoraineSubspaceMerge *items, size_t len);
 // `name`, if non-null, must be a valid C string.
 bool moraine_subspace_is_known(const char *name);
 
+// What the process's block cache has served since it was built.
+//
+// Process-wide, not per attach: one cache serves every store a process
+// opens, so these are the host's numbers. Needs no handle for the same
+// reason, and reports zeros before anything has read.
+//
+// Metadata (SST indexes, filters, stats) and data blocks are counted
+// apart because they are budgeted apart — a healthy stack keeps
+// metadata near fully served, while blocks land wherever the working
+// set does.
+//
+// # Safety
+//
+// Every out-pointer must be valid and writable for the duration of the
+// call.
+int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
+                            uint64_t *out_metadata_misses,
+                            uint64_t *out_block_hits,
+                            uint64_t *out_block_misses,
+                            uint64_t *out_errors);
+
 // The store state the catalog's dumps currently serve: the head
 // snapshot id and batch count. `out_present` is false on a store with no
 // head yet (mid-bootstrap), where the other outputs are left unwritten.
