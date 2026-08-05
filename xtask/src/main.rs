@@ -9,6 +9,8 @@
 //! - `check-pins` verifies every place naming a DuckDB version agrees with
 //!   `.github/duckdb-versions` (see `pins.rs`), and `version-matrix` prints
 //!   that manifest as the JSON array the release workflows build from.
+//! - `check-release-assets <directory>` verifies a release carries a build for
+//!   every supported version on every published platform (see `release.rs`).
 //! - `bump-duckdb <version>` moves the primary pin to a new DuckDB release,
 //!   writing every place `check-pins` checks (see `bump.rs`).
 
@@ -19,6 +21,7 @@ mod bump;
 mod duckdb;
 mod e2e;
 mod pins;
+mod release;
 mod s3;
 
 fn main() -> anyhow::Result<()> {
@@ -29,6 +32,7 @@ fn main() -> anyhow::Result<()> {
         Some("bench") => bench::bench(&arguments),
         Some("s3") => s3::s3(),
         Some("check-pins") => pins::check_pins(),
+        Some("check-release-assets") => release::check_release_assets(&arguments),
         Some("bump-duckdb") => bump::bump_duckdb(&arguments),
         Some("version-matrix") => {
             pins::print_version_matrix();
@@ -37,12 +41,12 @@ fn main() -> anyhow::Result<()> {
         Some(other) => {
             bail!(
                 "unknown task `{other}`; available: e2e, bench, s3, check-pins, \
-                 version-matrix, bump-duckdb"
+                 check-release-assets, version-matrix, bump-duckdb"
             )
         }
         None => bail!(
             "usage: cargo xtask <task>; available: e2e, bench, s3, check-pins, \
-             version-matrix, bump-duckdb"
+             check-release-assets, version-matrix, bump-duckdb"
         ),
     }
 }

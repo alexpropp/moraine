@@ -96,6 +96,7 @@ pub fn check_pins() -> anyhow::Result<()> {
                 "{file} pins DuckDB `{stale}`, which is not in .github/duckdb-versions"
             ));
         }
+        problems.extend(tools_ref_problem(file, &contents));
     }
 
     let readme = read(README)?;
@@ -208,6 +209,34 @@ fn ducklake_problems(commit: &str) -> anyhow::Result<Vec<String>> {
     }
 
     Ok(problems)
+}
+
+/// The complaint that a workflow calls the reusable extension build at one
+/// extension-ci-tools ref and asks it to generate the build matrix from
+/// another.
+///
+/// The two are one artifact: the distribution matrix a `ci_tools_version`
+/// checkout supplies is read by the workflow body at the `uses:` ref, so an
+/// older matrix omits fields a newer body requires. That drops the platforms
+/// it cannot describe silently — no job, no failure, an incomplete release.
+fn tools_ref_problem(file: &str, contents: &str) -> Option<String> {
+    let called = word_after(contents, "_extension_distribution.yml@")?;
+    let generated_from = word_after(contents, "ci_tools_version: ")?;
+    (called != generated_from).then(|| {
+        format!(
+            "{file} calls extension-ci-tools `{called}` but generates its build matrix from \
+             `{generated_from}`; both must name the same ref, or the platforms the older \
+             matrix cannot describe are dropped without failing"
+        )
+    })
+}
+
+/// The run of non-whitespace immediately after `marker`.
+fn word_after<'a>(contents: &'a str, marker: &str) -> Option<&'a str> {
+    let after = contents.find(marker)? + marker.len();
+    let rest = contents.get(after..)?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    rest.get(..end).filter(|word| !word.is_empty())
 }
 
 /// A repo-relative file, read whole.
@@ -333,6 +362,23 @@ mod tests {
             ducklake_problems(commit).expect("reading the pinned files"),
             Vec::<String>::new()
         );
+    }
+
+    /// The mismatch that shipped a release with no macOS builds for one of
+    /// its DuckDB versions.
+    #[test]
+    fn a_build_matrix_generated_from_another_tools_ref_is_a_problem() {
+        let workflow = |generated_from| {
+            format!(
+                "    uses: duckdb/extension-ci-tools/.github/workflows/\
+                 _extension_distribution.yml@v1.5.5\n      \
+                 ci_tools_version: {generated_from}\n"
+            )
+        };
+        assert_eq!(tools_ref_problem("w.yml", &workflow("v1.5.5")), None);
+        let problem = tools_ref_problem("w.yml", &workflow("${{ matrix.duckdb_version }}"))
+            .expect("a differing ref is a problem");
+        assert!(problem.contains("`v1.5.5`"), "{problem}");
     }
 
     #[test]
