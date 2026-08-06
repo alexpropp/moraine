@@ -678,16 +678,19 @@ std::vector<std::vector<duckdb::Value>> ProvideScheduledDeletions(MoraineCatalog
 //     uses it when no DATA_PATH is supplied, so a re-attach need not repeat
 //     it; a store with none served leaves the ATTACH DATA_PATH as authority.
 //   - "created_by": never read back; served because it costs nothing.
-//   - "data_inlining_row_limit": "10" (DuckLake's compiled default). Load-
-//     bearing: a non-zero value is what makes DuckLake's write path emit
-//     `INSERT INTO ducklake_inlined_data_tables`; "0" would suppress inlining
-//     entirely. inline_tables.cpp serves the dynamic inline catalog surface
-//     this drives.
+// No row is served for "data_inlining_row_limit". DuckLake resolves that
+// limit from its config options first and falls back to the DuckDB setting
+// and then a compiled default of 10, and an ATTACH option lands in the same
+// map an option row does — so a row served here would outrank both
+// `ATTACH ... (DATA_INLINING_ROW_LIMIT n)` and
+// `SET ducklake_default_data_inlining_row_limit`, silently. Serving none
+// leaves inlining on at that same default of 10 and leaves both knobs
+// meaningful; a store that wants another limit records a real option row.
 // All rows are global (scope/scope_id NULL).
 // The `ducklake_metadata` rows moraine serves from its own facts rather
 // than from stored options: the protocol version, the writer, the
-// creation-time `encrypted` flag, the inlining default, and the recorded
-// data root in the normalized form DuckLake compares against.
+// creation-time `encrypted` flag, and the recorded data root in the
+// normalized form DuckLake compares against.
 std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *handle, MoraineInterruptProbe probe,
                                                           void *probe_ctx) {
 	bool encrypted = false;
@@ -702,7 +705,6 @@ std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *
 	    {Varchar("version"), Varchar("1.0"), null_varchar, null_bigint},
 	    {Varchar("created_by"), Varchar("moraine"), null_varchar, null_bigint},
 	    {Varchar("encrypted"), Varchar(encrypted ? "true" : "false"), null_varchar, null_bigint},
-	    {Varchar("data_inlining_row_limit"), Varchar("10"), null_varchar, null_bigint},
 	};
 	// The recorded data root, when the store has one, so DuckLake reads it
 	// back on attach instead of requiring DATA_PATH again.
@@ -728,7 +730,7 @@ std::vector<std::vector<duckdb::Value>> FixedMetadataRows(MoraineCatalogHandle *
 	// Stored options last. Most override a fixed row of the same key and
 	// scope — the rows above are what a store *without* a setting serves,
 	// and `set_option` is what replaces one; without the override a user
-	// could set `data_inlining_row_limit` and never see it take effect.
+	// could set an option and never see it take effect.
 	//
 	// The exceptions are the keys above that are *store facts* rather than
 	// defaults: `version` is the protocol constant, `encrypted` is fixed
@@ -754,8 +756,7 @@ std::vector<duckdb::Value> OptionShape(const MoraineOptionRow &r) {
 // Merges the store's own option rows over the fixed ones. Most override a
 // fixed row of the same key and scope — the fixed rows are what a store
 // *without* a setting serves, and `set_option` is what replaces one; without
-// the override a user could set `data_inlining_row_limit` and never see it
-// take effect.
+// the override a user could set an option and never see it take effect.
 //
 // The exceptions are the keys that are *store facts* rather than defaults:
 // `version` is the protocol constant, `encrypted` is fixed when the catalog
