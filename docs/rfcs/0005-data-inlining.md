@@ -241,9 +241,10 @@ converting accumulated small writes into scan-optimized storage.
 ### Extension surface (as implemented)
 
 DuckLake does not write inlined rows as fixed `ducklake_*` rows. When
-`data_inlining_row_limit != 0` (its compiled default is 10; moraine
-synthesizes a nonzero value in `ducklake_metadata` to enable inlining, in
-place of the `0` it advertised while inlining was unsupported), DuckLake
+`data_inlining_row_limit != 0` (its compiled default is 10, which moraine
+leaves standing — it serves no `ducklake_metadata` row for the key,
+because one would outrank the ATTACH option and the DuckDB setting alike
+and shadow every way of raising the limit), DuckLake
 **dynamically creates and drives per-table physical tables** in the
 metadata catalog and issues ordinary SQL against them. moraine's
 `StorageExtension` recognizes these table-name patterns and routes every

@@ -848,20 +848,27 @@ write; a lost race at commit returns an error whose message contains the
 literal substring `conflict` (never retried internally, per the C ABI
 error mapping table above).
 
-### `ducklake_metadata` synthesis: `data_inlining_row_limit = 10` and dynamic inline-table interception
+### `data_inlining_row_limit` is deliberately not synthesized, and dynamic inline-table interception
 
 Beyond the keys the exists-probe path reads (version, encrypted,
 created_by — see the metadata-catalog section below), the synthesized
-`ducklake_metadata` also serves `data_inlining_row_limit = "10"` —
-DuckLake's own compiled default, declaring catalog-wide that inlining is
-**on**. (An earlier revision of this shim served `"0"` to keep inlining
-off while RFC 0005 was unimplemented; that stopgap is gone now that it
-is.) This is load-bearing, not informational: DuckLake's
-`WriteNewInlinedTables` (source-verified) skips registering a table's
-per-schema-version inlined-data table when `DataInliningRowLimit(...)`
-resolves to 0 for that table, and that limit's only inputs are catalog
-configuration options — absent a served value the default is 10 anyway,
-so serving `10` explicitly just makes the choice legible.
+`ducklake_metadata` serves **no** row for `data_inlining_row_limit`.
+Inlining is on regardless: DuckLake's `WriteNewInlinedTables`
+(source-verified) skips registering a table's per-schema-version
+inlined-data table only when `DataInliningRowLimit(...)` resolves to 0,
+and absent any served value that resolves to a compiled default of 10.
+(An earlier revision served `"0"` to keep inlining off while RFC 0005 was
+unimplemented, then `"10"` to make the choice legible.)
+
+Serving it is worse than redundant. `DataInliningRowLimit` reads the
+catalog's configuration options first and only then the DuckDB setting
+`ducklake_default_data_inlining_row_limit`, and an
+`ATTACH ... (DATA_INLINING_ROW_LIMIT n)` lands in that same option map —
+so a served row outranks both knobs and shadows them silently, leaving an
+operator with no way to raise the limit. Serving nothing keeps the same
+default and keeps both knobs working; a store that wants a different
+limit records a real option row, which overrides the default as any
+stored option does.
 
 With inlining on, DuckLake **dynamically creates and drives per-table
 physical tables** in the metadata catalog rather than writing fixed

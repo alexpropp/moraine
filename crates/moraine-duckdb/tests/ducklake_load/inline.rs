@@ -6,8 +6,8 @@ fn ducklake_inline_data_round_trip_through_flush() {
     let dir = TempDir::new("inline-store");
     let data_dir = TempDir::new("inline-data");
     // No fixture seed: bootstrap alone (an empty attach mints `main`)
-    // is enough for a CREATE TABLE; row inlining is on by default
-    // (`data_inlining_row_limit = 10`), so these small inserts inline.
+    // is enough for a CREATE TABLE; row inlining is on at DuckLake's
+    // compiled default of ten rows, so these small inserts inline.
     let store = dir.path();
     let data_path = data_dir.path();
 
@@ -299,5 +299,147 @@ fn ducklake_flush_clears_inlined_file_deletions() {
         after.last().expect("a count row"),
         &vec!["98".to_string()],
         "the emptied inlined-deletion table must still exist for the rest of the session"
+    );
+}
+
+/// Rows for `count` parents' worth of data in one insert, and the number
+/// of Parquet files the catalog holds afterwards. Inlining writes none.
+fn data_files_after_inserting(
+    store: &std::path::Path,
+    data_path: &std::path::Path,
+    attach_options: &str,
+    rows: u64,
+) -> String {
+    run_ducklake_sql_with_options(
+        store,
+        data_path,
+        attach_options,
+        &format!(
+            "CREATE TABLE lake.main.t (i BIGINT);\n\
+             INSERT INTO lake.main.t SELECT range FROM range({rows});"
+        ),
+    );
+    csv_rows(&run_standalone_sql(
+        store,
+        "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+    ))
+    .into_iter()
+    .next()
+    .and_then(|row| row.into_iter().next())
+    .expect("a count row")
+}
+
+/// DuckLake's compiled default bounds an insert at ten rows, and moraine
+/// serves no option row of its own to displace it: a small insert inlines,
+/// a large one writes a file.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_inlining_defaults_to_ten_rows() {
+    let small = TempDir::new("limit-small-store");
+    let small_data = TempDir::new("limit-small-data");
+    assert_eq!(
+        data_files_after_inserting(small.path(), small_data.path(), "", 5),
+        "0",
+        "five rows are under the default, so they inline"
+    );
+
+    let large = TempDir::new("limit-large-store");
+    let large_data = TempDir::new("limit-large-data");
+    assert_eq!(
+        data_files_after_inserting(large.path(), large_data.path(), "", 400),
+        "1",
+        "four hundred are over it, so they land as a data file"
+    );
+}
+
+/// `ATTACH ... (DATA_INLINING_ROW_LIMIT n)` raises the limit.
+///
+/// DuckLake resolves the limit from its config options first and only
+/// falls back to the setting and its compiled default, and an ATTACH
+/// option and a `ducklake_metadata` row land in the same map — so any row
+/// moraine serves for this key silently outranks what the attach asked
+/// for. Serving none is what keeps the option meaningful.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_attach_option_raises_the_inlining_row_limit() {
+    let dir = TempDir::new("limit-attach-store");
+    let data_dir = TempDir::new("limit-attach-data");
+    assert_eq!(
+        data_files_after_inserting(
+            dir.path(),
+            data_dir.path(),
+            ", DATA_INLINING_ROW_LIMIT 1000",
+            400
+        ),
+        "0",
+        "the attach option must take effect, so 400 rows inline"
+    );
+}
+
+/// `SET ducklake_default_data_inlining_row_limit` raises it too — the
+/// same shadowing question, reached through DuckDB's setting rather than
+/// through an ATTACH option.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_session_setting_raises_the_inlining_row_limit() {
+    let dir = TempDir::new("limit-setting-store");
+    let data_dir = TempDir::new("limit-setting-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "SET ducklake_default_data_inlining_row_limit = 1000;\n\
+         CREATE TABLE lake.main.t (i BIGINT);\n\
+         INSERT INTO lake.main.t SELECT range FROM range(400);",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["0"]],
+        "the session setting must take effect, so 400 rows inline"
+    );
+}
+
+/// A stored option raises the limit as well, which is the durable form of
+/// the two knobs above: `set_option` records a `ducklake_metadata` row,
+/// and a stored row is what DuckLake resolves before either of them.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_stored_option_raises_the_inlining_row_limit() {
+    let dir = TempDir::new("limit-stored-store");
+    let data_dir = TempDir::new("limit-stored-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL lake.set_option('data_inlining_row_limit', 1000);",
+    );
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CREATE TABLE lake.main.t (i BIGINT);\n\
+         INSERT INTO lake.main.t SELECT range FROM range(400);",
+    );
+    assert_eq!(
+        csv_rows(&run_standalone_sql(
+            store,
+            "SELECT count(*) FROM m.ducklake_data_file WHERE end_snapshot IS NULL;",
+        )),
+        vec![vec!["0"]],
+        "the stored option must take effect, so 400 rows inline"
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT count(*) FROM lake.main.t;",
+        )),
+        vec![vec!["400"]]
     );
 }

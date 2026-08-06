@@ -278,6 +278,70 @@ fn ducklake_schema_version_classification_matches_stock_ducklake() {
     );
 }
 
+/// Re-setting an option overwrites its row rather than failing.
+///
+/// DuckLake's `SetConfigOption` counts the rows already holding the key
+/// at that scope and issues an `INSERT` only when there are none, so
+/// every set after the first arrives as `UPDATE ducklake_metadata SET
+/// value` — a spelling the staged path has to translate, or an option
+/// can be set exactly once and never corrected.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_set_option_overwrites_an_existing_option_row() {
+    let twin = Twin::new("setopt-twice");
+    let value = || {
+        twin.probe(
+            "SELECT value FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'parquet_compression' AND scope IS NULL;",
+        )
+    };
+
+    twin.apply("CALL lake.set_option('parquet_compression', 'zstd');");
+    assert_eq!(value(), vec![vec!["zstd".to_string()]]);
+
+    twin.apply("CALL lake.set_option('parquet_compression', 'snappy');");
+    assert_eq!(
+        value(),
+        vec![vec!["snappy".to_string()]],
+        "the second set must overwrite the row, not duplicate it or fail"
+    );
+}
+
+/// An option row can be removed, which is what resets an option to its
+/// default. The staged delete carries the row's key columns — key and
+/// scope — as every other raw-delete kind does, so the core has to decode
+/// that shape rather than a whole row.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_an_option_row_can_be_deleted() {
+    let dir = TempDir::new("setopt-delete-store");
+    let data_dir = TempDir::new("setopt-delete-data");
+    let store = dir.path();
+    let data_path = data_dir.path();
+
+    run_ducklake_sql(
+        store,
+        data_path,
+        "CALL lake.set_option('parquet_compression', 'zstd');",
+    );
+    run_ducklake_sql(
+        store,
+        data_path,
+        "DELETE FROM __ducklake_metadata_lake.ducklake_metadata \
+         WHERE key = 'parquet_compression';",
+    );
+    assert_eq!(
+        csv_rows(&run_ducklake_sql(
+            store,
+            data_path,
+            "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'parquet_compression';",
+        )),
+        vec![vec!["0"]],
+        "the option is gone, so it resolves to its default again"
+    );
+}
+
 /// A name-mapping registration is data-only: registering foreign Parquet
 /// writes `ducklake_column_mapping` / `ducklake_name_mapping` rows and a
 /// data file, and must carry `schema_version` forward — the mapping

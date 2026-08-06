@@ -515,8 +515,11 @@ DuckLake settings exist to serve.
 
 ### Data inlining
 
-`ducklake_metadata` also serves `data_inlining_row_limit = "10"`
-(DuckLake's compiled default), turning inlining on catalog-wide. With it
+Inlining is on catalog-wide at DuckLake's own compiled default of ten
+rows, which `ducklake_metadata` serves no row for on purpose: an option
+row outranks both `ATTACH ... (DATA_INLINING_ROW_LIMIT n)` and
+`SET ducklake_default_data_inlining_row_limit`, so serving one would
+shadow every way an operator has of raising the limit. With inlining
 on, DuckLake dynamically creates and drives per-table physical tables in
 the metadata catalog instead of writing fixed `ducklake_*` rows for small
 inserts; `cpp/inline_tables.cpp` recognizes two dynamic name families —

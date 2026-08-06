@@ -4583,6 +4583,13 @@ async fn staged_option_rows_set_scoped_options_without_minting_a_snapshot() {
             scope.map_or(Cell::Null, |(_, id)| Cell::U64(id)),
         ]
     };
+    let option_key_row = |key: &str, scope: Option<(&str, u64)>| {
+        vec![
+            Cell::Str(key.to_string()),
+            scope.map_or(Cell::Null, |(name, _)| Cell::Str(name.to_string())),
+            scope.map_or(Cell::Null, |(_, id)| Cell::U64(id)),
+        ]
+    };
     let stored = |key: &'static str, scope: OptionScope| {
         let store = store.clone();
         async move {
@@ -4628,9 +4635,11 @@ async fn staged_option_rows_set_scoped_options_without_minting_a_snapshot() {
         table: TableKind::Metadata,
         cells: option_row("parquet_compression", "gzip", None),
     });
+    // A delete names the option, not its value: the key cells alone, as
+    // every other raw-delete kind carries them.
     tx.stage(RowOperation::Delete {
         table: TableKind::Metadata,
-        cells: option_row("parquet_compression", "snappy", Some(("table", 1))),
+        cells: option_key_row("parquet_compression", Some(("table", 1))),
     });
     assert_eq!(tx.commit().await.unwrap().get(), head_before);
 

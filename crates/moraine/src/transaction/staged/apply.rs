@@ -10,9 +10,10 @@ use super::{
         decode_data_file, decode_delete_file, decode_delete_key, decode_end,
         decode_file_column_stats, decode_file_partition_value, decode_gc_file_row,
         decode_hard_delete, decode_macro, decode_macro_impl, decode_macro_parameter,
-        decode_metadata, decode_name_mapping, decode_partition_column, decode_partition_info,
-        decode_schema, decode_sort_expression, decode_sort_info, decode_table,
-        decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view, table_value,
+        decode_metadata, decode_metadata_key, decode_name_mapping, decode_partition_column,
+        decode_partition_info, decode_schema, decode_sort_expression, decode_sort_info,
+        decode_table, decode_table_column_stats, decode_table_stats, decode_tag_row, decode_view,
+        table_value,
     },
     proto,
 };
@@ -758,7 +759,7 @@ fn apply_schedule_delete(
 /// unversioned and last-write-wins, so a delete of one already gone is not
 /// a disagreement about state.
 fn apply_option_delete(state: &mut CatalogSnapshot, cells: &[Cell]) -> Result<()> {
-    let (components, key, _value) = decode_metadata(cells)?;
+    let (components, key) = decode_metadata_key(cells)?;
     let Some(mut record) = state.options.get(&components).cloned() else {
         return Ok(());
     };

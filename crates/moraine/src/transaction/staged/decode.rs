@@ -662,8 +662,26 @@ pub(super) fn decode_metadata(cells: &[Cell]) -> Result<((u64, u64), String, Str
     let scope = c.opt_string()?;
     let scope_id = c.opt_u64()?.unwrap_or_default();
     c.finish()?;
+    Ok((option_scope(scope.as_deref(), scope_id)?, key, value))
+}
 
-    let scope_kind = match scope.as_deref() {
+/// Decodes a `ducklake_metadata` row's identity alone: the key and the
+/// scope, without the value. A removal names the option rather than what
+/// it held, so the staged delete carries these three cells — the shape
+/// every raw-delete kind uses, and narrower than [`decode_metadata`].
+pub(super) fn decode_metadata_key(cells: &[Cell]) -> Result<((u64, u64), String)> {
+    let mut c = Cursor::new(TableKind::Metadata, cells);
+    let key = c.string()?;
+    let scope = c.opt_string()?;
+    let scope_id = c.opt_u64()?.unwrap_or_default();
+    c.finish()?;
+    Ok((option_scope(scope.as_deref(), scope_id)?, key))
+}
+
+/// The scope components of an option row, from DuckLake's scope name and
+/// id.
+fn option_scope(scope: Option<&str>, scope_id: u64) -> Result<(u64, u64)> {
+    let scope_kind = match scope {
         None => 0,
         Some("schema") => 1,
         Some("table") => 2,
@@ -675,8 +693,7 @@ pub(super) fn decode_metadata(cells: &[Cell]) -> Result<((u64, u64), String, Str
         }
     };
     // A global option carries no id, whatever the row says.
-    let scope_id = if scope_kind == 0 { 0 } else { scope_id };
-    Ok(((scope_kind, scope_id), key, value))
+    Ok((scope_kind, if scope_kind == 0 { 0 } else { scope_id }))
 }
 
 /// A `ducklake_schema_versions` row: `(table_id, begin_snapshot,
