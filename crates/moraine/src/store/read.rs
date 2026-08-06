@@ -326,7 +326,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn reads_decode_what_was_written() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();
@@ -468,7 +468,7 @@ mod tests {
     /// replay from silently overwriting the live record.
     #[tokio::test]
     async fn unversioned_kind_in_history_is_refused() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();
@@ -505,7 +505,7 @@ mod tests {
     /// there is refused like every other unversioned kind.
     #[tokio::test]
     async fn mapping_in_history_is_refused() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();

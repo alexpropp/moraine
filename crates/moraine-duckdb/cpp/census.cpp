@@ -154,20 +154,27 @@ void CensusImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckd
 
 // moraine_cache_tally: what the block cache has served.
 //
-// Takes no lake name because it has nothing to take one for: a process
-// keeps one cache and every attached store reads through it, so the
-// numbers are the host's. One row, so it composes into a monitoring
-// query without an aggregate.
+// Two forms over one cache. Without arguments the numbers are the host's:
+// a process keeps one cache and every attached store reads through it, so
+// that is the scope its budget is set at. Given a lake name they are that
+// attach's alone, which is the question a host with several catalogs on
+// one cache has — which of them is spending the budget. One row either
+// way, so it composes into a monitoring query without an aggregate.
 struct TallyBindData : public duckdb::FunctionData {
+	// Empty for the process-wide form.
+	std::string catalog_name;
+
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-		return duckdb::make_uniq<TallyBindData>();
+		auto result = duckdb::make_uniq<TallyBindData>();
+		*result = *this;
+		return std::move(result);
 	}
-	bool Equals(const duckdb::FunctionData &) const override {
-		return true;
+	bool Equals(const duckdb::FunctionData &other_p) const override {
+		return catalog_name == other_p.Cast<TallyBindData>().catalog_name;
 	}
 };
 
-duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &,
+duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duckdb::TableFunctionBindInput &input,
                                                    duckdb::vector<duckdb::LogicalType> &return_types,
                                                    duckdb::vector<duckdb::string> &names) {
 	names = {"metadata_hits",  "metadata_misses",   "metadata_hit_rate", "block_hits",
@@ -175,7 +182,15 @@ duckdb::unique_ptr<duckdb::FunctionData> TallyBind(duckdb::ClientContext &, duck
 	return_types = {duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT, duckdb::LogicalType::UBIGINT, duckdb::LogicalType::DOUBLE,
 	                duckdb::LogicalType::UBIGINT};
-	return duckdb::make_uniq<TallyBindData>();
+
+	auto bind_data = duckdb::make_uniq<TallyBindData>();
+	if (!input.inputs.empty()) {
+		if (input.inputs[0].IsNull()) {
+			throw duckdb::BinderException("moraine_cache_tally: the lake name must not be NULL");
+		}
+		bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+	}
+	return std::move(bind_data);
 }
 
 struct TallyGlobalState : public duckdb::GlobalTableFunctionState {
@@ -187,7 +202,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> TallyInitGlobal(duckdb::Cli
 	return duckdb::make_uniq<TallyGlobalState>();
 }
 
-void TallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+void TallyImpl(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<TallyBindData>();
 	auto &state = data.global_state->Cast<TallyGlobalState>();
 	if (state.emitted) {
 		output.SetCardinality(0);
@@ -200,7 +216,12 @@ void TallyImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duckdb
 	uint64_t block_hits = 0;
 	uint64_t block_misses = 0;
 	uint64_t errors = 0;
-	if (moraine_cache_tally(&metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors) != MORAINE_OK) {
+	auto code = bind_data.catalog_name.empty()
+	                ? moraine_cache_tally(&metadata_hits, &metadata_misses, &block_hits, &block_misses, &errors)
+	                : moraine_catalog_cache_tally(ResolveMoraineCatalog(context, bind_data.catalog_name).Handle(),
+	                                              &metadata_hits, &metadata_misses, &block_hits, &block_misses,
+	                                              &errors);
+	if (code != MORAINE_OK) {
 		throw duckdb::InternalException("moraine_cache_tally: could not read the cache counters");
 	}
 
@@ -231,7 +252,10 @@ void RegisterMoraineCensusFunctions(duckdb::ExtensionLoader &loader) {
 	census.named_parameters["live"] = duckdb::LogicalType::BOOLEAN;
 	loader.RegisterFunction(census);
 
-	duckdb::TableFunction tally("moraine_cache_tally", {}, TallyImpl, TallyBind, TallyInitGlobal);
+	duckdb::TableFunctionSet tally("moraine_cache_tally");
+	tally.AddFunction(duckdb::TableFunction({}, TallyImpl, TallyBind, TallyInitGlobal));
+	tally.AddFunction(
+	    duckdb::TableFunction({duckdb::LogicalType::VARCHAR}, TallyImpl, TallyBind, TallyInitGlobal));
 	loader.RegisterFunction(tally);
 }
 

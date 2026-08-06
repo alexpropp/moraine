@@ -502,6 +502,75 @@ async fn the_cache_reports_what_it_served() {
     );
 }
 
+/// Two catalogs in one process share the cache but not the tally: what one
+/// reads lands in its own counts and not the other's, and the process's
+/// counts take both.
+///
+/// The point is attribution. A host with several catalogs on one budget
+/// can read the process's numbers today; what it cannot do without this is
+/// tell which attach is spending them.
+#[tokio::test]
+async fn each_catalog_tallies_its_own_reads() {
+    let quiet = Catalog::open(
+        Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>,
+        CatalogOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let busy_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+    let writer = Catalog::open(Arc::clone(&busy_store), CatalogOptions::default())
+        .await
+        .unwrap();
+    writer
+        .commit(|tx| {
+            let schema = tx.schema_by_name("main").expect("bootstrap").id;
+            tx.create_table(schema, "t", &[col("a")])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let quiet_before = quiet.cache_tally();
+    let process_before = moraine::cache_tally();
+
+    // A cold reader fetches and decodes the store's SSTs, so its own
+    // metadata counters must move.
+    let busy = Catalog::open_read_only(busy_store, CatalogOptions::default())
+        .await
+        .unwrap();
+    let view = busy.snapshot().await.unwrap();
+    assert!(
+        view.table_by_name(view.schema_by_name("main").expect("bootstrap").id, "t")
+            .is_some()
+    );
+
+    let busy_tally = busy.cache_tally();
+    let busy_lookups = busy_tally.metadata_hits + busy_tally.metadata_misses;
+    assert!(
+        busy_lookups > 0,
+        "the reading catalog's own tally must move: {busy_tally:?}"
+    );
+
+    assert_eq!(
+        quiet.cache_tally(),
+        quiet_before,
+        "an idle catalog must not be charged for another's reads"
+    );
+
+    let process_after = moraine::cache_tally();
+    assert!(
+        (process_after.metadata_hits + process_after.metadata_misses)
+            - (process_before.metadata_hits + process_before.metadata_misses)
+            >= busy_lookups,
+        "the process's counts still cover every attach's reads"
+    );
+
+    busy.close().await.unwrap();
+    quiet.close().await.unwrap();
+}
+
 /// A bulk scan must not cost the probe path its residency. The meta slot
 /// holds SST indexes and filters and data blocks cannot compete for it,
 /// so a whole-subspace scan between two probes leaves the second probe

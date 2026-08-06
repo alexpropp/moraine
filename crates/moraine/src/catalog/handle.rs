@@ -34,6 +34,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
+        cache::{CacheCounters, CacheTally},
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
         handle::{ReadHandle, ReadSession, ScanShape},
@@ -260,13 +261,13 @@ pub struct CatalogOptions {
     /// so a durable commit waits only on the object-store PUT — the lowest
     /// latency, at the cost of a busy flush loop. Defaults to 100ms.
     pub flush_interval: Duration,
-    /// Local directory backing SlateDB's on-disk object cache, which holds
-    /// fetched object parts. When set, reads are served from a disk-backed
-    /// cache that survives process restarts, so warm queries skip repeat
+    /// Local directory backing the block cache's disk tier, which holds
+    /// data blocks evicted from memory. When set, warm queries skip repeat
     /// object-store GETs — worthwhile for remote (`s3://`) stores,
-    /// redundant for local ones. `None` (the default) leaves only the
-    /// in-memory caches: a block cache and a metadata cache, both at
-    /// SlateDB's own sizes and not configurable here.
+    /// redundant for local ones. Process-wide, like
+    /// [`cache_size`](Self::cache_size): the first catalog to open decides
+    /// whether there is a disk tier at all, and where. `None` (the
+    /// default) keeps the cache in memory.
     pub cache_dir: Option<std::path::PathBuf>,
     /// How many bytes of disk the block cache's device may hold, for the
     /// whole process rather than per catalog: one cache is shared by every
@@ -453,6 +454,9 @@ pub struct ReadOnlyCatalog {
     store: Arc<Store>,
     // Shared across handle clones: how this attach has served its reads.
     reads: Arc<ReadTally>,
+    // Shared across handle clones: what the process's block cache has
+    // served for this attach in particular.
+    cache: Arc<CacheCounters>,
     // Where the store lives. Retained because the census and the store
     // merge reach SlateDB's admin surface, which addresses a store by path
     // rather than through an open handle.
@@ -510,6 +514,37 @@ impl ReadOnlyCatalog {
     /// The maintained-projection state shared by this handle's clones.
     pub(crate) fn projections(&self) -> &Arc<std::sync::RwLock<ProjectionCache>> {
         &self.projections
+    }
+
+    /// What the block cache has served for **this catalog** since it
+    /// attached — metadata and data blocks counted apart, because they are
+    /// sized apart.
+    ///
+    /// The cache itself is the process's: every catalog a process attaches
+    /// reads through one instance under one budget. These are that
+    /// instance's numbers for this attach alone, which is what tells a
+    /// busy catalog from an idle one sharing it;
+    /// [`cache_tally`](crate::cache_tally) is the same counts for the
+    /// process.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use moraine::{Catalog, CatalogOptions};
+    /// # use object_store::memory::InMemory;
+    /// # tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    /// let catalog = Catalog::open(Arc::new(InMemory::new()), CatalogOptions::default()).await?;
+    /// let tally = catalog.cache_tally();
+    /// // A fresh attach of a fresh store has read nothing back through
+    /// // the cache, so there is no rate to report yet.
+    /// assert_eq!(
+    ///     tally.block_hit_rate().is_none(),
+    ///     tally.block_hits == 0 && tally.block_misses == 0
+    /// );
+    /// # Ok::<(), moraine::Error>(()) }).unwrap();
+    /// ```
+    #[must_use]
+    pub fn cache_tally(&self) -> CacheTally {
+        self.cache.tally()
     }
 
     /// Records that the `current` half of the shared record set was
@@ -1765,8 +1800,9 @@ impl Catalog {
             .cache_memory(options.cache_memory)
             .cache_preload(options.cache_preload)
             .cache_puts(options.cache_puts);
-        let db = commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
-            .await?;
+        let (db, cache) =
+            commit::open_initialized(store, options.encrypted, options.data_path.as_deref())
+                .await?;
         info!(
             path = options.path,
             flush_interval_ms = options.flush_interval.as_millis(),
@@ -1782,6 +1818,7 @@ impl Catalog {
                     object_store: located,
                 }),
                 reads: Arc::new(ReadTally::default()),
+                cache,
                 commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
                 projections,
             },
@@ -1851,7 +1888,7 @@ impl Catalog {
             .poll_interval(options.reader_poll_interval)
             .checkpoint(checkpoint);
 
-        let reader = commit::open_reader_initialized(store).await?;
+        let (reader, cache) = commit::open_reader_initialized(store).await?;
         info!(
             path = options.path,
             checkpoint = options.checkpoint,
@@ -1866,6 +1903,7 @@ impl Catalog {
                 object_store: located,
             }),
             reads: Arc::new(ReadTally::default()),
+            cache,
             commits: Arc::new(commit::Coalescer::new(Arc::clone(&projections))),
             projections,
         })
@@ -1919,7 +1957,7 @@ impl Catalog {
         options: CatalogOptions,
         request: MigrationRequest,
     ) -> Result<MigrationReport> {
-        let db = StoreBuilder::new(&options.path, object_store.clone())
+        let (db, _cache) = StoreBuilder::new(&options.path, object_store.clone())
             .flush_interval(options.flush_interval)
             .cache_dir(options.cache_dir.clone())
             .cache_size(options.cache_size)

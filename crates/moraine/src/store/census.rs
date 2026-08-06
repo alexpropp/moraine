@@ -311,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_census_reports_written_segments() {
         let store = memory_store();
-        let db = StoreBuilder::new("census/store", Arc::clone(&store))
+        let (db, _) = StoreBuilder::new("census/store", Arc::clone(&store))
             .open_writer()
             .await
             .unwrap();
@@ -353,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_census_omits_unflushed_writes() {
         let store = memory_store();
-        let db = StoreBuilder::new("census/unflushed", Arc::clone(&store))
+        let (db, _) = StoreBuilder::new("census/unflushed", Arc::clone(&store))
             .open_writer()
             .await
             .unwrap();
@@ -378,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn the_listing_counts_objects_the_manifest_does_not() {
         let store = memory_store();
-        let db = StoreBuilder::new("census/objects", Arc::clone(&store))
+        let (db, _) = StoreBuilder::new("census/objects", Arc::clone(&store))
             .open_writer()
             .await
             .unwrap();
@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn scan_live_counts_and_splits_current() {
         let store = memory_store();
-        let db = StoreBuilder::new("census/live", Arc::clone(&store))
+        let (db, _) = StoreBuilder::new("census/live", Arc::clone(&store))
             .open_writer()
             .await
             .unwrap();
@@ -455,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn scan_live_ignores_deleted_keys() {
         let store = memory_store();
-        let db = StoreBuilder::new("census/deleted", Arc::clone(&store))
+        let (db, _) = StoreBuilder::new("census/deleted", Arc::clone(&store))
             .open_writer()
             .await
             .unwrap();
@@ -487,7 +487,7 @@ mod tests {
     /// A subspace nothing wrote tallies zero rather than failing.
     #[tokio::test]
     async fn scan_live_of_an_untouched_subspace_is_zero() {
-        let db = StoreBuilder::new("census/empty", memory_store())
+        let (db, _) = StoreBuilder::new("census/empty", memory_store())
             .open_writer()
             .await
             .unwrap();

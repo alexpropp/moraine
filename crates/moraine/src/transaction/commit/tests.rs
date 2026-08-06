@@ -13,7 +13,7 @@ use super::*;
 #[tokio::test]
 async fn a_durable_commit_returns_its_own_outcome() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store)
+    let (db, _) = StoreBuilder::new("", object_store)
         .open_writer()
         .await
         .unwrap();
@@ -42,6 +42,7 @@ async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
         .open_writer()
         .await
         .unwrap()
+        .0
         .close()
         .await
         .unwrap();
@@ -74,7 +75,7 @@ async fn a_store_with_an_unreadable_manifest_refuses_to_open() {
 #[tokio::test]
 async fn unknown_format_is_refused() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store.clone())
+    let (db, _) = StoreBuilder::new("", object_store.clone())
         .open_writer()
         .await
         .unwrap();
@@ -102,7 +103,7 @@ async fn unknown_format_is_refused() {
 #[tokio::test]
 async fn migration_marker_is_refused() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store.clone())
+    let (db, _) = StoreBuilder::new("", object_store.clone())
         .open_writer()
         .await
         .unwrap();
@@ -144,7 +145,7 @@ async fn migration_marker_is_refused() {
 #[tokio::test]
 async fn older_format_refuses_toward_migrate() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store.clone())
+    let (db, _) = StoreBuilder::new("", object_store.clone())
         .open_writer()
         .await
         .unwrap();
@@ -183,7 +184,7 @@ async fn older_format_refuses_toward_migrate() {
 #[tokio::test]
 async fn materialize_gate_refuses_on_marker() {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = StoreBuilder::new("", object_store)
+    let (db, _) = StoreBuilder::new("", object_store)
         .open_writer()
         .await
         .unwrap();
@@ -4240,7 +4241,7 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
         .await
         .unwrap();
 
-    let reader = StoreBuilder::new("", object_store)
+    let (reader, _) = StoreBuilder::new("", object_store)
         .poll_interval(std::time::Duration::from_millis(20))
         .open_reader()
         .await
@@ -4288,7 +4289,7 @@ async fn a_read_only_pass_that_straddles_a_commit_is_discarded_and_re_run() {
 async fn catalog_with_a_reclaimed_snapshot()
 -> (Db, Arc<std::sync::RwLock<ProjectionCache>>, Arc<Coalescer>) {
     let object_store: Arc<InMemory> = Arc::new(InMemory::new());
-    let db = open_initialized(StoreBuilder::new("", object_store), false, None)
+    let (db, _) = open_initialized(StoreBuilder::new("", object_store), false, None)
         .await
         .unwrap();
     let projections = Arc::new(std::sync::RwLock::new(ProjectionCache::empty()));

@@ -734,7 +734,9 @@ The attach options keep their surface (RFC 0006) and change machinery:
   is warned with both numbers, a failure is skipped rather than fatal.
 
 **Hit rates before tuning.** The tiers report: hits and misses per slot,
-process-wide, through `moraine_cache_tally()` (RFC 0006). Metadata and
+process-wide through `moraine_cache_tally()` and per attach through
+`moraine_cache_tally('lake')` (RFC 0006) — the budget is set at the first
+scope and attributed at the second. Metadata and
 blocks are counted apart because they are budgeted apart — a metadata
 rate short of ~1 says the meta slot cannot hold the store's filters and
 indexes, which the census measures directly, while a low block rate

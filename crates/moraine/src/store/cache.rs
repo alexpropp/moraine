@@ -83,8 +83,11 @@ static SHARED: OnceCell<Option<Arc<dyn DbCache>>> = OnceCell::const_new();
 /// What the cache has served, by tier. Every sizing claim about the
 /// budget is checkable only if the tiers report, so they do.
 ///
-/// The counts are the process's, like the cache: every store's reads run
-/// through the one instance and land here together.
+/// Read at two scopes over the one cache: [`cache_tally`] is the
+/// process's, which is what the budget is set from, and
+/// [`ReadOnlyCatalog::cache_tally`](crate::ReadOnlyCatalog::cache_tally)
+/// is one attach's,
+/// which is what says whose reads the budget is spent on.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CacheTally {
     /// Filter, index, and stats lookups the meta slot served.
@@ -127,11 +130,12 @@ fn rate(hits: u64, misses: u64) -> Option<f64> {
     Some(hits as f64 / total as f64)
 }
 
-/// The counters SlateDB increments as the cache serves. Registered once
-/// and shared by every store the process opens, so the tally spans them
-/// all rather than the last one to attach.
+/// The counters SlateDB increments as the cache serves. One set per store
+/// and one for the process: the cache is shared, so the process's numbers
+/// are what size it, but only a per-store set can say whose reads it is
+/// serving.
 #[derive(Debug, Default)]
-struct CacheCounters {
+pub(crate) struct CacheCounters {
     metadata_hits: AtomicU64,
     metadata_misses: AtomicU64,
     block_hits: AtomicU64,
@@ -140,7 +144,7 @@ struct CacheCounters {
 }
 
 impl CacheCounters {
-    fn tally(&self) -> CacheTally {
+    pub(crate) fn tally(&self) -> CacheTally {
         CacheTally {
             metadata_hits: self.metadata_hits.load(Ordering::Relaxed),
             metadata_misses: self.metadata_misses.load(Ordering::Relaxed),
@@ -149,12 +153,24 @@ impl CacheCounters {
             errors: self.errors.load(Ordering::Relaxed),
         }
     }
+
+    fn of(&self, which: Which) -> &AtomicU64 {
+        match which {
+            Which::MetadataHit => &self.metadata_hits,
+            Which::MetadataMiss => &self.metadata_misses,
+            Which::BlockHit => &self.block_hits,
+            Which::BlockMiss => &self.block_misses,
+            Which::Error => &self.errors,
+        }
+    }
 }
 
-/// One counter's home in [`CacheCounters`], or nowhere: SlateDB registers
-/// far more than the cache's, and everything else increments a sink.
+/// One counter's home in the opening store's [`CacheCounters`] and in the
+/// process's, or nowhere: SlateDB registers far more than the cache's, and
+/// everything else increments a sink.
 struct Slot {
-    counters: Arc<CacheCounters>,
+    store: Arc<CacheCounters>,
+    process: Arc<CacheCounters>,
     which: Option<Which>,
 }
 
@@ -169,15 +185,12 @@ enum Which {
 
 impl CounterFn for Slot {
     fn increment(&self, value: u64) {
-        let counter = match self.which {
-            Some(Which::MetadataHit) => &self.counters.metadata_hits,
-            Some(Which::MetadataMiss) => &self.counters.metadata_misses,
-            Some(Which::BlockHit) => &self.counters.block_hits,
-            Some(Which::BlockMiss) => &self.counters.block_misses,
-            Some(Which::Error) => &self.counters.errors,
-            None => return,
+        let Some(which) = self.which else {
+            return;
         };
-        counter.fetch_add(value, Ordering::Relaxed);
+        for counters in [&self.store, &self.process] {
+            counters.of(which).fetch_add(value, Ordering::Relaxed);
+        }
     }
 }
 
@@ -190,7 +203,7 @@ impl CounterFn for Slot {
 /// later lands in neither rather than being miscounted as one.
 #[derive(Debug)]
 struct CacheRecorder {
-    counters: Arc<CacheCounters>,
+    store: Arc<CacheCounters>,
 }
 
 impl MetricsRecorder for CacheRecorder {
@@ -217,7 +230,8 @@ impl MetricsRecorder for CacheRecorder {
             _ => None,
         };
         Arc::new(Slot {
-            counters: Arc::clone(&self.counters),
+            store: Arc::clone(&self.store),
+            process: Arc::clone(&COUNTERS),
             which,
         })
     }
@@ -266,23 +280,29 @@ impl HistogramFn for Sink {
 static COUNTERS: std::sync::LazyLock<Arc<CacheCounters>> =
     std::sync::LazyLock::new(|| Arc::new(CacheCounters::default()));
 
-/// The recorder every store's builder is given, so their reads tally
-/// together.
-pub(crate) fn recorder() -> Arc<dyn MetricsRecorder> {
-    Arc::new(CacheRecorder {
-        counters: Arc::clone(&COUNTERS),
-    })
+/// A fresh set of counters for one store, which the catalog holds for as
+/// long as it is open.
+pub(crate) fn store_counters() -> Arc<CacheCounters> {
+    Arc::new(CacheCounters::default())
+}
+
+/// The recorder an opening store's builder is given: what it counts lands
+/// in `store` and in the process's set together.
+pub(crate) fn recorder(store: Arc<CacheCounters>) -> Arc<dyn MetricsRecorder> {
+    Arc::new(CacheRecorder { store })
 }
 
 /// What the process's block cache has served since it was built —
 /// metadata and data blocks counted apart, because they are sized apart.
 ///
 /// Process-wide, like the cache itself: every catalog a process attaches
-/// reads through the one instance, so these are the host's numbers rather
-/// than any one catalog's. Use them to size
+/// reads through the one instance, so these are the host's numbers, and
+/// they outlive the catalogs that produced them. Use them to size
 /// [`CatalogOptions::cache_memory`](crate::CatalogOptions::cache_memory)
 /// and [`cache_size`](crate::CatalogOptions::cache_size) from measured
-/// curves rather than from the defaults.
+/// curves rather than from the defaults, and
+/// [`ReadOnlyCatalog::cache_tally`](crate::ReadOnlyCatalog::cache_tally)
+/// to see which attach is spending them.
 ///
 /// ```
 /// let tally = moraine::cache_tally();
@@ -526,7 +546,7 @@ mod tests {
     fn the_recorder_routes_counters_by_entry_kind() {
         let counters = Arc::new(CacheCounters::default());
         let recorder = CacheRecorder {
-            counters: Arc::clone(&counters),
+            store: Arc::clone(&counters),
         };
         let counter = |kind: &str, result: &str| {
             recorder.register_counter(
@@ -552,6 +572,33 @@ mod tests {
         assert_eq!(tally.block_hits, 4);
         assert_eq!(tally.block_misses, 5);
         assert_eq!(tally.errors, 6);
+    }
+
+    /// Two stores share the cache but not the counters: what one store's
+    /// reads tally stays out of the other's, while the process's set takes
+    /// both. Without this the per-attach tally is the process's under
+    /// another name.
+    #[test]
+    fn a_stores_counters_are_its_own() {
+        let first = store_counters();
+        let second = store_counters();
+        let before = cache_tally().block_hits;
+
+        recorder(Arc::clone(&first))
+            .register_counter(
+                stats::ACCESS_COUNT,
+                "",
+                &[("entry_kind", "data_block"), ("result", "hit")],
+            )
+            .increment(4);
+
+        assert_eq!(first.tally().block_hits, 4);
+        assert_eq!(second.tally().block_hits, 0, "one store's hits are its own");
+        assert_eq!(
+            cache_tally().block_hits - before,
+            4,
+            "and the process still counts them"
+        );
     }
 
     /// A rate is reported only once something has been looked up, and is

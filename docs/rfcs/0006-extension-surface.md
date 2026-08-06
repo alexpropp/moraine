@@ -321,13 +321,19 @@ store — trading a slower ATTACH for a first query that touches object
 storage not at all; `'l0'` suits an attach that must return fast against a
 store with a deep unfolded tail.
 
-**`moraine_cache_tally()` — what the cache has served.** One row, no
-arguments: `metadata_hits`/`metadata_misses` and `block_hits`/
-`block_misses` with a rate beside each, plus `errors` for lookups the
-cache itself failed and read through. It takes no lake name because it
-has nothing to take one for — a process keeps one cache and every
-attached store reads through it, so the numbers are the host's, not any
-one catalog's.
+**`moraine_cache_tally()` — what the cache has served.** One row:
+`metadata_hits`/`metadata_misses` and `block_hits`/`block_misses` with a
+rate beside each, plus `errors` for lookups the cache itself failed and
+read through. Without arguments the numbers are the host's — a process
+keeps one cache and every attached store reads through it — which is the
+scope the budget is set at.
+
+`moraine_cache_tally('lake')` narrows the same row to one attach. The
+cache and its budget stay the process's; what the lake name adds is which
+attach is spending them, which is the question a host with several
+catalogs on one cache has and the process-wide numbers cannot answer. A
+detached catalog's counts leave with it, while the process's keep them,
+so the two forms do not have to agree on totals.
 
 The two slots are reported apart because they are budgeted apart: a
 healthy stack keeps metadata near fully served — that is the slot being
