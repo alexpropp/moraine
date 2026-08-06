@@ -146,6 +146,26 @@ deliberately not itemized here.
   0009 records why pushdown cannot pay off while the whole catalog is resident,
   so this revives only alongside that decision. If built it must be
   transform-aware and type-aware, never a naive compare.
+- **DEFERRED** — Upstream: DuckLake discards virtual-column filters before
+  they reach the file list, so `rowid`, `filename`, and `file_index` never
+  prune it. `DuckLakeMultiFileList::AddFilterToPushdownInfo` returns early
+  for any virtual column, and both pushdown entry points bail out once
+  nothing survives, so a `rowid` predicate opens every live file to read its
+  footer where a real-column predicate opens one. Measured against the
+  pinned DuckLake (`d8a1881`) over a four-file table, identically for
+  `SELECT` and `DELETE`: `WHERE line < 3` opened 1 file, `WHERE rowid IN
+  (…)` opened 4. Fixable upstream with no new metadata —
+  `DuckLakeFileListEntry` already carries `row_id_start` and
+  `ducklake_data_file` carries `record_count`, so a file's row-id interval
+  is derivable from the list query itself. Not moraine's to fix: DuckLake
+  builds the file list, moraine only answers it. It bounds what an equality
+  index is worth on the read path, since a resolved row id has no prunable
+  spelling.
+- **DEFERRED** — Upstream: filter pushdown is gated to `SCAN_TABLE`, so the
+  change-feed scans (`SCAN_INSERTIONS`, `SCAN_DELETIONS`) and the flush's
+  own scan get none at all — real column filters included, not just the
+  virtual ones above. Same owner, and the reason a change-feed read cannot
+  prune the way the equivalent table scan does.
 
 ## 0014 — Catalog and data encryption
 
