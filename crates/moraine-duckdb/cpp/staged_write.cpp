@@ -10,6 +10,7 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
+#include <algorithm>
 #include <deque>
 
 namespace moraine_duckdb {
@@ -480,8 +481,17 @@ duckdb::PhysicalOperator &PlanMetadataUpdate(duckdb::PhysicalPlanGenerator &plan
 		    spec.name);
 	}
 	if (spec.overlay_updatable) {
-		// An unversioned statistics kind: any SET subset overlays the row
-		// in place.
+		// An unversioned kind: any SET subset overlays the row in place.
+		// Its key columns are the exception — an overlay stages the whole
+		// row as an insert, so moving a row's key would add a row rather
+		// than rename one, and the original would survive unreferenced.
+		for (auto set_column : set_columns) {
+			auto &key_columns = spec.delete_key_columns;
+			if (std::find(key_columns.begin(), key_columns.end(), set_column) != key_columns.end()) {
+				throw duckdb::NotImplementedException("moraine: UPDATE on \"%s\" cannot SET the key column \"%s\"",
+				                                      spec.name, spec.columns[set_column].name);
+			}
+		}
 		return planner.Make<MoraineMetadataUpdate>(op.types, spec, op.table.catalog, op.estimated_cardinality,
 		                                           /* overlay */ -1, std::move(set_columns), std::move(set_refs));
 	}

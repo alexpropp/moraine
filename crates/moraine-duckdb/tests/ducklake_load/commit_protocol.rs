@@ -278,6 +278,59 @@ fn ducklake_schema_version_classification_matches_stock_ducklake() {
     );
 }
 
+/// Re-setting an option overwrites its row rather than failing.
+///
+/// DuckLake's `SetConfigOption` counts the rows already holding the key
+/// at that scope and issues an `INSERT` only when there are none, so
+/// every set after the first arrives as `UPDATE ducklake_metadata SET
+/// value` — a spelling the staged path has to translate, or an option
+/// can be set exactly once and never corrected.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_set_option_overwrites_an_existing_option_row() {
+    let twin = Twin::new("setopt-twice");
+    let value = || {
+        twin.probe(
+            "SELECT value FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'parquet_compression' AND scope IS NULL;",
+        )
+    };
+
+    twin.apply("CALL lake.set_option('parquet_compression', 'zstd');");
+    assert_eq!(value(), vec![vec!["zstd".to_string()]]);
+
+    twin.apply("CALL lake.set_option('parquet_compression', 'snappy');");
+    assert_eq!(
+        value(),
+        vec![vec!["snappy".to_string()]],
+        "the second set must overwrite the row, not duplicate it or fail"
+    );
+}
+
+/// An option moraine serves a default for is settable too.
+///
+/// `ducklake_metadata` carries a synthesized `data_inlining_row_limit`
+/// so DuckLake's write path emits inline data at all, and that row is
+/// indistinguishable from a stored one to the existence check above — so
+/// this key reaches the `UPDATE` branch on the *first* set, where every
+/// other key reaches it on the second. The stored row then replaces the
+/// synthesized one rather than joining it.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn ducklake_set_option_overrides_a_synthesized_default() {
+    let twin = Twin::new("setopt-default");
+
+    twin.apply("CALL lake.set_option('data_inlining_row_limit', 5000);");
+    assert_eq!(
+        twin.probe(
+            "SELECT value FROM __ducklake_metadata_lake.ducklake_metadata \
+             WHERE key = 'data_inlining_row_limit' AND scope IS NULL;",
+        ),
+        vec![vec!["5000".to_string()]],
+        "one row, holding the set value — the default is replaced, not joined"
+    );
+}
+
 /// A name-mapping registration is data-only: registering foreign Parquet
 /// writes `ducklake_column_mapping` / `ducklake_name_mapping` rows and a
 /// data file, and must carry `schema_version` forward — the mapping

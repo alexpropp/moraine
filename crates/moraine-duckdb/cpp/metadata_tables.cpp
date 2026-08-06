@@ -1279,13 +1279,17 @@ const std::vector<MetadataTableSpec> &MetadataTableSpecsImpl() {
 	            {"scope_id", "BIGINT", false},
 	        },
 	        ProvideMetadata,
-	        // Options are unversioned and outside the snapshot protocol, so
-	        // DuckLake's `set_option` writes them as a delete of the old row
-	        // (by its whole key) followed by an insert of the new one.
+	        // Options are unversioned and outside the snapshot protocol.
+	        // `set_option` counts the rows already holding the key at that
+	        // scope and writes an INSERT only when there are none, so every
+	        // later set arrives as `SET value` on the matched row — the
+	        // overlay below. A key moraine serves a default for takes that
+	        // branch on the first set, since a synthesized row counts.
 	        25,
 	        {},
 	        0,
 	        /* delete key: key, scope, scope_id */ {0, 2, 3},
+	        /* overlay_updatable */ true,
 	    },
 	};
 	return specs;
