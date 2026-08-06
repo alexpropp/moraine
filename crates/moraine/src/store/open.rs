@@ -118,23 +118,23 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Sets the local directory backing SlateDB's on-disk object cache,
-    /// which holds fetched object parts. When set, warm reads skip repeat
-    /// object-store GETs and survive process restarts — worthwhile for
-    /// remote (`s3://`) stores, redundant for local ones. `None` (the
-    /// default) leaves only the in-memory caches, which are SlateDB's
-    /// defaults and are configured nowhere here.
+    /// Sets the local directory backing the block cache's disk tier, which
+    /// holds data blocks evicted from memory. When set, warm reads skip
+    /// repeat object-store GETs — worthwhile for remote (`s3://`) stores,
+    /// redundant for local ones. Process-wide, not per store: the first
+    /// store to open decides whether there is a disk tier at all, and
+    /// where. `None` (the default) keeps the cache in memory.
     pub(crate) fn cache_dir(mut self, cache_dir: Option<PathBuf>) -> Self {
         self.cache_dir = cache_dir;
         self
     }
 
-    /// Sets how many bytes of disk the object cache may hold. The cap is
-    /// per open store, so stores sharing one
-    /// [`cache_dir`](Self::cache_dir) each spend up to it. `None` (the
-    /// default) leaves SlateDB's own cap in force, and without a cache
-    /// directory there is no object cache to bound. The in-memory caches
-    /// are untouched by this.
+    /// Sets how many bytes of disk the block cache's device may hold.
+    /// Process-wide, not per store: the first store to open sizes the
+    /// device and later ones share it. `None` (the default) takes what
+    /// SlateDB gives one store's cache, and without a
+    /// [`cache_dir`](Self::cache_dir) there is no device to bound. The
+    /// memory budget is [`cache_memory`](Self::cache_memory).
     pub(crate) fn cache_size(mut self, cache_size: Option<u64>) -> Self {
         self.cache_size = cache_size;
         self
@@ -151,22 +151,25 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Sets what to load into the on-disk object cache while the store
-    /// opens. The load is bounded by [`cache_size`](Self::cache_size) and
-    /// skips what it cannot fetch, but it runs as part of the open, so an
-    /// open that preloads returns only once it has. `None` (the default)
-    /// loads nothing. Inert without a [`cache_dir`](Self::cache_dir).
+    /// Sets what to load into the cache while the store opens. Per store,
+    /// unlike the budget: each store warms its own bytes into the shared
+    /// cache. The load skips what it cannot fetch, but it runs as part of
+    /// the open, so an open that preloads returns only once it has. `None`
+    /// (the default) loads nothing. Never inert — the memory slots exist
+    /// with or without a [`cache_dir`](Self::cache_dir).
     pub(crate) fn cache_preload(mut self, cache_preload: Option<CachePreload>) -> Self {
         self.cache_preload = cache_preload;
         self
     }
 
-    /// Sets whether objects this store writes are cached as they are
-    /// written, rather than only when something reads them back. A flushed
-    /// or compacted SST then costs one local write and no later fetch.
-    /// Compaction output is cached too, so a merge can evict parts that
-    /// reads had warmed — which is why this is off by default. Inert
-    /// without a [`cache_dir`](Self::cache_dir).
+    /// Sets whether the SST metadata this store writes enters the cache as
+    /// it is written, rather than only when something reads it back. A
+    /// flushed or compacted SST's index and filters are then resident
+    /// without a later fetch. Compaction output is admitted too, so a merge
+    /// can evict what reads had warmed — which is why this is off by
+    /// default. Data blocks are never admitted on the write path, at either
+    /// setting. Per store, and never inert: the metadata it admits lands in
+    /// the memory slot, with or without a [`cache_dir`](Self::cache_dir).
     pub(crate) fn cache_puts(mut self, cache_puts: bool) -> Self {
         self.cache_puts = cache_puts;
         self
@@ -181,14 +184,18 @@ impl<'a> StoreBuilder<'a> {
         self
     }
 
-    /// Opens (or creates) the store as a read-write [`Db`].
-    pub(crate) async fn open_writer(&self) -> Result<Db> {
+    /// Opens (or creates) the store as a read-write [`Db`], with the
+    /// counters its reads tally into. The cache is the process's; the
+    /// counters are this store's, so a host attaching several can tell
+    /// which catalog's reads the one cache is serving.
+    pub(crate) async fn open_writer(&self) -> Result<(Db, Arc<cache::CacheCounters>)> {
         let settings = self.settings();
+        let counters = cache::store_counters();
         let mut builder = Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_block_cache_policy(self.block_cache_policy())
-            .with_metrics_recorder(cache::recorder());
+            .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
         if let Some(cache) = cache::shared(&self.cache_config()).await {
             builder = builder.with_db_cache(cache);
         }
@@ -201,7 +208,7 @@ impl<'a> StoreBuilder<'a> {
             self.warm(crate::store::handle::ReadHandle::Tx(&tx)).await;
             tx.rollback();
         }
-        Ok(db)
+        Ok((db, counters))
     }
 
     /// Opens the store read-only as a [`DbReader`]. A `DbReader` never opens
@@ -212,14 +219,15 @@ impl<'a> StoreBuilder<'a> {
     /// costs a manifest write on open and a refresh for the reader's
     /// lifetime. Pinned to a [`checkpoint`](Self::checkpoint) it writes
     /// nothing at all, and reads the fixed cut that checkpoint names.
-    pub(crate) async fn open_reader(&self) -> Result<DbReader> {
+    pub(crate) async fn open_reader(&self) -> Result<(DbReader, Arc<cache::CacheCounters>)> {
         let options = DbReaderOptions {
             manifest_poll_interval: self.poll_interval,
             ..Default::default()
         };
+        let counters = cache::store_counters();
         let mut builder = DbReader::builder(self.path, Arc::clone(&self.object_store))
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
-            .with_metrics_recorder(cache::recorder())
+            .with_metrics_recorder(cache::recorder(Arc::clone(&counters)))
             .with_options(options);
         if let Some(cache) = cache::shared(&self.cache_config()).await {
             builder = builder.with_db_cache(cache);
@@ -232,7 +240,7 @@ impl<'a> StoreBuilder<'a> {
             self.warm(crate::store::handle::ReadHandle::Reader(&reader))
                 .await;
         }
-        Ok(reader)
+        Ok((reader, counters))
     }
 
     /// Deletes the checkpoint `checkpoint`, unpinning whatever it held
@@ -395,7 +403,7 @@ mod tests {
     /// segment's keys (multi-segment batches satisfy the antichain rule).
     #[tokio::test]
     async fn multi_subspace_transaction_and_prefix_scans() {
-        let db = StoreBuilder::new("test/store", memory_store())
+        let (db, _) = StoreBuilder::new("test/store", memory_store())
             .open_writer()
             .await
             .unwrap();
@@ -441,7 +449,7 @@ mod tests {
     /// rather than on a timer, so the store opens and a durable write lands.
     #[tokio::test]
     async fn zero_flush_interval_opens_a_working_store() {
-        let db = StoreBuilder::new("test/store", memory_store())
+        let (db, _) = StoreBuilder::new("test/store", memory_store())
             .flush_interval(Duration::ZERO)
             .open_writer()
             .await
@@ -458,7 +466,7 @@ mod tests {
     /// opens, and a durable commit still lands.
     #[tokio::test]
     async fn explicit_flush_interval_opens_a_working_store() {
-        let db = StoreBuilder::new("test/store", memory_store())
+        let (db, _) = StoreBuilder::new("test/store", memory_store())
             .flush_interval(Duration::from_millis(1))
             .open_writer()
             .await
@@ -476,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn reopen_without_extractor_is_refused() {
         let object_store = memory_store();
-        let db = StoreBuilder::new("test/store", object_store.clone())
+        let (db, _) = StoreBuilder::new("test/store", object_store.clone())
             .open_writer()
             .await
             .unwrap();
@@ -500,7 +508,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache);
 
         let head = Key::Sys(SysKey::Head).encode();
-        let db = StoreBuilder::new("s", object_store.clone())
+        let (db, _) = StoreBuilder::new("s", object_store.clone())
             .flush_interval(Duration::from_millis(1))
             .cache_dir(Some(cache.clone()))
             .open_writer()
@@ -509,7 +517,7 @@ mod tests {
         db.put(&head, b"head").await.unwrap();
         db.close().await.unwrap();
 
-        let reader = StoreBuilder::new("s", object_store)
+        let (reader, _) = StoreBuilder::new("s", object_store)
             .cache_dir(Some(cache.clone()))
             .open_reader()
             .await
@@ -595,7 +603,7 @@ mod tests {
         let object_store = memory_store();
         let head = Key::Sys(SysKey::Head).encode();
 
-        let db = StoreBuilder::new("s", Arc::clone(&object_store))
+        let (db, _) = StoreBuilder::new("s", Arc::clone(&object_store))
             .flush_interval(Duration::from_millis(1))
             .open_writer()
             .await
@@ -605,7 +613,7 @@ mod tests {
         db.close().await.unwrap();
 
         for preload in [None, Some(CachePreload::L0), Some(CachePreload::All)] {
-            let reader = StoreBuilder::new("s", Arc::clone(&object_store))
+            let (reader, _) = StoreBuilder::new("s", Arc::clone(&object_store))
                 .cache_preload(preload)
                 .open_reader()
                 .await

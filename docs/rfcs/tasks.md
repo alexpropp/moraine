@@ -78,12 +78,38 @@ deliberately not itemized here.
   (`BENCHMARK.md`), so this would bound that too.
 - **DEFERRED** — Upstream: a caller-supplied stable cache scope in
   SlateDB. Shared-cache keys are scoped per opened handle by a
-  process-local counter, so foyer's disk recovery matches nothing after a
-  restart; a scope derived from the store path would make the disk tier
-  restart-warm and reclaim the one property the object cache still holds.
-  Until then the restart story is preload, at re-fetch cost. Filed as an
-  upstream ask rather than a decision to take: nothing here blocks on it,
-  and the cross-process row cache below is the other way to the same end.
+  process-local counter assigned in attach *order*, not derived from the
+  store, so foyer's disk recovery matches only when a restart repeats the
+  order — and on a host attaching two lakes that reverses it, one store's
+  scope can match the other's recovered entries. Compacted SST ids are
+  ULIDs and collide with nothing; WAL ids are per-store sequential `u64`s
+  and are exactly what the scoping exists to keep apart. A scope derived
+  from the store path would make the disk tier restart-warm *and* remove
+  the mismatch. Until then the restart story is preload, at re-fetch cost.
+  Filed as an upstream ask rather than a decision to take: nothing here
+  blocks on it, and the cross-process row cache below is the other way to
+  the same end.
+- **VALIDATE** — The disk tier across a restart, in both attach orders.
+  Traced through the scope-id assignment above and never reproduced: two
+  lakes on one cache directory, attached in one order, restarted, attached
+  in the other. Closes the question of whether the mismatch is reachable
+  or only theoretical.
+- **DECISION** — Whether each attach should build its own block cache
+  rather than sharing the process's. For it: every attach's options would
+  mean what they say instead of the first attach's standing, and one
+  catalog's scan could not evict another's filters. Against it,
+  `META_CACHE_MEMORY` stops being the single number to weigh against
+  DuckDB's `memory_limit` — a host spends it once per attach with nothing
+  naming the attach count — and the meta slot, pinned and sized to hold
+  every SST index and filter, would take a fifth of each budget rather
+  than a fifth of one. Two constraints bind any such change: each attach
+  needs a cache directory of its own, since a foyer device names its
+  partition files by index within its directory and takes no lock, so two
+  devices over one directory write each other's files; and the spawner
+  runtime stays process-wide regardless, because it holds no cached bytes
+  and one per attach would both cost two threads an attach and re-open the
+  hang that keeping it off the attach's runtime fixed. The reporting half
+  is already built — the tally is per attach.
 - **DEFERRED** — Upstream: export `SsTableId`, so
   `DbCacheManagerOps::warm_sst` and `evict_cached_sst` can be called at
   all (their parameter type is in a private module). Closed as a

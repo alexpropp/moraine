@@ -722,14 +722,15 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	// ignores it afterward. `FLUSH_INTERVAL_MS` sets the WAL flush cadence; 0 on
 	// the ABI means "not given", so an explicit zero (flush continuously, no
 	// timer) is mapped to the ABI's continuous-flush sentinel (UINT64_MAX).
-	// `CACHE_DIR` is a local directory for SlateDB's on-disk object cache,
-	// which holds fetched object parts; it must outlive the moraine_attach
-	// call, so it lives in this scope. `CACHE_SIZE` bounds that cache in
-	// bytes, per attach rather than per directory; 0 on the ABI means "not
-	// given" and leaves the store's cap. `CACHE_PUTS` additionally fills
-	// that cache from the write path, so a flushed object is local without a
-	// later fetch, and `CACHE_PRELOAD` fills it as the attach opens. None of
-	// them touches the in-memory caches.
+	// `CACHE_DIR` is a local directory for the block cache's disk tier; it
+	// must outlive the moraine_attach call, so it lives in this scope.
+	// `CACHE_SIZE` bounds that directory and `CACHE_MEMORY` bounds the
+	// cache's memory; 0 on the ABI means "not given" for either. All three
+	// configure a cache the process shares rather than this attach's, so
+	// only the first attach in the process sets them — a later attach naming
+	// different ones is served what stands. `CACHE_PUTS` and `CACHE_PRELOAD`
+	// are per attach: the first admits the SST metadata this store writes as
+	// it is written, the second warms this store's bytes as the attach opens.
 	// `CHECKPOINT` pins a read-only attach to a checkpoint minted ahead of
 	// time, so the open writes nothing at all; the ABI refuses it on a
 	// read-write attach.

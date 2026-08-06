@@ -114,9 +114,11 @@ ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
 when sizing a host: DuckDB's budget covers its buffers and its Parquet cache,
 and this is the one memory consumer beside it.
 
-By default the cache fills only as queries read, so blocks the writer just
-flushed are fetched back from S3 the first time something reads them.
-`META_CACHE_PUTS true` admits them as they are written instead:
+By default the cache fills only as queries read, so the indexes and filters
+of an SST the writer just flushed are fetched back from S3 the first time
+something reads them. `META_CACHE_PUTS true` admits them as they are written
+instead — metadata only, since a data block the writer produced is not one a
+reader is likely to want next:
 
 ```sql
 ATTACH 'ducklake:moraine:s3://bucket/prefix' AS lake
@@ -144,6 +146,20 @@ bytes are distributed.
 
 The first attach in a process sizes the cache; later attaches share what it
 built. On a host that attaches several catalogs, set these on the first one.
+
+`moraine_cache_tally()` reports what that cache has served — hits and misses
+per slot, with a rate beside each — so the budgets can be set from measured
+curves rather than the defaults. Since one cache serves every attach, those
+numbers are the host's; pass a lake name to see one attach's share of them:
+
+```sql
+SELECT * FROM moraine_cache_tally();        -- the process
+SELECT * FROM moraine_cache_tally('lake');  -- one attach
+```
+
+A rate is NULL rather than zero before anything has been looked up. On a host
+attaching several catalogs, the per-lake form is what says which of them is
+spending the budget the process-wide form reports.
 
 ## Caching the data files
 

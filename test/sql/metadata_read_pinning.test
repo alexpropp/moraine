@@ -174,12 +174,37 @@ WHERE key = 'parquet_compression' AND value = 'zstd';
 1
 
 # The block cache reports what it served, so the budgets can be sized from
-# measured curves instead of from the defaults. Process-wide and so
-# handle-free: every attached store reads through the one cache.
+# measured curves instead of from the defaults. Handle-free, because the
+# budget is the process's: every attached store reads through the one cache.
 query I
 SELECT count(*) FROM moraine_cache_tally();
 ----
 1
+
+# Named a lake, the same row is that attach's share of the one cache —
+# which is what says who is spending the budget the process-wide numbers
+# report.
+query I
+SELECT count(*) FROM moraine_cache_tally('lake');
+----
+1
+
+# An attach cannot have served more than the process it reads through.
+query I
+SELECT (SELECT metadata_hits + block_hits FROM moraine_cache_tally('lake'))
+    <= (SELECT metadata_hits + block_hits FROM moraine_cache_tally());
+----
+true
+
+# The per-lake form reports absence the same way the process-wide one
+# does: a rate is NULL exactly when nothing was looked up, never zero.
+# (A catalog this small is served from the memtable, so an attach can
+# genuinely have looked nothing up.)
+query I
+SELECT (metadata_hit_rate IS NOT NULL) = ((metadata_hits + metadata_misses) > 0)
+FROM moraine_cache_tally('lake');
+----
+true
 
 # Rates are NULL before a lookup and a fraction after — never zero for
 # "nothing asked", which a monitoring query would read as a cold cache.

@@ -959,22 +959,31 @@ extern "C" {
 // already-initialized store, whose stored flag
 // ([`moraine_catalog_encrypted`]) is authoritative.
 //
-// `cache_size_bytes` bounds the on-disk object cache `cache_dir` names.
-// The cap is per attach, so several attaches sharing one directory each
-// spend up to it; `0` leaves the store's own cap in force, and without a
-// `cache_dir` there is no object cache to bound. The store's in-memory
-// caches are separate and take no configuration here.
+// `cache_dir`, `cache_size_bytes`, and `cache_memory_bytes` configure the
+// block cache, which is the process's rather than the attach's: one
+// instance, shared by every store the process opens. The first attach to
+// reach it builds it and these three are what it is built from; a later
+// attach naming different ones is served what stands and its own are
+// logged as ignored, never an error. On a host that attaches several
+// catalogs, set them on the first.
 //
-// `cache_preload` loads objects into that cache as the attach opens, so
-// the first query pays no first touch: `0` loads nothing, `1` the newest
-// objects, `2` every object the manifest references. The load is bounded
-// by `cache_size_bytes` and skips what it cannot fetch, but the attach
-// waits for it. Any other value is [`codes::INVALID_ARGUMENT`].
+// `cache_dir` is a local directory for the cache's disk tier, which holds
+// data blocks evicted from memory; null leaves the cache in memory.
+// `cache_size_bytes` bounds that directory and `cache_memory_bytes` bounds
+// memory across both of the cache's slots — the metadata slot that holds
+// SST indexes and filters, and the data-block slot. `0` means "not given"
+// for either, taking what SlateDB gives a single store's cache.
 //
-// `cache_puts` fills that cache from the write path as well as the read
-// path, so a flushed or compacted object is local without a later fetch.
-// Compaction output is cached too, so a merge can evict what reads had
-// warmed; `false` leaves the cache filled by reads alone.
+// `cache_preload` warms this store's bytes into that cache as the attach
+// opens, so the first query pays no first touch: `0` loads nothing, `1`
+// each subspace's SST metadata, `2` the scan-shaped subspaces whole. Per
+// attach rather than process-wide, and the attach waits for it. Any other
+// value is [`codes::INVALID_ARGUMENT`].
+//
+// `cache_puts` admits the SST metadata this store writes as it is written,
+// rather than only when a read pulls it back. Compaction output is
+// admitted too, so a merge can evict what reads had warmed; `false` leaves
+// the cache filled by reads alone. Per attach, like `cache_preload`.
 //
 // `checkpoint` pins a **read-only** attach to an existing SlateDB
 // checkpoint (see [`moraine_create_checkpoint`]), so the open writes
@@ -1019,8 +1028,8 @@ extern "C" {
 // must point to a valid [`MoraineS3Config`] whose non-null fields are
 // valid NUL-terminated C strings. `cache_dir`, `data_path`, and
 // `checkpoint`, if non-null, must be valid NUL-terminated C strings.
-// `cache_size_bytes`, `cache_preload`, `cache_puts`, and `host_threads`
-// are unconstrained.
+// `cache_size_bytes`, `cache_memory_bytes`, `cache_preload`, `cache_puts`,
+// and `host_threads` are unconstrained.
 // `probe`, if non-null, must be safe to call with `probe_ctx` from any
 // thread. `out` must be a valid, writable `*mut *mut
 // MoraineCatalogHandle`. `err`, if non-null, must be a valid, writable
@@ -1417,9 +1426,11 @@ bool moraine_subspace_is_known(const char *name);
 
 // What the process's block cache has served since it was built.
 //
-// Process-wide, not per attach: one cache serves every store a process
-// opens, so these are the host's numbers. Needs no handle for the same
-// reason, and reports zeros before anything has read.
+// One cache serves every store a process opens, so these are the host's
+// numbers — the ones its budget is set from — and they outlive the
+// attaches that produced them. Needs no handle for the same reason, and
+// reports zeros before anything has read.
+// [`moraine_catalog_cache_tally`] reports the same counts for one attach.
 //
 // Metadata (SST indexes, filters, stats) and data blocks are counted
 // apart because they are budgeted apart — a healthy stack keeps
@@ -1435,6 +1446,27 @@ int32_t moraine_cache_tally(uint64_t *out_metadata_hits,
                             uint64_t *out_block_hits,
                             uint64_t *out_block_misses,
                             uint64_t *out_errors);
+
+// What the process's block cache has served **for one attach** since it
+// attached.
+//
+// The same counts [`moraine_cache_tally`] reports, narrowed to the
+// catalog `handle` names. The cache and its budget are still the
+// process's — what this adds is which attach is spending them, which is
+// the question a host with several catalogs on one cache has and the
+// process-wide numbers cannot answer. A detached catalog's counts leave
+// with it; the process's keep them.
+//
+// # Safety
+//
+// `handle` must be a live handle from [`moraine_attach`]. Every
+// out-pointer must be valid and writable for the duration of the call.
+int32_t moraine_catalog_cache_tally(struct MoraineCatalogHandle *handle,
+                                    uint64_t *out_metadata_hits,
+                                    uint64_t *out_metadata_misses,
+                                    uint64_t *out_block_hits,
+                                    uint64_t *out_block_misses,
+                                    uint64_t *out_errors);
 
 // The store state the catalog's dumps currently serve: the head
 // snapshot id and batch count. `out_present` is false on a store with no

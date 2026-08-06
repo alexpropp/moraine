@@ -174,7 +174,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn scans_return_inline_records_in_key_order() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();
@@ -393,7 +393,7 @@ mod tests {
     /// table-scoped `scan_inline_schemas`.
     #[tokio::test]
     async fn scan_all_inline_schemas_covers_every_table() {
-        let db = StoreBuilder::new("t", Arc::new(InMemory::new()))
+        let (db, _) = StoreBuilder::new("t", Arc::new(InMemory::new()))
             .open_writer()
             .await
             .unwrap();

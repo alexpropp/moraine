@@ -21,6 +21,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
+        cache::CacheCounters,
         handle::ReadHandle,
         key::{EntityKey, Key, SysKey},
         open::StoreBuilder,
@@ -298,11 +299,11 @@ pub(crate) async fn open_initialized(
     store: StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
-) -> Result<Db> {
+) -> Result<(Db, Arc<CacheCounters>)> {
     let mut attempt = 1;
     loop {
         match open_attempt(&store, encrypted, data_path).await {
-            Ok(db) => return Ok(db),
+            Ok(opened) => return Ok(opened),
             Err(OpenFailure::Fatal(err)) => return Err(err),
             Err(OpenFailure::FencedAtGenesis(err)) => {
                 if attempt == GENESIS_ATTEMPTS {
@@ -325,11 +326,11 @@ async fn open_attempt(
     store: &StoreBuilder<'_>,
     encrypted: bool,
     data_path: Option<&str>,
-) -> std::result::Result<Db, OpenFailure> {
+) -> std::result::Result<(Db, Arc<CacheCounters>), OpenFailure> {
     // Timed for the same reason the read-only open is: a writer open reads
     // the manifest and replays the log before any catalog work begins.
     let started = Instant::now();
-    let db = store.open_writer().await.map_err(OpenFailure::Fatal)?;
+    let (db, counters) = store.open_writer().await.map_err(OpenFailure::Fatal)?;
     info!(
         writer_open_ms = started.elapsed().as_secs_f64() * 1_000.0,
         "opened the store read-write"
@@ -339,7 +340,7 @@ async fn open_attempt(
     match validate_format(ReadHandle::Tx(&tx)).await {
         Ok(Some(_)) => {
             tx.rollback();
-            return Ok(db);
+            return Ok((db, counters));
         }
         Ok(None) => {}
         Err(err) => {
@@ -357,7 +358,7 @@ async fn open_attempt(
         Ok(_) => {
             // Once per store, ever: the commit that created the catalog.
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
-            Ok(db)
+            Ok((db, counters))
         }
         Err(err) if err.kind() == slatedb::ErrorKind::Transaction => {
             // Lost the bootstrap race: someone initialized concurrently.
@@ -365,7 +366,7 @@ async fn open_attempt(
             let validated = validate_format(ReadHandle::Tx(&tx)).await;
             tx.rollback();
             match validated {
-                Ok(Some(_)) => Ok(db),
+                Ok(Some(_)) => Ok((db, counters)),
                 Ok(None) => Err(OpenFailure::Fatal(Error::Corruption(
                     "bootstrap race left the store uninitialized".to_string(),
                 ))),
@@ -393,12 +394,14 @@ async fn begin_snapshot(db: &Db) -> std::result::Result<DbTransaction, OpenFailu
 /// finds. Never opens a `Db`, so it never fences a live writer, and never
 /// bootstraps — a read-only attach against an uninitialized store is refused
 /// (there is nothing committed to read).
-pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<DbReader> {
+pub(crate) async fn open_reader_initialized(
+    store: StoreBuilder<'_>,
+) -> Result<(DbReader, Arc<CacheCounters>)> {
     // The substrate open is timed on its own: it reads the manifest, takes
     // a checkpoint, and — unless pinned to one — replays the write-ahead
     // log, none of which any per-subspace measurement can see.
     let started = Instant::now();
-    let reader = store.open_reader().await?;
+    let (reader, counters) = store.open_reader().await?;
     let opened = started.elapsed();
 
     let started = Instant::now();
@@ -410,7 +413,7 @@ pub(crate) async fn open_reader_initialized(store: StoreBuilder<'_>) -> Result<D
     );
 
     match format {
-        Some(_) => Ok(reader),
+        Some(_) => Ok((reader, counters)),
         None => Err(Error::Corruption(
             "store is not an initialized moraine catalog; a read-only attach \
              needs a writer to have created it first"
