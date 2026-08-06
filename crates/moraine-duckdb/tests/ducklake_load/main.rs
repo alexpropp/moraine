@@ -29,6 +29,7 @@ mod checkpoints;
 mod commit_protocol;
 mod crash;
 mod ddl;
+mod deletes;
 mod index;
 mod inline;
 mod maintenance;
