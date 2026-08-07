@@ -133,6 +133,10 @@ struct IndexDdlBindData : public duckdb::FunctionData {
 	bool unique = false;
 	// Run the multi-commit build instead of backfilling in one commit.
 	bool staged = false;
+	// Bounds on one step of that build, 0 for moraine's default. Only
+	// meaningful with `staged`.
+	uint64_t step_entries = 0;
+	uint64_t step_bytes = 0;
 
 	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
 		auto result = duckdb::make_uniq<IndexDdlBindData>();
@@ -145,7 +149,8 @@ struct IndexDdlBindData : public duckdb::FunctionData {
 		       schema_name == other.schema_name && table_name == other.table_name &&
 		       index_name == other.index_name && columns == other.columns &&
 		       descending == other.descending && nulls_first == other.nulls_first &&
-		       unique == other.unique && staged == other.staged;
+		       unique == other.unique && staged == other.staged &&
+		       step_entries == other.step_entries && step_bytes == other.step_bytes;
 	}
 };
 
@@ -177,6 +182,7 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexDdlInitGlobal(duckdb::
 		code = moraine_index_create(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
 		                            bind_data.index_name.c_str(), column_ptrs.data(), column_ptrs.size(),
 		                            directions, nulls_first, bind_data.unique, bind_data.staged,
+		                            bind_data.step_entries, bind_data.step_bytes,
 		                            moraine_shim_is_interrupted, &context, &err);
 	} else {
 		code = moraine_index_drop(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
@@ -258,6 +264,24 @@ duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duc
 	if (staged != input.named_parameters.end() && !staged->second.IsNull()) {
 		bind_data->staged = staged->second.GetValue<bool>();
 	}
+	// Optional bounds on one step of that build. Rejected here rather than
+	// in the core so the message names the parameter the user typed, and so
+	// nothing is committed before the refusal.
+	auto positive = [&input](const char *name) -> uint64_t {
+		auto found = input.named_parameters.find(name);
+		if (found == input.named_parameters.end() || found->second.IsNull()) {
+			return 0;
+		}
+		const int64_t value = found->second.GetValue<int64_t>();
+		if (value <= 0) {
+			throw duckdb::InvalidInputException(
+			    "moraine_index_create: `%s` must be greater than zero, got %lld", name,
+			    static_cast<long long>(value));
+		}
+		return static_cast<uint64_t>(value);
+	};
+	bind_data->step_entries = positive("step_entries");
+	bind_data->step_bytes = positive("step_bytes");
 	return_types = {duckdb::LogicalType::VARCHAR};
 	names = {"result"};
 	return std::move(bind_data);
@@ -728,8 +752,12 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	// placement ['first'|'last', ...], each parallel to the columns.
 	create.named_parameters["directions"] = LogicalType::LIST(LogicalType::VARCHAR);
 	create.named_parameters["nulls"] = LogicalType::LIST(LogicalType::VARCHAR);
-	// Multi-commit build, for a backfill too large for one commit.
+	// Multi-commit build, for a backfill too large for one commit, and the
+	// bounds on one step of it — each step is one object-store request, so a
+	// slow link wants them smaller than the default.
 	create.named_parameters["staged"] = LogicalType::BOOLEAN;
+	create.named_parameters["step_entries"] = LogicalType::BIGINT;
+	create.named_parameters["step_bytes"] = LogicalType::BIGINT;
 	loader.RegisterFunction(create);
 
 	// (catalog, schema, table, index, then the equality key as variadic args

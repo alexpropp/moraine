@@ -1827,6 +1827,12 @@ unsafe fn create_index_in_one_commit(
 /// one commit may stage — and returns once the index is ready; interrupting
 /// it leaves the build resumable by the same call.
 ///
+/// `step_entries` and `step_bytes` bound one step of that build, each `0`
+/// for the default. They matter on a slow link: a step becomes a single
+/// object-store request, and one too large to transfer inside the store
+/// client's timeout is retried forever rather than failing. Both are
+/// ignored without `staged`.
+///
 /// # Safety
 ///
 /// Every pointer must be valid per the ABI contract; `err`, if non-null,
@@ -1843,6 +1849,8 @@ pub unsafe extern "C" fn moraine_index_create(
     column_nulls_first: *const u8,
     unique: bool,
     staged: bool,
+    step_entries: u64,
+    step_bytes: u64,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
     err: *mut MoraineError,
@@ -1908,6 +1916,19 @@ pub unsafe extern "C" fn moraine_index_create(
         // The staged build derives its own backfill, one bounded step at a
         // time; the single-commit path derives it all up front.
         if staged {
+            let default = moraine::BuildStep::default();
+            let step = moraine::BuildStep {
+                entries: if step_entries == 0 {
+                    default.entries
+                } else {
+                    usize::try_from(step_entries).unwrap_or(usize::MAX)
+                },
+                bytes: if step_bytes == 0 {
+                    default.bytes
+                } else {
+                    step_bytes
+                },
+            };
             // SAFETY: caller contract for `probe`/`probe_ctx`.
             unsafe {
                 handle_ref.block_on_cancellable(
@@ -1919,7 +1940,7 @@ pub unsafe extern "C" fn moraine_index_create(
                         &orders,
                         data_store,
                         &handle_ref.data_prefix,
-                        None,
+                        Some(step),
                     ),
                 )
             }?;

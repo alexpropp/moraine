@@ -247,10 +247,10 @@ mod store;
 mod transaction;
 
 pub use catalog::{
-    CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest, ColumnAlteration,
-    ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CommitMember, CompactStoreReport,
-    CompactStoreRequest, CompactionTarget, DataFile, DataFileId, DataFileInfo, DeleteFile,
-    DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
+    BuildStep, CachePreload, Catalog, CatalogOptions, CatalogSnapshot, CensusRequest,
+    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, CommitMember,
+    CompactStoreReport, CompactStoreRequest, CompactionTarget, DataFile, DataFileId, DataFileInfo,
+    DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats, FileIndexEntry, FileIndexRemoval,
     FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, InlineChunk, LiveCount,
     MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef, MaintenanceReport,
     MaintenanceRequest, MappingId, MappingInfo, MergeOutcome, MigrationRequest, NameMappingDef,

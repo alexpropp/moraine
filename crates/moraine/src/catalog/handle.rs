@@ -18,9 +18,9 @@ use tracing::{info, warn};
 
 use crate::{
     catalog::{
-        CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo, FileIndexEntry, IndexDef,
-        IndexEntry, IndexId, IndexInfo, IndexState, RecentRow, RowHolder, RowLocation, SnapshotId,
-        TableId,
+        BuildStep, CatalogSnapshot, ColumnId, ColumnOrder, DataFileId, DataFileInfo,
+        FileIndexEntry, IndexDef, IndexEntry, IndexId, IndexInfo, IndexState, RecentRow, RowHolder,
+        RowLocation, SnapshotId, TableId,
         census::{
             CensusRequest, CompactStoreReport, CompactStoreRequest, CompactionTarget, LiveCount,
             MergeOutcome, StoreCensus, StoreObjects, SubspaceCensus, SubspaceMerge, SubspaceName,
@@ -34,6 +34,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
+        StagedBytes,
         cache::{CacheCounters, CacheTally},
         census::{self as store_census, SegmentSize},
         compaction::{self as store_compaction, MergeEnd},
@@ -98,13 +99,29 @@ fn bytes_of(census: &StoreCensus, subspace: &SubspaceName) -> u64 {
         .map_or(0, |measured| measured.bytes)
 }
 
-/// How many entries one staged build step commits. At roughly a kilobyte
-/// of write-path memory apiece, a step peaks near a gigabyte.
-const BUILD_STEP_ENTRIES: usize = 1_000_000;
-
 /// How many times a staged build re-derives after losing a race before
 /// giving up.
 const BUILD_DERIVATION_ATTEMPTS: usize = 8;
+
+/// How many of `remaining` the next step commits: as many as fit `bound`,
+/// and never fewer than one — a single entry larger than the byte bound
+/// still has to be committed for the build to advance.
+fn step_length(remaining: &[IndexEntry], bound: BuildStep) -> usize {
+    if remaining.is_empty() {
+        return 0;
+    }
+
+    let mut bytes = 0u64;
+    let mut length = 0;
+    for entry in remaining.iter().take(bound.entries) {
+        bytes = bytes.saturating_add(entry.nominal_bytes());
+        if length > 0 && bytes > bound.bytes {
+            break;
+        }
+        length += 1;
+    }
+    length.max(1)
+}
 
 /// The per-column orders `orders` asks for, as a definition records them.
 /// An empty list means ascending / NULLS LAST throughout.
@@ -2082,8 +2099,8 @@ impl Catalog {
     /// The definition lands `building` in its own commit; each pass then
     /// derives the table's live entries (external files through
     /// `data_store`, inline rows from the catalog store), orders them by row
-    /// id, and commits them in steps of `step_entries`, defaulting to a
-    /// million. Writers maintain entries from the first commit forward.
+    /// id, and commits them in steps bounded by `step`. Writers maintain
+    /// entries from the first commit forward.
     ///
     /// Interrupting the call leaves the definition `building`: calling again
     /// with the same `def` resumes from the persisted cursor, and
@@ -2095,8 +2112,8 @@ impl Catalog {
     /// # Errors
     ///
     /// Returns [`Error::AlreadyExists`] if the table already holds a ready
-    /// index of this name, or [`Error::Constraint`] if `step_entries` is
-    /// zero, the resumed definition differs from `def`, or the rows
+    /// index of this name, or [`Error::Constraint`] if either `step` bound
+    /// is zero, the resumed definition differs from `def`, or the rows
     /// duplicate a unique value. A failed build drops its definition.
     pub async fn create_index_staged(
         &self,
@@ -2105,18 +2122,18 @@ impl Catalog {
         orders: &[ColumnOrder],
         data_store: Option<Arc<dyn ObjectStore>>,
         data_prefix: &str,
-        step_entries: Option<usize>,
+        step: Option<BuildStep>,
     ) -> Result<IndexId> {
-        let step_entries = step_entries.unwrap_or(BUILD_STEP_ENTRIES);
-        if step_entries == 0 {
+        let step = step.unwrap_or_default();
+        if step.entries == 0 || step.bytes == 0 {
             return Err(Error::Constraint(
-                "a staged build's step size must be at least one entry".to_owned(),
+                "a staged build's step must admit at least one entry and one byte".to_owned(),
             ));
         }
 
         let index = self.begin_staged_index(table, def, orders).await?;
         let outcome = self
-            .drive_staged_build(table, def, index, data_store, data_prefix, step_entries)
+            .drive_staged_build(table, def, index, data_store, data_prefix, step)
             .await;
 
         // A build that cannot finish leaves no half-covered index behind.
@@ -2141,7 +2158,7 @@ impl Catalog {
         table: TableId,
         index: IndexId,
         entries: &[IndexEntry],
-        step_entries: usize,
+        bound: BuildStep,
     ) -> Result<BuildProgress> {
         loop {
             let cursor = self.staged_build_cursor(table, index).await?;
@@ -2152,7 +2169,7 @@ impl Catalog {
                 None => 0,
             };
             let remaining = &entries[pending..];
-            let step = &remaining[..remaining.len().min(step_entries)];
+            let step = &remaining[..step_length(remaining, bound)];
             let is_final = step.len() == remaining.len();
 
             match self
@@ -2193,8 +2210,10 @@ impl Catalog {
         }
 
         let tx = self.begin_write_tx().await?;
-        let deleted = index_maintenance::reclaim_entries(&tx, index.get(), limit).await?;
-        commit::commit_durable(tx, "entry reclamation")
+        let mut staged = StagedBytes::default();
+        let deleted =
+            index_maintenance::reclaim_entries(&tx, index.get(), limit, &mut staged).await?;
+        commit::commit_durable(tx, "entry reclamation", staged)
             .await
             .map_err(Error::from)?;
 
@@ -2547,7 +2566,7 @@ impl Catalog {
         index: IndexId,
         data_store: Option<Arc<dyn ObjectStore>>,
         data_prefix: &str,
-        step_entries: usize,
+        step: BuildStep,
     ) -> Result<()> {
         for _ in 0..BUILD_DERIVATION_ATTEMPTS {
             let mut entries = match &data_store {
@@ -2568,7 +2587,7 @@ impl Catalog {
             entries.sort_unstable_by_key(|entry| entry.row_id);
 
             if let BuildProgress::Ready = self
-                .commit_build_steps(table, index, &entries, step_entries)
+                .commit_build_steps(table, index, &entries, step)
                 .await?
             {
                 return Ok(());
@@ -2597,12 +2616,15 @@ impl Catalog {
         let mut cursor: Option<Vec<u8>> = None;
         loop {
             let tx = self.begin_write_tx().await?;
+            // Non-durable below, so nothing reads the staged size.
+            let mut staged = StagedBytes::default();
             let (deleted, last) = index_maintenance::reclaim_entries_from(
                 &tx,
                 kind,
                 index_id,
                 batch_size,
                 cursor.as_deref(),
+                &mut staged,
             )
             .await?;
             if deleted == 0 {

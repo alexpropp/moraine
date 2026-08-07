@@ -24,8 +24,8 @@ pub use handle::{
 pub use snapshot::CatalogSnapshot;
 pub(crate) use snapshot::ScopedNames;
 pub use types::{
-    ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats, DataFile,
-    DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats,
+    BuildStep, ColumnAlteration, ColumnDef, ColumnId, ColumnInfo, ColumnOrder, ColumnStats,
+    DataFile, DataFileId, DataFileInfo, DeleteFile, DeleteFileId, DeleteFileInfo, FileColumnStats,
     FileIndexEntry, FileIndexRemoval, FlushedDataFile, IndexDef, IndexEntry, IndexId, IndexInfo,
     IndexState, InlineChunk, MacroId, MacroImplementationDef, MacroInfo, MacroParameterDef,
     MappingId, MappingInfo, NameMappingDef, OptionScope, PartitionColumnDef, PartitionId,

@@ -23,6 +23,7 @@ use super::{Landed, Prepared, StagedWrite, commit_batch, fold, head_view_for, pr
 use crate::{
     catalog::{CatalogSnapshot, SnapshotId, projection::ProjectionCache},
     error::{Error, Result},
+    store::StagedBytes,
     transaction::{operations::ChangeSet, verbs::Transaction},
 };
 
@@ -91,6 +92,8 @@ struct Batch {
     /// Commits staged onto the batch, against [`MAX_BATCH_MEMBERS`].
     members: usize,
     writes: Vec<StagedWrite>,
+    /// What the members have staged onto `db_tx`, index entries included.
+    staged_bytes: StagedBytes,
     outcome: watch::Sender<Option<Outcome>>,
 }
 
@@ -118,6 +121,7 @@ impl Batch {
             head: head_before,
             members: 0,
             writes: Vec::new(),
+            staged_bytes: StagedBytes::default(),
             outcome: watch::Sender::new(None),
         })
     }
@@ -158,11 +162,13 @@ impl Batch {
                     ours: theirs,
                     commits,
                     writes,
+                    staged_bytes,
                 } => {
                     ids.push(SnapshotId::new(commits));
                     ours.push(*theirs);
                     self.head = commits;
                     self.writes.extend(writes);
+                    self.staged_bytes.0 = self.staged_bytes.0.saturating_add(staged_bytes.0);
                 }
             }
         }
@@ -306,21 +312,31 @@ impl Coalescer {
             head_before,
             head,
             writes,
+            staged_bytes,
             outcome,
             ..
         } = batch;
 
-        let landed =
-            match commit_batch(db_tx, head_before, head, &writes, &base, &self.projections).await {
-                Ok(Landed::Committed) => Outcome::Committed,
-                Ok(Landed::LostRace) => Outcome::LostRace,
-                Err(err) => {
-                    // The only record of this error. Its members re-attempt,
-                    // and the one that meets it alone returns it typed.
-                    tracing::warn!(error = %err, "commit batch failed to write; its members retry");
-                    Outcome::Nothing
-                }
-            };
+        let landed = match commit_batch(
+            db_tx,
+            head_before,
+            head,
+            &writes,
+            staged_bytes,
+            &base,
+            &self.projections,
+        )
+        .await
+        {
+            Ok(Landed::Committed) => Outcome::Committed,
+            Ok(Landed::LostRace) => Outcome::LostRace,
+            Err(err) => {
+                // The only record of this error. Its members re-attempt,
+                // and the one that meets it alone returns it typed.
+                tracing::warn!(error = %err, "commit batch failed to write; its members retry");
+                Outcome::Nothing
+            }
+        };
         // Every member may already have gone; the batch landed regardless.
         let _ = outcome.send(Some(landed));
 

@@ -20,7 +20,11 @@ async fn a_durable_commit_returns_its_own_outcome() {
 
     let tx = db.begin(IsolationLevel::Snapshot).await.unwrap();
     tx.put(Key::Sys(SysKey::Head).encode(), b"head").unwrap();
-    assert!(commit_durable(tx, "test").await.is_ok());
+    assert!(
+        commit_durable(tx, "test", StagedBytes::default())
+            .await
+            .is_ok()
+    );
     assert_eq!(
         db.get(&Key::Sys(SysKey::Head).encode())
             .await
@@ -4094,12 +4098,13 @@ async fn a_commit_landing_after_an_attempts_materialization_is_always_detected()
     // premises that omit a landed commit.
     let mut staged = diff_writes(&base, &base, head_before + 1);
     staged.push(head_write(&attempt, head_before + 1).await.unwrap());
-    stage_writes(&attempt, &staged).unwrap();
+    let staged_bytes = stage_writes(&attempt, &staged).unwrap();
     let landed = commit_batch(
         attempt,
         head_before,
         head_before + 1,
         &staged,
+        staged_bytes,
         &base,
         catalog.projections(),
     )
@@ -4460,4 +4465,70 @@ async fn a_marker_from_the_writer_that_fenced_us_never_reads_as_a_migration() {
 
     let noticed = noticed.expect("the displaced handle never noticed it had been fenced");
     assert!(matches!(noticed, Error::Fenced(_)), "{noticed:?}");
+}
+
+/// The batch's reported size is the batch: every key and value staged,
+/// index entries included. It is what the stall warning names, so an
+/// undercount would point an operator at the wrong cause.
+#[tokio::test]
+async fn a_staged_batch_reports_the_bytes_it_holds() {
+    let (catalog, table) = catalog_with_two_column_table().await;
+
+    let entries: Vec<crate::catalog::IndexEntry> = (0..4)
+        .map(|row_id| crate::catalog::IndexEntry {
+            row_id,
+            values: vec![Some(int_value(i128::from(row_id)))],
+        })
+        .collect();
+    let def = crate::catalog::IndexDef {
+        name: "by_a".into(),
+        columns: vec![crate::catalog::ColumnId::new(1)],
+        unique: false,
+    };
+
+    let base = catalog.snapshot().await.unwrap();
+    let db_tx = catalog.begin_write_tx().await.unwrap();
+    let prepared = prepare_and_stage(
+        &db_tx,
+        &|tx: &mut Transaction| tx.create_index(table, &def, &entries).map(|_| ()),
+        &base,
+    )
+    .await
+    .unwrap();
+
+    let Prepared::Staged {
+        writes,
+        staged_bytes,
+        ..
+    } = prepared
+    else {
+        panic!("the closure staged writes");
+    };
+
+    let catalog_bytes: u64 = writes
+        .iter()
+        .map(|(key, value)| (key.len() + value.as_ref().map_or(0, Vec::len)) as u64)
+        .sum();
+    // The entries' own contribution is bracketed rather than exact: the
+    // per-entry estimate is taken before encoding, and framing escapes the
+    // zero bytes a big-endian integer key is full of.
+    let nominal: u64 = entries
+        .iter()
+        .map(crate::catalog::IndexEntry::nominal_bytes)
+        .sum();
+
+    assert!(nominal > 0, "the entries weigh something");
+    assert!(
+        staged_bytes.0 >= catalog_bytes + nominal,
+        "{} < {catalog_bytes} + {nominal}",
+        staged_bytes.0
+    );
+    assert!(
+        staged_bytes.0 <= catalog_bytes + 2 * nominal,
+        "{} > {catalog_bytes} + 2 * {nominal}",
+        staged_bytes.0
+    );
+
+    db_tx.rollback();
+    catalog.close().await.unwrap();
 }

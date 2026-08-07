@@ -557,6 +557,61 @@ pub struct IndexEntry {
     pub values: Vec<Option<crate::store::index_encoding::IndexKeyValue>>,
 }
 
+impl IndexEntry {
+    /// What this entry will weigh on a batch, key and value together,
+    /// assuming no byte needs escaping.
+    ///
+    /// Nominal because it is wanted *before* the key is encoded, to decide
+    /// how many entries a step may carry. Escaping can make the staged
+    /// entry up to twice this; nothing can make it smaller.
+    pub(crate) fn nominal_bytes(&self) -> u64 {
+        crate::store::key::index_entry_bytes(&self.values)
+    }
+}
+
+/// How much one step of a staged index build may commit. A step ends at
+/// whichever bound it reaches first, and always carries at least one entry
+/// so a bound below a single entry's size still makes progress.
+///
+/// The two bounds answer to different limits. `entries` is memory: the
+/// store's write path holds roughly a kilobyte per staged entry, so a step
+/// of a million peaks near a gigabyte. `bytes` is transfer: the batch
+/// reaches object storage as a single request, which has to complete
+/// inside the store client's timeout, and a batch too large to push in
+/// that window is retried forever rather than failing.
+///
+/// At the defaults the byte bound always wins — an entry costs at least 19
+/// bytes, so 8 MiB admits at most ~440,000 of them. `entries` earns its
+/// place under a *raised* `bytes`, where it is what keeps a step sized for
+/// a fast link from becoming a memory bomb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildStep {
+    /// Entries per step.
+    pub entries: usize,
+    /// Staged key and value bytes per step, summed over each entry's key
+    /// and value before either is encoded. Framing escapes `0x00` and
+    /// `0x01`, so the committed batch can be up to twice this.
+    pub bytes: u64,
+}
+
+/// Entries per step when [`BuildStep`] is left to its default.
+const DEFAULT_STEP_ENTRIES: usize = 1_000_000;
+
+/// Staged bytes per step when [`BuildStep`] is left to its default. Eight
+/// mebibytes clears `object_store`'s 30-second default request timeout at
+/// a little over 270 KiB/s, so a step lands on links far slower than a
+/// build has any right to expect.
+const DEFAULT_STEP_BYTES: u64 = 8 * 1024 * 1024;
+
+impl Default for BuildStep {
+    fn default() -> Self {
+        Self {
+            entries: DEFAULT_STEP_ENTRIES,
+            bytes: DEFAULT_STEP_BYTES,
+        }
+    }
+}
+
 /// Where a row a lookup found currently lives. moraine returns candidates;
 /// the consumer applies delete files, as any DuckLake scan does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

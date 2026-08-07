@@ -19,6 +19,7 @@ use tracing::warn;
 use crate::{
     error::{Error, Result},
     store::{
+        StagedBytes,
         handle::{ReadHandle, ScanShape},
         index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
         key::{
@@ -103,6 +104,15 @@ const UNIQUENESS_PROBE_GROUP: usize = 1024;
 /// At roughly a kilobyte apiece this admits commits needing about 8 GiB.
 const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 8_000_000;
 
+/// What staging a batch's entries produced: the indexes a collision
+/// poisoned, and the bytes the entries put on the batch.
+pub(crate) struct StagedEntries {
+    /// Definitions a duplicate poisoned, sorted and deduplicated.
+    pub(crate) poisoned: Vec<u64>,
+    /// Key and value bytes staged, deletes included.
+    pub(crate) bytes: u64,
+}
+
 /// One unique put awaiting its probe.
 struct PendingProbe {
     /// The entry's encoded store key.
@@ -134,6 +144,7 @@ async fn resolve_probes(
     deleted_unique: &HashSet<Vec<u8>>,
     pending: &mut Vec<PendingProbe>,
     poisoned: &mut Vec<u64>,
+    staged: &mut StagedBytes,
 ) -> Result<()> {
     let reader = ReadHandle::Tx(db_tx);
     let held: Vec<Option<Bytes>> = stream::iter(0..pending.len())
@@ -168,6 +179,7 @@ async fn resolve_probes(
             }
             continue;
         }
+        staged.add(probe.key.len(), size_of::<u64>());
         db_tx.put(probe.key, probe.row_id.to_be_bytes())?;
     }
     Ok(())
@@ -199,7 +211,7 @@ async fn resolve_probes(
 pub(crate) async fn stage_index_entries(
     db_tx: &DbTransaction,
     entries: &[StagedIndexEntry],
-) -> Result<Vec<u64>> {
+) -> Result<StagedEntries> {
     if entries.len() > MAX_INDEX_ENTRIES_PER_COMMIT {
         // Logged as well as returned: the refusal is the guardrail firing,
         // and an operator reading logs after a failed bulk load should see
@@ -212,12 +224,14 @@ pub(crate) async fn stage_index_entries(
         return Err(oversized_commit(entries.len()));
     }
 
+    let mut staged = StagedBytes::default();
     let mut deleted_unique: HashSet<Vec<u8>> = HashSet::new();
     for entry in entries.iter().filter(|entry| entry.delete) {
         let key_bytes = entry_key(entry).encode();
         if entry.unique {
             deleted_unique.insert(key_bytes.clone());
         }
+        staged.add(key_bytes.len(), 0);
         db_tx.delete(key_bytes)?;
     }
 
@@ -233,6 +247,7 @@ pub(crate) async fn stage_index_entries(
         let key_bytes = entry_key(entry).encode();
         if !entry.unique {
             // The row id lives in the key; the value is empty.
+            staged.add(key_bytes.len(), 0);
             db_tx.put(key_bytes, [])?;
             continue;
         }
@@ -253,14 +268,31 @@ pub(crate) async fn stage_index_entries(
             building: entry.building,
         });
         if pending.len() >= UNIQUENESS_PROBE_GROUP {
-            resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
+            resolve_probes(
+                db_tx,
+                &deleted_unique,
+                &mut pending,
+                &mut poisoned,
+                &mut staged,
+            )
+            .await?;
         }
     }
-    resolve_probes(db_tx, &deleted_unique, &mut pending, &mut poisoned).await?;
+    resolve_probes(
+        db_tx,
+        &deleted_unique,
+        &mut pending,
+        &mut poisoned,
+        &mut staged,
+    )
+    .await?;
 
     poisoned.sort_unstable();
     poisoned.dedup();
-    Ok(poisoned)
+    Ok(StagedEntries {
+        poisoned,
+        bytes: staged.0,
+    })
 }
 
 /// Records `poisoned` on the working state's definitions, so the commit's
@@ -312,13 +344,15 @@ pub(crate) async fn reclaim_entries(
     tx: &slatedb::DbTransaction,
     index_id: u64,
     limit: usize,
+    staged: &mut StagedBytes,
 ) -> Result<usize> {
     let mut deleted = 0;
     for kind in [IndexKind::Unique, IndexKind::Multi] {
         if deleted >= limit {
             break;
         }
-        let (batch, _) = reclaim_entries_from(tx, kind, index_id, limit - deleted, None).await?;
+        let (batch, _) =
+            reclaim_entries_from(tx, kind, index_id, limit - deleted, None, staged).await?;
         deleted += batch;
     }
     Ok(deleted)
@@ -340,6 +374,7 @@ pub(crate) async fn reclaim_entries_from(
     index_id: u64,
     limit: usize,
     start_from: Option<&[u8]>,
+    staged: &mut StagedBytes,
 ) -> Result<(usize, Option<Vec<u8>>)> {
     let prefix = index_index_prefix(kind, index_id);
     // `scan_prefix` takes its bounds as a suffix of the prefix.
@@ -357,6 +392,7 @@ pub(crate) async fn reclaim_entries_from(
         match iter.next().await? {
             Some(entry) => {
                 let key = entry.key.to_vec();
+                staged.add(key.len(), 0);
                 tx.delete(entry.key)?;
                 deleted += 1;
                 last = Some(key);

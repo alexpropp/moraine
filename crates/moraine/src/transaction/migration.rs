@@ -21,6 +21,7 @@ use crate::{
     error::{Error, Result},
     fault::{CrashPoint, crash_seam},
     store::{
+        StagedBytes,
         handle::ReadHandle,
         key::{Key, SysKey},
         proto, read, value,
@@ -28,9 +29,18 @@ use crate::{
     transaction::commit::commit_durable,
 };
 
-/// Where a step left off: the cursor the next step resumes at, or `None`
-/// when the walk is done and the step staged nothing.
-pub(crate) type StepOutcome = Option<Vec<u8>>;
+/// Where a step left off: the cursor the next step resumes at and what it
+/// put on the batch, or `None` when the walk is done and the step staged
+/// nothing.
+pub(crate) type StepOutcome = Option<StepProgress>;
+
+/// One step's contribution to the batch the driver commits.
+pub(crate) struct StepProgress {
+    /// The cursor the next step resumes at.
+    pub(crate) cursor: Vec<u8>,
+    /// Key and value bytes the step staged onto the transaction.
+    pub(crate) staged: StagedBytes,
+}
 
 /// A unit's step: stages one bounded batch of its rewrite into `tx`,
 /// resuming at `cursor` (empty at the start of the walk).
@@ -163,16 +173,17 @@ fn plan(format: u64, marker: Option<&proto::MigrationValue>) -> Result<Plan> {
 }
 
 /// Stages the marker recording `unit` and its progress.
-fn stage_marker(tx: &DbTransaction, unit: &MigrationUnit, cursor: &[u8]) -> Result<()> {
-    tx.put(
-        Key::Sys(SysKey::Migration).encode(),
-        value::encode_value(&proto::MigrationValue {
-            from_format: unit.from_format,
-            to_format: unit.to_format,
-            cursor: cursor.to_vec(),
-        }),
-    )
-    .map_err(Error::from)
+fn stage_marker(tx: &DbTransaction, unit: &MigrationUnit, cursor: &[u8]) -> Result<StagedBytes> {
+    let key = Key::Sys(SysKey::Migration).encode();
+    let value = value::encode_value(&proto::MigrationValue {
+        from_format: unit.from_format,
+        to_format: unit.to_format,
+        cursor: cursor.to_vec(),
+    });
+    let mut staged = StagedBytes::default();
+    staged.add(key.len(), value.len());
+    tx.put(key, value).map_err(Error::from)?;
+    Ok(staged)
 }
 
 /// The start batch: the marker exists after it, or it does not.
@@ -181,11 +192,14 @@ async fn start(db: &Db, unit: &MigrationUnit) -> Result<()> {
         .begin(IsolationLevel::Snapshot)
         .await
         .map_err(Error::from)?;
-    if let Err(error) = stage_marker(&tx, unit, &[]) {
-        tx.rollback();
-        return Err(error);
-    }
-    commit_durable(tx, "migration start")
+    let staged = match stage_marker(&tx, unit, &[]) {
+        Ok(staged) => staged,
+        Err(error) => {
+            tx.rollback();
+            return Err(error);
+        }
+    };
+    commit_durable(tx, "migration start", staged)
         .await
         .map_err(Error::from)?;
     Ok(())
@@ -199,21 +213,21 @@ async fn finish(db: &Db, unit: &MigrationUnit) -> Result<()> {
         .await
         .map_err(Error::from)?;
 
-    let staged = tx
-        .put(
-            Key::Sys(SysKey::Format).encode(),
-            value::encode_value(&proto::FormatValue {
-                format_version: unit.to_format,
-                writer_version: env!("CARGO_PKG_VERSION").to_string(),
-            }),
-        )
-        .and_then(|()| tx.delete(Key::Sys(SysKey::Migration).encode()));
-    if let Err(error) = staged {
+    let format = Key::Sys(SysKey::Format).encode();
+    let stamp = value::encode_value(&proto::FormatValue {
+        format_version: unit.to_format,
+        writer_version: env!("CARGO_PKG_VERSION").to_string(),
+    });
+    let marker = Key::Sys(SysKey::Migration).encode();
+    let mut staged = StagedBytes::default();
+    staged.add(format.len(), stamp.len());
+    staged.add(marker.len(), 0);
+    if let Err(error) = tx.put(format, stamp).and_then(|()| tx.delete(marker)) {
         tx.rollback();
         return Err(Error::from(error));
     }
 
-    commit_durable(tx, "migration finish")
+    commit_durable(tx, "migration finish", staged)
         .await
         .map_err(Error::from)?;
     Ok(())
@@ -244,18 +258,26 @@ async fn run_unit(db: &Db, unit: &MigrationUnit, resume: Option<Vec<u8>>) -> Res
             }
         };
 
-        let Some(next) = outcome else {
+        let Some(StepProgress {
+            cursor: next,
+            staged: rewritten,
+        }) = outcome
+        else {
             tx.rollback();
             break;
         };
 
         // The cursor advances in the same batch as the rewrite it records,
         // so it never claims more progress than is durable.
-        if let Err(error) = stage_marker(&tx, unit, &next) {
-            tx.rollback();
-            return Err(error);
-        }
-        commit_durable(tx, "migration step")
+        let mut staged = match stage_marker(&tx, unit, &next) {
+            Ok(staged) => staged,
+            Err(error) => {
+                tx.rollback();
+                return Err(error);
+            }
+        };
+        staged.0 = staged.0.saturating_add(rewritten.0);
+        commit_durable(tx, "migration step", staged)
             .await
             .map_err(Error::from)?;
         crash_seam(CrashPoint::AfterStep)?;

@@ -36,6 +36,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
+        StagedBytes,
         handle::ReadHandle,
         index_encoding::encode_ordered_values,
         inline as store_inline,
@@ -44,7 +45,7 @@ use crate::{
     },
     transaction::{
         commit,
-        index_maintenance::{StagedIndexEntry, stage_index_entries},
+        index_maintenance::{StagedEntries, StagedIndexEntry, stage_index_entries},
     },
 };
 
@@ -957,56 +958,32 @@ impl StagedTransaction {
         // indexed table with no store to read it aborts the commit rather
         // than under-covering the index. Staged before the translation so a
         // poisoned definition rides the writes it produces.
-        let maintained =
-            stage_index_maintenance(&db_tx, base_ref, &ops, data_store.as_ref(), &data_prefix)
-                .await;
-        let poisoned = match maintained {
-            Ok(poisoned) => poisoned,
-            Err(err) => {
-                db_tx.rollback();
-                return Err(err);
-            }
-        };
-
-        let translated = if mints_snapshot {
-            translate(base_ref, &ops, &poisoned).map(|(new_id, mut writes, snap)| {
-                // Derived before the snapshot record joins the batch: the
-                // changelog names `current` keys, and that record is not.
-                let changelog = commit::changelog_writes(new_id, &writes);
-                writes.push((
-                    Key::Snapshot {
-                        snapshot_id: new_id,
-                    }
-                    .encode(),
-                    Some(value::encode_value(&snap)),
-                ));
-                writes.extend(changelog);
-                (new_id, writes)
-            })
-        } else {
-            translate_maintenance(base_ref, &ops)
-                .map(|writes| (base_ref.snapshot.snapshot_id, writes))
-        };
-
-        match translated {
-            Ok((result_id, mut writes)) => {
-                // Every batch stamps the head — a maintenance one included,
-                // where it reuses the standing snapshot id and only the
-                // batch count moves. That makes `sys/head` the one conflict
-                // anchor every batch shares, and the stamp a reader
-                // validates its cut against.
-                match commit::head_write(&db_tx, result_id).await {
-                    Ok(head) => writes.push(head),
-                    Err(err) => {
-                        db_tx.rollback();
-                        return Err(err);
-                    }
-                }
-                writes.extend(inline_writes);
-                if let Err(err) = commit::stage_writes(&db_tx, &writes) {
+        let store = data_store.as_ref();
+        let entries =
+            match stage_index_maintenance(&db_tx, base_ref, &ops, store, &data_prefix).await {
+                Ok(entries) => entries,
+                Err(err) => {
                     db_tx.rollback();
                     return Err(err);
                 }
+            };
+        let StagedEntries {
+            poisoned,
+            bytes: entry_bytes,
+        } = entries;
+
+        match translate_batch(base_ref, &ops, &poisoned, mints_snapshot) {
+            Ok((result_id, mut writes)) => {
+                let staged_bytes =
+                    match stage_batch(&db_tx, &mut writes, inline_writes, result_id, entry_bytes)
+                        .await
+                    {
+                        Ok(staged) => staged,
+                        Err(err) => {
+                            db_tx.rollback();
+                            return Err(err);
+                        }
+                    };
                 // The same landing the verb path takes: one durable write,
                 // one head-race classification, one projection refresh.
                 // This path never retries the loss — DuckLake authored the
@@ -1023,6 +1000,7 @@ impl StagedTransaction {
                     head_before,
                     result_id,
                     writes,
+                    staged_bytes,
                     Arc::clone(&base),
                     projections,
                 )
@@ -1041,6 +1019,56 @@ impl StagedTransaction {
             }
         }
     }
+}
+
+/// The writes a batch carries and the snapshot id it results in. A
+/// snapshot-minting commit translates its operations and appends its own
+/// snapshot record; a maintenance one reuses the standing id.
+fn translate_batch(
+    base: &CatalogSnapshot,
+    ops: &[RowOperation],
+    poisoned: &[u64],
+    mints_snapshot: bool,
+) -> Result<(u64, Vec<commit::StagedWrite>)> {
+    if !mints_snapshot {
+        return translate_maintenance(base, ops).map(|writes| (base.snapshot.snapshot_id, writes));
+    }
+
+    let (new_id, mut writes, snap) = translate(base, ops, poisoned)?;
+    // Derived before the snapshot record joins the batch: the changelog
+    // names `current` keys, and that record is not.
+    let changelog = commit::changelog_writes(new_id, &writes);
+    writes.push((
+        Key::Snapshot {
+            snapshot_id: new_id,
+        }
+        .encode(),
+        Some(value::encode_value(&snap)),
+    ));
+    writes.extend(changelog);
+    Ok((new_id, writes))
+}
+
+/// Stamps the head, folds in the inline writes, and stages the whole batch
+/// onto `db_tx`, returning what the batch weighs — `entry_bytes` included,
+/// since index entries stage directly and never join `writes`.
+///
+/// Every batch stamps the head, a maintenance one included, where it reuses
+/// the standing snapshot id and only the batch count moves. That makes
+/// `sys/head` the one conflict anchor every batch shares, and the stamp a
+/// reader validates its cut against.
+async fn stage_batch(
+    db_tx: &DbTransaction,
+    writes: &mut Vec<commit::StagedWrite>,
+    inline_writes: Vec<commit::StagedWrite>,
+    result_id: u64,
+    entry_bytes: u64,
+) -> Result<StagedBytes> {
+    writes.push(commit::head_write(db_tx, result_id).await?);
+    writes.extend(inline_writes);
+    let mut staged = commit::stage_writes(db_tx, writes)?;
+    staged.0 = staged.0.saturating_add(entry_bytes);
+    Ok(staged)
 }
 
 /// One landed staged commit's summary event.

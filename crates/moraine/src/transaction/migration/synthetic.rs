@@ -12,6 +12,7 @@ use slatedb::DbTransaction;
 use crate::{
     error::{Error, Result},
     store::{
+        StagedBytes,
         handle::ReadHandle,
         key::{EntityKey, Key},
         proto,
@@ -20,7 +21,7 @@ use crate::{
     },
     transaction::{
         commit::{FORMAT_VERSION, MAX_FORMAT_VERSION},
-        migration::{MigrationUnit, StepOutcome},
+        migration::{MigrationUnit, StepOutcome, StepProgress},
     },
 };
 
@@ -54,25 +55,28 @@ fn move_scope_step<'a>(
         // New key first, old key second. Within one batch the pair is
         // atomic; the ordering is the discipline a unit that ever split its
         // work across batches would need, so it is written that way here.
-        tx.put(
-            Key::current(EntityKey::Option {
-                scope_kind: TARGET_SCOPE,
-                scope_id,
-            })
-            .encode(),
-            value::encode_value(&value),
-        )
-        .map_err(Error::from)?;
-        tx.delete(
-            Key::current(EntityKey::Option {
-                scope_kind: SOURCE_SCOPE,
-                scope_id,
-            })
-            .encode(),
-        )
-        .map_err(Error::from)?;
+        let mut staged = StagedBytes::default();
+        let target = Key::current(EntityKey::Option {
+            scope_kind: TARGET_SCOPE,
+            scope_id,
+        })
+        .encode();
+        let encoded = value::encode_value(&value);
+        staged.add(target.len(), encoded.len());
+        tx.put(target, encoded).map_err(Error::from)?;
 
-        Ok(Some(scope_id.to_be_bytes().to_vec()))
+        let source = Key::current(EntityKey::Option {
+            scope_kind: SOURCE_SCOPE,
+            scope_id,
+        })
+        .encode();
+        staged.add(source.len(), 0);
+        tx.delete(source).map_err(Error::from)?;
+
+        Ok(Some(StepProgress {
+            cursor: scope_id.to_be_bytes().to_vec(),
+            staged,
+        }))
     }
     .boxed()
 }
