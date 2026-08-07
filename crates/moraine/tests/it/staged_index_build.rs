@@ -7,7 +7,9 @@ use arrow::{
     array::{Int64Array, RecordBatch},
     datatypes::{DataType, Field, Schema},
 };
-use moraine::{Catalog, ColumnId, Error, IndexDef, IndexKeyValue, IndexState, IntWidth, TableId};
+use moraine::{
+    BuildStep, Catalog, ColumnId, Error, IndexDef, IndexKeyValue, IndexState, IntWidth, TableId,
+};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::ArrowWriter;
 
@@ -62,6 +64,28 @@ fn def(unique: bool) -> IndexDef {
     }
 }
 
+/// A step bounded only by its entry count, so a test that means to pin
+/// step boundaries is not also measuring entry width.
+fn by_entries(entries: usize) -> BuildStep {
+    BuildStep {
+        entries,
+        bytes: u64::MAX,
+    }
+}
+
+/// The head snapshot id — one per commit, so its movement counts the
+/// commits a build spent.
+#[allow(clippy::unwrap_used)]
+async fn head(catalog: &Catalog) -> u64 {
+    catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .current_snapshot()
+        .id
+        .get()
+}
+
 fn int(value: i128) -> IndexKeyValue {
     IndexKeyValue::Int {
         value,
@@ -76,7 +100,7 @@ async fn staged_build_spans_steps_and_finishes_ready() {
     let (catalog, table, data) = table_with_file((0..7).collect()).await;
 
     let index = catalog
-        .create_index_staged(table, &def(true), &[], Some(data), "", Some(2))
+        .create_index_staged(table, &def(true), &[], Some(data), "", Some(by_entries(2)))
         .await
         .unwrap();
 
@@ -151,7 +175,7 @@ async fn interrupted_staged_build_resumes_from_its_cursor() {
     // Re-issuing the create resumes rather than starting over or colliding
     // on the name.
     let resumed = catalog
-        .create_index_staged(table, &def(true), &[], Some(data), "", Some(2))
+        .create_index_staged(table, &def(true), &[], Some(data), "", Some(by_entries(2)))
         .await
         .unwrap();
     assert_eq!(resumed, index, "resumed the same definition");
@@ -187,7 +211,7 @@ async fn duplicate_in_backfill_fails_the_build_and_drops_the_definition() {
     let (catalog, table, data) = table_with_file(vec![0, 1, 2, 3, 4, 4, 6]).await;
 
     let err = catalog
-        .create_index_staged(table, &def(true), &[], Some(data), "", Some(2))
+        .create_index_staged(table, &def(true), &[], Some(data), "", Some(by_entries(2)))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Constraint(_)), "{err}");
@@ -209,7 +233,7 @@ async fn non_unique_staged_build_admits_duplicates() {
     let (catalog, table, data) = table_with_file(vec![0, 1, 2, 3, 4, 4, 6]).await;
 
     let index = catalog
-        .create_index_staged(table, &def(false), &[], Some(data), "", Some(2))
+        .create_index_staged(table, &def(false), &[], Some(data), "", Some(by_entries(2)))
         .await
         .unwrap();
 
@@ -238,7 +262,7 @@ async fn resuming_with_a_different_definition_is_refused() {
             &[],
             Some(Arc::clone(&data)),
             "",
-            Some(2),
+            Some(by_entries(2)),
         )
         .await
         .unwrap_err();
@@ -258,7 +282,7 @@ async fn resuming_with_a_different_definition_is_refused() {
             }],
             Some(data),
             "",
-            Some(2),
+            Some(by_entries(2)),
         )
         .await
         .unwrap_err();
@@ -275,14 +299,96 @@ async fn resuming_with_a_different_definition_is_refused() {
 async fn staged_create_over_a_ready_index_is_refused() {
     let (catalog, table, data) = table_with_file((0..3).collect()).await;
     catalog
-        .create_index_staged(table, &def(true), &[], Some(Arc::clone(&data)), "", Some(2))
+        .create_index_staged(
+            table,
+            &def(true),
+            &[],
+            Some(Arc::clone(&data)),
+            "",
+            Some(by_entries(2)),
+        )
         .await
         .unwrap();
 
     let err = catalog
-        .create_index_staged(table, &def(true), &[], Some(data), "", Some(2))
+        .create_index_staged(table, &def(true), &[], Some(data), "", Some(by_entries(2)))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::AlreadyExists(_)), "{err}");
+    catalog.close().await.unwrap();
+}
+
+/// A step ends at its byte bound as well as its entry bound. Under a bound
+/// no single entry fits, every step carries exactly one — the build still
+/// advances rather than stalling on a step it can never fill.
+#[tokio::test]
+async fn steps_end_at_the_byte_bound() {
+    let (catalog, table, data) = table_with_file((0..7).collect()).await;
+    let before = head(&catalog).await;
+
+    catalog
+        .create_index_staged(
+            table,
+            &def(true),
+            &[],
+            Some(data),
+            "",
+            Some(BuildStep {
+                entries: 1_000,
+                bytes: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+    // The definition commit, then one per entry.
+    assert_eq!(head(&catalog).await - before, 1 + 7);
+    catalog.close().await.unwrap();
+}
+
+/// The entry bound still binds when the byte bound is out of reach: seven
+/// entries two at a time is four steps, not seven.
+#[tokio::test]
+async fn steps_end_at_the_entry_bound() {
+    let (catalog, table, data) = table_with_file((0..7).collect()).await;
+    let before = head(&catalog).await;
+
+    catalog
+        .create_index_staged(table, &def(true), &[], Some(data), "", Some(by_entries(2)))
+        .await
+        .unwrap();
+
+    assert_eq!(head(&catalog).await - before, 1 + 4);
+    catalog.close().await.unwrap();
+}
+
+/// A step admitting no entry at all is refused rather than looping.
+#[tokio::test]
+async fn a_zero_step_bound_is_refused() {
+    let (catalog, table, data) = table_with_file((0..3).collect()).await;
+
+    for bound in [
+        BuildStep {
+            entries: 0,
+            bytes: 1_024,
+        },
+        BuildStep {
+            entries: 8,
+            bytes: 0,
+        },
+    ] {
+        let err = catalog
+            .create_index_staged(
+                table,
+                &def(true),
+                &[],
+                Some(Arc::clone(&data)),
+                "",
+                Some(bound),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Constraint(_)), "{err}");
+    }
     catalog.close().await.unwrap();
 }

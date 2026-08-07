@@ -146,6 +146,36 @@ impl IndexKeyValue {
             Self::Bytes(value) => value.clone(),
         }
     }
+
+    /// How many canonical bytes [`Self::encode`] would produce, without
+    /// producing them.
+    const fn encoded_len(&self) -> usize {
+        match self {
+            Self::Int { width, .. } | Self::UInt { width, .. } => width.bytes(),
+            Self::F32(_) => size_of::<f32>(),
+            Self::F64(_) => size_of::<f64>(),
+            Self::Bool(_) => 1,
+            Self::Str(value) => value.len(),
+            Self::Bytes(value) => value.len(),
+        }
+    }
+}
+
+/// What [`encode_ordered_key`] would produce for `values`, assuming no byte
+/// needs escaping: a flag byte per column, plus each non-null value's
+/// canonical bytes and their terminator.
+///
+/// A lower bound, not the exact length — framing escapes `0x00` and `0x01`,
+/// which at worst doubles a value. Callers sizing a batch against it get a
+/// bound they may exceed by up to that factor.
+pub(crate) fn nominal_key_bytes(values: &[Option<IndexKeyValue>]) -> usize {
+    values
+        .iter()
+        .map(|value| match value {
+            Some(value) => 1 + value.encoded_len() + 1,
+            None => 1,
+        })
+        .sum()
 }
 
 /// Sort direction of an indexed column.
@@ -822,6 +852,35 @@ mod tests {
                     .unwrap()
                 };
                 prop_assert_eq!(a == b, encode(&a) == encode(&b));
+            }
+
+            /// The nominal size brackets the encoding it estimates: never
+            /// over the real length, and never under half of it, since
+            /// framing escapes at most every byte of a value.
+            #[test]
+            fn nominal_size_brackets_the_encoded_key(
+                values in prop::collection::vec(
+                    prop::option::of(prop::collection::vec(any::<u8>(), 0..24)),
+                    0..4,
+                ),
+            ) {
+                let values: Vec<Option<IndexKeyValue>> = values
+                    .into_iter()
+                    .map(|value| value.map(IndexKeyValue::Bytes))
+                    .collect();
+                let columns: Vec<OrderedColumn> = values
+                    .iter()
+                    .map(|value| OrderedColumn {
+                        value: value.clone(),
+                        direction: Direction::Ascending,
+                        nulls: NullOrder::Last,
+                    })
+                    .collect();
+
+                let nominal = nominal_key_bytes(&values);
+                let encoded = encode_ordered_key(&columns).unwrap().as_bytes().len();
+                prop_assert!(nominal <= encoded, "{nominal} > {encoded}");
+                prop_assert!(encoded <= 2 * nominal, "{encoded} > 2 * {nominal}");
             }
         }
     }

@@ -21,6 +21,7 @@ use crate::{
     },
     error::{Error, Result},
     store::{
+        StagedBytes,
         cache::CacheCounters,
         handle::ReadHandle,
         key::{EntityKey, Key, SysKey},
@@ -108,18 +109,20 @@ pub(crate) fn durable() -> WriteOptions {
 const STALL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Commits `tx` and waits for the batch to reach object storage, naming
-/// `operation` in the log if the wait runs long.
+/// `operation` and the batch's `staged` size in the log if the wait runs
+/// long.
 ///
 /// The wait is unbounded on purpose. A failed object-store write is retried
-/// beneath us indefinitely, so a permanent refusal — expired credentials, a
-/// revoked bucket policy — stalls here rather than failing. Giving up on a
-/// deadline would not undo the staged batch: the flush continues, so the
-/// deadline would report failure for a commit that still lands, and a
-/// caller re-driving it would apply it twice. A stall that says so in the
-/// log is the half of that trade worth having.
+/// beneath us indefinitely, so a write that never succeeds stalls here
+/// rather than failing. Giving up on a deadline would not undo the staged
+/// batch: the flush continues, so the deadline would report failure for a
+/// commit that still lands, and a caller re-driving it would apply it
+/// twice. A stall that says so in the log is the half of that trade worth
+/// having.
 pub(crate) async fn commit_durable(
     tx: DbTransaction,
     operation: &'static str,
+    staged: StagedBytes,
 ) -> std::result::Result<Option<slatedb::WriteHandle>, slatedb::Error> {
     let options = durable();
     let mut commit = Box::pin(tx.commit_with_options(&options));
@@ -129,11 +132,19 @@ pub(crate) async fn commit_durable(
             return outcome;
         }
         waited = waited.saturating_add(STALL_INTERVAL);
+        // No error accompanies this, and none can: the failure is retried
+        // below us, so there is nothing here to report but the wait. The
+        // batch's size is the one fact that separates the two causes — a
+        // batch too large to transfer inside the store client's request
+        // timeout can never land, however healthy the credentials are.
         warn!(
             operation,
             waited_seconds = waited.as_secs(),
-            "still waiting for object storage to accept a durable write; writes are retried \
-             indefinitely, so check credentials and bucket policy"
+            staged_bytes = staged.0,
+            "still waiting for object storage to accept a durable write; the batch goes as one \
+             request and is retried indefinitely, so it will not fail on its own — check that a \
+             batch this size fits the store client's request timeout, then credentials and \
+             bucket policy"
         );
     }
 }
@@ -194,8 +205,19 @@ async fn validate_format(tx: ReadHandle<'_>) -> Result<Option<proto::FormatValue
 /// here: whether data files are encrypted is fixed when the catalog is
 /// created, exactly as DuckLake fixes it when initializing a metadata
 /// store.
-fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>) -> Result<()> {
-    let stage = |key: Key, bytes: Vec<u8>| tx.put(key.encode(), bytes).map_err(Error::from);
+fn stage_bootstrap(
+    tx: &DbTransaction,
+    encrypted: bool,
+    data_path: Option<&str>,
+) -> Result<StagedBytes> {
+    let staged = std::cell::Cell::new(StagedBytes::default());
+    let stage = |key: Key, bytes: Vec<u8>| {
+        let key = key.encode();
+        let mut running = staged.get();
+        running.add(key.len(), bytes.len());
+        staged.set(running);
+        tx.put(key, bytes).map_err(Error::from)
+    };
     stage(
         Key::Sys(SysKey::Format),
         value::encode_value(&proto::FormatValue {
@@ -258,7 +280,8 @@ fn stage_bootstrap(tx: &DbTransaction, encrypted: bool, data_path: Option<&str>)
             snapshot_id: 0,
             batch_seq: 0,
         }),
-    )
+    )?;
+    Ok(staged.get())
 }
 
 /// How many attempts an open that is fenced while creating the catalog
@@ -349,12 +372,15 @@ async fn open_attempt(
         }
     }
 
-    if let Err(err) = stage_bootstrap(&tx, encrypted, data_path) {
-        tx.rollback();
-        return Err(OpenFailure::Fatal(err));
-    }
+    let staged = match stage_bootstrap(&tx, encrypted, data_path) {
+        Ok(staged) => staged,
+        Err(err) => {
+            tx.rollback();
+            return Err(OpenFailure::Fatal(err));
+        }
+    };
 
-    match commit_durable(tx, "bootstrap").await {
+    match commit_durable(tx, "bootstrap", staged).await {
         Ok(_) => {
             // Once per store, ever: the commit that created the catalog.
             info!(encrypted, data_path, "bootstrapped a fresh catalog store");
@@ -904,6 +930,9 @@ enum Prepared {
         /// The staged batch, kept so a successful commit can fold it into
         /// the maintained projections.
         writes: Vec<StagedWrite>,
+        /// What the batch weighs, index entries included — the size of the
+        /// object-store request the durable commit becomes.
+        staged_bytes: StagedBytes,
     },
 }
 
@@ -1018,17 +1047,19 @@ where
         // re-run that re-validates the scope against the winner's state
         // instead of committing blind.
         writes.push(head_write(db_tx, head).await?);
-        stage_writes(db_tx, &writes)?;
+        let staged_bytes = stage_writes(db_tx, &writes)?;
         return Ok(Prepared::Staged {
             ours: Box::default(),
             commits: head,
             writes,
+            staged_bytes,
         });
     }
 
     // Entries stage before the entity diff so a poisoned definition rides
     // that diff rather than needing a write of its own.
-    let poisoned = index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    let entries = index_maintenance::stage_index_entries(db_tx, &index_entries).await?;
+    let poisoned = entries.poisoned;
     index_maintenance::apply_poison(&mut state, &poisoned);
 
     let mut writes = diff_writes(base, &state, new_id);
@@ -1037,15 +1068,6 @@ where
     // state, before any of this batch's writes are staged onto it.
     writes.extend(inline::stage_inline_writes(db_tx, &inline_ops).await?);
     writes.extend(format_stamp(db_tx, &state).await?);
-    tracing::debug!(
-        snapshot = new_id,
-        index_entries = index_entries.len(),
-        inline_ops = inline_ops.len(),
-        catalog_writes = writes.len(),
-        poisoned_indexes = poisoned.len(),
-        "commit staged"
-    );
-
     let schema_changed = operations.iter().any(Operation::is_schema_changing);
     let schema_changed_table_ids: Vec<u64> = operations
         .iter()
@@ -1086,24 +1108,37 @@ where
         Some(value::encode_value(&snapshot)),
     ));
     writes.push(head_write(db_tx, new_id).await?);
-    stage_writes(db_tx, &writes)?;
+    let mut staged_bytes = stage_writes(db_tx, &writes)?;
+    staged_bytes.0 = staged_bytes.0.saturating_add(entries.bytes);
+    tracing::debug!(
+        snapshot = new_id,
+        index_entries = index_entries.len(),
+        inline_ops = inline_ops.len(),
+        catalog_writes = writes.len(),
+        poisoned_indexes = poisoned.len(),
+        staged_bytes = staged_bytes.0,
+        "commit staged"
+    );
 
     Ok(Prepared::Staged {
         ours: Box::new(ours),
         commits: new_id,
         writes,
+        staged_bytes,
     })
 }
 
-pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Result<()> {
+pub(crate) fn stage_writes(db_tx: &DbTransaction, writes: &[StagedWrite]) -> Result<StagedBytes> {
+    let mut staged = StagedBytes::default();
     for (key, write) in writes {
+        staged.add(key.len(), write.as_ref().map_or(0, Vec::len));
         match write {
             Some(bytes) => db_tx.put(key.clone(), bytes.clone()),
             None => db_tx.delete(key.clone()),
         }
         .map_err(Error::from)?;
     }
-    Ok(())
+    Ok(staged)
 }
 
 /// Commits one staged batch — one commit's or a whole batch of them — and
@@ -1118,6 +1153,7 @@ pub(crate) async fn commit_batch(
     head_before: u64,
     head: u64,
     writes: &[StagedWrite],
+    staged_bytes: StagedBytes,
     base: &CatalogSnapshot,
     projections: &std::sync::RwLock<ProjectionCache>,
 ) -> Result<Landed> {
@@ -1128,7 +1164,7 @@ pub(crate) async fn commit_batch(
     if !head_advanced {
         invalidate_head_view(projections);
     }
-    match commit_durable(db_tx, "commit").await {
+    match commit_durable(db_tx, "commit", staged_bytes).await {
         Ok(_) => {
             fold_committed_batch(projections, writes, head);
             if head_advanced {
@@ -1168,13 +1204,23 @@ pub(crate) async fn commit_batch_off_task(
     head_before: u64,
     head: u64,
     writes: Vec<StagedWrite>,
+    staged_bytes: StagedBytes,
     base: Arc<CatalogSnapshot>,
     projections: Arc<std::sync::RwLock<ProjectionCache>>,
 ) -> Result<Landed> {
     let task = {
         let projections = Arc::clone(&projections);
         tokio::spawn(async move {
-            commit_batch(db_tx, head_before, head, &writes, &base, &projections).await
+            commit_batch(
+                db_tx,
+                head_before,
+                head,
+                &writes,
+                staged_bytes,
+                &base,
+                &projections,
+            )
+            .await
         })
     };
 

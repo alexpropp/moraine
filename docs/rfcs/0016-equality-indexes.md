@@ -353,6 +353,62 @@ therefore hit an unsplittable refusal, and an indexed table past a few
 million rows could never be compacted again. It derives none (Compaction
 derives nothing), so the limit binds only writers who can obey it.
 
+### Two bounds on a step
+
+Entry count is not the only thing that can make a commit impossible, and
+the second bound is not a smaller version of the first — they fail
+differently and are set by different facts about the machine.
+
+The memory bound above is about the process: a kilobyte of write-path
+memory per staged entry, so a big enough batch thrashes. The **transfer**
+bound is about the link. A durable commit becomes exactly one object-store
+request: the store guarantees a write batch lands in a single WAL object,
+and WAL objects are written with a conditional single PUT — the fencing
+they rely on cannot be expressed through the multipart API — so the whole
+batch goes in one request body. `object_store` applies its request timeout
+(30 seconds by default) per attempt to that entire request, upload
+included. A batch too large to push inside the timeout therefore does not
+fail: it times out, is retried from the first byte, and is retried beneath
+moraine indefinitely. It never lands and never errors.
+
+So a staged build step carries two bounds, and ends at whichever it reaches
+first:
+
+- `entries` — the memory bound, defaulting to a million.
+- `bytes` — the transfer bound, defaulting to 8 MiB. That clears the
+  30-second default at a little over 270 KiB/s, which is slower than any
+  link a build has a right to expect.
+
+A step always carries at least one entry: an entry wider than the byte
+bound still has to be committed, and a step that admitted nothing would
+never advance.
+
+At the defaults the byte bound always binds first, and the entry bound
+never does: an entry costs at least 19 bytes (the entry prefix, a one-byte
+NULL flag, and the row id), so 8 MiB admits at most about 440,000 of them.
+The entry bound is therefore not a second safety net at rest — it is what
+holds when `bytes` is *raised*. An operator on a fast in-region link who
+lifts the byte bound to cut commit count is exactly who needs a step still
+capped at a million entries, because at 256 MiB the byte bound alone would
+admit fourteen million and the memory limit above is real.
+
+The byte figure is **nominal** — summed before the keys are encoded, since
+the step boundary has to be chosen first. Framing escapes `0x00` and
+`0x01`, which at worst doubles a value, so the committed batch can be up to
+twice the bound. The margin against the timeout absorbs that; a property
+test pins the bracket.
+
+Both are settable per call, because neither default can know the link. The
+transfer bound is the one an operator on a slow or distant link reaches
+for, and lowering it is strictly a latency trade: more commits, each
+cheaper and independently resumable from the cursor.
+
+The commit stall warning reports the batch's staged bytes for the same
+reason. A stalled durable write carries no error — the failure is retried
+below moraine, so there is nothing to report but the wait — and the batch's
+size is the one fact that separates a batch that cannot be transferred from
+credentials that will not authorize it.
+
 ### What data movement costs the index: nothing
 
 The entry payload is a row id, not a location. Flush re-homes rows from
@@ -522,8 +578,9 @@ snapshot; everything committed after the definition is writer-covered by
 the paragraph above, so the two sets meet with no gap. Each derivation
 pass assembles the whole live backfill — inline chunks by scanning,
 external files by the scoped read, delete files and inline deletes already
-applied — sorts it by row id, and streams it as bounded step commits of at
-most `BUILD_STEP_ENTRIES` entries, in row-id order. Each step atomically
+applied — sorts it by row id, and streams it as bounded step commits in
+row-id order, each step ending at whichever bound of `BuildStep` it reaches
+first (Two bounds on a step) and always carrying at least one entry. Each step atomically
 advances a **cursor** persisted in the definition value — the highest row
 id covered — so a crashed or cancelled build resumes by re-deriving and
 skipping entries at or below the watermark; re-derived entries land as
@@ -629,7 +686,7 @@ written `…` below for brevity.
 
 | Function | Effect |
 |---|---|
-| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call |
+| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b, step_entries := n, step_bytes := n)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call. `step_entries`/`step_bytes` bound one step of that build (Two bounds on a step); each must be positive, and both are ignored without `staged` |
 | `moraine_index_drop(…)` | end the definition (Reclamation) |
 | `moraine_index_lookup(…, v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids and holders for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |

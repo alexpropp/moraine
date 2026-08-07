@@ -10,7 +10,7 @@ use storekey::{Decode, Encode};
 
 use crate::{
     error::{Error, Result},
-    store::index_encoding::CanonicalKey,
+    store::index_encoding::{CanonicalKey, IndexKeyValue, nominal_key_bytes},
 };
 
 /// Length in bytes of the encoded subspace prefix — one discriminant
@@ -584,6 +584,18 @@ const INDEX_KIND_PREFIX_LEN: usize = 2;
 /// Bytes preceding an index entry's value: the kind discriminants and the
 /// eight-byte index id.
 const INDEX_ENTRY_PREFIX_LEN: usize = INDEX_KIND_PREFIX_LEN + size_of::<u64>();
+
+/// The bytes one index entry stages, key and value together. Both kinds
+/// cost the same: the entry prefix and the framed value, plus a row id
+/// carried in the key (non-unique, where it is the final component) or as
+/// the whole value (unique).
+///
+/// Nominal, in the sense [`nominal_key_bytes`] is: escaping can make the
+/// real entry larger, never smaller.
+pub(crate) fn index_entry_bytes(values: &[Option<IndexKeyValue>]) -> u64 {
+    let bytes = INDEX_ENTRY_PREFIX_LEN + nominal_key_bytes(values) + size_of::<u64>();
+    bytes as u64
+}
 
 /// The two entry kinds inside the `index` subspace. An index is exclusively
 /// one kind, so its entries form one contiguous `(kind, index_id)` range.
