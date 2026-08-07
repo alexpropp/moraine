@@ -76,8 +76,18 @@ pub(super) async fn data_file_index_entries(
         None => None,
     };
     let path = data_file_object_path(base, &file, context.prefix)?;
-    let per_index =
-        per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
+    // Every row is wanted here: a registration indexes the file's whole
+    // contents, minus the few this same commit kills.
+    let per_index = per_index_scoped_entries(
+        base,
+        &indexes,
+        table,
+        data_store,
+        &file,
+        &path,
+        scoped_read::ScopedRows::All,
+    )
+    .await?;
 
     // A row this same commit deletes out of the file it also registers is
     // never indexed, rather than indexed and then removed. The two are not
@@ -99,7 +109,9 @@ pub(super) async fn data_file_index_entries(
 
 /// One scoped read of `file` covering every index's columns at once — the
 /// footer and any shared column chunks are fetched a single time — split
-/// back into per-index entry lists, ordered as `indexes`.
+/// back into per-index entry lists, ordered as `indexes`. `rows` names which
+/// of the file's rows to decode, so a caller wanting a few of them pays for
+/// a few of them.
 pub(super) async fn per_index_scoped_entries(
     base: &CatalogSnapshot,
     indexes: &[IndexInfo],
@@ -107,6 +119,7 @@ pub(super) async fn per_index_scoped_entries(
     data_store: &Arc<dyn ObjectStore>,
     file: &proto::DataFileValue,
     path: &object_store::path::Path,
+    rows: scoped_read::ScopedRows<'_>,
 ) -> Result<Vec<Vec<ScopedReadEntry>>> {
     let live_columns = base.columns_of(table);
     let mut all_positions = Vec::new();
@@ -123,6 +136,7 @@ pub(super) async fn per_index_scoped_entries(
         Arc::clone(data_store),
         path,
         &all_positions,
+        rows,
         scoped_read::RowIdSource::Resolve {
             row_id_start: file.row_id_start,
         },
@@ -596,10 +610,11 @@ pub(super) async fn stage_inline_delete_entries(
 /// The physical row positions a commit kills inside one data file. Both a
 /// delete file's `pos` column and an inlined file-delete name positions,
 /// not row ids; the target's scoped read resolves each position to the row
-/// it holds.
+/// it holds. Ordered, because the read selects on these positions and a
+/// selection is built in file order.
 #[derive(Debug, Default)]
 pub(super) struct KilledRows {
-    positions: HashSet<u64>,
+    positions: BTreeSet<u64>,
 }
 
 impl KilledRows {
@@ -675,19 +690,22 @@ pub(super) async fn file_delete_index_entries(
     refuse_out_of_range(killed, &file)?;
 
     let path = data_file_object_path(base, &file, context.prefix)?;
-    let per_index =
-        per_index_scoped_entries(base, &indexes, table, data_store, &file, &path).await?;
-    // An entry dies when a delete names its physical position; the scoped
-    // read resolves that position to the row it holds — one rule for dense
-    // and per-row-id targets alike.
+    // An entry dies when a delete names its physical position, so only those
+    // positions are read: a delete costs the rows it removes rather than the
+    // file holding them. The scoped read resolves each position to the row it
+    // holds — one rule for dense and per-row-id targets alike.
+    let per_index = per_index_scoped_entries(
+        base,
+        &indexes,
+        table,
+        data_store,
+        &file,
+        &path,
+        scoped_read::ScopedRows::At(&killed.positions),
+    )
+    .await?;
     let mut entries = Vec::new();
     for (index, scoped) in indexes.iter().zip(per_index) {
-        let scoped = scoped
-            .into_iter()
-            .enumerate()
-            .filter(|(ordinal, _)| killed.positions.contains(&(*ordinal as u64)))
-            .map(|(_, entry)| entry)
-            .collect();
         push_index_entries(&mut entries, index, scoped, true)?;
     }
     Ok(entries)
