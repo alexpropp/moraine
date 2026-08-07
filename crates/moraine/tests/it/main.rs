@@ -14,6 +14,7 @@ mod crash_recovery;
 mod data_files;
 mod group_commit;
 mod index_backfill;
+mod index_lookup;
 mod inline_data;
 mod interrupt;
 mod macros;

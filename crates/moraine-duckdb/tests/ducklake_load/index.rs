@@ -95,6 +95,46 @@ fn moraine_index_lookup_resolves_a_composite_key() {
     );
 }
 
+/// The batched equality surface implements SQL `IN` over one-column and
+/// composite indexes, including duplicate, absent, NULL, and empty keys.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_in_resolves_a_list_of_keys() {
+    let store = TempDir::new("index-in-store");
+    let data = TempDir::new("index-in-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT, b VARCHAR);");
+    run("INSERT INTO lake.main.t VALUES (5, 'x'), (5, 'y'), (7, 'x');");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], false);");
+    run("CALL moraine_index_create('lake', 'main', 't', 'by_ab', ['a', 'b'], true);");
+
+    assert_eq!(
+        csv_rows(&run("SELECT row_id FROM moraine_index_in(\
+                'lake', 'main', 't', 'by_a', [5, 7, 5, NULL, 99]) ORDER BY row_id;")),
+        vec![
+            vec!["0".to_string()],
+            vec!["1".to_string()],
+            vec!["2".to_string()]
+        ],
+        "scalar IN returns each matching row once"
+    );
+    assert_eq!(
+        csv_rows(&run("SELECT row_id FROM moraine_index_in(\
+                'lake', 'main', 't', 'by_ab', \
+                [row(5, 'x'), row(7, 'x'), row(5, 'x')]) ORDER BY row_id;")),
+        vec![vec!["0".to_string()], vec!["2".to_string()]],
+        "composite IN accepts a list of full row keys"
+    );
+    assert_eq!(
+        csv_rows(&run("SELECT count(*) FROM moraine_index_in(\
+                'lake', 'main', 't', 'by_a', []::BIGINT[]);")),
+        vec![vec!["0".to_string()]],
+        "an empty typed list returns no rows"
+    );
+}
+
 /// A composite index answers a range whose bounds are `row(...)` tuples over
 /// its leading columns: a leading-column equality window (a one-field tuple),
 /// a full-tuple window, and a half-open window with a NULL open side.

@@ -1,7 +1,10 @@
 //! `Catalog::create_index_staged`: driving a multi-commit index build to
 //! `ready` over a table whose rows live in registered Parquet files.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+};
 
 use arrow::{
     array::{Int64Array, RecordBatch},
@@ -12,8 +15,84 @@ use moraine::{
 };
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use parquet::arrow::ArrowWriter;
+use tracing::{Event, Subscriber, field::Visit};
+use tracing_subscriber::{layer::Context, prelude::*};
 
 use crate::fixtures::{col, datafile, open_memory};
+
+#[derive(Clone, Default)]
+struct CapturedEvents(Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+impl<S> tracing_subscriber::Layer<S> for CapturedEvents
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, String>);
+
+        impl Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+
+            fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+        }
+
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields
+            .0
+            .get("message")
+            .is_some_and(|message| message.contains("staged index"))
+        {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(fields.0);
+        }
+    }
+}
+
+impl CapturedEvents {
+    fn named_for(&self, message: &str, index_name: &str) -> Vec<BTreeMap<String, String>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|fields| {
+                fields.get("message").is_some_and(|value| value == message)
+                    && fields
+                        .get("index_name")
+                        .is_some_and(|value| value == index_name)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn captured_events() -> &'static CapturedEvents {
+    static EVENTS: OnceLock<CapturedEvents> = OnceLock::new();
+    EVENTS.get_or_init(|| {
+        let events = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        assert!(
+            tracing::subscriber::set_global_default(subscriber).is_ok(),
+            "the integration test process installs only this tracing subscriber"
+        );
+        events
+    })
+}
 
 /// A table holding one registered file of `values`, plus the data store
 /// that file lives in.
@@ -122,6 +201,57 @@ async fn staged_build_spans_steps_and_finishes_ready() {
         assert_eq!(hits[0].row_id, u64::try_from(value).unwrap());
     }
     catalog.close().await.unwrap();
+}
+
+/// The driver names its long derivation phase, records the derived
+/// denominator, and reports each durable step against that denominator.
+#[tokio::test]
+async fn staged_build_reports_explicit_progress() {
+    const INDEX_NAME: &str = "telemetry_by_a";
+    let events = captured_events();
+    let (catalog, table, data) = table_with_file((0..7).collect()).await;
+    let telemetry_def = IndexDef {
+        name: INDEX_NAME.to_owned(),
+        ..def(true)
+    };
+
+    let index = catalog
+        .create_index_staged(
+            table,
+            &telemetry_def,
+            &[],
+            Some(data),
+            "",
+            Some(by_entries(2)),
+        )
+        .await
+        .unwrap();
+    catalog.close().await.unwrap();
+
+    let started = events.named_for("staged index backfill derivation started", INDEX_NAME);
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].get("index"), Some(&index.get().to_string()));
+    assert_eq!(started[0].get("derivation_attempt"), Some(&"1".to_owned()));
+
+    let derived = events.named_for("staged index backfill derived", INDEX_NAME);
+    assert_eq!(derived.len(), 1);
+    assert_eq!(derived[0].get("total_entries"), Some(&"7".to_owned()));
+    assert!(derived[0].contains_key("derive_ms"));
+    assert!(derived[0].contains_key("sort_ms"));
+
+    let progress = events.named_for("staged index build step committed", INDEX_NAME);
+    assert_eq!(progress.len(), 4);
+    assert_eq!(
+        progress
+            .iter()
+            .map(|event| event["completed_entries"].as_str())
+            .collect::<Vec<_>>(),
+        ["2", "4", "6", "7"]
+    );
+    assert!(progress.iter().all(|event| event["total_entries"] == "7"));
+    assert_eq!(progress.last().unwrap()["progress_percent"], "100");
+    assert_eq!(progress.last().unwrap()["is_final"], "true");
+    assert!(progress.iter().all(|event| event.contains_key("commit_ms")));
 }
 
 /// A build interrupted partway resumes from its persisted cursor: the
