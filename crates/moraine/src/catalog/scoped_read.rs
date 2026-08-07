@@ -118,6 +118,8 @@ impl ScopedRows<'_> {
 enum Ordinals<'a> {
     /// Every row was read, so the nth emitted row is the nth row.
     Dense,
+    /// A full-file read resumed at this physical position.
+    Offset(u64),
     /// Only these positions were read, in this order.
     Selected(&'a [u64]),
 }
@@ -127,6 +129,7 @@ impl Ordinals<'_> {
     fn at(self, nth: usize) -> Result<u64> {
         match self {
             Self::Dense => Ok(usize_as_u64(nth)),
+            Self::Offset(start) => Ok(start.saturating_add(usize_as_u64(nth))),
             Self::Selected(positions) => positions.get(nth).copied().ok_or_else(|| {
                 Error::Corruption(
                     "scoped read: the reader emitted more rows than the selection named".to_owned(),
@@ -495,6 +498,145 @@ pub(crate) async fn scoped_read_entries(
     }
 
     Ok(entries)
+}
+
+/// Receives one bounded group of entries from a full-file scoped read.
+/// `first_ordinal` is the physical position of the group's first row.
+pub(crate) trait ScopedEntryBatchConsumer {
+    /// Consumes one decoded group before the reader advances to the next.
+    async fn consume(&mut self, entries: Vec<ScopedReadEntry>, first_ordinal: u64) -> Result<()>;
+}
+
+/// Rows decoded at once by the staged-build reader. The build step may be
+/// smaller; its consumer splits this group before staging.
+const BUILD_READ_BATCH_ROWS: usize = 8_192;
+
+/// Streams a file's projected index entries to `consumer` in bounded Arrow
+/// batches, starting at physical row `start_ordinal`. Unlike
+/// [`scoped_read_entries`], this never collects the whole file.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn scoped_read_entry_batches<C: ScopedEntryBatchConsumer>(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    indexed_positions: &[usize],
+    row_id_source: RowIdSource,
+    file_size: Option<u64>,
+    start_ordinal: u64,
+    consumer: &mut C,
+) -> Result<()> {
+    let file_size = match file_size {
+        Some(size) => size,
+        None => {
+            object_store
+                .head(path)
+                .await
+                .map_err(corrupt("scoped read"))?
+                .size
+        }
+    };
+
+    if file_size < WHOLE_OBJECT_THRESHOLD {
+        let bytes: Bytes = object_store
+            .get(path)
+            .await
+            .map_err(corrupt("scoped read"))?
+            .bytes()
+            .await
+            .map_err(corrupt("scoped read"))?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(corrupt("scoped read"))?;
+        let total = total_rows(builder.metadata(), path)?;
+        let start = usize::try_from(start_ordinal)
+            .ok()
+            .filter(|start| *start <= total)
+            .ok_or_else(|| {
+                Error::Corruption(format!(
+                    "scoped read: resume row {start_ordinal} is past the file's {total} rows"
+                ))
+            })?;
+        if start == total {
+            return Ok(());
+        }
+        let (row_id_position, row_id_start) =
+            resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+        let (mask, indexed_output, row_id_output) =
+            projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
+        let selection = RowSelection::from_consecutive_ranges(std::iter::once(start..total), total);
+        let reader = builder
+            .with_projection(mask)
+            .with_batch_size(BUILD_READ_BATCH_ROWS)
+            .with_row_selection(selection)
+            .build()
+            .map_err(corrupt("scoped read"))?;
+        let mut emitted = 0usize;
+        for batch in reader {
+            let batch = batch.map_err(corrupt("scoped read"))?;
+            let entries = record_batch_entries(
+                &batch,
+                &indexed_output,
+                row_id_output,
+                row_id_start,
+                Ordinals::Offset(start_ordinal),
+                emitted,
+            )?;
+            consumer
+                .consume(entries, start_ordinal.saturating_add(usize_as_u64(emitted)))
+                .await?;
+            emitted = emitted.saturating_add(batch.num_rows());
+        }
+        return Ok(());
+    }
+
+    let reader = ObjectStoreReader {
+        store: object_store,
+        path: path.clone(),
+        file_size,
+        page_index: PageIndexPolicy::Optional,
+    };
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .map_err(corrupt("scoped read"))?;
+    let total = total_rows(builder.metadata(), path)?;
+    let start = usize::try_from(start_ordinal)
+        .ok()
+        .filter(|start| *start <= total)
+        .ok_or_else(|| {
+            Error::Corruption(format!(
+                "scoped read: resume row {start_ordinal} is past the file's {total} rows"
+            ))
+        })?;
+    if start == total {
+        return Ok(());
+    }
+    let (row_id_position, row_id_start) =
+        resolve_row_id_source(builder.parquet_schema(), row_id_source, path)?;
+    let (mask, indexed_output, row_id_output) =
+        projection(builder.parquet_schema(), indexed_positions, row_id_position)?;
+    let selection = RowSelection::from_consecutive_ranges(std::iter::once(start..total), total);
+    let mut stream = builder
+        .with_projection(mask)
+        .with_batch_size(BUILD_READ_BATCH_ROWS)
+        .with_row_selection(selection)
+        .build()
+        .map_err(corrupt("scoped read"))?;
+    let mut emitted = 0usize;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(corrupt("scoped read"))?;
+        let entries = record_batch_entries(
+            &batch,
+            &indexed_output,
+            row_id_output,
+            row_id_start,
+            Ordinals::Offset(start_ordinal),
+            emitted,
+        )?;
+        consumer
+            .consume(entries, start_ordinal.saturating_add(usize_as_u64(emitted)))
+            .await?;
+        emitted = emitted.saturating_add(batch.num_rows());
+    }
+    Ok(())
 }
 
 /// Below this object size the whole file is fetched in one request and

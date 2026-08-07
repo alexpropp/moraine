@@ -627,6 +627,60 @@ async fn create_index_persists_definition_stamps_format_and_lands_entries() {
 }
 
 #[tokio::test]
+async fn deferred_index_is_non_unique_and_stamps_its_format() {
+    use crate::catalog::{ColumnId, IndexDef, IndexMaintenance};
+    let (catalog, table) = catalog_with_two_column_table().await;
+
+    catalog
+        .commit(|tx| {
+            tx.create_index_ordered_with_maintenance(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: false,
+                },
+                &[],
+                IndexMaintenance::Deferred,
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap();
+
+    let snapshot = catalog.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.indexes_of(table)[0].maintenance,
+        IndexMaintenance::Deferred
+    );
+    assert_eq!(
+        read_format_version(&catalog).await,
+        FORMAT_WITH_DEFERRED_INDEX
+    );
+
+    let error = catalog
+        .commit(|tx| {
+            tx.create_index_ordered_with_maintenance(
+                table,
+                &IndexDef {
+                    name: "unique_by_b".into(),
+                    columns: vec![ColumnId::new(2)],
+                    unique: true,
+                },
+                &[],
+                IndexMaintenance::Deferred,
+                &[],
+            )
+            .map(|_| ())
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("non-unique"), "{error}");
+    catalog.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn duplicate_unique_value_in_backfill_aborts_create() {
     use crate::catalog::{ColumnId, IndexDef};
     let (catalog, table) = catalog_with_two_column_table().await;

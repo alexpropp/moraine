@@ -969,10 +969,11 @@ impl StagedTransaction {
             };
         let StagedEntries {
             poisoned,
+            deferred,
             bytes: entry_bytes,
         } = entries;
 
-        match translate_batch(base_ref, &ops, &poisoned, mints_snapshot) {
+        match translate_batch(base_ref, &ops, &poisoned, &deferred, mints_snapshot) {
             Ok((result_id, mut writes)) => {
                 let staged_bytes =
                     match stage_batch(&db_tx, &mut writes, inline_writes, result_id, entry_bytes)
@@ -1028,13 +1029,14 @@ fn translate_batch(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     poisoned: &[u64],
+    deferred: &[u64],
     mints_snapshot: bool,
 ) -> Result<(u64, Vec<commit::StagedWrite>)> {
     if !mints_snapshot {
         return translate_maintenance(base, ops).map(|writes| (base.snapshot.snapshot_id, writes));
     }
 
-    let (new_id, mut writes, snap) = translate(base, ops, poisoned)?;
+    let (new_id, mut writes, snap) = translate(base, ops, poisoned, deferred)?;
     // Derived before the snapshot record joins the batch: the changelog
     // names `current` keys, and that record is not.
     let changelog = commit::changelog_writes(new_id, &writes);
@@ -1102,6 +1104,7 @@ fn translate(
     base: &CatalogSnapshot,
     ops: &[RowOperation],
     poisoned: &[u64],
+    deferred: &[u64],
 ) -> Result<(u64, Vec<commit::StagedWrite>, proto::SnapshotValue)> {
     let snapshot = build_snapshot_value(ops)?;
     let new_id = snapshot.snapshot_id;
@@ -1196,6 +1199,9 @@ fn translate(
     }
 
     crate::transaction::index_maintenance::apply_poison(&mut state, poisoned);
+    crate::transaction::index_maintenance::apply_deferred_maintenance(
+        base, &mut state, deferred, new_id,
+    );
 
     let mut writes = commit::diff_writes(base, &state, new_id);
     writes.extend(direct);

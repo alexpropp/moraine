@@ -109,6 +109,8 @@ const MAX_INDEX_ENTRIES_PER_COMMIT: usize = 8_000_000;
 pub(crate) struct StagedEntries {
     /// Definitions a duplicate poisoned, sorted and deduplicated.
     pub(crate) poisoned: Vec<u64>,
+    /// Deferred definitions whose SQL additions committed without entries.
+    pub(crate) deferred: Vec<u64>,
     /// Key and value bytes staged, deletes included.
     pub(crate) bytes: u64,
 }
@@ -291,6 +293,7 @@ pub(crate) async fn stage_index_entries(
     poisoned.dedup();
     Ok(StagedEntries {
         poisoned,
+        deferred: Vec::new(),
         bytes: staged.0,
     })
 }
@@ -303,6 +306,42 @@ pub(crate) fn apply_poison(state: &mut crate::catalog::CatalogSnapshot, poisoned
         for per_table in state.indexes.values_mut() {
             if let Some(value) = per_table.get_mut(index_id) {
                 value.poisoned = Some(true);
+            }
+        }
+    }
+}
+
+/// Marks ready deferred definitions as awaiting repair. A definition already
+/// being repaired keeps its cursor: newly registered files have greater ids,
+/// so the existing source watermark will still reach them.
+pub(crate) fn apply_deferred_maintenance(
+    base: &crate::catalog::CatalogSnapshot,
+    state: &mut crate::catalog::CatalogSnapshot,
+    deferred: &[u64],
+    new_snapshot: u64,
+) {
+    for index_id in deferred {
+        for (table_id, per_table) in &mut state.indexes {
+            let Some(value) = per_table.get_mut(index_id) else {
+                continue;
+            };
+            if value.build_state.is_none() {
+                value.begin_snapshot = new_snapshot;
+                value.build_state = Some("maintaining".to_owned());
+                value.build_cursor_row_id = base
+                    .table_stats
+                    .get(table_id)
+                    .and_then(|stats| stats.next_row_id.checked_sub(1));
+                let tail = base
+                    .data_files
+                    .get(table_id)
+                    .and_then(|files| files.values().max_by_key(|file| file.data_file_id));
+                // File ids begin above zero. The zero sentinel means the
+                // old snapshot held no files, while still selecting the
+                // physical source-cursor resume path.
+                value.build_cursor_file = Some(tail.map_or(0, |file| file.data_file_id));
+                value.build_cursor_position =
+                    Some(tail.map_or(0, |file| file.record_count.saturating_sub(1)));
             }
         }
     }

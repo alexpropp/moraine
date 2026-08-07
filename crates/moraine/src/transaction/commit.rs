@@ -49,9 +49,13 @@ pub(crate) const FORMAT_WITH_INDEX: u64 = 2;
 /// exists. A format-2 binary would read a `building` definition as a ready
 /// index and serve from an under-covered entry set, so it must refuse this.
 pub(crate) const FORMAT_WITH_STAGED_INDEX: u64 = 3;
+/// Format stamped the first time an index defers SQL additions. A format-3
+/// binary does not understand the deferred marker and could expose partial
+/// coverage as ready after rewriting the definition.
+pub(crate) const FORMAT_WITH_DEFERRED_INDEX: u64 = 4;
 /// The highest format this binary understands. It opens any store in
 /// `MIN_FORMAT_VERSION..=MAX_FORMAT_VERSION` and refuses a newer one.
-pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_STAGED_INDEX;
+pub(crate) const MAX_FORMAT_VERSION: u64 = FORMAT_WITH_DEFERRED_INDEX;
 /// The lowest structural format this binary reads directly. A store below
 /// this floor must be migrated up before an ordinary attach can use it.
 /// Every format so far is additive — each adds a subspace without moving an
@@ -936,10 +940,19 @@ enum Prepared {
     },
 }
 
-/// The store format the staged state requires: a `building` index implies
-/// [`FORMAT_WITH_STAGED_INDEX`], any other index [`FORMAT_WITH_INDEX`],
-/// else the base [`FORMAT_VERSION`].
+/// The store format the staged state requires: deferred upkeep implies
+/// [`FORMAT_WITH_DEFERRED_INDEX`], a `building` index
+/// [`FORMAT_WITH_STAGED_INDEX`], any other index [`FORMAT_WITH_INDEX`], else
+/// the base [`FORMAT_VERSION`].
 fn target_format(state: &CatalogSnapshot) -> u64 {
+    if state
+        .indexes
+        .values()
+        .flat_map(BTreeMap::values)
+        .any(|index| index.deferred_maintenance == Some(true))
+    {
+        return FORMAT_WITH_DEFERRED_INDEX;
+    }
     if state
         .indexes
         .values()

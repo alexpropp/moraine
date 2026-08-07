@@ -11,9 +11,9 @@ use crate::{
     catalog::{
         CatalogSnapshot, ColumnAlteration, ColumnDef, ColumnId, ColumnOrder, ColumnStats, DataFile,
         DataFileId, DeleteFile, DeleteFileId, FileIndexEntry, FileIndexRemoval, FlushedDataFile,
-        IndexDef, IndexEntry, IndexId, IndexState, InlineChunk, MacroId, MacroImplementationDef,
-        OptionScope, PartitionColumnDef, PartitionId, SchemaId, SnapshotId, SortId, SortKeyDef,
-        TableId, TagTarget, ViewId, inline_policy::ensure_inlinable,
+        IndexDef, IndexEntry, IndexId, IndexMaintenance, IndexState, InlineChunk, MacroId,
+        MacroImplementationDef, OptionScope, PartitionColumnDef, PartitionId, SchemaId, SnapshotId,
+        SortId, SortKeyDef, TableId, TagTarget, ViewId, inline_policy::ensure_inlinable,
     },
     error::{Error, Result},
     store::{
@@ -866,7 +866,8 @@ impl Transaction {
         def: &IndexDef,
         backfill: &[IndexEntry],
     ) -> Result<IndexId> {
-        let index_id = self.insert_index_definition(table, def, None, &[])?;
+        let index_id =
+            self.insert_index_definition(table, def, IndexMaintenance::Synchronous, None, &[])?;
         for entry in backfill {
             self.stage_index_entry(
                 index_id,
@@ -898,7 +899,31 @@ impl Transaction {
         orders: &[ColumnOrder],
         backfill: &[IndexEntry],
     ) -> Result<IndexId> {
-        let index_id = self.insert_index_definition(table, def, None, orders)?;
+        self.create_index_ordered_with_maintenance(
+            table,
+            def,
+            orders,
+            IndexMaintenance::Synchronous,
+            backfill,
+        )
+    }
+
+    /// Creates an index with explicit sort orders and upkeep mode.
+    /// Deferred upkeep is available only to non-unique indexes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_index_ordered`], plus [`Error::Constraint`] when
+    /// deferred upkeep is requested for a unique index.
+    pub fn create_index_ordered_with_maintenance(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        maintenance: IndexMaintenance,
+        backfill: &[IndexEntry],
+    ) -> Result<IndexId> {
+        let index_id = self.insert_index_definition(table, def, maintenance, None, orders)?;
         for entry in backfill {
             self.stage_index_entry(
                 index_id,
@@ -922,6 +947,7 @@ impl Transaction {
         &mut self,
         table: TableId,
         def: &IndexDef,
+        maintenance: IndexMaintenance,
         build_state: Option<String>,
         orders: &[ColumnOrder],
     ) -> Result<u64> {
@@ -938,6 +964,12 @@ impl Transaction {
             crate::catalog::index_policy::ensure_indexable(&live.column_name, &live.column_type)?;
         }
         self.index_name_free(table, &def.name)?;
+
+        if maintenance == IndexMaintenance::Deferred && def.unique {
+            return Err(Error::Constraint(
+                "deferred maintenance is supported only for non-unique indexes".to_owned(),
+            ));
+        }
 
         if !orders.is_empty() && orders.len() != def.columns.len() {
             return Err(Error::Constraint(format!(
@@ -977,9 +1009,11 @@ impl Transaction {
             build_state,
             build_cursor_file: None,
             build_cursor_row_id: None,
+            build_cursor_position: None,
             build_deletes_scanned: None,
             poisoned: None,
             ducklake_index_id: None,
+            deferred_maintenance: (maintenance == IndexMaintenance::Deferred).then_some(true),
         });
         Ok(index_id)
     }
@@ -1041,8 +1075,34 @@ impl Transaction {
         def: &IndexDef,
         orders: &[ColumnOrder],
     ) -> Result<IndexId> {
-        let index_id =
-            self.insert_index_definition(table, def, Some("building".to_owned()), orders)?;
+        self.create_index_staged_ordered_with_maintenance(
+            table,
+            def,
+            orders,
+            IndexMaintenance::Synchronous,
+        )
+    }
+
+    /// Begins a staged build with explicit sort orders and upkeep mode.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_index_staged_ordered`], plus [`Error::Constraint`]
+    /// when deferred upkeep is requested for a unique index.
+    pub fn create_index_staged_ordered_with_maintenance(
+        &mut self,
+        table: TableId,
+        def: &IndexDef,
+        orders: &[ColumnOrder],
+        maintenance: IndexMaintenance,
+    ) -> Result<IndexId> {
+        let index_id = self.insert_index_definition(
+            table,
+            def,
+            maintenance,
+            Some("building".to_owned()),
+            orders,
+        )?;
         self.mark_altered(table.get());
 
         Ok(IndexId::new(index_id))
@@ -1067,12 +1127,39 @@ impl Transaction {
         batch: &[IndexEntry],
         is_final: bool,
     ) -> Result<IndexState> {
+        self.build_index_step_at(index, batch, is_final, None)
+    }
+
+    /// Advances a staged build and persists the physical source position
+    /// covered by this step. The file-position cursor, rather than row-id
+    /// ordering, lets the driver stream files without a table-wide sort.
+    pub(crate) fn build_index_source_step(
+        &mut self,
+        index: IndexId,
+        batch: &[IndexEntry],
+        is_final: bool,
+        source: Option<(u64, u64)>,
+    ) -> Result<IndexState> {
+        self.build_index_step_at(index, batch, is_final, source)
+    }
+
+    fn build_index_step_at(
+        &mut self,
+        index: IndexId,
+        batch: &[IndexEntry],
+        is_final: bool,
+        source: Option<(u64, u64)>,
+    ) -> Result<IndexState> {
         let (table_id, mut value) = self.live_index(index)?;
-        if value.build_state.as_deref() != Some("building") {
+        if !matches!(
+            value.build_state.as_deref(),
+            Some("building" | "maintaining")
+        ) {
             return Err(Error::Constraint(format!("index {index} is not building")));
         }
 
         let unique = value.unique;
+        let maintenance_repair = value.build_state.as_deref() == Some("maintaining");
         let column_count = value.column_ids.len();
         let orders = Self::column_orders(&value);
         let mut cursor = value.build_cursor_row_id.unwrap_or(0);
@@ -1092,15 +1179,23 @@ impl Transaction {
         }
 
         value.begin_snapshot = self.new_snapshot_id;
-        value.build_cursor_row_id = Some(cursor);
+        if !batch.is_empty() {
+            value.build_cursor_row_id = Some(cursor);
+        }
+        if let Some((file_id, position)) = source {
+            value.build_cursor_file = Some(file_id);
+            value.build_cursor_position = Some(position);
+        }
         let resulting_state = if is_final {
             value.build_state = None;
             IndexState::Ready
+        } else if value.build_state.as_deref() == Some("maintaining") {
+            IndexState::Maintaining
         } else {
             IndexState::Building
         };
         self.state.put_index(value);
-        if is_final {
+        if is_final && !maintenance_repair {
             self.mark_altered(table_id);
         } else {
             self.ops.push(Operation::AdvanceIndexBuild { table_id });

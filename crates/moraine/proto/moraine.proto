@@ -162,15 +162,20 @@ message IndexValue {
   repeated bool column_nulls_first = 15;
   // Staged-build lifecycle. Absent => a single-commit `ready` index.
   optional string build_state = 8;
-  // Backfill watermark: the last covered file and row id.
+  // Backfill watermark: the current source file, physical row position, and
+  // highest row id observed. The source pair drives resume; row id is
+  // retained for progress and compatibility with older staged builds.
   optional uint64 build_cursor_file = 9;
   optional uint64 build_cursor_row_id = 10;
+  optional uint64 build_cursor_position = 16;
   // Last snapshot the delete-exclusion scan has caught up to.
   optional uint64 build_deletes_scanned = 11;
   // Terminal poison flag: a duplicate discovered during the build.
   optional bool poisoned = 12;
   // Reserved for a future DuckLake-native index mapped onto this index range.
   optional uint64 ducklake_index_id = 13;
+  // SQL additions may land before this non-unique index is repaired.
+  optional bool deferred_maintenance = 17;
 }
 
 // ducklake_file_partition_value — embedded in DataFileValue.

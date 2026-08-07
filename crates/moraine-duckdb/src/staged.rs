@@ -26,6 +26,7 @@ use std::{
 use moraine::ffi_support::staged::{
     self, Cell, RowOperation, StagedTransaction, TableKind, staged_begin,
 };
+use tracing::warn;
 
 use crate::{
     abi::{borrow_bytes, borrow_str, guard, write_array},
@@ -1124,6 +1125,20 @@ pub unsafe extern "C" fn moraine_tx_commit(
         // SAFETY: `probe`/`probe_ctx` validity is this function's own
         // safety contract.
         let id = unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, tx.commit()) }?;
+
+        // Repair begins only after the data snapshot is known durable. Its
+        // failure, including cancellation, cannot turn that success into a
+        // reported commit failure: the durable marker makes it resumable.
+        let repair = catalog_ref.catalog.writer()?.repair_deferred_indexes(
+            catalog_ref.data_store.clone(),
+            &catalog_ref.data_prefix,
+            None,
+        );
+        // SAFETY: `probe`/`probe_ctx` validity is this function's own
+        // safety contract.
+        if let Err(error) = unsafe { catalog_ref.block_on_cancellable(probe, probe_ctx, repair) } {
+            warn!(error = ?error, "deferred index repair will resume during maintenance");
+        }
 
         Ok(id.get())
     };

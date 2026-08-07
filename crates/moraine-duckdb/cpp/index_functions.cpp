@@ -131,6 +131,8 @@ struct IndexDdlBindData : public duckdb::FunctionData {
 	// Empty leaves the index NULLS LAST.
 	std::vector<uint8_t> nulls_first;
 	bool unique = false;
+	// Commit additions after the data snapshot in bounded repair steps.
+	bool deferred_maintenance = false;
 	// Run the multi-commit build instead of backfilling in one commit.
 	bool staged = false;
 	// Bounds on one step of that build, 0 for moraine's default. Only
@@ -149,7 +151,8 @@ struct IndexDdlBindData : public duckdb::FunctionData {
 		       schema_name == other.schema_name && table_name == other.table_name &&
 		       index_name == other.index_name && columns == other.columns &&
 		       descending == other.descending && nulls_first == other.nulls_first &&
-		       unique == other.unique && staged == other.staged &&
+		       unique == other.unique && deferred_maintenance == other.deferred_maintenance &&
+		       staged == other.staged &&
 		       step_entries == other.step_entries && step_bytes == other.step_bytes;
 	}
 };
@@ -181,7 +184,8 @@ duckdb::unique_ptr<duckdb::GlobalTableFunctionState> IndexDdlInitGlobal(duckdb::
 		const uint8_t *nulls_first = bind_data.nulls_first.empty() ? nullptr : bind_data.nulls_first.data();
 		code = moraine_index_create(handle, bind_data.schema_name.c_str(), bind_data.table_name.c_str(),
 		                            bind_data.index_name.c_str(), column_ptrs.data(), column_ptrs.size(),
-		                            directions, nulls_first, bind_data.unique, bind_data.staged,
+		                            directions, nulls_first, bind_data.unique,
+		                            bind_data.deferred_maintenance, bind_data.staged,
 		                            bind_data.step_entries, bind_data.step_bytes,
 		                            moraine_shim_is_interrupted, &context, &err);
 	} else {
@@ -220,6 +224,20 @@ duckdb::unique_ptr<duckdb::FunctionData> CreateBind(duckdb::ClientContext &, duc
 		bind_data->columns.push_back(child.GetValue<std::string>());
 	}
 	bind_data->unique = input.inputs[5].GetValue<bool>();
+	auto maintenance = input.named_parameters.find("maintenance");
+	if (maintenance != input.named_parameters.end() && !maintenance->second.IsNull()) {
+		const std::string mode = maintenance->second.GetValue<std::string>();
+		if (mode == "deferred" || mode == "DEFERRED") {
+			bind_data->deferred_maintenance = true;
+		} else if (mode != "synchronous" && mode != "SYNCHRONOUS") {
+			throw duckdb::InvalidInputException(
+			    "moraine_index_create: maintenance must be 'synchronous' or 'deferred', got \"%s\"", mode);
+		}
+	}
+	if (bind_data->deferred_maintenance && bind_data->unique) {
+		throw duckdb::InvalidInputException(
+		    "moraine_index_create: deferred maintenance is supported only for non-unique indexes");
+	}
 	// Optional `directions := ['asc'|'desc', ...]`, parallel to the columns.
 	auto directions = input.named_parameters.find("directions");
 	if (directions != input.named_parameters.end() && !directions->second.IsNull()) {
@@ -815,6 +833,7 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	// placement ['first'|'last', ...], each parallel to the columns.
 	create.named_parameters["directions"] = LogicalType::LIST(LogicalType::VARCHAR);
 	create.named_parameters["nulls"] = LogicalType::LIST(LogicalType::VARCHAR);
+	create.named_parameters["maintenance"] = LogicalType::VARCHAR;
 	// Multi-commit build, for a backfill too large for one commit, and the
 	// bounds on one step of it — each step is one object-store request, so a
 	// slow link wants them smaller than the default.

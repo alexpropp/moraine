@@ -484,9 +484,22 @@ pub enum IndexState {
     /// A staged backfill is in progress; lookups fail typed and a unique
     /// violation poisons the build rather than failing the writer.
     Building,
+    /// SQL additions committed ahead of bounded non-unique index repair;
+    /// lookups refuse until the repair flips the index ready.
+    Maintaining,
     /// A duplicate was discovered during a staged build; the definition is
     /// terminally poisoned and will be dropped by its driver.
     Poisoned,
+}
+
+/// When SQL writes add entries to an index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IndexMaintenance {
+    /// Entries land atomically with the data snapshot.
+    #[default]
+    Synchronous,
+    /// Non-unique additions land in bounded commits after the data snapshot.
+    Deferred,
 }
 
 /// The sort order of one indexed column: its direction and NULL placement.
@@ -525,11 +538,20 @@ pub struct IndexInfo {
     pub nulls: Vec<crate::store::index_encoding::NullOrder>,
     /// Whether the index enforces uniqueness.
     pub unique: bool,
+    /// Whether SQL additions are maintained synchronously or after commit.
+    pub maintenance: IndexMaintenance,
     /// The build lifecycle state.
     pub state: IndexState,
     /// A staged build's watermark: the highest row id covered so far, or
     /// `None` before its first step. Always `None` on a single-commit index.
     pub build_cursor: Option<u64>,
+    /// The data file currently covered through [`Self::build_position_cursor`].
+    /// `None` while the build is still covering inline rows or was written by
+    /// a binary that used only the row-id cursor.
+    pub build_file_cursor: Option<DataFileId>,
+    /// The physical row position durably covered in
+    /// [`Self::build_file_cursor`].
+    pub build_position_cursor: Option<u64>,
 }
 
 /// The definition of an equality index to create.

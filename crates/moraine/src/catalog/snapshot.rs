@@ -876,10 +876,15 @@ fn partition_spec(value: &PartitionValue) -> PartitionSpec {
     }
 }
 
-fn index_info(value: &IndexValue) -> IndexInfo {
-    use crate::store::index_encoding::{Direction, NullOrder};
+pub(crate) fn index_info(value: &IndexValue) -> IndexInfo {
+    use crate::{
+        catalog::IndexMaintenance,
+        store::index_encoding::{Direction, NullOrder},
+    };
     let state = if value.poisoned == Some(true) {
         IndexState::Poisoned
+    } else if value.build_state.as_deref() == Some("maintaining") {
+        IndexState::Maintaining
     } else if value.build_state.is_some() {
         IndexState::Building
     } else {
@@ -919,8 +924,15 @@ fn index_info(value: &IndexValue) -> IndexInfo {
         directions,
         nulls,
         unique: value.unique,
+        maintenance: if value.deferred_maintenance == Some(true) {
+            IndexMaintenance::Deferred
+        } else {
+            IndexMaintenance::Synchronous
+        },
         state,
         build_cursor: value.build_cursor_row_id,
+        build_file_cursor: value.build_cursor_file.map(DataFileId::new),
+        build_position_cursor: value.build_cursor_position,
     }
 }
 
@@ -1401,9 +1413,11 @@ mod tests {
             build_state: None,
             build_cursor_file: None,
             build_cursor_row_id: None,
+            build_cursor_position: None,
             build_deletes_scanned: None,
             poisoned: None,
             ducklake_index_id: None,
+            deferred_maintenance: None,
         }
     }
 
@@ -1462,8 +1476,8 @@ mod tests {
     }
 
     #[test]
-    fn building_and_poisoned_states_are_projected() {
-        use crate::catalog::types::IndexState;
+    fn building_maintaining_and_poisoned_states_are_projected() {
+        use crate::catalog::types::{IndexMaintenance, IndexState};
         let building = crate::store::proto::IndexValue {
             build_state: Some("building".into()),
             ..index_rec(7, 1, "b", vec![0], true, 1, None)
@@ -1473,15 +1487,31 @@ mod tests {
             poisoned: Some(true),
             ..index_rec(8, 1, "p", vec![0], true, 1, None)
         };
+        let maintaining = crate::store::proto::IndexValue {
+            build_state: Some("maintaining".into()),
+            deferred_maintenance: Some(true),
+            ..index_rec(9, 1, "m", vec![0], false, 1, None)
+        };
         let view = CatalogSnapshot::build(
             snap(1),
-            &[EntityRecord::Index(building), EntityRecord::Index(poisoned)],
+            &[
+                EntityRecord::Index(building),
+                EntityRecord::Index(poisoned),
+                EntityRecord::Index(maintaining),
+            ],
             &[],
             None,
         );
         let by_name = |n: &str| view.index_by_name(TableId::new(1), n).unwrap().state;
         assert_eq!(by_name("b"), IndexState::Building);
         assert_eq!(by_name("p"), IndexState::Poisoned);
+        assert_eq!(by_name("m"), IndexState::Maintaining);
+        assert_eq!(
+            view.index_by_name(TableId::new(1), "m")
+                .unwrap()
+                .maintenance,
+            IndexMaintenance::Deferred
+        );
     }
 
     #[test]
