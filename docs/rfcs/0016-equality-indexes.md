@@ -664,6 +664,16 @@ resumes from the cursor, and `moraine_index_drop` abandons the build.
 `drop_index` on a building index is an ordinary drop: the builder's next
 step re-runs against the ended definition and stops.
 
+The driver emits progress at `info`. A derivation-started event makes the
+otherwise quiet Parquet-read phase explicit; the matching derived event names
+the live entry total and the derivation and sort times. Every successfully
+durable step then reports the entries in that step, cumulative completed and
+total entries, percentage, cursor, final-step flag, and commit time. The
+cumulative count is computed from the persisted cursor, so it includes work
+recovered from an earlier invocation. A conflicting step emits a warning with
+the last durable cumulative count before the driver re-derives. Attempted but
+non-durable work is never reported as completed.
+
 **Format.** Staged builds stamp **format 3** at the first staged
 `create_index` — lazily, like format 2. A format-2 binary would ignore the
 unknown state field, see a `building` definition as a ready index, and

@@ -127,6 +127,18 @@ fn step_length(remaining: &[IndexEntry], bound: BuildStep) -> usize {
     length.max(1)
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the percentage is diagnostic; f64 is exact for every practical row count"
+)]
+fn build_progress_percent(completed: usize, total: usize) -> f64 {
+    if total == 0 {
+        100.0
+    } else {
+        completed as f64 * 100.0 / total as f64
+    }
+}
+
 /// The per-column orders `orders` asks for, as a definition records them.
 /// An empty list means ascending / NULLS LAST throughout.
 fn requested_orders(orders: &[ColumnOrder], columns: usize) -> (Vec<Direction>, Vec<NullOrder>) {
@@ -2212,8 +2224,10 @@ impl Catalog {
         &self,
         table: TableId,
         index: IndexId,
+        index_name: &str,
         entries: &[IndexEntry],
         bound: BuildStep,
+        derivation_attempt: usize,
     ) -> Result<BuildProgress> {
         loop {
             let cursor = self.staged_build_cursor(table, index).await?;
@@ -2226,17 +2240,47 @@ impl Catalog {
             let remaining = &entries[pending..];
             let step = &remaining[..step_length(remaining, bound)];
             let is_final = step.len() == remaining.len();
+            let commit_started = Instant::now();
 
             match self
                 .commit(|tx| tx.build_index_step(index, step, is_final).map(|_| ()))
                 .await
             {
                 Ok(_) => {
+                    let completed = pending.saturating_add(step.len());
+                    let build_cursor = step.last().map(|entry| entry.row_id).or(cursor);
+                    info!(
+                        table = table.get(),
+                        index = index.get(),
+                        index_name = %index_name,
+                        derivation_attempt,
+                        step_entries = step.len(),
+                        completed_entries = completed,
+                        total_entries = entries.len(),
+                        progress_percent = build_progress_percent(completed, entries.len()),
+                        build_cursor = ?build_cursor,
+                        is_final,
+                        commit_ms = commit_started.elapsed().as_secs_f64() * 1_000.0,
+                        "staged index build step committed"
+                    );
                     if is_final {
                         return Ok(BuildProgress::Ready);
                     }
                 }
-                Err(Error::CommitConflict(_)) => return Ok(BuildProgress::Conflicted),
+                Err(Error::CommitConflict(_)) => {
+                    warn!(
+                        table = table.get(),
+                        index = index.get(),
+                        index_name = %index_name,
+                        derivation_attempt,
+                        completed_entries = pending,
+                        total_entries = entries.len(),
+                        progress_percent = build_progress_percent(pending, entries.len()),
+                        commit_ms = commit_started.elapsed().as_secs_f64() * 1_000.0,
+                        "staged index build step conflicted; re-deriving"
+                    );
+                    return Ok(BuildProgress::Conflicted);
+                }
                 Err(other) => return Err(other),
             }
         }
@@ -2623,7 +2667,15 @@ impl Catalog {
         data_prefix: &str,
         step: BuildStep,
     ) -> Result<()> {
-        for _ in 0..BUILD_DERIVATION_ATTEMPTS {
+        for attempt in 1..=BUILD_DERIVATION_ATTEMPTS {
+            info!(
+                table = table.get(),
+                index = index.get(),
+                index_name = %def.name,
+                derivation_attempt = attempt,
+                "staged index backfill derivation started"
+            );
+            let derivation_started = Instant::now();
             let mut entries = match &data_store {
                 Some(store) => {
                     self.scoped_backfill_entries(
@@ -2637,12 +2689,24 @@ impl Catalog {
                 None => Vec::new(),
             };
             entries.extend(self.inline_backfill_entries(table, &def.columns).await?);
+            let derive_ms = derivation_started.elapsed().as_secs_f64() * 1_000.0;
             // One watermark can describe the covered set only in row-id
             // order, which per-row-id rewrite files would otherwise break.
+            let sort_started = Instant::now();
             entries.sort_unstable_by_key(|entry| entry.row_id);
+            info!(
+                table = table.get(),
+                index = index.get(),
+                index_name = %def.name,
+                derivation_attempt = attempt,
+                total_entries = entries.len(),
+                derive_ms,
+                sort_ms = sort_started.elapsed().as_secs_f64() * 1_000.0,
+                "staged index backfill derived"
+            );
 
             if let BuildProgress::Ready = self
-                .commit_build_steps(table, index, &entries, step)
+                .commit_build_steps(table, index, &def.name, &entries, step, attempt)
                 .await?
             {
                 return Ok(());
