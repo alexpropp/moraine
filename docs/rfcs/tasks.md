@@ -204,9 +204,6 @@ deliberately not itemized here.
 
 ## 0016 — Equality indexes
 
-- **DECISION** — The oversized-indexed-value refusal threshold. The strawman is
-  1 KiB per composite key, with hash-overflow as the recorded escape if a
-  workload needs larger values.
 - **DECISION** — Whether to carry an upstream DuckLake binder patch accepting
   `CREATE INDEX` and `PRIMARY KEY` and routing equality pushdown to the moraine
   index.
