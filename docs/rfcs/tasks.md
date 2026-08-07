@@ -223,6 +223,20 @@ deliberately not itemized here.
 - **DEFERRED** — Make the per-commit index-entry cap a `CatalogOptions` field
   threaded through both commit paths and the FFI, instead of a hardcoded
   constant, once a caller has a legitimate reason to raise it.
+- **DEFERRED** — Admit an oversized indexed SQL commit without splitting the
+  statement or weakening unique enforcement, by staging its index delta in
+  bounded, invisible generations. Entry batches land under an unpublished
+  generation; the final DuckLake commit publishes one small manifest/root
+  reference atomically with the data metadata, so publication moves no
+  entries and readers never observe data without complete index coverage. A
+  same-table race after derivation must make publication lose and re-derive,
+  and a crash or failed transaction must leave only an unreferenced generation
+  that maintenance can reclaim. This needs an RFC before implementation: it
+  changes the internal key/metadata format and must settle lookup, range merge,
+  uniqueness across published generations, format gating, orphan reclamation,
+  and generation compaction so read amplification stays bounded. It changes no
+  user table schema and is distinct from deferred post-commit maintenance,
+  whose under-coverage window is intentionally visible.
 - **DEFERRED** — Bound the staged-build derivation's driver memory. The whole
   live backfill is materialized into one entry vector before stepping; only
   per-commit staging is capped.
