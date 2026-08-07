@@ -490,6 +490,11 @@ cut:
   live row-id range contains the id. The consumer applies delete files as
   any DuckLake scan does — moraine returns candidates, not adjudicated rows.
   The extension path surfaces this accessor as `moraine_index_lookup`.
+- `index_lookup_many(table, index, keys) -> Vec<RowLocation>` — the `IN`
+  accessor: deduplicate complete equality keys, resolve every distinct key
+  under the same pinned read as one logical lookup, and return the union of
+  their row locations. An empty key set returns no rows after validating the
+  index. The extension path surfaces this accessor as `moraine_index_in`.
 - `index_range(table, index, lower, upper) -> Vec<RowLocation>` — the
   comparison accessor (Range and comparison queries). Each bound is
   `Included`/`Excluded`/`Unbounded`; results come back in the index's stored
@@ -689,9 +694,14 @@ written `…` below for brevity.
 | `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b, step_entries := n, step_bytes := n)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call. `step_entries`/`step_bytes` bound one step of that build (Two bounds on a step); each must be positive, and both are ignored without `staged` |
 | `moraine_index_drop(…)` | end the definition (Reclamation) |
 | `moraine_index_lookup(…, v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
+| `moraine_index_in(…, keys)` | table function: row ids and holders for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
 | `moraine_index_range(…, lower, upper, lower_inclusive, upper_inclusive, reverse := b)` | table function: row ids and holders for a value window. Each bound is a scalar (single-column index) or a `row(...)` tuple over the leading columns; a NULL bound is an open side (half-open). `reverse` serves the opposite of the index's order |
 | `moraine_index_nulls(…, prefix…, reverse := b)` | table function: row ids and holders for an `IS NULL` query; the variadic prefix is the leading columns, a `NULL` arg meaning `IS NULL` and any other `= value` |
 | `moraine_indexes(catalog, schema, table)` | table function: index introspection |
+
+`moraine_index_in` binds `keys` as one constant list value (including a
+prepared-statement parameter), like the arguments of the other explicit
+lookup functions; it does not consume keys streamed from another relation.
 
 A multi-column range bound is a tuple. Tuple windows require every named
 column to sort the same way; one byte range then spans them. With mixed

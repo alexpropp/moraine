@@ -1,8 +1,8 @@
-// The equality-index SQL surface: moraine_index_create / moraine_index_drop
-// (autonomous-commit DDL) and moraine_indexes (introspection). These are the
-// first user-callable functions this extension registers; every other
-// TableFunction in the shim is reached through a catalog-entry override, not
-// a global registration.
+// The equality-index SQL surface: autonomous-commit DDL, introspection, and
+// explicit point, IN, range, and NULL-prefix lookups. These are the first
+// user-callable functions this extension registers; every other TableFunction
+// in the shim is reached through a catalog-entry override, not a global
+// registration.
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -464,6 +464,69 @@ duckdb::unique_ptr<duckdb::FunctionData> LookupBind(duckdb::ClientContext &conte
 	return std::move(bind_data);
 }
 
+// moraine_index_in: resolves a list of complete equality keys under one
+// catalog read. A scalar list addresses a one-column index; a list of
+// STRUCT/row values addresses a composite index.
+duckdb::unique_ptr<duckdb::FunctionData> InBind(duckdb::ClientContext &context,
+                                                duckdb::TableFunctionBindInput &input,
+                                                duckdb::vector<duckdb::LogicalType> &return_types,
+                                                duckdb::vector<duckdb::string> &names) {
+	auto bind_data = duckdb::make_uniq<LookupBindData>();
+	bind_data->catalog_name = input.inputs[0].GetValue<std::string>();
+	bind_data->schema_name = input.inputs[1].GetValue<std::string>();
+	bind_data->table_name = input.inputs[2].GetValue<std::string>();
+	bind_data->index_name = input.inputs[3].GetValue<std::string>();
+	bind_data->value_repr = ValueRepr(input.inputs[4]);
+
+	LookupValueArena backings;
+	std::vector<std::vector<MoraineLookupValue>> key_values;
+	if (!input.inputs[4].IsNull()) {
+		auto &keys = duckdb::ListValue::GetChildren(input.inputs[4]);
+		key_values.reserve(keys.size());
+		for (auto &key : keys) {
+			// A whole NULL row cannot make an IN predicate true. Skipping it
+			// here also avoids asking StructValue for a NULL payload.
+			if (key.IsNull() && key.type().id() == duckdb::LogicalTypeId::STRUCT) {
+				continue;
+			}
+			auto &values = key_values.emplace_back();
+			if (key.type().id() == duckdb::LogicalTypeId::STRUCT) {
+				auto &children = duckdb::StructValue::GetChildren(key);
+				values.reserve(children.size());
+				for (auto &child : children) {
+					values.push_back(BuildLookupValue(child, backings, "moraine_index_in"));
+				}
+			} else {
+				values.push_back(BuildLookupValue(key, backings, "moraine_index_in"));
+			}
+		}
+	}
+
+	std::vector<MoraineLookupKey> keys;
+	keys.reserve(key_values.size());
+	for (auto &values : key_values) {
+		keys.push_back({values.data(), values.size()});
+	}
+
+	auto handle = ResolveHandle(context, bind_data->catalog_name);
+	OwnedArray<MoraineRowLocation> locations(moraine_index_in_free);
+	MoraineError err {};
+	auto code = moraine_index_in(handle, bind_data->schema_name.c_str(), bind_data->table_name.c_str(),
+	                             bind_data->index_name.c_str(), keys.data(), keys.size(), locations.OutItems(),
+	                             locations.OutLen(), moraine_shim_is_interrupted, &context, &err);
+	if (code != MORAINE_OK) {
+		ThrowMoraineError(err);
+	}
+	for (auto &location : locations) {
+		bind_data->rows.push_back({static_cast<int64_t>(location.row_id),
+		                           static_cast<int64_t>(location.data_file_id), location.is_inline});
+	}
+
+	return_types = {duckdb::LogicalType::BIGINT, duckdb::LogicalType::BIGINT, duckdb::LogicalType::BOOLEAN};
+	names = {"row_id", "data_file_id", "is_inline"};
+	return std::move(bind_data);
+}
+
 struct LookupGlobalState : public duckdb::GlobalTableFunctionState {
 	duckdb::idx_t offset = 0;
 	duckdb::idx_t MaxThreads() const override {
@@ -768,6 +831,14 @@ void RegisterMoraineIndexFunctions(duckdb::ExtensionLoader &loader) {
 	                             LookupImpl, LookupBind, LookupInitGlobal);
 	lookup.varargs = LogicalType::ANY;
 	loader.RegisterFunction(lookup);
+
+	// A homogeneous scalar list addresses a one-column index. A list of
+	// `row(...)` structs carries complete composite keys.
+	duckdb::TableFunction in("moraine_index_in",
+	                         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                          LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+	                         LookupImpl, InBind, LookupInitGlobal);
+	loader.RegisterFunction(in);
 
 	duckdb::TableFunction drop("moraine_index_drop",
 	                           {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,

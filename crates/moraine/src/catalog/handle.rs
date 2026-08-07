@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{ObjectStore, path::Path};
 use slatedb::{CloseReason, Db, DbReader, DbStatus, DbTransaction, IsolationLevel};
 use tokio::sync::watch;
@@ -52,6 +53,9 @@ use crate::{
     },
     transaction::{MigrationReport, Transaction, commit, index_maintenance, migration},
 };
+
+/// Exact probes kept in flight by one batched index lookup.
+const INDEX_LOOKUP_CONCURRENCY: usize = 32;
 
 /// One subspace's row, zeroed when the manifest carries no segment for it.
 fn measure(subspace: SubspaceName, segment: Option<&SegmentSize>) -> SubspaceCensus {
@@ -972,13 +976,37 @@ impl ReadOnlyCatalog {
         index: IndexId,
         values: &[IndexKeyValue],
     ) -> Result<Vec<RowLocation>> {
+        self.index_lookup_many(table, index, &[values.to_vec()])
+            .await
+    }
+
+    /// Resolves an `IN` lookup to the union of rows currently holding any
+    /// complete equality key in `keys`.
+    ///
+    /// Duplicate keys are probed once and duplicate row ids are returned
+    /// once. An empty key set returns no rows after validating that the index
+    /// exists and is ready. The whole batch uses one read session and one head
+    /// view, so every result belongs to the same consistent cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotFound`] if the index does not exist,
+    /// [`Error::IndexBuilding`] if its staged backfill has not completed,
+    /// [`Error::Constraint`] if a key is partial or exceeds the size cap, or
+    /// a store error if a probe fails.
+    pub async fn index_lookup_many(
+        &self,
+        table: TableId,
+        index: IndexId,
+        keys: &[Vec<IndexKeyValue>],
+    ) -> Result<Vec<RowLocation>> {
         let session = self.begin_read().await?;
         let handle = session.handle();
 
-        let outcome = async {
+        let outcome = crate::store::read::consistent(handle, || async {
             // The head view, not a fresh materialization: a probe that
             // rematerializes re-scans `current` under a bulk shape, which
-            // admits no blocks, so every lookup pays a store read for a
+            // admits no blocks, so every lookup batch pays a store read for a
             // view the handle already holds. The scan the probe actually
             // needs is the `index` one below, and that one is warm.
             let view = self.head_view(handle).await?;
@@ -997,22 +1025,49 @@ impl ReadOnlyCatalog {
                     return Err(Error::NotFound(format!("index {index} was poisoned")));
                 }
             }
-            let key = encode_ordered_values(
-                &values.iter().cloned().map(Some).collect::<Vec<_>>(),
-                &info.directions,
-                &info.nulls,
-            )?;
-            let row_ids =
-                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await?;
+
+            let mut encoded = Vec::with_capacity(keys.len());
+            for key in keys {
+                if key.len() != info.columns.len() {
+                    return Err(Error::Constraint(format!(
+                        "index lookup: {} values do not address the {}-column index {index}; an \
+                         equality lookup names every column",
+                        key.len(),
+                        info.columns.len()
+                    )));
+                }
+                encoded.push(encode_ordered_values(
+                    &key.iter().cloned().map(Some).collect::<Vec<_>>(),
+                    &info.directions,
+                    &info.nulls,
+                )?);
+            }
+            encoded.sort_unstable();
+            encoded.dedup();
+
+            // Exact probes are independent. Keep enough in flight to hide an
+            // object-store round trip while bounding iterator and result
+            // memory for a large key list. `buffered` preserves canonical-key
+            // order, though callers must not depend on result order.
+            let row_id_groups = stream::iter(encoded.into_iter().map(|key| async move {
+                index_maintenance::lookup_row_ids(handle, index.get(), info.unique, &key).await
+            }))
+            .buffered(INDEX_LOOKUP_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
             let holders = RowHolders::of(&view.data_files_of(table));
-            Ok(row_ids
+            let mut seen = HashSet::new();
+            Ok(row_id_groups
                 .into_iter()
+                .flatten()
+                .filter(|row_id| seen.insert(*row_id))
                 .map(|row_id| RowLocation {
                     row_id,
                     holder: holders.holder(row_id),
                 })
                 .collect())
-        }
+        })
         .await;
         session.finish();
 

@@ -316,6 +316,14 @@ typedef struct MoraineRowLocation {
   bool is_inline;
 } MoraineRowLocation;
 
+// One complete equality key passed to [`moraine_index_in`].
+typedef struct MoraineLookupKey {
+  // The key's values, in the index's column order.
+  const struct MoraineLookupValue *values;
+  // Number of entries in `values`.
+  size_t values_len;
+} MoraineLookupKey;
+
 // One checkpoint the store's manifest carries.
 typedef struct MoraineCheckpoint {
   // The checkpoint's id, in the form `moraine_attach`'s `checkpoint`
@@ -1559,6 +1567,36 @@ int32_t moraine_index_lookup(struct MoraineCatalogHandle *handle,
 // `items`/`len` must be exactly the pointer and length written by a
 // matching [`moraine_index_lookup`] call, not yet freed.
 void moraine_index_lookup_free(struct MoraineRowLocation *items, size_t len);
+
+// Resolves an `IN` lookup to the union of rows holding any complete key.
+// Each key is coerced to the indexed columns' canonical types. Duplicate
+// keys are probed once; a key containing NULL matches no row; an empty key
+// list returns no rows after validating the index.
+//
+// # Safety
+//
+// Every pointer must be valid per the ABI contract; `keys` points to
+// `keys_len` descriptors, and each descriptor's `values` points to
+// `values_len` values. `err`, if non-null, must be writable.
+int32_t moraine_index_in(struct MoraineCatalogHandle *handle,
+                         const char *schema_name,
+                         const char *table_name,
+                         const char *index_name,
+                         const struct MoraineLookupKey *keys,
+                         size_t keys_len,
+                         struct MoraineRowLocation **out_items,
+                         size_t *out_len,
+                         MoraineInterruptProbe probe,
+                         void *probe_ctx,
+                         struct MoraineError *err);
+
+// Frees the array a [`moraine_index_in`] call returned.
+//
+// # Safety
+//
+// `items`/`len` must be exactly the pointer and length written by a matching
+// [`moraine_index_in`] call, not yet freed.
+void moraine_index_in_free(struct MoraineRowLocation *items, size_t len);
 
 // Resolves a comparison query to the rows whose leading indexed values fall
 // between the bounds. Each bound is a run of `lower_len`/`upper_len`

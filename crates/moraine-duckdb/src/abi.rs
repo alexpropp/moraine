@@ -2724,6 +2724,15 @@ pub struct MoraineLookupValue {
     pub bytes_len: usize,
 }
 
+/// One complete equality key passed to [`moraine_index_in`].
+#[repr(C)]
+pub struct MoraineLookupKey {
+    /// The key's values, in the index's column order.
+    pub values: *const MoraineLookupValue,
+    /// Number of entries in `values`.
+    pub values_len: usize,
+}
+
 /// Coerces a lookup value to the canonical [`IndexKeyValue`] for a column of
 /// DuckLake type `ducklake_type`: marshals the tagged union into an owned
 /// [`LookupInput`], then defers to the core's coercion table so the type
@@ -2918,6 +2927,134 @@ pub unsafe extern "C" fn moraine_index_lookup(
 /// matching [`moraine_index_lookup`] call, not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moraine_index_lookup_free(items: *mut MoraineRowLocation, len: usize) {
+    let attempt = || {
+        // SAFETY: caller contract above. The descriptor owns no heap.
+        unsafe {
+            free_array(items, len, |_| {});
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(attempt));
+}
+
+/// Resolves an `IN` lookup to the union of rows holding any complete key.
+/// Each key is coerced to the indexed columns' canonical types. Duplicate
+/// keys are probed once; a key containing NULL matches no row; an empty key
+/// list returns no rows after validating the index.
+///
+/// # Safety
+///
+/// Every pointer must be valid per the ABI contract; `keys` points to
+/// `keys_len` descriptors, and each descriptor's `values` points to
+/// `values_len` values. `err`, if non-null, must be writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn moraine_index_in(
+    handle: *mut MoraineCatalogHandle,
+    schema_name: *const c_char,
+    table_name: *const c_char,
+    index_name: *const c_char,
+    keys: *const MoraineLookupKey,
+    keys_len: usize,
+    out_items: *mut *mut MoraineRowLocation,
+    out_len: *mut usize,
+    probe: MoraineInterruptProbe,
+    probe_ctx: *mut c_void,
+    err: *mut MoraineError,
+) -> i32 {
+    let produce = |handle_ref: &MoraineCatalogHandle| -> Result<Vec<MoraineRowLocation>, AbiError> {
+        if keys.is_null() && keys_len != 0 {
+            return Err(AbiError::invalid_argument(
+                "`keys` is null but its length is nonzero",
+            ));
+        }
+        // SAFETY: caller contract for the string pointers.
+        let schema = unsafe { borrow_str(schema_name, "schema_name") }?;
+        // SAFETY: caller contract.
+        let table = unsafe { borrow_str(table_name, "table_name") }?;
+        // SAFETY: caller contract.
+        let name = unsafe { borrow_str(index_name, "index_name") }?;
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let snapshot = unsafe {
+            handle_ref.block_on_cancellable(probe, probe_ctx, handle_ref.catalog.reads().snapshot())
+        }?;
+        let table_id = resolve_table(&snapshot, schema, table)?;
+        let index = snapshot
+            .index_by_name(table_id, name)
+            .ok_or_else(|| AbiError::from(moraine::Error::NotFound(format!("index {name}"))))?;
+        let columns = snapshot.columns_of(table_id);
+        let raw_keys = if keys_len == 0 {
+            &[]
+        } else {
+            // SAFETY: non-null checked above; caller contract says the array
+            // contains `keys_len` readable descriptors.
+            unsafe { std::slice::from_raw_parts(keys, keys_len) }
+        };
+        let mut coerced_keys = Vec::with_capacity(raw_keys.len());
+        for raw_key in raw_keys {
+            if raw_key.values_len != index.columns.len() {
+                return Err(AbiError::invalid_argument(format!(
+                    "index IN: {} values do not address the {}-column index {name}; an equality \
+                     lookup names every column",
+                    raw_key.values_len,
+                    index.columns.len()
+                )));
+            }
+            if raw_key.values.is_null() {
+                return Err(AbiError::invalid_argument("`key.values` is null"));
+            }
+            // SAFETY: caller contract for this descriptor's nested array.
+            let raw_values =
+                unsafe { std::slice::from_raw_parts(raw_key.values, raw_key.values_len) };
+            // SAFETY: caller contract for each value's string/bytes fields.
+            let coerced =
+                unsafe { coerce_index_key(&index, name, table_id, &columns, raw_values) }?;
+            // A NULL-bearing equality key cannot make SQL's IN predicate
+            // true, so it contributes no probe and no row.
+            if let Some(key) = coerced.into_iter().collect::<Option<Vec<_>>>() {
+                coerced_keys.push(key);
+            }
+        }
+
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        let locations = unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref
+                    .catalog
+                    .reads()
+                    .index_lookup_many(table_id, index.id, &coerced_keys),
+            )
+        }?;
+        Ok(locations
+            .into_iter()
+            .map(|location| {
+                let (data_file_id, is_inline) = match location.holder {
+                    moraine::RowHolder::DataFile(id) => (id.get(), false),
+                    moraine::RowHolder::Inline => (0, true),
+                };
+                MoraineRowLocation {
+                    row_id: location.row_id,
+                    data_file_id,
+                    is_inline,
+                }
+            })
+            .collect())
+    };
+
+    // SAFETY: caller contract for the pointers.
+    unsafe { handle_list(handle, out_items, out_len, err, produce) }
+}
+
+/// Frees the array a [`moraine_index_in`] call returned.
+///
+/// # Safety
+///
+/// `items`/`len` must be exactly the pointer and length written by a matching
+/// [`moraine_index_in`] call, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn moraine_index_in_free(items: *mut MoraineRowLocation, len: usize) {
     let attempt = || {
         // SAFETY: caller contract above. The descriptor owns no heap.
         unsafe {
@@ -3467,6 +3604,74 @@ mod tests {
             short.contains("2-column"),
             "the arity error names the index width, got: {short}"
         );
+
+        // SAFETY: `handle` was minted by `attach_ok`, detached once.
+        unsafe { moraine_detach(handle) };
+    }
+
+    /// A batched `IN` lookup accepts full composite keys, deduplicates them,
+    /// and returns the union of rows for present keys.
+    #[test]
+    fn index_in_resolves_distinct_composite_keys() {
+        let dir = TempDir::new("composite-in");
+        seed_composite(dir.path());
+        let handle = attach_ok(dir.path());
+
+        let x = CString::new("x").expect("no NUL");
+        let first = [i64_lookup(5), str_lookup(&x)];
+        let second = [i64_lookup(7), str_lookup(&x)];
+        let absent = [i64_lookup(9), str_lookup(&x)];
+        let keys = [
+            MoraineLookupKey {
+                values: first.as_ptr(),
+                values_len: first.len(),
+            },
+            MoraineLookupKey {
+                values: second.as_ptr(),
+                values_len: second.len(),
+            },
+            MoraineLookupKey {
+                values: first.as_ptr(),
+                values_len: first.len(),
+            },
+            MoraineLookupKey {
+                values: absent.as_ptr(),
+                values_len: absent.len(),
+            },
+        ];
+        let schema = CString::new("sales").expect("no NUL");
+        let table = CString::new("t").expect("no NUL");
+        let index = CString::new("by_ab").expect("no NUL");
+        let mut items: *mut MoraineRowLocation = ptr::null_mut();
+        let mut len = 0;
+        let mut err = MoraineError::default();
+
+        // SAFETY: the handle, strings, nested key slices, and output slots
+        // remain valid for the call.
+        let code = unsafe {
+            moraine_index_in(
+                handle,
+                schema.as_ptr(),
+                table.as_ptr(),
+                index.as_ptr(),
+                keys.as_ptr(),
+                keys.len(),
+                &raw mut items,
+                &raw mut len,
+                None,
+                ptr::null_mut(),
+                &raw mut err,
+            )
+        };
+        assert_eq!(code, codes::OK);
+        // SAFETY: the successful call wrote `items`/`len` as one valid array.
+        let rows = unsafe { std::slice::from_raw_parts(items, len) }
+            .iter()
+            .map(|location| location.row_id)
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![0, 2]);
+        // SAFETY: the array is freed exactly once by its matching function.
+        unsafe { moraine_index_in_free(items, len) };
 
         // SAFETY: `handle` was minted by `attach_ok`, detached once.
         unsafe { moraine_detach(handle) };
