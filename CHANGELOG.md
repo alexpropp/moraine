@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6](https://github.com/morainedb/moraine/compare/v0.4.5...v0.4.6) - 2026-08-07
+
+### Added
+
+- bound a commit by the bytes it must transfer, and report them ([#108](https://github.com/morainedb/moraine/pull/108))
+- report the block cache tally per attach ([#104](https://github.com/morainedb/moraine/pull/104))
+
+### Fixed
+
+- make catalog options settable, resettable, and unshadowed ([#106](https://github.com/morainedb/moraine/pull/106))
+
+### Other
+
+- read only the rows a delete kills, not the file holding them ([#107](https://github.com/morainedb/moraine/pull/107))
+- pin what a delete against flushed inline data costs ([#105](https://github.com/morainedb/moraine/pull/105))
+
 ## [0.4.5](https://github.com/morainedb/moraine/compare/v0.4.4...v0.4.5) - 2026-08-05
 
 ### Added
