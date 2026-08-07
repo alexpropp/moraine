@@ -55,6 +55,13 @@ pub(crate) enum Operation {
         /// The re-sorted table's id.
         table_id: u64,
     },
+    /// An intermediate staged index-build cursor advance. Classifies as an
+    /// alter so it retains the build protocol's table conflict fence, but
+    /// does not change the table schema.
+    AdvanceIndexBuild {
+        /// The table whose index build advanced.
+        table_id: u64,
+    },
     /// A table was dropped.
     DropTable {
         /// The dropped table's id.
@@ -171,6 +178,7 @@ impl Operation {
             | Operation::CreateMacro { .. }
             | Operation::DropMacro { .. } => true,
             Operation::AlterTableSorting { .. }
+            | Operation::AdvanceIndexBuild { .. }
             | Operation::RegisterDataFile { .. }
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
@@ -199,6 +207,7 @@ impl Operation {
             | Operation::DropSchema { .. }
             | Operation::AlterSchema { .. }
             | Operation::AlterTableSorting { .. }
+            | Operation::AdvanceIndexBuild { .. }
             | Operation::DropTable { .. }
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
@@ -378,7 +387,9 @@ impl ChangeSet {
                         .insert((schema_name.clone(), table_name.clone()));
                     set.created_table_schema_ids.insert(*schema_id);
                 }
-                Operation::AlterTable { table_id } | Operation::AlterTableSorting { table_id } => {
+                Operation::AlterTable { table_id }
+                | Operation::AlterTableSorting { table_id }
+                | Operation::AdvanceIndexBuild { table_id } => {
                     set.altered_tables.insert(*table_id);
                 }
                 Operation::DropTable { table_id } => {
@@ -1252,5 +1263,27 @@ mod tests {
 
         let elsewhere = ChangeSet::from_operations(&[Operation::AlterTableSorting { table_id: 2 }]);
         assert!(!conflicts(&sorted, &elsewhere));
+    }
+
+    /// A staged index cursor advance keeps the same conflict fence as the
+    /// schema-changing publication commits without growing schema history.
+    #[test]
+    fn an_index_build_advance_alters_the_table_without_changing_its_schema() {
+        let advance = Operation::AdvanceIndexBuild { table_id: 1 };
+        assert!(!advance.is_schema_changing());
+        assert_eq!(advance.schema_changed_table_id(), None);
+
+        let advanced = ChangeSet::from_operations(&[advance]);
+        assert_eq!(advanced.to_changes_made(), "altered_table:1");
+        let dropped = ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]);
+        let altered = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
+        let appended = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        assert!(conflicts(&advanced, &dropped));
+        assert!(conflicts(&advanced, &altered));
+        assert!(conflicts(&advanced, &advanced));
+        assert!(conflicts(&advanced, &appended));
+
+        let elsewhere = ChangeSet::from_operations(&[Operation::AdvanceIndexBuild { table_id: 2 }]);
+        assert!(!conflicts(&advanced, &elsewhere));
     }
 }

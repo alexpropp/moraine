@@ -165,6 +165,28 @@ async fn head(catalog: &Catalog) -> u64 {
         .get()
 }
 
+/// The current global schema version.
+#[allow(clippy::unwrap_used)]
+async fn schema_version(catalog: &Catalog) -> u64 {
+    catalog
+        .snapshot()
+        .await
+        .unwrap()
+        .current_snapshot()
+        .schema_version
+}
+
+/// The durable schema-history rows for one table.
+#[allow(clippy::unwrap_used)]
+async fn schema_history_len(catalog: &Catalog, table: TableId) -> usize {
+    moraine::ffi_support::dump_schema_versions(catalog)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.table_id == table.get())
+        .count()
+}
+
 fn int(value: i128) -> IndexKeyValue {
     IndexKeyValue::Int {
         value,
@@ -200,6 +222,29 @@ async fn staged_build_spans_steps_and_finishes_ready() {
         assert_eq!(hits.len(), 1, "value {value} is indexed");
         assert_eq!(hits[0].row_id, u64::try_from(value).unwrap());
     }
+    catalog.close().await.unwrap();
+}
+
+/// Intermediate cursor advances mint snapshots but not schema versions;
+/// only publishing the definition and flipping it ready change schema.
+#[tokio::test]
+async fn intermediate_steps_do_not_grow_table_schema_history() {
+    let (catalog, table, data) = table_with_file((0..7).collect()).await;
+    let snapshot_before = head(&catalog).await;
+    let schema_version_before = schema_version(&catalog).await;
+    let schema_history_before = schema_history_len(&catalog, table).await;
+
+    catalog
+        .create_index_staged(table, &def(true), &[], Some(data), "", Some(by_entries(2)))
+        .await
+        .unwrap();
+
+    assert_eq!(head(&catalog).await - snapshot_before, 5);
+    assert_eq!(schema_version(&catalog).await - schema_version_before, 2);
+    assert_eq!(
+        schema_history_len(&catalog, table).await - schema_history_before,
+        2
+    );
     catalog.close().await.unwrap();
 }
 

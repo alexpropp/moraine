@@ -1051,8 +1051,9 @@ impl Transaction {
     /// Advances a staged build by one bounded batch of writer-supplied
     /// entries, persisting a row-id cursor so a crashed build resumes. With
     /// `is_final`, flips the index ready in this same commit; from the flip
-    /// forward it is indistinguishable from a single-commit build. Returns
-    /// the resulting state.
+    /// forward it is indistinguishable from a single-commit build. A
+    /// non-final step preserves the catalog schema version; the final flip
+    /// advances it. Returns the resulting state.
     ///
     /// # Errors
     ///
@@ -1099,7 +1100,11 @@ impl Transaction {
             IndexState::Building
         };
         self.state.put_index(value);
-        self.mark_altered(table_id);
+        if is_final {
+            self.mark_altered(table_id);
+        } else {
+            self.ops.push(Operation::AdvanceIndexBuild { table_id });
+        }
         Ok(resulting_state)
     }
 
