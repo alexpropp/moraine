@@ -1302,6 +1302,12 @@ void moraine_snapshot_data_files_of_free(struct MoraineDataFileDesc *items, size
 // one commit may stage — and returns once the index is ready; interrupting
 // it leaves the build resumable by the same call.
 //
+// `step_entries` and `step_bytes` bound one step of that build, each `0`
+// for the default. They matter on a slow link: a step becomes a single
+// object-store request, and one too large to transfer inside the store
+// client's timeout is retried forever rather than failing. Both are
+// ignored without `staged`.
+//
 // # Safety
 //
 // Every pointer must be valid per the ABI contract; `err`, if non-null,
@@ -1316,6 +1322,8 @@ int32_t moraine_index_create(struct MoraineCatalogHandle *handle,
                              const uint8_t *column_nulls_first,
                              bool unique,
                              bool staged,
+                             uint64_t step_entries,
+                             uint64_t step_bytes,
                              MoraineInterruptProbe probe,
                              void *probe_ctx,
                              struct MoraineError *err);

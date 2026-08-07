@@ -1035,3 +1035,78 @@ fn moraine_index_entries_survive_the_data_file_lifecycle() {
         "the freed value is claimable again, exactly once"
     );
 }
+
+/// `step_entries` and `step_bytes` size the staged build's commits from
+/// SQL. The default step is a million entries or eight mebibytes, which no
+/// reachable test table exceeds — so without these the build is always one
+/// step, and a link too slow to carry that one step has no recourse.
+///
+/// Observed through the snapshot count: each step is its own commit.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_create_takes_a_step_size() {
+    let store = TempDir::new("index-step-store");
+    let data = TempDir::new("index-step-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    let snapshots = |out: String| -> i64 {
+        csv_rows(&out)[0][0]
+            .parse()
+            .expect("the snapshot count is a number")
+    };
+
+    run("CREATE TABLE lake.main.t(a BIGINT);");
+    run("INSERT INTO lake.main.t SELECT i FROM range(400) t(i);");
+    let before = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
+
+    run(
+        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], true, \
+         staged := true, step_entries := 100);",
+    );
+    let after = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
+
+    // The definition commit, then 400 entries in steps of 100.
+    assert_eq!(after - before, 1 + 4, "one commit per step of 100");
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT is_building FROM moraine_indexes('lake','main','t');"
+        )),
+        vec![vec!["false".to_string()]],
+        "the build still flipped ready"
+    );
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 399);"
+        )),
+        vec![vec!["1".to_string()]],
+        "every step's entries landed"
+    );
+
+    // A byte bound cuts steps the same way, and a bound below one entry
+    // still advances one entry at a time rather than stalling.
+    run("CREATE TABLE lake.main.u(a BIGINT);");
+    run("INSERT INTO lake.main.u SELECT i FROM range(5) t(i);");
+    let before = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
+    run(
+        "CALL moraine_index_create('lake', 'main', 'u', 'by_a', ['a'], true, \
+         staged := true, step_bytes := 1);",
+    );
+    let after = snapshots(run("SELECT count(*) FROM ducklake_snapshots('lake');"));
+    assert_eq!(after - before, 1 + 5, "one commit per entry");
+
+    // A step admitting nothing is refused at bind, before any commit.
+    let out = run_ducklake_sql_output(
+        store.path(),
+        data.path(),
+        &meta,
+        "CALL moraine_index_create('lake', 'main', 't', 'by_b', ['a'], true, \
+         staged := true, step_entries := 0);",
+    );
+    assert!(!out.status.success(), "a zero step must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("step_entries"),
+        "the refusal names the parameter, got: {stderr}"
+    );
+}
