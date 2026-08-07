@@ -1234,6 +1234,7 @@ impl ReadOnlyCatalog {
             object_store,
             path,
             indexed_positions,
+            scoped_read::ScopedRows::All,
             scoped_read::RowIdSource::Ordinal,
             None,
         )
@@ -1335,6 +1336,7 @@ impl ReadOnlyCatalog {
                     Arc::clone(&object_store),
                     &path,
                     &positions,
+                    scoped_read::ScopedRows::All,
                     scoped_read::RowIdSource::Resolve {
                         row_id_start: file.row_id_start,
                     },
