@@ -601,7 +601,10 @@ collide write-write — the cursor serializes them mechanically. Steps carry
 the definition write, so they classify `altered_table:<table_id>` like the
 create: conservative — a step racing any same-table write surfaces a
 conflict rather than interleaving (a benign `inserted_into_table`
-refinement is unsettled).
+refinement is unsettled). An intermediate cursor advance does **not** change
+the table schema: it mints its ordinary snapshot while retaining the current
+global schema version and writes no `ducklake_schema_versions` row. Only the
+initial definition publication and final `ready` flip advance schema history.
 
 **The delete race.** A row live at one derivation pass can die before its
 step lands, and a stale entry for a dead row is corruption — for a unique
