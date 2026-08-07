@@ -207,9 +207,6 @@ deliberately not itemized here.
 - **DECISION** — The oversized-indexed-value refusal threshold. The strawman is
   1 KiB per composite key, with hash-overflow as the recorded escape if a
   workload needs larger values.
-- **DECISION** — Whether staged build steps can loosen from `altered_table` to
-  the benign `inserted_into_table` classification. This requires re-examining
-  the delete race that surfaced conflicts currently protect against.
 - **DECISION** — Whether to carry an upstream DuckLake binder patch accepting
   `CREATE INDEX` and `PRIMARY KEY` and routing equality pushdown to the moraine
   index.

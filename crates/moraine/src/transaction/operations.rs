@@ -56,10 +56,17 @@ pub(crate) enum Operation {
         table_id: u64,
     },
     /// An intermediate staged index-build cursor advance. Classifies as an
-    /// alter so it retains the build protocol's table conflict fence, but
-    /// does not change the table schema.
+    /// insert so concurrent appends can land, while deletes, alters, and
+    /// drops retain the build protocol's conflict fence.
     AdvanceIndexBuild {
         /// The table whose index build advanced.
+        table_id: u64,
+    },
+    /// A deferred repair published complete coverage. Classifies as an alter
+    /// so a racing writer cannot leave the index ready without its additions,
+    /// but does not change the table schema.
+    FinishIndexMaintenance {
+        /// The table whose repaired index became ready.
         table_id: u64,
     },
     /// A table was dropped.
@@ -179,6 +186,7 @@ impl Operation {
             | Operation::DropMacro { .. } => true,
             Operation::AlterTableSorting { .. }
             | Operation::AdvanceIndexBuild { .. }
+            | Operation::FinishIndexMaintenance { .. }
             | Operation::RegisterDataFile { .. }
             | Operation::RegisterDeleteFile { .. }
             | Operation::ExpireDataFile { .. }
@@ -208,6 +216,7 @@ impl Operation {
             | Operation::AlterSchema { .. }
             | Operation::AlterTableSorting { .. }
             | Operation::AdvanceIndexBuild { .. }
+            | Operation::FinishIndexMaintenance { .. }
             | Operation::DropTable { .. }
             | Operation::DropView { .. }
             | Operation::CreateMacro { .. }
@@ -389,17 +398,19 @@ impl ChangeSet {
                 }
                 Operation::AlterTable { table_id }
                 | Operation::AlterTableSorting { table_id }
-                | Operation::AdvanceIndexBuild { table_id } => {
+                | Operation::FinishIndexMaintenance { table_id } => {
                     set.altered_tables.insert(*table_id);
                 }
                 Operation::DropTable { table_id } => {
                     set.dropped_tables.insert(*table_id);
                 }
-                // An inlined insert is an append and an inlined tombstone
-                // a delete: they classify exactly as their file-backed
-                // counterparts, because to a concurrent writer they are the
-                // same change to the same table.
-                Operation::RegisterDataFile { table_id } | Operation::InlineInsert { table_id } => {
+                // An inlined insert and an intermediate index step both
+                // classify as appends. A concurrent append cannot invalidate
+                // the step's already-derived entries, while a delete still
+                // conflicts through the ordinary table matrix.
+                Operation::RegisterDataFile { table_id }
+                | Operation::InlineInsert { table_id }
+                | Operation::AdvanceIndexBuild { table_id } => {
                     set.inserted_tables.insert(*table_id);
                 }
                 Operation::RegisterDeleteFile {
@@ -1265,25 +1276,54 @@ mod tests {
         assert!(!conflicts(&sorted, &elsewhere));
     }
 
-    /// A staged index cursor advance keeps the same conflict fence as the
-    /// schema-changing publication commits without growing schema history.
+    /// A staged index cursor advance classifies like an append: another
+    /// append is benign, while deletes, alters, and drops still conflict.
     #[test]
-    fn an_index_build_advance_alters_the_table_without_changing_its_schema() {
+    fn an_index_build_advance_inserts_without_changing_the_schema() {
         let advance = Operation::AdvanceIndexBuild { table_id: 1 };
         assert!(!advance.is_schema_changing());
         assert_eq!(advance.schema_changed_table_id(), None);
 
         let advanced = ChangeSet::from_operations(&[advance]);
-        assert_eq!(advanced.to_changes_made(), "altered_table:1");
+        assert_eq!(advanced.to_changes_made(), "inserted_into_table:1");
         let dropped = ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]);
         let altered = ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]);
         let appended = ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]);
+        let deleted = ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+            table_id: 1,
+            data_file_id: 10,
+        }]);
         assert!(conflicts(&advanced, &dropped));
         assert!(conflicts(&advanced, &altered));
-        assert!(conflicts(&advanced, &advanced));
-        assert!(conflicts(&advanced, &appended));
+        assert!(conflicts(&advanced, &deleted));
+        assert!(!conflicts(&advanced, &advanced));
+        assert!(!conflicts(&advanced, &appended));
 
         let elsewhere = ChangeSet::from_operations(&[Operation::AdvanceIndexBuild { table_id: 2 }]);
         assert!(!conflicts(&advanced, &elsewhere));
+    }
+
+    /// Publishing a deferred repair remains an alter-classified fence: a
+    /// writer that began while the index was maintaining must re-run and add
+    /// its entries before the definition can stay ready.
+    #[test]
+    fn finishing_index_maintenance_alters_without_changing_the_schema() {
+        let finish = Operation::FinishIndexMaintenance { table_id: 1 };
+        assert!(!finish.is_schema_changing());
+        assert_eq!(finish.schema_changed_table_id(), None);
+
+        let finished = ChangeSet::from_operations(&[finish]);
+        assert_eq!(finished.to_changes_made(), "altered_table:1");
+        for racing in [
+            ChangeSet::from_operations(&[Operation::RegisterDataFile { table_id: 1 }]),
+            ChangeSet::from_operations(&[Operation::RegisterDeleteFile {
+                table_id: 1,
+                data_file_id: 10,
+            }]),
+            ChangeSet::from_operations(&[Operation::AlterTable { table_id: 1 }]),
+            ChangeSet::from_operations(&[Operation::DropTable { table_id: 1 }]),
+        ] {
+            assert!(conflicts(&finished, &racing));
+        }
     }
 }

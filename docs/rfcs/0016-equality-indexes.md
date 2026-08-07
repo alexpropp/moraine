@@ -435,11 +435,12 @@ outcome. The maintenance scheduler repairs maintaining indexes before
 sweeping dropped ones.
 
 Further writers arriving while a repair runs continue to defer additions and
-maintain deletions. The final `ready` flip retains `altered_table` conflict
-classification, so a racing writer makes the repair re-derive from its durable
-source cursor rather than publish incomplete coverage. Intermediate repair
-steps and the final repair flip use the non-schema-changing index-advance
-operation: they mint snapshots for durability but add no
+maintain deletions. Intermediate repair steps classify
+`inserted_into_table`, so they can advance beside concurrent appends while
+retaining conflicts with deletes, schema alters, and drops. The final `ready`
+flip uses a non-schema-changing `altered_table` operation, so a racing writer
+makes the repair re-derive from its durable source cursor rather than publish
+incomplete coverage. Both operations mint snapshots for durability but add no
 `ducklake_schema_versions` rows. Only an index's initial publication and first
 build-to-ready flip are schema changes; routine upkeep cannot churn table
 schema history.
@@ -635,15 +636,16 @@ tail, so it consumes only later files. It re-derives the policy-bounded inline
 live set because UPDATE may preserve a row id while changing its value. The
 driver retains at most one step of derived entries plus one Arrow batch, so
 its entry memory is bounded by `BuildStep` rather than table size.
-Two builders racing the same build both write the definition key and
-collide write-write — the cursor serializes them mechanically. Steps carry
-the definition write, so they classify `altered_table:<table_id>` like the
-create: conservative — a step racing any same-table write surfaces a
-conflict rather than interleaving (a benign `inserted_into_table`
-refinement is unsettled). An intermediate cursor advance does **not** change
-the table schema: it mints its ordinary snapshot while retaining the current
-global schema version and writes no `ducklake_schema_versions` row. Only the
-initial definition publication and final `ready` flip advance schema history.
+Two builders racing the same build both write the definition key and collide
+write-write. Re-running either batch is idempotent, and the persisted source
+cursor advances monotonically, so a stale retry cannot move it backward.
+Intermediate steps classify `inserted_into_table:<table_id>`: a concurrent
+append is benign and re-runs whichever commit loses the head race, while the
+ordinary conflict matrix still rejects a concurrent delete, schema alter, or
+drop. An intermediate cursor advance does **not** change the table schema: it
+mints its ordinary snapshot while retaining the current global schema version
+and writes no `ducklake_schema_versions` row. Only the initial definition
+publication and final `ready` flip advance schema history.
 
 **The delete race.** A row live at one derivation pass can die before its
 step lands, and a stale entry for a dead row is corruption — for a unique
@@ -653,8 +655,9 @@ mechanism: derivation from a fresh snapshot.
 - *Past deletes* (committed before the pass's snapshot): excluded by
   construction — the scoped read applies the table's delete bookkeeping,
   so a dead row produces no entry.
-- *Concurrent deletes* (racing a step): the killing commit writes the
-  table the step's `altered_table` classification conflicts with, so the
+- *Concurrent deletes* (racing a step): the killing commit writes
+  `deleted_from_table`, which conflicts with the step's
+  `inserted_into_table` classification, so the
   loser surfaces `CommitConflict` — never an internal closure re-run that
   would re-stage a stale batch. The driver answers a surfaced conflict by
   re-deriving at a fresh snapshot (which excludes the newly dead rows) and
@@ -1030,7 +1033,9 @@ tests against real SlateDB on in-memory `object_store`:
 - **Staged lifecycle.** A staged build over a table too large for one batch,
   under concurrent inserts, deletes, and updates: lookups fail typed while
   `building`; after the flip, the `index` range is byte-identical to a
-  from-scratch single-commit build over the same live rows.
+  from-scratch single-commit build over the same live rows. Intermediate
+  steps serialize as `inserted_into_table`; publication commits remain
+  `altered_table`.
 - **Staged delete races.** A row deleted between `S₀` and its batch is
   excluded via the delete bookkeeping; a row deleted *concurrently* with its
   batch collides on the entry key, the batch re-runs, and the entry is
@@ -1045,7 +1050,8 @@ tests against real SlateDB on in-memory `object_store`:
   than failing the step.
 - **Staged resume and racing builders.** A builder killed mid-build resumes
   from the persisted cursor with idempotent re-puts; two builders advancing
-  one build serialize on the definition key.
+  one build serialize on the definition key, and a stale retry cannot regress
+  the source cursor.
 - **Ready-flip visibility.** A write in flight across the flip re-runs
   (altered-table conflict) and commits under full enforcement — a duplicate
   in that write gets `Constraint`, not poison.

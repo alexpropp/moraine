@@ -245,6 +245,26 @@ async fn intermediate_steps_do_not_grow_table_schema_history() {
         schema_history_len(&catalog, table).await - schema_history_before,
         2
     );
+    let changes: Vec<_> = moraine::ffi_support::dump_snapshots(&catalog)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|snapshot| snapshot.snapshot_id > snapshot_before)
+        .map(|snapshot| snapshot.changes_made)
+        .collect();
+    let altered = format!("altered_table:{}", table.get());
+    let inserted = format!("inserted_into_table:{}", table.get());
+    assert_eq!(
+        changes,
+        vec![
+            altered.clone(),
+            inserted.clone(),
+            inserted.clone(),
+            inserted,
+            altered,
+        ],
+        "only intermediate cursor advances loosen to append classification"
+    );
     catalog.close().await.unwrap();
 }
 
