@@ -1150,3 +1150,78 @@ fn moraine_index_create_takes_a_step_size() {
         "the refusal names the parameter, got: {stderr}"
     );
 }
+
+/// Deferred maintenance lets a non-unique index move SQL-write upkeep out
+/// of the data commit, then catches it up in bounded post-commit steps before
+/// returning. The index never serves a partial answer.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn moraine_index_deferred_maintenance_catches_up_after_sql_insert() {
+    let store = TempDir::new("index-deferred-store");
+    let data = TempDir::new("index-deferred-data");
+    let meta = format!(", META_DATA_PATH '{}'", data.path().display());
+    let run = |sql: &str| run_ducklake_sql_with_options(store.path(), data.path(), &meta, sql);
+
+    run("CREATE TABLE lake.main.t(a BIGINT);");
+    run(
+        "CALL moraine_index_create('lake', 'main', 't', 'by_a', ['a'], false, \
+         maintenance := 'deferred');",
+    );
+    let schema_rows = csv_rows(&run(
+        "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_schema_versions;",
+    ));
+    run("INSERT INTO lake.main.t SELECT i % 3 FROM range(7) t(i);");
+
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
+        )),
+        vec![vec!["2".to_string()]],
+        "the post-commit pass made every inserted row visible"
+    );
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT is_building FROM moraine_indexes('lake','main','t');"
+        )),
+        vec![vec!["false".to_string()]],
+        "the post-commit pass flipped the index back to ready"
+    );
+
+    run("INSERT INTO lake.main.t VALUES (1);");
+    run("CALL ducklake_flush_inlined_data('lake');");
+    run("CALL lake.set_option('data_inlining_row_limit', 0);");
+    run("UPDATE lake.main.t SET a = 2 WHERE a = 0;");
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 1);"
+        )),
+        vec![vec!["3".to_string()]],
+        "a later repair starts at the preceding source tail"
+    );
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM moraine_index_lookup('lake','main','t','by_a', 2);"
+        )),
+        vec![vec!["5".to_string()]],
+        "deferred UPDATE additions replace their synchronous removals"
+    );
+    assert_eq!(
+        csv_rows(&run(
+            "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_schema_versions;",
+        )),
+        schema_rows,
+        "routine deferred repair does not grow table schema history"
+    );
+
+    let stderr = run_ducklake_sql_expect_err_with_options(
+        store.path(),
+        data.path(),
+        &meta,
+        "CALL moraine_index_create('lake', 'main', 't', 'unique_by_a', ['a'], true, \
+         maintenance := 'deferred');",
+    );
+    assert!(
+        stderr.contains("non-unique"),
+        "deferred uniqueness cannot be sound: {stderr}"
+    );
+}

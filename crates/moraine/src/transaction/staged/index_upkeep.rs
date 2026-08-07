@@ -53,7 +53,11 @@ pub(super) async fn data_file_index_entries(
 ) -> Result<Vec<StagedIndexEntry>> {
     let file = decode_data_file(cells)?;
     let table = TableId::new(file.table_id);
-    let indexes = base.indexes_of(table);
+    let indexes: Vec<_> = base
+        .indexes_of(table)
+        .into_iter()
+        .filter(|index| index.maintenance != crate::catalog::IndexMaintenance::Deferred)
+        .collect();
     if indexes.is_empty() {
         return Ok(Vec::new());
     }
@@ -176,6 +180,7 @@ pub(super) async fn stage_index_maintenance(
     };
 
     let mut entries: Vec<StagedIndexEntry> = Vec::new();
+    let mut deferred: Vec<u64> = Vec::new();
     // Rows this commit kills, grouped by where their values must be read
     // from: an inline chunk, or a position range of one data file.
     let mut inline_deletes: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -195,6 +200,7 @@ pub(super) async fn stage_index_maintenance(
         &file_deletes,
         &context,
         &mut entries,
+        &mut deferred,
     )
     .await?;
 
@@ -235,10 +241,15 @@ pub(super) async fn stage_index_maintenance(
     if entries.is_empty() {
         return Ok(StagedEntries {
             poisoned: Vec::new(),
+            deferred,
             bytes: 0,
         });
     }
-    stage_index_entries(db_tx, &entries).await
+    let mut staged = stage_index_entries(db_tx, &entries).await?;
+    deferred.sort_unstable();
+    deferred.dedup();
+    staged.deferred = deferred;
+    Ok(staged)
 }
 
 /// Groups every row this commit kills: inlined rows by table, and file
@@ -308,6 +319,7 @@ async fn collect_deletes(
 /// accounted for here rather than as removals. A file registered by a
 /// commit that only compacts its table derives nothing and is not among
 /// them.
+#[allow(clippy::too_many_arguments)]
 async fn stage_adds(
     db_tx: &DbTransaction,
     base: &CatalogSnapshot,
@@ -316,6 +328,7 @@ async fn stage_adds(
     file_deletes: &HashMap<(u64, u64), KilledRows>,
     context: &FileContext<'_>,
     entries: &mut Vec<StagedIndexEntry>,
+    deferred: &mut Vec<u64>,
 ) -> Result<HashSet<(u64, u64)>> {
     let mut registered: HashSet<(u64, u64)> = HashSet::new();
     let mut adds: Vec<Add<'_>> = Vec::new();
@@ -339,6 +352,15 @@ async fn stage_adds(
                     continue;
                 }
 
+                deferred.extend(
+                    base.indexes_of(TableId::new(file.table_id))
+                        .into_iter()
+                        .filter(|index| {
+                            index.maintenance == crate::catalog::IndexMaintenance::Deferred
+                        })
+                        .map(|index| index.id.get()),
+                );
+
                 let key = (file.table_id, file.data_file_id);
                 registered.insert(key);
                 adds.push(Add::File {
@@ -354,6 +376,14 @@ async fn stage_adds(
                 arrow_body,
                 ..
             } => {
+                deferred.extend(
+                    base.indexes_of(TableId::new(*table_id))
+                        .into_iter()
+                        .filter(|index| {
+                            index.maintenance == crate::catalog::IndexMaintenance::Deferred
+                        })
+                        .map(|index| index.id.get()),
+                );
                 adds.push(Add::Inline {
                     table_id: *table_id,
                     chunk: InlineChunk {
@@ -490,7 +520,13 @@ pub(super) async fn inline_chunk_index_entries(
     held: Option<&HashSet<u64>>,
 ) -> Result<Vec<StagedIndexEntry>> {
     let table = TableId::new(table_id);
-    let indexes = base.indexes_of(table);
+    let indexes: Vec<_> = base
+        .indexes_of(table)
+        .into_iter()
+        .filter(|index| {
+            held.is_some() || index.maintenance != crate::catalog::IndexMaintenance::Deferred
+        })
+        .collect();
     if indexes.is_empty() {
         return Ok(Vec::new());
     }

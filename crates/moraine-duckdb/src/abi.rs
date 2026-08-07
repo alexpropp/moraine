@@ -1764,11 +1764,13 @@ unsafe fn column_orders(
 /// # Safety
 ///
 /// `probe`/`probe_ctx` must satisfy the ABI's cancellation contract.
+#[allow(clippy::too_many_arguments)]
 unsafe fn create_index_in_one_commit(
     handle: &MoraineCatalogHandle,
     table_id: moraine::TableId,
     def: &moraine::IndexDef,
     orders: &[moraine::ColumnOrder],
+    maintenance: moraine::IndexMaintenance,
     data_store: Option<std::sync::Arc<dyn object_store::ObjectStore>>,
     probe: MoraineInterruptProbe,
     probe_ctx: *mut c_void,
@@ -1810,11 +1812,13 @@ unsafe fn create_index_in_one_commit(
             probe,
             probe_ctx,
             handle.catalog.writer()?.commit(|tx| {
-                if orders.is_empty() {
-                    tx.create_index(table_id, def, &backfill)?;
-                } else {
-                    tx.create_index_ordered(table_id, def, orders, &backfill)?;
-                }
+                tx.create_index_ordered_with_maintenance(
+                    table_id,
+                    def,
+                    orders,
+                    maintenance,
+                    &backfill,
+                )?;
                 Ok(())
             }),
         )
@@ -1848,6 +1852,7 @@ pub unsafe extern "C" fn moraine_index_create(
     column_descending: *const u8,
     column_nulls_first: *const u8,
     unique: bool,
+    deferred_maintenance: bool,
     staged: bool,
     step_entries: u64,
     step_bytes: u64,
@@ -1912,6 +1917,11 @@ pub unsafe extern "C" fn moraine_index_create(
             columns: column_ids,
             unique,
         };
+        let maintenance = if deferred_maintenance {
+            moraine::IndexMaintenance::Deferred
+        } else {
+            moraine::IndexMaintenance::Synchronous
+        };
 
         // The staged build derives its own backfill, one bounded step at a
         // time; the single-commit path derives it all up front.
@@ -1934,14 +1944,18 @@ pub unsafe extern "C" fn moraine_index_create(
                 handle_ref.block_on_cancellable(
                     probe,
                     probe_ctx,
-                    handle_ref.catalog.writer()?.create_index_staged(
-                        table_id,
-                        &def,
-                        &orders,
-                        data_store,
-                        &handle_ref.data_prefix,
-                        Some(step),
-                    ),
+                    handle_ref
+                        .catalog
+                        .writer()?
+                        .create_index_staged_with_maintenance(
+                            table_id,
+                            &def,
+                            &orders,
+                            maintenance,
+                            data_store,
+                            &handle_ref.data_prefix,
+                            Some(step),
+                        ),
                 )
             }?;
             return Ok(());
@@ -1954,6 +1968,7 @@ pub unsafe extern "C" fn moraine_index_create(
                 table_id,
                 &def,
                 &orders,
+                maintenance,
                 data_store.filter(|_| holds_files),
                 probe,
                 probe_ctx,
@@ -2056,6 +2071,21 @@ pub unsafe extern "C" fn moraine_maintain(
         }
         // SAFETY: caller contract for `handle`.
         let handle_ref = unsafe { &*handle };
+
+        // Finish deferred index additions before reclaiming unrelated dead
+        // ranges. A failed repair remains non-queryable and resumable.
+        // SAFETY: caller contract for `probe`/`probe_ctx`.
+        unsafe {
+            handle_ref.block_on_cancellable(
+                probe,
+                probe_ctx,
+                handle_ref.catalog.writer()?.repair_deferred_indexes(
+                    handle_ref.data_store.clone(),
+                    &handle_ref.data_prefix,
+                    None,
+                ),
+            )
+        }?;
 
         // `MaintenanceRequest` is `#[non_exhaustive]`, so it is built
         // through `default()` and field assignment.

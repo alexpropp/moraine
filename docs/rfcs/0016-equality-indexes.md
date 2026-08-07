@@ -409,6 +409,41 @@ below moraine, so there is nothing to report but the wait — and the batch's
 size is the one fact that separates a batch that cannot be transferred from
 credentials that will not authorize it.
 
+### Deferred upkeep for non-unique indexes
+
+Synchronous upkeep remains the default: the data snapshot and every index
+entry land atomically. An index created with `maintenance := 'deferred'`
+instead moves **additions** out of DuckLake's data commit. This mode is
+limited to non-unique indexes: unique enforcement cannot acknowledge a row
+before its value has won the index collision.
+
+When a SQL commit adds rows covered by a deferred index, the same snapshot
+that registers the rows flips that index from `ready` to `maintaining` and
+persists the repair cursor. It stages no additions for that index. Deletions
+remain synchronous in every state, so no stale entry survives while a repair
+is pending. An UPDATE therefore removes the old value in its data commit and
+leaves the new value for the repair.
+
+`maintaining` is unavailable, never partially readable: every lookup fails
+with the same typed building error used by an initial staged backfill. After
+the data snapshot is durable, the extension drives the ordinary bounded
+backfill machinery over the missing live rows and flips the index back to
+`ready`. Repair failure cannot roll back a data snapshot that already landed;
+it is logged and leaves the durable `maintaining` marker for the next SQL
+commit or moraine maintenance pass to resume. Process loss has the same
+outcome. The maintenance scheduler repairs maintaining indexes before
+sweeping dropped ones.
+
+Further writers arriving while a repair runs continue to defer additions and
+maintain deletions. The final `ready` flip retains `altered_table` conflict
+classification, so a racing writer makes the repair re-derive from its durable
+source cursor rather than publish incomplete coverage. Intermediate repair
+steps and the final repair flip use the non-schema-changing index-advance
+operation: they mint snapshots for durability but add no
+`ducklake_schema_versions` rows. Only an index's initial publication and first
+build-to-ready flip are schema changes; routine upkeep cannot churn table
+schema history.
+
 ### What data movement costs the index: nothing
 
 The entry payload is a row id, not a location. Flush re-homes rows from
@@ -580,22 +615,26 @@ does not fail the writer (below).
 
 **Backfill batches.** The builder covers the rows live at its current
 snapshot; everything committed after the definition is writer-covered by
-the paragraph above, so the two sets meet with no gap. Each derivation
-pass assembles the whole live backfill — inline chunks by scanning,
-external files by the scoped read, delete files and inline deletes already
-applied — sorts it by row id, and streams it as bounded step commits in
-row-id order, each step ending at whichever bound of `BuildStep` it reaches
-first (Two bounds on a step) and always carrying at least one entry. Each step atomically
-advances a **cursor** persisted in the definition value — the highest row
-id covered — so a crashed or cancelled build resumes by re-deriving and
-skipping entries at or below the watermark; re-derived entries land as
-idempotent puts (multi keys include the row id; unique puts hit the
-same-row-id no-op arm). Row-id order is what makes the single watermark
-sufficient, and the global sort is what makes per-row-id rewrite files
-(whose embedded ids interleave with dense ranges) safe to cover. The
-derivation holds the raw entry set in driver memory — two orders of
-magnitude cheaper per entry than the store's write path, so the commit
-bound's rationale does not apply; the cost is recorded rather than capped.
+the paragraph above, so the two sets meet with no gap. A derivation pass
+walks live inline chunks and then external files in durable source order.
+Parquet is decoded as bounded Arrow batches and entries flow directly into
+the next `BuildStep`; the driver never assembles or sorts the table-wide
+entry set. Delete files and inline deletes are applied as each source is
+read. Each step ends at whichever `BuildStep` bound it reaches first (Two
+bounds on a step) and always carries at least one entry.
+
+Each step atomically advances a **source cursor** persisted in the definition
+value: the completed inline row watermark, then the data-file id and physical
+position most recently covered. Files are immutable and ids are monotonic, so
+the cursor survives a crash without depending on embedded row-id order. A
+replacement file receives a later id and is safe to re-derive; entries name
+stable row ids, so the put is idempotent whether the source row was already
+covered. A crash within one file resumes after its last durable physical
+position. Deferred repair seeds the file cursor at the preceding snapshot's
+tail, so it consumes only later files. It re-derives the policy-bounded inline
+live set because UPDATE may preserve a row id while changing its value. The
+driver retains at most one step of derived entries plus one Arrow batch, so
+its entry memory is bounded by `BuildStep` rather than table size.
 Two builders racing the same build both write the definition key and
 collide write-write — the cursor serializes them mechanically. Steps carry
 the definition write, so they classify `altered_table:<table_id>` like the
@@ -670,12 +709,12 @@ step re-runs against the ended definition and stops.
 The driver emits progress at `info`. A derivation-started event makes the
 otherwise quiet Parquet-read phase explicit; the matching derived event names
 the live entry total and the derivation and sort times. Every successfully
-durable step then reports the entries in that step, cumulative completed and
-total entries, percentage, cursor, final-step flag, and commit time. The
-cumulative count is computed from the persisted cursor, so it includes work
-recovered from an earlier invocation. A conflicting step emits a warning with
-the last durable cumulative count before the driver re-derives. Attempted but
-non-durable work is never reported as completed.
+durable step then reports the entries in that step, cumulative entries for the
+current invocation, the live-table total estimate, percentage, row and source
+cursors, final-step flag, and commit time. A resumed invocation starts its
+counter at zero but names its durable starting cursor. A conflicting step
+emits a warning with the last durable count before the driver re-derives.
+Attempted but non-durable work is never reported as completed.
 
 **Format.** Staged builds stamp **format 3** at the first staged
 `create_index` — lazily, like format 2. A format-2 binary would ignore the
@@ -704,7 +743,7 @@ written `…` below for brevity.
 
 | Function | Effect |
 |---|---|
-| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b, step_entries := n, step_bytes := n)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call. `step_entries`/`step_bytes` bound one step of that build (Two bounds on a step); each must be positive, and both are ignored without `staged` |
+| `moraine_index_create(…, columns, unique, directions := ['asc'\|'desc'], nulls := ['first'\|'last'], staged := b, maintenance := 'synchronous'\|'deferred', step_entries := n, step_bytes := n)` | insert the definition, backfill live rows (Coverage). `directions`/`nulls` are optional, parallel to `columns`, defaulting ascending / NULLS LAST. `staged := true` runs the multi-commit build (Staged builds) — required past the single-commit bound, resumable by re-issuing the call. `maintenance := 'deferred'` opts a non-unique index into bounded post-commit SQL-write upkeep; unique indexes refuse it. `step_entries`/`step_bytes` bound one staged build step (Two bounds on a step); each must be positive |
 | `moraine_index_drop(…)` | end the definition (Reclamation) |
 | `moraine_index_lookup(…, v…)` | table function: row ids and holders for the equality key `v…` — one variadic value per indexed column, in the index's column order (a single value for a single-column index); the count must equal the index width |
 | `moraine_index_in(…, keys)` | table function: row ids and holders for the union of complete equality keys in `keys`. A single-column index takes a list of scalar values; a composite index takes a list of `row(...)` values in index-column order. Duplicate keys are one predicate, a key containing NULL matches no row, and an empty list returns no rows |
@@ -920,9 +959,11 @@ validation). Index-free stores stay format 1, byte-identical to today,
 compatible in both directions. Format 2 is format 1 plus the `index` subspace
 and `index` kind — no migration, no rewrite; dropping the last index does not
 downgrade the stamp. Staged builds bump once more, to format 3 (Staged
-builds), under the same lazy posture. The `index` discriminant leaves the
-segment extractor ("first byte") untouched, so existing segments and the
-RFC 0011 crash cases are unaffected.
+builds), under the same lazy posture. Deferred upkeep bumps to format 4: a
+format-3 writer does not know the deferred marker and could otherwise rewrite
+a partially covered definition as ready. The `index` discriminant leaves the
+segment extractor ("first byte") untouched, so existing segments and the RFC
+0011 crash cases are unaffected.
 
 ### Reclamation
 

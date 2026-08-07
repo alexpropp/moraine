@@ -213,9 +213,6 @@ deliberately not itemized here.
 - **DECISION** — Whether to carry an upstream DuckLake binder patch accepting
   `CREATE INDEX` and `PRIMARY KEY` and routing equality pushdown to the moraine
   index.
-- **DECISION** — Whether to offer a deferred, post-commit index-maintenance
-  mode for non-unique indexes on SQL writes, trading an under-coverage window
-  for the scoped read's commit-time latency.
 - **DECISION** — Whether to add a store-level reverse iterator, so one index
   serves both directions and a composite its exact-opposite order, versus
   keeping "declare the direction or build a second index". Reverse currently
@@ -223,9 +220,6 @@ deliberately not itemized here.
 - **DEFERRED** — Make the per-commit index-entry cap a `CatalogOptions` field
   threaded through both commit paths and the FFI, instead of a hardcoded
   constant, once a caller has a legitimate reason to raise it.
-- **DEFERRED** — Bound the staged-build derivation's driver memory. The whole
-  live backfill is materialized into one entry vector before stepping; only
-  per-commit staging is capped.
 - **DEFERRED** — Ordered emission of stored NULL rows at the declared
   `NULLS FIRST` or `NULLS LAST` end of an ordered scan. Range scans clamp to
   the non-null region, so this becomes observable only once `ORDER BY` routes
