@@ -20,7 +20,7 @@ use crate::{
     error::{Error, Result},
     store::{
         StagedBytes,
-        handle::{ReadHandle, ScanShape},
+        handle::{ReadHandle, ScanOrder, ScanShape},
         index_encoding::{CanonicalKey, NullOrder, non_null_flag_key},
         key::{
             IndexKey, IndexKind, Key, index_index_prefix, index_multi_value_prefix,
@@ -483,11 +483,11 @@ pub(crate) async fn lookup_row_ids(
 }
 
 /// The row ids whose indexed value falls between `lower` and `upper`, in the
-/// index's stored order. Ordered encoding makes byte order equal value order,
-/// so the query is a bounded sub-scan of the index's contiguous range; the
-/// bounds are the canonical values, already encoded in the columns' declared
-/// directions. A unique entry carries its row id in the value, a non-unique
-/// one in the key.
+/// requested scan order. Ordered encoding makes byte order equal the index's
+/// declared value order, so the query is a bounded sub-scan of its contiguous
+/// range; descending iteration serves the exact opposite. The bounds are the
+/// canonical values, already encoded in the columns' declared directions. A
+/// unique entry carries its row id in the value, a non-unique one in the key.
 pub(crate) async fn range_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
@@ -495,6 +495,7 @@ pub(crate) async fn range_row_ids(
     leading_nulls: NullOrder,
     lower: Bound<CanonicalKey>,
     upper: Bound<CanonicalKey>,
+    order: ScanOrder,
 ) -> Result<Vec<u64>> {
     let kind = if unique {
         IndexKind::Unique
@@ -533,7 +534,7 @@ pub(crate) async fn range_row_ids(
     };
 
     let mut iter = reader
-        .scan_prefix(prefix, (start, end), ScanShape::Probe)
+        .scan_prefix_ordered(prefix, (start, end), ScanShape::Probe, order)
         .await
         .map_err(Error::from)?;
     let mut row_ids = Vec::new();
@@ -559,17 +560,19 @@ pub(crate) async fn range_row_ids(
 /// A row with any NULL indexed column is stored multi-shaped, so `IS NULL`
 /// queries scan the `multi` subrange; the value framing's terminator is
 /// dropped from the scan prefix so it matches every key that extends the run.
+/// The iterator emits the stored or exact-opposite order directly.
 pub(crate) async fn null_prefix_row_ids(
     reader: ReadHandle<'_>,
     index_id: u64,
     prefix: &CanonicalKey,
+    order: ScanOrder,
 ) -> Result<Vec<u64>> {
     let mut scan_prefix = index_multi_value_prefix(index_id, prefix);
     // `index_multi_value_prefix` frames the value and appends a terminator for an
     // exact-value scan; dropping it turns the bytes into a true leading prefix.
     scan_prefix.pop();
     let mut iter = reader
-        .scan_prefix(scan_prefix, .., ScanShape::Probe)
+        .scan_prefix_ordered(scan_prefix, .., ScanShape::Probe, order)
         .await
         .map_err(Error::from)?;
     let mut row_ids = Vec::new();

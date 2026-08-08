@@ -1326,6 +1326,19 @@ async fn unique_index_admits_null_rows_and_index_nulls_finds_them() {
     nulls.sort_unstable();
     assert_eq!(nulls, vec![1, 2], "IS NULL finds both NULL rows");
 
+    let reversed_nulls = catalog
+        .index_nulls(table, index, vec![None], true)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.row_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reversed_nulls,
+        vec![2, 1],
+        "a reverse NULL-prefix scan streams the opposite order"
+    );
+
     // The non-null value is still uniquely resolvable, unaffected.
     let value = vec![crate::store::index_encoding::IndexKeyValue::Int {
         value: 10,
@@ -1496,6 +1509,23 @@ async fn index_range_spans_a_composite_prefix_and_window() {
         .await
         .unwrap();
     assert_eq!(sorted_row_ids(above_a), vec![2], "a > 5 spans only row 2");
+
+    let forward = catalog
+        .index_range(table, index, Bound::Unbounded, Bound::Unbounded, false)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.row_id)
+        .collect::<Vec<_>>();
+    let reverse = catalog
+        .index_range(table, index, Bound::Unbounded, Bound::Unbounded, true)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.row_id)
+        .collect::<Vec<_>>();
+    assert_eq!(forward, vec![0, 1, 2]);
+    assert_eq!(reverse, vec![2, 1, 0]);
 
     catalog.close().await.unwrap();
 }

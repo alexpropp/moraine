@@ -5,6 +5,11 @@ directory. RFCs state the binding design; this file states what about that
 design is undecided or unbuilt. An RFC that has no entry here is fully
 settled and fully implemented.
 
+Requests owned by upstream projects are tracked separately in
+[`../ducklake.md`](../ducklake.md) and [`../slatedb.md`](../slatedb.md). They
+do not remain open work here unless moraine has an independent implementation
+or decision to make.
+
 Each item is tagged:
 
 - **DECISION** — a design question with no answer yet.
@@ -26,12 +31,6 @@ deliberately not itemized here.
 
 ## 0004 — Commit and transaction protocol
 
-- **DEFERRED** — Let the staged-row path join a batch. Both front doors now
-  land through one function, but the staged path still commits its own
-  transaction: its snapshot id is DuckLake's, authored against the head it
-  read, so it can only ever lead a batch, never fold onto a member. Worth
-  building when DuckLake's serialized metadata connection admits concurrent
-  committers — until then there is nothing to batch it with.
 - **MEASURE** — Commit latency against a *real* S3, not a loopback one. The
   composition is settled and measured both ways (`BENCHMARK.md` → Core
   measurements: `max(flush cadence, write RTT) + ~2 ms`, confirmed by an
@@ -43,17 +42,6 @@ deliberately not itemized here.
 
 - **DEFERRED** — Auto-flush policy: when to trigger an inline flush. This RFC
   specifies only the mechanism; the policy is an operational concern.
-
-## 0006 — Extension surface (DuckDB)
-
-- **DEFERRED** — The upstream DuckLake catalog-cache multi-threaded race: a
-  fresh attach's listing comes back empty right after a write, so every e2e
-  session pins `SET threads=1`. Not moraine's to fix, and re-verified live at
-  the tracked version — 23 of 40 runs against a plain duckdb-file-backed
-  catalog with no moraine in the chain, and not `RENAME`-specific (a plain
-  `CREATE TABLE` is enough). A test now asserts the race's *presence* against
-  the reference chain, so its failure is the signal that the workaround can
-  go.
 
 ## 0007 — Snapshot expiry and garbage collection
 
@@ -76,24 +64,6 @@ deliberately not itemized here.
   Whichever is taken first pulls the other with it. A replay's base-view
   copy is the one part of a refresh that scales with catalog size
   (`BENCHMARK.md`), so this would bound that too.
-- **DEFERRED** — Upstream: a caller-supplied stable cache scope in
-  SlateDB. Shared-cache keys are scoped per opened handle by a
-  process-local counter assigned in attach *order*, not derived from the
-  store, so foyer's disk recovery matches only when a restart repeats the
-  order — and on a host attaching two lakes that reverses it, one store's
-  scope can match the other's recovered entries. Compacted SST ids are
-  ULIDs and collide with nothing; WAL ids are per-store sequential `u64`s
-  and are exactly what the scoping exists to keep apart. A scope derived
-  from the store path would make the disk tier restart-warm *and* remove
-  the mismatch. Until then the restart story is preload, at re-fetch cost.
-  Filed as an upstream ask rather than a decision to take: nothing here
-  blocks on it, and the cross-process row cache below is the other way to
-  the same end.
-- **VALIDATE** — The disk tier across a restart, in both attach orders.
-  Traced through the scope-id assignment above and never reproduced: two
-  lakes on one cache directory, attached in one order, restarted, attached
-  in the other. Closes the question of whether the mismatch is reachable
-  or only theoretical.
 - **DECISION** — Whether each attach should build its own block cache
   rather than sharing the process's. For it: every attach's options would
   mean what they say instead of the first attach's standing, and one
@@ -110,13 +80,6 @@ deliberately not itemized here.
   and one per attach would both cost two threads an attach and re-open the
   hang that keeping it off the attach's runtime fixed. The reporting half
   is already built — the tally is per attach.
-- **DEFERRED** — Upstream: export `SsTableId`, so
-  `DbCacheManagerOps::warm_sst` and `evict_cached_sst` can be called at
-  all (their parameter type is in a private module). Closed as a
-  decision: the preload warms by reading, which is cheaper and
-  subspace-grained rather than SST-grained, so an export would buy
-  precision rather than capability. Worth filing upstream; nothing here
-  waits on it.
 - **DEFERRED** — SST block size (0002's layout, 4 KiB today): a sweep over
   4/16/64 KiB on the scan-heavy `current` and probe-heavy `index`
   workloads. Attempted and withdrawn twice over. The sweep must set a
@@ -135,8 +98,9 @@ deliberately not itemized here.
   case, where every process starts row-cold today. Deferred because it is
   a second durable encoding to version and migrate; revisit when
   deploy-cold attach cost is measured, and note the byte tier's restart
-  story is currently preload-at-re-fetch-cost (the stable-scope DECISION
-  above), which strengthens this item's case until that lands.
+  story is currently preload-at-re-fetch-cost (the stable-scope request in
+  [`../slatedb.md`](../slatedb.md)), which strengthens this item's case until
+  that lands.
 
 ## 0013 — Partitioning, sorting, and pruning
 
@@ -146,26 +110,6 @@ deliberately not itemized here.
   0009 records why pushdown cannot pay off while the whole catalog is resident,
   so this revives only alongside that decision. If built it must be
   transform-aware and type-aware, never a naive compare.
-- **DEFERRED** — Upstream: DuckLake discards virtual-column filters before
-  they reach the file list, so `rowid`, `filename`, and `file_index` never
-  prune it. `DuckLakeMultiFileList::AddFilterToPushdownInfo` returns early
-  for any virtual column, and both pushdown entry points bail out once
-  nothing survives, so a `rowid` predicate opens every live file to read its
-  footer where a real-column predicate opens one. Measured against the
-  pinned DuckLake (`d8a1881`) over a four-file table, identically for
-  `SELECT` and `DELETE`: `WHERE line < 3` opened 1 file, `WHERE rowid IN
-  (…)` opened 4. Fixable upstream with no new metadata —
-  `DuckLakeFileListEntry` already carries `row_id_start` and
-  `ducklake_data_file` carries `record_count`, so a file's row-id interval
-  is derivable from the list query itself. Not moraine's to fix: DuckLake
-  builds the file list, moraine only answers it. It bounds what an equality
-  index is worth on the read path, since a resolved row id has no prunable
-  spelling.
-- **DEFERRED** — Upstream: filter pushdown is gated to `SCAN_TABLE`, so the
-  change-feed scans (`SCAN_INSERTIONS`, `SCAN_DELETIONS`) and the flush's
-  own scan get none at all — real column filters included, not just the
-  virtual ones above. Same owner, and the reason a change-feed read cannot
-  prune the way the equivalent table scan does.
 
 ## 0014 — Catalog and data encryption
 
@@ -202,31 +146,6 @@ deliberately not itemized here.
 - **DEFERRED** — Rolling a fleet across a structural bump with mixed binary
   versions online.
 
-## 0016 — Equality indexes
-
-- **DECISION** — Whether to carry an upstream DuckLake binder patch accepting
-  `CREATE INDEX` and `PRIMARY KEY` and routing equality pushdown to the moraine
-  index.
-- **DECISION** — Whether to add a store-level reverse iterator, so one index
-  serves both directions and a composite its exact-opposite order, versus
-  keeping "declare the direction or build a second index". Reverse currently
-  materializes the row-id vector and reverses it.
-- **DEFERRED** — Make the per-commit index-entry cap a `CatalogOptions` field
-  threaded through both commit paths and the FFI, instead of a hardcoded
-  constant, once a caller has a legitimate reason to raise it.
-- **DEFERRED** — Ordered emission of stored NULL rows at the declared
-  `NULLS FIRST` or `NULLS LAST` end of an ordered scan. Range scans clamp to
-  the non-null region, so this becomes observable only once `ORDER BY` routes
-  to the index.
-- **DEFERRED** — Replace the batched scan-and-delete orphan sweep with a single
-  SlateDB range-delete once that primitive exists at the pinned version. Shared
-  with 0021.
-- **DEFERRED** — Route comparison and `ORDER BY` pushdown into DuckLake's
-  optimizer. The encoding blocker is gone; this waits on a binder change.
-- **DEFERRED** — Map a native `ducklake_*` index onto the same `index` range via
-  the reserved `ducklake_index_id` field, if DuckLake grows index metadata,
-  with maintenance arriving as writer-supplied entries.
-
 ## 0021 — Maintenance orchestration
 
 - **DECISION** — Whether to persist the maintenance status window, and whether
@@ -241,8 +160,6 @@ deliberately not itemized here.
   cheap sweep interval can differ from an expensive
   `delete_orphaned_files` interval. One interval drives the whole fixed
   sequence today.
-- **DEFERRED** — Collapse the batched sweep into one range-delete per dead
-  index if SlateDB exposes a range delete. Shared with 0016.
 - **DEFERRED** — Wire checkpoint lifecycle in as a consumer of the maintenance
   pass surface, if and when it lands.
 - **MEASURE** — The absolute number against a real endpoint. Both halves of
