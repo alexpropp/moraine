@@ -317,17 +317,42 @@ that they should.
 ### The scheduler
 
 One thread per read-write attach, started at `ATTACH` when an interval is
-configured, stopped and joined at detach *before* `moraine_detach`
-(`abi.rs:775`) releases the handle. Three properties it must hold:
+configured. Explicit `DETACH` stops and joins it before `moraine_detach`
+(`abi.rs:775`) releases the handle. Without `DETACH`, destruction of the last
+host `ClientContext` stops and joins it before that context releases its
+`DatabaseInstance` reference. Moraine tags the connection a pass creates and
+excludes it from the host count. DuckLake's temporary connection for the nested
+metadata attach remains a host, but closing it does not stop the scheduler while
+the caller's connection remains. The catalog destructor repeats the operation
+as an idempotent fallback.
+
+The connection-lifecycle hook is load-bearing. A running pass owns a DuckDB
+`Connection`, and that connection retains the `DatabaseInstance`; waiting for
+the database or catalog destructor to initiate the join creates an ownership
+cycle. The last-host hook breaks the cycle while both the database and catalog
+handle are still live. DuckDB calls connection-close callbacks under its
+connection-manager lock, so the callback records a context state and that
+state's destructor performs the join after the lock is released. Otherwise the
+worker connection's own close would deadlock on the same lock.
+
+Once every host context has closed, scheduled passes for that attachment stay
+stopped even if an embedder retains the `DuckDB` object and later opens another
+connection. Queries and manually triggered maintenance remain available. A new
+schedule requires a new attach; this keeps one unambiguous ownership boundary
+rather than reviving a thread whose original database-close sequence already
+began.
+
+Three properties the scheduler must hold:
 
 - **Single-flight.** A pass still running when the next tick fires skips
   that tick rather than overlapping. Concurrent passes are safe — the sweep
   is idempotent — but their DuckLake steps collide under RFC 0008's
   conflict matrix, and a scheduler that manufactures its own conflicts is
   indefensible.
-- **Stops before the database does.** Detach sets the stop flag and joins;
-  the thread holds no reference that would keep the `DatabaseInstance`
-  alive past shutdown.
+- **Stops before the database does.** Detach or destruction of the last host
+  context sets the stop flag and joins. A pass already in flight completes
+  before the join returns, so its connection and handle cannot outlive DuckDB
+  state.
 - **Failures are visible.** An unattended pass has no one to return an
   error to, so `moraine_maintenance_status` serves the **last 16 passes**,
   newest first, each carrying `started_at` and whether it was `scheduled`
@@ -829,6 +854,9 @@ Live (e2e):
   per pass rather than frozen at attach.
 - **Detach during a running pass completes**, rather than hanging on the
   join or failing.
+- **Process teardown without detach completes a running pass** before the
+  last host context releases the database, rather than letting the pass's own
+  connection keep the database alive until process exit.
 - **Path overlap refused**; sibling locations attach normally.
 - **The census table function** reports one row per subspace on a lake with
   data, from a read-write and a read-only attach alike.

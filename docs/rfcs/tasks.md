@@ -229,9 +229,6 @@ deliberately not itemized here.
 
 ## 0021 — Maintenance orchestration
 
-- **DECISION** — The outcome when a process is torn down without detaching at
-  all. DuckDB extension teardown ordering leaves scheduler-thread lifetime
-  undefined in that case.
 - **DECISION** — Whether to persist the maintenance status window, and whether
   inside the catalog or outside it, so an overnight failure in a
   since-restarted process leaves a trace. Today it is a per-attach in-memory

@@ -165,8 +165,8 @@ private:
 // duckdb::NotImplementedException.
 class MoraineCatalog : public duckdb::Catalog {
 public:
-	MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path,
-	               MaintenanceConfig maintenance);
+	MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientContext &context,
+	               MoraineCatalogHandle *handle, std::string path, MaintenanceConfig maintenance);
 	~MoraineCatalog() override;
 
 	// The attach_function_t the storage extension registers.
@@ -237,7 +237,7 @@ public:
 private:
 	MoraineCatalogHandle *handle_;
 	std::string path_;
-	duckdb::unique_ptr<MaintenanceScheduler> scheduler_;
+	duckdb::shared_ptr<MaintenanceScheduler> scheduler_;
 
 	// One dumped row set per synthesized table, stamped with the store
 	// state it was dumped at. DuckLake re-reads its metadata at every
