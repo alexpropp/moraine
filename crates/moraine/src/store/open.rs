@@ -12,7 +12,7 @@ use object_store::ObjectStore;
 use slatedb::{
     BlockCachePolicy, CacheTarget, Db, DbReader, DbReaderMode,
     admin::AdminBuilder,
-    config::{CheckpointOptions, CheckpointScope, DbReaderOptions, Settings},
+    config::{CheckpointOptions, CheckpointScope, DbReaderOptions, Settings, SstBlockSize},
 };
 use tracing::info;
 use uuid::Uuid;
@@ -30,6 +30,9 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// configured — SlateDB's own default, kept so an unconfigured reader
 /// costs exactly what it always has.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The stored block grain for every writer and reader.
+const SST_BLOCK_SIZE: SstBlockSize = SstBlockSize::Block4Kib;
 
 /// Creates a checkpoint of everything `db` has committed, expiring after
 /// `lifetime` (never, if `None`), and reports its id. The scope is every
@@ -193,6 +196,7 @@ impl<'a> StoreBuilder<'a> {
         let counters = cache::store_counters();
         let mut builder = Db::builder(self.path, Arc::clone(&self.object_store))
             .with_settings(settings)
+            .with_sst_block_size(SST_BLOCK_SIZE)
             .with_segment_extractor(Arc::new(TagSegmentExtractor))
             .with_block_cache_policy(self.block_cache_policy())
             .with_metrics_recorder(cache::recorder(Arc::clone(&counters)));
@@ -396,6 +400,13 @@ mod tests {
 
     fn memory_store() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
+    }
+
+    /// The format grain is a moraine choice rather than an upstream default
+    /// that can move without the matching scan/probe evidence.
+    #[test]
+    fn the_sst_block_size_is_fixed_at_four_kibibytes() {
+        assert_eq!(SST_BLOCK_SIZE.as_bytes(), 4 * 1024);
     }
 
     /// A commit-shaped transaction spanning several subspaces lands
