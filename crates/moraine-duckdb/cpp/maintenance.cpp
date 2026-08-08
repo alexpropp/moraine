@@ -1,7 +1,11 @@
 #include "maintenance.hpp"
 
+#include "duckdb/main/client_context_state.hpp"
+
+#include "duckdb/main/connection_manager.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 
 #include "catalog.hpp"
 #include "moraine_abi.h"
@@ -228,6 +232,118 @@ namespace {
 // that passes `METADATA_CATALOG` uses its own name instead, which is why
 // this prefix is only ever a fallback.
 constexpr const char *METADATA_PREFIX = "__ducklake_metadata_";
+constexpr const char *MAINTENANCE_CLOSE_STATE = "moraine_maintenance_close";
+constexpr const char *MAINTENANCE_CONNECTION_STATE = "moraine_maintenance_connection";
+
+class MaintenanceConnectionState : public duckdb::ClientContextState {
+};
+
+class MaintenanceLifecycle;
+
+class MaintenanceCloseState : public duckdb::ClientContextState {
+public:
+	MaintenanceCloseState(MaintenanceLifecycle &lifecycle, uint64_t host_epoch)
+	    : lifecycle_(lifecycle), host_epoch_(host_epoch) {
+	}
+	~MaintenanceCloseState() override;
+
+private:
+	MaintenanceLifecycle &lifecycle_;
+	uint64_t host_epoch_;
+};
+
+thread_local bool opening_maintenance_connection = false;
+
+class MaintenanceConnectionScope {
+public:
+	MaintenanceConnectionScope() : previous_(opening_maintenance_connection) {
+		opening_maintenance_connection = true;
+	}
+	~MaintenanceConnectionScope() {
+		opening_maintenance_connection = previous_;
+	}
+
+private:
+	bool previous_;
+};
+
+class MaintenanceLifecycle : public duckdb::ExtensionCallback {
+public:
+	void Add(const duckdb::shared_ptr<MaintenanceScheduler> &scheduler) {
+		std::lock_guard<std::mutex> guard(lock_);
+		Prune();
+		schedulers_.push_back(scheduler);
+	}
+
+	void OnConnectionOpened(duckdb::ClientContext &context) override {
+		if (opening_maintenance_connection) {
+			context.registered_state->GetOrCreate<MaintenanceConnectionState>(MAINTENANCE_CONNECTION_STATE);
+			return;
+		}
+
+		std::lock_guard<std::mutex> guard(lock_);
+		host_epoch_++;
+	}
+
+	void OnConnectionClosed(duckdb::ClientContext &context) override {
+		if (context.registered_state->Get<MaintenanceConnectionState>(MAINTENANCE_CONNECTION_STATE)) {
+			return;
+		}
+
+		auto &connections = duckdb::ConnectionManager::Get(context).GetConnectionListReference();
+		for (auto &entry : connections) {
+			auto &other = entry.first.get();
+			if (&other == &context || entry.second.expired()) {
+				continue;
+			}
+			if (!other.registered_state->Get<MaintenanceConnectionState>(MAINTENANCE_CONNECTION_STATE)) {
+				return;
+			}
+		}
+
+		uint64_t host_epoch;
+		{
+			std::lock_guard<std::mutex> guard(lock_);
+			host_epoch = host_epoch_;
+		}
+		context.registered_state->GetOrCreate<MaintenanceCloseState>(MAINTENANCE_CLOSE_STATE, *this, host_epoch);
+	}
+
+	void StopIfNoHostOpened(uint64_t host_epoch) {
+		std::vector<duckdb::shared_ptr<MaintenanceScheduler>> schedulers;
+		{
+			std::lock_guard<std::mutex> guard(lock_);
+			if (host_epoch_ != host_epoch) {
+				return;
+			}
+			Prune();
+			for (auto &scheduler : schedulers_) {
+				auto live = scheduler.lock();
+				if (live) {
+					schedulers.push_back(std::move(live));
+				}
+			}
+		}
+		for (auto &scheduler : schedulers) {
+			scheduler->Stop();
+		}
+	}
+
+private:
+	void Prune() {
+		schedulers_.erase(std::remove_if(schedulers_.begin(), schedulers_.end(),
+		                                 [](const auto &scheduler) { return scheduler.expired(); }),
+		                  schedulers_.end());
+	}
+
+	std::mutex lock_;
+	std::vector<duckdb::weak_ptr<MaintenanceScheduler>> schedulers_;
+	uint64_t host_epoch_ = 0;
+};
+
+MaintenanceCloseState::~MaintenanceCloseState() {
+	lifecycle_.StopIfNoHostOpened(host_epoch_);
+}
 
 } // namespace
 
@@ -270,13 +386,19 @@ MaintenanceScheduler::~MaintenanceScheduler() {
 }
 
 void MaintenanceScheduler::Start() {
+	std::lock_guard<std::mutex> stop_guard(stop_lock_);
 	if (config_.interval_ms == 0 || thread_.joinable()) {
 		return;
+	}
+	{
+		std::lock_guard<std::mutex> guard(wake_lock_);
+		stopping_ = false;
 	}
 	thread_ = std::thread([this]() { Loop(); });
 }
 
 void MaintenanceScheduler::Stop() {
+	std::lock_guard<std::mutex> stop_guard(stop_lock_);
 	{
 		std::lock_guard<std::mutex> guard(wake_lock_);
 		stopping_ = true;
@@ -285,6 +407,18 @@ void MaintenanceScheduler::Stop() {
 	if (thread_.joinable()) {
 		thread_.join();
 	}
+}
+
+void BindMaintenanceScheduler(duckdb::ClientContext &context,
+                              const duckdb::shared_ptr<MaintenanceScheduler> &scheduler) {
+	for (auto &callback : duckdb::ExtensionCallback::Iterate(context)) {
+		auto lifecycle = dynamic_cast<MaintenanceLifecycle *>(callback.get());
+		if (lifecycle != nullptr) {
+			lifecycle->Add(scheduler);
+			return;
+		}
+	}
+	throw duckdb::InternalException("moraine: maintenance lifecycle callback is not registered");
 }
 
 void MaintenanceScheduler::Loop() {
@@ -332,6 +466,7 @@ std::vector<MaintenanceStep> MaintenanceScheduler::RunPass(bool skip_if_busy, co
 	// takes a non-recursive lock, so a query issued from inside a running
 	// operator on the caller's own context would deadlock; a separate
 	// connection on the same instance is the supported way in.
+	MaintenanceConnectionScope maintenance_connection;
 	duckdb::Connection connection(db_);
 	auto lake = ResolveLakeName(connection);
 
@@ -753,6 +888,8 @@ void CompactImpl(duckdb::ClientContext &, duckdb::TableFunctionInput &data, duck
 } // namespace
 
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader) {
+	duckdb::ExtensionCallback::Register(loader.GetDatabaseInstance().config,
+	                                    duckdb::make_shared_ptr<MaintenanceLifecycle>());
 	duckdb::TableFunction maintenance("moraine_maintenance", {duckdb::LogicalType::VARCHAR}, MaintenanceImpl,
 	                                  MaintenanceBind, MaintenanceInitGlobal);
 	loader.RegisterFunction(maintenance);

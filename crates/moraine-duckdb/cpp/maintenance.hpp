@@ -139,8 +139,17 @@ private:
 	std::mutex wake_lock_;
 	std::condition_variable wake_;
 	bool stopping_ = false;
+	// Serializes callers from explicit detach, catalog destruction, and
+	// last-host-context destruction around the one joinable thread.
+	std::mutex stop_lock_;
 	std::thread thread_;
 };
+
+// Registers a scheduler with its database's connection lifecycle. Destruction
+// of the last non-maintenance context stops it before that context releases
+// its DatabaseInstance reference.
+void BindMaintenanceScheduler(duckdb::ClientContext &context,
+                              const duckdb::shared_ptr<MaintenanceScheduler> &scheduler);
 
 void RegisterMoraineMaintenanceFunctions(duckdb::ExtensionLoader &loader);
 
