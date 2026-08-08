@@ -504,7 +504,11 @@ returned rows. Server-side filter pushdown therefore cannot reduce work while
 the whole view is resident — there is nothing left to avoid fetching. Pushdown
 becomes worth building only if moraine stops materializing the whole catalog,
 because lazy materialization needs predicates to know what to fetch. The two
-are one decision, and neither is taken here.
+are one decision, and this RFC rejects both: the full view keeps every accessor
+store-free, and no profile has shown its memory or the replay base-view copy to
+be a problem. A measured live-catalog memory problem would replace this
+decision and take predicate pushdown with it; it does not leave an unbounded
+implementation task in the meantime.
 
 ### Maintained served projections
 
@@ -567,18 +571,17 @@ The caches a moraine-backed query crosses, top to bottom:
 | DuckLake catalog cache | schema/catalog entries; the per-transaction snapshot | snapshot id + `schema_version` | live-catalog-sized | `schema_version` move; transaction end |
 | shim `MetadataRows` | decoded rows per synthesized table | head stamp at first scan | per transaction | transaction end |
 | core logical caches | `CatalogSnapshot`, entity record set, maintained projections | head stamp + install epoch | one catalog's decoded size | replaced on stamp move |
-| SlateDB block + meta cache | decoded SST blocks, indexes, filters | SST id + offset | in-memory, per open store | LRU-ish (foyer) |
-| SlateDB object cache (`CACHE_DIR`) | raw object parts on disk | object path + part | per open store | part-file LRU |
+| SlateDB block + meta cache | decoded SST blocks, indexes, filters | scoped SST id + offset | process-shared memory + `CACHE_DIR` disk | LRU-ish (foyer) |
 
-Two findings drive this section. One catalog byte can be resident in five
-tiers at once, four of them refilled from the tier below on every miss —
-duplication that costs copies as well as memory. And the SlateDB tiers are
-invisible to every budget: their per-store defaults (hundreds of MiB in
-memory, 16 GiB on disk, *multiplied by attached stores*) are bounded by
-nothing DuckDB can see, so a host attaching several catalogs is
-over-committed by construction. The subsections below take the row tiers
-(duplication), DuckLake's tier (composed with, not consolidated), the byte
-tier (consolidated), and the data tier (DuckDB's, untouched).
+Two findings drove this section. Before consolidation, one catalog byte could
+be resident in five tiers at once, four of them refilled from the tier below on
+every miss — duplication that costs copies as well as memory. And SlateDB's
+per-store cache defaults (hundreds of MiB in memory, 16 GiB on disk,
+*multiplied by attached stores*) were bounded by nothing DuckDB could see, so a
+host attaching several catalogs was over-committed by construction. The
+subsections below take the row tiers (duplication), DuckLake's tier (composed
+with, not consolidated), the byte tier (consolidated), and the data tier
+(DuckDB's, untouched).
 
 ### One scan pair per head
 
@@ -690,14 +693,19 @@ it. The next attach to touch the cache blocks forever. So the cache
 builds its own runtime and hands foyer that; nothing the cache does runs
 on an attach's runtime.
 
-Two consequences of SlateDB scoping a shared cache's keys per opened
-handle (which is what keeps two stores' same-numbered WAL SSTs apart).
-The instance shares *budget* unconditionally but *entries* only within a
-handle — satisfied, since moraine holds one handle per attached store.
-And foyer's disk recovery is inert across restarts, because a fresh
-process draws scopes matching none of the recovered keys; until SlateDB
-takes a caller-supplied stable scope, restart warmth is the preload's
-job, at re-fetch cost.
+SlateDB scopes a shared cache's keys per opened handle, which is what keeps two
+stores' same-numbered WAL SSTs apart during one process. The instance shares
+*budget* unconditionally but entries stay store-local — satisfied, since
+moraine holds one handle per attached store. The scope is a process-local
+counter, however, so it resets and follows attach order. The reversed-order
+restart test made the consequence concrete: after process one warmed stores A
+then B, process two opening B then A read A's recovered WAL block for B.
+
+Moraine therefore opens Foyer with disk recovery disabled. A `CACHE_DIR` is a
+process-lifetime disk tier, never a source of prior-process entries; after a
+restart the preload warms it at re-fetch cost. Recovery can be enabled only
+after SlateDB accepts a caller-supplied stable store scope, tracked in
+[`../slatedb.md`](../slatedb.md).
 
 **Admission follows read shape.** SlateDB's defaults already split it —
 point reads cache their blocks, scans do not — and moraine makes the
@@ -719,7 +727,8 @@ The attach options keep their surface (RFC 0006) and change machinery:
   evicts what reads warmed.
 - `CACHE_PRELOAD` — a segment-aware warm, run as reads rather than as a
   manifest walk. SlateDB's per-SST warm call takes an id type its crate
-  does not export, so no caller outside it can name one; reading is in
+  does not export, so no caller outside it can name one (the export request is
+  tracked in [`../slatedb.md`](../slatedb.md)); reading is in
   any case the cheaper instrument, because a scan admits the blocks it
   touches and SlateDB caches every SST index and filter it walks whatever
   the scan's own admission says. So the levels differ by *subspace*, not
@@ -751,6 +760,22 @@ store's, which is the whole point, but it makes the *first* attach's
 options the ones that decide — including whether there is a disk device
 at all.
 
+A cache per attach is rejected. It would make each attach's options
+independent and isolate eviction, but it would also multiply `CACHE_MEMORY` by
+an unnamed attach count and reserve the metadata fifth in every copy. Each
+copy would require a different directory because Foyer devices do not lock or
+namespace their partition files, while the executor would still have to stay
+process-wide to avoid two threads and the detached-runtime failure per attach.
+One shared budget with per-attach tallies keeps the host's memory commitment
+explicit.
+
+The SST block size is fixed at 4 KiB. Read-ahead removed the per-block network
+round trip from scans, while the measured probe shape is zero bytes warm and
+62 KB cold, so there is no remaining evidence for a 4/16/64 KiB sweep or an
+attach option. A future profile that puts material weight on block grain must
+change this binding choice and add the option and the scan/probe benchmark
+together.
+
 Three losses, taken knowingly. Part-grain prefetch: replaced by the scan
 path's own read-ahead (the measured fix for the 277 s materialization in
 `BENCHMARK.md`), with admission per the shape rule. A `CACHE_DIR` shared
@@ -758,8 +783,9 @@ between processes: a foyer device has one owner — but the deployed
 topology never shared a directory across hosts, and within one process
 the shared cache serves the same end better. And restart-persistent
 bytes: the object cache served a restarted process from disk with zero
-GETs, where preload re-fetches — taken on the bet that probes are more
-frequent than restarts, and reversible by the upstream scope work above.
+GETs, where preload re-fetches. Recovery is also unsafe with attach-order
+scopes, so this loss is required for correctness until the upstream stable-
+scope work lands.
 
 ### The data path is DuckDB's, and DuckDB caches it
 
@@ -892,6 +918,10 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **One budget across attaches.** Several attached stores share one cache
   and one tally; a later attach's differing options are reported as
   ignored rather than silently applied.
+- **Restart scope isolation.** Two stores with colliding WAL SST ids warm one
+  cache directory in one attach order; a fresh process opens them in reverse
+  and reads the correct store from both. The test is cross-process so the
+  scope counter actually resets.
 - **Scans cannot evict the probe path.** After a whole-subspace scan and a
   compaction through a warm cache, a probe that was GET-free stays
   GET-free.
@@ -947,6 +977,12 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **A persistent name→id index to skip materialization.** Already rejected by
   RFC 0002 (complexity without payoff at live-catalog scale); nothing here
   changes that calculus. Name resolution stays against the in-memory view.
+- **Partial or lazy materialization.** Rejected with server-side filter
+  pushdown while the live catalog fits comfortably: lazy reads need predicates
+  to know what to fetch, and predicates save nothing while the whole view is
+  already resident. This also leaves the replay base-view copy proportional to
+  catalog size. A profile showing either memory term to be material would be
+  evidence for replacing both choices together.
 - **Rematerializing fully on every refresh (no incremental path).** Rejected as
   the default: correct but pays catalog-size cost per refresh for a
   churn-sized delta. Kept only as the fallback when the gap is large or the base
@@ -972,8 +1008,8 @@ Per RFC 0001, integration tests run against real SlateDB on in-memory
 - **Setting DuckDB's cache settings from the attach.** Rejected: they are
   global, and an `ATTACH` that mutates global state reaches every other
   database in the process. Guidance over mutation.
-- **A cross-process row cache (serialized projections on disk).** Rejected
-  for now: preload bounds process-cold cost (at re-fetch cost, per the
-  scoping caveat), and a persisted row snapshot is a second durable
-  encoding to version and migrate (RFC 0015). Revisit when deploy-cold
-  attach cost is measured; the tasks file carries the case for it.
+- **A cross-process row cache (serialized projections on disk).** Rejected:
+  preload bounds process-cold cost at re-fetch cost, while a persisted row
+  snapshot is a second durable encoding to version and migrate (RFC 0015).
+  Deploy-cold attach must first be measured as a material problem; that result
+  would justify a new format design rather than an open-ended cache task.

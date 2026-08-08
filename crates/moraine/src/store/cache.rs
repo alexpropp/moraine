@@ -22,7 +22,7 @@ use std::{
 
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
-    Spawner,
+    RecoverMode, Spawner,
 };
 use slatedb::db_cache::{
     CachedEntry, CachedKey, DbCache, SplitCache,
@@ -461,6 +461,10 @@ async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<Arc<dyn
         .memory(usize::try_from(memory).unwrap_or(usize::MAX))
         .with_weighter(|_: &CachedKey, value: &CachedEntry| value.size())
         .storage()
+        // SlateDB scopes shared-cache keys with an attach-order counter.
+        // Recovering them in a new process can bind one store's WAL blocks
+        // to another store when that order changes.
+        .with_recover_mode(RecoverMode::None)
         // Keeps the cache's tasks off the runtime of whichever attach
         // happened to build it.
         .with_spawner(Spawner::from(cache_runtime()?))
@@ -485,6 +489,111 @@ async fn hybrid(dir: &PathBuf, memory: u64, disk: Option<u64>) -> Option<Arc<dyn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RESTART_PHASE: &str = "MORAINE_CACHE_RESTART_PHASE";
+    const RESTART_ROOT: &str = "MORAINE_CACHE_RESTART_ROOT";
+
+    async fn run_restart_phase(phase: &str, root: &std::path::Path) {
+        use object_store::local::LocalFileSystem;
+        use slatedb::{
+            Db, DbReader,
+            config::{FlushOptions, FlushType, PutOptions, Settings, WriteOptions},
+        };
+
+        let store_root = root.join("store");
+        let cache_root = root.join("cache");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(&store_root).unwrap());
+
+        if phase == "seed" {
+            let settings = Settings {
+                flush_interval: None,
+                ..Settings::default()
+            };
+            for (path, value) in [("a", b"catalog-a"), ("b", b"catalog-b")] {
+                let db = Db::builder(path, object_store.clone())
+                    .with_settings(settings.clone())
+                    .build()
+                    .await
+                    .unwrap();
+                db.put_with_options(
+                    b"key",
+                    value,
+                    &PutOptions::default(),
+                    &WriteOptions {
+                        await_durable: false,
+                        ..WriteOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+                db.flush_with_options(FlushOptions {
+                    flush_type: FlushType::Wal,
+                })
+                .await
+                .unwrap();
+                drop(db);
+            }
+            std::process::exit(0);
+        }
+
+        let cache = hybrid(&cache_root, 4 * 1024 * 1024, Some(64 * 1024 * 1024))
+            .await
+            .unwrap();
+        let order = if phase == "warm" {
+            [("a", b"catalog-a"), ("b", b"catalog-b")]
+        } else {
+            [("b", b"catalog-b"), ("a", b"catalog-a")]
+        };
+
+        for (path, expected) in order {
+            let reader = DbReader::builder(path, object_store.clone())
+                .with_db_cache(cache.clone())
+                .build()
+                .await
+                .unwrap();
+            let found = reader.get(b"key").await.unwrap().unwrap();
+            assert_eq!(found.as_ref(), expected, "cache scope crossed into {path}");
+            reader.close().await.unwrap();
+        }
+        cache.close().await.unwrap();
+    }
+
+    /// Recovered keys must not follow attach-order scope ids into another
+    /// catalog. WAL SST ids are per store, so two stores deliberately use
+    /// the same id here; the second process attaches them in reverse order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovered_disk_entries_do_not_cross_catalog_scopes() {
+        if let Ok(phase) = std::env::var(RESTART_PHASE) {
+            let root = PathBuf::from(std::env::var_os(RESTART_ROOT).unwrap());
+            run_restart_phase(&phase, &root).await;
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "moraine-cache-restart-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let test_name = "store::cache::tests::recovered_disk_entries_do_not_cross_catalog_scopes";
+
+        for phase in ["seed", "warm", "probe"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(RESTART_PHASE, phase)
+                .env(RESTART_ROOT, &root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{phase} subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// The budget splits into two slots that add up to it, and the meta
     /// slot is the smaller one — data blocks are what needs the room.
