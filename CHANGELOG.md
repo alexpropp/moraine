@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/morainedb/moraine/compare/v0.4.6...v0.5.0) - 2026-08-08
+
+### Added
+
+- settle staged index concurrency and reverse scans ([#114](https://github.com/morainedb/moraine/pull/114))
+- bound and defer index maintenance ([#112](https://github.com/morainedb/moraine/pull/112))
+- add batched SQL index lookups ([#109](https://github.com/morainedb/moraine/pull/109))
+
+### Fixed
+
+- prevent cross-catalog cache recovery ([#116](https://github.com/morainedb/moraine/pull/116))
+- avoid schema churn during staged index builds ([#111](https://github.com/morainedb/moraine/pull/111))
+- join maintenance scheduler on shutdown ([#115](https://github.com/morainedb/moraine/pull/115))
+
+### Other
+
+- allow inserts during staged index steps ([#113](https://github.com/morainedb/moraine/pull/113))
+
 ## [0.4.6](https://github.com/morainedb/moraine/compare/v0.4.5...v0.4.6) - 2026-08-07
 
 ### Added
