@@ -650,18 +650,19 @@ void MoraineSchemaEntry::Alter(duckdb::CatalogTransaction transaction, duckdb::A
 	throw duckdb::NotImplementedException("moraine: altering an entry is not supported (read-only catalog)");
 }
 
-MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, MoraineCatalogHandle *handle, std::string path,
-                               MaintenanceConfig maintenance)
+MoraineCatalog::MoraineCatalog(duckdb::AttachedDatabase &db, duckdb::ClientContext &context,
+                               MoraineCatalogHandle *handle, std::string path, MaintenanceConfig maintenance)
     : duckdb::Catalog(db), handle_(handle), path_(std::move(path)) {
 	// A throw here would abandon a partially constructed object, whose
 	// destructor never runs — so the handle would leak with no
 	// `moraine_detach`. Release it by hand and re-throw instead.
 	try {
-		scheduler_ = duckdb::make_uniq<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
-		                                                     std::move(maintenance));
+		scheduler_ = duckdb::make_shared_ptr<MaintenanceScheduler>(db.GetDatabase(), db.GetName(), path_, handle_,
+		                                                           std::move(maintenance));
 		// A read-only attach never schedules — maintenance mutates, and
 		// a `DbReader` never opens a writer. The trigger refuses too.
 		if (!db.IsReadOnly()) {
+			BindMaintenanceScheduler(context, scheduler_);
 			scheduler_->Start();
 		}
 		// While this catalog lives, the handle's events push straight
@@ -824,7 +825,7 @@ duckdb::unique_ptr<duckdb::Catalog> MoraineCatalog::Attach(duckdb::optional_ptr<
 	if (code != MORAINE_OK) {
 		ThrowMoraineError(err);
 	}
-	return duckdb::make_uniq<MoraineCatalog>(db, handle, info.path, std::move(maintenance));
+	return duckdb::make_uniq<MoraineCatalog>(db, context, handle, info.path, std::move(maintenance));
 }
 
 void MoraineCatalog::Initialize(bool load_builtin) {
@@ -1020,7 +1021,8 @@ void MoraineCatalog::OnDetach(duckdb::ClientContext &context) {
 	// it issues SQL against a database that is being detached, so it is
 	// stopped and joined here, at the last point a live context proves
 	// nothing is mid-teardown. Stop is idempotent; the destructor repeats
-	// it for the paths that never reach this hook.
+	// it as a fallback; destruction of the last host context stops it before
+	// that context releases its database reference on the no-DETACH path.
 	if (scheduler_) {
 		scheduler_->Stop();
 	}

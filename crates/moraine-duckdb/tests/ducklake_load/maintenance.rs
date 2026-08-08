@@ -1335,6 +1335,55 @@ fn detach_during_a_running_pass_completes() {
     );
 }
 
+/// Graceful process shutdown takes the last-host-context path when no explicit
+/// detach occurs. An active pass owns a connection that retains the database,
+/// so waiting for database destruction to stop it is an ownership cycle. The
+/// last host context must stop and join the pass before releasing its own
+/// database reference.
+#[test]
+#[ignore = "needs the downloaded DuckDB CLI, packaged extension, and network access to INSTALL ducklake"]
+fn database_shutdown_during_a_running_pass_completes_without_detach() {
+    let store = TempDir::new("maint-shutdown-store");
+    let data = TempDir::new("maint-shutdown-data");
+    // Ten times the range used by the detach test keeps this pass in flight
+    // well beyond the short pre-shutdown pause, even on a release build.
+    orphaned_range(&store, &data, 15_000);
+
+    let options = format!(
+        ", META_DATA_PATH '{}', META_MAINTENANCE_INTERVAL INTERVAL '100 milliseconds', \
+         META_MAINTENANCE_BATCH_SIZE 1",
+        data.path().display()
+    );
+    // The first tick starts at ~100ms. At 300ms stdin closes without a
+    // DETACH statement, making last-host-context destruction own the join.
+    run_ducklake_sql_with_pause(
+        store.path(),
+        data.path(),
+        &options,
+        "SELECT 1;\n",
+        std::time::Duration::from_millis(300),
+        "",
+    );
+
+    // A shutdown that merely killed the scheduler thread could leave the
+    // range partially reclaimed. A new pass must find the joined pass's work
+    // complete.
+    let output = run_ducklake_sql(
+        store.path(),
+        data.path(),
+        "SELECT 'PASS' AS marker, detail FROM moraine_maintenance('lake') \
+           WHERE step = 'sweep_indexes';",
+    );
+    let sweep = csv_rows(&output)
+        .into_iter()
+        .find(|row| row.first().is_some_and(|marker| marker == "PASS"))
+        .unwrap_or_else(|| panic!("no sweep row after shutdown: {output}"));
+    assert!(
+        sweep[1].contains("0 entries"),
+        "last-host-context shutdown did not wait for the active pass: {sweep:?}"
+    );
+}
+
 /// A lake attached with `METADATA_CATALOG` names its metadata catalog
 /// itself, so the default `__ducklake_metadata_<lake>` naming does not
 /// find it and stripping that prefix does not recover the lake name.
