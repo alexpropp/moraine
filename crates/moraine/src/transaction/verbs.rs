@@ -1183,8 +1183,11 @@ impl Transaction {
             value.build_cursor_row_id = Some(cursor);
         }
         if let Some((file_id, position)) = source {
-            value.build_cursor_file = Some(file_id);
-            value.build_cursor_position = Some(position);
+            let covered = value.build_cursor_file.zip(value.build_cursor_position);
+            if covered.is_none_or(|covered| (file_id, position) > covered) {
+                value.build_cursor_file = Some(file_id);
+                value.build_cursor_position = Some(position);
+            }
         }
         let resulting_state = if is_final {
             value.build_state = None;
@@ -1195,8 +1198,13 @@ impl Transaction {
             IndexState::Building
         };
         self.state.put_index(value);
-        if is_final && !maintenance_repair {
-            self.mark_altered(table_id);
+        if is_final {
+            if maintenance_repair {
+                self.ops
+                    .push(Operation::FinishIndexMaintenance { table_id });
+            } else {
+                self.mark_altered(table_id);
+            }
         } else {
             self.ops.push(Operation::AdvanceIndexBuild { table_id });
         }
@@ -2555,6 +2563,72 @@ mod tests {
             default_value: None,
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_retried_index_step_never_regresses_its_source_cursor() {
+        let mut transaction = empty_transaction();
+        let schema = transaction.create_schema("s").unwrap();
+        let table = transaction.create_table(schema, "t", &[col("a")]).unwrap();
+        let index = transaction
+            .create_index_staged(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: false,
+                },
+            )
+            .unwrap();
+
+        transaction
+            .build_index_source_step(index, &[], false, Some((9, 90)))
+            .unwrap();
+        transaction
+            .build_index_source_step(index, &[], false, Some((9, 20)))
+            .unwrap();
+
+        let value = &transaction.state.indexes[&table.get()][&index.get()];
+        assert_eq!(value.build_cursor_file, Some(9));
+        assert_eq!(value.build_cursor_position, Some(90));
+    }
+
+    #[test]
+    fn a_final_deferred_repair_uses_the_non_schema_alter_fence() {
+        let mut transaction = empty_transaction();
+        let schema = transaction.create_schema("s").unwrap();
+        let table = transaction.create_table(schema, "t", &[col("a")]).unwrap();
+        let index = transaction
+            .create_index_staged(
+                table,
+                &IndexDef {
+                    name: "by_a".into(),
+                    columns: vec![ColumnId::new(1)],
+                    unique: false,
+                },
+            )
+            .unwrap();
+        transaction
+            .state
+            .indexes
+            .get_mut(&table.get())
+            .unwrap()
+            .get_mut(&index.get())
+            .unwrap()
+            .build_state = Some("maintaining".to_owned());
+        transaction.ops.clear();
+
+        transaction
+            .build_index_source_step(index, &[], true, Some((9, 90)))
+            .unwrap();
+
+        assert_eq!(
+            transaction.ops,
+            vec![Operation::FinishIndexMaintenance {
+                table_id: table.get()
+            }]
+        );
+        assert!(!transaction.ops[0].is_schema_changing());
     }
 
     /// Nested field ids are allocated in **pre-order**, from the same two
