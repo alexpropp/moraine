@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use slatedb::{ByteRangeBounds, DbIterator, DbReader, DbTransaction, config::ScanOptions};
+use slatedb::{
+    ByteRangeBounds, DbIterator, DbReader, DbTransaction, IterationOrder, config::ScanOptions,
+};
 
 /// Read-ahead for a scan, in bytes, rounded up to a block by SlateDB.
 ///
@@ -38,6 +40,33 @@ pub(crate) enum ScanShape {
     Probe,
 }
 
+/// The direction SlateDB traverses a scan range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanOrder {
+    /// Lowest encoded key first.
+    Ascending,
+    /// Highest encoded key first.
+    Descending,
+}
+
+impl ScanOrder {
+    /// Selects the direction requested by an index read.
+    pub(crate) fn from_reverse(reverse: bool) -> Self {
+        if reverse {
+            Self::Descending
+        } else {
+            Self::Ascending
+        }
+    }
+
+    fn iteration_order(self) -> IterationOrder {
+        match self {
+            Self::Ascending => IterationOrder::Ascending,
+            Self::Descending => IterationOrder::Descending,
+        }
+    }
+}
+
 /// Scan options for reading a whole subspace, as every materialization
 /// does. Blocks are not admitted to the cache.
 fn bulk_scan_options() -> ScanOptions {
@@ -62,11 +91,13 @@ fn probe_scan_options() -> ScanOptions {
 }
 
 impl ScanShape {
-    fn options(self) -> ScanOptions {
-        match self {
+    fn options(self, order: ScanOrder) -> ScanOptions {
+        let mut options = match self {
             Self::Bulk => bulk_scan_options(),
             Self::Probe => probe_scan_options(),
-        }
+        };
+        options.order = order.iteration_order();
+        options
     }
 }
 
@@ -116,7 +147,23 @@ impl ReadHandle<'_> {
         P: AsRef<[u8]> + Send,
         T: ByteRangeBounds + Send,
     {
-        let options = shape.options();
+        self.scan_prefix_ordered(prefix, subrange, shape, ScanOrder::Ascending)
+            .await
+    }
+
+    /// Scan keys sharing `prefix` in the requested key order.
+    pub(crate) async fn scan_prefix_ordered<P, T>(
+        &self,
+        prefix: P,
+        subrange: T,
+        shape: ScanShape,
+        order: ScanOrder,
+    ) -> Result<DbIterator, slatedb::Error>
+    where
+        P: AsRef<[u8]> + Send,
+        T: ByteRangeBounds + Send,
+    {
+        let options = shape.options(order);
         match self {
             Self::Tx(tx) => {
                 tx.scan_prefix_with_options(prefix, subrange, &options)
@@ -167,7 +214,7 @@ mod tests {
     /// the row-level caches, so caching its blocks is pure pollution.
     #[test]
     fn bulk_scans_read_ahead_and_admit_nothing() {
-        let options = ScanShape::Bulk.options();
+        let options = ScanShape::Bulk.options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
         assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
         assert!(!options.cache_blocks);
@@ -177,9 +224,17 @@ mod tests {
     /// and keeps the same read-ahead, which stops at the range's end.
     #[test]
     fn probe_scans_admit_their_blocks() {
-        let options = ScanShape::Probe.options();
+        let options = ScanShape::Probe.options(ScanOrder::Ascending);
         assert_eq!(options.read_ahead_bytes, SCAN_READ_AHEAD_BYTES);
         assert_eq!(options.max_fetch_tasks, SCAN_FETCH_TASKS);
         assert!(options.cache_blocks);
+    }
+
+    /// Reverse index reads ask SlateDB to iterate backwards instead of
+    /// materializing an ascending result and reversing it afterward.
+    #[test]
+    fn descending_probes_request_descending_iteration() {
+        let options = ScanShape::Probe.options(ScanOrder::Descending);
+        assert!(matches!(options.order, IterationOrder::Descending));
     }
 }
