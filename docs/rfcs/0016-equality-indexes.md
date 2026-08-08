@@ -1,6 +1,6 @@
 # RFC 0016: Equality and range indexes
 
-- **Date:** 2026-07-10
+- **Date:** 2026-07-10 (reverse iteration settled 2026-08-08)
 
 ## Summary
 
@@ -29,19 +29,19 @@ every type, so the same `index` storage answers comparison queries
 (`<`, `<=`, `>`, `>=`, `BETWEEN`, half-open) as a bounded sub-scan —
 equality is the degenerate closed `[v, v]` case. Each column carries a
 declared **direction** (`ASC`/`DESC`, realized by complementing its framed
-bytes, so one forward-only scan yields the declared order) and a **NULL
-placement** (`NULLS FIRST`/`LAST`). None of this adds a maintenance path:
-coverage, staged builds, uniqueness, and the scoped read are unchanged —
-they just call the ordered encoder (Range and comparison queries).
+bytes, so an ascending store scan yields the declared order) and a **NULL
+placement** (`NULLS FIRST`/`LAST`). A descending store scan serves the exact
+opposite order from the same index. None of this adds a maintenance path:
+coverage, staged builds, uniqueness, and the scoped read are unchanged — they
+just call the ordered encoder (Range and comparison queries).
 
 The store is one index; the ways in are two. The **embedding (verb) API**
 creates and maintains indexes directly — the bulk of this RFC. The
 **extension path** reaches the same `index` storage from DuckDB SQL through
 registered moraine functions, and covers DuckLake-written Parquet by the
 scoped read, which also enforces uniqueness over SQL writes.
-DuckLake-native `CREATE INDEX` waits on DuckLake itself, which owns the
-user-table binder and refuses index DDL before moraine is consulted
-(Extension path).
+DuckLake-native `CREATE INDEX` belongs to DuckLake, which owns the user-table
+binder and refuses index DDL before moraine is consulted (Extension path).
 
 ## Goals
 
@@ -63,14 +63,10 @@ user-table binder and refuses index DDL before moraine is consulted
 Non-goals:
 
 - **Serving DuckLake's planner transparently.** DuckLake owns the user-table
-  binder and optimizer, so index-routed pushdown — including range and
-  `ORDER BY` pushdown — waits on DuckLake (Extension path, Future
-  directions). The extension path integrates through an explicit surface —
-  registered functions and the scoped read — never `ducklake_*` changes or
-  the planner.
-- **Reverse iteration.** The store scans forward only (RFC 0002). One index
-  serves one declared order; the exact opposite order is a second index or a
-  future reverse-scan capability, not this RFC.
+  binder and optimizer. The extension path integrates through an explicit
+  surface — registered functions and the scoped read — never downstream
+  `ducklake_*` changes or a planner fork. Requests for a supported upstream
+  integration live in [`../ducklake.md`](../ducklake.md).
 - **Locale/collation-aware order.** String order is DuckDB's default binary
   (bytewise) order; collation-sensitive ordering is out of scope.
 - **Approximate structures** (bloom filters, zone maps) — they cannot carry
@@ -204,9 +200,9 @@ store codec:
 **Direction** is per column. A `DESC` column stores the bitwise complement
 of its fully framed component (terminator included, so variable-length
 values reverse correctly — `"ab" < "a"`); the leading NULL flag is not
-complemented, so NULL placement is independent of direction. A forward-only
-scan then yields the declared composite order in one pass, no reverse
-iterator.
+complemented, so NULL placement is independent of direction. An ascending
+scan yields the declared composite order and a descending scan yields its
+exact opposite, both directly from SlateDB's iterator.
 
 **NULL placement** is per column (`NULLS FIRST`/`LAST`). Each column's
 component carries a leading flag byte separating NULL from non-null, ordered
@@ -215,10 +211,14 @@ per the placement. A row with a NULL in an indexed column **is stored** — so
 **multi-shaped** (the row id is in the key) and **exempt from the value
 collision**: SQL treats NULLs as distinct, so a unique index still admits any
 number of NULL rows. An equality *point* lookup on NULL still has no answer
-(`= NULL` is unknown); NULL rows are reached only through `IS NULL`. What the
-flag does not yet drive is *ordered emission* of NULL rows at the declared end
-for `ORDER BY … NULLS FIRST/LAST` — that waits on `ORDER BY` pushdown (Open
-questions).
+(`= NULL` is unknown); NULL rows are reached only through `IS NULL`.
+
+The explicit read surface deliberately keeps comparison and NULL scans
+separate. `index_range` clamps open sides to the non-null region, while
+`index_nulls` emits only the matching NULL subrange in either scan direction.
+It does not combine the two into an `ORDER BY … NULLS FIRST/LAST` result;
+that behavior belongs to any future DuckLake planner integration, not this
+API's contract.
 
 **Oversized values are refused.** Indexed values beyond a fixed cap fail
 with `Constraint` at insert/registration — huge keys degrade the whole
@@ -340,10 +340,10 @@ The refusal's text avoids DuckLake's four retry substrings, as the
 uniqueness rejection does: it is terminal, and re-running it reaches the
 same answer more slowly.
 
-The limit is currently a constant rather than a `CatalogOptions` field.
-Making it configurable means threading it through both commit paths and the
-FFI; that is worth doing if a caller ever has a legitimate reason to raise
-it, and is not yet justified.
+The limit is a fixed safety invariant, not a `CatalogOptions` field. A caller
+cannot raise it and turn a bounded commit back into memory thrash; workloads
+above it must split the load or use a staged build. Changing the limit or
+making it configurable requires new measurements and a new design decision.
 
 The remedy the refusal names — split the load — is only available to a
 writer that chooses its own batch boundaries. A DuckLake maintenance call
@@ -850,19 +850,17 @@ correctness.
 **Reads are explicit.** DuckLake owns the planner, so no optimizer routing.
 The extension path reads through `moraine_index_lookup`; the caller joins
 back to the table, whose scan DuckLake adjudicates against delete files. v1
-scope: creation, uniqueness enforcement, explicit lookup. Pushdown waits on a
-DuckLake change (below).
+scope: creation, uniqueness enforcement, and explicit equality, range, and
+NULL reads.
 
-**Future directions — noted, and ruled out of the main design: both require
-DuckLake to move first.** (a) *DuckLake grows index metadata.* That catalog
-state would land in moraine like every other `ducklake_*` mapping, with
-maintenance arriving as writer-supplied entries (the Coverage contract,
-DuckLake as the writer); the protobuf definition value reserves a
-`ducklake_index_id` field for mapping such an index onto the same `index`
-range, and that reservation is the entire commitment made here. (b) *A
-DuckLake binder patch* — native `CREATE INDEX`/`PRIMARY KEY`, entry
-maintenance delegated to the metadata catalog, index-served pushdown; an
-upstream change moraine would own. Neither is designed further in this RFC.
+**The upstream boundary is explicit.** Moraine does not carry a downstream
+DuckLake binder or optimizer patch. If DuckLake defines native index metadata,
+the protobuf definition value's reserved `ducklake_index_id` can map its
+stable identifier onto the existing `index` range; the reservation preserves
+that option but commits to no implementation. Native DDL, writer-supplied
+maintenance, and equality, comparison, or `ORDER BY` pushdown are upstream
+requests tracked in [`../ducklake.md`](../ducklake.md), not open work in this
+RFC.
 
 Read-only attaches over an indexed store are unaffected.
 
@@ -976,14 +974,14 @@ ends, so reclamation is pure space hygiene: a bounded sweep deletes
 `index/{index_id}` in batches — never inside the dropping commit, whose
 batch must stay bounded.
 
-RFC 0021 specifies and implements that sweep, and gives it the home this
-RFC deferred: `Catalog::maintain` discovers dead index ids by seeking
+RFC 0021 specifies and implements that sweep: `Catalog::maintain` discovers
+dead index ids by seeking
 through the `index` subspace (ids are monotonic and never reused, so an id
 absent from the live catalog is dead forever) and reclaims each range in
-head-preserving batches. It runs as one step of the maintenance pass. The
-SlateDB range-delete that would collapse the sweep into one call still
-does not exist at the pinned version, so the batched scan-and-delete is
-the answer for now.
+head-preserving batches. It runs as one step of the maintenance pass. Batched
+scan-and-delete is the binding design. A SlateDB range delete could optimize
+the mechanism without changing its semantics; that upstream request is
+tracked in [`../slatedb.md`](../slatedb.md).
 
 ### Test obligations
 

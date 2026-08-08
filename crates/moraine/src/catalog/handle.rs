@@ -1209,8 +1209,8 @@ impl ReadOnlyCatalog {
     /// [`index_lookup`](Self::index_lookup): the scan and the catalog it
     /// resolves against are one consistent cut, and the caller applies delete
     /// files. Results are in the index's stored order, or its exact opposite
-    /// when `reverse` is set — the reverse of the materialized result, which
-    /// needs no reverse iterator.
+    /// when `reverse` is set. Both directions stream from the store in the
+    /// requested order.
     ///
     /// # Errors
     ///
@@ -1258,20 +1258,16 @@ impl ReadOnlyCatalog {
             // flag byte bounds the scan's open sides.
             let leading_nulls = info.nulls.first().copied().unwrap_or(NullOrder::Last);
 
-            let mut row_ids = index_maintenance::range_row_ids(
+            let row_ids = index_maintenance::range_row_ids(
                 handle,
                 index.get(),
                 info.unique,
                 leading_nulls,
                 byte_lower,
                 byte_upper,
+                crate::store::handle::ScanOrder::from_reverse(reverse),
             )
             .await?;
-            // The scan yields the index's declared order; reversing the
-            // materialized result serves the exact opposite order.
-            if reverse {
-                row_ids.reverse();
-            }
             let holders = RowHolders::of(&view.data_files_of(table));
             Ok(row_ids
                 .into_iter()
@@ -1353,11 +1349,13 @@ impl ReadOnlyCatalog {
             }
 
             let key = encode_ordered_values(&prefix, &info.directions, &info.nulls)?;
-            let mut row_ids =
-                index_maintenance::null_prefix_row_ids(handle, index.get(), &key).await?;
-            if reverse {
-                row_ids.reverse();
-            }
+            let row_ids = index_maintenance::null_prefix_row_ids(
+                handle,
+                index.get(),
+                &key,
+                crate::store::handle::ScanOrder::from_reverse(reverse),
+            )
+            .await?;
             let holders = RowHolders::of(&view.data_files_of(table));
 
             Ok(row_ids
